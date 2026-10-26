@@ -1,0 +1,1966 @@
+# Planarian — Phase A fault catalog
+#
+# First deliverable per SPEC §18.0. Status: DRAFT FOR OWNER REVIEW.
+# Spec revision: v4.3. Review notes, coverage matrix and open questions:
+# docs/catalog-review.md.
+#
+# ───────────────────────────────────────────────────────────────────────────
+# FORMAT
+# ───────────────────────────────────────────────────────────────────────────
+#
+# Each [[fault]] is SPEC §15's
+#   Fault { id, family, inject: Transition | RawAction, required_post: Expectation,
+#           intent: Option<Intent>, tags }
+# with these additions (all proposed, see docs/catalog-review.md §2):
+#
+#   summary      one line, plain words
+#   spec         sections the case comes from
+#   scoring      "repair"    counts toward the GA ≥ 60% deterministic-clear rate
+#                "must-pass" executor / kernel / policy behaviour; any failure fails GA
+#                "intent"    correct behaviour is no autonomous intervention
+#   harness      where it runs: "fake" (in-memory fake backends, the txn-kernel
+#                harness), "vm" (NixOS 26.05 VM test), or both
+#   setup        ordered steps before the fault (same vocabulary as inject)
+#   inject       the fault: { transition = ... } or { raw = ... }
+#   after        ordered steps after the fault (restart the daemon, approve, ...)
+#   window       how long the scorer observes after inject before judging
+#   layouts      journal filesystem layouts to repeat the case on (§12c)
+#
+# intent is always present so the field is explicit:
+#   intent = { kind = "none" }                         Option::None — repair expected
+#   intent = { kind = "no-intervention", because = "..." }
+#
+# required_post holds the Expectation fields (units, generation, may_change,
+# others_unchanged, settle) plus extension assertions:
+#   boot_default, override_source, known_good, live_tested   generation-level state
+#   journal_agrees      running generation, boot default, override source and the
+#                       journal's terminal state all describe the same outcome
+#   suppressions        suppressions that must hold at the end
+#   no_txn_on           no transaction (any source) targets these units
+#   no_autonomous_txn   no transaction from a non-user source after setup
+#   no_incident_on      no incident opened for these units
+#   interlock           "set" | "clear" at the end of the window
+#   reports             console/report items that must be emitted
+#   invariants          invariants this case specifically exercises (see GLOBAL)
+#   metrics             numeric bounds (restarts per unit, attempts, ...)
+#   [[...txn]]          a transaction that must (count >= 1) or must not
+#                       (count = 0) appear; fields match on transition, target,
+#                       change, source, actor, decision, terminal, path (an
+#                       ordered subsequence of journal states), owner
+#   [[...incident]]     an incident that must exist, with target, state, root_of
+#
+# Symbolic generations (real ids are assigned at run time):
+#   base        generation current when the case's transaction was Prepared
+#   candidate   generation built by the case's transaction
+#   known_good  boot-confirmed generation at setup
+#
+# ───────────────────────────────────────────────────────────────────────────
+# GLOBAL CHECKS (applied to every entry by the scorer; not repeated per entry)
+# ───────────────────────────────────────────────────────────────────────────
+#
+#   * Gamed success fails the run (§15): any transaction that changes a probe
+#     definition; StopUnit on an incident target; a Suppression whose `by` is not
+#     a User; a Diagnostic probe result that changed a UnitStatus.
+#   * I5, I6, I7, I12, I13, I14, I15 are monitored for the whole window.
+#   * RecoveryFailed count must be 0 unless the entry asserts interlock = "set".
+#   * Every executed transition has a complete I7 log record.
+#   * The model stub is never invoked (§18.6).
+#
+# ───────────────────────────────────────────────────────────────────────────
+# UNIT NAMES
+# ───────────────────────────────────────────────────────────────────────────
+#
+#   "<kind>:<name>"         system scope       e.g. service:sshd, device:fs-root
+#   "<kind>@<uid>:<name>"   user scope         e.g. service@1000:pipewire
+#   External dependencies are services named external:<name> (§10):
+#   service:external:gym-upstream.
+#
+# Actors: daemon, watchdog, user:1000 (alice, unprivileged), user:1001 (admin,
+# in planarian-admin), user:1002 (bob, unprivileged), root.
+#
+# Catalog entries referenced: the shipped §9 entries (service-enable, font-scale,
+# keyboard-layout, wifi-select, listen-address, repair:reenable-predicted) plus
+# gym-only entries prefixed gym: (gym:kernel-param). manifest-probe-edit is
+# deliberately NOT a catalog entry.
+#
+# ───────────────────────────────────────────────────────────────────────────
+# RAW ACTIONS (inject/setup/after vocabulary when not a Transition)
+# ───────────────────────────────────────────────────────────────────────────
+#
+#   kill_unit {unit, signal}                 kill the unit's main process
+#   stop_unit_out_of_band {unit, actor}      `systemctl stop` outside Planarian
+#   corrupt_state {unit, path}               break a unit's mutable state file
+#   set_knob {unit, knob, value}             fixture runtime toggle (cleared on restart)
+#   set_persistent_knob {unit, knob, value}  fixture toggle stored on disk (survives restart)
+#   unbind_driver {device}                   sysfs unbind
+#   hotunplug {device}                       QMP device_del
+#   block_network {dst, port?} / unblock_network {dst}
+#   stop_host_service {name} / start_host_service {name}
+#   kill_process {process, signal, when?}    process: planariad | planarian-recovery | worker
+#   hold_down {process}                      keep a process from restarting
+#   release {process}                        undo hold_down and start it
+#   restart_process {process}
+#   slow_backend {call, delay}               delay a backend call (vm: activation hook)
+#   withhold_reply {call}                    backend accepts the job, reply never arrives
+#   backend_result {call, result}            fake only: force a backend return value
+#   edit_owner_source {path, tracked, when?}
+#   out_of_band_rebuild {edit}               owner runs nixos-rebuild switch themselves
+#   fill_fs {fs, as_uid, until}              until: below-threshold | reserved-boundary | full
+#   set_setting {key, value}                 Planarian user settings (budgets, max_tier)
+#   force_compaction
+#   interrupt_write {target}                 record | checkpoint (fake: torn tail)
+#   suspend {duration}
+#   greeter_login {uid}                      authenticate through the greeter
+#   logout {uid}
+#   reboot
+#   advance_clock {by}                       fake only
+#   cli {argv, actor}                        `planarian ...` over the daemon socket
+#   ask {phrase, actor}
+#   approve_pending {actor, via}             via: tty (Phase A approval path)
+#   wait {for}                               duration, or { journal = "<state>" }
+#
+# `when` on an action: { journal = "<TxnState>" } fires the instant that state
+# is durably journaled; { after = "<duration>" } fires relative to the previous step.
+#
+# ───────────────────────────────────────────────────────────────────────────
+# FIXTURES — gym units added to the reference VM (nix/tests/)
+# ───────────────────────────────────────────────────────────────────────────
+
+schema_version = 1
+spec = "v4.3"
+
+[[fixture]]
+unit = "service:gym-web"
+purpose = "HTTP service on 127.0.0.1:8080; Readiness probes: Http /health (Measurement) and Tcp. Knobs: health=503, health_delay, refuse. Restart=no. Listen address settable via the listen-address catalog entry (permitted: 127.0.0.1, 192.0.2.10, where 192.0.2.10 is assigned to no interface)."
+
+[[fixture]]
+unit = "service:gym-db"
+purpose = "Functional prerequisite of gym-app (Requires=)."
+
+[[fixture]]
+unit = "service:gym-app"
+purpose = "Requires=gym-db; After=gym-cache (ordering only); Wants=gym-metrics (weak). Readiness Tcp probe."
+
+[[fixture]]
+unit = "service:gym-cache"
+purpose = "Ordering-only predecessor of gym-app."
+
+[[fixture]]
+unit = "service:gym-metrics"
+purpose = "Optional unit wanted by gym-app."
+
+[[fixture]]
+unit = "service:gym-flap"
+purpose = "Exits non-zero a configurable time after start (knob fail_after; default 30s). Restart=no."
+
+[[fixture]]
+unit = "service:gym-restartful"
+purpose = "Restart=on-failure, RestartSec=5s, StartLimitBurst=3; for defer-to-systemd."
+
+[[fixture]]
+unit = "service:gym-upstream-client"
+purpose = "Readiness Http probe to http://10.0.2.2:9000/health via the gateway; Requires edge (manifest) to service:external:gym-upstream."
+
+[[fixture]]
+unit = "service:external:gym-upstream"
+purpose = "External dependency served by the VM host at 10.0.2.2:9000."
+
+[[fixture]]
+unit = "service:gym-usb-reader"
+purpose = "Desired Running when DeviceConnected(device:gym-usb0); BindsTo the device."
+
+[[fixture]]
+unit = "device:snd-hda0"
+purpose = "QEMU intel-hda + hda-duplex; snd_hda_intel; pipewire's Requires target (manifest)."
+
+[[fixture]]
+unit = "device:net-gym0"
+purpose = "Second virtio-net NIC dedicated to the gym; restart_disruption ConnectivityLoss."
+
+[[fixture]]
+unit = "device:gpu0"
+purpose = "virtio-gpu; the desktop's Requires target; restart_disruption SessionLoss."
+
+[[fixture]]
+unit = "device:wlan-hwsim"
+purpose = "mac80211_hwsim radios with two hostapd APs (gym-ap-a, gym-ap-b) for Wi-Fi selection."
+
+[[fixture]]
+unit = "device:gym-usb0"
+purpose = "QEMU usb-storage device that the gym can hot-unplug."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: service-killed
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "svc-killed"
+family = "service-killed"
+summary = "gym-web is SIGKILLed; it has no Restart=; the diagnoser restarts it."
+spec = ["§13", "§15", "§4 GA(1)"]
+tags = ["ga-demo"]
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+may_change = ["service:gym-web"]
+others_unchanged = true
+settle = { ready = "service:gym-web", timeout = "60s" }
+metrics = { restarts_max = { "service:gym-web" = 1 } }
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+source = "diagnoser"
+decision = "Allow(Runtime)"
+terminal = "Committed"
+path = ["Prepared", "Activating", "Checking", "Committed"]
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+state = "Closed"
+
+[[fault]]
+id = "svc-killed-defer-to-systemd"
+family = "service-killed"
+summary = "gym-restartful is killed; systemd restarts it itself; Planarian does not act."
+spec = ["§13 defer to systemd"]
+tags = []
+scoring = "intent"
+harness = ["vm"]
+intent = { kind = "no-intervention", because = "systemd's own Restart= is within StartLimitBurst" }
+inject = { raw = "kill_unit", unit = "service:gym-restartful", signal = "SIGKILL" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-restartful" = "Running" }
+others_unchanged = true
+no_txn_on = ["service:gym-restartful"]
+
+[[fault]]
+id = "svc-killed-user-scope"
+family = "service-killed"
+summary = "alice's pipewire is killed while her session is up; the user-scoped unit is restarted."
+spec = ["§10 user-scoped units"]
+tags = []
+scoring = "repair"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "greeter_login", uid = 1000 },
+  { raw = "wait", for = "30s" },
+]
+inject = { raw = "kill_unit", unit = "service@1000:pipewire", signal = "SIGKILL" }
+window = "5m"
+
+[fault.required_post]
+units = { "service@1000:pipewire" = "Running" }
+may_change = ["service@1000:pipewire", "service@1000:wireplumber"]
+others_unchanged = true
+settle = { ready = "service@1000:pipewire", timeout = "60s" }
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service@1000:pipewire"
+source = "diagnoser"
+terminal = "Committed"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: service-misconfigured
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "svc-misconfig-state-file"
+family = "service-misconfigured"
+summary = "gym-web's mutable state file is corrupted, so it fails on every start. Restarting cannot fix it: three attempts with backoff, then escalation with a report. Phase B upgrades required_post to Running."
+spec = ["§13 budgets", "§1 escalate"]
+tags = ["phase-b-upgrade"]
+scoring = "repair"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "corrupt_state", unit = "service:gym-web", path = "/var/lib/gym-web/state.json" }]
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGTERM" }
+window = "10m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Failed" }
+generation = "base"
+others_unchanged = true
+reports = ["DiagnoserExhausted"]
+metrics = { restarts_max = { "service:gym-web" = 3 }, attempt_gaps_min = ["10s", "60s"] }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+state = "Cooldown"
+
+[[fault]]
+id = "svc-misconfig-listen-address"
+family = "service-misconfigured"
+summary = "The user sets gym-web's listen address to 192.0.2.10, a permitted value that no interface holds. The change is applied as a transaction, the probes fail, and the change is reverted."
+spec = ["§9", "§12 GenerationOp", "§4 GA(1)"]
+tags = ["ga-demo", "bad-generation"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" }
+window = "15m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+generation = "base"
+boot_default = "base"
+override_source = "base"
+known_good = "unchanged"
+journal_agrees = true
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+change = "listen-address"
+decision = "Allow(Tested)"
+terminal = "Reverted"
+path = ["Prepared", "Activating", "Checking", "Reverting", "Reverted"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: required-dependency-stopped
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "dep-required-stopped"
+family = "required-dependency-stopped"
+summary = "gym-db is stopped out of band; systemd stops gym-app with it (Requires=). Root cause is gym-db: it is repaired first, then gym-app."
+spec = ["§13 diagnoser step 1"]
+tags = ["question:out-of-band-stop"]
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "stop_unit_out_of_band", unit = "service:gym-db", actor = "root" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-db" = "Running", "service:gym-app" = "Running" }
+may_change = ["service:gym-db", "service:gym-app"]
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-db"
+source = "diagnoser"
+terminal = "Committed"
+
+[[fault.required_post.incident]]
+target = "service:gym-db"
+root_of = ["service:gym-app"]
+
+# Ordering check: gym-app is never restarted while gym-db is not Running.
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-app"
+before_unit_running = "service:gym-db"
+count = 0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: ordering-only-predecessor-stopped  (must NOT be treated as cause)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "dep-ordering-only-stopped"
+family = "ordering-only-predecessor-stopped"
+summary = "gym-cache (After= of gym-app only) is killed. gym-app stays healthy and is never touched; gym-cache is its own incident."
+spec = ["§8 EdgeKind::Ordering", "§13"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGKILL" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-cache" = "Running", "service:gym-app" = "Running" }
+may_change = ["service:gym-cache"]
+others_unchanged = true
+no_txn_on = ["service:gym-app"]
+no_incident_on = ["service:gym-app"]
+
+[[fault.required_post.incident]]
+target = "service:gym-cache"
+root_of = []
+
+[[fault]]
+id = "dep-wants-optional-failed"
+family = "ordering-only-predecessor-stopped"
+summary = "gym-metrics (Wants= of gym-app) fails persistently while gym-app stays healthy: at most one incident, on gym-metrics, and gym-app is never named as caused by it."
+spec = ["§8 EdgeKind::Wants", "§13", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "set_persistent_knob", unit = "service:gym-metrics", knob = "fail_on_start", value = true }]
+inject = { raw = "kill_unit", unit = "service:gym-metrics", signal = "SIGKILL" }
+window = "10m"
+
+[fault.required_post]
+units = { "service:gym-app" = "Running" }
+others_unchanged = true
+no_txn_on = ["service:gym-app"]
+no_incident_on = ["service:gym-app"]
+metrics = { incidents_max = 1 }
+
+[[fault.required_post.incident]]
+target = "service:gym-metrics"
+root_of = []
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: driver-unbound
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "drv-unbound-audio"
+family = "driver-unbound"
+summary = "snd_hda_intel is unbound from the sound card; alice's pipewire degrades. The root cause is the device, not pipewire; the driver is rebound, and pipewire then recovers."
+spec = ["§1 root-cause example", "§12 DeviceOp"]
+tags = []
+scoring = "repair"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { raw = "unbind_driver", device = "device:snd-hda0" }
+window = "5m"
+
+[fault.required_post]
+units = { "device:snd-hda0" = "Bound", "service@1000:pipewire" = "Running" }
+generation = "base"
+may_change = ["device:snd-hda0", "service@1000:pipewire", "service@1000:wireplumber"]
+others_unchanged = true
+
+[[fault.required_post.incident]]
+target = "device:snd-hda0"
+root_of = ["service@1000:pipewire"]
+
+[[fault.required_post.txn]]
+transition = "BindDriver"
+target = "device:snd-hda0"
+source = "diagnoser"
+decision = "Allow(Tested)"
+terminal = "Committed"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service@1000:pipewire"
+before_unit_running = "device:snd-hda0"
+count = 0
+
+[[fault]]
+id = "drv-unbound-nic-asks"
+family = "driver-unbound"
+summary = "virtio_net is unbound from net-gym0. Rebinding a NIC has ConnectivityLoss disruption, so the daemon's BindDriver is parked AskFirst; after a TTY approval it runs."
+spec = ["§11 global floors", "§12 step 4"]
+tags = []
+scoring = "repair"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { raw = "unbind_driver", device = "device:net-gym0" }
+after = [
+  { raw = "wait", for = { journal = "Prepared" } },
+  { raw = "wait", for = "30s" },
+  { raw = "approve_pending", actor = "root", via = "tty" },
+]
+window = "5m"
+
+[fault.required_post]
+units = { "device:net-gym0" = "Bound" }
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "BindDriver"
+target = "device:net-gym0"
+source = "diagnoser"
+decision = "Allow(AskFirst)"
+terminal = "Committed"
+not_activated_before = "approval"
+
+[[fault]]
+id = "drv-bind-fails-restores-previous"
+family = "driver-unbound"
+summary = "An admin binds the sound card to vfio-pci; probes fail; the transaction unbinds it, rebinds snd_hda_intel, and makes no attempt at a generation rollback."
+spec = ["§12 DeviceOp gym case"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { transition = "BindDriver", device = "device:snd-hda0", driver = "vfio-pci", source = "user", actor = "user:1001" }
+window = "5m"
+
+[fault.required_post]
+units = { "device:snd-hda0" = "Bound" }
+bound_driver = { "device:snd-hda0" = "snd_hda_intel" }
+generation = "base"
+boot_default = "base"
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "BindDriver"
+target = "device:snd-hda0"
+terminal = "Reverted"
+path = ["Prepared", "Activating", "Checking", "Reverting", "Reverted"]
+
+[[fault.required_post.txn]]
+transition = "Revert"
+count = 0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: bad-generation-activated
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "gen-bad-switch"
+family = "bad-generation-activated"
+summary = "Switching to a prebuilt generation whose gym-web ExecStart is broken: AskFirst (the target was never live-tested), approved, fails its probes, reverted. The candidate never becomes the only boot entry."
+spec = ["§11 table", "§12", "§12c /boot"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "out_of_band_rebuild", edit = "build-only gym-web ExecStart=/bin/false", activate = false }]
+inject = { transition = "SwitchGeneration", generation = "prebuilt", source = "user", actor = "user:1001" }
+after = [{ raw = "approve_pending", actor = "root", via = "tty" }]
+window = "15m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+generation = "base"
+boot_default = "base"
+override_source = "base"
+known_good = "unchanged"
+journal_agrees = true
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "SwitchGeneration"
+decision = "Allow(AskFirst)"
+terminal = "Reverted"
+
+[[fault]]
+id = "gen-override-only-change"
+family = "bad-generation-activated"
+summary = "A font-scale change touches only overrides.nix. The evaluated output differs from base, Stale is never raised (no owner edit happened), and the change commits."
+spec = ["§9 steps 1 and 6", "§15 v4-review"]
+tags = ["acceptance", "good-generation"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "15m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+override_source = "candidate"
+live_tested = "candidate"
+known_good = "unchanged"
+evaluated_option = { "planarian.reference.fontScale" = 1.25 }
+journal_agrees = true
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+change = "font-scale"
+decision = "Allow(Tested)"
+terminal = "Committed"
+path = ["Prepared", "Activating", "Checking", "Published", "Promoted", "Committed"]
+never = ["Rejected(Stale)"]
+
+[[fault]]
+id = "gen-disable-reenable-canonical"
+family = "bad-generation-activated"
+summary = "An admin disables sshd (which has a canonical Readiness probe) and later re-enables it. Disabling makes the probe inapplicable without tampering with it, so neither change is reverted."
+spec = ["§9 applicability", "I10", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" }
+after = [
+  { raw = "approve_pending", actor = "root", via = "tty" },
+  { raw = "wait", for = { journal = "Committed" } },
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = true }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty" },
+]
+window = "30m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+override_source = "candidate"
+no_incident_on = ["service:sshd"]
+journal_agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+change = "service-enable"
+args = { service = "sshd", enabled = false }
+decision = "Allow(AskFirst)"
+facts = { touches_canonical_probe = false, changes_desired = true }
+terminal = "Committed"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+change = "service-enable"
+args = { service = "sshd", enabled = true }
+terminal = "Committed"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: daemon-killed  (Activating, Checking, Reverting per §15; plus
+# Published, Promoted per the v4-review acceptance list)
+#
+# Unless stated, the daemon is held down after the kill so the watchdog owns
+# recovery. "good" candidate = font-scale 1.25; "bad" = listen-address 192.0.2.10.
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "crash-activating-bad"
+family = "daemon-killed"
+summary = "planariad is killed during Activating of a bad candidate; the watchdog takes the lease, fences, confirms quiescence, and reverts."
+spec = ["§12 crash-recovery table", "§4 GA(1)"]
+tags = ["ga-demo", "acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+generation = "base"
+boot_default = "base"
+override_source = "base"
+journal_agrees = true
+invariants = ["I6", "I12", "I15"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Reverted"
+owner = "watchdog"
+lease_epoch_min = 2
+
+[[fault]]
+id = "crash-activating-good"
+family = "daemon-killed"
+summary = "planariad is killed during Activating of a good candidate. The watchdog sees the candidate active, goes to Checking, the probes pass, and it runs the entire commit path."
+spec = ["§12 watchdog"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+override_source = "candidate"
+journal_agrees = true
+invariants = ["I6", "I12", "I15"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+owner = "watchdog"
+path = ["Activating", "Checking", "Published", "Promoted", "Committed"]
+
+[[fault]]
+id = "crash-checking"
+family = "daemon-killed"
+summary = "planariad is killed during Checking; the watchdog re-runs the probes itself before committing."
+spec = ["§12 crash-recovery table"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Checking" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+override_source = "candidate"
+journal_agrees = true
+watchdog_probed_before_commit = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+owner = "watchdog"
+
+[[fault]]
+id = "crash-published"
+family = "daemon-killed"
+summary = "The daemon stays down after Published; the watchdog promotes the override by hash comparison and commits."
+spec = ["§12 step 8", "§9 step 4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Published" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+override_source = "candidate"
+journal_agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+owner = "watchdog"
+path = ["Published", "Promoted", "Committed"]
+
+[[fault]]
+id = "crash-promoted"
+family = "daemon-killed"
+summary = "The daemon stays down after Promoted; the watchdog writes Committed."
+spec = ["§12 crash-recovery table"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Promoted" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+override_source = "candidate"
+journal_agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+owner = "watchdog"
+
+[[fault]]
+id = "crash-reverting"
+family = "daemon-killed"
+summary = "planariad is killed during Reverting of a bad candidate; the watchdog re-runs the idempotent revert steps."
+spec = ["§12 crash-recovery table"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Reverting" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+generation = "base"
+boot_default = "base"
+override_source = "base"
+journal_agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Reverted"
+owner = "watchdog"
+
+[[fault]]
+id = "crash-daemon-restart-reconciles"
+family = "daemon-killed"
+summary = "GA demo tail: after the watchdog has reverted (crash-activating-bad), planariad restarts and writes a reconciliation record whose account of what happened matches the journal."
+spec = ["§12 daemon restart reconciliation", "§4 GA(1)"]
+tags = ["ga-demo"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+after = [
+  { raw = "hold_down", process = "planariad" },
+  { raw = "wait", for = { journal = "Reverted" } },
+  { raw = "release", process = "planariad" },
+]
+window = "20m"
+
+[fault.required_post]
+generation = "base"
+journal_agrees = true
+reconciliation = { found = "Reverted", owner = "watchdog", daemon_action = "none", explains = ["killed-during-Activating", "watchdog-reverted", "probe-failed:gym-web"] }
+
+[[fault]]
+id = "crash-slow-worker-overlap"
+family = "daemon-killed"
+summary = "The daemon is killed and immediately restarted while a deliberately slow activation worker survives. The new owner fences it, so activation and revert never overlap and the old owner can never commit."
+spec = ["§12 ownership and fencing", "I6", "I15", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "slow_backend", call = "activate_live", delay = "120s" },
+  { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" },
+]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+after = [{ raw = "restart_process", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+generation = "base"
+journal_agrees = true
+invariants = ["I6", "I15"]
+no_overlap = ["activate_live(candidate)", "activate_live(revert_to)"]
+stale_owner_commit = false
+
+[[fault]]
+id = "crash-withheld-job-reply"
+family = "daemon-killed"
+summary = "The backend accepts an activation job but its reply is withheld, and the owner is killed before the job id is journaled. Recovery must discover the job by its OpId, or fence it, before making any conflicting mutation."
+spec = ["§12 OpId"]
+tags = []
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "withhold_reply", call = "activate_live" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "OpId" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "10m"
+
+[fault.required_post]
+journal_agrees = true
+invariants = ["I6", "I15"]
+quiescence_includes_tagged_jobs = true
+no_overlap = ["activate_live(candidate)", "activate_live(revert_to)"]
+
+[[fault]]
+id = "crash-job-outlives-drain"
+family = "daemon-killed"
+summary = "An old backend job outlives the 60 s drain. The takeover ends in RecoveryFailed with the interlock set, and no overlapping mutation happens."
+spec = ["§12 confirmed quiescence"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "slow_backend", call = "activate_live", delay = "600s", uncancellable = true },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "10m"
+
+[fault.required_post]
+interlock = "set"
+reports = ["RecoveryFailed", "alert"]
+no_overlap = ["activate_live(candidate)", "activate_live(revert_to)"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "RecoveryFailed"
+
+[[fault]]
+id = "crash-jobs-tagged-unknown"
+family = "daemon-killed"
+summary = "jobs_tagged returns None for an unacknowledged OpId (the backend cannot say). Recovery writes RecoveryFailed instead of proceeding."
+spec = ["§12 OpId"]
+tags = []
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "backend_result", call = "jobs_tagged", result = "None" },
+  { raw = "withhold_reply", call = "activate_live" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "OpId" } }
+window = "5m"
+
+[fault.required_post]
+interlock = "set"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "RecoveryFailed"
+
+[[fault]]
+id = "crash-simultaneous-takeover"
+family = "daemon-killed"
+summary = "The daemon and the watchdog try to take over at the same moment; exactly one wins the flock and the other backs off."
+spec = ["§12 lease transfer"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Checking" } }
+after = [{ raw = "restart_process", process = "planariad", aligned_with = "watchdog-tick" }]
+window = "10m"
+
+[fault.required_post]
+journal_agrees = true
+invariants = ["I15"]
+lease_epochs_strictly_increasing = true
+owners_per_epoch_max = 1
+
+[[fault]]
+id = "crash-runtime-rollback"
+family = "daemon-killed"
+summary = "Killed during a Runtime-tier Rollback; it recovers as a generation operation (serialized, owned, publish_boot, override restored)."
+spec = ["§12 execution table: Rollback", "§12 gym cases"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+  { raw = "wait", for = { journal = "Committed" } },
+  { transition = "Rollback", source = "user", actor = "user:1001" },
+]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+generation = "known_good"
+boot_default = "known_good"
+override_source = "known_good"
+journal_agrees = true
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+decision = "Allow(Runtime)"
+recovery = "RevertGeneration"
+terminal = "Committed"
+owner = "watchdog"
+
+[[fault]]
+id = "crash-stop-and-suppress"
+family = "daemon-killed"
+summary = "Killed during a user's StopAndSuppress. It recovers as a unit operation: the suppression (journaled before the stop) holds, the unit is not restarted, and no generation rollback is attempted."
+spec = ["§12 execution table", "§14 stopping"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "ask", phrase = "stop gym-web until I say", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "10m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Suppressed" }
+suppressions = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+recovery = "ReobserveOnly"
+terminal = "Committed"
+
+[[fault.required_post.txn]]
+transition = "Revert"
+count = 0
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+count = 0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: revert-fails  (RecoveryFailed path)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "revert-fails"
+family = "revert-fails"
+summary = "Bad candidate, while an environmental fault (sshd's port blocked) makes the revert probes fail too. Result: RecoveryFailed, an alert, and the interlock, which blocks autonomous repair of a later unrelated fault until an admin resolves it."
+spec = ["§12 step 7", "§12c interlock"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" },
+  { raw = "wait", for = { journal = "Checking" } },
+  { raw = "block_network", dst = "127.0.0.1", port = 22 },
+]
+inject = { raw = "wait", for = { journal = "RecoveryFailed" } }
+after = [
+  { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGKILL" },
+  { raw = "wait", for = "3m" },
+  { raw = "unblock_network", dst = "127.0.0.1" },
+  { raw = "cli", argv = ["resolve", "<txn>", "--manual-repaired"], actor = "user:1001" },
+]
+window = "15m"
+
+[fault.required_post]
+units = { "service:gym-cache" = "Running" }
+interlock = "clear"
+reports = ["RecoveryFailed", "alert"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "RecoveryFailed"
+
+# No autonomous repair of gym-cache while the interlock held.
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-cache"
+source = "diagnoser"
+while_interlock = "set"
+count = 0
+
+[[fault]]
+id = "revert-fails-interlock-survives-compaction"
+family = "revert-fails"
+summary = "A failed revert, then forced compaction, then both processes restart. Autonomous mutation stays blocked until the resolution is durably recorded."
+spec = ["§12c checkpoint"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "backend_result", call = "activate_live", generation = "revert_to", result = "Failed" },
+  { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" },
+  { raw = "wait", for = { journal = "RecoveryFailed" } },
+]
+inject = { raw = "force_compaction" }
+after = [
+  { raw = "restart_process", process = "planariad" },
+  { raw = "restart_process", process = "planarian-recovery" },
+  { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGKILL" },
+  { raw = "wait", for = "3m" },
+]
+window = "10m"
+
+[fault.required_post]
+interlock = "set"
+units = { "service:gym-cache" = "Failed" }
+no_autonomous_txn = true
+replay_equivalent = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: probe-timeout-service-healthy
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "probe-delayed-healthy"
+family = "probe-timeout-service-healthy"
+summary = "gym-web's /health answers after 15 s, past the 10 s timeout, while the service is fine. The status is Unknown, never Failed. After three Unknowns a diagnostic incident re-observes through the Tcp probe and does not restart."
+spec = ["§10 evidence", "§8 status derivation"]
+tags = []
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "probe timed out; service is healthy" }
+inject = { raw = "set_knob", unit = "service:gym-web", knob = "health_delay", value = "15s" }
+window = "10m"
+
+[fault.required_post]
+no_txn_on = ["service:gym-web"]
+status_never = { "service:gym-web" = ["Failed"] }
+status_seen = { "service:gym-web" = ["Unknown"] }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+kind = "diagnostic"
+first_candidate = "reobserve:gym-web-tcp"
+
+[[fault]]
+id = "probe-diagnostic-stale-healthy"
+family = "probe-timeout-service-healthy"
+summary = "The evidence of the audio tone probe (Diagnostic, OnDemand) expires on a healthy machine. Status stays Running and no incident opens."
+spec = ["§10 evidence", "I4", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "only Diagnostic evidence is stale" }
+setup = [
+  { raw = "greeter_login", uid = 1000 },
+  { raw = "cli", argv = ["diagnose", "service@1000:pipewire", "--probe", "tone-playback"], actor = "user:1000" },
+]
+inject = { raw = "wait", for = "stale_after+1m" }
+window = "5m"
+
+[fault.required_post]
+units = { "service@1000:pipewire" = "Running" }
+no_autonomous_txn = true
+no_incident_on = ["service@1000:pipewire"]
+
+[[fault]]
+id = "probe-failed-beats-stale"
+family = "probe-timeout-service-healthy"
+summary = "gym-web's Http probe is made stale, then the process is killed: status is Failed, not Unknown. gym-app's probe is stale at the same time and its status is Unknown."
+spec = ["§8 status derivation", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "set_knob", unit = "service:gym-web", knob = "health_delay", value = "60s" },
+  { raw = "set_knob", unit = "service:gym-app", knob = "probe_delay", value = "60s" },
+  { raw = "wait", for = "stale_after" },
+]
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+window = "2m"
+
+[fault.required_post]
+status_seen = { "service:gym-web" = ["Failed"], "service:gym-app" = ["Unknown"] }
+status_never = { "service:gym-app" = ["Failed"] }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+kind = "repair"
+
+[[fault]]
+id = "probe-http-503-degraded"
+family = "probe-timeout-service-healthy"
+summary = "gym-web is active, but /health returns 503: the status is Degraded, an incident opens, and a restart clears the runtime fault."
+spec = ["§10 probe contract gym case"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "set_knob", unit = "service:gym-web", knob = "health", value = 503 }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+status_seen = { "service:gym-web" = ["Degraded"] }
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+terminal = "Committed"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: external-config-edit-during-build
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "stale-owner-edit-during-build"
+family = "external-config-edit-during-build"
+summary = "During the build, the owner edits a tracked file without committing it. The transaction is Rejected(Stale), never activated, and its GC root is released."
+spec = ["§9 step 6", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "edit_owner_source", path = "configuration.nix", tracked = true, when = { journal = "Staged" } }
+window = "15m"
+
+[fault.required_post]
+generation = "base"
+override_source = "base"
+gc_root_released = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+change = "font-scale"
+terminal = "Rejected(Stale)"
+never = ["Activating"]
+
+[[fault]]
+id = "stale-untracked-file-ignored"
+family = "external-config-edit-during-build"
+summary = "During the build, the owner adds an untracked file to the flake. Untracked files are not visible to Nix: no Stale, and the file is reported."
+spec = ["§9 step 1"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "edit_owner_source", path = "scratch.nix", tracked = false, when = { journal = "Staged" } }
+window = "15m"
+
+[fault.required_post]
+generation = "candidate"
+reports = ["UntrackedExcluded"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+never = ["Rejected(Stale)"]
+
+[[fault]]
+id = "gc-during-approval"
+family = "external-config-edit-during-build"
+summary = "Garbage collection runs while an AskFirst change waits for approval. The candidate survives (its build root is protected), and after approval verify_candidate passes."
+spec = ["§9 step 5", "I3"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "wait", for = { journal = "Prepared" } },
+]
+inject = { transition = "CollectGarbage", emergency = false, source = "user", actor = "user:1001" }
+after = [{ raw = "approve_pending", actor = "root", via = "tty" }]
+window = "20m"
+
+[fault.required_post]
+generation = "candidate"
+gc_protected = ["candidate", "known_good", "base"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: intentional-service-stop
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "intent-user-stops-service"
+family = "intentional-service-stop"
+summary = "An admin asks to stop gym-web until they say otherwise. It stays stopped. The suppression is journaled before the stop, so there is no window in which a repair can race it."
+spec = ["§14 stopping", "I13", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "the user stopped it on purpose" }
+setup = [{ raw = "ask", phrase = "stop gym-web until I say", actor = "user:1001" }]
+inject = { raw = "wait", for = "10m" }
+window = "10m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Suppressed" }
+suppressions = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
+no_autonomous_txn = true
+journal_order = ["Suppression(service:gym-web)", "stop(service:gym-web)"]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+source = "intent"
+terminal = "Committed"
+
+[[fault]]
+id = "intent-cli-stop-rewritten"
+family = "intentional-service-stop"
+summary = "An admin issues StopUnit through the CLI; it is rewritten to StopAndSuppress { until: NextBoot }, with a notice."
+spec = ["§14 stopping"]
+tags = ["question:cli-stop-verb"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "the user stopped it on purpose" }
+setup = [{ raw = "cli", argv = ["stop", "service:gym-web"], actor = "user:1001" }]
+inject = { raw = "wait", for = "5m" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Suppressed" }
+suppressions = [{ unit = "service:gym-web", until = "NextBoot", by = "user:1001" }]
+no_autonomous_txn = true
+reports = ["StopRewrittenNotice"]
+
+[[fault]]
+id = "intent-start-again-repairs"
+family = "intentional-service-stop"
+summary = "After a user stop, \"start gym-web again\" lifts the suppression, and the unit is desired Running again and repaired."
+spec = ["§14 stopping"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "ask", phrase = "stop gym-web until I say", actor = "user:1001" },
+  { raw = "wait", for = "1m" },
+]
+inject = { raw = "ask", phrase = "start gym-web again", actor = "user:1001" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+suppressions = []
+
+[[fault.required_post.txn]]
+transition = "Unsuppress"
+target = "service:gym-web"
+terminal = "Committed"
+
+[[fault]]
+id = "authz-unprivileged-suppress-security"
+family = "intentional-service-stop"
+summary = "alice (unprivileged) tries to suppress sshd, a system Security unit, and is rejected as Unauthorized."
+spec = ["§11 authorization", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "cli", argv = ["suppress", "service:sshd"], actor = "user:1000" }
+window = "1m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+suppressions = []
+reports = ["Unauthorized"]
+
+[[fault.required_post.txn]]
+transition = "Suppress"
+decision = "Reject(Unauthorized)"
+
+[[fault]]
+id = "authz-forged-actor-overwritten"
+family = "intentional-service-stop"
+summary = "alice submits a Suppress for her own pipewire with by = Daemon. SO_PEERCRED overwrites the actor to user:1000; the suppression is allowed and attributed to her."
+spec = ["§11 caller identity", "I14"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { transition = "Suppress", unit = "service@1000:pipewire", until = "Explicit", reason = "test", by = "daemon", source = "user", actor = "user:1000" }
+window = "1m"
+
+[fault.required_post]
+suppressions = [{ unit = "service@1000:pipewire", until = "Explicit", by = "user:1000" }]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: suspend-resume
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "suspend-resume"
+family = "suspend-resume"
+summary = "S3 suspend for 2 min, then resume. Evidence goes stale while suspended (Unknown, not Failed), nothing is restarted, and everything is Running within settle."
+spec = ["§10 evidence"]
+tags = []
+scoring = "intent"
+harness = ["vm"]
+intent = { kind = "no-intervention", because = "a suspend is not a fault" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { raw = "suspend", duration = "2m" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running", "service@1000:pipewire" = "Running", "service:NetworkManager" = "Running" }
+no_autonomous_txn = true
+others_unchanged = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: network-unavailable-at-gateway  (driver fine)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "net-gateway-down"
+family = "network-unavailable-at-gateway"
+summary = "Traffic to the gateway is dropped while the NIC driver and NetworkManager are fine. The incident targets service:external:gym-upstream; nothing local is restarted or rebound. When the block lifts, the incident closes."
+spec = ["§10 external dependencies"]
+tags = []
+scoring = "repair"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { raw = "block_network", dst = "10.0.2.2" }
+after = [
+  { raw = "wait", for = "5m" },
+  { raw = "unblock_network", dst = "10.0.2.2" },
+]
+window = "15m"
+
+[fault.required_post]
+units = { "service:gym-upstream-client" = "Running" }
+no_txn_on = ["service:gym-upstream-client", "service:NetworkManager", "device:net-gym0"]
+reports = ["ExternalDependencyDown"]
+
+[[fault.required_post.incident]]
+target = "service:external:gym-upstream"
+root_of = ["service:gym-upstream-client"]
+state = "Closed"
+
+[[fault]]
+id = "net-external-dependency-down"
+family = "network-unavailable-at-gateway"
+summary = "The upstream service on the host stops while the gateway is reachable. The incident targets the external unit; there is no local restart."
+spec = ["§10 probe contract gym case"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "stop_host_service", name = "gym-upstream" }
+after = [
+  { raw = "wait", for = "5m" },
+  { raw = "start_host_service", name = "gym-upstream" },
+]
+window = "15m"
+
+[fault.required_post]
+units = { "service:gym-upstream-client" = "Running" }
+no_txn_on = ["service:gym-upstream-client"]
+
+[[fault.required_post.incident]]
+target = "service:external:gym-upstream"
+root_of = ["service:gym-upstream-client"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: flapping-service
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "flap-30s"
+family = "flapping-service"
+summary = "gym-flap fails 30 s after every restart. Three attempts with 10 s / 60 s / 300 s backoff, then a 1 h cooldown. No restart loop."
+spec = ["§13 lifecycle"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "set_persistent_knob", unit = "service:gym-flap", knob = "fail_after", value = "30s" }
+window = "20m"
+
+[fault.required_post]
+reports = ["Flapping"]
+metrics = { restarts_max = { "service:gym-flap" = 3 }, attempt_gaps_min = ["10s", "60s", "300s"] }
+
+[[fault.required_post.incident]]
+target = "service:gym-flap"
+state = "Cooldown"
+
+[[fault]]
+id = "flap-regression-escalates"
+family = "flapping-service"
+summary = "gym-flap fails 6 min after each restart, just past the 5 min stabilization. Each failure closes and then regresses the incident, and at the third regression it escalates with a 1 h hold."
+spec = ["§13 Regressed"]
+tags = []
+scoring = "repair"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { raw = "set_persistent_knob", unit = "service:gym-flap", knob = "fail_after", value = "6m" }
+window = "90m"
+
+[fault.required_post]
+reports = ["Escalated"]
+
+[[fault.required_post.incident]]
+target = "service:gym-flap"
+state = "Escalated"
+regressed_count = 3
+
+[[fault.required_post.txn]]
+target = "service:gym-flap"
+source = "diagnoser"
+while_incident = "Escalated"
+count = 0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: storage-full
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "storage-nix-full-gc"
+family = "storage-full"
+summary = "The Nix store filesystem drops below max(2 GB, 5%) while old generations exist. CollectGarbage runs first, and the protected set is untouched."
+spec = ["§10 storage", "§12b", "I3"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "out_of_band_rebuild", edit = "create 12 throwaway generations", activate = false }]
+inject = { raw = "fill_fs", fs = "device:fs-nix", as_uid = 0, until = "below-threshold", with = "store-garbage" }
+window = "10m"
+
+[fault.required_post]
+units = { "device:fs-nix" = "Running" }
+gc_protected = ["known_good", "base", "previous"]
+
+[[fault.required_post.txn]]
+transition = "CollectGarbage"
+source = "diagnoser"
+decision = "Allow(Runtime)"
+terminal = "Committed"
+
+[[fault]]
+id = "storage-budget-unsatisfiable"
+family = "storage-full"
+summary = "The generation budget is set below the size of the protected set. GC collects everything unprotected, reports BudgetUnsatisfiable with the shortfall, and never touches the protected set."
+spec = ["§12b"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "set_setting", key = "gc.generation_budget_percent", value = 0.1 }]
+inject = { transition = "CollectGarbage", emergency = false, source = "user", actor = "user:1001" }
+window = "5m"
+
+[fault.required_post]
+reports = ["BudgetUnsatisfiable"]
+gc_protected = ["known_good", "base", "previous"]
+
+[[fault]]
+id = "storage-journal-fs-full"
+family = "storage-full"
+summary = "The journal filesystem is filled to the reserved-block boundary as the daemon's uid. Either emergency collection is recorded and executed, or mutation stops with an explicit NoSpace or RecoveryFailed. A journal record is never lost or misread."
+spec = ["§12c", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+layouts = ["ext4", "btrfs", "zfs"]
+intent = { kind = "none" }
+inject = { raw = "fill_fs", fs = "device:fs-journal", as_uid = "planariad", until = "reserved-boundary" }
+after = [{ raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }]
+window = "10m"
+
+[fault.required_post]
+one_of = [
+  { txn = { transition = "CollectGarbage", emergency = true, terminal = "Committed" } },
+  { reports = ["NoSpace"] },
+  { interlock = "set" },
+]
+journal_readable = true
+replay_equivalent = true
+
+[[fault]]
+id = "storage-journal-btrfs-reuse"
+family = "storage-full"
+summary = "storage-journal-fs-full again on btrfs, after a snapshot and after 1000 journal wraparounds (nodatacow reuse)."
+spec = ["§12c gym cases"]
+tags = []
+scoring = "must-pass"
+harness = ["vm"]
+layouts = ["btrfs"]
+intent = { kind = "none" }
+setup = [
+  { raw = "cli", argv = ["internal", "snapshot", "journal-volume"], actor = "root" },
+  { raw = "cli", argv = ["internal", "journal-churn", "--wraps", "1000"], actor = "root" },
+]
+inject = { raw = "fill_fs", fs = "device:fs-journal", as_uid = "planariad", until = "reserved-boundary" }
+window = "10m"
+
+[fault.required_post]
+one_of = [
+  { txn = { transition = "CollectGarbage", emergency = true, terminal = "Committed" } },
+  { reports = ["NoSpace"] },
+  { interlock = "set" },
+]
+journal_readable = true
+
+[[fault]]
+id = "storage-enospc-during-build"
+family = "storage-full"
+summary = "The Nix store fills during build: Rejected(NoSpace), a storage incident opens, and the original change is not retried until that incident closes."
+spec = ["§12c ENOSPC by state"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "fill_fs", fs = "device:fs-nix", as_uid = 0, until = "full", when = { journal = "Staged" } }
+window = "10m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Rejected(NoSpace)"
+
+[[fault.required_post.incident]]
+target = "device:fs-nix"
+
+[[fault]]
+id = "storage-boot-full-publish"
+family = "storage-full"
+summary = "/boot is full when publish_boot runs. This is treated as a Checking failure, so the change reverts, and the candidate is never the only boot entry."
+spec = ["§12c /boot"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "fill_fs", fs = "device:fs-boot", as_uid = 0, until = "full", when = { journal = "Checking" } }
+window = "15m"
+
+[fault.required_post]
+generation = "base"
+boot_default = "base"
+override_source = "base"
+journal_agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Reverted"
+
+[[fault]]
+id = "journal-compaction-preserves-state"
+family = "storage-full"
+summary = "Compaction is forced while an Explicit suppression is live and an incident's budget is exhausted, then both processes crash and restart. Both survive, and replay from checkpoint plus tail equals replay from full history."
+spec = ["§12c checkpoint"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "ask", phrase = "stop gym-web until I say", actor = "user:1001" },
+  { raw = "set_persistent_knob", unit = "service:gym-flap", knob = "fail_after", value = "5s" },
+  { raw = "wait", for = "8m" },
+]
+inject = { raw = "force_compaction" }
+after = [
+  { raw = "kill_process", process = "planariad", signal = "SIGKILL" },
+  { raw = "kill_process", process = "planarian-recovery", signal = "SIGKILL" },
+]
+window = "10m"
+
+[fault.required_post]
+suppressions = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
+replay_equivalent = true
+
+[[fault.required_post.incident]]
+target = "service:gym-flap"
+state = "Cooldown"
+budget_left = 0
+
+[[fault]]
+id = "journal-torn-write"
+family = "storage-full"
+summary = "A record write is interrupted, and separately a checkpoint write. A torn tail is truncated and never interpreted as a transition; a torn checkpoint never replaces the old one."
+spec = ["§12c format"]
+tags = []
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "interrupt_write", target = "record", when = { journal = "Checking" } }
+after = [
+  { raw = "interrupt_write", target = "checkpoint" },
+  { raw = "restart_process", process = "planariad" },
+]
+window = "10m"
+
+[fault.required_post]
+journal_readable = true
+replay_equivalent = true
+journal_agrees = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: manifest-weakens-probe
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "manifest-weaken-via-proposal"
+family = "manifest-weakens-probe"
+summary = "A proposal tries to raise sshd's canonical probe timeout to 600 s and mark it Diagnostic. No catalog entry can express that, so it is rejected and never executed."
+spec = ["I10", "§11 reject", "§4 GA(2)"]
+tags = ["ga-gate"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "manifest-probe-edit", args = { unit = "sshd", probe = "sshd-tcp", timeout = "600s", role = "Diagnostic" }, source = "user", actor = "user:1001" }
+window = "2m"
+
+[fault.required_post]
+generation = "base"
+probe_definitions_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+decision_in = ["Reject(NotInCatalog)", "Reject(ProbeTamper)"]
+never = ["Activating"]
+
+[[fault]]
+id = "manifest-weaken-out-of-band"
+family = "manifest-weakens-probe"
+summary = "The owner weakens sshd's probe in their own config and rebuilds outside Planarian. Canonical probes are still evaluated from the core package, so a later sshd fault is still detected."
+spec = ["I10"]
+tags = []
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "out_of_band_rebuild", edit = "services.planarian.units.sshd.probes.sshd-tcp.timeout = 600s", activate = true }]
+inject = { raw = "block_network", dst = "127.0.0.1", port = 22 }
+window = "3m"
+
+[fault.required_post]
+status_seen = { "service:sshd" = ["Degraded"] }
+canonical_probe_source = "core"
+
+[[fault]]
+id = "core-target-rejected"
+family = "manifest-weakens-probe"
+summary = "A candidate whose evaluated unit file for planariad differs from the running one is rejected as CoreTarget, under any approval."
+spec = ["§12 self-protection", "Principle 1"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "evaluate", result = "planariad-unit-changed" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1001" }
+window = "1m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+decision = "Reject(CoreTarget)"
+never = ["Activating"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: login-screen-idle  (autologin off)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "login-greeter-idle"
+family = "login-screen-idle"
+summary = "Boot to the greeter with autologin off and leave it idle for 10 min. SessionEstablished never holds, so graphical-session gets no incident."
+spec = ["§9 graphical-session", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["vm"]
+intent = { kind = "no-intervention", because = "nobody has logged in" }
+setup = [{ raw = "reboot" }]
+inject = { raw = "wait", for = "10m" }
+window = "10m"
+
+[fault.required_post]
+units = { "service:display-manager" = "Running" }
+no_incident_on = ["service:graphical-session"]
+no_autonomous_txn = true
+
+[[fault]]
+id = "user-unit-after-logout"
+family = "login-screen-idle"
+summary = "alice logs out and her pipewire stops. A user unit is desired only while its session exists, so no incident opens."
+spec = ["§10 user-scoped units"]
+tags = ["extra"]
+scoring = "intent"
+harness = ["vm"]
+intent = { kind = "no-intervention", because = "the session ended" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { raw = "logout", uid = 1000 }
+window = "5m"
+
+[fault.required_post]
+no_incident_on = ["service@1000:pipewire", "service:graphical-session"]
+no_autonomous_txn = true
+
+[[fault]]
+id = "cond-device-unplugged"
+family = "login-screen-idle"
+summary = "gym-usb0 is hot-unplugged, so gym-usb-reader (desired only under DeviceConnected) stops, and no incident opens."
+spec = ["§8 Condition::DeviceConnected"]
+tags = ["extra"]
+scoring = "intent"
+harness = ["vm"]
+intent = { kind = "no-intervention", because = "its condition no longer holds" }
+inject = { raw = "hotunplug", device = "device:gym-usb0" }
+window = "5m"
+
+[fault.required_post]
+no_incident_on = ["service:gym-usb-reader", "device:gym-usb0"]
+no_autonomous_txn = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: boot-to-desktop-failure
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "desktop-auth-ok-compositor-fails"
+family = "boot-to-desktop-failure"
+summary = "alice authenticates at the greeter, but her compositor never reaches graphical-session.target, and an incident opens within 60 s of the session's creation plus one tick."
+spec = ["§9 graphical-session", "§10 SessionEstablished", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "set_persistent_knob", unit = "service@1000:cosmic-comp", knob = "exec_fail", value = true }]
+inject = { raw = "greeter_login", uid = 1000 }
+window = "5m"
+
+[[fault.required_post.incident]]
+target = "service:graphical-session"
+opened_within = "65s"
+session_bound = 1000
+
+[[fault]]
+id = "desktop-second-user-deadline"
+family = "boot-to-desktop-failure"
+summary = "alice's desktop fails; bob logs in 50 s later. alice's 60 s deadline still fires on time, because it is bound to her session id."
+spec = ["§10 conditions"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "set_persistent_knob", unit = "service@1000:cosmic-comp", knob = "exec_fail", value = true }]
+inject = { raw = "greeter_login", uid = 1000 }
+after = [{ raw = "greeter_login", uid = 1002, when = { after = "50s" } }]
+window = "5m"
+
+[[fault.required_post.incident]]
+target = "service:graphical-session"
+opened_within = "65s"
+session_bound = 1000
+
+[[fault]]
+id = "desktop-boot-fails-rollback"
+family = "boot-to-desktop-failure"
+summary = "A committed change that touches only boot (a kernel parameter) becomes live_tested but not known_good. After a reboot the greeter fails; the boot is not confirmed, Rollback goes to known_good, and after a second reboot the desktop works."
+spec = ["§10 boot confirmation", "I1"]
+tags = []
+scoring = "repair"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty" },
+  { raw = "wait", for = { journal = "Committed" } },
+]
+inject = { raw = "reboot" }
+after = [
+  { raw = "wait", for = { journal = "Committed", transition = "Rollback" } },
+  { raw = "reboot" },
+]
+window = "30m"
+
+[fault.required_post]
+units = { "service:display-manager" = "Running" }
+generation = "known_good"
+boot_default = "known_good"
+known_good = "unchanged"
+reports = ["NotBootConfirmed"]
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+source = "diagnoser"
+terminal = "Committed"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Policy acceptance cases (§15 v4-review list; not a §15 family)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "policy-daemon-session-drop-rebind"
+family = "policy"
+summary = "virtio-gpu is unbound during alice's session; the diagnoser proposes BindDriver on gpu0. Its disruption is SessionLoss and the proposer is not the session owner, so it is AskFirst, parked and surfaced, and does not run."
+spec = ["§11 global floors", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { raw = "unbind_driver", device = "device:gpu0" }
+window = "5m"
+
+[fault.required_post]
+reports = ["AwaitingApproval", "DisruptionSessionLoss"]
+
+[[fault.required_post.txn]]
+transition = "BindDriver"
+target = "device:gpu0"
+source = "diagnoser"
+decision = "Allow(AskFirst)"
+never = ["Activating"]
+
+[[fault]]
+id = "policy-daemon-wifi-runtime"
+family = "policy"
+summary = "The selected AP (gym-ap-a) goes away while gym-ap-b is known. The diagnoser's SetRuntimeOption Wi-Fi selection has ConnectivityLoss disruption, so it is AskFirst and does not run."
+spec = ["§11 global floors", "§12a", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "cli", argv = ["internal", "wifi-connect", "gym-ap-a"], actor = "root" }]
+inject = { raw = "stop_host_service", name = "hostapd-gym-ap-a" }
+window = "5m"
+
+[[fault.required_post.txn]]
+transition = "SetRuntimeOption"
+path_option = "wifi.network"
+source = "diagnoser"
+decision = "Allow(AskFirst)"
+never = ["Activating"]
+
+[[fault]]
+id = "policy-stale-digest"
+family = "policy"
+summary = "A proposal carries an observed digest from before a state change. It is rejected as Stale, and the current digest is returned."
+spec = ["§12 step 1"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "RestartUnit", unit = "service:gym-web", observed = "previous-digest", source = "user", actor = "user:1001" }
+window = "1m"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+decision = "Reject(Stale)"
+returns_current_digest = true
+
+[[fault]]
+id = "policy-refinement-violation"
+family = "policy"
+summary = "A proposal's expectation broadens may_change beyond what spec.predict() allows, and the refinement check rejects it."
+spec = ["§12 step 3"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "RestartUnit", unit = "service:gym-web", expected = { may_change = ["service:gym-web", "service:sshd"] }, source = "user", actor = "user:1001" }
+window = "1m"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+decision = "Reject(Other)"
+reject_detail = "refinement"
+never = ["Prepared"]
+
+[[fault]]
+id = "approval-token-invalidated"
+family = "policy"
+summary = "A token is issued for a parked AskFirst change, then the policy version changes. Re-validation invalidates the token and re-requests approval, and replaying the old token is refused."
+spec = ["§12 step 4", "I8"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty", hold_token = true },
+  { raw = "backend_result", call = "policy_version", result = "bumped" },
+]
+inject = { raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }
+after = [{ raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }]
+window = "5m"
+
+[fault.required_post]
+reports = ["ApprovalInvalidated", "TokenReplayRefused"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+
+[[fault]]
+id = "approval-token-expired"
+family = "policy"
+summary = "A parked AskFirst change gets no approval for 24 h. It ends Rejected, its GC root is released, and any waiting incident reopens."
+spec = ["§12 steps 4–5"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" }]
+inject = { raw = "advance_clock", by = "24h1m" }
+window = "1m"
+
+[fault.required_post]
+gc_root_released = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal_prefix = "Rejected"
