@@ -512,7 +512,10 @@ impl GenerationBackend for Nixos {
         if !o.ok() {
             return Err(err(&o));
         }
-        let path = o.stdout.lines().last().unwrap_or_default().trim().to_string();
+        let printed = o.stdout.lines().last().unwrap_or_default().trim().to_string();
+        // Resolve symlinks, so a generation has one name whichever way it was
+        // reached (`/run/current-system` is resolved the same way).
+        let path = std::fs::canonicalize(&printed).map(|p| p.to_string_lossy().into_owned()).unwrap_or(printed);
         let generation = self.with_registry(|r| r.id_for(&path))?;
         let dry = run(&[&format!("{path}/bin/switch-to-configuration"), "dry-activate"], Duration::from_secs(120));
         let mut activation = parse_dry_activate(&format!("{}\n{}", dry.stdout, dry.stderr));

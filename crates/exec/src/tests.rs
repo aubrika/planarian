@@ -41,17 +41,21 @@ fn tables() -> Tables {
     }
 }
 
+fn config() -> Config {
+    Config {
+        settings: Settings::default(),
+        tables: tables(),
+        catalog: catalog(),
+        owner: PinnedSource { root: "/etc/nixos".into(), kind: SourceKind::Git },
+        canonical: fixtures::canonical(),
+    }
+}
+
 impl Rig {
     fn new() -> Rig {
         let store = MemStore::new(4 << 20);
         let fake = gym_world(store.clone());
-        let cfg = Config {
-            settings: Settings::default(),
-            tables: tables(),
-            catalog: catalog(),
-            owner: PinnedSource { root: "/etc/nixos".into(), kind: SourceKind::Git },
-            canonical: fixtures::canonical(),
-        };
+        let cfg = config();
         let journal = Journal::open(store).unwrap();
         let ex = Executor::new(journal, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, cfg);
         ex.adopt_current();
@@ -320,4 +324,165 @@ fn runtime_option_then_writeback() {
     wb.observed = s.digest();
     assert_eq!(finished(&r.ex.submit(wb, alice(), &s, &defs)), TxnState::Committed);
     assert_eq!(r.fake.w().overrides.assignments["planarian.reference.fontScale"], Value::Str("1.25".into()));
+}
+
+/// Property tests (§17a: proptest for `exec` in Phase A). Random histories of
+/// proposals, faults and crashes at every kernel crash point, each crash
+/// followed by watchdog and/or daemon-restart recovery; after every step the
+/// journal-level invariants must hold.
+mod props {
+    use super::*;
+    use planarian_txn::kernel::Kernel;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as PConfig, FailurePersistence};
+
+    const POINTS: [CrashPoint; 15] = [
+        CrashPoint::State("Staged"),
+        CrashPoint::State("Built"),
+        CrashPoint::State("Activating"),
+        CrashPoint::State("Checking"),
+        CrashPoint::State("Published"),
+        CrashPoint::State("Promoted"),
+        CrashPoint::State("Reverting"),
+        CrashPoint::OpBegun("activate_live"),
+        CrashPoint::OpCalled("activate_live"),
+        CrashPoint::OpBegun("publish_boot"),
+        CrashPoint::OpCalled("publish_boot"),
+        CrashPoint::OpBegun("swap_override"),
+        CrashPoint::OpCalled("swap_override"),
+        CrashPoint::OpBegun("runtime"),
+        CrashPoint::OpCalled("runtime"),
+    ];
+
+    #[derive(Clone, Debug)]
+    enum Step {
+        Submit(u8),
+        /// Submit, crash at a point, recover (by the watchdog first, or not).
+        Crash(u8, u8, bool),
+        KillWeb,
+        Wait(u8),
+    }
+
+    fn proposal(k: u8) -> (Transition, Authorization) {
+        let web = UnitId::service("gym-web");
+        let addr = |a: &str| {
+            change("listen-address", &[("service", Value::Str("gym-web".into())), ("addr", Value::Str(a.into()))])
+        };
+        match k % 10 {
+            0 => (Transition::RestartUnit(web), admin()),
+            1 => (change("font-scale", &[("scale", Value::Str("1.25".into()))]), alice()),
+            2 => (change("font-scale", &[("scale", Value::Str("1.5".into()))]), alice()),
+            3 => (addr("192.0.2.10"), admin()),
+            4 => (addr("127.0.0.1"), admin()),
+            5 => (Transition::Rollback, admin()),
+            6 => (Transition::StopAndSuppress { unit: web, until: Until::Explicit, reason: "test".into() }, admin()),
+            7 => (Transition::Unsuppress(web), admin()),
+            8 => (Transition::CollectGarbage { emergency: false }, admin()),
+            _ => (Transition::SwitchGeneration(GenerationId(1)), admin()),
+        }
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+        prop_oneof![
+            4 => any::<u8>().prop_map(Step::Submit),
+            3 => (any::<u8>(), 0..POINTS.len() as u8, any::<bool>()).prop_map(|(k, p, w)| Step::Crash(k, p, w)),
+            1 => Just(Step::KillWeb),
+            1 => (1..30u8).prop_map(Step::Wait),
+        ]
+    }
+
+    impl Rig {
+        /// The daemon dies mid-transaction; the watchdog may take over what is
+        /// in its window; a new daemon starts and reconciles the rest.
+        fn crash_and_recover(&mut self, watchdog_first: bool, next_pid: &mut u32) {
+            let dead = match &self.ex.kernel.me {
+                OwnerId::Daemon { pid, .. } => *pid,
+                OwnerId::Watchdog { pid, .. } => *pid,
+            };
+            self.fake.w().alive.remove(&dead);
+            if watchdog_first {
+                let journal = Journal::open(self.fake.store.clone()).unwrap();
+                let host = ExecHost::new(self.fake.clone(), fixtures::canonical());
+                let mut wd = Kernel::new(journal, host, OwnerId::Watchdog { pid: 200, boot_id: Hash::ZERO });
+                let live: Vec<_> = wd.journal.ledger().live.values().map(|l| l.txn.clone()).collect();
+                for t in live {
+                    if wd.watchdog_should_take_over(&t) {
+                        wd.recover(t.id, t.lease.epoch).expect("watchdog recovery");
+                    }
+                }
+            }
+            *next_pid += 1;
+            let me = OwnerId::Daemon { pid: *next_pid, boot_id: Hash::ZERO };
+            self.fake.w().alive.insert(*next_pid);
+            let journal = Journal::open(self.fake.store.clone()).unwrap();
+            self.ex = Executor::new(journal, self.fake.clone(), me, config());
+            self.ex.kernel.reconcile().expect("daemon reconciliation");
+            self.ex.adopt_current();
+        }
+    }
+
+    fn check(r: &mut Rig) -> Result<(), TestCaseError> {
+        let l = r.ex.kernel.journal.sync_ledger().unwrap().clone();
+        // The proved ledger invariant, on the ledger the run produced.
+        prop_assert!(l.well_formed());
+        // Replaying the journal from scratch gives the same ledger.
+        let replay = Journal::open(r.fake.store.clone()).unwrap().ledger().clone();
+        prop_assert_eq!(&replay, &l);
+        // I12: nothing is left part-way through a mutation.
+        for t in l.live.values() {
+            prop_assert!(t.txn.state.is_pre_mutation(), "{:?} left in {:?}", t.txn.id, t.txn.state);
+        }
+        // A committed generation change was published and promoted first.
+        for t in l.terminal.values() {
+            if t.state == TxnState::Committed && t.transition.changes_generation() {
+                prop_assert!(t.path.iter().any(|p| p == "Published"), "{:?}", t.path);
+                prop_assert!(t.path.iter().any(|p| p == "Promoted"), "{:?}", t.path);
+            }
+        }
+        // The running generation is the one that boots, and no protected
+        // generation was collected.
+        let w = r.fake.w();
+        prop_assert_eq!(w.boot_default, w.current);
+        prop_assert!(!w.collected.contains(&w.current));
+        prop_assert!(!w.collected.contains(&GenerationId(1)), "known-good collected");
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(PConfig {
+            cases: 96,
+            failure_persistence: None::<Box<dyn FailurePersistence>>,
+            ..PConfig::default()
+        })]
+
+        #[test]
+        fn histories_keep_the_invariants(steps in proptest::collection::vec(step(), 1..10)) {
+            let mut r = Rig::new();
+            let mut next_pid = 100;
+            for s in steps {
+                match s {
+                    Step::Submit(k) => {
+                        let (t, a) = proposal(k);
+                        let _ = r.propose(t, a);
+                    }
+                    Step::Crash(k, p, watchdog_first) => {
+                        let (t, a) = proposal(k);
+                        r.ex.kernel.crash_at = Some(POINTS[p as usize].clone());
+                        let res = r.propose(t, a);
+                        r.ex.kernel.crash_at = None;
+                        if matches!(res, Submitted::Error(_)) {
+                            r.crash_and_recover(watchdog_first, &mut next_pid);
+                        }
+                    }
+                    Step::KillWeb => r.fake.w().kill(&UnitId::service("gym-web")),
+                    Step::Wait(n) => {
+                        for _ in 0..n {
+                            r.fake.advance(planarian_state::TICK);
+                        }
+                    }
+                }
+                check(&mut r)?;
+            }
+        }
+    }
 }

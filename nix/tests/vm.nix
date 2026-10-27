@@ -1,7 +1,6 @@
 # A NixOS VM test of the runtime path on real systemd: detection, repair,
 # respecting a user's stop, authorization, and the watchdog's presence.
-# (Generation changes need an owner flake that can build inside the VM; that
-# belongs to the gym's VM harness.)
+# Generation changes are in vm-generations.nix.
 { pkgs, self }:
 
 pkgs.testers.runNixOSTest {

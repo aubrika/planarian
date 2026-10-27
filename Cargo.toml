@@ -47,6 +47,7 @@ rustix = { version = "1", features = ["fs"] }
 tempfile = "3"
 # Verus's standard library, at the version of the pinned Verus commit (docs/pins.md).
 vstd = "=0.0.0-2026-10-25-0158"
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
