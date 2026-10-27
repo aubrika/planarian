@@ -333,10 +333,10 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
             }
             "reconciliation" => {
                 let text = ledger.last_reconciliation.as_ref().map(|r| r.actions.join("\n")).unwrap_or_default();
-                if let Some(found) = val.get("found").and_then(T::as_str) {
-                    if !text.contains(&format!("finished it: {found}")) {
-                        fail(&mut v, format!("record does not say the watchdog finished it as {found}: {text:?}"));
-                    }
+                if let Some(found) = val.get("found").and_then(T::as_str)
+                    && !text.contains(&format!("finished it: {found}"))
+                {
+                    fail(&mut v, format!("record does not say the watchdog finished it as {found}: {text:?}"));
                 }
                 for token in val.get("explains").and_then(T::as_array).into_iter().flatten().filter_map(T::as_str) {
                     let ok = if let Some(state) = token.strip_prefix("killed-during-") {
@@ -438,10 +438,10 @@ fn check_txn(sim: &Sim, all: &[TxnView], spec: &T, v: &mut Verdict) {
             v.failures.push(format!("{label}: ended {got}"));
         }
     }
-    if let Some(want) = s("terminal_prefix") {
-        if !state_name(&t.state).starts_with(want) {
-            v.failures.push(format!("{label}: ended {}", state_name(&t.state)));
-        }
+    if let Some(want) = s("terminal_prefix")
+        && !state_name(&t.state).starts_with(want)
+    {
+        v.failures.push(format!("{label}: ended {}", state_name(&t.state)));
     }
     if let Some(path) = spec.get("path").and_then(T::as_array) {
         let want: Vec<String> = path.iter().filter_map(T::as_str).map(String::from).collect();
@@ -456,10 +456,10 @@ fn check_txn(sim: &Sim, all: &[TxnView], spec: &T, v: &mut Verdict) {
             }
         }
     }
-    if let Some(min) = spec.get("lease_epoch_min").and_then(T::as_integer) {
-        if (t.epoch as i64) < min {
-            v.failures.push(format!("{label}: epoch {} < {min}", t.epoch));
-        }
+    if let Some(min) = spec.get("lease_epoch_min").and_then(T::as_integer)
+        && (t.epoch as i64) < min
+    {
+        v.failures.push(format!("{label}: epoch {} < {min}", t.epoch));
     }
     if let Some(src) = s("source") {
         let target = target_of(&t.transition);
@@ -480,10 +480,10 @@ fn check_txn(sim: &Sim, all: &[TxnView], spec: &T, v: &mut Verdict) {
     if s("owner") == Some("watchdog") && !t.watchdog {
         v.failures.push(format!("{label}: not finished by the watchdog"));
     }
-    if let Some(r) = s("recovery") {
-        if format!("{:?}", t.transition.recovery()) != r {
-            v.failures.push(format!("{label}: recovery {:?}", t.transition.recovery()));
-        }
+    if let Some(r) = s("recovery")
+        && format!("{:?}", t.transition.recovery()) != r
+    {
+        v.failures.push(format!("{label}: recovery {:?}", t.transition.recovery()));
     }
     match s("decision") {
         Some("Allow(AskFirst)") => {
@@ -543,15 +543,15 @@ fn check_incident(sim: &Sim, spec: &T, v: &mut Verdict) {
             v.failures.push(format!("{label}: is {got}, want {state}"));
         }
     }
-    if let Some(n) = spec.get("regressed_count").and_then(T::as_integer) {
-        if found.iter().map(|i| i.regressions as i64).max().unwrap_or(0) < n {
-            v.failures.push(format!("{label}: regressions below {n}"));
-        }
+    if let Some(n) = spec.get("regressed_count").and_then(T::as_integer)
+        && found.iter().map(|i| i.regressions as i64).max().unwrap_or(0) < n
+    {
+        v.failures.push(format!("{label}: regressions below {n}"));
     }
-    if let Some(n) = spec.get("budget_left").and_then(T::as_integer) {
-        if last.budget_left as i64 != n {
-            v.failures.push(format!("{label}: budget {}", last.budget_left));
-        }
+    if let Some(n) = spec.get("budget_left").and_then(T::as_integer)
+        && last.budget_left as i64 != n
+    {
+        v.failures.push(format!("{label}: budget {}", last.budget_left));
     }
     if let Some(k) = spec.get("kind").and_then(T::as_str) {
         let want = if k == "diagnostic" { IncidentKind::Diagnostic } else { IncidentKind::Repair };

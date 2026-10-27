@@ -174,7 +174,7 @@ impl Sim {
         let now = self.now();
         if let Some(c) = self.core.as_mut() {
             self.notices.extend(c.notices.drain(..));
-            self.log.extend(c.log.drain(..));
+            self.log.append(&mut c.log);
             for i in c.incidents.incidents.values() {
                 self.first_incident_at.entry(i.target.clone()).or_insert(now);
                 self.seen_incidents.insert(i.id, i.clone());
@@ -253,7 +253,7 @@ impl Sim {
             c.tick();
         }
         self.record_status();
-        if (self.now().0 - self.start.0) / TICK.0 % 2 == 0 {
+        if ((self.now().0 - self.start.0) / TICK.0).is_multiple_of(2) {
             self.watchdog();
         }
         self.harvest();
@@ -297,8 +297,12 @@ impl Sim {
 
     fn track_candidate(&mut self) {
         let l = self.ledger();
-        if let Some(c) =
-            l.live.values().chain(std::iter::empty()).filter_map(|t| t.txn.candidate.as_ref().map(|(g, _)| *g)).last()
+        if let Some(c) = l
+            .live
+            .values()
+            .chain(std::iter::empty())
+            .filter_map(|t| t.txn.candidate.as_ref().map(|(g, _)| *g))
+            .next_back()
         {
             self.candidate = Some(c);
         }

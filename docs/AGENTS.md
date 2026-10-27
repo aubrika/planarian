@@ -17,12 +17,16 @@ Instructions to coding agents working on Planarian. Source of truth: SPEC §18 (
 
 ## Status
 
-- [x] 0. Phase A fault catalog: `crates/gym/catalog/phase-a.toml`; review notes in `docs/catalog-review.md`. Owner accepted the defaults 2026-10-26.
-- [x] 1. GA demonstration script `crates/gym/demo.sh` (written; passes once `gym` exists).
-- Build order (item 3):
-  - [x] `schema`
-  - [x] `txn`: journal, ledger, kernel, crash-recovery table, in-memory fake backend. The fake-harness catalog cases for the kernel are in `crates/txn/tests/`.
-  - [ ] `policy`, with Verus proofs (item 9). Verus is not preinstalled in the dev container; building it from source (git clone works; z3 from PyPI) is the first step.
-  - [ ] everything after `policy`
+- [x] 0. Phase A fault catalog: `crates/gym/catalog/phase-a.toml`. Owner accepted the defaults 2026-10-26.
+- [x] 1. GA demonstration: `crates/gym/demo.sh --harness fake` passes all four steps.
+- Build order (item 3), all implemented: `schema`, `txn`, `policy`, `state`, the real backends (`crates/backends/linux`), `exec`, `watchdog`, `changes`, `incident`, `diagnose`, `gym`, `intent`, `cli`, `daemon`. The console is not built (see `docs/deviations.md`).
+- Packaging: `flake.nix` (package, `nixosModules.default`/`reference`, template, checks), `nix/module.nix`, `nix/reference.nix`.
 
-Verus status: `schema`, `policy` and `txn` are written to the subset's discipline (no `dyn`, no `unsafe`, no floats, integer time), but nothing has been run through Verus yet. The intended proof targets in `txn` are `machine::step_allowed` and `Ledger::validate`/`apply`. Until then, their properties are covered by tests (`machine.rs` unit tests; `tests/kernel.rs`).
+Checks and where they run:
+- `cargo test`: unit and fake-harness tests for every crate.
+- `cargo run -p planarian-gym -- run`: the catalog on the fake harness. Reports PASS, PARTIAL (some keys not checkable on the fake), FAIL, UNSUPPORTED, or VM-only.
+- `nix build .#checks.x86_64-linux.package`: the package and its tests, in the Nix sandbox.
+- `nix build .#checks.x86_64-linux.module-eval`: evaluates a full NixOS system with the module and asserts on the exported manifest.
+- `nix build .#checks.x86_64-linux.vm-runtime`: a NixOS VM on real systemd. Needs KVM to be fast; without KVM it runs under emulation in about 20–30 minutes.
+
+**Not yet done:** Verus proofs (item 9); the console; §12b space budgets; the VM harness for generation changes (needs an owner flake that can build inside the VM).
