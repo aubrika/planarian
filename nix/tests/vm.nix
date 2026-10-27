@@ -20,6 +20,27 @@ pkgs.testers.runNixOSTest {
       wantedBy = [ "multi-user.target" ];
       serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 -m http.server 8080 --bind 127.0.0.1 --directory /etc";
     };
+    # Catalog svc-killed-defer-to-systemd: systemd restarts it itself.
+    systemd.services.gym-restartful = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = { ExecStart = "${pkgs.coreutils}/bin/sleep infinity"; Restart = "always"; RestartSec = "2s"; };
+    };
+    services.planarian.units.gym-restartful = { };
+
+    # Catalog svc-misconfig-state-file: a corrupt state file makes every start fail.
+    systemd.services.gym-state = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig.StateDirectory = "gym-state";
+      script = ''
+        if grep -q corrupt /var/lib/gym-state/state.json 2>/dev/null; then
+          echo "state file is corrupt" >&2
+          exit 1
+        fi
+        exec ${pkgs.coreutils}/bin/sleep infinity
+      '';
+    };
+    services.planarian.units.gym-state = { };
+
     services.planarian.units.gym-web = {
       synonyms = [ "web server" ];
       probes = [
@@ -53,6 +74,23 @@ pkgs.testers.runNixOSTest {
     with subtest("an unprivileged user cannot suppress sshd"):
         out = machine.fail("su alice -c 'planarian suppress sshd' 2>&1")
         assert "Unauthorized" in out, out
+
+    with subtest("a service systemd restarts itself is left to systemd"):
+        machine.wait_for_unit("gym-restartful.service")
+        machine.succeed("systemctl kill --signal=SIGKILL gym-restartful.service")
+        machine.sleep(90)
+        machine.succeed("systemctl is-active gym-restartful.service")
+        machine.fail("planarian log -n 2000 | grep -q 'restart service:gym-restartful'")
+
+    with subtest("a fault restarting cannot fix is tried within budget, then handed to a person"):
+        machine.wait_for_unit("gym-state.service")
+        machine.succeed("echo corrupt > /var/lib/gym-state/state.json")
+        machine.succeed("systemctl kill --signal=SIGTERM gym-state.service")
+        # Backoff 10 s, 60 s, 300 s: three attempts, then a cooldown that says so.
+        machine.wait_until_succeeds("planarian status | grep -q 'needs a person'", timeout=1200)
+        attempts = int(machine.succeed("planarian log -n 2000 | grep -c 'restart service:gym-state' || true").strip() or 0)
+        assert 1 <= attempts <= 3, f"{attempts} restart attempts"
+        machine.fail("planarian log -n 2000 | grep -q 'roll back'")
 
     with subtest("the executor log and journal exist"):
         machine.succeed("test -s /var/lib/planarian/log/executor.jsonl")
