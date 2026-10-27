@@ -698,6 +698,7 @@ impl Sim {
                 };
                 let policy = core.ex.policy_version();
                 let r = core.ex.submit(p.clone(), authz, &st, &defs);
+                let (facts, decision) = core.ex.last.clone().unzip();
                 let now = self.fake.w().now;
                 self.log.push(planarian_daemon::LogRecord {
                     at: now,
@@ -706,6 +707,11 @@ impl Sim {
                     pre_digest: st.digest(),
                     policy,
                     result: r,
+                    facts,
+                    decision,
+                    post_digest: None,
+                    path: vec![],
+                    why: String::new(),
                 });
                 return Ok(());
             }
@@ -750,6 +756,7 @@ impl Sim {
         };
         let policy = core.ex.policy_version();
         let r = core.ex.submit(p.clone(), authz, &st, &defs);
+        let (facts, decision) = core.ex.last.clone().unzip();
         if let Some(c) = self.core.as_mut() {
             c.ex.kernel.crash_at = None;
         }
@@ -762,6 +769,11 @@ impl Sim {
             pre_digest: st.digest(),
             policy,
             result: r,
+            facts,
+            decision,
+            post_digest: None,
+            path: vec![],
+            why: String::new(),
         });
         if crashed {
             self.kill_daemon();

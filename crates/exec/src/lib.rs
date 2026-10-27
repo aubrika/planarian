@@ -98,6 +98,9 @@ pub struct Executor<B: Backends + Clone, S: Store> {
     pub cfg: Config,
     pub session: Session,
     pub parked: BTreeMap<TxnId, Parked>,
+    /// The derived facts and decision of the last submission that got that
+    /// far, for the executor log (I7).
+    pub last: Option<(DerivedFacts, Decision)>,
 }
 
 fn reject(reason: RejectReason, detail: impl Into<String>) -> Submitted {
@@ -120,6 +123,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             cfg,
             session: Session::default(),
             parked: BTreeMap::new(),
+            last: None,
         }
     }
 
@@ -414,10 +418,12 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 digest: Some(digest),
             };
         }
+        self.last = None;
         let plan = match self.plan(&p, &authz, state, defs) {
             Ok(plan) => plan,
             Err(s) => return s,
         };
+        self.last = Some((plan.facts.clone(), plan.decision.clone()));
         if let Decision::Reject(r) = &plan.decision {
             self.release(&plan);
             return reject(r.clone(), "refused by policy");

@@ -298,6 +298,10 @@ fn generations_over_the_bound_are_collected_by_maintenance() {
     let collected = r.fake.w().collected.clone();
     assert_eq!(collected, vec![GenerationId(2), GenerationId(3), GenerationId(4), GenerationId(5)]);
     assert!(!collected.contains(&GenerationId(1)), "known-good is protected");
+    // The log record is completed with the post-state at the next observation.
+    r.ticks(1);
+    let record = r.core.log.iter().find(|l| l.proposal.source == Source::Maintenance).expect("logged");
+    assert!(record.post_digest.is_some() && record.facts.is_some() && record.decision.is_some(), "I7: {record:?}");
     assert!(r.core.log.iter().any(|l| l.proposal.source == Source::Maintenance
         && matches!(l.result, Submitted::Finished { state: TxnState::Committed, .. })));
     let report = r.fake.w().space_report.clone().expect("a report");

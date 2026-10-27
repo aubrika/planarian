@@ -60,6 +60,19 @@ pub struct LogRecord {
     pub pre_digest: Hash,
     pub policy: PolicyVersion,
     pub result: Submitted,
+    /// What the executor derived and decided, when it got that far.
+    #[serde(default)]
+    pub facts: Option<DerivedFacts>,
+    #[serde(default)]
+    pub decision: Option<Decision>,
+    /// The state after, and the transaction's journal path and last reason
+    /// (which carries the probe verdict).
+    #[serde(default)]
+    pub post_digest: Option<Hash>,
+    #[serde(default)]
+    pub path: Vec<String>,
+    #[serde(default)]
+    pub why: String,
 }
 
 pub struct Core<B: Backends + Clone, S: Store> {
@@ -81,6 +94,8 @@ pub struct Core<B: Backends + Clone, S: Store> {
     next_gc_check: Timestamp,
     /// The space report last noticed.
     space_noted: Timestamp,
+    /// Executor log records waiting for their post-state (I7).
+    awaiting_post: Vec<LogRecord>,
 }
 
 /// How often the daemon checks the §12b collection bounds.
@@ -150,6 +165,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             interlock_noted: false,
             next_gc_check: Timestamp(0),
             space_noted: Timestamp(0),
+            awaiting_post: Vec::new(),
         };
         if core.cfg.fresh_boot {
             for s in ledger.suppressions.iter().filter(|s| s.until == Until::NextBoot) {
@@ -238,6 +254,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let s = self.asm.observe(&self.b, &ctx);
         let defs = self.asm.defs();
         self.last = Some((s.clone(), defs.clone()));
+        if !self.awaiting_post.is_empty() {
+            let digest = s.digest();
+            for mut r in self.awaiting_post.drain(..) {
+                r.post_digest = Some(digest);
+                self.log.push(r);
+            }
+        }
         (s, defs)
     }
 
@@ -251,7 +274,43 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let policy = self.ex.policy_version();
         let caller = authz.caller.clone();
         let mut result = self.ex.submit(p.clone(), authz.clone(), s, defs);
-        self.log.push(LogRecord { at: now, proposal: p, caller, pre_digest: pre, policy, result: result.clone() });
+        let (facts, decision) = self.ex.last.clone().unzip();
+        let txn = match &result {
+            Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } => Some(*txn),
+            _ => None,
+        };
+        let l = self.ledger();
+        let (path, why) = match txn {
+            Some(t) => (
+                l.path(t).map(<[String]>::to_vec).unwrap_or_default(),
+                l.live
+                    .get(&t)
+                    .map(|x| x.why.clone())
+                    .or_else(|| l.terminal.get(&t).map(|x| x.why.clone()))
+                    .unwrap_or_default(),
+            ),
+            None => (vec![], String::new()),
+        };
+        let record = LogRecord {
+            at: now,
+            proposal: p,
+            caller,
+            pre_digest: pre,
+            policy,
+            result: result.clone(),
+            facts,
+            decision,
+            post_digest: None,
+            path,
+            why,
+        };
+        // A finished transaction's record waits for the next observation for
+        // its post-state (observing here would run the probes again).
+        if matches!(result, Submitted::Finished { .. }) {
+            self.awaiting_post.push(record);
+        } else {
+            self.log.push(record);
+        }
         // §12a: the runtime change is in effect; persist it in the background.
         if let Submitted::Finished { followup: Some(wb), .. } = &mut result {
             let mut wb = wb.clone();

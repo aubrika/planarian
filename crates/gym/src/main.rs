@@ -9,6 +9,7 @@
 //! the flake's NixOS tests (`nix flake check`, `checks.vm-runtime`).
 
 mod check;
+mod metrics;
 mod serve;
 mod sim;
 
@@ -169,9 +170,11 @@ fn main() {
         "run" => {
             let mut worst = Result_::Pass;
             let mut tally = std::collections::BTreeMap::new();
+            let mut metrics = metrics::Metrics::default();
             for e in selected {
                 let id = e.get("id").and_then(T::as_str).unwrap_or("?");
                 let r = run_entry(e);
+                metrics.add(e, r.result == Result_::Pass, r.result == Result_::Partial, r.sim.as_ref());
                 *tally.entry(format!("{:?}", r.result)).or_insert(0) += 1;
                 if r.result != Result_::NotFake {
                     worst = worst.max(r.result);
@@ -184,6 +187,7 @@ fn main() {
                 }
             }
             println!("\n{tally:?}");
+            println!("\n{metrics}");
             std::process::exit(match worst {
                 Result_::Pass | Result_::Partial | Result_::NotFake => 0,
                 _ => 1,
