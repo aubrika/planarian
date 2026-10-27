@@ -399,3 +399,14 @@ mod tests {
         assert_eq!(parse(&render(&OverrideSet::default())), Some(OverrideSet::default()));
     }
 }
+
+#[cfg(test)]
+mod golden {
+    /// The flake template ships an empty override file; the parser only accepts
+    /// the exact rendered form, so the two must stay identical.
+    #[test]
+    fn template_override_file_is_the_rendered_empty_set() {
+        let shipped = include_str!("../../../nix/template/planarian/overrides.nix");
+        assert_eq!(shipped, super::render(&planarian_schema::OverrideSet::default()));
+    }
+}

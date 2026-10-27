@@ -294,10 +294,10 @@ impl World {
     pub fn stop_out_of_band(&mut self, unit: &UnitId) {
         let mut todo = vec![unit.clone()];
         while let Some(u) = todo.pop() {
-            if let Some(sim) = self.units.get_mut(&u) {
-                if sim.observed == Observed::Active {
-                    sim.observed = Observed::Bound;
-                }
+            if let Some(sim) = self.units.get_mut(&u)
+                && sim.observed == Observed::Active
+            {
+                sim.observed = Observed::Bound;
             }
             for (id, d) in &self.base_units {
                 if d.edges.iter().any(|e| e.to == u && e.kind == EdgeKind::Requires) {

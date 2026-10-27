@@ -1,0 +1,226 @@
+{
+ "coreUnits": {
+  "planariad.service": "1f8ca7b64f3595d994ddeee975f3061687e56a2abbe5e28aceedf7c9daab86ba",
+  "planarian-recovery.service": "70fb8dcc620f780351da982ebd722fb370041c1fc8350f568fb36e0034b24afd"
+ },
+ "devices": {},
+ "units": [
+  {
+   "desired": {
+    "status": "Running",
+    "when": "Always"
+   },
+   "edges": [],
+   "id": "service:NetworkManager",
+   "probes": [],
+   "restart_disruption": "ConnectivityLoss",
+   "sensitivity": [
+    "External"
+   ],
+   "synonyms": [
+    "wifi",
+    "wi-fi",
+    "network",
+    "internet"
+   ],
+   "systemd_restart": null
+  },
+  {
+   "desired": {
+    "status": "Running",
+    "when": "Always"
+   },
+   "edges": [],
+   "id": "device:fs-boot",
+   "probes": [],
+   "restart_disruption": "None",
+   "sensitivity": [
+    "Routine"
+   ],
+   "synonyms": [],
+   "systemd_restart": null
+  },
+  {
+   "desired": {
+    "status": "Running",
+    "when": "Always"
+   },
+   "edges": [],
+   "id": "device:fs-journal",
+   "probes": [],
+   "restart_disruption": "None",
+   "sensitivity": [
+    "Routine"
+   ],
+   "synonyms": [],
+   "systemd_restart": null
+  },
+  {
+   "desired": {
+    "status": "Running",
+    "when": "Always"
+   },
+   "edges": [],
+   "id": "device:fs-root",
+   "probes": [],
+   "restart_disruption": "None",
+   "sensitivity": [
+    "Routine"
+   ],
+   "synonyms": [],
+   "systemd_restart": null
+  },
+  {
+   "desired": {
+    "status": "Running",
+    "when": {
+     "SessionEstablished": {
+      "uid": null
+     }
+    }
+   },
+   "edges": [],
+   "id": "target:graphical-session",
+   "probes": [],
+   "restart_disruption": "SessionLoss",
+   "sensitivity": [
+    "Routine"
+   ],
+   "synonyms": [
+    "desktop"
+   ],
+   "systemd_restart": null
+  },
+  {
+   "desired": {
+    "status": "Running",
+    "when": "Always"
+   },
+   "edges": [],
+   "id": "service:greetd",
+   "probes": [],
+   "restart_disruption": "SessionLoss",
+   "sensitivity": [
+    "Routine"
+   ],
+   "synonyms": [
+    "login screen",
+    "greeter"
+   ],
+   "systemd_restart": {
+    "restart": true,
+    "restart_sec": 100,
+    "start_limit_burst": 5
+   }
+  },
+  {
+   "desired": {
+    "status": "Running",
+    "when": "Always"
+   },
+   "edges": [
+    {
+     "from": "service:gym-app",
+     "kind": "Requires",
+     "origin": "SystemdRequires",
+     "to": "service:gym-db"
+    },
+    {
+     "from": "service:gym-app",
+     "kind": "Ordering",
+     "origin": "SystemdAfter",
+     "to": "service:gym-db"
+    }
+   ],
+   "id": "service:gym-app",
+   "probes": [
+    {
+     "cadence": "EveryTick",
+     "cost": "Cheap",
+     "establishes": "gym-app accepts connections",
+     "id": "gym-app-tcp",
+     "kind": {
+      "Tcp": {
+       "addr": "127.0.0.1:8081"
+      }
+     },
+     "origin": "User",
+     "role": "Readiness",
+     "side_effects": {
+      "Measurement": {
+       "bytes_max": 4096,
+       "per": 5000
+      }
+     },
+     "timeout": 10000
+    }
+   ],
+   "restart_disruption": "Brief",
+   "sensitivity": [
+    "Routine"
+   ],
+   "synonyms": [],
+   "systemd_restart": {
+    "restart": true,
+    "restart_sec": 5000,
+    "start_limit_burst": 5
+   }
+  },
+  {
+   "desired": {
+    "status": "Running",
+    "when": "Always"
+   },
+   "edges": [],
+   "id": "service:gym-db",
+   "probes": [],
+   "restart_disruption": "Brief",
+   "sensitivity": [
+    "Routine"
+   ],
+   "synonyms": [],
+   "systemd_restart": null
+  },
+  {
+   "desired": {
+    "status": "Running",
+    "when": "Always"
+   },
+   "edges": [],
+   "id": "service:sshd",
+   "probes": [],
+   "restart_disruption": "Brief",
+   "sensitivity": [
+    "Security"
+   ],
+   "synonyms": [
+    "ssh"
+   ],
+   "systemd_restart": {
+    "restart": true,
+    "restart_sec": 100,
+    "start_limit_burst": 5
+   }
+  }
+ ],
+ "userUnits": [
+  {
+   "desired": {
+    "status": "Running",
+    "when": "Always"
+   },
+   "edges": [],
+   "id": "service@0:pipewire",
+   "probes": [],
+   "restart_disruption": "Brief",
+   "sensitivity": [
+    "Routine"
+   ],
+   "synonyms": [
+    "sound",
+    "audio"
+   ],
+   "systemd_restart": null
+  }
+ ]
+}

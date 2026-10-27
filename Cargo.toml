@@ -22,7 +22,7 @@ members = [
 version = "0.0.0"
 edition = "2024"
 license = "MPL-2.0"
-rust-version = "1.97"
+rust-version = "1.95"
 
 [workspace.dependencies]
 planarian-schema = { path = "crates/schema" }

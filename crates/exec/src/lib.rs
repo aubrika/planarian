@@ -13,6 +13,8 @@
 //!    approval re-derives everything and compares the binding. Otherwise the
 //!    kernel runs it to a terminal state.
 
+#![allow(clippy::result_large_err)] // `Submitted` is the error type on purpose: a refusal is a result.
+
 pub mod derive;
 pub mod host;
 
@@ -42,6 +44,9 @@ pub struct Config {
     pub canonical: Canonical,
 }
 
+/// `Parked` carries the derived facts for display; results are rare and short-lived,
+/// so the size difference between variants doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Submitted {
     Rejected {
@@ -159,10 +164,35 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             Transition::Suppress(s) => Transition::Suppress(Suppression { by: authz.caller.clone(), ..s.clone() }),
             t => t.clone(),
         };
-        let base_eval =
-            self.eval_of(state.generation).map_err(|e| reject(RejectReason::Other("evaluation".into()), e))?;
-        let (live, live_hash) =
-            gens.read_overrides().map_err(|o| reject(RejectReason::Other("overrides".into()), outcome_msg(o)))?;
+        // Only generation changes need the running generation's evaluation and
+        // the override file; unit operations keep working on generations that
+        // predate Planarian.
+        let gen_op = transition.changes_generation();
+        let base_eval = match self.eval_of(state.generation) {
+            Ok(e) => e,
+            Err(_) if !gen_op => EvaluatedGeneration {
+                source: Hash::ZERO,
+                options: BTreeMap::new(),
+                units: defs.clone(),
+                user_units: vec![],
+                activation: ActivationPlan::default(),
+                locked: Default::default(),
+                core_units: BTreeMap::new(),
+            },
+            Err(e) => {
+                return Err(reject(
+                    RejectReason::Other("evaluation".into()),
+                    format!(
+                        "the running generation's manifest is unavailable ({e}); rebuild once with Planarian enabled"
+                    ),
+                ));
+            }
+        };
+        let (live, live_hash) = match gens.read_overrides() {
+            Ok(x) => x,
+            Err(_) if !gen_op => (OverrideSet::default(), Hash::ZERO),
+            Err(o) => return Err(reject(RejectReason::Other("overrides".into()), outcome_msg(o))),
+        };
 
         let mut plan = Plan {
             transition: transition.clone(),

@@ -102,12 +102,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let ledger = ex.kernel.journal.ledger().clone();
         let incidents = Manager::restore(ledger.incidents.values().cloned());
         let current = b.generations().current().unwrap_or_default();
-        let manifest = b
-            .generations()
-            .path_of(current)
-            .and_then(|p| b.generations().evaluate_built(&p))
-            .map(|e| manifest_of(&e))
-            .unwrap_or_default();
+        let manifest = match b.generations().path_of(current).and_then(|p| b.generations().evaluate_built(&p)) {
+            Ok(e) => manifest_of(&e),
+            Err(o) => {
+                notices.push_back(format!(
+                    "the running generation has no Planarian manifest ({o:?}); nothing is watched until a generation built with services.planarian.enable is running"
+                ));
+                Default::default()
+            }
+        };
         let asm = Assembler::new(manifest, cfg.exec.canonical.clone());
         let now = b.clock().now();
         let last_booted = b.generations().last_booted().ok();
@@ -293,10 +296,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         for t in self.ex.expire() {
             self.notice(format!("approval for transaction {} expired", t.0));
         }
-        if self.ex.kernel.journal.needs_compaction() {
-            if let Err(e) = self.ex.kernel.journal.compact() {
-                self.notice(format!("journal compaction failed: {e:?}"));
-            }
+        if self.ex.kernel.journal.needs_compaction()
+            && let Err(e) = self.ex.kernel.journal.compact()
+        {
+            self.notice(format!("journal compaction failed: {e:?}"));
         }
         self.confirm_boot(&s, &defs, now);
     }

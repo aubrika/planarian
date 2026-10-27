@@ -172,12 +172,12 @@ fn print_status(r: &StatusReport) {
     for (t, s, what) in &r.in_flight {
         println!("\nin progress: transaction {} ({s:?}): {what}", t.0);
     }
-    if let Some(rec) = &r.reconciliation {
-        if !rec.is_empty() {
-            println!("\nafter the last restart:");
-            for a in rec {
-                println!("  {a}");
-            }
+    if let Some(rec) = &r.reconciliation
+        && !rec.is_empty()
+    {
+        println!("\nafter the last restart:");
+        for a in rec {
+            println!("  {a}");
         }
     }
     if !r.notices.is_empty() {

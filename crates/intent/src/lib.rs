@@ -237,7 +237,7 @@ fn catalog_matches(phrase: &str, idx: &Index) -> Vec<Match> {
             })
         })
         .collect();
-    out.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+    out.sort_by_key(|m| std::cmp::Reverse(m.confidence));
     out
 }
 
@@ -308,7 +308,7 @@ pub fn interpret(phrase: &str, idx: &Index, now: Timestamp) -> Interpretation {
         matches = catalog_matches(&p, idx);
     }
 
-    matches.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+    matches.sort_by_key(|m| std::cmp::Reverse(m.confidence));
     match matches.first() {
         Some(m) if m.confidence >= PROPOSE && matches.get(1).is_none_or(|n| n.confidence < m.confidence) => {
             Interpretation::Propose(m.clone())

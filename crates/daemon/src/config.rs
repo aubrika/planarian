@@ -134,3 +134,31 @@ pub fn is_admin(uid: u32, group: &str) -> bool {
         f.len() > 3 && f[0] == group && (f[2] == primary_gid || f[3].split(',').any(|m| m == name))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped canonical probes parse and keep the probe contract (§10, §18.4).
+    #[test]
+    fn shipped_canonical_probes_are_valid() {
+        let text = include_str!("../../../share/canonical.json");
+        let c: BTreeMap<String, Vec<ProbeDef>> = serde_json::from_str(text).unwrap();
+        for (unit, probes) in &c {
+            for p in probes {
+                assert_eq!(p.origin, planarian_schema::ProbeOrigin::Canonical, "{unit}");
+                p.check_contract().unwrap_or_else(|e| panic!("{unit}: {e:?}"));
+            }
+        }
+        assert!(c.contains_key("sshd") && c.contains_key("graphical-session") && c.contains_key("fs-journal"));
+    }
+
+    #[test]
+    fn default_config_roundtrips() {
+        let c = FileConfig::default();
+        let j = serde_json::to_string(&c).unwrap();
+        let back: FileConfig = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.max_tier, c.max_tier);
+        assert!(serde_json::from_str::<FileConfig>("{}").is_ok(), "every field has a default");
+    }
+}

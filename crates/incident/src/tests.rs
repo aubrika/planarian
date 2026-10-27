@@ -108,7 +108,7 @@ fn flapping_spends_budget_with_backoff_then_cools_down() {
     assert!(matches!(inc.state, IncidentState::Cooldown { .. }), "{:?}", inc.state);
     assert!(sim.m.actionable(sim.now()).is_empty());
     // After an hour: exactly one more attempt.
-    for _ in 0..(3600_000 / TICK as usize) {
+    for _ in 0..(3_600_000 / TICK as usize) {
         sim.tick();
     }
     let inc = sim.active("gym-flap").unwrap().clone();

@@ -1,0 +1,191 @@
+{
+  "sshd": [
+    {
+      "id": "sshd-tcp",
+      "kind": {
+        "Tcp": {
+          "addr": "127.0.0.1:22"
+        }
+      },
+      "timeout": 10000,
+      "origin": "Canonical",
+      "role": "Readiness",
+      "cadence": "EveryTick",
+      "cost": "Cheap",
+      "side_effects": {
+        "Measurement": {
+          "bytes_max": 4096,
+          "per": 5000
+        }
+      },
+      "establishes": "sshd accepts TCP connections on port 22"
+    }
+  ],
+  "NetworkManager": [
+    {
+      "id": "networkmanager-active",
+      "kind": "SystemdActive",
+      "timeout": 10000,
+      "origin": "Canonical",
+      "role": "Readiness",
+      "cadence": "EveryTick",
+      "cost": "Trivial",
+      "side_effects": "None",
+      "establishes": "NetworkManager is running"
+    }
+  ],
+  "display-manager": [
+    {
+      "id": "display-manager-active",
+      "kind": "SystemdActive",
+      "timeout": 10000,
+      "origin": "Canonical",
+      "role": "Readiness",
+      "cadence": "EveryTick",
+      "cost": "Trivial",
+      "side_effects": "None",
+      "establishes": "the login screen's service is running"
+    }
+  ],
+  "graphical-session": [
+    {
+      "id": "graphical-session-reached",
+      "kind": {
+        "SessionTarget": {
+          "target": "graphical-session",
+          "within": 60000
+        }
+      },
+      "timeout": 10000,
+      "origin": "Canonical",
+      "role": "Readiness",
+      "cadence": "EveryTick",
+      "cost": "Trivial",
+      "side_effects": "None",
+      "establishes": "graphical-session.target was reached within 60 s of that login session's creation"
+    }
+  ],
+  "pipewire": [
+    {
+      "id": "pipewire-active",
+      "kind": "SystemdActive",
+      "timeout": 10000,
+      "origin": "Canonical",
+      "role": "Readiness",
+      "cadence": "EveryTick",
+      "cost": "Trivial",
+      "side_effects": "None",
+      "establishes": "PipeWire is running in the user's session"
+    }
+  ],
+  "wireplumber": [
+    {
+      "id": "wireplumber-active",
+      "kind": "SystemdActive",
+      "timeout": 10000,
+      "origin": "Canonical",
+      "role": "Readiness",
+      "cadence": "EveryTick",
+      "cost": "Trivial",
+      "side_effects": "None",
+      "establishes": "WirePlumber is running in the user's session"
+    }
+  ],
+  "fs-root": [
+    {
+      "id": "fs-root-free",
+      "kind": {
+        "FreeSpace": {
+          "path": "/",
+          "min_bytes": 2147483648,
+          "min_permille": 50
+        }
+      },
+      "timeout": 10000,
+      "origin": "Canonical",
+      "role": "Readiness",
+      "cadence": {
+        "Every": 60000
+      },
+      "cost": "Cheap",
+      "side_effects": "None",
+      "establishes": "the root filesystem has at least 2 GB and 5% free"
+    }
+  ],
+  "fs-nix": [
+    {
+      "id": "fs-nix-free",
+      "kind": {
+        "FreeSpace": {
+          "path": "/nix",
+          "min_bytes": 2147483648,
+          "min_permille": 50
+        }
+      },
+      "timeout": 10000,
+      "origin": "Canonical",
+      "role": "Readiness",
+      "cadence": {
+        "Every": 60000
+      },
+      "cost": "Cheap",
+      "side_effects": "None",
+      "establishes": "the Nix store's filesystem has at least 2 GB and 5% free"
+    }
+  ],
+  "fs-boot": [
+    {
+      "id": "fs-boot-free",
+      "kind": {
+        "FreeSpace": {
+          "path": "/boot",
+          "min_bytes": 67108864,
+          "min_permille": 0
+        }
+      },
+      "timeout": 10000,
+      "origin": "Canonical",
+      "role": "Readiness",
+      "cadence": {
+        "Every": 60000
+      },
+      "cost": "Cheap",
+      "side_effects": "None",
+      "establishes": "/boot has at least 64 MB free"
+    }
+  ],
+  "fs-journal": [
+    {
+      "id": "fs-journal-free",
+      "kind": {
+        "FreeSpace": {
+          "path": "/var/lib/planarian",
+          "min_bytes": 134217728,
+          "min_permille": 0
+        }
+      },
+      "timeout": 10000,
+      "origin": "Canonical",
+      "role": "Readiness",
+      "cadence": {
+        "Every": 60000
+      },
+      "cost": "Cheap",
+      "side_effects": "None",
+      "establishes": "the journal's filesystem has at least 128 MB free beyond the preallocation"
+    }
+  ],
+  "greetd": [
+    {
+      "id": "greetd-active",
+      "kind": "SystemdActive",
+      "timeout": 10000,
+      "origin": "Canonical",
+      "role": "Readiness",
+      "cadence": "EveryTick",
+      "cost": "Trivial",
+      "side_effects": "None",
+      "establishes": "the login screen's service is running"
+    }
+  ]
+}
