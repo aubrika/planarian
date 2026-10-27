@@ -3,11 +3,12 @@
 //! are reported, and make the result PARTIAL rather than PASS.
 
 use crate::evidence::Evidence;
-use crate::sim::unit;
+use crate::sim::{dur, unit};
 use planarian_exec::Submitted;
 use planarian_ipc::Response;
 use planarian_schema::*;
 use planarian_txn::machine::tag;
+use std::collections::BTreeMap;
 use toml::Value as T;
 
 #[derive(Debug, Default)]
@@ -307,6 +308,44 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                             let n = e.seen_incidents.values().filter(|i| i.kind == IncidentKind::Repair).count() as i64;
                             if n > spec.as_integer().unwrap_or(0) {
                                 fail(&mut v, format!("{n} incidents"));
+                            }
+                        }
+                        "attempt_gaps_min" => {
+                            // Backoff: the k-th gap between a repair incident's
+                            // attempts is at least the k-th minimum.
+                            let mins: Vec<Millis> = spec.as_array().into_iter().flatten().filter_map(dur).collect();
+                            let at: BTreeMap<TxnId, Timestamp> = e
+                                .log
+                                .iter()
+                                .filter_map(|r| match &r.result {
+                                    Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } => {
+                                        Some((*txn, r.at))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            for i in e.seen_incidents.values().filter(|i| i.kind == IncidentKind::Repair) {
+                                let times: Vec<Timestamp> =
+                                    i.attempts.iter().filter_map(|(t, _)| at.get(t).copied()).collect();
+                                if times.len() < i.attempts.len() {
+                                    v.unchecked.push(format!("metrics.attempt_gaps_min ({}: attempt times)", i.target));
+                                    continue;
+                                }
+                                for (k, w) in times.windows(2).enumerate() {
+                                    let gap = w[1].0.saturating_sub(w[0].0);
+                                    if let Some(min) = mins.get(k).filter(|m| gap < m.0) {
+                                        fail(
+                                            &mut v,
+                                            format!(
+                                                "{}: attempts {} and {} {gap} ms apart (min {} ms)",
+                                                i.target,
+                                                k + 1,
+                                                k + 2,
+                                                min.0
+                                            ),
+                                        );
+                                    }
+                                }
                             }
                         }
                         other => v.unchecked.push(format!("metrics.{other}")),

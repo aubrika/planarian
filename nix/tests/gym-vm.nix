@@ -287,9 +287,11 @@ let
       testScript = ''
         import json, time
         ID = ${builtins.toJSON id}
-        start_all()
-        machine.wait_for_unit("planariad.service")
+        # The upstream first, so the machine never boots without it.
+        upstream.start()
         upstream.wait_for_unit("gym-upstream.service")
+        machine.start()
+        machine.wait_for_unit("planariad.service")
         gym = "planarian-gym vm"
         plan = json.loads(machine.succeed(f"{gym} plan --id {ID}"))
         print(plan)
@@ -310,7 +312,7 @@ let
                 elif kind == "host":
                     if raw == "reboot":
                         machine.shutdown(); machine.start(); machine.wait_for_unit("planariad.service")
-                        machine.succeed("systemd-run --unit=gym-sampler planarian-gym vm sample")
+                        machine.succeed("systemd-run --unit=gym-sampler -E PLANARIAN_GYM_CATALOG planarian-gym vm sample")
                     elif raw == "suspend":
                         machine.execute("systemctl suspend &")
                         d = st.get("duration", "60s")
@@ -324,6 +326,8 @@ let
                         upstream.succeed("systemctl start gym-upstream")
             print(machine.succeed(f"{gym} judge --id {ID} 2>&1"))
         machine.copy_from_vm("/var/lib/gym-run/verdict.json", "")
+        if machine.execute("test -e /var/lib/gym-run/evidence.json")[0] == 0:
+            machine.copy_from_vm("/var/lib/gym-run/evidence.json", "")
       '';
     };
 in

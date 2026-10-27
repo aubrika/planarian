@@ -286,7 +286,8 @@ fn journal_reached(cfg: &FileConfig, state: &str) -> bool {
 }
 
 /// Wait for a healthy baseline: the daemon answers, every expected unit is
-/// up, and this generation is the known-good one.
+/// up with no incident left over from boot, and this generation is the
+/// known-good one.
 fn begin(entry: &T) {
     let cfg = config();
     let dir = run_dir();
@@ -300,6 +301,13 @@ fn begin(entry: &T) {
                 .iter()
                 .filter(|n| n.expected && !matches!(n.health, UnitStatus::Running | UnitStatus::Bound))
                 .map(|n| format!("{} {:?}", n.unit, n.health))
+                .chain(
+                    r.status
+                        .incidents
+                        .iter()
+                        .filter(|i| i.state != IncidentState::Closed)
+                        .map(|i| format!("incident on {} ({:?})", i.target, i.state)),
+                )
                 .collect();
             if unhealthy.is_empty() {
                 break;
@@ -348,10 +356,12 @@ fn begin(entry: &T) {
     let _ = std::fs::write(dir.join("responses.jsonl"), "");
     let _ = sh(&format!("chmod 666 {RUN}/responses.jsonl"));
     let exe = std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "planarian-gym".into());
-    sh(&format!("systemctl stop gym-sampler 2>/dev/null; systemd-run --unit=gym-sampler {exe} vm sample"));
+    sh(&format!(
+        "systemctl stop gym-sampler 2>/dev/null; systemd-run --unit=gym-sampler -E PLANARIAN_GYM_CATALOG {exe} vm sample"
+    ));
     for (i, state) in &p.watched {
         sh(&format!(
-            "systemd-run --unit=gym-watch-{i} {exe} vm step --id {} --index {i} --watched {state}",
+            "systemd-run --unit=gym-watch-{i} -E PLANARIAN_GYM_CATALOG {exe} vm step --id {} --index {i} --watched {state}",
             s(entry, "id")
         ));
     }
@@ -815,9 +825,10 @@ fn judge(entry: &T) -> i32 {
     let full = needs_full_window(&post);
     let end = Instant::now() + Duration::from_secs(p.window_secs);
     let min = Instant::now() + Duration::from_secs(60.min(p.window_secs));
-    let mut v;
+    let (mut v, mut e);
     loop {
-        v = check::judge(&evidence(), &post);
+        e = evidence();
+        v = check::judge(&e, &post);
         let now = Instant::now();
         if now >= end || (!full && now >= min && v.failures.is_empty()) {
             break;
@@ -825,6 +836,11 @@ fn judge(entry: &T) -> i32 {
         std::thread::sleep(Duration::from_secs(20));
     }
     sh("systemctl stop gym-sampler 2>/dev/null; true");
+    // A run the sampler never saw proves nothing.
+    if unsupported.is_empty() && e.seen_status.is_empty() {
+        v.failures.push("harness: no status samples (gym-sampler)".into());
+    }
+    write_json(&dir.join("evidence.json"), &e);
     let result = if !unsupported.is_empty() {
         "UNSUPPORTED"
     } else if !v.failures.is_empty() {
