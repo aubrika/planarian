@@ -103,6 +103,13 @@ pub struct Executor<B: Backends + Clone, S: Store> {
     pub last: Option<(DerivedFacts, Decision)>,
 }
 
+/// An approval token issued at `issued` has expired by `now` (§12 step 4:
+/// 24 hours). Saturating: a token issued near the end of time never expires
+/// early, and no clock value makes this panic.
+pub fn token_expired(now: Timestamp, issued: Timestamp) -> bool {
+    now > issued.plus(TOKEN_LIFETIME)
+}
+
 fn reject(reason: RejectReason, detail: impl Into<String>) -> Submitted {
     Submitted::Rejected { reason, detail: detail.into(), digest: None }
 }
@@ -498,7 +505,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             return reject(RejectReason::Other("approval".into()), "no pending change with that hash");
         };
         let now = self.b.clock().now();
-        if now.0 > parked.issued.0 + TOKEN_LIFETIME.0 {
+        if token_expired(now, parked.issued) {
             return self.expire_one(parked.txn);
         }
         // §9 step 6, against the source staged when the approval was requested:
@@ -563,8 +570,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     /// Tokens expire after 24 h (§12 step 4); the parked transaction ends Rejected.
     pub fn expire(&mut self) -> Vec<TxnId> {
         let now = self.b.clock().now();
-        let old: Vec<TxnId> =
-            self.parked.values().filter(|p| now.0 > p.issued.0 + TOKEN_LIFETIME.0).map(|p| p.txn).collect();
+        let old: Vec<TxnId> = self.parked.values().filter(|p| token_expired(now, p.issued)).map(|p| p.txn).collect();
         for t in &old {
             self.expire_one(*t);
         }
@@ -583,5 +589,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     }
 }
 
+#[cfg(kani)]
+mod kani;
 #[cfg(test)]
 mod tests;

@@ -21,6 +21,110 @@ pub const JOB_DRAIN: Millis = Millis::secs(60);
 /// once the transaction's deadline has passed.
 pub const LEASE_GRACE: Millis = Millis::secs(30);
 
+/// One row of the crash-recovery table (§12): what recovery does from the
+/// state a transaction was left in. `Kernel::recover_steps` dispatches on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// Nothing was mutated: end `Rejected(Interrupted)`.
+    Reject,
+    /// A runtime operation: re-observe and commit.
+    Reobserve,
+    /// A generation was being activated: Checking if the candidate is active, else revert.
+    CandidateActive,
+    /// A generation was being checked: probes decide.
+    CheckGeneration,
+    /// The boot entry was written: probes, then publish again and promote, or revert.
+    RecheckPublished,
+    /// The override was promoted: write Committed.
+    WriteCommitted,
+    /// A generation revert was under way: run it again (it is idempotent).
+    RevertGeneration,
+    /// A driver was being bound: Checking if it is bound, else revert.
+    DriverBound,
+    /// A driver bind was being checked: probes decide.
+    CheckDevice,
+    /// A driver revert was under way: run it again.
+    RevertDevice,
+    /// No recovery path: RecoveryFailed.
+    Fail,
+}
+
+/// Whether the watchdog should take a transaction over (§12 recovery
+/// watchdog): only in the window where mutation may be under way, never from
+/// itself, and only when the owner is dead or has let both the transaction's
+/// deadline and its lease's grace period pass.
+pub fn should_take_over(
+    state: &TxnState,
+    mine: bool,
+    owner_alive: bool,
+    now: Timestamp,
+    deadline: Timestamp,
+    renewed: Timestamp,
+) -> bool {
+    let in_window = matches!(
+        state,
+        TxnState::Activating | TxnState::Checking | TxnState::Published | TxnState::Promoted | TxnState::Reverting
+    );
+    if !in_window || mine {
+        return false;
+    }
+    let unrenewed = now > deadline && now > renewed.plus(LEASE_GRACE);
+    !owner_alive || unrenewed
+}
+
+/// The epoch a takeover writes: above both the journaled lease's and the
+/// store's fence (which may be ahead if an earlier takeover crashed between
+/// the two writes). `None` when epochs are exhausted.
+pub fn next_epoch(lease_epoch: u64, fence: Option<u64>) -> Option<u64> {
+    lease_epoch.max(fence.unwrap_or(0)).checked_add(1)
+}
+
+/// Whether a backend call tagged with `epoch` may proceed, given the store's
+/// fence for its transaction (I15): only the current owner's epoch passes.
+pub fn fence_admits(fence: Option<u64>, epoch: u64) -> bool {
+    fence == Some(epoch)
+}
+
+/// The hash-compared override replacement (§9 step 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapStep {
+    /// The live file already holds the target.
+    Done,
+    /// The live file holds the expected source: replace it.
+    Swap,
+    /// Someone else changed it: never overwrite.
+    ThirdParty,
+}
+
+pub fn swap_step(current: &Hash, from: &Hash, to: &Hash) -> SwapStep {
+    if current == to {
+        SwapStep::Done
+    } else if current == from {
+        SwapStep::Swap
+    } else {
+        SwapStep::ThirdParty
+    }
+}
+
+/// The crash-recovery table (§12).
+pub fn recovery_action(state: &TxnState, strategy: RecoveryStrategy) -> RecoveryAction {
+    use RecoveryAction as A;
+    use RecoveryStrategy as S;
+    match (state, strategy) {
+        (s, _) if s.is_pre_mutation() => A::Reject,
+        (TxnState::Activating | TxnState::Checking, S::ReobserveOnly) => A::Reobserve,
+        (TxnState::Activating, S::RevertGeneration) => A::CandidateActive,
+        (TxnState::Checking, S::RevertGeneration) => A::CheckGeneration,
+        (TxnState::Published, S::RevertGeneration) => A::RecheckPublished,
+        (TxnState::Promoted, S::RevertGeneration) => A::WriteCommitted,
+        (TxnState::Reverting, S::RevertGeneration) => A::RevertGeneration,
+        (TxnState::Activating, S::UnbindDevice) => A::DriverBound,
+        (TxnState::Checking, S::UnbindDevice) => A::CheckDevice,
+        (TxnState::Reverting, S::UnbindDevice) => A::RevertDevice,
+        _ => A::Fail,
+    }
+}
+
 /// Which probe run a check belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckPhase {
@@ -437,11 +541,10 @@ impl<S: Store, H: Host> Kernel<S, H> {
             Ok(h) => h,
             Err(o) => return Ok(Swap::Failed(format!("{o:?}"))),
         };
-        if current == to {
-            return Ok(Swap::Done);
-        }
-        if current != from {
-            return Ok(Swap::ThirdParty);
+        match swap_step(&current, &from, &to) {
+            SwapStep::Done => return Ok(Swap::Done),
+            SwapStep::ThirdParty => return Ok(Swap::ThirdParty),
+            SwapStep::Swap => {}
         }
         let o = self.call(txn.id, "swap_override", |h, op| h.generations().swap_override(&from, &to, op))?;
         Ok(if o.is_success() { Swap::Done } else { Swap::Failed(format!("{o:?}")) })
@@ -542,17 +645,14 @@ impl<S: Store, H: Host> Kernel<S, H> {
 
     /// Whether the watchdog should take this transaction over (§12 recovery watchdog).
     pub fn watchdog_should_take_over(&self, txn: &Transaction) -> bool {
-        let in_window = matches!(
-            txn.state,
-            TxnState::Activating | TxnState::Checking | TxnState::Published | TxnState::Promoted | TxnState::Reverting
-        );
-        if !in_window || txn.lease.owner == self.me {
-            return false;
-        }
-        let now = self.host.now();
-        let owner_dead = !self.host.pid_alive(txn.lease.owner.pid());
-        let unrenewed = now > txn.deadline && now > txn.lease.renewed.plus(LEASE_GRACE);
-        owner_dead || unrenewed
+        should_take_over(
+            &txn.state,
+            txn.lease.owner == self.me,
+            self.host.pid_alive(txn.lease.owner.pid()),
+            self.host.now(),
+            txn.deadline,
+            txn.lease.renewed,
+        )
     }
 
     /// Take the lease (epoch + 1), fence the old owner, establish confirmed
@@ -572,8 +672,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
             }
             // The fence may already be ahead of the journal if a previous
             // takeover crashed between the two writes.
-            let fence = j.store().fence(id).map_err(|e| KernelError::Journal(e.into()))?.unwrap_or(0);
-            let epoch = old.epoch.max(fence) + 1;
+            let fence = j.store().fence(id).map_err(|e| KernelError::Journal(e.into()))?;
+            let epoch = next_epoch(old.epoch, fence).ok_or(KernelError::LostLease(id))?;
             let new = Lease { txn: id, owner: me, epoch, worker_pid: worker, renewed: now, jobs: vec![] };
             // Fence first: from here on the old owner's calls are refused.
             j.store().set_fence(id, epoch).map_err(|e| KernelError::Journal(e.into()))?;
@@ -636,20 +736,18 @@ impl<S: Store, H: Host> Kernel<S, H> {
         self.recover_steps(id)
     }
 
-    /// The crash-recovery table (§12). Assumes this handle holds the lease.
+    /// The crash-recovery table (§12), as `recovery_action` gives it.
+    /// Assumes this handle holds the lease.
     fn recover_steps(&mut self, id: TxnId) -> R<TxnState> {
         let l = self.live(id)?;
         let txn = l.txn;
-        use RecoveryStrategy as S;
-        match (&txn.state, txn.recovery) {
-            (s, _) if s.is_pre_mutation() => self.reject(id, RejectReason::Interrupted),
-            (TxnState::Activating, S::ReobserveOnly) => {
-                // A StopAndSuppress whose suppression is durable but whose stop
-                // may not have happened: the suppression holds; re-observe and record.
-                self.finish_reobserve(&txn)
-            }
-            (TxnState::Checking, S::ReobserveOnly) => self.finish_reobserve(&txn),
-            (TxnState::Activating, S::RevertGeneration) => {
+        use RecoveryAction as A;
+        match recovery_action(&txn.state, txn.recovery) {
+            A::Reject => self.reject(id, RejectReason::Interrupted),
+            // Activating: a StopAndSuppress whose suppression is durable but whose
+            // stop may not have happened: the suppression holds; re-observe and record.
+            A::Reobserve => self.finish_reobserve(&txn),
+            A::CandidateActive => {
                 let cand = Self::candidate(&txn);
                 if cand.is_some() && self.host.generations().current().ok() == cand {
                     self.advance(&txn, TxnState::Checking, "recovery: candidate is active")?;
@@ -658,8 +756,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
                     self.revert_generation(&txn, "recovery: candidate not active")
                 }
             }
-            (TxnState::Checking, S::RevertGeneration) => self.check_then_commit(&txn),
-            (TxnState::Published, S::RevertGeneration) => match self.host.check(&txn, CheckPhase::Candidate) {
+            A::CheckGeneration => self.check_then_commit(&txn),
+            A::RecheckPublished => match self.host.check(&txn, CheckPhase::Candidate) {
                 Verdict::Pass => {
                     let cand = Self::candidate(&txn).expect("candidate");
                     let o = self.call(id, "publish_boot", |h, op| h.generations().publish_boot(cand, op))?;
@@ -670,9 +768,9 @@ impl<S: Store, H: Host> Kernel<S, H> {
                 }
                 Verdict::Fail(why) => self.revert_generation(&txn, &why),
             },
-            (TxnState::Promoted, S::RevertGeneration) => self.write_committed(&txn),
-            (TxnState::Reverting, S::RevertGeneration) => self.revert_generation(&txn, "recovery: re-run revert"),
-            (TxnState::Activating, S::UnbindDevice) => {
+            A::WriteCommitted => self.write_committed(&txn),
+            A::RevertGeneration => self.revert_generation(&txn, "recovery: re-run revert"),
+            A::DriverBound => {
                 let Transition::BindDriver { device, driver } = &txn.transition else { unreachable!() };
                 if self.host.inventory().bound_driver(device).ok().flatten().as_ref() == Some(driver) {
                     self.advance(&txn, TxnState::Checking, "recovery: candidate driver bound")?;
@@ -681,10 +779,10 @@ impl<S: Store, H: Host> Kernel<S, H> {
                     self.revert_device(&txn, "recovery: candidate driver not bound")
                 }
             }
-            (TxnState::Checking, S::UnbindDevice) => self.check_device(&txn),
-            (TxnState::Reverting, S::UnbindDevice) => self.revert_device(&txn, "recovery: re-run revert"),
-            (s, strategy) => {
-                let why = format!("no recovery path for {} under {strategy:?}", tag(s));
+            A::CheckDevice => self.check_device(&txn),
+            A::RevertDevice => self.revert_device(&txn, "recovery: re-run revert"),
+            A::Fail => {
+                let why = format!("no recovery path for {} under {:?}", tag(&txn.state), txn.recovery);
                 self.recovery_failed(&txn, &why)
             }
         }

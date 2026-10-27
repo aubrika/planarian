@@ -21,3 +21,6 @@ pub mod kernel;
 pub mod ledger;
 pub mod machine;
 pub mod store;
+
+#[cfg(kani)]
+mod kani;

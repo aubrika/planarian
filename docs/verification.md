@@ -1,7 +1,7 @@
 # Verification
 
-What the Verus proofs establish, what they trust, and how to run them
-(SPEC §17a). Pins are in `pins.md`; the trusted assumptions in `assumptions.md`.
+What the Verus proofs and Kani harnesses establish, what they trust, and
+how to run them (SPEC §17a). Pins are in `pins.md`; the trusted assumptions in `assumptions.md`.
 
 ## Running
 
@@ -112,5 +112,48 @@ not setting the interlock on RecoveryFailed; dropping I6 from the rule.
 **Not proved here:** that the kernel journals OpBegin before the backend
 call it names (it does, in `kernel.rs`, which is not verified; §17a puts
 `exec` under Verus only in Phase C, with Kani harnesses and proptest in
-Phase A, which are not written yet), and the bookkeeping helpers listed in
+Phase A; see Kani below), and the bookkeeping helpers listed in
 `assumptions.md`.
+
+## Kani: the kernel's decisions and exec (Phase A target: done)
+
+§17a gives `exec` orchestration Kani harnesses and proptest in Phase A. The
+kernel journals through serde JSON, which bounded model checking cannot get
+through, so the decisions it makes are pure functions in
+`crates/txn/src/kernel.rs` that it calls, and the harnesses check those for
+every input (`kani::any()`; the state and strategy enums are enumerated in
+full). The ordering of journal writes around backend calls is covered
+elsewhere: the Verus ledger rules (an `OpAck` needs its `OpBegin`; I15
+epochs) and the exec property tests, which crash the kernel at each of 15
+points and check recovery.
+
+```
+cargo install --locked kani-verifier && cargo kani setup   # once; not in nixpkgs
+cargo kani -p planarian-txn
+cargo kani -p planarian-exec
+```
+
+Kani is not packaged in nixpkgs, so there is no flake check; it runs from
+`cargo kani` (version in `pins.md`). Timings are on 4 cores.
+
+| Harness | Proves | Time |
+| --- | --- | --- |
+| `txn::kani::recovery_table_follows_the_state_machine` | For every non-terminal state and every recovery strategy, `recovery_action` (the crash-recovery table `recover_steps` dispatches on) refuses exactly the pre-mutation states, and every sequence of states the chosen kernel path can journal starts at that state, takes only steps `machine::step_allowed` (Verus-verified) permits, and ends terminal. The paths are read off the kernel functions each action runs. | ~50 s |
+| `txn::kani::watchdog_takes_over_only_when_it_should` | `should_take_over` (the watchdog rule): only in the mutation window, never from itself, never from a live owner within its deadline or lease grace; always from a dead owner in the window. No overflow for any clock value. | ~1 s |
+| `txn::kani::takeover_fences_out_the_previous_owner` | `next_epoch` and `fence_admits` (I15): a takeover's epoch is above the lease's and the store's fence; once fenced, the old epoch and every other epoch are refused and only the new one admitted; a second takeover fences out the first; at `u64::MAX` the takeover backs off instead of overflowing. `fence_admits` is the check both the real backends and the fake use. | <1 s |
+| `txn::kani::override_swap_never_overwrites_a_third_party` | `swap_step` (§9 step 4): swap only when the live override holds the expected source, done exactly when it holds the target, otherwise third party; the revert direction swaps back. | <1 s |
+| `exec::kani::approval_tokens_expire_after_their_lifetime` | `token_expired` (§12 step 4): never expired at issue, expired exactly after 24 h, stays expired; no overflow. | <1 s |
+
+Bounds: the recovery harness unwinds loops 6 times (paths are at most 4
+steps); the others have no loops. Hash inputs vary in two bytes (only
+equality matters).
+
+**Mutation check.** Each of these makes a harness fail: the token expiry as
+it was written before (`issued + TOKEN_LIFETIME` without saturation:
+"attempt to add with overflow", a real panic on an extreme clock value,
+fixed); mapping Activating under RevertGeneration to re-observe-and-commit;
+computing the takeover epoch without the store's fence.
+
+Extracting the decisions changed no behaviour, with one exception: a
+takeover at epoch `u64::MAX` now backs off with `LostLease` instead of
+overflowing.

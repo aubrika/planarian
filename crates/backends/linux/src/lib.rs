@@ -59,7 +59,8 @@ impl Paths {
 /// transaction's fence file.
 pub fn admitted(txn_dir: &Path, op: &OpId) -> bool {
     let p = txn_dir.join(op.txn.0.to_string()).join("lease");
-    std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<u64>().ok()) == Some(op.epoch)
+    let fence = std::fs::read_to_string(p).ok().and_then(|s| s.trim().parse::<u64>().ok());
+    planarian_txn::kernel::fence_admits(fence, op.epoch)
 }
 
 /// Everything, for the daemon and the watchdog.

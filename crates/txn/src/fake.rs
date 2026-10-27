@@ -97,7 +97,7 @@ impl FakeHost {
     /// Fence and log a mutating call. Returns false if the call must be refused.
     fn admit(&self, w: &mut World, op: &OpId, call: &str) -> bool {
         let current = self.store.fence(op.txn).ok().flatten();
-        let fenced = current != Some(op.epoch);
+        let fenced = !crate::kernel::fence_admits(current, op.epoch);
         let pending = w.jobs.len();
         w.calls.push(CallLog { at: w.now, op: *op, call: call.into(), fenced, pending });
         !fenced
