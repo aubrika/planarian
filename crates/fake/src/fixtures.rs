@@ -45,6 +45,7 @@ pub fn unit(id: &str, sens: &[Sensitivity], disruption: Disruption, probes: Vec<
         probes,
         synonyms: vec![],
         systemd_restart: None,
+        startup_grace: None,
     }
 }
 

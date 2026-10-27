@@ -85,6 +85,11 @@ let
       restartDisruption = mkOption { type = types.enum disruptions; default = defaultDisruption name; };
       probes = mkOption { type = types.listOf (types.submodule probeModule); default = [ ]; };
       synonyms = mkOption { type = types.listOf types.str; default = [ ]; };
+      startupGrace = mkOption {
+        type = types.nullOr types.ints.unsigned;
+        default = null;
+        description = "Seconds after this unit comes up during which a failing health probe is not yet a fault. `null`: `services.planarian.startupGrace`.";
+      };
       sysfs = mkOption { type = types.nullOr types.str; default = null; description = "Devices: the sysfs directory, e.g. /sys/bus/pci/devices/0000:00:1b.0."; };
     };
   };
@@ -173,6 +178,7 @@ let
     restart_disruption = u.restartDisruption;
     probes = map probeJSON u.probes;
     systemd_restart = if u.scope == "system" && u.kind == "service" then restartJSON name else null;
+    startup_grace = if u.startupGrace == null then null else u.startupGrace * 1000;
   };
 
   unitsOf = scope: lib.mapAttrsToList unitJSON (lib.filterAttrs (_: u: u.scope == scope) cfg.units);
@@ -218,6 +224,18 @@ in
       type = types.str;
       default = "nixosConfigurations.${config.networking.hostName}";
       description = "The flake output that is this machine.";
+    };
+
+    startupGrace = mkOption {
+      type = types.ints.unsigned;
+      default = 90;
+      description = ''
+        Seconds after a unit comes up (at boot, or when it or Planarian starts
+        it) during which a failing health probe is not yet a fault: the unit
+        may still be starting. A crash is never covered. Raise it for slow
+        machines or services that warm up slowly; units can set their own
+        (`units.<name>.startupGrace`).
+      '';
     };
 
     maxTier = mkOption {
@@ -344,6 +362,7 @@ in
         keepEmergency = 3;
       };
       journalBytes = 64 * 1024 * 1024;
+      startupGraceSecs = cfg.startupGrace;
     };
 
     # With the console: its launcher entry and icons too.

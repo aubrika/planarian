@@ -400,6 +400,10 @@ pub struct UnitDef {
     pub probes: Vec<ProbeDef>,
     pub synonyms: Vec<String>,
     pub systemd_restart: Option<SystemdRestartPolicy>,
+    /// How long after the unit comes up a failing health probe is not yet a
+    /// fault (it may still be starting). `None`: the daemon's default.
+    #[serde(default)]
+    pub startup_grace: Option<Millis>,
 }
 
 pub type UnitDefs = BTreeMap<UnitId, UnitDef>;

@@ -245,6 +245,7 @@ mod tests {
             probes,
             synonyms: vec![],
             systemd_restart: None,
+            startup_grace: None,
         }
     }
 

@@ -54,6 +54,7 @@ pub fn config() -> CoreConfig {
         },
         runtime_options: vec![],
         fresh_boot: true,
+        startup_grace: planarian_daemon::STARTUP_GRACE,
     }
 }
 

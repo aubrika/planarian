@@ -32,6 +32,7 @@ pub fn service(name: &str) -> UnitDef {
         probes: vec![readiness(&format!("{}-ready", id.name))],
         synonyms: vec![],
         systemd_restart: None,
+        startup_grace: None,
     }
 }
 

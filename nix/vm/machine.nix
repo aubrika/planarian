@@ -100,6 +100,8 @@ in
     services.planarian = {
       enable = true;
       owner = "/etc/nixos";
+      # The VM may run without KVM, where everything starts slowly.
+      startupGrace = lib.mkDefault 180;
       catalog.services.gym-extra = "services.gym-extra.enable";
       units.gym-web = {
         synonyms = [ "web server" ];

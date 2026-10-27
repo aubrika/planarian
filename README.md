@@ -137,6 +137,11 @@ become `Wants` and ordering edges that are never blamed for a failure. Add
 `edges`, `sensitivity`, `restartDisruption` and `synonyms` as needed; see
 `nix/module.nix`.
 
+Services get a startup grace: a health check that fails in a unit's first
+90 seconds after it comes up is not yet a fault (crashes are). Set
+`services.planarian.startupGrace`, or `units.<name>.startupGrace` per unit,
+for slow machines or slow-starting services.
+
 ### If something goes wrong
 
 - `planarian status` shows incidents, pending approvals, any recovery failure

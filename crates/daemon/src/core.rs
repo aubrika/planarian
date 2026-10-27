@@ -41,6 +41,8 @@ pub struct CoreConfig {
     pub runtime_options: Vec<intent::RuntimeOption>,
     /// The first start of the daemon on this boot (NextBoot suppressions end).
     pub fresh_boot: bool,
+    /// The default startup grace (units may set their own).
+    pub startup_grace: Millis,
 }
 
 /// The caller of a request, from `SO_PEERCRED` and group membership.
@@ -154,7 +156,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             Err(e) => notices.push_back(format!("journal reconciliation failed: {e:?}")),
         }
         let ledger = ex.kernel.journal.ledger().clone();
-        let incidents = Manager::restore(ledger.incidents.values().cloned());
+        let mut incidents = Manager::restore(ledger.incidents.values().cloned());
+        incidents.startup_grace = cfg.startup_grace;
         let current = b.generations().current().unwrap_or_default();
         let manifest = match b.generations().path_of(current).and_then(|p| b.generations().evaluate_built(&p)) {
             Ok(e) => manifest_of(&e),
@@ -307,6 +310,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let policy = self.ex.policy_version();
         let caller = authz.caller.clone();
         let mut result = self.ex.submit(p.clone(), authz.clone(), s, defs);
+        if let (Transition::RestartUnit(u), Submitted::Finished { .. }) = (&p.transition, &result) {
+            self.incidents.started(u, now);
+        }
         let (facts, decision) = self.ex.last.clone().unzip();
         let txn = match &result {
             Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } => Some(*txn),

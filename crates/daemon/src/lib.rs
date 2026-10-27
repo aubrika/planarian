@@ -8,3 +8,4 @@ pub mod render;
 pub mod snapshot;
 
 pub use core::{Core, CoreConfig, LogRecord, Peer};
+pub use planarian_incident::STARTUP_GRACE;

@@ -62,13 +62,30 @@ struct Track {
     /// When the unit went from fine to divergent, recently.
     failures: Vec<Timestamp>,
     was_divergent: bool,
+    /// When the unit last came up (Running or Degraded: its process is active),
+    /// or when Planarian started or restarted it; first sight counts as coming up.
+    up_since: Option<Timestamp>,
+    /// Degraded within its startup grace: not yet a fault.
+    in_grace: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Manager {
     pub incidents: BTreeMap<IncidentId, Incident>,
     tracks: BTreeMap<UnitId, Track>,
     next_id: u64,
+    /// How long after coming up a failing health probe is not yet a fault,
+    /// for units that do not set their own (`UnitDef::startup_grace`).
+    pub startup_grace: Millis,
+}
+
+/// The default startup grace (`services.planarian.startupGrace`).
+pub const STARTUP_GRACE: Millis = Millis::secs(90);
+
+impl Default for Manager {
+    fn default() -> Manager {
+        Manager::restore([])
+    }
 }
 
 impl Manager {
@@ -76,7 +93,13 @@ impl Manager {
     pub fn restore(incidents: impl IntoIterator<Item = Incident>) -> Manager {
         let incidents: BTreeMap<IncidentId, Incident> = incidents.into_iter().map(|i| (i.id, i)).collect();
         let next_id = incidents.keys().map(|i| i.0).max().unwrap_or(0);
-        Manager { incidents, tracks: BTreeMap::new(), next_id }
+        Manager { incidents, tracks: BTreeMap::new(), next_id, startup_grace: STARTUP_GRACE }
+    }
+
+    /// Planarian (or a user through it) just started or restarted `unit`:
+    /// its startup grace begins again.
+    pub fn started(&mut self, unit: &UnitId, now: Timestamp) {
+        self.tracks.entry(unit.clone()).or_default().up_since = Some(now);
     }
 
     pub fn active_for(&self, unit: &UnitId) -> Option<&Incident> {
@@ -147,6 +170,24 @@ impl Manager {
                     changed.push(inc);
                 }
                 continue;
+            }
+
+            // Startup grace: a unit whose process is up but whose health probe
+            // fails may still be starting. A crash (Failed) gets no grace.
+            {
+                let t = self.tracks.entry(id.clone()).or_default();
+                if matches!(status, UnitStatus::Running | UnitStatus::Degraded(_)) {
+                    t.up_since.get_or_insert(now);
+                } else {
+                    t.up_since = None;
+                }
+                let grace = def.startup_grace.unwrap_or(self.startup_grace);
+                t.in_grace = matches!(status, UnitStatus::Degraded(_))
+                    && t.up_since.is_some_and(|since| now.0.saturating_sub(since.0) < grace.0);
+                if t.in_grace {
+                    (t.divergent_ticks, t.unknown_ticks, t.satisfied_since) = (0, 0, None);
+                    continue;
+                }
             }
 
             if divergent(desired, &status) {
@@ -259,7 +300,7 @@ impl Manager {
                     && matches!(i.state, IncidentState::Open | IncidentState::Regressed { .. })
                     && i.budget_left > 0
                     && now >= i.next_attempt
-                    && self.tracks.get(&i.target).is_none_or(|t| t.satisfied_since.is_none())
+                    && self.tracks.get(&i.target).is_none_or(|t| t.satisfied_since.is_none() && !t.in_grace)
             })
             .collect()
     }

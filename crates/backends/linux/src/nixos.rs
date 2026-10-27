@@ -831,6 +831,7 @@ mod tests {
                 probes: vec![],
                 synonyms: vec!["ssh".into()],
                 systemd_restart: None,
+                startup_grace: None,
             }],
             ..Default::default()
         };

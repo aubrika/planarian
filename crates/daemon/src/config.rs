@@ -40,6 +40,9 @@ pub struct FileConfig {
     pub admin_group: String,
     /// §12b collection bounds (`services.planarian.gc`).
     pub gc: planarian_schema::gc::GcBudget,
+    /// Seconds after a unit comes up during which a failing health probe is
+    /// not yet a fault (`services.planarian.startupGrace`).
+    pub startup_grace_secs: u64,
     pub journal_bytes: u64,
 }
 
@@ -61,6 +64,7 @@ impl Default for FileConfig {
             devices: BTreeMap::new(),
             admin_group: "planarian-admin".into(),
             gc: Default::default(),
+            startup_grace_secs: planarian_incident::STARTUP_GRACE.0 / 1000,
             journal_bytes: planarian_txn::store::DEFAULT_CAPACITY,
         }
     }

@@ -212,3 +212,50 @@ fn stabilizing_incident_is_not_actionable() {
     assert!(sim.active("gym-web").is_some());
     assert!(sim.m.actionable(sim.now()).is_empty());
 }
+
+impl Sim {
+    fn degrade(&mut self, unit: &str) {
+        self.set(unit, Observed::Active, ProbeResult::Fail("connection refused".into()));
+    }
+}
+
+#[test]
+fn a_failing_probe_right_after_start_is_not_yet_a_fault() {
+    let mut sim = Sim::new(defs([service("gym-web")]));
+    sim.tick(); // first sight: the unit came up now
+    sim.degrade("gym-web");
+    assert!(matches!(sim.s.status(&UnitId::service("gym-web"), &sim.defs), UnitStatus::Degraded(_)));
+    // 90 s of grace (18 ticks): nothing opens, nothing is actionable.
+    sim.ticks(16);
+    assert!(sim.active("gym-web").is_none(), "still starting");
+    // After the grace it is a fault like any other (two ticks to open).
+    sim.ticks(4);
+    assert!(sim.active("gym-web").is_some(), "past the grace");
+}
+
+#[test]
+fn a_crash_gets_no_startup_grace() {
+    let mut sim = Sim::new(defs([service("gym-web")]));
+    sim.tick();
+    sim.fail("gym-web");
+    sim.ticks(2);
+    assert!(sim.active("gym-web").is_some());
+}
+
+#[test]
+fn a_unit_may_set_its_own_grace_and_a_restart_starts_it_again() {
+    let mut d = defs([service("gym-web")]);
+    d.get_mut(&UnitId::service("gym-web")).unwrap().startup_grace = Some(Millis::secs(10));
+    let mut sim = Sim::new(d);
+    sim.tick();
+    sim.degrade("gym-web");
+    sim.ticks(4);
+    assert!(sim.active("gym-web").is_some(), "10 s grace is over");
+    // Planarian restarts it: the grace begins again and the incident waits.
+    let now = sim.now();
+    sim.m.started(&UnitId::service("gym-web"), now);
+    sim.tick();
+    assert!(sim.m.actionable(sim.now()).is_empty(), "within the new grace");
+    sim.ticks(2);
+    assert_eq!(sim.m.actionable(sim.now()).len(), 1);
+}
