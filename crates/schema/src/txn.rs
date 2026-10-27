@@ -92,29 +92,38 @@ impl TxnState {
     }
 }
 
-} // verus!
+// Payloads no proof reads, opaque to Verus.
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)]
+pub struct ExCheckContext(CheckContext);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)]
+pub struct ExApprovalToken(ApprovalToken);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)]
+pub struct ExIncident(Incident);
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)]
+pub struct ExExpectation(Expectation);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[verifier::external_derive]
 pub enum OwnerId {
     Daemon { pid: u32, boot_id: Hash },
     Watchdog { pid: u32, boot_id: Hash },
 }
 
-impl OwnerId {
-    pub fn pid(&self) -> u32 {
-        match self {
-            OwnerId::Daemon { pid, .. } | OwnerId::Watchdog { pid, .. } => *pid,
-        }
-    }
-
-    pub fn is_watchdog(&self) -> bool {
-        matches!(self, OwnerId::Watchdog { .. })
-    }
-}
-
 /// Exclusive ownership of a transaction (§12). `txn` is not in §8; the
 /// backend fences on (txn, epoch), so the lease has to name its transaction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[verifier::external_derive]
 pub struct Lease {
     pub txn: TxnId,
     pub owner: OwnerId,
@@ -126,6 +135,7 @@ pub struct Lease {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[verifier::external_derive]
 pub struct Transaction {
     pub id: TxnId,
     pub state: TxnState,
@@ -159,6 +169,29 @@ pub struct Transaction {
     pub check: CheckContext,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum Outcome {
+    Succeeded,
+    Failed(String),
+    Partial(String),
+    Unknown(String),
+}
+
+} // verus!
+
+impl OwnerId {
+    pub fn pid(&self) -> u32 {
+        match self {
+            OwnerId::Daemon { pid, .. } | OwnerId::Watchdog { pid, .. } => *pid,
+        }
+    }
+
+    pub fn is_watchdog(&self) -> bool {
+        matches!(self, OwnerId::Watchdog { .. })
+    }
+}
+
 /// The manifest part of an evaluated generation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -174,14 +207,6 @@ pub struct CheckContext {
     pub candidate: Option<Manifest>,
     pub base: Manifest,
     pub pre: std::collections::BTreeMap<UnitId, UnitStatus>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Outcome {
-    Succeeded,
-    Failed(String),
-    Partial(String),
-    Unknown(String),
 }
 
 impl Outcome {

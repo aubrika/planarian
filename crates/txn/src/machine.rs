@@ -177,8 +177,6 @@ pub proof fn generations_commit_after_promotion(from: TxnState, strategy: Recove
 {
 }
 
-} // verus!
-
 /// A short, stable name for a state (journal notes, crash points, catalog `path`).
 pub fn tag(s: &TxnState) -> &'static str {
     match s {
@@ -197,6 +195,8 @@ pub fn tag(s: &TxnState) -> &'static str {
         TxnState::Cancelled(_) => "Cancelled",
     }
 }
+
+} // verus!
 
 #[cfg(test)]
 mod tests {

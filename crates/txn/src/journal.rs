@@ -118,6 +118,11 @@ impl<S: Store> Journal<S> {
         if ledger.last_seq != seq {
             return Err(JournalError::Corrupt("checkpoint seq disagrees with its ledger".into()));
         }
+        // The proofs show `apply` keeps the ledger invariant; a ledger read
+        // from disk is checked against it instead.
+        if !ledger.well_formed() {
+            return Err(JournalError::Corrupt("checkpoint breaks the ledger invariant".into()));
+        }
         Ok(Some((seq, ledger)))
     }
 
@@ -196,7 +201,7 @@ impl<S: Store> Journal<S> {
             if entry.seq != seq {
                 return self.stop_at_tail(truncate);
             }
-            self.ledger.apply(&entry)?;
+            self.ledger.apply(entry)?;
             prev = Some(seq);
             self.offset += size as u64;
         }
@@ -260,7 +265,7 @@ impl<S: Store> Journal<S> {
         }
         self.store.write_at(self.offset, &bytes)?;
         self.store.sync()?;
-        self.ledger.apply(&entry)?;
+        self.ledger.apply(entry.clone())?;
         self.offset += bytes.len() as u64;
         Ok(entry)
     }
@@ -344,17 +349,14 @@ impl<S: Store> Journal<S> {
             Some(l) => (l.txn.transition.clone(), l.txn.revert_to),
             None => (Transition::Rollback, GenerationId(0)),
         };
-        self.ledger.interlock.insert(
+        self.ledger.add_interlock(InterlockEntry {
             txn,
-            InterlockEntry {
-                txn,
-                transition,
-                failed_from: "sentinel".into(),
-                base_override: None,
-                candidate_override: None,
-                revert_to,
-                note: text.into(),
-            },
-        );
+            transition,
+            failed_from: "sentinel".into(),
+            base_override: None,
+            candidate_override: None,
+            revert_to,
+            note: text.into(),
+        });
     }
 }

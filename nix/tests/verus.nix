@@ -26,7 +26,7 @@ pkgs.stdenv.mkDerivation {
   buildPhase = ''
     runHook preBuild
     export HOME=$TMPDIR
-    cargo-verus verify -p planarian-policy --offline 2>&1 | tee verus.log
+    cargo-verus verify -p planarian-policy -p planarian-txn --offline 2>&1 | tee verus.log
     status=''${PIPESTATUS[0]}
     if [ "$status" -ne 0 ] || grep -q "verification results:: .* [1-9][0-9]* errors" verus.log; then
       echo "Verus failed (exit $status)"; exit 1

@@ -60,6 +60,51 @@ reject (the I5 lemma fails).
 The types `decide` reads are inside `verus!`; `Sensitivities`' operations
 are verified against their specs. `schema::digest` is not yet proved.
 
-## `txn`
+## `txn` (Phase A target: done for the state machine and the ledger)
 
-Not yet verified.
+Every record goes through `Ledger::validate` before it is written and
+`Ledger::apply` when it is applied or replayed; both are verified.
+
+**State machine** (`machine.rs`): `step_allowed` equals `step_spec`.
+
+| Lemma | Property |
+| --- | --- |
+| `i12_steps_terminate` | Every allowed step lowers a rank: at most eight steps, no cycles. |
+| `i12_terminal_always_reachable` | Every non-terminal state has an allowed step to a terminal one (Cancelled before mutation, RecoveryFailed after). |
+| `terminal_is_final` | Terminal states have no successors. |
+| `refusal_only_before_mutation` | Rejected and Cancelled only before anything was mutated. |
+| `runtime_never_reverts` | Runtime operations never revert, publish or promote. |
+| `only_generations_publish`, `generations_commit_after_promotion` | Only generation operations publish; they commit only from Promoted. |
+
+Together with the progress assumptions (`assumptions.md`), these are I12: a
+lease holder that keeps stepping reaches a terminal state within eight steps.
+
+**Ledger** (`ledger.rs`). `inv` holds that live transactions have unique ids,
+issued ids, leases naming them, non-terminal states, the recovery strategy
+their transition fixes, and (I6) that while a generation-changing
+transaction is in flight no other transaction is. Proved on the code:
+
+- `validate` accepts a record only if `rules` hold: the sequence number is
+  next; an Advance, Takeover, Renew or OpBegin carries the transaction's
+  current lease epoch (I15: only the lease holder advances the journal); an
+  Advance follows `step_spec`, and one that starts mutating is refused while
+  the interlock is set for an autonomous caller (§12c) and when it would
+  overlap another in-flight transaction where either changes the generation
+  (I6); a Takeover strictly raises the epoch; an OpAck names an op that was
+  begun and not yet acknowledged (write-ahead at the journal: no outcome
+  without its OpBegin); a Prepared transaction gets a fresh id and epoch 1,
+  and is refused while the interlock is set for an autonomous caller.
+- `apply` preserves `inv`, never lowers a live transaction's epoch, and an
+  Advance to RecoveryFailed always sets the interlock (I12's alerting half).
+- `well_formed` decides `inv`; a checkpoint read from disk must pass it.
+- `add_interlock` (the sentinel path) preserves `inv`.
+
+**Mutation check.** Each of these fails verification: skipping the I6
+exclusivity check in `validate`; accepting a takeover with an equal epoch;
+not setting the interlock on RecoveryFailed; dropping I6 from the rule.
+
+**Not proved here:** that the kernel journals OpBegin before the backend
+call it names (it does, in `kernel.rs`, which is not verified; §17a puts
+`exec` under Verus only in Phase C, with Kani harnesses and proptest in
+Phase A, which are not written yet), and the bookkeeping helpers listed in
+`assumptions.md`.

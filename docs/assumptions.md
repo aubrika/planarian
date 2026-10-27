@@ -10,7 +10,10 @@ No `assume` and no `external_body` function. Trusted instead:
 | --- | --- |
 | vstd's specifications of `Vec`, `String::as_str`, `str::unicode_len`, `str::get_char` | `policy` string helpers |
 | `Value` is an opaque external type (`external_type_specification`); nothing about it is assumed | `schema::transition` |
-| Serde impls are unverified (`external_derive`) | `schema`, `policy` |
+| Serde impls are unverified (`external_derive`) | `schema`, `policy`, `txn` |
+| `Expectation`, `CheckContext`, `ApprovalToken`, `Incident` are opaque external types | `schema::txn`, `schema::transition` |
+| Ledger bookkeeping helpers (`push_tag`, `tag_string`, `note_why`, `archive`, `suppress`, `unsuppress`, `record_incident`, `use_token`) are `external_body` with no postcondition: each receives only the field it updates, so the verified fields are untouched by construction; trusted only to terminate | `txn::ledger` |
+| vstd's specifications of `Vec::push`, `insert`, `remove`, `is_empty` and `Box` | `txn::ledger` |
 
 See `verification.md` for what is proved.
 

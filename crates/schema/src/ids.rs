@@ -9,9 +9,6 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use vstd::prelude::*;
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Hash(pub [u8; 32]);
-
 impl Hash {
     pub const ZERO: Hash = Hash([0; 32]);
 
@@ -82,21 +79,6 @@ macro_rules! newtype {
 }
 
 newtype!(ProbeId(String));
-newtype!(
-    #[derive(Copy)]
-    IncidentId(u64)
-);
-newtype!(
-    #[derive(Copy)]
-    PolicyVersion(Hash)
-);
-newtype!(JobId(String));
-
-newtype!(
-    /// A duration in milliseconds.
-    #[derive(Copy, Default)]
-    Millis(u64)
-);
 
 // The identifiers a `Transition` carries, visible to the `policy` proofs. Serde
 // derives are `external_derive`: Verus does not verify serialization.
@@ -145,6 +127,46 @@ pub struct SnapshotId(pub String);
 #[verifier::external_derive]
 pub struct Timestamp(pub u64);
 
+/// SHA-256. Serialized as 64 lowercase hex digits.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Hash(pub [u8; 32]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+#[verifier::external_derive]
+pub struct IncidentId(pub u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+#[verifier::external_derive]
+pub struct PolicyVersion(pub Hash);
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+#[verifier::external_derive]
+pub struct JobId(pub String);
+
+/// A duration in milliseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+#[verifier::external_derive]
+pub struct Millis(pub u64);
+
+/// Durable identity of one mutation attempt (§12). Journaled and fsynced before
+/// the backend call it names; the backend tags the call with it and fences on
+/// `(txn, epoch)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[verifier::external_derive]
+pub struct OpId {
+    pub txn: TxnId,
+    pub epoch: u64,
+    pub seq: u64,
+}
+
 } // verus!
 
 impl Timestamp {
@@ -157,16 +179,6 @@ impl Millis {
     pub const fn secs(s: u64) -> Millis {
         Millis(s * 1000)
     }
-}
-
-/// Durable identity of one mutation attempt (§12). Journaled and fsynced before
-/// the backend call it names; the backend tags the call with it and fences on
-/// `(txn, epoch)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct OpId {
-    pub txn: TxnId,
-    pub epoch: u64,
-    pub seq: u64,
 }
 
 impl fmt::Display for OpId {

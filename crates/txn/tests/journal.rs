@@ -234,3 +234,32 @@ fn file_store_roundtrip() {
     let j = Journal::open(store).unwrap();
     assert!(j.ledger().interlock.contains_key(&TxnId(3)));
 }
+
+/// A checkpoint is checked against the ledger invariant before use; two
+/// generation changes in flight at once (I6) is refused.
+#[test]
+fn ledger_invariant_checked_on_load() {
+    use planarian_txn::ledger::{Ledger, LiveTxn};
+    let live = |id: u64, state: TxnState| {
+        let mut t = good_change();
+        t.id = TxnId(id);
+        t.lease.txn = TxnId(id);
+        t.state = state;
+        (TxnId(id), LiveTxn { txn: t, ops: vec![], path: vec![], why: String::new() })
+    };
+    let mut l = Ledger { next_txn: 3, ..Ledger::default() };
+    l.live.entries = vec![live(1, TxnState::Activating), live(2, TxnState::Prepared)];
+    assert!(l.well_formed());
+    l.live.entries[1] = live(2, TxnState::Checking);
+    assert!(!l.well_formed(), "two generation changes in flight");
+    l.live.entries[1] = live(1, TxnState::Prepared);
+    assert!(!l.well_formed(), "duplicate id");
+    l.live.entries = vec![live(5, TxnState::Prepared)];
+    assert!(!l.well_formed(), "id not yet issued");
+
+    // The vector-backed maps serialize as the JSON objects they replaced.
+    l.live.entries = vec![live(1, TxnState::Prepared)];
+    let json = serde_json::to_value(&l).unwrap();
+    assert!(json["live"]["1"].is_object());
+    assert_eq!(serde_json::from_value::<Ledger>(json).unwrap(), l);
+}
