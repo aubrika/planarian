@@ -13,6 +13,15 @@ in
       default = "1";
       description = "Text scale for GTK and Qt applications (changed by `ask \"make text bigger\"`).";
     };
+    verboseBoot = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Show the boot as text (kernel and service messages) instead of the
+        planarian splash. With the splash, press Esc during boot to see the
+        messages.
+      '';
+    };
     wifiNetwork = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
@@ -43,11 +52,23 @@ in
       script = "${config.networking.networkmanager.package}/bin/nmcli connection up id ${lib.escapeShellArg cfg.wifiNetwork} || true";
     };
 
-    # Dark boot splash with the planarian mark (identity kit, white on black).
-    boot.plymouth = {
+    # A quiet boot behind a dark splash with the planarian mark (identity
+    # kit, white on black); `verboseBoot` shows the messages instead.
+    boot.plymouth = lib.mkIf (!cfg.verboseBoot) {
       enable = lib.mkDefault true;
       logo = lib.mkDefault ../assets/identity/marks/planarian-mark-white-128.png;
     };
+    boot.consoleLogLevel = lib.mkIf (!cfg.verboseBoot) (lib.mkDefault 3);
+    boot.initrd.verbose = lib.mkIf (!cfg.verboseBoot) (lib.mkDefault false);
+    # plymouth.use-simpledrm: draw the splash on the firmware framebuffer from
+    # the start; otherwise Plymouth waits for a GPU driver, which NixOS does
+    # not load that early, and falls back to text.
+    boot.kernelParams = lib.mkIf (!cfg.verboseBoot) [
+      "quiet"
+      "udev.log_level=3"
+      "systemd.show_status=auto"
+      "plymouth.use-simpledrm"
+    ];
 
     # The console autostarts on the reference desktop (§16a).
     services.planarian.console.enable = lib.mkDefault true;

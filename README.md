@@ -84,6 +84,9 @@ is gone at the next boot. Give it at least 8 GB of RAM if you want to try
 configuration changes. It does not install anything; to keep Planarian,
 install NixOS and follow the next section.
 
+It boots quietly behind the planarian splash. Press Esc during boot to see
+the messages, or pick **verbose boot** in the boot menu.
+
 ## Trying it on your machine
 
 Planarian needs a flake-based NixOS configuration. It never edits your own
@@ -98,7 +101,9 @@ files. It changes only `planarian/overrides.nix`, which your flake imports.
    # in nixosSystem { modules = [ … ]; }:
    ./planarian/overrides.nix
    planarian.nixosModules.default
-   planarian.nixosModules.reference   # optional: COSMIC, PipeWire, NetworkManager, catalog wiring
+   planarian.nixosModules.reference   # optional: COSMIC, PipeWire, NetworkManager, a quiet boot
+                                      # behind the planarian splash (planarian.reference.verboseBoot
+                                      # = true for text), catalog wiring
    { services.planarian.enable = true; services.planarian.owner = "/etc/nixos"; }
    # and make yourself an administrator (approve, restart system services, resolve):
    { users.users.<you>.extraGroups = [ "planarian-admin" ]; }
