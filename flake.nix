@@ -12,6 +12,7 @@
     {
       packages = forAll (pkgs: rec {
         planarian = pkgs.callPackage ./nix/package.nix { };
+        console = pkgs.callPackage ./nix/console.nix { };
         default = planarian;
       });
 
@@ -19,6 +20,7 @@
         default = { pkgs, lib, ... }: {
           imports = [ ./nix/module.nix ];
           services.planarian.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          services.planarian.console.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.console;
         };
         reference = ./nix/reference.nix;
       };

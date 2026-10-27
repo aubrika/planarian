@@ -69,7 +69,15 @@ struct Console {
 
 impl Console {
     fn new() -> (Console, Task<Message>) {
-        let c = Console { view: View::Graph, report: None, error: None, selected: None, answer: None, first: true };
+        // `--view timeline|generations|incidents` opens on that view.
+        let arg = std::env::args().skip_while(|a| a != "--view").nth(1).unwrap_or_default();
+        let view = match arg.as_str() {
+            "timeline" => View::Timeline,
+            "generations" => View::Generations,
+            "incidents" => View::Incidents,
+            _ => View::Graph,
+        };
+        let c = Console { view, report: None, error: None, selected: None, answer: None, first: true };
         (c, Task::done(Message::Tick))
     }
 
@@ -181,7 +189,7 @@ impl Console {
                         text(n.unit.to_string()).size(16),
                         text(format!("desired: {}{}", n.desired, if n.expected { "" } else { " (not now)" })).size(14),
                         text(format!("observed: {}", n.observed)).size(14),
-                        text(format!("health: {:?}", n.health)).size(14),
+                        text(format!("health: {}", status_words(&n.health))).size(14),
                         action,
                         text(graph::LEGEND).size(12),
                     ]
@@ -317,16 +325,19 @@ fn incidents<'a>(r: &'a ConsoleReport) -> Element<'a, Message> {
     }
     for i in &r.status.incidents {
         let state = match &i.state {
-            IncidentState::Cooldown { until } => format!("cooling down until {}", until.0 / 1000),
-            IncidentState::Escalated { .. } => "needs a person".into(),
-            s => format!("{s:?}"),
+            IncidentState::Cooldown { until } => format!("cooling down for {}", minutes(until.0, r.now.0)),
+            IncidentState::Escalated { until } => {
+                format!("needs a person (no automatic action for {})", minutes(until.0, r.now.0))
+            }
+            IncidentState::Open => "open".into(),
+            s => format!("{s:?}").to_lowercase(),
         };
         list = list.push(
             text(format!(
-                "#{}  {} — {:?}\n    {state}; {} attempt(s)",
+                "#{}  {} — {}\n    {state}; {} attempt(s)",
                 i.id.0,
                 i.target,
-                i.divergence.1,
+                status_words(&i.divergence.1),
                 i.attempts.len()
             ))
             .size(14),
@@ -345,4 +356,33 @@ fn describe(r: &Response) -> String {
         Response::Ok { message } | Response::Error { message } | Response::Unmatched { message } => message.clone(),
         other => format!("{other:?}"),
     }
+}
+
+/// A unit status in words.
+pub fn status_words(s: &planarian_schema::UnitStatus) -> String {
+    use planarian_schema::{Reason, UnitStatus as S};
+    match s {
+        S::Running => "running".into(),
+        S::Degraded(probes) => {
+            let names: Vec<&str> = probes.iter().map(|p| p.0.as_str()).collect();
+            format!("running, but failing its health check ({})", names.join(", "))
+        }
+        S::Stopped => "stopped".into(),
+        S::Suppressed => "left alone on request".into(),
+        S::Unknown => "unknown (no fresh evidence)".into(),
+        S::Failed(Reason::ExitCode(c)) => format!("failed (exit code {c})"),
+        S::Failed(Reason::DriverError(e)) => format!("failed (driver: {e})"),
+        S::Failed(Reason::Backend(e)) => format!("failed ({e})"),
+        S::Absent => "absent".into(),
+        S::Detected => "detected, no driver bound".into(),
+        S::Bound => "bound to its driver".into(),
+        S::Transitioning => "starting or stopping".into(),
+        S::NotExpected => "not expected now".into(),
+    }
+}
+
+/// "12 min", "1 h 5 min": from `now` until `until`, both in milliseconds.
+fn minutes(until: u64, now: u64) -> String {
+    let m = until.saturating_sub(now).div_ceil(60_000);
+    if m >= 60 { format!("{} h {} min", m / 60, m % 60) } else { format!("{m} min") }
 }

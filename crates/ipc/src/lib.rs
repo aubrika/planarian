@@ -156,6 +156,9 @@ pub struct ConsoleReport {
     pub candidates: Vec<GenerationId>,
     /// The most recent generation change was reverted.
     pub last_change_reverted: bool,
+    /// The daemon's clock when it answered.
+    #[serde(default)]
+    pub now: Timestamp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

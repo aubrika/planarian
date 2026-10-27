@@ -196,6 +196,18 @@ in
       description = "The Planarian package (the flake's module sets it).";
     };
 
+    console = {
+      enable = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Start the read-only console with each graphical session. It starts minimized unless something needs attention.";
+      };
+      package = mkOption {
+        type = types.package;
+        description = "The console package (the flake's module sets it).";
+      };
+    };
+
     owner = mkOption {
       type = types.str;
       default = "/etc/nixos";
@@ -353,6 +365,18 @@ in
         Restart = "always";
         RestartSec = 2;
         StateDirectory = "planarian";
+      };
+    };
+
+    systemd.user.services.planarian-console = mkIf cfg.console.enable {
+      description = "Planarian console";
+      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      after = [ "graphical-session.target" ];
+      serviceConfig = {
+        ExecStart = "${cfg.console.package}/bin/planarian-console";
+        Restart = "on-failure";
+        RestartSec = 5;
       };
     };
 

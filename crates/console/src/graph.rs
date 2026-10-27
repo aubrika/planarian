@@ -243,6 +243,7 @@ mod tests {
             last_booted: Some(GenerationId(1)),
             candidates: vec![],
             last_change_reverted: false,
+            now: Default::default(),
         };
         let p = layout(&r, Size::new(800.0, 600.0));
         assert!(p[&UnitId::service("db")].y < p[&UnitId::service("app")].y);

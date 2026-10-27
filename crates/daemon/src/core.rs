@@ -556,6 +556,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     Some(Observed::Failed(r)) => format!("Failed: {r:?}"),
                     Some(Observed::Unknown { reason, .. }) => format!("Unknown: {reason}"),
                     Some(Observed::Transitioning { .. }) => "Transitioning".to_string(),
+                    // A loaded, inactive service is observed as `Bound`.
+                    Some(Observed::Bound) if u.kind != UnitKind::Device => "Stopped".to_string(),
                     Some(o) => format!("{o:?}"),
                 };
                 GraphNode {
@@ -614,6 +616,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             last_booted: gens.last_booted().ok(),
             candidates: l.live.values().filter_map(|t| t.txn.candidate.as_ref().map(|(g, _)| *g)).collect(),
             last_change_reverted,
+            now: s.observed_at,
         }
     }
 

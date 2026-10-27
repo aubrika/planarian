@@ -43,6 +43,9 @@ in
       script = "${config.networking.networkmanager.package}/bin/nmcli connection up id ${lib.escapeShellArg cfg.wifiNetwork} || true";
     };
 
+    # The console autostarts on the reference desktop (§16a).
+    services.planarian.console.enable = lib.mkDefault true;
+
     services.planarian.catalog = {
       services = {
         sshd = "services.openssh.enable";
