@@ -7,6 +7,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use vstd::prelude::*;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hash(pub [u8; 32]);
@@ -80,39 +81,71 @@ macro_rules! newtype {
     };
 }
 
-newtype!(
-    #[derive(Copy, Default)]
-    GenerationId(u64)
-);
-newtype!(StorePath(String));
 newtype!(ProbeId(String));
-newtype!(ChangeId(String));
 newtype!(
     #[derive(Copy)]
     IncidentId(u64)
 );
 newtype!(
     #[derive(Copy)]
-    TxnId(u64)
-);
-newtype!(
-    #[derive(Copy)]
     PolicyVersion(Hash)
 );
-newtype!(ModelId(String));
-newtype!(SnapshotId(String));
 newtype!(JobId(String));
 
-newtype!(
-    /// Milliseconds since the Unix epoch.
-    #[derive(Copy, Default)]
-    Timestamp(u64)
-);
 newtype!(
     /// A duration in milliseconds.
     #[derive(Copy, Default)]
     Millis(u64)
 );
+
+// The identifiers a `Transition` carries, visible to the `policy` proofs. Serde
+// derives are `external_derive`: Verus does not verify serialization.
+verus! {
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+#[verifier::external_derive]
+pub struct GenerationId(pub u64);
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+#[verifier::external_derive]
+pub struct StorePath(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+#[verifier::external_derive]
+pub struct ChangeId(pub String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+#[verifier::external_derive]
+pub struct TxnId(pub u64);
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+#[verifier::external_derive]
+pub struct ModelId(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+#[verifier::external_derive]
+pub struct SnapshotId(pub String);
+
+/// Milliseconds since the Unix epoch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+#[verifier::external_derive]
+pub struct Timestamp(pub u64);
+
+} // verus!
 
 impl Timestamp {
     pub fn plus(self, d: Millis) -> Timestamp {

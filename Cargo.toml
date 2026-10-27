@@ -45,6 +45,9 @@ sha2 = "0.10"
 crc32c = "0.6"
 rustix = { version = "1", features = ["fs"] }
 tempfile = "3"
+# Verus's standard library, at the version of the pinned Verus commit (docs/pins.md).
+vstd = "=0.0.0-2026-10-25-0158"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_keep_ghost)', 'cfg(verus_keep_ghost_body)'] }

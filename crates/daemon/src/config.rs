@@ -83,7 +83,7 @@ impl FileConfig {
         Tables {
             catalog,
             runtime_allowlist: self.runtime_allowlist.clone(),
-            option_sensitivity: self.option_sensitivity.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            option_sensitivity: self.option_sensitivity.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             model_catalog: Default::default(),
         }
     }

@@ -99,7 +99,7 @@ pub fn predict(t: &Transition, s: &SystemState, defs: &UnitDefs) -> Expectation 
 /// prediction names, must not broaden `may_change`, and must not relax
 /// `others_unchanged`. For generation operations (`others_unchanged = false`
 /// in the prediction) `bound` limits `may_change` instead.
-pub fn refines(claimed: &Expectation, predicted: &Expectation, bound: Option<&BTreeSet<UnitId>>) -> Result<(), String> {
+pub fn refines(claimed: &Expectation, predicted: &Expectation, bound: Option<&[UnitId]>) -> Result<(), String> {
     for (u, st) in &predicted.units {
         if claimed.units.get(u) != Some(st) {
             return Err(format!("expected status of {u} disagrees with the prediction"));
@@ -111,10 +111,12 @@ pub fn refines(claimed: &Expectation, predicted: &Expectation, bound: Option<&BT
     if predicted.others_unchanged && !claimed.others_unchanged {
         return Err("claims others may change where the prediction says they don't".into());
     }
-    let allowed = if predicted.others_unchanged { Some(&predicted.may_change) } else { bound };
-    if let Some(allowed) = allowed
-        && let Some(u) = claimed.may_change.iter().find(|u| !allowed.contains(*u))
-    {
+    let allowed = |u: &UnitId| match (predicted.others_unchanged, bound) {
+        (true, _) => predicted.may_change.contains(u),
+        (false, Some(b)) => b.contains(u),
+        (false, None) => true,
+    };
+    if let Some(u) = claimed.may_change.iter().find(|u| !allowed(u)) {
         return Err(format!("may_change broadened with {u}"));
     }
     Ok(())

@@ -6,7 +6,6 @@ use planarian_policy::Tables;
 use planarian_schema::spec::dependents;
 use planarian_schema::*;
 use planarian_state::Canonical;
-use std::collections::BTreeSet;
 
 pub const CORE_UNITS: [&str; 2] = ["planariad", "planarian-recovery"];
 
@@ -27,7 +26,7 @@ pub fn manifest_of(e: &EvaluatedGeneration) -> Manifest {
     Manifest { units: e.units.clone(), user_units: e.user_units.clone() }
 }
 
-fn unit_facts(units: &BTreeSet<UnitId>, defs: &UnitDefs) -> (Sensitivities, Disruption) {
+fn unit_facts<'a>(units: impl IntoIterator<Item = &'a UnitId>, defs: &UnitDefs) -> (Sensitivities, Disruption) {
     let mut sens = Sensitivities::default();
     let mut disruption = Disruption::None;
     for u in units {
@@ -36,7 +35,7 @@ fn unit_facts(units: &BTreeSet<UnitId>, defs: &UnitDefs) -> (Sensitivities, Disr
             disruption = disruption.max(d.restart_disruption);
         }
         if CORE_UNITS.contains(&u.name.as_str()) {
-            sens.0.insert(Sensitivity::Core);
+            sens.insert(Sensitivity::Core);
         }
     }
     (sens, disruption)
@@ -112,7 +111,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         s
     };
     let mut f = DerivedFacts {
-        affected_units: BTreeSet::new(),
+        affected_units: Vec::new(),
         sensitivity: Sensitivities::of(&[Sensitivity::Routine]),
         disruption: Disruption::None,
         recovery: Recovery::Idempotent,
@@ -124,7 +123,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         config_diff: None,
     };
     let unit_op = |f: &mut DerivedFacts, u: &UnitId, recovery: Recovery| {
-        f.affected_units = one(u);
+        f.affected_units = unit_set(one(u));
         let (s, d) = unit_facts(&f.affected_units, i.defs);
         f.sensitivity = s;
         f.disruption = d;
@@ -138,12 +137,12 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         }
         Transition::Suppress(s) => {
             unit_op(&mut f, &s.unit, Recovery::Idempotent);
-            f.affected_units = [s.unit.clone()].into();
+            f.affected_units = vec![s.unit.clone()];
             f.disruption = Disruption::None;
         }
         Transition::Unsuppress(u) => {
             unit_op(&mut f, u, Recovery::Idempotent);
-            f.affected_units = [u.clone()].into();
+            f.affected_units = vec![u.clone()];
             f.disruption = Disruption::None;
         }
         Transition::BindDriver { device, .. } => unit_op(&mut f, device, Recovery::Revertible),
@@ -181,7 +180,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             f.touches_canonical_probe = touches_canonical(&base_m, &cand_m, i.canonical);
             f.changes_desired = changes_desired(&base_m, &cand_m);
             f.touches_core = cand.core_units != i.base.core_units || f.sensitivity.contains(Sensitivity::Core);
-            f.affected_units = affected;
+            f.affected_units = unit_set(affected);
             f.config_diff = (!config.options.is_empty()).then_some(config);
         }
     }

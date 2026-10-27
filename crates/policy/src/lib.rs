@@ -73,7 +73,7 @@ impl Tables {
             .iter()
             .filter(|(prefix, _)| path == prefix || path.starts_with(&format!("{prefix}.")))
             .max_by_key(|(prefix, _)| prefix.len())
-            .map(|(_, s)| s.clone())
+            .map(|(_, s)| *s)
             .unwrap_or_else(|| Sensitivities::of(&[Sensitivity::Routine]))
     }
 

@@ -116,7 +116,7 @@ impl Rig {
 
 pub fn facts(caller: Actor) -> DerivedFacts {
     DerivedFacts {
-        affected_units: BTreeSet::new(),
+        affected_units: Vec::new(),
         sensitivity: Sensitivities::default(),
         disruption: Disruption::Brief,
         recovery: Recovery::Revertible,

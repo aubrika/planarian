@@ -278,7 +278,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
 
         // §12 step 3: `expected` must refine the spec's prediction.
         let predicted = predict(&transition, state, defs);
-        if let Err(e) = refines(&p.expected, &predicted, Some(&plan.facts.affected_units)) {
+        if let Err(e) = refines(&p.expected, &predicted, Some(plan.facts.affected_units.as_slice())) {
             self.release(&plan);
             return Err(reject(RejectReason::Refinement, e));
         }

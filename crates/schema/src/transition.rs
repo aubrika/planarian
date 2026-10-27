@@ -1,10 +1,12 @@
 //! Transitions, decisions, derived facts and proposals (§8).
 
 use crate::ids::{ChangeId, GenerationId, Hash, IncidentId, Millis, ModelId, SnapshotId, StorePath, TxnId};
+use crate::pathmap::PathMap;
 use crate::state::{SystemState, UnitStatus};
 use crate::unit::{Actor, Disruption, Recovery, Sensitivities, Suppression, UnitDefs, UnitId, Until};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use vstd::prelude::*;
 
 /// An option value in the override file or a catalog argument. There is no
 /// float variant: fractional settings (font scale) are carried as strings
@@ -18,49 +20,45 @@ pub enum Value {
     List(Vec<Value>),
 }
 
+// The types `policy::decide` reads, visible to its proofs. `Value` stays
+// opaque to them: the proofs never look inside an option value.
+verus! {
+
+#[verifier::external_type_specification]
+#[verifier::external_body]
+#[allow(dead_code)]
+pub struct ExValue(Value);
+
 /// Option path → (before, after). `None` means unset.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
 pub struct ConfigDiff {
-    pub options: BTreeMap<String, (Option<Value>, Option<Value>)>,
-}
-
-impl ConfigDiff {
-    /// Compose `self` then `next`: keep the earliest `before` and the latest `after`;
-    /// drop entries that end where they began.
-    pub fn then(&self, next: &ConfigDiff) -> ConfigDiff {
-        let mut out = self.options.clone();
-        for (path, (before, after)) in &next.options {
-            let first = match out.get(path) {
-                Some((b, _)) => b.clone(),
-                None => before.clone(),
-            };
-            out.insert(path.clone(), (first, after.clone()));
-        }
-        out.retain(|_, (b, a)| b != a);
-        ConfigDiff { options: out }
-    }
-
-    pub fn hash(&self) -> Hash {
-        Hash::of(&serde_json::to_vec(self).expect("diff serializes"))
-    }
+    pub options: PathMap<(Option<Value>, Option<Value>)>,
 }
 
 /// An in-tree driver is named (`snd_hda_intel`); an out-of-tree one also names
 /// the module's store path. Replaces §8's bare `StorePath` (G6).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
 pub struct DriverRef {
     pub name: String,
     pub module: Option<StorePath>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
 pub enum Resolution {
     AsCommitted,
     AsReverted,
     ManualRepaired,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
 pub enum Transition {
     RestartUnit(UnitId),
     StopUnit(UnitId),
@@ -105,6 +103,119 @@ pub enum Transition {
         txn: TxnId,
         resolution: Resolution,
     },
+}
+
+/// Ordered; the autonomy setting compares with `>` (`rank` in proofs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum Tier {
+    Observe,
+    Runtime,
+    Tested,
+    AskFirst,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum Decision {
+    Allow(Tier),
+    Reject(RejectReason),
+}
+
+/// `Unauthorized`, `Interrupted` and `NoSpace` are used by §11, §12 and §12c
+/// but were missing from §8 (G1). `Refinement` names the §12 step 3 rejection.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum RejectReason {
+    Forbidden,
+    CoreTarget,
+    ProbeTamper,
+    NotInCatalog,
+    LockedOption,
+    Stale,
+    Unauthorized,
+    Interrupted,
+    NoSpace,
+    Refinement,
+    ApprovalExpired,
+    Other(String),
+}
+
+/// Derived by the executor from the evaluated generation, never from the
+/// proposal (I14).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub struct DerivedFacts {
+    /// Sorted and unique (`unit_set`).
+    pub affected_units: Vec<UnitId>,
+    pub sensitivity: Sensitivities,
+    pub disruption: Disruption,
+    pub recovery: Recovery,
+    pub touches_manifest: bool,
+    /// A canonical probe's *definition* changed (protected by I10).
+    pub touches_canonical_probe: bool,
+    /// Which units are desired-present changed; makes probes (in)applicable.
+    /// Not tampering (§9; missing from §8, G2).
+    pub changes_desired: bool,
+    pub touches_core: bool,
+    pub caller: Actor,
+    pub config_diff: Option<ConfigDiff>,
+}
+
+impl Tier {
+    /// Observe 0, Runtime 1, Tested 2, AskFirst 3: the derived `Ord`.
+    pub open spec fn rank(self) -> u8 {
+        match self {
+            Tier::Observe => 0,
+            Tier::Runtime => 1,
+            Tier::Tested => 2,
+            Tier::AskFirst => 3,
+        }
+    }
+
+    pub fn rank_of(&self) -> (r: u8)
+        ensures r == self.rank(),
+    {
+        match self {
+            Tier::Observe => 0,
+            Tier::Runtime => 1,
+            Tier::Tested => 2,
+            Tier::AskFirst => 3,
+        }
+    }
+}
+
+} // verus!
+
+/// Sorted, without duplicates: the form of `DerivedFacts::affected_units`.
+pub fn unit_set(units: impl IntoIterator<Item = UnitId>) -> Vec<UnitId> {
+    let set: BTreeSet<UnitId> = units.into_iter().collect();
+    set.into_iter().collect()
+}
+
+impl ConfigDiff {
+    /// Compose `self` then `next`: keep the earliest `before` and the latest `after`;
+    /// drop entries that end where they began.
+    pub fn then(&self, next: &ConfigDiff) -> ConfigDiff {
+        let mut out = self.options.clone();
+        for (path, (before, after)) in &next.options {
+            let first = match out.get(path) {
+                Some((b, _)) => b.clone(),
+                None => before.clone(),
+            };
+            out.insert(path.clone(), (first, after.clone()));
+        }
+        out.retain(|_, (b, a)| b != a);
+        ConfigDiff { options: out }
+    }
+
+    pub fn hash(&self) -> Hash {
+        Hash::of(&serde_json::to_vec(self).expect("diff serializes"))
+    }
 }
 
 /// Per-transition recovery strategy, fixed by the spec, not the proposer (§12).
@@ -161,58 +272,6 @@ impl Transition {
     pub fn changes_generation(&self) -> bool {
         matches!(self.recovery(), RecoveryStrategy::RevertGeneration | RecoveryStrategy::RestoreSnapshotThenRevert)
     }
-}
-
-/// Ordered; the autonomy setting compares with `>`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Tier {
-    Observe,
-    Runtime,
-    Tested,
-    AskFirst,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Decision {
-    Allow(Tier),
-    Reject(RejectReason),
-}
-
-/// `Unauthorized`, `Interrupted` and `NoSpace` are used by §11, §12 and §12c
-/// but were missing from §8 (G1). `Refinement` names the §12 step 3 rejection.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum RejectReason {
-    Forbidden,
-    CoreTarget,
-    ProbeTamper,
-    NotInCatalog,
-    LockedOption,
-    Stale,
-    Unauthorized,
-    Interrupted,
-    NoSpace,
-    Refinement,
-    ApprovalExpired,
-    Other(String),
-}
-
-/// Derived by the executor from the evaluated generation, never from the
-/// proposal (I14).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DerivedFacts {
-    pub affected_units: BTreeSet<UnitId>,
-    pub sensitivity: Sensitivities,
-    pub disruption: Disruption,
-    pub recovery: Recovery,
-    pub touches_manifest: bool,
-    /// A canonical probe's *definition* changed (protected by I10).
-    pub touches_canonical_probe: bool,
-    /// Which units are desired-present changed; makes probes (in)applicable.
-    /// Not tampering (§9; missing from §8, G2).
-    pub changes_desired: bool,
-    pub touches_core: bool,
-    pub caller: Actor,
-    pub config_diff: Option<ConfigDiff>,
 }
 
 /// What evaluating a staged source yields (§9 step 2).

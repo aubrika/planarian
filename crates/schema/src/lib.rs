@@ -2,10 +2,13 @@
 //! No I/O. Intended for the Verus subset: no `dyn`, no `unsafe`, no floats,
 //! integer time.
 
+#![cfg_attr(verus_keep_ghost, verifier::allow(autoderive_clone_without_spec))]
+
 pub mod backend;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 pub mod ids;
+pub mod pathmap;
 pub mod spec;
 pub mod state;
 pub mod transition;
@@ -14,6 +17,7 @@ pub mod unit;
 
 pub use backend::*;
 pub use ids::*;
+pub use pathmap::PathMap;
 pub use state::*;
 pub use transition::*;
 pub use txn::*;

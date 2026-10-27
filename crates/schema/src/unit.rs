@@ -5,6 +5,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
+use vstd::prelude::*;
+
+// The unit and risk types `policy` reads, visible to its proofs.
+verus! {
 
 /// Written `<kind>:<name>` for system scope and `<kind>@<uid>[/<session>]:<name>`
 /// for user scope, e.g. `service:sshd`, `service@1000:pipewire`,
@@ -17,17 +21,187 @@ pub struct UnitId {
 }
 
 /// `Target` is not in §8; added for units such as `graphical-session` (G4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
 pub enum UnitKind {
     Service,
     Device,
     Target,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
 pub enum Scope {
     System,
     User { uid: u32, session: Option<String> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum Actor {
+    Daemon,
+    Watchdog,
+    User { uid: u32 },
+    Model(crate::ids::ModelId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub struct Suppression {
+    pub unit: UnitId,
+    pub until: Until,
+    pub reason: String,
+    /// Always overwritten by the daemon from the caller's credentials (§11).
+    pub by: Actor,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum Until {
+    At(Timestamp),
+    NextBoot,
+    Explicit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum Sensitivity {
+    Routine,
+    Security,
+    UserData,
+    External,
+    Core,
+}
+
+/// Ordered by how much it costs the user; §11 compares with `>=`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum Disruption {
+    None,
+    Brief,
+    SessionLoss,
+    DataInterruption,
+    ConnectivityLoss,
+}
+
+/// Ordered from most to least reversible (§13 step 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum Recovery {
+    Idempotent,
+    Revertible,
+    NonReversible,
+}
+
+/// A set of `Sensitivity` values, as flags so the proofs can read it.
+/// Serialized as the list of members in declaration order, as the
+/// `BTreeSet` it replaces was.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Sensitivities {
+    pub routine: bool,
+    pub security: bool,
+    pub user_data: bool,
+    pub external: bool,
+    pub core: bool,
+}
+
+impl Sensitivities {
+    pub open spec fn has(self, s: Sensitivity) -> bool {
+        match s {
+            Sensitivity::Routine => self.routine,
+            Sensitivity::Security => self.security,
+            Sensitivity::UserData => self.user_data,
+            Sensitivity::External => self.external,
+            Sensitivity::Core => self.core,
+        }
+    }
+
+    /// Nothing but `Routine` is present (an empty set counts as Routine).
+    pub open spec fn routine_only(self) -> bool {
+        !self.security && !self.user_data && !self.external && !self.core
+    }
+
+    pub fn contains(&self, s: Sensitivity) -> (r: bool)
+        ensures r == self.has(s),
+    {
+        match s {
+            Sensitivity::Routine => self.routine,
+            Sensitivity::Security => self.security,
+            Sensitivity::UserData => self.user_data,
+            Sensitivity::External => self.external,
+            Sensitivity::Core => self.core,
+        }
+    }
+
+    pub fn only_routine(&self) -> (r: bool)
+        ensures r == self.routine_only(),
+    {
+        !self.security && !self.user_data && !self.external && !self.core
+    }
+
+    pub fn union(&self, other: &Sensitivities) -> (r: Sensitivities)
+        ensures forall|s: Sensitivity| #[trigger] r.has(s) == (self.has(s) || other.has(s)),
+    {
+        Sensitivities {
+            routine: self.routine || other.routine,
+            security: self.security || other.security,
+            user_data: self.user_data || other.user_data,
+            external: self.external || other.external,
+            core: self.core || other.core,
+        }
+    }
+
+    pub fn insert(&mut self, s: Sensitivity)
+        ensures forall|t: Sensitivity| #[trigger] final(self).has(t) == (old(self).has(t) || t == s),
+    {
+        match s {
+            Sensitivity::Routine => self.routine = true,
+            Sensitivity::Security => self.security = true,
+            Sensitivity::UserData => self.user_data = true,
+            Sensitivity::External => self.external = true,
+            Sensitivity::Core => self.core = true,
+        }
+    }
+}
+
+} // verus!
+
+impl Sensitivities {
+    pub const ALL: [Sensitivity; 5] =
+        [Sensitivity::Routine, Sensitivity::Security, Sensitivity::UserData, Sensitivity::External, Sensitivity::Core];
+
+    pub fn of(items: &[Sensitivity]) -> Sensitivities {
+        let mut out = Sensitivities::default();
+        for s in items {
+            out.insert(*s);
+        }
+        out
+    }
+
+    /// Members in declaration order.
+    pub fn members(&self) -> Vec<Sensitivity> {
+        Self::ALL.into_iter().filter(|s| self.contains(*s)).collect()
+    }
+}
+
+impl Serialize for Sensitivities {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.members().serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Sensitivities {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Sensitivities::of(&Vec::<Sensitivity>::deserialize(d)?))
+    }
 }
 
 impl UnitId {
@@ -110,14 +284,6 @@ impl<'de> Deserialize<'de> for UnitId {
 
 // ---------- Actors ----------
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Actor {
-    Daemon,
-    Watchdog,
-    User { uid: u32 },
-    Model(crate::ids::ModelId),
-}
-
 // ---------- Desired ----------
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -162,22 +328,6 @@ pub enum DesiredStatus {
 pub struct Desired {
     pub status: DesiredStatus,
     pub when: Condition,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Suppression {
-    pub unit: UnitId,
-    pub until: Until,
-    pub reason: String,
-    /// Always overwritten by the daemon from the caller's credentials (§11).
-    pub by: Actor,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum Until {
-    At(Timestamp),
-    NextBoot,
-    Explicit,
 }
 
 impl Suppression {
@@ -228,56 +378,6 @@ pub enum EdgeOrigin {
 }
 
 // ---------- Risk metadata ----------
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Sensitivity {
-    Routine,
-    Security,
-    UserData,
-    External,
-    Core,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Sensitivities(pub BTreeSet<Sensitivity>);
-
-impl Sensitivities {
-    pub fn of(items: &[Sensitivity]) -> Sensitivities {
-        Sensitivities(items.iter().copied().collect())
-    }
-
-    pub fn contains(&self, s: Sensitivity) -> bool {
-        self.0.contains(&s)
-    }
-
-    /// True when nothing but `Routine` is present (an empty set counts as Routine).
-    pub fn only_routine(&self) -> bool {
-        self.0.iter().all(|s| *s == Sensitivity::Routine)
-    }
-
-    pub fn union(&self, other: &Sensitivities) -> Sensitivities {
-        Sensitivities(self.0.union(&other.0).copied().collect())
-    }
-}
-
-/// Ordered by how much it costs the user; §11 compares with `>=`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Disruption {
-    None,
-    Brief,
-    SessionLoss,
-    DataInterruption,
-    ConnectivityLoss,
-}
-
-/// Ordered from most to least reversible (§13 step 3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Recovery {
-    Idempotent,
-    Revertible,
-    NonReversible,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemdRestartPolicy {
