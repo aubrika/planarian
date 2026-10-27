@@ -58,7 +58,7 @@ let
     Things to try:
 
       planarian status                  what Planarian sees
-      planarian-console                 the console window (desktop only)
+      planarian-console                 the console (on the desktop it starts minimized in the dock)
       ask "restart the web server"      the intent front-end
       ask "make text bigger"            a generation change: built, tested, committed
       planarian apply service-enable service=gym-extra enabled=true
@@ -115,6 +115,9 @@ in
     services.desktopManager.cosmic.enable = cfg.desktop;
     services.displayManager.cosmic-greeter.enable = cfg.desktop;
     services.displayManager.autoLogin = lib.mkIf cfg.desktop { enable = true; user = "demo"; };
+    # No first-run wizard: the VM should open straight onto the desktop.
+    environment.cosmic.excludePackages = lib.mkIf cfg.desktop [ pkgs.cosmic-initial-setup ];
+    services.desktopManager.cosmic.showExcludedPkgsWarning = false;
     services.getty.autologinUser = lib.mkIf (!cfg.desktop) "demo";
     services.pipewire.enable = lib.mkIf (!cfg.desktop) false;
     services.planarian.console.enable = cfg.desktop;
@@ -127,6 +130,19 @@ in
     };
     users.users.root.initialPassword = "planarian";
     users.motd = welcome;
+    # On the desktop, a terminal with the same text opens at login (XDG
+    # autostart, so it starts inside the session once the compositor is up).
+    environment.etc."xdg/autostart/planarian-demo-welcome.desktop" = lib.mkIf cfg.desktop {
+      text = ''
+        [Desktop Entry]
+        Type=Application
+        Name=Planarian demo
+        Exec=${pkgs.cosmic-term}/bin/cosmic-term -e ${pkgs.writeShellScript "planarian-demo-welcome" ''
+          cat /etc/planarian-demo/WELCOME
+          exec ${pkgs.bashInteractive}/bin/bash -l
+        ''}
+      '';
+    };
     environment.etc."planarian-demo/WELCOME".text = welcome;
 
     # Fixtures (the gym catalog's): a web server with a health probe, a

@@ -38,9 +38,9 @@ host's network).
 - State lives in `planarian-vm.qcow2` in the directory you ran it from.
   Delete it to start over. Delete it too after updating Planarian, since the
   old disk's `/etc/nixos` still points at the old version.
-- Generations built inside survive a restart of the VM, but the VM always
-  boots the system it was launched with, so Planarian will report
-  that the booted generation differs from the one it published.
+- Generations built inside survive a restart of the VM, but the VM has no
+  boot loader: it always boots the system it was launched with, not the
+  newest generation Planarian published.
 - The text variant's terminal is the serial console: `Ctrl-a x` quits QEMU.
 
 ## Trying it on your machine
