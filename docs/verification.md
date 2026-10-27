@@ -6,12 +6,15 @@ What the Verus proofs establish, what they trust, and how to run them
 ## Running
 
 ```
-cargo verus verify -p planarian-policy    # also verifies planarian-schema
+nix build .#checks.x86_64-linux.verus     # in the Nix sandbox, pinned Verus
+cargo verus verify -p planarian-policy    # with a local Verus; also verifies planarian-schema
 ```
 
-`cargo verus` comes with Verus (built from source at the commit in
-`pins.md`; set `VERUS_Z3_PATH` to z3 4.16.0). The crates also build with
-plain `cargo`, which erases the proof code: `vstd` is an ordinary dependency.
+The flake check uses Verus's published release and the Rust toolchain it
+was built against (`nix/verus.nix`, pins in `pins.md`). It fails if any
+proof obligation fails: dropping the cumulative check from `decide` makes
+it fail. The crates also build with plain `cargo`, which erases the proof
+code: `vstd` is an ordinary dependency.
 
 ## `policy` (Phase A target: done)
 

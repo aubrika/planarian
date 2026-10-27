@@ -29,6 +29,6 @@ Checks and where they run:
 - `nix build .#checks.x86_64-linux.module-eval`: evaluates a full NixOS system with the module and asserts on the exported manifest.
 - `nix build .#checks.x86_64-linux.vm-runtime`: a NixOS VM on real systemd. Needs KVM to be fast; without KVM it runs under emulation in about 20–30 minutes.
 
-- `cargo verus verify -p planarian-policy`: `decide` verified and the §17a policy properties proved (37 verified). See `docs/verification.md`.
+- `nix build .#checks.x86_64-linux.verus`: `decide` verified and the §17a policy properties proved, in the Nix sandbox with the pinned Verus. See `docs/verification.md`.
 
-**Not yet done:** Verus proofs for `txn` and `schema`, and Verus in CI (item 9); the console; §12b space budgets; the VM harness for generation changes (needs an owner flake that can build inside the VM).
+**Not yet done:** Verus proofs for `txn` and `schema::digest` (item 9); the console; §12b space budgets; the VM harness for generation changes (needs an owner flake that can build inside the VM).

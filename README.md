@@ -94,6 +94,7 @@ crates/gym/demo.sh --harness fake            # the GA demonstration
 nix build .#checks.x86_64-linux.package      # package + tests in the Nix sandbox
 nix build .#checks.x86_64-linux.module-eval  # a full NixOS system evaluated with the module
 nix build .#checks.x86_64-linux.vm-runtime   # NixOS VM test on real systemd (KVM recommended)
+nix build .#checks.x86_64-linux.verus        # the Verus proofs (docs/verification.md)
 ```
 
 License: [MPL-2.0](LICENSE).
