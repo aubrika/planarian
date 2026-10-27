@@ -13,3 +13,6 @@ sha2.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+fixtures = []

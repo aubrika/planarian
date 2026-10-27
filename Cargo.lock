@@ -129,6 +129,52 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "planarian-changes"
+version = "0.0.0"
+dependencies = [
+ "planarian-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "planarian-diagnose"
+version = "0.0.0"
+dependencies = [
+ "planarian-incident",
+ "planarian-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "planarian-incident"
+version = "0.0.0"
+dependencies = [
+ "planarian-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "planarian-intent"
+version = "0.0.0"
+dependencies = [
+ "planarian-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "planarian-policy"
+version = "0.0.0"
+dependencies = [
+ "planarian-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "planarian-schema"
 version = "0.0.0"
 dependencies = [

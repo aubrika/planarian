@@ -1,0 +1,15 @@
+[package]
+name = "planarian-policy"
+description = "Planarian policy: the pure decision function (SPEC §11)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+planarian-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

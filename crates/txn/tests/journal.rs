@@ -26,6 +26,7 @@ fn history() -> Vec<Entry> {
             Timestamp(2_000_000),
             Record::Incident(Incident {
                 id: IncidentId(7),
+                kind: IncidentKind::Repair,
                 target: UnitId::service("gym-flap"),
                 divergence: (DesiredStatus::Running, UnitStatus::Failed(Reason::ExitCode(1))),
                 opened: Timestamp(1_000_000),
@@ -33,6 +34,8 @@ fn history() -> Vec<Entry> {
                 budget_left: 0,
                 state: IncidentState::Cooldown { until: Timestamp(9_000_000) },
                 backoff: Millis::secs(300),
+                next_attempt: Timestamp(9_000_000),
+                regressions: 0,
             }),
         )
         .unwrap();

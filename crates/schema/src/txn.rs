@@ -165,15 +165,33 @@ pub struct Session {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IncidentState {
     Open,
-    Cooldown { until: Timestamp },
-    Escalated,
+    Cooldown {
+        until: Timestamp,
+    },
+    /// Reported to the user; no autonomous action until `until` or a human acts.
+    /// `until` is not in §8; without it the hold could not survive a restart.
+    Escalated {
+        until: Timestamp,
+    },
     Closed,
-    Regressed { count: u8 },
+    Regressed {
+        count: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IncidentKind {
+    /// A divergence to repair.
+    Repair,
+    /// Three consecutive Unknowns (§10): re-observe through another Readiness
+    /// probe; never a restart.
+    Diagnostic,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Incident {
     pub id: IncidentId,
+    pub kind: IncidentKind,
     pub target: UnitId,
     pub divergence: (DesiredStatus, UnitStatus),
     pub opened: Timestamp,
@@ -182,4 +200,9 @@ pub struct Incident {
     pub budget_left: u8,
     pub state: IncidentState,
     pub backoff: Millis,
+    /// Earliest time of the next attempt (backoff and defer-to-systemd).
+    /// Not in §8; persisted so a restart does not reset the backoff.
+    pub next_attempt: Timestamp,
+    /// How often this target regressed within the window (§13).
+    pub regressions: u8,
 }

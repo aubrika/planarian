@@ -3,7 +3,10 @@
 //! integer time.
 
 pub mod backend;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
 pub mod ids;
+pub mod spec;
 pub mod state;
 pub mod transition;
 pub mod txn;
