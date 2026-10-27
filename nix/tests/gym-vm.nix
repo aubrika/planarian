@@ -178,7 +178,9 @@ let
       networking.networkmanager.unmanaged = [ "type:ethernet" ];
       services.pipewire = { enable = true; pulse.enable = true; };
       networking.firewall.enable = false;
-      networking.interfaces.eth1.ipv4.addresses = lib.mkAfter [ { address = "10.0.2.15"; prefixLength = 24; } ];
+      # The catalog's upstream is "the VM host" at 10.0.2.2, which on eth0 is QEMU's
+      # user-mode gateway; a host route sends it to the upstream node instead.
+      networking.interfaces.eth1.ipv4.routes = [ { address = "10.0.2.2"; prefixLength = 32; } ];
 
       users.users = {
         alice = { isNormalUser = true; uid = 1000; };
@@ -274,7 +276,8 @@ let
       name = "gym-${id}";
       nodes.machine = machineModule;
       nodes.upstream = { pkgs, ... }: {
-        networking.interfaces.eth1.ipv4.addresses = lib.mkAfter [ { address = "10.0.2.2"; prefixLength = 24; } ];
+        networking.interfaces.eth1.ipv4.addresses = lib.mkAfter [ { address = "10.0.2.2"; prefixLength = 32; } ];
+        environment.etc.health.text = "ok\n";
         networking.firewall.enable = false;
         systemd.services.gym-upstream = {
           wantedBy = [ "multi-user.target" ];

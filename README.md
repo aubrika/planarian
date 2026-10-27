@@ -81,8 +81,30 @@ from it (UEFI or BIOS) and you get the same demo as the VM: COSMIC, the
 console, the welcome terminal, `demo-fault`. It runs entirely in RAM, so
 changes Planarian makes are real rebuilds (with a network), and everything
 is gone at the next boot. Give it at least 8 GB of RAM if you want to try
-configuration changes. It does not install anything; to keep Planarian,
-install NixOS and follow the next section.
+configuration changes.
+
+## Installing it
+
+The same USB stick installs it. From the live system, open **Install
+Planarian** (or run `sudo planarian-install` in a terminal). It asks for a
+disk, a filesystem (ext4 or btrfs), a computer name, your user name and a
+password, then **erases that disk** and installs NixOS with Planarian, COSMIC
+and the reference configuration. Your user is an administrator
+(`planarian-admin`): you approve the changes Planarian asks about.
+
+- `/etc/nixos` is the installed computer's flake: edit `configuration.nix`;
+  Planarian edits only `planarian/overrides.nix`. It is pinned to the nixpkgs
+  and Planarian the stick was built from, and both sources stay on disk, so
+  Planarian can rebuild without a network. (While the repository is
+  private, `nix flake update` there needs the credentials above.)
+- Installing copies most of the system from the stick; anything missing
+  (firmware, drivers for your hardware) comes from cache.nixos.org, so plug
+  in a network.
+- UEFI machines boot with systemd-boot, BIOS machines with GRUB.
+- On btrfs, the installer turns off copy-on-write for Planarian's journal
+  directory, which its recovery guarantee needs (SPEC §12c). ZFS isn't offered.
+- Unattended: `planarian-install --disk /dev/nvme0n1 --fs btrfs --hostname
+  laptop --user ana --password-file pw --yes`.
 
 It boots quietly behind the planarian splash. Press Esc during boot to see
 the messages, or pick **verbose boot** in the boot menu.

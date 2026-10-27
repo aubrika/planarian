@@ -1,13 +1,34 @@
 # The live USB image (`nix build .#iso`): the demo machine (nix/demo/common.nix)
 # booting from a flash drive on real hardware. Everything lives in RAM: changes
 # Planarian makes are real rebuilds, and all of it is gone at the next boot.
-{ lib, modulesPath, ... }:
+# It is also the installer: `planarian-install` (nix/installer) puts NixOS
+# with Planarian and the reference desktop on a disk.
+{ lib, pkgs, modulesPath, ... }:
 
 {
   imports = [
     (modulesPath + "/installer/cd-dvd/iso-image.nix")
     (modulesPath + "/profiles/all-hardware.nix")
     ../demo/common.nix
+    ../installer
+  ];
+
+  environment.etc."planarian-demo/WELCOME".text = lib.mkAfter ''
+    To install on this computer's disk: sudo planarian-install
+    (or "Install Planarian" in the applications).
+  '';
+  users.motd = lib.mkAfter ''
+    To install on this computer's disk: sudo planarian-install
+  '';
+  environment.systemPackages = [
+    (pkgs.makeDesktopItem {
+      name = "planarian-install";
+      desktopName = "Install Planarian";
+      comment = "Install NixOS with Planarian on this computer";
+      icon = "planarian";
+      exec = "cosmic-term -e sudo planarian-install";
+      categories = [ "System" ];
+    })
   ];
 
   planarian.demo = { module = "live"; name = "live system"; };
@@ -25,7 +46,8 @@
     volumeID = "PLANARIAN_LIVE";
     makeEfiBootable = true;
     makeUsbBootable = true;
-    # "planarian live: NixOS 26.05…", not "… Installer": it installs nothing.
+    # "planarian live: NixOS 26.05…", not "… Installer": it boots into the
+    # demo, and installing is a choice made from there.
     # (ASCII only: the boot loaders' fonts have no dashes.)
     prependToMenuLabel = "planarian live: ";
     appendToMenuLabel = "";
