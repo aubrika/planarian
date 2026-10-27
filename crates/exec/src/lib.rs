@@ -283,17 +283,18 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             return Err(reject(RejectReason::Refinement, e));
         }
 
-        let empty = Default::default();
-        let locked = plan.cand_eval.as_ref().map(|e| &e.locked).unwrap_or(&empty);
+        let locked: Vec<String> =
+            plan.cand_eval.as_ref().map(|e| e.locked.iter().cloned().collect()).unwrap_or_default();
         plan.decision = decide(&Input {
             transition: &transition,
             facts: &plan.facts,
-            state,
-            session: &self.session,
+            known_good: state.known_good,
+            live_tested: state.live_tested,
+            cumulative: &self.session.cumulative,
             authz,
             settings: &self.cfg.settings,
             tables: &self.cfg.tables,
-            locked,
+            locked: &locked,
             revert_to: None,
         });
         Ok(plan)

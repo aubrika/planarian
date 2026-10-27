@@ -49,9 +49,9 @@ impl Default for FileConfig {
             flake_attr: "nixosConfigurations.default".into(),
             state_dir: "/var/lib/planarian".into(),
             max_tier: Tier::Tested,
-            user_controllable_units: s.user_controllable_units,
+            user_controllable_units: s.user_controllable_units.into_iter().collect(),
             user_controllable_changes: s.user_controllable_changes.into_iter().map(|c| c.0).collect(),
-            user_controllable_options: s.user_controllable_options,
+            user_controllable_options: s.user_controllable_options.into_iter().collect(),
             runtime_allowlist: ["font.scale", "wifi.network"].map(String::from).into(),
             option_sensitivity: BTreeMap::new(),
             catalog: CatalogConfig::default(),
@@ -72,9 +72,9 @@ impl FileConfig {
     pub fn settings(&self) -> Settings {
         Settings {
             max_tier: self.max_tier.min(Tier::Tested),
-            user_controllable_units: self.user_controllable_units.clone(),
+            user_controllable_units: self.user_controllable_units.iter().cloned().collect(),
             user_controllable_changes: self.user_controllable_changes.iter().map(|c| ChangeId(c.clone())).collect(),
-            user_controllable_options: self.user_controllable_options.clone(),
+            user_controllable_options: self.user_controllable_options.iter().cloned().collect(),
         }
     }
 
@@ -82,7 +82,7 @@ impl FileConfig {
         let catalog = planarian_changes::entries(&self.catalog).into_iter().map(|e| e.id).collect();
         Tables {
             catalog,
-            runtime_allowlist: self.runtime_allowlist.clone(),
+            runtime_allowlist: self.runtime_allowlist.iter().cloned().collect(),
             option_sensitivity: self.option_sensitivity.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             model_catalog: Default::default(),
         }

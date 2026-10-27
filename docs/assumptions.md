@@ -2,7 +2,17 @@
 
 Every externally specified behavior the proofs rely on (SPEC §17a). Each Verus `assume` / `external_body` site gets a line here in the same PR that adds it (SPEC §18.11).
 
-The `policy` proofs (`crates/policy/verus/policy.rs`) use no `assume` and no `external_body`.
+## Verified code (`policy`, `schema`)
+
+No `assume` and no `external_body` function. Trusted instead:
+
+| Trusted | Sites |
+| --- | --- |
+| vstd's specifications of `Vec`, `String::as_str`, `str::unicode_len`, `str::get_char` | `policy` string helpers |
+| `Value` is an opaque external type (`external_type_specification`); nothing about it is assumed | `schema::transition` |
+| Serde impls are unverified (`external_derive`) | `schema`, `policy` |
+
+See `verification.md` for what is proved.
 
 ## Phase A: stated in SPEC §17a, not yet bound to proof sites
 
