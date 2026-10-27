@@ -10,6 +10,10 @@ rust-version.workspace = true
 name = "planarian_daemon"
 path = "src/lib.rs"
 
+[[bin]]
+name = "planariad"
+path = "src/main.rs"
+
 [dependencies]
 planarian-schema.workspace = true
 planarian-txn.workspace = true
@@ -21,6 +25,8 @@ planarian-diagnose.workspace = true
 planarian-intent.workspace = true
 planarian-exec.workspace = true
 planarian-ipc.workspace = true
+planarian-backend-linux.workspace = true
+rustix = { version = "1", features = ["net"] }
 serde.workspace = true
 serde_json.workspace = true
 

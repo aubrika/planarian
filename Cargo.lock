@@ -151,9 +151,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "planarian-cli"
+version = "0.0.0"
+dependencies = [
+ "planarian-ipc",
+ "planarian-schema",
+ "serde_json",
+]
+
+[[package]]
 name = "planarian-daemon"
 version = "0.0.0"
 dependencies = [
+ "planarian-backend-linux",
  "planarian-changes",
  "planarian-diagnose",
  "planarian-exec",
@@ -165,6 +175,7 @@ dependencies = [
  "planarian-schema",
  "planarian-state",
  "planarian-txn",
+ "rustix",
  "serde",
  "serde_json",
 ]
@@ -269,6 +280,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "planarian-watchdog"
+version = "0.0.0"
+dependencies = [
+ "planarian-backend-linux",
+ "planarian-daemon",
+ "planarian-exec",
+ "planarian-schema",
+ "planarian-txn",
 ]
 
 [[package]]

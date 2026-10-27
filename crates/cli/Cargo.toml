@@ -1,0 +1,19 @@
+[package]
+name = "planarian-cli"
+description = "planarian and ask: the command line (SPEC §16)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "planarian"
+path = "src/main.rs"
+
+[dependencies]
+planarian-schema.workspace = true
+planarian-ipc.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
