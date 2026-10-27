@@ -166,6 +166,7 @@ pub fn txn(transition: Transition, caller: Actor) -> Transaction {
         deadline: Timestamp(1_000_000 + 15 * 60 * 1000),
         revert_to: G1,
         prior_driver: None,
+        check: CheckContext::default(),
     }
 }
 

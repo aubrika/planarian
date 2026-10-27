@@ -114,6 +114,25 @@ pub struct Transaction {
     /// For `BindDriver`: the driver bound at Prepared, rebound on revert (§12
     /// execution table). Not in §8 (G12).
     pub prior_driver: Option<DriverRef>,
+    /// What the probe check needs, journaled so the watchdog can run it alone.
+    pub check: CheckContext,
+}
+
+/// The manifest part of an evaluated generation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Manifest {
+    pub units: crate::unit::UnitDefs,
+    /// Per-user templates (`Scope::User { uid: 0 }`), instantiated per session.
+    pub user_units: Vec<crate::unit::UnitDef>,
+}
+
+/// Recorded at Prepared (§12 step 4) for the Checking and revert probe runs:
+/// the candidate's and the base's manifests, and every unit's status before.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckContext {
+    pub candidate: Option<Manifest>,
+    pub base: Manifest,
+    pub pre: std::collections::BTreeMap<UnitId, UnitStatus>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

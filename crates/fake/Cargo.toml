@@ -1,0 +1,17 @@
+[package]
+name = "planarian-fake"
+description = "In-memory fake machine implementing every Planarian backend, for the gym's fake harness and tests."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+planarian-schema.workspace = true
+planarian-changes.workspace = true
+planarian-txn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

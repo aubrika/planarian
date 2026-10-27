@@ -1,0 +1,879 @@
+//! A fake machine: every backend trait, in memory, deterministic.
+//!
+//! It models what the catalog's fake-harness cases need. The NixOS side has
+//! generations, an owner source tree, the override file, a tiny evaluator
+//! (option rules that break, remove or alter units), builds, live activation,
+//! boot entries and GC. The systemd side has units that crash, flap, fail on
+//! start, or are restarted by systemd itself. Devices have drivers. logind
+//! has sessions. There are external dependencies, runtime options, and
+//! processes (owner and worker pids). Fencing reads the epochs in the shared
+//! journal store, as real backends read the journal's.
+//!
+//! Time advances only through `Clock::sleep` or `Fake::advance`.
+
+use planarian_changes::render;
+use planarian_schema::*;
+pub use planarian_txn::store::MemStore;
+use planarian_txn::store::Store;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Effect {
+    /// The unit fails to start in generations where the rule holds.
+    Break(UnitId),
+    /// The unit is not part of such generations (disabled).
+    Remove(UnitId),
+    /// The evaluated unit files for planariad change (touches_core).
+    TouchCore,
+    /// The probe definition on a unit changes (a manifest edit).
+    ReplaceProbe(UnitId, ProbeDef),
+    /// Kernel/boot change: needs a reboot to be confirmed.
+    NeedsReboot,
+}
+
+/// If option `option` evaluates to `value`, apply `effect`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rule {
+    pub option: String,
+    pub value: Value,
+    pub effect: Effect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Health {
+    Ok,
+    /// Http probes get a 503; the process stays active.
+    Http503,
+    /// Network probes answer after this long.
+    Delay(Millis),
+}
+
+#[derive(Clone, Debug)]
+pub struct UnitSim {
+    pub observed: Observed,
+    pub health: Health,
+    /// Exits this long after each start (flapping).
+    pub fail_after: Option<Millis>,
+    /// Fails every start (corrupt state file).
+    pub fail_on_start: bool,
+    /// systemd `Restart=` with this RestartSec.
+    pub systemd_restart: Option<Millis>,
+    pub started_at: Timestamp,
+    pub failed_at: Option<Timestamp>,
+    pub restarts: u32,
+}
+
+impl UnitSim {
+    pub fn active(now: Timestamp) -> UnitSim {
+        UnitSim {
+            observed: Observed::Active,
+            health: Health::Ok,
+            fail_after: None,
+            fail_on_start: false,
+            systemd_restart: None,
+            started_at: now,
+            failed_at: None,
+            restarts: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Gen {
+    pub path: StorePath,
+    pub eval: EvaluatedGeneration,
+    pub broken: BTreeSet<UnitId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Job {
+    pub op: OpId,
+    pub done_at: Timestamp,
+    pub cancellable: bool,
+    pub activates: GenerationId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Call {
+    pub at: Timestamp,
+    pub op: OpId,
+    pub call: String,
+    pub fenced: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct World {
+    pub now: Timestamp,
+    // ---- NixOS ----
+    /// The owner's configuration as evaluated without any override.
+    pub base_units: UnitDefs,
+    pub base_user_units: Vec<UnitDef>,
+    pub base_options: BTreeMap<String, Value>,
+    pub rules: Vec<Rule>,
+    /// Options the owner `mkForce`d.
+    pub forced: BTreeSet<String>,
+    pub core_units: BTreeMap<String, Hash>,
+    /// Tracked owner files (path → content) and untracked ones.
+    pub owner_files: BTreeMap<String, String>,
+    pub untracked: BTreeSet<String>,
+    pub gens: BTreeMap<GenerationId, Gen>,
+    pub current: GenerationId,
+    pub booted: GenerationId,
+    pub boot_default: GenerationId,
+    pub boot_entries: BTreeSet<GenerationId>,
+    pub overrides: OverrideSet,
+    pub override_store: BTreeMap<Hash, OverrideSet>,
+    pub gen_overrides: BTreeMap<GenerationId, Hash>,
+    pub staged: BTreeMap<String, (OverrideSet, BTreeMap<String, String>)>,
+    pub gc_roots: BTreeSet<String>,
+    pub collected: Vec<GenerationId>,
+    pub fail_publish: bool,
+    pub fail_activate: BTreeSet<GenerationId>,
+    pub slow_activation: Option<(Millis, bool)>,
+    pub jobs: BTreeMap<JobId, Job>,
+    pub next_job: u64,
+    pub jobs_tagged_unknown: bool,
+    // ---- systemd / logind / devices ----
+    pub units: BTreeMap<UnitId, UnitSim>,
+    pub devices: BTreeMap<UnitId, Option<DriverRef>>,
+    pub sessions: Vec<SessionInfo>,
+    pub power: Option<PowerSource>,
+    /// Probes of these units fail regardless (e.g. a port blocked by nftables).
+    pub blocked: BTreeSet<UnitId>,
+    /// External dependencies that are down, by name (`gym-upstream`).
+    pub external_down: BTreeSet<String>,
+    /// Free bytes and size of filesystems, by path.
+    pub fs: BTreeMap<String, (u64, u64)>,
+    pub runtime: BTreeMap<String, Value>,
+    // ---- processes ----
+    pub alive: BTreeSet<u32>,
+    pub unkillable: BTreeSet<u32>,
+    pub calls: Vec<Call>,
+}
+
+impl World {
+    fn key(id: &UnitId) -> UnitId {
+        let mut k = id.clone();
+        if let Scope::User { uid, .. } = k.scope {
+            k.scope = Scope::User { uid, session: None };
+        }
+        k
+    }
+
+    fn override_hash_of(set: &OverrideSet) -> Hash {
+        Hash::of(render(set).as_bytes())
+    }
+
+    fn source_hash_of(files: &BTreeMap<String, String>, overrides: &OverrideSet) -> Hash {
+        let mut bytes = serde_json::to_vec(files).expect("files serialize");
+        bytes.extend(render(overrides).as_bytes());
+        Hash::of(&bytes)
+    }
+
+    /// The fake evaluator.
+    pub fn evaluate(&self, overrides: &OverrideSet) -> (EvaluatedGeneration, BTreeSet<UnitId>) {
+        let mut options = self.base_options.clone();
+        for (k, v) in &overrides.assignments {
+            if !self.forced.contains(k) {
+                options.insert(k.clone(), v.clone());
+            }
+        }
+        let mut units = self.base_units.clone();
+        let mut core = self.core_units.clone();
+        let mut broken = BTreeSet::new();
+        let mut needs_reboot = false;
+        for r in &self.rules {
+            if options.get(&r.option) != Some(&r.value) {
+                continue;
+            }
+            match &r.effect {
+                Effect::Break(u) => {
+                    broken.insert(u.clone());
+                }
+                Effect::Remove(u) => {
+                    units.remove(u);
+                }
+                Effect::TouchCore => {
+                    core.insert("planariad.service".into(), Hash::of(b"changed"));
+                }
+                Effect::ReplaceProbe(u, p) => {
+                    if let Some(d) = units.get_mut(u) {
+                        d.probes.retain(|x| x.id != p.id);
+                        d.probes.push(p.clone());
+                    }
+                }
+                Effect::NeedsReboot => needs_reboot = true,
+            }
+        }
+        let locked = overrides.assignments.keys().filter(|k| self.forced.contains(*k)).cloned().collect();
+        let eval = EvaluatedGeneration {
+            source: Hash::ZERO,
+            options,
+            units,
+            user_units: self.base_user_units.clone(),
+            activation: ActivationPlan { needs_reboot_to_confirm: needs_reboot, ..Default::default() },
+            locked,
+            core_units: core,
+        };
+        (eval, broken)
+    }
+
+    pub fn add_generation(&mut self, overrides: &OverrideSet) -> GenerationId {
+        let (eval, broken) = self.evaluate(overrides);
+        let id = GenerationId(self.gens.keys().map(|g| g.0).max().unwrap_or(0) + 1);
+        let path = StorePath(format!("/nix/store/{:03}-nixos-system-fake", id.0));
+        self.gens.insert(id, Gen { path, eval, broken });
+        id
+    }
+
+    fn apply_generation(&mut self, g: GenerationId) {
+        let generation = self.gens[&g].clone();
+        let now = self.now;
+        for id in generation.eval.units.keys() {
+            if id.kind != UnitKind::Service || id.name.starts_with("external:") {
+                continue;
+            }
+            let sim = self.units.entry(id.clone()).or_insert_with(|| UnitSim::active(now));
+            if generation.broken.contains(id) || sim.fail_on_start {
+                sim.observed = Observed::Failed(Reason::ExitCode(1));
+                sim.failed_at = Some(now);
+            } else if sim.observed != Observed::Active {
+                sim.observed = Observed::Active;
+                sim.started_at = now;
+            }
+        }
+        // Units the generation no longer has are stopped and gone.
+        let gone: Vec<UnitId> = self
+            .units
+            .keys()
+            .filter(|u| {
+                u.scope == Scope::System && u.kind == UnitKind::Service && !generation.eval.units.contains_key(u)
+            })
+            .cloned()
+            .collect();
+        for u in gone {
+            self.units.get_mut(&u).expect("listed").observed = Observed::Absent;
+        }
+        self.current = g;
+    }
+
+    /// Advance time-driven behaviour to `now`.
+    pub fn advance_to(&mut self, now: Timestamp) {
+        self.now = now;
+        let done: Vec<JobId> = self.jobs.iter().filter(|(_, j)| j.done_at <= now).map(|(k, _)| k.clone()).collect();
+        for id in done {
+            let job = self.jobs.remove(&id).expect("listed");
+            self.apply_generation(job.activates);
+        }
+        let broken = self.gens.get(&self.current).map(|g| g.broken.clone()).unwrap_or_default();
+        for (id, sim) in self.units.iter_mut() {
+            if sim.observed == Observed::Active
+                && let Some(after) = sim.fail_after
+                    && now.0 >= sim.started_at.0 + after.0 {
+                        sim.observed = Observed::Failed(Reason::ExitCode(1));
+                        sim.failed_at = Some(Timestamp(sim.started_at.0 + after.0));
+                    }
+            if let (Observed::Failed(_), Some(rs), Some(at)) = (&sim.observed, sim.systemd_restart, sim.failed_at)
+                && now.0 >= at.0 + rs.0 {
+                    sim.restarts += 1;
+                    if sim.fail_on_start || broken.contains(id) {
+                        sim.failed_at = Some(now);
+                    } else {
+                        sim.observed = Observed::Active;
+                        sim.started_at = now;
+                    }
+                }
+        }
+    }
+
+    pub fn reboot(&mut self) {
+        self.booted = self.boot_default;
+        self.jobs.clear();
+        self.sessions.clear();
+        let g = self.boot_default;
+        for sim in self.units.values_mut() {
+            sim.observed = Observed::Bound;
+        }
+        self.apply_generation(g);
+    }
+
+    fn start(&mut self, id: &UnitId) -> Outcome {
+        let now = self.now;
+        let broken = self.gens.get(&self.current).is_some_and(|g| g.broken.contains(id));
+        let present =
+            self.gens.get(&self.current).is_none_or(|g| g.eval.units.contains_key(id) || id.scope != Scope::System);
+        if !present {
+            return Outcome::Failed(format!("{id} not found"));
+        }
+        let sim = self.units.entry(Self::key(id)).or_insert_with(|| UnitSim::active(now));
+        sim.restarts += 1;
+        if broken || sim.fail_on_start {
+            sim.observed = Observed::Failed(Reason::ExitCode(1));
+            sim.failed_at = Some(now);
+            return Outcome::Failed(format!("{id} failed to start"));
+        }
+        sim.observed = Observed::Active;
+        sim.health = Health::Ok;
+        sim.started_at = now;
+        Outcome::Succeeded
+    }
+}
+
+/// The handle every backend trait is implemented on. Cheap to clone; all
+/// clones share one world and one journal store.
+#[derive(Clone, Debug)]
+pub struct Fake {
+    pub world: Arc<Mutex<World>>,
+    pub store: MemStore,
+}
+
+impl Fake {
+    pub fn new(world: World, store: MemStore) -> Fake {
+        Fake { world: Arc::new(Mutex::new(world)), store }
+    }
+
+    pub fn w(&self) -> MutexGuard<'_, World> {
+        self.world.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn advance(&self, d: Millis) {
+        let mut w = self.w();
+        let t = w.now.plus(d);
+        w.advance_to(t);
+    }
+
+    fn admit(&self, w: &mut World, op: &OpId, call: String) -> bool {
+        let fenced = self.store.fence(op.txn).ok().flatten() != Some(op.epoch);
+        w.calls.push(Call { at: w.now, op: *op, call, fenced });
+        !fenced
+    }
+}
+
+impl UnitBackend for Fake {
+    fn observe(&self, id: &UnitId) -> Result<Observed, Outcome> {
+        let w = self.w();
+        Ok(w.units.get(&World::key(id)).map(|s| s.observed.clone()).unwrap_or(Observed::Absent))
+    }
+
+    fn list(&self) -> Result<Vec<UnitId>, Outcome> {
+        Ok(self.w().units.keys().cloned().collect())
+    }
+
+    fn restart(&self, id: &UnitId, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, format!("restart({id})")) {
+            return Outcome::fenced();
+        }
+        w.start(id)
+    }
+
+    fn stop(&self, id: &UnitId, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, format!("stop({id})")) {
+            return Outcome::fenced();
+        }
+        let now = w.now;
+        let sim = w.units.entry(World::key(id)).or_insert_with(|| UnitSim::active(now));
+        sim.observed = Observed::Bound;
+        Outcome::Succeeded
+    }
+}
+
+impl GenerationBackend for Fake {
+    fn current(&self) -> Result<GenerationId, Outcome> {
+        Ok(self.w().current)
+    }
+
+    fn boot_entries(&self) -> Result<Vec<GenerationId>, Outcome> {
+        Ok(self.w().boot_entries.iter().copied().collect())
+    }
+
+    fn boot_default(&self) -> Result<GenerationId, Outcome> {
+        Ok(self.w().boot_default)
+    }
+
+    fn last_booted(&self) -> Result<GenerationId, Outcome> {
+        Ok(self.w().booted)
+    }
+
+    fn stage(&self, _owner: &PinnedSource, overrides: &OverrideSet) -> Result<StagedSource, Outcome> {
+        let mut w = self.w();
+        let dir = format!("/var/lib/planarian/stage/{}", w.staged.len() + 1);
+        let files = w.owner_files.clone();
+        let base = w.overrides.clone();
+        w.staged.insert(dir.clone(), (overrides.clone(), files.clone()));
+        let candidate_override = World::override_hash_of(overrides);
+        w.override_store.insert(candidate_override, overrides.clone());
+        Ok(StagedSource {
+            dir,
+            base_source: World::source_hash_of(&files, &base),
+            staged_source: World::source_hash_of(&files, overrides),
+            base_override: World::override_hash_of(&base),
+            candidate_override,
+            excluded: w.untracked.iter().cloned().collect(),
+        })
+    }
+
+    fn source_hash(&self, _owner: &PinnedSource) -> Result<Hash, Outcome> {
+        let w = self.w();
+        Ok(World::source_hash_of(&w.owner_files, &w.overrides))
+    }
+
+    fn evaluate(&self, src: &StagedSource) -> Result<EvaluatedGeneration, Outcome> {
+        let w = self.w();
+        let (overrides, _) = w.staged.get(&src.dir).ok_or_else(|| Outcome::Failed("no such stage".into()))?;
+        let (mut eval, _) = w.evaluate(overrides);
+        eval.source = src.staged_source;
+        Ok(eval)
+    }
+
+    fn build(&self, eval: &EvaluatedGeneration) -> Result<Built, Outcome> {
+        let mut w = self.w();
+        let staged = w
+            .staged
+            .values()
+            .find(|(o, files)| World::source_hash_of(files, o) == eval.source)
+            .cloned()
+            .ok_or_else(|| Outcome::Failed("build: unknown evaluation".into()))?;
+        // Nix builds are deterministic: the same evaluation yields the same path.
+        let existing =
+            w.gens.iter().find(|(_, x)| x.eval.source == eval.source && eval.source != Hash::ZERO).map(|(g, _)| *g);
+        let g = match existing {
+            Some(g) => g,
+            None => {
+                let g = w.add_generation(&staged.0);
+                w.gens.get_mut(&g).expect("added").eval.source = eval.source;
+                g
+            }
+        };
+        let cur = w.gens[&w.current].clone();
+        let new = w.gens[&g].clone();
+        let mut plan = new.eval.activation.clone();
+        for u in new.eval.units.keys() {
+            match cur.eval.units.get(u) {
+                None => {
+                    plan.start.insert(u.clone());
+                }
+                Some(old) if old != &new.eval.units[u] || new.broken.contains(u) != cur.broken.contains(u) => {
+                    plan.restart.insert(u.clone());
+                }
+                _ => {}
+            }
+        }
+        for (k, v) in &new.eval.options {
+            if cur.eval.options.get(k) != Some(v) {
+                // An option change restarts the services of its module (`services.<name>.…`).
+                if let Some(svc) = k.strip_prefix("services.").and_then(|r| r.split('.').next()) {
+                    let id = UnitId::service(svc);
+                    if new.eval.units.contains_key(&id) {
+                        plan.restart.insert(id);
+                    }
+                }
+            }
+        }
+        for u in cur.eval.units.keys() {
+            if !new.eval.units.contains_key(u) {
+                plan.stop.insert(u.clone());
+            }
+        }
+        let root = format!("/nix/var/nix/gcroots/planarian/builds/{}", eval.source.to_hex());
+        w.gc_roots.insert(root.clone());
+        Ok(Built { generation: g, path: new.path, root, activation: plan })
+    }
+
+    fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
+        let w = self.w();
+        Ok(w.gens.values().any(|g| &g.path == path)
+            && !w.collected.iter().any(|c| w.gens.get(c).is_some_and(|g| &g.path == path)))
+    }
+
+    fn pending_jobs(&self) -> Result<Vec<JobId>, Outcome> {
+        Ok(self.w().jobs.keys().cloned().collect())
+    }
+
+    fn jobs_tagged(&self, op: &OpId) -> Result<Option<Vec<JobId>>, Outcome> {
+        let w = self.w();
+        if w.jobs_tagged_unknown {
+            return Ok(None);
+        }
+        Ok(Some(w.jobs.iter().filter(|(_, j)| j.op == *op).map(|(k, _)| k.clone()).collect()))
+    }
+
+    fn override_hash(&self) -> Result<Hash, Outcome> {
+        Ok(World::override_hash_of(&self.w().overrides))
+    }
+
+    fn activate_live(&self, g: GenerationId, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, format!("activate_live({})", g.0)) {
+            return Outcome::fenced();
+        }
+        if !w.gens.contains_key(&g) {
+            return Outcome::Failed(format!("no generation {}", g.0));
+        }
+        if w.fail_activate.contains(&g) {
+            return Outcome::Failed(format!("switch-to-configuration test failed for {}", g.0));
+        }
+        if let Some((delay, cancellable)) = w.slow_activation {
+            w.next_job += 1;
+            let id = JobId(format!("job-{}", w.next_job));
+            let done_at = w.now.plus(delay);
+            w.jobs.insert(id, Job { op: *op, done_at, cancellable, activates: g });
+            return Outcome::Unknown("activation job accepted; no reply".into());
+        }
+        w.apply_generation(g);
+        Outcome::Succeeded
+    }
+
+    fn publish_boot(&self, g: GenerationId, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, format!("publish_boot({})", g.0)) {
+            return Outcome::fenced();
+        }
+        if w.fail_publish {
+            return Outcome::Failed("No space left on device (/boot)".into());
+        }
+        w.boot_entries.insert(g);
+        w.boot_default = g;
+        Outcome::Succeeded
+    }
+
+    fn protect(&self, g: GenerationId, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, format!("protect({})", g.0)) {
+            return Outcome::fenced();
+        }
+        Outcome::Succeeded
+    }
+
+    fn cancel(&self, job: &JobId, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, format!("cancel({})", job.0)) {
+            return Outcome::fenced();
+        }
+        match w.jobs.get(job) {
+            Some(j) if j.cancellable => {
+                w.jobs.remove(job);
+                Outcome::Succeeded
+            }
+            Some(_) => Outcome::Failed("job cannot be cancelled".into()),
+            None => Outcome::Succeeded,
+        }
+    }
+
+    fn swap_override(&self, from: &Hash, to: &Hash, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, "swap_override".into()) {
+            return Outcome::fenced();
+        }
+        let cur = World::override_hash_of(&w.overrides);
+        if cur == *to {
+            return Outcome::Succeeded;
+        }
+        if cur != *from {
+            return Outcome::Failed("override file changed by a third party".into());
+        }
+        match w.override_store.get(to).cloned() {
+            Some(set) => {
+                w.overrides = set;
+                Outcome::Succeeded
+            }
+            None => Outcome::Failed("override content unknown".into()),
+        }
+    }
+
+    fn path_of(&self, g: GenerationId) -> Result<StorePath, Outcome> {
+        self.w().gens.get(&g).map(|x| x.path.clone()).ok_or_else(|| Outcome::Failed(format!("no generation {}", g.0)))
+    }
+
+    fn evaluate_built(&self, path: &StorePath) -> Result<EvaluatedGeneration, Outcome> {
+        self.w()
+            .gens
+            .values()
+            .find(|g| &g.path == path)
+            .map(|g| g.eval.clone())
+            .ok_or_else(|| Outcome::Failed("unknown store path".into()))
+    }
+
+    fn read_overrides(&self) -> Result<(OverrideSet, Hash), Outcome> {
+        let w = self.w();
+        Ok((w.overrides.clone(), World::override_hash_of(&w.overrides)))
+    }
+
+    fn remember_override(&self, set: &OverrideSet) -> Result<Hash, Outcome> {
+        let h = World::override_hash_of(set);
+        self.w().override_store.insert(h, set.clone());
+        Ok(h)
+    }
+
+    fn override_for(&self, g: GenerationId) -> Result<Option<Hash>, Outcome> {
+        Ok(self.w().gen_overrides.get(&g).copied())
+    }
+
+    fn record_override(&self, g: GenerationId, hash: &Hash) -> Result<(), Outcome> {
+        self.w().gen_overrides.insert(g, *hash);
+        Ok(())
+    }
+
+    fn release_root(&self, root: &str) -> bool {
+        self.w().gc_roots.remove(root)
+    }
+
+    fn collect_garbage(&self, protect: &[GenerationId], _emergency: bool, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, "collect_garbage".into()) {
+            return Outcome::fenced();
+        }
+        let victims: Vec<GenerationId> = w
+            .gens
+            .keys()
+            .copied()
+            .filter(|g| !protect.contains(g) && *g != w.current && *g != w.boot_default && !w.collected.contains(g))
+            .filter(|g| {
+                // Built candidates still rooted under gcroots/planarian/builds survive.
+                let generation = &w.gens[g];
+                !w.gc_roots.iter().any(|r| r.ends_with(&generation.eval.source.to_hex()))
+            })
+            .collect();
+        let freed = victims.len() as u64 * 2_000_000_000;
+        w.collected.extend(victims);
+        for (free, size) in w.fs.values_mut() {
+            *free = (*free + freed).min(*size);
+        }
+        Outcome::Succeeded
+    }
+}
+
+impl InventoryBackend for Fake {
+    fn devices(&self) -> Result<Vec<DeviceInfo>, Outcome> {
+        Ok(self.w().devices.iter().map(|(id, d)| DeviceInfo { id: id.clone(), driver: d.clone() }).collect())
+    }
+
+    fn resources(&self) -> Result<Resources, Outcome> {
+        Ok(Resources { mem_total_mb: 16_000, mem_available_mb: 12_000, fs_free_bytes: BTreeMap::new() })
+    }
+
+    fn bound_driver(&self, device: &UnitId) -> Result<Option<DriverRef>, Outcome> {
+        Ok(self.w().devices.get(device).cloned().flatten())
+    }
+
+    fn bind(&self, device: &UnitId, driver: &DriverRef, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, format!("bind({device}, {})", driver.name)) {
+            return Outcome::fenced();
+        }
+        w.devices.insert(device.clone(), Some(driver.clone()));
+        Outcome::Succeeded
+    }
+
+    fn unbind(&self, device: &UnitId, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, format!("unbind({device})")) {
+            return Outcome::fenced();
+        }
+        w.devices.insert(device.clone(), None);
+        Outcome::Succeeded
+    }
+}
+
+impl ProbeBackend for Fake {
+    fn run_batch(&self, jobs: &[(UnitId, ProbeDef)]) -> Vec<ProbeResult> {
+        let w = self.w();
+        jobs.iter()
+            .map(|(unit, p)| {
+                if let ProbeKind::FreeSpace { path, min_bytes, min_permille } = &p.kind {
+                    return match w.fs.get(path) {
+                        Some((free, size)) if *free >= *min_bytes && free * 1000 >= size * *min_permille as u64 => {
+                            ProbeResult::Pass
+                        }
+                        Some((free, _)) => ProbeResult::Fail(format!("{free} bytes free on {path}")),
+                        None => ProbeResult::Error(format!("no filesystem at {path}")),
+                    };
+                }
+                if w.blocked.contains(unit) {
+                    return ProbeResult::Fail("connection refused".into());
+                }
+                if let Some(ext) = unit.name.strip_prefix("external:") {
+                    return if w.external_down.contains(ext) {
+                        ProbeResult::Fail(format!("{ext}: connection refused"))
+                    } else {
+                        ProbeResult::Pass
+                    };
+                }
+                // A client of a down external dependency sees its upstream fail.
+                if w.base_units.get(unit).is_some_and(|d| {
+                    d.edges
+                        .iter()
+                        .any(|e| e.to.name.strip_prefix("external:").is_some_and(|x| w.external_down.contains(x)))
+                }) {
+                    return ProbeResult::Fail("upstream unavailable (502)".into());
+                }
+                match w.units.get(&World::key(unit)) {
+                    None => ProbeResult::Fail("not running".into()),
+                    Some(sim) if sim.observed != Observed::Active => ProbeResult::Fail("connection refused".into()),
+                    Some(sim) => match (&sim.health, &p.kind) {
+                        (Health::Ok, _) => ProbeResult::Pass,
+                        (Health::Http503, ProbeKind::Http { .. }) => ProbeResult::Fail("HTTP 503".into()),
+                        (Health::Http503, _) => ProbeResult::Pass,
+                        (Health::Delay(d), _) if d.0 > p.timeout.0 => ProbeResult::Timeout,
+                        (Health::Delay(_), _) => ProbeResult::Pass,
+                    },
+                }
+            })
+            .collect()
+    }
+}
+
+impl SessionBackend for Fake {
+    fn sessions(&self) -> Result<Vec<SessionInfo>, Outcome> {
+        Ok(self.w().sessions.clone())
+    }
+
+    fn power(&self) -> Option<PowerSource> {
+        self.w().power
+    }
+}
+
+impl RuntimeOptionBackend for Fake {
+    fn get(&self, path: &str) -> Option<Value> {
+        self.w().runtime.get(path).cloned()
+    }
+
+    fn set(&self, path: &str, value: &Value, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, format!("set({path})")) {
+            return Outcome::fenced();
+        }
+        w.runtime.insert(path.into(), value.clone());
+        Outcome::Succeeded
+    }
+}
+
+impl ProcessBackend for Fake {
+    fn kill_group(&self, pid: u32) -> bool {
+        let mut w = self.w();
+        if w.unkillable.contains(&pid) {
+            return false;
+        }
+        w.alive.remove(&pid);
+        true
+    }
+
+    fn alive(&self, pid: u32) -> bool {
+        self.w().alive.contains(&pid)
+    }
+}
+
+impl Clock for Fake {
+    fn now(&self) -> Timestamp {
+        self.w().now
+    }
+
+    fn sleep(&self, d: Millis) {
+        self.advance(d);
+    }
+}
+
+impl Backends for Fake {
+    type Units = Fake;
+    type Gens = Fake;
+    type Inv = Fake;
+    type Probes = Fake;
+    type Sessions = Fake;
+    type Runtime = Fake;
+    type Procs = Fake;
+    type Clock = Fake;
+
+    fn units(&self) -> &Fake {
+        self
+    }
+    fn generations(&self) -> &Fake {
+        self
+    }
+    fn inventory(&self) -> &Fake {
+        self
+    }
+    fn probes(&self) -> &Fake {
+        self
+    }
+    fn sessions(&self) -> &Fake {
+        self
+    }
+    fn runtime(&self) -> &Fake {
+        self
+    }
+    fn processes(&self) -> &Fake {
+        self
+    }
+    fn clock(&self) -> &Fake {
+        self
+    }
+}
+
+/// A fake machine built from the gym fixtures (catalog `[[fixture]]`), on its
+/// first generation, healthy, with nobody logged in.
+pub fn gym_world(store: MemStore) -> Fake {
+    let mut w = World { now: Timestamp(1_700_000_000_000), power: Some(PowerSource::Ac), ..Default::default() };
+    w.base_units = fixtures::gym_units();
+    w.base_user_units = fixtures::gym_user_units();
+    w.base_options = [
+        ("services.gym-web.listenAddress".to_string(), Value::Str("127.0.0.1".into())),
+        ("services.openssh.enable".to_string(), Value::Bool(true)),
+        ("planarian.reference.fontScale".to_string(), Value::Str("1".into())),
+    ]
+    .into();
+    w.rules = vec![
+        Rule {
+            option: "services.gym-web.listenAddress".into(),
+            value: Value::Str("192.0.2.10".into()),
+            effect: Effect::Break(UnitId::service("gym-web")),
+        },
+        Rule {
+            option: "services.openssh.enable".into(),
+            value: Value::Bool(false),
+            effect: Effect::Remove(UnitId::service("sshd")),
+        },
+    ];
+    w.core_units = [
+        ("planariad.service".to_string(), Hash::of(b"planariad")),
+        ("planarian-recovery.service".to_string(), Hash::of(b"recovery")),
+    ]
+    .into();
+    w.owner_files = [
+        ("flake.nix".to_string(), "{ outputs = …; }".to_string()),
+        ("configuration.nix".to_string(), "{ … }".to_string()),
+    ]
+    .into();
+    w.devices = [
+        (UnitId::device("snd-hda0"), Some(DriverRef { name: "snd_hda_intel".into(), module: None })),
+        (UnitId::device("net-gym0"), Some(DriverRef { name: "virtio_net".into(), module: None })),
+        (UnitId::device("gpu0"), Some(DriverRef { name: "virtio_gpu".into(), module: None })),
+    ]
+    .into();
+    w.fs = [
+        ("/".to_string(), (40_000_000_000, 100_000_000_000)),
+        ("/nix".to_string(), (40_000_000_000, 100_000_000_000)),
+        ("/boot".to_string(), (400_000_000, 1_000_000_000)),
+        ("/var/lib/planarian".to_string(), (40_000_000_000, 100_000_000_000)),
+    ]
+    .into();
+    let g = w.add_generation(&OverrideSet::default());
+    w.boot_entries.insert(g);
+    w.boot_default = g;
+    w.booted = g;
+    w.override_store.insert(World::override_hash_of(&OverrideSet::default()), OverrideSet::default());
+    let now = w.now;
+    for id in w.base_units.keys() {
+        if id.kind == UnitKind::Service && !id.name.starts_with("external:") {
+            w.units.insert(id.clone(), UnitSim::active(now));
+        }
+    }
+    if let Some(sim) = w.units.get_mut(&UnitId::service("gym-restartful")) {
+        sim.systemd_restart = Some(Millis::secs(5));
+    }
+    w.apply_generation(g);
+    Fake::new(w, store)
+}
+
+pub mod fixtures;

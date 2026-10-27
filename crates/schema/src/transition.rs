@@ -221,7 +221,14 @@ pub struct EvaluatedGeneration {
     pub source: Hash,
     pub options: BTreeMap<String, Value>,
     pub units: UnitDefs,
+    /// Units instantiated once per logged-in user (`Scope::User { uid: 0 }` as
+    /// a placeholder); `state` expands them per session (§10).
+    pub user_units: Vec<crate::unit::UnitDef>,
+    /// Filled in by `build` (dry-activate); empty after evaluation alone.
     pub activation: ActivationPlan,
+    /// Option paths whose highest-priority definition beats Planarian's
+    /// `mkOverride 90` (the owner used `mkForce`): `locked` (§9).
+    pub locked: BTreeSet<String>,
     /// Content hashes of the evaluated unit files for `planariad` and
     /// `planarian-recovery`; a difference from the running ones is `touches_core`.
     pub core_units: BTreeMap<String, Hash>,

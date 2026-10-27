@@ -1,0 +1,20 @@
+[package]
+name = "planarian-state"
+description = "Planarian state: desired/observed/health assembly and probe scheduling (SPEC §10)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+planarian-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+planarian-schema = { workspace = true, features = ["fixtures"] }
+
+planarian-fake.workspace = true
+
+[lints]
+workspace = true

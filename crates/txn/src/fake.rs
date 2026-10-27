@@ -228,6 +228,42 @@ impl GenerationBackend for FakeHost {
         w.override_hash = *to;
         Outcome::Succeeded
     }
+
+    fn path_of(&self, g: GenerationId) -> Result<StorePath, Outcome> {
+        self.w().generations.get(&g).cloned().ok_or_else(|| Outcome::Failed(format!("no generation {}", g.0)))
+    }
+
+    fn evaluate_built(&self, _path: &StorePath) -> Result<EvaluatedGeneration, Outcome> {
+        Err(Outcome::Failed("fake: evaluation is exec's concern".into()))
+    }
+
+    fn read_overrides(&self) -> Result<(OverrideSet, Hash), Outcome> {
+        Ok((OverrideSet::default(), self.w().override_hash))
+    }
+
+    fn remember_override(&self, set: &OverrideSet) -> Result<Hash, Outcome> {
+        Ok(Hash::of(&serde_json::to_vec(set).expect("serializes")))
+    }
+
+    fn override_for(&self, _g: GenerationId) -> Result<Option<Hash>, Outcome> {
+        Ok(None)
+    }
+
+    fn record_override(&self, _g: GenerationId, _hash: &Hash) -> Result<(), Outcome> {
+        Ok(())
+    }
+
+    fn release_root(&self, root: &str) -> bool {
+        self.w().gc_roots.remove(root)
+    }
+
+    fn collect_garbage(&self, _protect: &[GenerationId], _emergency: bool, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, "collect_garbage") {
+            return Outcome::fenced();
+        }
+        Outcome::Succeeded
+    }
 }
 
 impl InventoryBackend for FakeHost {

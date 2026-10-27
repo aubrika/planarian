@@ -148,6 +148,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "planarian-exec"
+version = "0.0.0"
+dependencies = [
+ "planarian-changes",
+ "planarian-fake",
+ "planarian-policy",
+ "planarian-schema",
+ "planarian-state",
+ "planarian-txn",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "planarian-fake"
+version = "0.0.0"
+dependencies = [
+ "planarian-changes",
+ "planarian-schema",
+ "planarian-txn",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "planarian-incident"
 version = "0.0.0"
 dependencies = [
@@ -181,6 +206,16 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "planarian-state"
+version = "0.0.0"
+dependencies = [
+ "planarian-fake",
+ "planarian-schema",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

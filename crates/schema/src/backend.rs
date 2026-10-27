@@ -6,11 +6,12 @@
 //! transaction, and tags the work it starts with the OpId so `jobs_tagged` can
 //! find it later. This replaces the `&Lease` parameter in §8.
 
-use crate::ids::{GenerationId, Hash, JobId, OpId, SnapshotId, StorePath};
+use crate::ids::{GenerationId, Hash, JobId, Millis, OpId, SnapshotId, StorePath, Timestamp};
 use crate::state::{Observed, Resources};
+use crate::transition::ActivationPlan;
 use crate::transition::{DriverRef, EvaluatedGeneration, Value};
 use crate::txn::Outcome;
-use crate::unit::UnitId;
+use crate::unit::{ProbeDef, ProbeResult, UnitId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -57,6 +58,8 @@ pub struct Built {
     pub path: StorePath,
     /// The GC root `build` created for its own output (§9 step 5).
     pub root: String,
+    /// What switching to it would start, stop, restart and reload (dry-activate).
+    pub activation: ActivationPlan,
 }
 
 pub trait UnitBackend {
@@ -96,6 +99,24 @@ pub trait GenerationBackend {
     /// `to`, but only if its current hash is `from`. Idempotent: if it already
     /// hashes to `to`, succeed without writing.
     fn swap_override(&self, from: &Hash, to: &Hash, op: &OpId) -> Outcome;
+
+    // Bookkeeping beyond §8 that the protocol needs.
+    /// The system store path of a known generation.
+    fn path_of(&self, g: GenerationId) -> Result<StorePath, Outcome>;
+    /// Evaluate an already-built generation from its store path (its exported
+    /// manifest), for SwitchGeneration / Revert / Rollback.
+    fn evaluate_built(&self, path: &StorePath) -> Result<EvaluatedGeneration, Outcome>;
+    /// The live override set and its content hash.
+    fn read_overrides(&self) -> Result<(OverrideSet, Hash), Outcome>;
+    /// Keep override content addressable by hash, so `swap_override` can write it.
+    fn remember_override(&self, set: &OverrideSet) -> Result<Hash, Outcome>;
+    /// The override content recorded for a generation when it was committed.
+    fn override_for(&self, g: GenerationId) -> Result<Option<Hash>, Outcome>;
+    fn record_override(&self, g: GenerationId, hash: &Hash) -> Result<(), Outcome>;
+    /// Remove a GC root symlink this backend created.
+    fn release_root(&self, root: &str) -> bool;
+    /// `nix-collect-garbage`, never touching `protect` (I3). Mutating.
+    fn collect_garbage(&self, protect: &[GenerationId], emergency: bool, op: &OpId) -> Outcome;
 }
 
 pub trait SnapshotBackend {
@@ -111,4 +132,82 @@ pub trait InventoryBackend {
     fn bound_driver(&self, device: &UnitId) -> Result<Option<DriverRef>, Outcome>;
     fn bind(&self, device: &UnitId, driver: &DriverRef, op: &OpId) -> Outcome;
     fn unbind(&self, device: &UnitId, op: &OpId) -> Outcome;
+}
+
+pub trait ProbeBackend {
+    /// Run probes concurrently, each in its sandbox, each killed at its timeout
+    /// (§10). One result per job, in order. `FreeSpace` probes are answered
+    /// here too; `SystemdActive` and `SessionTarget` are evaluated by `state`.
+    fn run_batch(&self, jobs: &[(UnitId, ProbeDef)]) -> Vec<ProbeResult>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub uid: u32,
+    /// logind class: `user`, `greeter`, `lock-screen`, `background`, `manager`, …
+    pub class: String,
+    pub seat: Option<String>,
+    pub remote: bool,
+    pub created: Timestamp,
+}
+
+impl SessionInfo {
+    /// §10: only `user`-class sessions with a seat, or remote user sessions, count.
+    pub fn establishes(&self) -> bool {
+        self.class == "user" && (self.seat.is_some() || self.remote)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PowerSource {
+    Ac,
+    Battery,
+}
+
+pub trait SessionBackend {
+    fn sessions(&self) -> Result<Vec<SessionInfo>, Outcome>;
+    fn power(&self) -> Option<PowerSource>;
+}
+
+/// The core-owned runtime-settable options (§12a).
+pub trait RuntimeOptionBackend {
+    fn get(&self, path: &str) -> Option<crate::transition::Value>;
+    /// `Outcome::Failed("no live mechanism")` when the option can only be
+    /// changed through its write-back.
+    fn set(&self, path: &str, value: &crate::transition::Value, op: &OpId) -> Outcome;
+}
+
+pub trait ProcessBackend {
+    /// SIGTERM, then SIGKILL, the process group via pidfd; true once confirmed gone.
+    fn kill_group(&self, pid: u32) -> bool;
+    fn alive(&self, pid: u32) -> bool;
+}
+
+pub trait Clock {
+    fn now(&self) -> Timestamp;
+    fn sleep(&self, d: Millis);
+}
+
+/// Every backend the system needs, as one generic parameter (§6: generics, no
+/// `dyn`). The daemon and the watchdog instantiate it with the real backends;
+/// the gym, with fakes.
+pub trait Backends {
+    type Units: UnitBackend;
+    type Gens: GenerationBackend;
+    type Inv: InventoryBackend;
+    type Probes: ProbeBackend;
+    type Sessions: SessionBackend;
+    type Runtime: RuntimeOptionBackend;
+    type Procs: ProcessBackend;
+    type Clock: Clock;
+
+    fn units(&self) -> &Self::Units;
+    fn generations(&self) -> &Self::Gens;
+    fn inventory(&self) -> &Self::Inv;
+    fn probes(&self) -> &Self::Probes;
+    fn sessions(&self) -> &Self::Sessions;
+    fn runtime(&self) -> &Self::Runtime;
+    fn processes(&self) -> &Self::Procs;
+    fn clock(&self) -> &Self::Clock;
 }

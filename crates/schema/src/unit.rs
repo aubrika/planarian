@@ -326,9 +326,31 @@ pub enum ProbeOrigin {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProbeKind {
     SystemdActive,
-    Tcp { addr: String },
-    Http { url: String, status: u16 },
-    Exec { argv: Vec<String>, sandbox: ProbeSandbox },
+    Tcp {
+        addr: String,
+    },
+    Http {
+        url: String,
+        status: u16,
+    },
+    Exec {
+        argv: Vec<String>,
+        sandbox: ProbeSandbox,
+    },
+    /// Free space on the filesystem holding `path`: at least `min_bytes` and at
+    /// least `min_permille` of its size (§10 storage units). Not in §8.
+    FreeSpace {
+        path: String,
+        min_bytes: u64,
+        min_permille: u16,
+    },
+    /// A systemd target in the user's session reached within `within` of that
+    /// session's creation (§9 graphical-session). Evaluated by `state` from logind
+    /// and systemd together; bound to one session id (§10). Not in §8.
+    SessionTarget {
+        target: String,
+        within: Millis,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
