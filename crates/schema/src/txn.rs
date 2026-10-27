@@ -7,8 +7,13 @@ use crate::state::UnitStatus;
 use crate::transition::{ConfigDiff, DerivedFacts, DriverRef, Expectation, RecoveryStrategy, RejectReason, Transition};
 use crate::unit::{Actor, DesiredStatus, UnitId};
 use serde::{Deserialize, Serialize};
+use vstd::prelude::*;
+
+// The journal state machine's states, visible to the `txn` proofs.
+verus! {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[verifier::external_derive]
 pub enum TxnState {
     Prepared,
     Staged,
@@ -31,27 +36,63 @@ pub enum TxnState {
 
 impl TxnState {
     /// I12's terminal set.
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            TxnState::Committed
-                | TxnState::Reverted
-                | TxnState::RecoveryFailed
-                | TxnState::Rejected(_)
-                | TxnState::Cancelled(_)
-        )
-    }
-
-    /// States in which no other transition may execute (I6).
-    pub fn is_exclusive(&self) -> bool {
-        matches!(self, TxnState::Activating | TxnState::Published | TxnState::Promoted | TxnState::Reverting)
+    pub open spec fn terminal(self) -> bool {
+        match self {
+            TxnState::Committed | TxnState::Reverted | TxnState::RecoveryFailed | TxnState::Rejected(_)
+            | TxnState::Cancelled(_) => true,
+            _ => false,
+        }
     }
 
     /// Nothing has been mutated yet.
-    pub fn is_pre_mutation(&self) -> bool {
-        matches!(self, TxnState::Prepared | TxnState::Staged | TxnState::Built)
+    pub open spec fn pre_mutation(self) -> bool {
+        match self {
+            TxnState::Prepared | TxnState::Staged | TxnState::Built => true,
+            _ => false,
+        }
+    }
+
+    /// States in which no other transition may execute (I6).
+    pub open spec fn exclusive(self) -> bool {
+        match self {
+            TxnState::Activating | TxnState::Published | TxnState::Promoted | TxnState::Reverting => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_terminal(&self) -> (r: bool)
+        ensures
+            r == self.terminal(),
+    {
+        match self {
+            TxnState::Committed | TxnState::Reverted | TxnState::RecoveryFailed | TxnState::Rejected(_)
+            | TxnState::Cancelled(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_pre_mutation(&self) -> (r: bool)
+        ensures
+            r == self.pre_mutation(),
+    {
+        match self {
+            TxnState::Prepared | TxnState::Staged | TxnState::Built => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_exclusive(&self) -> (r: bool)
+        ensures
+            r == self.exclusive(),
+    {
+        match self {
+            TxnState::Activating | TxnState::Published | TxnState::Promoted | TxnState::Reverting => true,
+            _ => false,
+        }
     }
 }
+
+} // verus!
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum OwnerId {

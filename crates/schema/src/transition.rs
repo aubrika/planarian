@@ -189,6 +189,109 @@ impl Tier {
     }
 }
 
+/// Per-transition recovery strategy, fixed by the spec, not the proposer (§12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum RecoveryStrategy {
+    ReobserveOnly,
+    RevertGeneration,
+    UnbindDevice,
+    RestoreSnapshotThenRevert,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum Handler {
+    UnitOp,
+    GenerationOp,
+    DeviceOp,
+    SnapshotOp,
+    GcOp,
+    IntentOp,
+}
+
+impl Transition {
+    /// The §12 execution table. Independent of tier.
+    pub open spec fn handler_spec(self) -> Handler {
+        match self {
+            Transition::RestartUnit(_) | Transition::StopUnit(_) | Transition::SetRuntimeOption { .. } => {
+                Handler::UnitOp
+            },
+            Transition::Suppress(_) | Transition::Unsuppress(_) | Transition::StopAndSuppress { .. }
+            | Transition::Resolve { .. } => Handler::IntentOp,
+            Transition::CollectGarbage { .. } => Handler::GcOp,
+            Transition::ApplyChange { .. } | Transition::SwitchGeneration(_) | Transition::Revert { .. }
+            | Transition::Rollback | Transition::LoadModel(_) => Handler::GenerationOp,
+            Transition::BindDriver { .. } => Handler::DeviceOp,
+            Transition::RestoreSnapshot(_) => Handler::SnapshotOp,
+        }
+    }
+
+    pub open spec fn recovery_spec(self) -> RecoveryStrategy {
+        match self.handler_spec() {
+            Handler::UnitOp | Handler::IntentOp | Handler::GcOp => RecoveryStrategy::ReobserveOnly,
+            Handler::GenerationOp => RecoveryStrategy::RevertGeneration,
+            Handler::DeviceOp => RecoveryStrategy::UnbindDevice,
+            Handler::SnapshotOp => RecoveryStrategy::RestoreSnapshotThenRevert,
+        }
+    }
+
+    /// Generation-changing transactions are serialized (I6).
+    pub open spec fn changes_generation_spec(self) -> bool {
+        self.recovery_spec().reverts_generation()
+    }
+
+    pub fn handler(&self) -> (r: Handler)
+        ensures
+            r == self.handler_spec(),
+    {
+        match self {
+            Transition::RestartUnit(_) | Transition::StopUnit(_) | Transition::SetRuntimeOption { .. } => {
+                Handler::UnitOp
+            },
+            Transition::Suppress(_) | Transition::Unsuppress(_) | Transition::StopAndSuppress { .. }
+            | Transition::Resolve { .. } => Handler::IntentOp,
+            Transition::CollectGarbage { .. } => Handler::GcOp,
+            Transition::ApplyChange { .. } | Transition::SwitchGeneration(_) | Transition::Revert { .. }
+            | Transition::Rollback | Transition::LoadModel(_) => Handler::GenerationOp,
+            Transition::BindDriver { .. } => Handler::DeviceOp,
+            Transition::RestoreSnapshot(_) => Handler::SnapshotOp,
+        }
+    }
+
+    pub fn recovery(&self) -> (r: RecoveryStrategy)
+        ensures
+            r == self.recovery_spec(),
+    {
+        match self.handler() {
+            Handler::UnitOp | Handler::IntentOp | Handler::GcOp => RecoveryStrategy::ReobserveOnly,
+            Handler::GenerationOp => RecoveryStrategy::RevertGeneration,
+            Handler::DeviceOp => RecoveryStrategy::UnbindDevice,
+            Handler::SnapshotOp => RecoveryStrategy::RestoreSnapshotThenRevert,
+        }
+    }
+
+    pub fn changes_generation(&self) -> (r: bool)
+        ensures
+            r == self.changes_generation_spec(),
+    {
+        match self.recovery() {
+            RecoveryStrategy::RevertGeneration | RecoveryStrategy::RestoreSnapshotThenRevert => true,
+            _ => false,
+        }
+    }
+}
+
+impl RecoveryStrategy {
+    /// Recovery reverts the generation (generation and snapshot operations).
+    pub open spec fn reverts_generation(self) -> bool {
+        match self {
+            RecoveryStrategy::RevertGeneration | RecoveryStrategy::RestoreSnapshotThenRevert => true,
+            _ => false,
+        }
+    }
+}
+
 } // verus!
 
 /// Sorted, without duplicates: the form of `DerivedFacts::affected_units`.
@@ -215,62 +318,6 @@ impl ConfigDiff {
 
     pub fn hash(&self) -> Hash {
         Hash::of(&serde_json::to_vec(self).expect("diff serializes"))
-    }
-}
-
-/// Per-transition recovery strategy, fixed by the spec, not the proposer (§12).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum RecoveryStrategy {
-    ReobserveOnly,
-    RevertGeneration,
-    UnbindDevice,
-    RestoreSnapshotThenRevert,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Handler {
-    UnitOp,
-    GenerationOp,
-    DeviceOp,
-    SnapshotOp,
-    GcOp,
-    IntentOp,
-}
-
-impl Transition {
-    /// The §12 execution table. Independent of tier.
-    pub fn handler(&self) -> Handler {
-        match self {
-            Transition::RestartUnit(_) | Transition::StopUnit(_) | Transition::SetRuntimeOption { .. } => {
-                Handler::UnitOp
-            }
-            Transition::Suppress(_)
-            | Transition::Unsuppress(_)
-            | Transition::StopAndSuppress { .. }
-            | Transition::Resolve { .. } => Handler::IntentOp,
-            Transition::CollectGarbage { .. } => Handler::GcOp,
-            Transition::ApplyChange { .. }
-            | Transition::SwitchGeneration(_)
-            | Transition::Revert { .. }
-            | Transition::Rollback
-            | Transition::LoadModel(_) => Handler::GenerationOp,
-            Transition::BindDriver { .. } => Handler::DeviceOp,
-            Transition::RestoreSnapshot(_) => Handler::SnapshotOp,
-        }
-    }
-
-    pub fn recovery(&self) -> RecoveryStrategy {
-        match self.handler() {
-            Handler::UnitOp | Handler::IntentOp | Handler::GcOp => RecoveryStrategy::ReobserveOnly,
-            Handler::GenerationOp => RecoveryStrategy::RevertGeneration,
-            Handler::DeviceOp => RecoveryStrategy::UnbindDevice,
-            Handler::SnapshotOp => RecoveryStrategy::RestoreSnapshotThenRevert,
-        }
-    }
-
-    /// Generation-changing transactions are serialized (I6).
-    pub fn changes_generation(&self) -> bool {
-        matches!(self.recovery(), RecoveryStrategy::RevertGeneration | RecoveryStrategy::RestoreSnapshotThenRevert)
     }
 }
 

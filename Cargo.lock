@@ -328,6 +328,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "vstd",
 ]
 
 [[package]]

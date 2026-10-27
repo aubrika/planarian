@@ -2,6 +2,9 @@
 //! Pure; a Verus proof target (I12 paths, write-ahead ordering).
 
 use planarian_schema::{RecoveryStrategy, TxnState};
+use vstd::prelude::*;
+
+verus! {
 
 /// Whether a transaction with recovery strategy `strategy` may move from `from` to `to`.
 ///
@@ -11,30 +14,170 @@ use planarian_schema::{RecoveryStrategy, TxnState};
 ///   trigger generation reversion); it may commit from Activating (crash table).
 /// - Only generation operations pass through Published and Promoted.
 /// - Any state in which mutation may have happened can end in RecoveryFailed.
-pub fn step_allowed(from: &TxnState, to: &TxnState, strategy: RecoveryStrategy) -> bool {
-    use RecoveryStrategy as R;
-    use TxnState as S;
-    let generation = matches!(strategy, R::RevertGeneration | R::RestoreSnapshotThenRevert);
+pub open spec fn step_spec(from: TxnState, to: TxnState, strategy: RecoveryStrategy) -> bool {
+    let generation = strategy.reverts_generation();
+    let runtime = strategy == RecoveryStrategy::ReobserveOnly;
+    if from.terminal() {
+        false
+    } else {
+        match (from, to) {
+            (TxnState::Prepared, TxnState::Staged) => true,
+            (TxnState::Prepared, TxnState::Built) => true,
+            (TxnState::Prepared, TxnState::Activating) => true,
+            (TxnState::Staged, TxnState::Built) => true,
+            (TxnState::Staged, TxnState::Activating) => true,
+            (TxnState::Built, TxnState::Activating) => true,
+            (_, TxnState::Rejected(_)) => from.pre_mutation(),
+            (_, TxnState::Cancelled(_)) => from.pre_mutation(),
+            (TxnState::Activating, TxnState::Checking) => true,
+            (TxnState::Activating, TxnState::Committed) => runtime,
+            (TxnState::Activating, TxnState::Reverting) => !runtime,
+            (TxnState::Checking, TxnState::Reverting) => !runtime,
+            (TxnState::Published, TxnState::Reverting) => !runtime,
+            (TxnState::Promoted, TxnState::Reverting) => !runtime,
+            (TxnState::Checking, TxnState::Committed) => runtime || strategy == RecoveryStrategy::UnbindDevice,
+            (TxnState::Checking, TxnState::Published) => generation,
+            (TxnState::Published, TxnState::Promoted) => generation,
+            (TxnState::Promoted, TxnState::Committed) => generation,
+            (TxnState::Reverting, TxnState::Reverted) => true,
+            (_, TxnState::RecoveryFailed) => !from.pre_mutation(),
+            _ => false,
+        }
+    }
+}
+
+pub fn step_allowed(from: &TxnState, to: &TxnState, strategy: RecoveryStrategy) -> (r: bool)
+    ensures
+        r == step_spec(*from, *to, strategy),
+{
+    let generation = match strategy {
+        RecoveryStrategy::RevertGeneration | RecoveryStrategy::RestoreSnapshotThenRevert => true,
+        _ => false,
+    };
+    let runtime = match strategy {
+        RecoveryStrategy::ReobserveOnly => true,
+        _ => false,
+    };
+    let device = match strategy {
+        RecoveryStrategy::UnbindDevice => true,
+        _ => false,
+    };
     if from.is_terminal() {
         return false;
     }
     match (from, to) {
-        (S::Prepared, S::Staged | S::Built | S::Activating) => true,
-        (S::Staged, S::Built | S::Activating) => true,
-        (S::Built, S::Activating) => true,
-        (f, S::Rejected(_) | S::Cancelled(_)) => f.is_pre_mutation(),
-        (S::Activating, S::Checking) => true,
-        (S::Activating, S::Committed) => strategy == R::ReobserveOnly,
-        (S::Activating | S::Checking | S::Published | S::Promoted, S::Reverting) => strategy != R::ReobserveOnly,
-        (S::Checking, S::Committed) => matches!(strategy, R::ReobserveOnly | R::UnbindDevice),
-        (S::Checking, S::Published) => generation,
-        (S::Published, S::Promoted) => generation,
-        (S::Promoted, S::Committed) => generation,
-        (S::Reverting, S::Reverted) => true,
-        (S::Activating | S::Checking | S::Published | S::Promoted | S::Reverting, S::RecoveryFailed) => true,
+        (TxnState::Prepared, TxnState::Staged) => true,
+        (TxnState::Prepared, TxnState::Built) => true,
+        (TxnState::Prepared, TxnState::Activating) => true,
+        (TxnState::Staged, TxnState::Built) => true,
+        (TxnState::Staged, TxnState::Activating) => true,
+        (TxnState::Built, TxnState::Activating) => true,
+        (_, TxnState::Rejected(_)) => from.is_pre_mutation(),
+        (_, TxnState::Cancelled(_)) => from.is_pre_mutation(),
+        (TxnState::Activating, TxnState::Checking) => true,
+        (TxnState::Activating, TxnState::Committed) => runtime,
+        (TxnState::Activating, TxnState::Reverting) => !runtime,
+        (TxnState::Checking, TxnState::Reverting) => !runtime,
+        (TxnState::Published, TxnState::Reverting) => !runtime,
+        (TxnState::Promoted, TxnState::Reverting) => !runtime,
+        (TxnState::Checking, TxnState::Committed) => runtime || device,
+        (TxnState::Checking, TxnState::Published) => generation,
+        (TxnState::Published, TxnState::Promoted) => generation,
+        (TxnState::Promoted, TxnState::Committed) => generation,
+        (TxnState::Reverting, TxnState::Reverted) => true,
+        (_, TxnState::RecoveryFailed) => !from.is_pre_mutation(),
         _ => false,
     }
 }
+
+/// How far a state is from the end: every allowed step lowers it.
+pub open spec fn rank(s: TxnState) -> nat {
+    match s {
+        TxnState::Prepared => 8,
+        TxnState::Staged => 7,
+        TxnState::Built => 6,
+        TxnState::Activating => 5,
+        TxnState::Checking => 4,
+        TxnState::Published => 3,
+        TxnState::Promoted => 2,
+        TxnState::Reverting => 1,
+        _ => 0,
+    }
+}
+
+/// I12, termination: every allowed step lowers the rank, so a transaction
+/// takes at most eight steps and never cycles.
+pub proof fn i12_steps_terminate(from: TxnState, to: TxnState, strategy: RecoveryStrategy)
+    requires
+        step_spec(from, to, strategy),
+    ensures
+        rank(to) < rank(from),
+{
+}
+
+/// I12, progress: from every state that is not terminal, a step to a
+/// terminal state is allowed: Cancelled before any mutation, RecoveryFailed
+/// after. So whoever holds the lease can always finish the transaction.
+pub proof fn i12_terminal_always_reachable(from: TxnState, strategy: RecoveryStrategy, by: planarian_schema::Actor)
+    requires
+        !from.terminal(),
+    ensures
+        from.pre_mutation() ==> step_spec(from, TxnState::Cancelled(by), strategy),
+        !from.pre_mutation() ==> step_spec(from, TxnState::RecoveryFailed, strategy),
+{
+}
+
+/// Terminal states have no successors.
+pub proof fn terminal_is_final(from: TxnState, to: TxnState, strategy: RecoveryStrategy)
+    requires
+        from.terminal(),
+    ensures
+        !step_spec(from, to, strategy),
+{
+}
+
+/// Rejected and Cancelled happen only before anything was mutated.
+pub proof fn refusal_only_before_mutation(from: TxnState, to: TxnState, strategy: RecoveryStrategy)
+    requires
+        step_spec(from, to, strategy),
+        to is Rejected || to is Cancelled,
+    ensures
+        from.pre_mutation(),
+{
+}
+
+/// Runtime operations never revert a generation and never publish (§12).
+pub proof fn runtime_never_reverts(from: TxnState, to: TxnState)
+    requires
+        step_spec(from, to, RecoveryStrategy::ReobserveOnly),
+    ensures
+        !(to is Reverting),
+        !(to is Published),
+        !(to is Promoted),
+{
+}
+
+/// Only generation operations publish a boot entry or promote overrides.
+pub proof fn only_generations_publish(from: TxnState, to: TxnState, strategy: RecoveryStrategy)
+    requires
+        step_spec(from, to, strategy),
+        to is Published || to is Promoted,
+    ensures
+        strategy.reverts_generation(),
+{
+}
+
+/// A generation operation commits only after it was published and promoted.
+pub proof fn generations_commit_after_promotion(from: TxnState, strategy: RecoveryStrategy)
+    requires
+        step_spec(from, TxnState::Committed, strategy),
+        strategy.reverts_generation(),
+    ensures
+        from is Promoted,
+{
+}
+
+} // verus!
 
 /// A short, stable name for a state (journal notes, crash points, catalog `path`).
 pub fn tag(s: &TxnState) -> &'static str {
