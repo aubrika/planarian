@@ -117,3 +117,19 @@ fn storage_and_devices() {
     assert_eq!(s.status(&UnitId::device("snd-hda0"), &defs), UnitStatus::Detected);
     assert_eq!(a.known_drivers[&UnitId::device("snd-hda0")].name, "snd_hda_intel", "remembered");
 }
+
+#[test]
+fn unknown_session_creation_time_counts_from_first_sight() {
+    let (fake, mut a) = rig();
+    fake.w().sessions.push(SessionInfo {
+        id: "c9".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: Timestamp(0),
+    });
+    let (s, defs) = tick(&fake, &mut a);
+    let gs = UnitId::target("graphical-session");
+    assert_eq!(s.status(&gs, &defs), UnitStatus::Transitioning, "a fresh 60 s, not a deadline missed since 1970");
+}

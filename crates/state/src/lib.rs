@@ -64,6 +64,8 @@ pub struct Assembler {
     pub failed_since: BTreeMap<UnitId, Timestamp>,
     pub known_drivers: BTreeMap<UnitId, DriverRef>,
     pub sessions: Vec<SessionInfo>,
+    /// When each session id was first observed (stands in for an unknown creation time).
+    session_seen: BTreeMap<String, Timestamp>,
     pub on_battery: bool,
     /// Ticks that went over budget (logged by the daemon).
     pub slow_ticks: u64,
@@ -252,6 +254,14 @@ impl Assembler {
         let now = started;
 
         self.sessions = b.sessions().sessions().unwrap_or_default();
+        for s in self.sessions.iter_mut() {
+            let seen = *self.session_seen.entry(s.id.clone()).or_insert(now);
+            if s.created.0 == 0 {
+                s.created = seen;
+            }
+        }
+        let live: BTreeSet<String> = self.sessions.iter().map(|s| s.id.clone()).collect();
+        self.session_seen.retain(|id, _| live.contains(id));
         let power = b.sessions().power();
         self.on_battery = power == Some(PowerSource::Battery);
         let devices: BTreeMap<UnitId, Option<DriverRef>> =

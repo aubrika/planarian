@@ -17,6 +17,11 @@ rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ../Cargo.lock;
 
+  # Install the daemon, the watchdog and the CLI; the gym is a developer tool.
+  cargoBuildFlags = [ "-p" "planarian-daemon" "-p" "planarian-watchdog" "-p" "planarian-cli" ];
+  # …but run every crate's tests.
+  cargoTestFlags = [ "--workspace" ];
+
   # The staging test hashes a directory with nix-hash, as the real backend does.
   nativeCheckInputs = [ nix ];
 

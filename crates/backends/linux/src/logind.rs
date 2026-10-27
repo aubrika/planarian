@@ -53,24 +53,14 @@ impl SessionBackend for Logind {
         }
         let mut out = vec![];
         for id in parse_list(&list.stdout) {
-            let o = run(
-                &["loginctl", "show-session", &id, "--property=User,Class,Seat,Remote,Timestamp", "--timestamp=unix"],
-                t,
-            );
+            // Creation time is left 0 (unknown): `state` measures the session
+            // deadline from when it first saw the session, at most one tick late,
+            // rather than depend on loginctl's timestamp formatting.
+            let o = run(&["loginctl", "show-session", &id, "--property=User,Class,Seat,Remote"], t);
             if !o.ok() {
                 continue;
             }
-            // With --timestamp=unix, Timestamp is "@<seconds>".
-            let text = o.stdout.replace("Timestamp=@", "TimestampUSec=");
-            let text: String = text
-                .lines()
-                .map(|l| match l.strip_prefix("TimestampUSec=") {
-                    Some(secs) => format!("TimestampUSec={}", secs.trim().parse::<u64>().unwrap_or(0) * 1_000_000),
-                    None => l.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if let Some(s) = parse_session(&id, &text) {
+            if let Some(s) = parse_session(&id, &o.stdout) {
                 out.push(s);
             }
         }
