@@ -13,6 +13,7 @@ members = [
     "crates/exec",
     "crates/ipc",
     "crates/daemon",
+    "crates/backends/linux",
 ]
 
 [workspace.package]
@@ -34,6 +35,7 @@ planarian-fake = { path = "crates/fake" }
 planarian-exec = { path = "crates/exec" }
 planarian-ipc = { path = "crates/ipc" }
 planarian-daemon = { path = "crates/daemon" }
+planarian-backend-linux = { path = "crates/backends/linux" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

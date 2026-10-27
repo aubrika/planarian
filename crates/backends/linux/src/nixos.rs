@@ -1,0 +1,777 @@
+//! `GenerationBackend` over Nix and NixOS's `switch-to-configuration`.
+//!
+//! Generation ids are Planarian's own, kept in `generations.json`. They map to
+//! system store paths, because a candidate needs an id before it is in the
+//! system profile (docs/deviations.md).
+//!
+//! Staging (§9 step 1) copies the owner's Nix-visible files (git-tracked files
+//! with their working-tree contents, or the whole directory if it isn't a git
+//! repository) into `stage/`. `base_source` is the NAR hash of that copy with
+//! the live override; `staged_source`, with the candidate override.
+//! Evaluation and build read the staged copy as a `path:` flake in pure-eval
+//! mode, never the owner's live tree.
+//!
+//! Live activation runs `switch-to-configuration test` in a transient unit
+//! named after the OpId (`planarian-op-<txn>-<epoch>-<seq>.service`), so
+//! `jobs_tagged` can find the work an op started even if the reply was lost.
+
+use crate::Paths;
+use crate::admitted;
+use crate::cmd::{Output, run};
+use planarian_changes::{parse as parse_overrides, render};
+use planarian_schema::*;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const NIX: Duration = Duration::from_secs(30 * 60);
+const QUICK: Duration = Duration::from_secs(30);
+pub const ACTIVATION: Duration = Duration::from_secs(16 * 60);
+pub const KEEP_GENERATIONS: usize = 10;
+pub const KEEP_GENERATIONS_EMERGENCY: usize = 3;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Registry {
+    pub next: u64,
+    pub paths: BTreeMap<u64, String>,
+    pub overrides: BTreeMap<u64, Hash>,
+}
+
+impl Registry {
+    pub fn id_for(&mut self, path: &str) -> GenerationId {
+        if let Some((id, _)) = self.paths.iter().find(|(_, p)| *p == path) {
+            return GenerationId(*id);
+        }
+        self.next = self.next.max(self.paths.keys().max().copied().unwrap_or(0)) + 1;
+        self.paths.insert(self.next, path.to_string());
+        GenerationId(self.next)
+    }
+}
+
+/// The JSON a generation exports at `/etc/planarian/export.json` and through
+/// `config.services.planarian.export` (see nix/module.nix).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Export {
+    pub units: Vec<UnitDef>,
+    pub user_units: Vec<UnitDef>,
+    pub core_units: BTreeMap<String, String>,
+    pub devices: BTreeMap<String, String>,
+}
+
+impl Export {
+    pub fn into_eval(self, source: Hash) -> EvaluatedGeneration {
+        EvaluatedGeneration {
+            source,
+            options: BTreeMap::new(),
+            units: self.units.into_iter().map(|d| (d.id.clone(), d)).collect(),
+            user_units: self.user_units,
+            activation: ActivationPlan::default(),
+            locked: BTreeSet::new(),
+            core_units: self
+                .core_units
+                .into_iter()
+                .map(|(k, v)| (k, Hash::from_hex(&v).unwrap_or(Hash::of(v.as_bytes()))))
+                .collect(),
+        }
+    }
+}
+
+/// Parse `switch-to-configuration dry-activate` output.
+pub fn parse_dry_activate(text: &str) -> ActivationPlan {
+    let mut plan = ActivationPlan::default();
+    for line in text.lines() {
+        let line = line.trim();
+        let (set, list) = if let Some(l) = line.strip_prefix("would stop the following units: ") {
+            (&mut plan.stop, l)
+        } else if let Some(l) = line.strip_prefix("would restart the following units: ") {
+            (&mut plan.restart, l)
+        } else if let Some(l) = line.strip_prefix("would start the following units: ") {
+            (&mut plan.start, l)
+        } else if let Some(l) = line.strip_prefix("would reload the following units: ") {
+            (&mut plan.reload, l)
+        } else {
+            continue;
+        };
+        for u in list.split(',').map(str::trim).filter(|u| !u.is_empty()) {
+            if let Some(n) = u.strip_suffix(".service") {
+                set.insert(UnitId::service(n));
+            } else if let Some(n) = u.strip_suffix(".target") {
+                set.insert(UnitId::target(n));
+            }
+        }
+    }
+    plan
+}
+
+/// The Nix function given to `nix eval --apply`: the export, plus the current
+/// value and highest priority of each option path the overrides touch.
+pub fn apply_expr(paths: &[String]) -> String {
+    let list = |p: &str| {
+        let segs: Vec<String> = p.split('.').map(|s| format!("{s:?}")).collect();
+        format!("[ {} ]", segs.join(" "))
+    };
+    let walk = |root: &str, p: &str| {
+        format!(
+            "(builtins.foldl' (a: k: if a != null && builtins.isAttrs a && a ? ${{k}} then a.${{k}} else null) {root} {})",
+            list(p)
+        )
+    };
+    let mut values = String::new();
+    let mut prios = String::new();
+    for p in paths {
+        values.push_str(&format!(" {p:?} = {};", walk("c.config", p)));
+        prios.push_str(&format!(
+            " {p:?} = (let o = {}; in if o != null && o ? highestPrio then o.highestPrio else 100);",
+            walk("c.options", p)
+        ));
+    }
+    format!("c: {{ export = c.config.services.planarian.export; values = {{{values} }}; prios = {{{prios} }}; }}")
+}
+
+fn value_from_json(v: &serde_json::Value) -> Option<Value> {
+    Some(match v {
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Str(n.to_string()),
+        },
+        serde_json::Value::String(s) => Value::Str(s.clone()),
+        serde_json::Value::Array(a) => Value::List(a.iter().filter_map(value_from_json).collect()),
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct Nixos {
+    paths: Paths,
+    lock: Arc<Mutex<()>>,
+}
+
+fn sha(text: &str) -> Hash {
+    Hash::of(text.as_bytes())
+}
+
+fn err(o: &Output) -> Outcome {
+    if o.timed_out { Outcome::Unknown("timed out".into()) } else { Outcome::Failed(o.tail()) }
+}
+
+fn nix(args: &[&str], timeout: Duration) -> Output {
+    let mut argv = vec!["nix", "--extra-experimental-features", "nix-command flakes"];
+    argv.extend_from_slice(args);
+    run(&argv, timeout)
+}
+
+/// NAR hash of a directory.
+fn nar_hash(dir: &Path) -> Result<Hash, Outcome> {
+    let o = run(&["nix-hash", "--type", "sha256", "--base16", &dir.to_string_lossy()], NIX);
+    if !o.ok() {
+        return Err(err(&o));
+    }
+    Hash::from_hex(o.stdout.trim())
+        .ok_or_else(|| Outcome::Failed(format!("unexpected nix-hash output {:?}", o.stdout.trim())))
+}
+
+fn copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(p) = dst.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    let meta = std::fs::symlink_metadata(src)?;
+    if meta.file_type().is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(src)?, dst)
+    } else {
+        std::fs::copy(src, dst).map(|_| ())
+    }
+}
+
+fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let p = e.path();
+        if p.file_name().is_some_and(|n| n == ".git") {
+            continue;
+        }
+        if e.file_type()?.is_dir() {
+            walk(root, &p, out)?;
+        } else {
+            out.push(p.strip_prefix(root).expect("under root").to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+impl Nixos {
+    pub fn new(paths: Paths) -> Nixos {
+        Nixos { paths, lock: Arc::new(Mutex::new(())) }
+    }
+
+    fn registry_path(&self) -> PathBuf {
+        self.paths.state.join("generations.json")
+    }
+
+    fn with_registry<R>(&self, f: impl FnOnce(&mut Registry) -> R) -> Result<R, Outcome> {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let p = self.registry_path();
+        let mut reg: Registry = match std::fs::read(&p) {
+            Ok(b) => serde_json::from_slice(&b).map_err(|e| Outcome::Failed(format!("generations.json: {e}")))?,
+            Err(_) => Registry::default(),
+        };
+        let before = serde_json::to_vec(&reg).expect("serializes");
+        let r = f(&mut reg);
+        let after = serde_json::to_vec(&reg).expect("serializes");
+        if after != before {
+            let tmp = p.with_extension("json.tmp");
+            std::fs::create_dir_all(&self.paths.state).map_err(|e| Outcome::Failed(e.to_string()))?;
+            std::fs::write(&tmp, &after)
+                .and_then(|_| std::fs::rename(&tmp, &p))
+                .map_err(|e| Outcome::Failed(e.to_string()))?;
+        }
+        Ok(r)
+    }
+
+    fn id_of_link(&self, link: &Path) -> Result<GenerationId, Outcome> {
+        let target = std::fs::canonicalize(link).map_err(|e| Outcome::Failed(format!("{}: {e}", link.display())))?;
+        let t = target.to_string_lossy().into_owned();
+        self.with_registry(|r| r.id_for(&t))
+    }
+
+    fn override_file(&self, root: &Path) -> PathBuf {
+        root.join("planarian/overrides.nix")
+    }
+
+    fn store_dir(&self) -> PathBuf {
+        self.paths.state.join("overrides")
+    }
+
+    /// The owner's Nix-visible files, and the untracked files left out.
+    fn visible_files(&self, root: &Path) -> Result<(Vec<PathBuf>, Vec<String>), Outcome> {
+        let r = root.to_string_lossy().into_owned();
+        if root.join(".git").exists() {
+            let safe = format!("safe.directory={r}");
+            let tracked = run(&["git", "-c", &safe, "-C", &r, "ls-files", "-z", "--cached"], QUICK);
+            if !tracked.ok() {
+                return Err(err(&tracked));
+            }
+            let untracked =
+                run(&["git", "-c", &safe, "-C", &r, "ls-files", "-z", "--others", "--exclude-standard"], QUICK);
+            let files = tracked
+                .stdout
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .filter(|p| root.join(p).exists())
+                .collect();
+            let skipped = untracked.stdout.split('\0').filter(|s| !s.is_empty()).map(String::from).collect();
+            Ok((files, skipped))
+        } else {
+            let mut out = vec![];
+            walk(root, root, &mut out).map_err(|e| Outcome::Failed(e.to_string()))?;
+            Ok((out, vec![]))
+        }
+    }
+
+    /// Copy the owner's visible files into a fresh directory.
+    fn copy_owner(&self, root: &Path) -> Result<(PathBuf, Vec<String>), Outcome> {
+        let (files, skipped) = self.visible_files(root)?;
+        let rel = Path::new("planarian/overrides.nix");
+        if !files.iter().any(|f| f == rel) {
+            return Err(Outcome::Failed(
+                "planarian/overrides.nix is not part of your configuration (for a git flake: `git add planarian/overrides.nix`)".into(),
+            ));
+        }
+        let stage = self.paths.state.join("stage");
+        let tmp = stage.join(format!("tmp-{}-{}", std::process::id(), Timestamp_now()));
+        for f in &files {
+            copy_file(&root.join(f), &tmp.join(f)).map_err(|e| Outcome::Failed(format!("{}: {e}", f.display())))?;
+        }
+        Ok((tmp, skipped))
+    }
+
+    fn flake_ref(&self, dir: &Path) -> String {
+        format!("path:{}#{}", dir.display(), self.paths.flake_attr)
+    }
+
+    fn staged_dir(&self, source: &Hash) -> PathBuf {
+        self.paths.state.join("stage").join(source.to_hex())
+    }
+
+    fn unit_name(op: &OpId) -> String {
+        format!("planarian-op-{}-{}-{}", op.txn.0, op.epoch, op.seq)
+    }
+
+    fn write_atomically(target: &Path, text: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let dir = target.parent().expect("has a parent");
+        let meta = std::fs::metadata(target).ok();
+        let tmp = dir.join(".overrides.nix.planarian-tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+        }
+        if let Some(m) = meta {
+            use std::os::unix::fs::MetadataExt;
+            let _ = rustix::fs::chown(
+                &tmp,
+                Some(rustix::fs::Uid::from_raw(m.uid())),
+                Some(rustix::fs::Gid::from_raw(m.gid())),
+            );
+        }
+        std::fs::rename(&tmp, target)?;
+        std::fs::File::open(dir)?.sync_all()
+    }
+}
+
+#[allow(non_snake_case)]
+fn Timestamp_now() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+}
+
+impl GenerationBackend for Nixos {
+    fn current(&self) -> Result<GenerationId, Outcome> {
+        self.id_of_link(Path::new("/run/current-system"))
+    }
+
+    fn boot_entries(&self) -> Result<Vec<GenerationId>, Outcome> {
+        let dir = self.paths.profile.parent().expect("profile has a directory");
+        let prefix = format!("{}-", self.paths.profile.file_name().expect("profile name").to_string_lossy());
+        let mut out = vec![];
+        for e in std::fs::read_dir(dir).map_err(|e| Outcome::Failed(e.to_string()))?.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with(&prefix) && n.ends_with("-link") {
+                out.push(self.id_of_link(&e.path())?);
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    fn boot_default(&self) -> Result<GenerationId, Outcome> {
+        self.id_of_link(&self.paths.profile)
+    }
+
+    fn last_booted(&self) -> Result<GenerationId, Outcome> {
+        self.id_of_link(Path::new("/run/booted-system"))
+    }
+
+    fn stage(&self, owner: &PinnedSource, overrides: &OverrideSet) -> Result<StagedSource, Outcome> {
+        let root = PathBuf::from(&owner.root);
+        let (tmp, excluded) = self.copy_owner(&root)?;
+        let live = std::fs::read_to_string(self.override_file(&tmp)).map_err(|e| Outcome::Failed(e.to_string()))?;
+        let base_source = nar_hash(&tmp)?;
+        let candidate = render(overrides);
+        std::fs::write(self.override_file(&tmp), &candidate).map_err(|e| Outcome::Failed(e.to_string()))?;
+        let staged_source = nar_hash(&tmp)?;
+        let dir = self.staged_dir(&staged_source);
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&tmp);
+        } else {
+            std::fs::rename(&tmp, &dir).map_err(|e| Outcome::Failed(e.to_string()))?;
+        }
+        self.remember_override(overrides)?;
+        Ok(StagedSource {
+            dir: dir.to_string_lossy().into_owned(),
+            base_source,
+            staged_source,
+            base_override: sha(&live),
+            candidate_override: sha(&candidate),
+            excluded,
+        })
+    }
+
+    fn source_hash(&self, owner: &PinnedSource) -> Result<Hash, Outcome> {
+        let (tmp, _) = self.copy_owner(Path::new(&owner.root))?;
+        let h = nar_hash(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
+        h
+    }
+
+    fn evaluate(&self, src: &StagedSource) -> Result<EvaluatedGeneration, Outcome> {
+        let dir = PathBuf::from(&src.dir);
+        let text = std::fs::read_to_string(self.override_file(&dir)).map_err(|e| Outcome::Failed(e.to_string()))?;
+        let set = parse_overrides(&text).unwrap_or_default();
+        let paths: Vec<String> = set.assignments.keys().cloned().collect();
+        let o = nix(
+            &["eval", "--json", "--option", "pure-eval", "true", &self.flake_ref(&dir), "--apply", &apply_expr(&paths)],
+            NIX,
+        );
+        if !o.ok() {
+            return Err(err(&o));
+        }
+        #[derive(Deserialize)]
+        struct Out {
+            export: Export,
+            values: BTreeMap<String, serde_json::Value>,
+            prios: BTreeMap<String, i64>,
+        }
+        let out: Out =
+            serde_json::from_str(&o.stdout).map_err(|e| Outcome::Failed(format!("evaluation output: {e}")))?;
+        let mut eval = out.export.into_eval(src.staged_source);
+        eval.options = out.values.iter().filter_map(|(k, v)| value_from_json(v).map(|v| (k.clone(), v))).collect();
+        // mkOverride 90 loses to anything with a lower number (mkForce is 50).
+        eval.locked = out.prios.into_iter().filter(|(_, p)| *p < 90).map(|(k, _)| k).collect();
+        Ok(eval)
+    }
+
+    fn build(&self, eval: &EvaluatedGeneration) -> Result<Built, Outcome> {
+        let dir = self.staged_dir(&eval.source);
+        let root = self.paths.gcroots.join("builds").join(eval.source.to_hex());
+        std::fs::create_dir_all(root.parent().expect("parent")).map_err(|e| Outcome::Failed(e.to_string()))?;
+        let attr = format!("{}.config.system.build.toplevel", self.flake_ref(&dir));
+        let o = nix(&["build", "--out-link", &root.to_string_lossy(), "--print-out-paths", &attr], NIX);
+        if !o.ok() {
+            return Err(err(&o));
+        }
+        let path = o.stdout.lines().last().unwrap_or_default().trim().to_string();
+        let generation = self.with_registry(|r| r.id_for(&path))?;
+        let dry = run(&[&format!("{path}/bin/switch-to-configuration"), "dry-activate"], Duration::from_secs(120));
+        let mut activation = parse_dry_activate(&format!("{}\n{}", dry.stdout, dry.stderr));
+        let differs = |f: &str| {
+            std::fs::read_link(format!("{path}/{f}")).ok()
+                != std::fs::read_link(format!("/run/current-system/{f}")).ok()
+        };
+        activation.needs_reboot_to_confirm = differs("kernel") || differs("initrd") || {
+            std::fs::read_to_string(format!("{path}/kernel-params")).ok()
+                != std::fs::read_to_string("/run/current-system/kernel-params").ok()
+        };
+        Ok(Built { generation, path: StorePath(path), root: root.to_string_lossy().into_owned(), activation })
+    }
+
+    fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
+        Ok(Path::new(&path.0).join("bin/switch-to-configuration").exists())
+    }
+
+    fn pending_jobs(&self) -> Result<Vec<JobId>, Outcome> {
+        let o = run(
+            &[
+                "systemctl",
+                "list-units",
+                "--plain",
+                "--no-legend",
+                "--state=activating,active,deactivating,reloading",
+                "planarian-op-*",
+            ],
+            QUICK,
+        );
+        if !o.ok() {
+            return Err(err(&o));
+        }
+        Ok(o.stdout.lines().filter_map(|l| l.split_whitespace().next()).map(|n| JobId(n.into())).collect())
+    }
+
+    fn jobs_tagged(&self, op: &OpId) -> Result<Option<Vec<JobId>>, Outcome> {
+        let name = format!("{}.service", Self::unit_name(op));
+        let o = run(&["systemctl", "show", "--property=ActiveState,LoadState", &name], QUICK);
+        if !o.ok() {
+            return Ok(None);
+        }
+        let props = crate::systemd::parse_show(&o.stdout);
+        let active = matches!(
+            props.get("ActiveState").map(String::as_str),
+            Some("active" | "activating" | "deactivating" | "reloading")
+        );
+        Ok(Some(if active { vec![JobId(name)] } else { vec![] }))
+    }
+
+    fn override_hash(&self) -> Result<Hash, Outcome> {
+        std::fs::read_to_string(self.override_file(&self.paths.owner))
+            .map(|t| sha(&t))
+            .map_err(|e| Outcome::Failed(e.to_string()))
+    }
+
+    fn activate_live(&self, g: GenerationId, op: &OpId) -> Outcome {
+        if !admitted(&self.paths.txn_dir(), op) {
+            return Outcome::fenced();
+        }
+        let path = match self.path_of(g) {
+            Ok(p) => p,
+            Err(o) => return o,
+        };
+        let unit = format!("--unit={}", Self::unit_name(op));
+        let o = run(
+            &[
+                "systemd-run",
+                &unit,
+                "--wait",
+                "--collect",
+                "--quiet",
+                "--service-type=oneshot",
+                "--property=TimeoutStartSec=15min",
+                &format!("{}/bin/switch-to-configuration", path.0),
+                "test",
+            ],
+            ACTIVATION,
+        );
+        if o.ok() { Outcome::Succeeded } else { err(&o) }
+    }
+
+    fn publish_boot(&self, g: GenerationId, op: &OpId) -> Outcome {
+        if !admitted(&self.paths.txn_dir(), op) {
+            return Outcome::fenced();
+        }
+        let path = match self.path_of(g) {
+            Ok(p) => p,
+            Err(o) => return o,
+        };
+        let profile = self.paths.profile.to_string_lossy().into_owned();
+        // Idempotent: only add a profile generation if the profile points elsewhere.
+        let already = std::fs::canonicalize(&self.paths.profile).ok().map(|p| p.to_string_lossy().into_owned())
+            == Some(path.0.clone());
+        if !already {
+            let o = run(&["nix-env", "-p", &profile, "--set", &path.0], QUICK);
+            if !o.ok() {
+                return err(&o);
+            }
+        }
+        let o = run(&[&format!("{}/bin/switch-to-configuration", path.0), "boot"], Duration::from_secs(300));
+        if o.ok() { Outcome::Succeeded } else { err(&o) }
+    }
+
+    fn protect(&self, g: GenerationId, op: &OpId) -> Outcome {
+        if !admitted(&self.paths.txn_dir(), op) {
+            return Outcome::fenced();
+        }
+        let path = match self.path_of(g) {
+            Ok(p) => p,
+            Err(o) => return o,
+        };
+        let link = self.paths.gcroots.join(format!("gen-{}", g.0));
+        let _ = std::fs::create_dir_all(&self.paths.gcroots);
+        let _ = std::fs::remove_file(&link);
+        match std::os::unix::fs::symlink(&path.0, &link) {
+            Ok(()) => Outcome::Succeeded,
+            Err(e) => Outcome::Failed(e.to_string()),
+        }
+    }
+
+    fn cancel(&self, job: &JobId, op: &OpId) -> Outcome {
+        if !admitted(&self.paths.txn_dir(), op) {
+            return Outcome::fenced();
+        }
+        let o = run(&["systemctl", "stop", &job.0], Duration::from_secs(90));
+        if o.ok() { Outcome::Succeeded } else { err(&o) }
+    }
+
+    fn swap_override(&self, from: &Hash, to: &Hash, op: &OpId) -> Outcome {
+        if !admitted(&self.paths.txn_dir(), op) {
+            return Outcome::fenced();
+        }
+        let live = self.override_file(&self.paths.owner);
+        let current = match std::fs::read_to_string(&live) {
+            Ok(t) => sha(&t),
+            Err(e) => return Outcome::Failed(e.to_string()),
+        };
+        if current == *to {
+            return Outcome::Succeeded;
+        }
+        if current != *from {
+            return Outcome::Failed("planarian/overrides.nix was changed by someone else".into());
+        }
+        let text = match std::fs::read_to_string(self.store_dir().join(format!("{}.nix", to.to_hex()))) {
+            Ok(t) if sha(&t) == *to => t,
+            _ => return Outcome::Failed("override content for this transaction is missing".into()),
+        };
+        match Self::write_atomically(&live, &text) {
+            Ok(()) => Outcome::Succeeded,
+            Err(e) => Outcome::Failed(e.to_string()),
+        }
+    }
+
+    fn path_of(&self, g: GenerationId) -> Result<StorePath, Outcome> {
+        self.with_registry(|r| r.paths.get(&g.0).cloned())?
+            .map(StorePath)
+            .ok_or_else(|| Outcome::Failed(format!("unknown generation {}", g.0)))
+    }
+
+    fn evaluate_built(&self, path: &StorePath) -> Result<EvaluatedGeneration, Outcome> {
+        let p = Path::new(&path.0).join("etc/planarian/export.json");
+        let text = std::fs::read_to_string(&p).map_err(|e| Outcome::Failed(format!("{}: {e}", p.display())))?;
+        let export: Export =
+            serde_json::from_str(&text).map_err(|e| Outcome::Failed(format!("{}: {e}", p.display())))?;
+        Ok(export.into_eval(Hash::ZERO))
+    }
+
+    fn read_overrides(&self) -> Result<(OverrideSet, Hash), Outcome> {
+        let text = std::fs::read_to_string(self.override_file(&self.paths.owner))
+            .map_err(|e| Outcome::Failed(e.to_string()))?;
+        let set = parse_overrides(&text).ok_or_else(|| {
+            Outcome::Failed(
+                "planarian/overrides.nix was edited by hand; restore it from `git` or remove the edits".into(),
+            )
+        })?;
+        Ok((set, sha(&text)))
+    }
+
+    fn remember_override(&self, set: &OverrideSet) -> Result<Hash, Outcome> {
+        let text = render(set);
+        let h = sha(&text);
+        let dir = self.store_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| Outcome::Failed(e.to_string()))?;
+        std::fs::write(dir.join(format!("{}.nix", h.to_hex())), text).map_err(|e| Outcome::Failed(e.to_string()))?;
+        Ok(h)
+    }
+
+    fn override_for(&self, g: GenerationId) -> Result<Option<Hash>, Outcome> {
+        self.with_registry(|r| r.overrides.get(&g.0).copied())
+    }
+
+    fn record_override(&self, g: GenerationId, hash: &Hash) -> Result<(), Outcome> {
+        self.with_registry(|r| {
+            r.overrides.insert(g.0, *hash);
+        })
+    }
+
+    fn release_root(&self, root: &str) -> bool {
+        Path::new(root).starts_with(&self.paths.gcroots) && std::fs::remove_file(root).is_ok()
+    }
+
+    fn collect_garbage(&self, protect: &[GenerationId], emergency: bool, op: &OpId) -> Outcome {
+        if !admitted(&self.paths.txn_dir(), op) {
+            return Outcome::fenced();
+        }
+        let keep_n = if emergency { KEEP_GENERATIONS_EMERGENCY } else { KEEP_GENERATIONS };
+        let protected_paths: BTreeSet<String> =
+            protect.iter().filter_map(|g| self.path_of(*g).ok()).map(|p| p.0).collect();
+        // Profile generations: number → store path.
+        let dir = self.paths.profile.parent().expect("profile dir");
+        let prefix = format!("{}-", self.paths.profile.file_name().expect("name").to_string_lossy());
+        let mut gens: Vec<(u64, String)> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| {
+                        let n = e.file_name().to_string_lossy().into_owned();
+                        let num = n.strip_prefix(&prefix)?.strip_suffix("-link")?.parse().ok()?;
+                        Some((num, std::fs::canonicalize(e.path()).ok()?.to_string_lossy().into_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        gens.sort();
+        let newest: BTreeSet<u64> = gens.iter().rev().take(keep_n).map(|(n, _)| *n).collect();
+        // Protected generations stay in the profile, so they stay in the boot menu (I1, I3).
+        let delete: Vec<String> = gens
+            .iter()
+            .filter(|(n, p)| !newest.contains(n) && !protected_paths.contains(p))
+            .map(|(n, _)| n.to_string())
+            .collect();
+        if !delete.is_empty() {
+            let profile = self.paths.profile.to_string_lossy().into_owned();
+            let mut argv = vec!["nix-env", "-p", &profile, "--delete-generations"];
+            argv.extend(delete.iter().map(String::as_str));
+            let o = run(&argv, QUICK);
+            if !o.ok() {
+                return err(&o);
+            }
+        }
+        for g in protect {
+            if let Ok(p) = self.path_of(*g) {
+                let link = self.paths.gcroots.join(format!("gen-{}", g.0));
+                let _ = std::fs::create_dir_all(&self.paths.gcroots);
+                if std::fs::read_link(&link).ok().map(|l| l.to_string_lossy().into_owned()) != Some(p.0.clone()) {
+                    let _ = std::fs::remove_file(&link);
+                    let _ = std::os::unix::fs::symlink(&p.0, &link);
+                }
+            }
+        }
+        let o = run(&["nix-store", "--gc"], NIX);
+        if !o.ok() {
+            return err(&o);
+        }
+        if !delete.is_empty() {
+            let _ = run(
+                &[&format!("{}/bin/switch-to-configuration", self.paths.profile.display()), "boot"],
+                Duration::from_secs(300),
+            );
+        }
+        Outcome::Succeeded
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dry_activate() {
+        let text = "would stop the following units: gym-web.service, foo.socket\n\
+                    would NOT stop the following changed units: getty@tty1.service\n\
+                    would restart the following units: sshd.service\n\
+                    would start the following units: avahi-daemon.service, graphical-session.target\n";
+        let p = parse_dry_activate(text);
+        assert_eq!(p.stop, [UnitId::service("gym-web")].into());
+        assert_eq!(p.restart, [UnitId::service("sshd")].into());
+        assert!(p.start.contains(&UnitId::target("graphical-session")));
+    }
+
+    #[test]
+    fn registry_ids_are_stable() {
+        let mut r = Registry::default();
+        let a = r.id_for("/nix/store/a");
+        let b = r.id_for("/nix/store/b");
+        assert_eq!(r.id_for("/nix/store/a"), a);
+        assert!(b > a);
+    }
+
+    #[test]
+    fn apply_expression_shape() {
+        let e = apply_expr(&["services.openssh.enable".into()]);
+        assert!(e.starts_with("c: { export = c.config.services.planarian.export;"));
+        assert!(e.contains(r#"[ "services" "openssh" "enable" ]"#));
+        assert!(e.contains("highestPrio"));
+    }
+
+    #[test]
+    fn export_roundtrip() {
+        let e = Export {
+            units: vec![UnitDef {
+                id: UnitId::service("sshd"),
+                desired: Desired { status: DesiredStatus::Running, when: Condition::Always },
+                edges: vec![],
+                sensitivity: Sensitivities::of(&[Sensitivity::Security]),
+                restart_disruption: Disruption::Brief,
+                probes: vec![],
+                synonyms: vec!["ssh".into()],
+                systemd_restart: None,
+            }],
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&e).unwrap();
+        assert!(j.contains("\"userUnits\""), "{j}");
+        assert_eq!(serde_json::from_str::<Export>(&j).unwrap(), e);
+    }
+
+    #[test]
+    fn stage_copies_tracked_files_and_hashes_like_nix() {
+        if run(&["nix-hash", "--version"], QUICK).status != Some(0) {
+            eprintln!("SKIPPED: nix-hash not on PATH");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let owner = d.path().join("owner");
+        std::fs::create_dir_all(owner.join("planarian")).unwrap();
+        std::fs::write(owner.join("flake.nix"), "{ }").unwrap();
+        std::fs::write(owner.join("planarian/overrides.nix"), render(&OverrideSet::default())).unwrap();
+        let paths = Paths { state: d.path().join("state"), owner: owner.clone(), ..Default::default() };
+        let n = Nixos::new(paths);
+        let src = PinnedSource { root: owner.to_string_lossy().into_owned(), kind: SourceKind::Directory };
+        let mut set = OverrideSet::default();
+        set.assignments.insert("a.b".into(), Value::Bool(true));
+        let s = n.stage(&src, &set).unwrap();
+        assert_ne!(s.base_source, s.staged_source);
+        assert_eq!(n.source_hash(&src).unwrap(), s.base_source, "owner tree unchanged → not stale");
+        std::fs::write(owner.join("flake.nix"), "{ edited = 1; }").unwrap();
+        assert_ne!(n.source_hash(&src).unwrap(), s.base_source, "owner edit → stale");
+        assert_eq!(
+            std::fs::read_to_string(PathBuf::from(&s.dir).join("planarian/overrides.nix")).unwrap(),
+            render(&set)
+        );
+        assert_eq!(
+            std::fs::read_to_string(owner.join("planarian/overrides.nix")).unwrap(),
+            render(&OverrideSet::default()),
+            "owner's file untouched"
+        );
+    }
+}
