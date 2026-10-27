@@ -220,8 +220,9 @@ mod tests {
         assert_eq!(http(&url, 200, Duration::from_secs(2), 4096), ProbeResult::Pass);
         assert!(matches!(http(&url, 200, Duration::from_secs(2), 4096), ProbeResult::Fail(m) if m.contains("503")));
         assert_eq!(tcp(&addr.to_string(), Duration::from_secs(1)), ProbeResult::Pass);
-        let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        assert!(matches!(tcp(&closed.to_string(), Duration::from_secs(1)), ProbeResult::Fail(_)));
+        // Port 1 is closed in any test environment; a freshly released
+        // ephemeral port is not (another test may have taken it).
+        assert!(matches!(tcp("127.0.0.1:1", Duration::from_secs(1)), ProbeResult::Fail(_)));
     }
 
     #[test]
