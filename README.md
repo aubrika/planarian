@@ -140,6 +140,14 @@ attention. It is dark, like the rest of the identity (`assets/identity`).
 While Planarian builds or applies a change, the mark in its window moves
 (the kit's "working" motion); set `PLANARIAN_REDUCED_MOTION=1` to keep it still.
 
+The status indicator (`services.planarian.tray.enable`, on with the console)
+puts the planarian mark in the panel: no dot when all is well, blue-grey
+while a change is being built or applied, amber when something needs a look
+(an incident being repaired, an approval, a reverted change), red when
+something needs a person (a repair that keeps failing, the recovery
+interlock, or the daemon is unreachable). Its tooltip says what; clicking it
+opens the console.
+
 Other commands: `planarian incidents`, `planarian log -n 50`, `planarian undo`,
 `planarian gc`, `planarian diagnose <unit>`, `planarian cancel <txn>`,
 `planarian mark-good`, `planarian resolve <txn> --as-committed|--as-reverted|--manual-repaired`.

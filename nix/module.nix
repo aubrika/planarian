@@ -211,8 +211,15 @@ in
       };
       package = mkOption {
         type = types.package;
-        description = "The console package (the flake's module sets it).";
+        description = "The console package (the flake's module sets it). It also holds `planarian-tray`.";
       };
+    };
+
+    tray.enable = mkOption {
+      type = types.bool;
+      default = cfg.console.enable;
+      defaultText = lib.literalExpression "config.services.planarian.console.enable";
+      description = "Show the status indicator in the panel with each graphical session: the planarian mark, amber when something needs a look, red when something needs a person. Clicking it opens the console.";
     };
 
     owner = mkOption {
@@ -367,7 +374,7 @@ in
     };
 
     # With the console: its launcher entry and icons too.
-    environment.systemPackages = [ cfg.package ] ++ lib.optional cfg.console.enable cfg.console.package;
+    environment.systemPackages = [ cfg.package ] ++ lib.optional (cfg.console.enable || cfg.tray.enable) cfg.console.package;
     users.groups.planarian-admin = { };
 
     # The healer is not the patient (Principle 1): no activation restarts or
@@ -396,6 +403,18 @@ in
       after = [ "graphical-session.target" ];
       serviceConfig = {
         ExecStart = "${cfg.console.package}/bin/planarian-console";
+        Restart = "on-failure";
+        RestartSec = 5;
+      };
+    };
+
+    systemd.user.services.planarian-tray = mkIf cfg.tray.enable {
+      description = "Planarian status indicator";
+      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      after = [ "graphical-session.target" ];
+      serviceConfig = {
+        ExecStart = "${cfg.console.package}/bin/planarian-tray";
         Restart = "on-failure";
         RestartSec = 5;
       };

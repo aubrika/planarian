@@ -7,7 +7,8 @@
 //! daemon runs as Runtime transitions with the user as the actor. It reads
 //! only the daemon's socket. It starts minimized unless something needs
 //! attention: an open incident, a pending approval, a reconciliation record,
-//! or a reverted change.
+//! or a reverted change (`--show`, which the status indicator passes, keeps
+//! it up regardless).
 
 mod graph;
 mod mark;
@@ -15,7 +16,7 @@ mod mark;
 use iced::widget::{button, canvas, column, container, row, rule, scrollable, text};
 use iced::{Color, Element, Fill, Subscription, Task, Theme, color, time, window};
 use mark::{Mark, Motion};
-use planarian_ipc::{ConsoleReport, Request, Response, SOCKET};
+use planarian_ipc::{ConsoleReport, Request, Response, SOCKET, status_words};
 use planarian_schema::{IncidentState, UnitId, Until};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -101,6 +102,8 @@ struct Console {
     /// The answer to the last button.
     answer: Option<String>,
     first: bool,
+    /// `--show` (from the tray): stay up even when nothing needs attention.
+    show: bool,
     /// The animation clock.
     started: Instant,
     seconds: f32,
@@ -127,6 +130,7 @@ impl Console {
             selected: None,
             answer: None,
             first: true,
+            show: std::env::args().any(|a| a == "--show"),
             started: Instant::now(),
             seconds: 0.0,
             reduced_motion,
@@ -203,7 +207,7 @@ impl Console {
         match m {
             Message::Tick => {
                 self.refresh();
-                if std::mem::take(&mut self.first) && !self.needs_attention() {
+                if std::mem::take(&mut self.first) && !self.show && !self.needs_attention() {
                     return window::latest().and_then(|id| window::minimize(id, true));
                 }
             }
@@ -220,15 +224,10 @@ impl Console {
         Task::none()
     }
 
-    /// §16a: start visible only when something needs attention.
+    /// §16a: start visible only when something needs attention (the tray
+    /// turns amber or red on the same condition).
     fn needs_attention(&self) -> bool {
-        let Some(r) = &self.report else { return true };
-        let s = &r.status;
-        s.incidents.iter().any(|i| i.state != IncidentState::Closed)
-            || !s.pending.is_empty()
-            || !s.interlock.is_empty()
-            || s.reconciliation.as_ref().is_some_and(|a| !a.is_empty())
-            || r.last_change_reverted
+        self.report.as_ref().is_none_or(ConsoleReport::needs_attention)
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -465,29 +464,6 @@ fn describe(r: &Response) -> String {
         Response::Rejected { reason, message } => format!("refused ({reason}): {message}"),
         Response::Ok { message } | Response::Error { message } | Response::Unmatched { message } => message.clone(),
         other => format!("{other:?}"),
-    }
-}
-
-/// A unit status in words.
-pub fn status_words(s: &planarian_schema::UnitStatus) -> String {
-    use planarian_schema::{Reason, UnitStatus as S};
-    match s {
-        S::Running => "running".into(),
-        S::Degraded(probes) => {
-            let names: Vec<&str> = probes.iter().map(|p| p.0.as_str()).collect();
-            format!("running, but failing its health check ({})", names.join(", "))
-        }
-        S::Stopped => "stopped".into(),
-        S::Suppressed => "left alone on request".into(),
-        S::Unknown => "unknown (no fresh evidence)".into(),
-        S::Failed(Reason::ExitCode(c)) => format!("failed (exit code {c})"),
-        S::Failed(Reason::DriverError(e)) => format!("failed (driver: {e})"),
-        S::Failed(Reason::Backend(e)) => format!("failed ({e})"),
-        S::Absent => "absent".into(),
-        S::Detected => "detected, no driver bound".into(),
-        S::Bound => "bound to its driver".into(),
-        S::Transitioning => "starting or stopping".into(),
-        S::NotExpected => "not expected now".into(),
     }
 }
 
