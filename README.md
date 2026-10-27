@@ -12,8 +12,8 @@ separate watchdog finishes or reverts the change.
 - Fault catalog: [`crates/gym/catalog/phase-a.toml`](crates/gym/catalog/phase-a.toml)
 
 **Status: Phase A, ready for initial user testing on NixOS 26.05.** No language
-model is involved. The visual console and the Verus proofs are not done yet
-(see `docs/AGENTS.md`).
+model is involved. The `policy` proofs verify; the `txn` proofs and the
+visual console are not done yet (see `docs/AGENTS.md`).
 
 ## Trying it
 

@@ -29,4 +29,6 @@ Checks and where they run:
 - `nix build .#checks.x86_64-linux.module-eval`: evaluates a full NixOS system with the module and asserts on the exported manifest.
 - `nix build .#checks.x86_64-linux.vm-runtime`: a NixOS VM on real systemd. Needs KVM to be fast; without KVM it runs under emulation in about 20–30 minutes.
 
-**Not yet done:** Verus proofs (item 9); the console; §12b space budgets; the VM harness for generation changes (needs an owner flake that can build inside the VM).
+- `verus crates/policy/verus/policy.rs`: the `policy` proofs (5 verified). By hand, see `crates/policy/verus/README.md`.
+
+**Not yet done:** Verus proofs for `txn` and `schema`, and Verus in CI (item 9); the console; §12b space budgets; the VM harness for generation changes (needs an owner flake that can build inside the VM).

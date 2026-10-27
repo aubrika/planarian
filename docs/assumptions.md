@@ -2,6 +2,8 @@
 
 Every externally specified behavior the proofs rely on (SPEC §17a). Each Verus `assume` / `external_body` site gets a line here in the same PR that adds it (SPEC §18.11).
 
+The `policy` proofs (`crates/policy/verus/policy.rs`) use no `assume` and no `external_body`.
+
 ## Phase A: stated in SPEC §17a, not yet bound to proof sites
 
 | Assumption | Sites |

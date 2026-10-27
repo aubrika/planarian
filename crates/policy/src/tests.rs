@@ -449,3 +449,96 @@ fn policy_version_covers_tables() {
     assert_ne!(policy_version(&a), policy_version(&b));
     assert_eq!(policy_version(&a), policy_version(&tables()));
 }
+
+/// The abstraction from a real input to the model's plain facts: set lookups,
+/// the diff classification, and the §11 `authorized` rule, which the model
+/// takes as given. The ordering, tiers and floors are the model's.
+#[allow(clippy::too_many_arguments)]
+fn abstract_input(
+    t: &Transition,
+    f: &DerivedFacts,
+    a: &Authorization,
+    session: &Session,
+    tb: &Tables,
+    st: &SystemState,
+    locked: &BTreeSet<String>,
+    revert_to: Option<GenerationId>,
+) -> (model::MKind, model::MFacts, model::MAuthz) {
+    use model::MKind as K;
+    let vetted = |g: GenerationId| Some(g) == st.live_tested || g == st.known_good;
+    let kind = match t {
+        Transition::RestartUnit(_) | Transition::StopUnit(_) => K::RestartStop,
+        Transition::Suppress(_) | Transition::Unsuppress(_) | Transition::StopAndSuppress { .. } => K::SuppressFamily,
+        Transition::BindDriver { .. } => K::BindDriver,
+        Transition::ApplyChange { change, .. } => K::ApplyChange { in_catalog: tb.catalog.contains(change) },
+        Transition::SwitchGeneration(g) => K::SwitchOrRevert { vetted: vetted(*g), mismatched: false },
+        Transition::Revert { to } => {
+            K::SwitchOrRevert { vetted: vetted(*to), mismatched: revert_to.is_some_and(|r| r != *to) }
+        }
+        Transition::Rollback => K::Rollback,
+        Transition::LoadModel(m) => K::LoadModel { in_catalog: tb.model_catalog.contains(m) },
+        Transition::RestoreSnapshot(_) => K::RestoreSnapshot,
+        Transition::CollectGarbage { .. } => K::CollectGarbage,
+        Transition::SetRuntimeOption { path, .. } => {
+            K::SetRuntimeOption { allowed: tb.runtime_allowlist.contains(path) }
+        }
+        Transition::Resolve { .. } => K::Resolve,
+    };
+    let s = &f.sensitivity;
+    let diff_non_routine = f.config_diff.as_ref().is_some_and(|d| {
+        !tb.diff_sensitivity(&session.cumulative.then(d)).only_routine() || !tb.diff_sensitivity(d).only_routine()
+    });
+    let facts = model::MFacts {
+        security: s.contains(Sensitivity::Security),
+        external: s.contains(Sensitivity::External),
+        user_data: s.contains(Sensitivity::UserData),
+        core: f.touches_core || s.contains(Sensitivity::Core),
+        disruption: match f.disruption {
+            Disruption::None => 0,
+            Disruption::Brief => 1,
+            Disruption::SessionLoss => 2,
+            Disruption::DataInterruption => 3,
+            Disruption::ConnectivityLoss => 4,
+        },
+        non_reversible: f.recovery == Recovery::NonReversible,
+        touches_manifest: f.touches_manifest,
+        touches_canonical_probe: f.touches_canonical_probe,
+        locked: f.config_diff.as_ref().is_some_and(|d| d.options.keys().any(|p| locked.contains(p))),
+        has_diff: f.config_diff.is_some(),
+        diff_non_routine,
+    };
+    let authz = model::MAuthz {
+        is_user: is_user(&a.caller),
+        authorized: authorized(t, f, a, &Settings::default()),
+        local_session: a.local_session,
+        owns_affected_session: a.owns_affected_session,
+    };
+    (kind, facts, authz)
+}
+
+fn concretize(d: model::MDecision) -> Decision {
+    let tiers = [Tier::Observe, Tier::Runtime, Tier::Tested, Tier::AskFirst];
+    let reasons =
+        [RejectReason::Unauthorized, RejectReason::CoreTarget, RejectReason::NotInCatalog, RejectReason::LockedOption];
+    match d {
+        model::MDecision::Allow(t) => Decision::Allow(tiers[t as usize]),
+        model::MDecision::Reject(r) => Decision::Reject(reasons[r as usize].clone()),
+    }
+}
+
+/// The verified model and the shipped `decide` agree on every grid input, at
+/// every autonomy setting.
+#[test]
+fn model_agrees_with_decide() {
+    let (st, tb) = (state(), tables());
+    let locked: BTreeSet<String> = ["services.locked".to_string()].into();
+    let mut n = 0;
+    grid(|t, f, a, session, decisions| {
+        let (k, mf, ma) = abstract_input(t, f, a, session, &tb, &st, &locked, Some(GenerationId(4)));
+        for (max, real) in decisions.iter().enumerate() {
+            n += 1;
+            assert_eq!(&concretize(model::decide_model(k, mf, ma, max as u8)), real, "{t:?} {f:?} {a:?} max={max}");
+        }
+    });
+    assert!(n > 300_000, "{n}");
+}

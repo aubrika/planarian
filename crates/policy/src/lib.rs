@@ -10,8 +10,9 @@
 //! 5. the autonomy setting, which can only raise a tier to AskFirst and never
 //!    touches a `Reject` (I5).
 //!
-//! Verus subset: no `dyn`, no `unsafe`, no floats. The properties the proofs
-//! will state are checked exhaustively in the tests below until Verus runs in CI.
+//! Verus subset: no `dyn`, no `unsafe`, no floats. The proofs are about
+//! `model::decide_model`, which the tests check agrees with `decide`; see
+//! `model.rs` for the chain from proof to shipped code.
 
 use planarian_schema::{
     Actor, ChangeId, ConfigDiff, Decision, DerivedFacts, Disruption, GenerationId, Hash, ModelId, PolicyVersion,
@@ -19,6 +20,8 @@ use planarian_schema::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+
+pub mod model;
 
 /// Bumped by hand whenever the decision logic changes; part of `PolicyVersion`.
 pub const POLICY_REVISION: &str = "phase-a.1";
