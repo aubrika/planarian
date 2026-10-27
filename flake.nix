@@ -35,6 +35,10 @@
         module-eval = import ./nix/tests/eval.nix { inherit pkgs self nixpkgs; };
         vm-runtime = import ./nix/tests/vm.nix { inherit pkgs self; };
         vm-generations = import ./nix/tests/vm-generations.nix { inherit pkgs self; };
+        # The dependency rule (SPEC §5, §17).
+        boundaries = pkgs.runCommand "planarian-boundaries" { } ''
+          ${pkgs.bash}/bin/bash ${./nix/tests/boundaries.sh} ${./.} > $out
+        '';
       } // pkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
         # Verus publishes binaries for x86_64-linux only.
         verus = import ./nix/tests/verus.nix { inherit pkgs; };

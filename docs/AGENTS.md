@@ -29,6 +29,8 @@ Checks and where they run:
 - `nix build .#checks.x86_64-linux.module-eval`: evaluates a full NixOS system with the module and asserts on the exported manifest.
 - `nix build .#checks.x86_64-linux.vm-runtime`: a NixOS VM on real systemd. Needs KVM to be fast; without KVM it runs under emulation in about 20–30 minutes.
 
+- `nix build .#checks.x86_64-linux.boundaries` (or `nix/tests/boundaries.sh`): the dependency rule (§5, §17): core crates use no backends, `std::process`, `/proc`, `/sys` or `/nix`; no `dyn` in schema, policy, txn, exec; nothing lifts `unsafe_code = forbid`.
+- `nix build .#checks.x86_64-linux.vm-generations`: a NixOS VM applies a cataloged change (commits), a bad one (reverts), and keeps a user's stop through both.
 - `nix build .#checks.x86_64-linux.verus`: `decide` verified and the §17a policy properties proved, in the Nix sandbox with the pinned Verus. See `docs/verification.md`.
 
 **Not yet done:** a Verus proof of `schema::digest` (property-tested instead; see deviations); Kani harnesses (proptest is in; installing Kani needs the owner's permission); the console's disruption notice with a cancel window (§11).
