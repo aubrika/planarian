@@ -84,6 +84,34 @@ fn renewer(store_dir: PathBuf, txn_dir: PathBuf, capacity: u64, me: OwnerId) {
 
 type Reply = mpsc::Sender<Response>;
 
+/// The gym's VM harness: a crash point from `/run/planarian-gym/crash`
+/// (`State:Activating`, `OpBegun:activate_live`, `OpCalled:activate_live`),
+/// armed for the next request. The file is consumed.
+#[cfg(feature = "gym-hooks")]
+fn gym_arm(core: &mut Core<Real, FileStore>) {
+    use planarian_txn::kernel::CrashPoint;
+    let path = "/run/planarian-gym/crash";
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let _ = std::fs::remove_file(path);
+    let (kind, name) = text.trim().split_once(':').unwrap_or(("", ""));
+    let name: &'static str = Box::leak(name.to_string().into_boxed_str());
+    core.ex.kernel.crash_at = match kind {
+        "State" => Some(CrashPoint::State(name)),
+        "OpBegun" => Some(CrashPoint::OpBegun(name)),
+        "OpCalled" => Some(CrashPoint::OpCalled(name)),
+        _ => None,
+    };
+}
+
+/// The crash point fired: die the way SIGKILL would, with no cleanup.
+#[cfg(feature = "gym-hooks")]
+fn gym_crash(resp: &Response) {
+    if matches!(resp, Response::Error { message } if message.contains("Crashed")) {
+        eprintln!("planariad: gym crash point reached; aborting");
+        std::process::abort();
+    }
+}
+
 enum Event {
     /// A request from the socket.
     Request(Peer, Request, Reply),
@@ -235,7 +263,11 @@ fn main() {
                     let b = Busy { with: snapshot::describe(&req), since: Instant::now() };
                     *busy.lock().unwrap_or_else(|e| e.into_inner()) = Some((b, snap));
                 }
+                #[cfg(feature = "gym-hooks")]
+                gym_arm(&mut core);
                 let resp = core.handle(peer, req);
+                #[cfg(feature = "gym-hooks")]
+                gym_crash(&resp);
                 if long {
                     *busy.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
@@ -256,7 +288,11 @@ fn main() {
                     let b = Busy { with: resume.describe(), since: Instant::now() };
                     *busy.lock().unwrap_or_else(|e| e.into_inner()) = Some((b, snap));
                 }
+                #[cfg(feature = "gym-hooks")]
+                gym_arm(&mut core);
                 let resp = core.resume(resume, *pre);
+                #[cfg(feature = "gym-hooks")]
+                gym_crash(&resp);
                 *busy.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 let _ = reply.send(resp);
                 match queued.pop_front() {

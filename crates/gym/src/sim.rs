@@ -94,7 +94,7 @@ pub fn peer(actor: &str) -> Peer {
 
 /// "90s", "5m", "24h1m"; "stale_after" means a probe's staleness window (30 s
 /// for the fixtures), optionally "+<duration>".
-fn dur(v: &T) -> Option<Millis> {
+pub fn dur(v: &T) -> Option<Millis> {
     let s = v.as_str()?;
     if let Some(rest) = s.strip_prefix("stale_after") {
         let extra = match rest.strip_prefix('+') {
@@ -125,7 +125,7 @@ pub fn unit(s: &str) -> UnitId {
     s.parse().unwrap_or_else(|_| UnitId::service(s))
 }
 
-fn value(v: &T) -> Value {
+pub fn value(v: &T) -> Value {
     match v {
         T::Boolean(b) => Value::Bool(*b),
         T::Integer(i) => Value::Int(*i),
@@ -180,6 +180,61 @@ impl Sim {
                 self.first_incident_at.entry(i.target.clone()).or_insert(now);
                 self.seen_incidents.insert(i.id, i.clone());
             }
+        }
+    }
+
+    /// Everything the judge reads (check.rs).
+    pub fn evidence(&mut self) -> crate::evidence::Evidence {
+        let finals = self.statuses();
+        let journal_replays = Journal::open(self.fake.store.clone()).is_ok();
+        let w = self.fake.w();
+        let mut restarts: BTreeMap<UnitId, i64> = BTreeMap::new();
+        for c in w.calls.iter().filter(|c| !c.fenced) {
+            if let Some(u) = c.call.strip_prefix("restart(").and_then(|r| r.strip_suffix(')')) {
+                *restarts.entry(unit(u)).or_default() += 1;
+            }
+        }
+        let (current, boot_default, boot_entries, collected, overrides_empty) = (
+            w.current,
+            w.boot_default,
+            w.boot_entries.iter().copied().collect(),
+            w.collected.to_vec(),
+            w.overrides.assignments.is_empty(),
+        );
+        drop(w);
+        crate::evidence::Evidence {
+            current,
+            boot_default,
+            base: self.base,
+            candidate: self.candidate,
+            boot_entries,
+            collected,
+            overrides_empty,
+            ledger: self.ledger(),
+            journal_replays,
+            log: self.log.clone(),
+            pre_status: self.pre_status.clone(),
+            finals,
+            touched: self.touched.clone(),
+            seen_status: self.seen_status.clone(),
+            seen_incidents: self.seen_incidents.clone(),
+            open_incidents: self
+                .core
+                .as_ref()
+                .map(|c| {
+                    c.incidents
+                        .incidents
+                        .values()
+                        .filter(|i| i.state != IncidentState::Closed)
+                        .map(|i| (i.target.clone(), i.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            first_incident_at: self.first_incident_at.clone(),
+            start: self.start,
+            restarts,
+            notices: self.notices.clone(),
+            responses: self.responses.clone(),
         }
     }
 

@@ -30,6 +30,10 @@ rustix = { version = "1", features = ["net"] }
 serde.workspace = true
 serde_json.workspace = true
 
+[features]
+# Fault injection for the gym's VM harness. Never in the shipped package.
+gym-hooks = ["planarian-backend-linux/gym-hooks"]
+
 [dev-dependencies]
 planarian-fake.workspace = true
 

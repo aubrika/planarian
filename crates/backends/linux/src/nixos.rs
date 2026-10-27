@@ -228,6 +228,32 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> 
 }
 
 impl Nixos {
+    fn activate_live_inner(&self, g: GenerationId, op: &OpId) -> Outcome {
+        if !admitted(&self.paths.txn_dir(), op) {
+            return Outcome::fenced();
+        }
+        let path = match self.path_of(g) {
+            Ok(p) => p,
+            Err(o) => return o,
+        };
+        let unit = format!("--unit={}", Self::unit_name(op));
+        let o = run(
+            &[
+                "systemd-run",
+                &unit,
+                "--wait",
+                "--collect",
+                "--quiet",
+                "--service-type=oneshot",
+                "--property=TimeoutStartSec=15min",
+                &format!("{}/bin/switch-to-configuration", path.0),
+                "test",
+            ],
+            ACTIVATION,
+        );
+        if o.ok() { Outcome::Succeeded } else { err(&o) }
+    }
+
     pub fn new(paths: Paths) -> Nixos {
         Nixos { paths, lock: Arc::new(Mutex::new(())), budget: gc::GcBudget::default() }
     }
@@ -553,6 +579,10 @@ impl GenerationBackend for Nixos {
     }
 
     fn jobs_tagged(&self, op: &OpId) -> Result<Option<Vec<JobId>>, Outcome> {
+        #[cfg(feature = "gym-hooks")]
+        if crate::gym::hook("jobs_tagged", None).result.as_deref() == Some("None") {
+            return Ok(None);
+        }
         let name = format!("{}.service", Self::unit_name(op));
         let o = run(&["systemctl", "show", "--property=ActiveState,LoadState", &name], QUICK);
         if !o.ok() {
@@ -573,29 +603,10 @@ impl GenerationBackend for Nixos {
     }
 
     fn activate_live(&self, g: GenerationId, op: &OpId) -> Outcome {
-        if !admitted(&self.paths.txn_dir(), op) {
-            return Outcome::fenced();
-        }
-        let path = match self.path_of(g) {
-            Ok(p) => p,
-            Err(o) => return o,
-        };
-        let unit = format!("--unit={}", Self::unit_name(op));
-        let o = run(
-            &[
-                "systemd-run",
-                &unit,
-                "--wait",
-                "--collect",
-                "--quiet",
-                "--service-type=oneshot",
-                "--property=TimeoutStartSec=15min",
-                &format!("{}/bin/switch-to-configuration", path.0),
-                "test",
-            ],
-            ACTIVATION,
-        );
-        if o.ok() { Outcome::Succeeded } else { err(&o) }
+        #[cfg(feature = "gym-hooks")]
+        return crate::gym::around("activate_live", Some(g), || self.activate_live_inner(g, op));
+        #[cfg(not(feature = "gym-hooks"))]
+        self.activate_live_inner(g, op)
     }
 
     fn publish_boot(&self, g: GenerationId, op: &OpId) -> Outcome {

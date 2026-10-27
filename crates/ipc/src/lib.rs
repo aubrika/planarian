@@ -5,8 +5,8 @@
 //! daemon takes it from `SO_PEERCRED` (§11).
 
 use planarian_schema::{
-    ChangeId, DerivedFacts, EdgeKind, GenerationId, Hash, Incident, ProbeId, Resolution, Timestamp, TxnId, TxnState,
-    UnitId, UnitStatus, Until, Value,
+    ChangeId, DerivedFacts, EdgeKind, GenerationId, Hash, Incident, ProbeId, Resolution, Timestamp, Transition, TxnId,
+    TxnState, UnitId, UnitStatus, Until, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -67,6 +67,16 @@ pub enum Request {
     },
     /// Everything the read-only console shows (§16a), in one answer.
     Console,
+    /// The gym's VM harness: submit `transition` as a proposal from the
+    /// caller, optionally with a stale digest or a narrowed `may_change`.
+    /// Answered only by a daemon built with `gym-hooks`.
+    GymPropose {
+        transition: Transition,
+        stale_digest: bool,
+        may_change: Option<Vec<UnitId>>,
+    },
+    /// The gym's VM harness: compact the journal now. `gym-hooks` only.
+    GymCompact,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

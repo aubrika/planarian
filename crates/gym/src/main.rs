@@ -9,6 +9,8 @@
 //! the flake's NixOS tests (`nix flake check`, `checks.vm-runtime`).
 
 mod check;
+mod evidence;
+mod live;
 mod metrics;
 mod serve;
 mod sim;
@@ -41,7 +43,7 @@ fn steps(entry: &T, key: &str) -> Vec<T> {
     }
 }
 
-fn window(entry: &T) -> planarian_schema::Millis {
+pub fn window(entry: &T) -> planarian_schema::Millis {
     let s = entry.get("window").and_then(T::as_str).unwrap_or("10m");
     let n: u64 = s.trim_end_matches(|c: char| c.is_alphabetic()).parse().unwrap_or(10);
     planarian_schema::Millis(if s.ends_with('h') {
@@ -85,7 +87,7 @@ fn run_entry(entry: &T) -> Run {
     sim.set_crash(None);
     sim.run_window(window(entry));
     let post = entry.get("required_post").cloned().unwrap_or(T::Table(Default::default()));
-    let v = check::judge(&mut sim, &post);
+    let v = check::judge(&sim.evidence(), &post);
     let mut notes = v.failures.clone();
     notes.extend(v.unchecked.iter().map(|u| format!("unchecked: {u}")));
     let result = if !v.failures.is_empty() {
@@ -112,6 +114,17 @@ fn load(path: &str) -> Vec<T> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("vm") {
+        // The VM harness's in-VM half (live.rs).
+        let catalog = args
+            .iter()
+            .position(|a| a == "--catalog")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .or_else(|| std::env::var("PLANARIAN_GYM_CATALOG").ok())
+            .unwrap_or_else(|| DEFAULT_CATALOG.to_string());
+        std::process::exit(live::main(&args[1..], &load(&catalog)));
+    }
     let mut catalog = DEFAULT_CATALOG.to_string();
     let mut ids: Vec<String> = vec![];
     let mut harness = "fake".to_string();

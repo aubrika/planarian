@@ -57,7 +57,27 @@
         in {
           vm = app "planarian-vm-${s}";
           vm-text = app "planarian-vm-text-${s}";
+          # The gym's VM harness: `nix run .#gym-vm -- [ID ...]` (needs KVM to be quick).
+          gym-vm = {
+            type = "app";
+            program = "${pkgs.writeShellApplication {
+              name = "planarian-gym-vm";
+              runtimeInputs = [ pkgs.jq pkgs.python3 ];
+              text = builtins.readFile ./nix/gym/run-vm.sh;
+            }}/bin/planarian-gym-vm";
+            meta.description = "Run the fault catalog on NixOS VMs";
+          };
         });
+
+      # One NixOS test per VM-capable catalog entry: legacyPackages.<system>.gym-vm.<id>.
+      legacyPackages = forAll (pkgs: {
+        gym-vm =
+          let
+            entries = (builtins.fromTOML (builtins.readFile ./crates/gym/catalog/phase-a.toml)).fault;
+            ids = map (e: e.id) (builtins.filter (e: builtins.elem "vm" (e.harness or [ ])) entries);
+          in
+          nixpkgs.lib.genAttrs ids (id: import ./nix/tests/gym-vm.nix { inherit pkgs self id; });
+      });
 
       templates.default = {
         path = ./nix/template;

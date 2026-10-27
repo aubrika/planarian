@@ -2057,6 +2057,7 @@ dependencies = [
 name = "planarian-gym"
 version = "0.0.0"
 dependencies = [
+ "planarian-backend-linux",
  "planarian-changes",
  "planarian-daemon",
  "planarian-exec",

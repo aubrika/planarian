@@ -179,6 +179,7 @@ for slow machines or slow-starting services.
 ```
 cargo test                                   # every crate
 cargo run -p planarian-gym -- run            # the fault catalog, fake harness
+nix run .#gym-vm -- svc-killed-defer-to-systemd   # entries on real NixOS VMs (no ids: all 62; wants KVM)
 crates/gym/demo.sh --harness fake            # the GA demonstration
 cargo run -p planarian-gym -- serve --socket /tmp/p.sock   # a fake machine on a socket:
 PLANARIAN_SOCKET=/tmp/p.sock cargo run -p planarian-console # try the console (or the CLI) against it

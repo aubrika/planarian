@@ -2,7 +2,8 @@
 //! cases, never on the absence of errors). Keys the fake harness cannot judge
 //! are reported, and make the result PARTIAL rather than PASS.
 
-use crate::sim::{Sim, unit};
+use crate::evidence::Evidence;
+use crate::sim::unit;
 use planarian_exec::Submitted;
 use planarian_ipc::Response;
 use planarian_schema::*;
@@ -60,8 +61,8 @@ struct TxnView {
     epoch: u64,
 }
 
-fn txns(sim: &Sim) -> Vec<TxnView> {
-    let l = sim.ledger();
+fn txns(e: &Evidence) -> Vec<TxnView> {
+    let l = &e.ledger;
     l.terminal
         .values()
         .map(|t| TxnView {
@@ -81,10 +82,10 @@ fn txns(sim: &Sim) -> Vec<TxnView> {
         .collect()
 }
 
-fn gen_named(sim: &Sim, name: &str) -> Option<GenerationId> {
+fn gen_named(e: &Evidence, name: &str) -> Option<GenerationId> {
     match name {
-        "base" | "known_good" | "unchanged" => Some(sim.base),
-        "candidate" => sim.candidate,
+        "base" | "known_good" | "unchanged" => Some(e.base),
+        "candidate" => e.candidate,
         "owner-built" => None,
         _ => None,
     }
@@ -95,15 +96,15 @@ fn subsequence(path: &[String], want: &[String]) -> bool {
     want.iter().all(|w| it.any(|p| p == w))
 }
 
-pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
+pub fn judge(e: &Evidence, post: &T) -> Verdict {
     let mut v = Verdict::default();
     let Some(post) = post.as_table() else { return v };
-    let current = sim.fake.w().current;
-    let boot = sim.fake.w().boot_default;
-    let overrides_empty = sim.fake.w().overrides.assignments.is_empty();
-    let ledger = sim.ledger();
-    let all = txns(sim);
-    let finals = sim.statuses();
+    let current = e.current;
+    let boot = e.boot_default;
+    let overrides_empty = e.overrides_empty;
+    let ledger = &e.ledger;
+    let all = txns(e);
+    let finals = &e.finals;
     let may_change: Vec<UnitId> =
         post.get("may_change").and_then(T::as_array).into_iter().flatten().filter_map(T::as_str).map(unit).collect();
 
@@ -123,8 +124,8 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
             "others_unchanged" if val.as_bool() == Some(true) => {
                 let named: Vec<UnitId> =
                     post.get("units").and_then(T::as_table).into_iter().flatten().map(|(k, _)| unit(k)).collect();
-                for (u, before) in &sim.pre_status {
-                    if before != "Running" || may_change.contains(u) || named.contains(u) || sim.touched.contains(u) {
+                for (u, before) in &e.pre_status {
+                    if before != "Running" || may_change.contains(u) || named.contains(u) || e.touched.contains(u) {
                         continue;
                     }
                     let after = finals.get(u).cloned().unwrap_or_default();
@@ -137,7 +138,7 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
             // The ledger refuses any record that would break I6, I12's paths or
             // I15, so a journal that replays cleanly is the check.
             "invariants" => {
-                if planarian_txn::journal::Journal::open(sim.fake.store.clone()).is_err() {
+                if !e.journal_replays {
                     fail(&mut v, "the journal does not replay".into());
                 }
             }
@@ -145,11 +146,11 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
                 let have = if key == "generation" { current } else { boot };
                 match val.as_str() {
                     Some("owner-built") => {
-                        if have == sim.base {
+                        if have == e.base {
                             fail(&mut v, "expected the owner's own generation".into());
                         }
                     }
-                    Some(name) => match gen_named(sim, name) {
+                    Some(name) => match gen_named(e, name) {
                         Some(g) if g == have => {}
                         Some(g) => fail(&mut v, format!("is {}, want {name} ({})", have.0, g.0)),
                         None => fail(&mut v, format!("no {name} generation")),
@@ -167,13 +168,13 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
                 }
             }
             "known_good" => {
-                if ledger.known_good != Some(sim.base) {
+                if ledger.known_good != Some(e.base) {
                     fail(&mut v, format!("{:?}", ledger.known_good));
                 }
             }
             "live_tested" => {
-                if ledger.live_tested.is_none() || ledger.live_tested != sim.candidate {
-                    fail(&mut v, format!("{:?} vs candidate {:?}", ledger.live_tested, sim.candidate));
+                if ledger.live_tested.is_none() || ledger.live_tested != e.candidate {
+                    fail(&mut v, format!("{:?} vs candidate {:?}", ledger.live_tested, e.candidate));
                 }
             }
             "journal_agrees" => {
@@ -237,7 +238,7 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
                 }
             }
             "no_autonomous_txn" => {
-                let auto = sim
+                let auto = e
                     .log
                     .iter()
                     .filter(|r| !matches!(r.caller, Actor::User { .. }))
@@ -250,19 +251,17 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
             "no_incident_on" => {
                 for u in val.as_array().into_iter().flatten().filter_map(T::as_str) {
                     let id = unit(u);
-                    if sim.seen_incidents.values().any(|i| i.target == id && i.kind == IncidentKind::Repair) {
+                    if e.seen_incidents.values().any(|i| i.target == id && i.kind == IncidentKind::Repair) {
                         fail(&mut v, format!("an incident opened on {u}"));
                     }
                 }
             }
             "gc_protected" => {
                 // I3: none of the named generations was collected.
-                let w = sim.fake.w();
-                let current = w.current;
-                let previous = w.boot_entries.iter().copied().filter(|g| *g < current).max();
+                let previous = e.boot_entries.iter().copied().filter(|g| *g < current).max();
                 for name in val.as_array().into_iter().flatten().filter_map(T::as_str) {
                     let gens: Vec<GenerationId> = match name {
-                        "known_good" => ledger.known_good.into_iter().chain([w.boot_default]).collect(),
+                        "known_good" => ledger.known_good.into_iter().chain([e.boot_default]).collect(),
                         "base" => vec![current],
                         "previous" => previous.into_iter().collect(),
                         "candidate" => {
@@ -273,14 +272,14 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
                             continue;
                         }
                     };
-                    if let Some(g) = gens.iter().find(|g| w.collected.contains(g)) {
+                    if let Some(g) = gens.iter().find(|g| e.collected.contains(g)) {
                         fail(&mut v, format!("{name} generation {} was collected", g.0));
                     }
                 }
             }
             "status_seen" | "status_never" => {
                 for (u, names) in val.as_table().into_iter().flatten() {
-                    let seen = sim.seen_status.get(&unit(u)).cloned().unwrap_or_default();
+                    let seen = e.seen_status.get(&unit(u)).cloned().unwrap_or_default();
                     for n in names.as_array().into_iter().flatten().filter_map(T::as_str) {
                         let has = seen.contains(n);
                         if key == "status_seen" && !has {
@@ -298,21 +297,14 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
                         "restarts_max" => {
                             for (u, n) in spec.as_table().into_iter().flatten() {
                                 let id = unit(u);
-                                let count = sim
-                                    .fake
-                                    .w()
-                                    .calls
-                                    .iter()
-                                    .filter(|c| !c.fenced && c.call == format!("restart({id})"))
-                                    .count() as i64;
+                                let count = e.restarts.get(&id).copied().unwrap_or(0);
                                 if count > n.as_integer().unwrap_or(0) {
                                     fail(&mut v, format!("{u} restarted {count} times (max {n})"));
                                 }
                             }
                         }
                         "incidents_max" => {
-                            let n =
-                                sim.seen_incidents.values().filter(|i| i.kind == IncidentKind::Repair).count() as i64;
+                            let n = e.seen_incidents.values().filter(|i| i.kind == IncidentKind::Repair).count() as i64;
                             if n > spec.as_integer().unwrap_or(0) {
                                 fail(&mut v, format!("{n} incidents"));
                             }
@@ -323,24 +315,24 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
             }
             "reports" => {
                 for r in val.as_array().into_iter().flatten().filter_map(T::as_str) {
-                    let notices = sim.notices.join("\n");
+                    let notices = e.notices.join("\n");
                     let ok = match r {
                         "DiagnoserExhausted" => notices.contains("needs a person"),
                         "Flapping" | "Escalated" => {
                             notices.contains("needs a person") || notices.contains("keeps failing")
                         }
-                        "Unauthorized" => sim
+                        "Unauthorized" => e
                             .responses
                             .iter()
                             .any(|x| matches!(x, Response::Rejected { reason, .. } if reason == "Unauthorized")),
                         "RecoveryFailed" | "alert" => {
                             ledger.terminal.values().any(|t| t.state == TxnState::RecoveryFailed)
                         }
-                        "NoSpace" => sim
+                        "NoSpace" => e
                             .responses
                             .iter()
                             .any(|x| matches!(x, Response::Rejected { reason, .. } if reason == "NoSpace")),
-                        "StopRewrittenNotice" => sim.responses.iter().any(
+                        "StopRewrittenNotice" => e.responses.iter().any(
                             |x| matches!(x, Response::Done { message, .. } if message.contains("until the next boot")),
                         ),
                         "AwaitingApproval" => notices.contains("needs approval"),
@@ -382,12 +374,12 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
             }
             "txn" => {
                 for spec in val.as_array().into_iter().flatten() {
-                    check_txn(sim, &all, spec, &mut v);
+                    check_txn(e, &all, spec, &mut v);
                 }
             }
             "incident" => {
                 for spec in val.as_array().into_iter().flatten() {
-                    check_incident(sim, spec, &mut v);
+                    check_incident(e, spec, &mut v);
                 }
             }
             other => v.unchecked.push(other.to_string()),
@@ -396,7 +388,7 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
     v
 }
 
-fn check_txn(sim: &Sim, all: &[TxnView], spec: &T, v: &mut Verdict) {
+fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
     let s = |k: &str| spec.get(k).and_then(T::as_str);
     let mut matching: Vec<&TxnView> = all.iter().collect();
     if let Some(t) = s("transition") {
@@ -442,7 +434,7 @@ fn check_txn(sim: &Sim, all: &[TxnView], spec: &T, v: &mut Verdict) {
                     .map(|a| a.iter().filter_map(T::as_str).map(|d| d.replace("Reject(", "Rejected(")).collect())
             })
             .unwrap_or_default();
-        let refused = sim.log.iter().any(|r| {
+        let refused = e.log.iter().any(|r| {
             s("transition").is_none_or(|t| transition_name(&r.proposal.transition) == t)
                 && match &r.result {
                     Submitted::Rejected { reason, .. } => wanted.iter().any(|w| *w == format!("Rejected({reason:?})")),
@@ -487,7 +479,7 @@ fn check_txn(sim: &Sim, all: &[TxnView], spec: &T, v: &mut Verdict) {
     }
     if let Some(src) = s("source") {
         let target = target_of(&t.transition);
-        let found = sim.log.iter().any(|r| {
+        let found = e.log.iter().any(|r| {
             transition_name(&r.proposal.transition) == transition_name(&t.transition)
                 && target_of(&r.proposal.transition) == target
                 && match &r.proposal.source {
@@ -512,7 +504,7 @@ fn check_txn(sim: &Sim, all: &[TxnView], spec: &T, v: &mut Verdict) {
     }
     match s("decision") {
         Some("Allow(AskFirst)") => {
-            let parked = sim.log.iter().any(|r| {
+            let parked = e.log.iter().any(|r| {
                 transition_name(&r.proposal.transition) == transition_name(&t.transition)
                     && matches!(r.result, Submitted::Parked { .. })
             });
@@ -521,7 +513,7 @@ fn check_txn(sim: &Sim, all: &[TxnView], spec: &T, v: &mut Verdict) {
             }
         }
         Some(d) if d.starts_with("Allow(") => {
-            let parked = sim.log.iter().any(|r| {
+            let parked = e.log.iter().any(|r| {
                 transition_name(&r.proposal.transition) == transition_name(&t.transition)
                     && matches!(r.result, Submitted::Parked { .. })
             });
@@ -549,17 +541,17 @@ fn check_txn(sim: &Sim, all: &[TxnView], spec: &T, v: &mut Verdict) {
     }
 }
 
-fn check_incident(sim: &Sim, spec: &T, v: &mut Verdict) {
+fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
     let Some(target) = spec.get("target").and_then(T::as_str) else { return };
     let id = unit(target);
     let label = format!("incident on {target}");
-    let found: Vec<&Incident> = sim.seen_incidents.values().filter(|i| i.target == id).collect();
+    let found: Vec<&Incident> = e.seen_incidents.values().filter(|i| i.target == id).collect();
     let Some(last) = found.last() else {
         v.failures.push(format!("{label}: none opened"));
         return;
     };
     if let Some(state) = spec.get("state").and_then(T::as_str) {
-        let current = sim.core.as_ref().and_then(|c| c.incidents.active_for(&id).cloned());
+        let current = e.open_incidents.get(&id).cloned();
         let got = match &current {
             None => "Closed".to_string(),
             Some(i) => format!("{:?}", i.state).split([' ', '{', '(']).next().unwrap_or("").to_string(),
@@ -586,8 +578,8 @@ fn check_incident(sim: &Sim, spec: &T, v: &mut Verdict) {
     }
     if let Some(w) = spec.get("opened_within").and_then(T::as_str) {
         let limit = w.trim_end_matches('s').parse::<u64>().unwrap_or(0) * 1000;
-        let at = sim.first_incident_at.get(&id).copied().unwrap_or(Timestamp(u64::MAX));
-        if at.0.saturating_sub(sim.start.0) > limit + 60_000 {
+        let at = e.first_incident_at.get(&id).copied().unwrap_or(Timestamp(u64::MAX));
+        if at.0.saturating_sub(e.start.0) > limit + 60_000 {
             v.unchecked.push(format!("{label}: opened_within (relative to inject)"));
         }
     }

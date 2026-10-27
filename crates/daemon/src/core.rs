@@ -956,6 +956,29 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
             }
             Request::Console => Response::Console(Box::new(self.console())),
+            #[cfg(feature = "gym-hooks")]
+            Request::GymPropose { transition, stale_digest, may_change } => {
+                let (s, defs) = self.observe();
+                let mut p = self.proposal(transition, &s, &defs, Source::User, "gym".into());
+                if stale_digest {
+                    p.observed = Hash::ZERO;
+                }
+                if let Some(m) = may_change {
+                    p.expected.may_change = m.into_iter().collect();
+                }
+                let authz = self.authz(peer);
+                let r = self.submit(p, authz, &s, &defs);
+                render::response(&r)
+            }
+            #[cfg(feature = "gym-hooks")]
+            Request::GymCompact => match self.ex.kernel.journal.compact() {
+                Ok(_) => Response::Ok { message: "compacted".into() },
+                Err(e) => Response::Error { message: format!("{e:?}") },
+            },
+            #[cfg(not(feature = "gym-hooks"))]
+            Request::GymPropose { .. } | Request::GymCompact => {
+                Response::Error { message: "not available in this build (gym-hooks)".into() }
+            }
             Request::Diagnose { unit, probe } => {
                 let (_, defs) = self.observe();
                 let Some(def) = defs.get(&unit) else {

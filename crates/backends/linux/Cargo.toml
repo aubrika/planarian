@@ -14,6 +14,10 @@ serde.workspace = true
 serde_json.workspace = true
 rustix = { version = "1", features = ["fs", "process"] }
 
+[features]
+# Fault injection for the gym's VM harness (src/gym.rs). Never in the shipped package.
+gym-hooks = []
+
 [dev-dependencies]
 tempfile.workspace = true
 

@@ -15,6 +15,7 @@ planarian-schema.workspace = true
 planarian-txn.workspace = true
 planarian-exec.workspace = true
 planarian-daemon.workspace = true
+planarian-backend-linux.workspace = true
 planarian-ipc.workspace = true
 planarian-changes.workspace = true
 planarian-policy.workspace = true

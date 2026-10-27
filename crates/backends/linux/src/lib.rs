@@ -9,6 +9,8 @@
 //! before touching anything (§12 fencing).
 
 pub mod cmd;
+#[cfg(feature = "gym-hooks")]
+pub mod gym;
 pub mod logind;
 pub mod nixos;
 pub mod probe;

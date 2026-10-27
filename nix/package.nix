@@ -1,7 +1,9 @@
-{ lib, rustPlatform, nix }:
+# `gymHooks`: the gym's VM harness build (fault injection and the gym binary;
+# nix/tests/gym-vm.nix). Never the shipped package.
+{ lib, rustPlatform, nix, gymHooks ? false }:
 
 rustPlatform.buildRustPackage {
-  pname = "planarian";
+  pname = if gymHooks then "planarian-gym-hooks" else "planarian";
   version = "0.0.0";
 
   src = lib.fileset.toSource {
@@ -19,9 +21,12 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
 
   # Install the daemon, the watchdog and the CLI; the gym is a developer tool.
-  cargoBuildFlags = [ "-p" "planarian-daemon" "-p" "planarian-watchdog" "-p" "planarian-cli" ];
-  # …but run every crate's tests.
+  cargoBuildFlags = [ "-p" "planarian-daemon" "-p" "planarian-watchdog" "-p" "planarian-cli" ]
+    ++ lib.optionals gymHooks [ "-p" "planarian-gym" ];
+  buildFeatures = lib.optionals gymHooks [ "planarian-daemon/gym-hooks" ];
+  # …but run every crate's tests (in the shipped package).
   cargoTestFlags = [ "--workspace" ];
+  doCheck = !gymHooks;
 
   # The staging test hashes a directory with nix-hash, as the real backend does.
   nativeCheckInputs = [ nix ];

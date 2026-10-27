@@ -25,6 +25,7 @@ let
           after = [ "gym-db.service" ];
           script = "sleep infinity";
           serviceConfig = { Restart = "on-failure"; RestartSec = "5s"; };
+          startLimitBurst = 3;
         };
         services.planarian.units.gym-db = { };
         services.planarian.units.gym-app.probes = [
@@ -47,6 +48,7 @@ let
     (check (builtins.elem { from = "service:gym-app"; to = "service:gym-db"; kind = "Requires"; origin = "SystemdRequires"; } app.edges) "Requires= became a Requires edge")
     (check (builtins.elem { from = "service:gym-app"; to = "service:gym-db"; kind = "Ordering"; origin = "SystemdAfter"; } app.edges) "After= became an Ordering edge")
     (check (app.systemd_restart.restart_sec == 5000) "RestartSec parsed")
+    (check (app.systemd_restart.start_limit_burst == 3) "StartLimitBurst (a string in NixOS) is a number")
     (check ((unit "service:sshd").sensitivity == [ "Security" ]) "sshd is Security")
     (check (!cfg.systemd.services.planariad.restartIfChanged) "planariad survives activation")
     (check (!cfg.systemd.services.planarian-recovery.stopIfChanged) "the watchdog survives activation")

@@ -152,7 +152,8 @@ let
     else {
       restart = true;
       restart_sec = secondsOf (sc.RestartSec or "100ms");
-      start_limit_burst = svc.unitConfig.StartLimitBurst or 5;
+      # NixOS stores StartLimitBurst as a string ("3") when startLimitBurst is set.
+      start_limit_burst = let b = svc.unitConfig.StartLimitBurst or 5; in if builtins.isString b then lib.toInt b else b;
     };
 
   probeJSON = p: {
