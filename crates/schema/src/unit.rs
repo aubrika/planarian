@@ -57,6 +57,10 @@ pub struct Suppression {
     pub reason: String,
     /// Always overwritten by the daemon from the caller's credentials (§11).
     pub by: Actor,
+    /// The user's "stop": the unit was stopped as well as left alone, so a
+    /// generation activation that starts it again is undone (principle 9).
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

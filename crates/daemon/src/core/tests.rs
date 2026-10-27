@@ -307,3 +307,33 @@ fn generations_over_the_bound_are_collected_by_maintenance() {
     r.ticks(800);
     assert!(r.core.log[before..].iter().all(|l| l.proposal.source != Source::Maintenance));
 }
+
+/// Activating a generation restarts every active target, which starts the
+/// services they want, including one the user stopped. Planarian's own
+/// activations (a change, and a revert) stop it again (principle 9).
+#[test]
+fn a_users_stop_survives_generation_changes() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let cache = UnitId::service("gym-cache");
+    let resp = r.core.handle(ADMIN, Request::Stop { unit: cache.clone() });
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let stopped = |r: &Rig| r.fake.w().units[&cache].observed != Observed::Active;
+    assert!(stopped(&r));
+
+    let mut args = BTreeMap::new();
+    args.insert("scale".to_string(), Value::Str("1.25".into()));
+    let resp = r.core.handle(ADMIN, Request::Apply { change: ChangeId("font-scale".into()), args });
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert!(stopped(&r), "a committed change left the user's stop in place");
+
+    let mut args = BTreeMap::new();
+    args.insert("service".to_string(), Value::Str("gym-web".into()));
+    args.insert("addr".to_string(), Value::Str("192.0.2.10".into()));
+    let resp = r.core.handle(ADMIN, Request::Apply { change: ChangeId("listen-address".into()), args });
+    assert!(matches!(resp, Response::Done { state: TxnState::Reverted, .. }), "{resp:?}");
+    assert!(stopped(&r), "a revert left the user's stop in place");
+    r.ticks(20);
+    assert!(stopped(&r));
+    assert_eq!(r.status("service:gym-cache"), UnitStatus::Suppressed);
+}

@@ -17,7 +17,9 @@ use planarian_diagnose as diagnose;
 use planarian_exec::{Config as ExecConfig, Executor, Submitted, derive::manifest_of};
 use planarian_incident::Manager;
 use planarian_intent::{self as intent, Interpretation};
-use planarian_ipc::{Choice, LogLine, Pending, Request, Response, StatusReport, UnitRow};
+use planarian_ipc::{
+    Choice, ConsoleReport, GraphEdge, GraphNode, LogLine, Pending, Request, Response, StatusReport, TxnSummary, UnitRow,
+};
 use planarian_policy::Authorization;
 use planarian_schema::spec::predict;
 use planarian_schema::*;
@@ -540,6 +542,81 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
     }
 
+    /// §16a: what the read-only console shows.
+    fn console(&mut self) -> ConsoleReport {
+        let status = self.status();
+        let (s, defs) = self.last.clone().unwrap_or_else(|| self.observe());
+        let l = self.ledger();
+        let nodes = defs
+            .iter()
+            .map(|(u, def)| {
+                let health = s.status(u, &defs);
+                let observed = match s.units.get(u).map(|(o, _)| o) {
+                    None => "not observed".to_string(),
+                    Some(Observed::Failed(r)) => format!("Failed: {r:?}"),
+                    Some(Observed::Unknown { reason, .. }) => format!("Unknown: {reason}"),
+                    Some(Observed::Transitioning { .. }) => "Transitioning".to_string(),
+                    Some(o) => format!("{o:?}"),
+                };
+                GraphNode {
+                    unit: u.clone(),
+                    desired: format!("{:?}", def.desired.status),
+                    expected: s.expected(u, &defs),
+                    observed,
+                    stale: health == UnitStatus::Unknown,
+                    suppressed: health == UnitStatus::Suppressed,
+                    health,
+                }
+            })
+            .collect();
+        let edges = defs
+            .values()
+            .flat_map(|d| d.edges.iter().map(|e| GraphEdge { from: e.from.clone(), to: e.to.clone(), kind: e.kind }))
+            .collect();
+        let mut timeline: Vec<TxnSummary> = l
+            .live
+            .values()
+            .map(|t| TxnSummary {
+                txn: t.txn.id,
+                what: render::transition(&t.txn.transition),
+                path: t.path.clone(),
+                state: t.txn.state.clone(),
+                live: true,
+                by_watchdog: t.txn.lease.owner.is_watchdog(),
+                why: t.why.clone(),
+            })
+            .chain(l.terminal.iter().map(|(id, t)| TxnSummary {
+                txn: *id,
+                what: render::transition(&t.transition),
+                path: t.path.clone(),
+                state: t.state.clone(),
+                live: false,
+                by_watchdog: t.owner.is_watchdog(),
+                why: t.why.clone(),
+            }))
+            .collect();
+        timeline.sort_by_key(|t| std::cmp::Reverse(t.txn));
+        let gens = self.b.generations();
+        let current = s.generation;
+        let previous = gens.boot_entries().ok().and_then(|e| e.into_iter().filter(|g| *g < current).max());
+        let last_change_reverted = l
+            .terminal
+            .values()
+            .rev()
+            .find(|t| t.transition.changes_generation())
+            .is_some_and(|t| t.state == TxnState::Reverted);
+        ConsoleReport {
+            status,
+            nodes,
+            edges,
+            timeline,
+            previous,
+            last_booted: gens.last_booted().ok(),
+            candidates: l.live.values().filter_map(|t| t.txn.candidate.as_ref().map(|(g, _)| *g)).collect(),
+            last_change_reverted,
+        }
+    }
+
     fn intent_index(&self, defs: &UnitDefs) -> intent::Index {
         let changes = planarian_changes::entries(&self.cfg.exec.catalog)
             .into_iter()
@@ -607,7 +684,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 self.user_submit(Transition::ApplyChange { change, args }, peer, Source::User, "from the CLI".into())
             }
             Request::Suppress { unit, until } => {
-                let s = Suppression { unit, until, reason: "from the CLI".into(), by: Actor::User { uid: peer.uid } };
+                let s = Suppression {
+                    unit,
+                    until,
+                    reason: "from the CLI".into(),
+                    by: Actor::User { uid: peer.uid },
+                    stopped: false,
+                };
                 self.user_submit(Transition::Suppress(s), peer, Source::User, "from the CLI".into())
             }
             Request::Unsuppress { unit } => {
@@ -726,6 +809,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     }
                 }
             }
+            Request::Console => Response::Console(Box::new(self.console())),
             Request::Diagnose { unit, probe } => {
                 let (_, defs) = self.observe();
                 let Some(def) = defs.get(&unit) else {

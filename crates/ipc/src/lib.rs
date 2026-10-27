@@ -5,8 +5,8 @@
 //! daemon takes it from `SO_PEERCRED` (§11).
 
 use planarian_schema::{
-    ChangeId, DerivedFacts, GenerationId, Hash, Incident, ProbeId, Resolution, Timestamp, TxnId, TxnState, UnitId,
-    UnitStatus, Until, Value,
+    ChangeId, DerivedFacts, EdgeKind, GenerationId, Hash, Incident, ProbeId, Resolution, Timestamp, TxnId, TxnState,
+    UnitId, UnitStatus, Until, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -65,6 +65,8 @@ pub enum Request {
         unit: UnitId,
         probe: Option<ProbeId>,
     },
+    /// Everything the read-only console shows (§16a), in one answer.
+    Console,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +107,57 @@ pub struct StatusReport {
     pub space: Option<planarian_schema::gc::SpaceReport>,
 }
 
+/// One node of the console's Graph view: what is desired, what is observed,
+/// and how healthy it is, kept apart (three indicators, not one colour).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub unit: UnitId,
+    /// "Running", "Stopped", … and whether its condition holds now.
+    pub desired: String,
+    pub expected: bool,
+    /// The supervisor's view: "Active", "Failed: …", "Unknown: …".
+    pub observed: String,
+    pub health: UnitStatus,
+    pub suppressed: bool,
+    /// Its readiness evidence is stale or unknown.
+    pub stale: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub from: UnitId,
+    pub to: UnitId,
+    pub kind: EdgeKind,
+}
+
+/// One transaction in the console's Timeline view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxnSummary {
+    pub txn: TxnId,
+    pub what: String,
+    /// Journal states, in order.
+    pub path: Vec<String>,
+    pub state: TxnState,
+    pub live: bool,
+    pub by_watchdog: bool,
+    pub why: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleReport {
+    pub status: StatusReport,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    /// Newest first.
+    pub timeline: Vec<TxnSummary>,
+    pub previous: Option<GenerationId>,
+    pub last_booted: Option<GenerationId>,
+    /// Generations an in-flight transaction is building or activating.
+    pub candidates: Vec<GenerationId>,
+    /// The most recent generation change was reverted.
+    pub last_change_reverted: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogLine {
     pub seq: u64,
@@ -123,6 +176,7 @@ pub struct Choice {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Response {
     Status(Box<StatusReport>),
+    Console(Box<ConsoleReport>),
     Log {
         lines: Vec<LogLine>,
     },

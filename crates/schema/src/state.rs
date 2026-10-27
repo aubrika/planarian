@@ -335,6 +335,7 @@ mod tests {
             until: Until::At(Timestamp(200_000)),
             reason: String::new(),
             by: Actor::User { uid: 1000 },
+            stopped: false,
         });
         assert_eq!(s.status(&id, &defs), UnitStatus::Suppressed);
         s.observed_at = Timestamp(200_000);

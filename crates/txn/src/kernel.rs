@@ -12,7 +12,7 @@ use crate::machine::tag;
 use crate::store::Store;
 use planarian_schema::{
     Actor, GenerationBackend, GenerationId, Hash, InventoryBackend, JobId, Lease, Millis, OpId, Outcome, OwnerId,
-    RecoveryStrategy, RejectReason, Suppression, Timestamp, Transaction, Transition, TxnId, TxnState,
+    RecoveryStrategy, RejectReason, Suppression, Timestamp, Transaction, Transition, TxnId, TxnState, UnitId,
 };
 
 /// Job-drain wait during takeover (§16 operational limits).
@@ -293,8 +293,13 @@ impl<S: Store, H: Host> Kernel<S, H> {
         // Activating: once the user's "stop" is recorded at all, the repair
         // loop leaves the unit alone, whatever happens to the rest.
         if let Transition::StopAndSuppress { unit, until, reason } = &txn.transition {
-            let s =
-                Suppression { unit: unit.clone(), until: until.clone(), reason: reason.clone(), by: caller.clone() };
+            let s = Suppression {
+                unit: unit.clone(),
+                until: until.clone(),
+                reason: reason.clone(),
+                by: caller.clone(),
+                stopped: true,
+            };
             self.record(Record::Suppressed(s))?;
         }
         self.advance(txn, TxnState::Activating, "")?;
@@ -304,7 +309,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
                 self.call(txn.id, "stop", |h, op| h.execute_runtime(&stop, op))?
             }
             Transition::Suppress(s) => {
-                let s = Suppression { by: caller, ..s.clone() };
+                let s = Suppression { by: caller, stopped: false, ..s.clone() };
                 self.record(Record::Suppressed(s))?;
                 Outcome::Succeeded
             }
@@ -359,8 +364,29 @@ impl<S: Store, H: Host> Kernel<S, H> {
         }
     }
 
+    /// Activating a generation restarts every active target, and with them
+    /// the services they want, including ones a user stopped on purpose.
+    /// Stop those again (principle 9: don't fight the user). Idempotent.
+    fn restop_suppressed(&mut self, txn: &Transaction) -> R<()> {
+        let now = self.host.now();
+        let units: Vec<UnitId> = self
+            .journal
+            .sync_ledger()?
+            .suppressions
+            .iter()
+            .filter(|s| s.stopped && s.holds_at(now))
+            .map(|s| s.unit.clone())
+            .collect();
+        for u in units {
+            let stop = Transition::StopUnit(u);
+            self.call(txn.id, "stop(suppressed)", |h, op| h.execute_runtime(&stop, op))?;
+        }
+        Ok(())
+    }
+
     /// From Checking: probes decide.
     fn check_then_commit(&mut self, txn: &Transaction) -> R<TxnState> {
+        self.restop_suppressed(txn)?;
         match self.host.check(txn, CheckPhase::Candidate) {
             Verdict::Pass => self.commit_from_checking(txn),
             Verdict::Fail(why) => self.revert_generation(txn, &why),
@@ -438,6 +464,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
         if !activated.is_success() && self.host.generations().current().ok() != Some(to) {
             return self.recovery_failed(txn, &format!("revert activation: {activated:?}"));
         }
+        self.restop_suppressed(txn)?;
         let published = self.call(txn.id, "publish_boot(revert_to)", |h, op| h.generations().publish_boot(to, op))?;
         if !published.is_success() {
             return self.recovery_failed(txn, &format!("revert publish_boot: {published:?}"));

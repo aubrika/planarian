@@ -17,6 +17,7 @@ members = [
     "crates/watchdog",
     "crates/cli",
     "crates/gym",
+    "crates/console",
 ]
 
 [workspace.package]

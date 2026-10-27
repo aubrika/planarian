@@ -9,6 +9,7 @@
 //! the flake's NixOS tests (`nix flake check`, `checks.vm-runtime`).
 
 mod check;
+mod serve;
 mod sim;
 
 use sim::Sim;
@@ -130,6 +131,7 @@ fn main() {
                 i += 1;
             }
             "--all" => {}
+            "--socket" => i += 1,
             "-v" | "--verbose" => verbose = true,
             other => {
                 eprintln!("unknown argument {other}");
@@ -186,6 +188,10 @@ fn main() {
                 Result_::Pass | Result_::Partial | Result_::NotFake => 0,
                 _ => 1,
             });
+        }
+        "serve" => {
+            let socket = args.iter().position(|a| a == "--socket").and_then(|i| args.get(i + 1)).cloned();
+            serve::serve(&socket.unwrap_or_else(|| "/tmp/planarian-gym.sock".into()));
         }
         "show-reconciliation" => {
             let r = run_entry(selected[0]);

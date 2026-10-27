@@ -65,6 +65,7 @@ fn transitions() -> Vec<Transition> {
             until: Until::Explicit,
             reason: String::new(),
             by: Actor::Daemon,
+            stopped: false,
         }),
         Transition::Unsuppress(u.clone()),
         Transition::StopAndSuppress { unit: u.clone(), until: Until::NextBoot, reason: String::new() },
@@ -268,6 +269,7 @@ fn i14_actor_field_is_not_authority() {
             until: Until::Explicit,
             reason: String::new(),
             by: claimed,
+            stopped: false,
         });
         let d = decide(&Input {
             transition: &t,
@@ -318,6 +320,7 @@ fn catalog_policy_cases() {
         until: Until::Explicit,
         reason: String::new(),
         by: Actor::Daemon,
+        stopped: false,
     });
     assert_eq!(
         one(
@@ -342,6 +345,7 @@ fn catalog_policy_cases() {
         until: Until::Explicit,
         reason: String::new(),
         by: Actor::Daemon,
+        stopped: false,
     });
     assert_eq!(one(own, routine(), alice.clone()), Decision::Allow(Tier::Runtime));
 

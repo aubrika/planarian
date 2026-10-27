@@ -215,6 +215,7 @@ fn authz_and_refinement_and_digest() {
         until: Until::Explicit,
         reason: String::new(),
         by: Actor::Daemon,
+        stopped: false,
     });
     assert!(matches!(r.propose(sup, alice()), Submitted::Rejected { reason: RejectReason::Unauthorized, .. }));
 
@@ -249,6 +250,7 @@ fn forged_actor_is_overwritten() {
         until: Until::Explicit,
         reason: String::new(),
         by: Actor::Daemon,
+        stopped: false,
     });
     assert_eq!(finished(&r.propose(sup, alice())), TxnState::Committed);
     let l = r.ex.kernel.journal.sync_ledger().unwrap();

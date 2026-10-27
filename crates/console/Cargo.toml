@@ -1,0 +1,20 @@
+[package]
+name = "planarian-console"
+description = "Planarian's read-only visual console (SPEC §16a)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "planarian-console"
+path = "src/main.rs"
+
+[dependencies]
+planarian-schema.workspace = true
+planarian-ipc.workspace = true
+serde_json.workspace = true
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "canvas", "x11", "wayland", "fira-sans", "smol"] }
+
+[lints]
+workspace = true

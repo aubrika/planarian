@@ -212,6 +212,7 @@ fn print(resp: &Response, json: bool) -> i32 {
     }
     match resp {
         Response::Status(r) => print_status(r),
+        Response::Console(r) => print_status(&r.status),
         Response::Log { lines } => {
             for l in lines {
                 println!("{:>6}  {}", l.seq, l.text);

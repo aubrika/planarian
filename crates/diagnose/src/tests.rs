@@ -157,6 +157,7 @@ fn suppressed_root_is_never_a_target() {
         until: Until::Explicit,
         reason: String::new(),
         by: Actor::User { uid: 0 },
+        stopped: false,
     });
     let app = UnitId::service("gym-app");
     observe(&mut w.s, &w.defs, &app, Observed::Bound, ProbeResult::Fail("x".into()));

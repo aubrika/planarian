@@ -151,6 +151,7 @@ fn suppression_closes_and_is_never_a_target() {
         until: Until::Explicit,
         reason: String::new(),
         by: Actor::User { uid: 1000 },
+        stopped: false,
     });
     sim.ticks(3);
     assert!(sim.active("gym-web").is_none());
