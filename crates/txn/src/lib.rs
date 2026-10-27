@@ -10,6 +10,10 @@
 //!   crash-recovery table, over a `Host` that provides backends and probes.
 //! - `fake`: in-memory backends for the fake harness.
 
+// Verus idioms: `&Vec` for its `@` view, explicit `match` and nested `if`
+// rather than `matches!` and let-chains.
+#![allow(clippy::ptr_arg, clippy::match_like_matches_macro, clippy::collapsible_if)]
+
 pub mod fake;
 pub mod journal;
 pub mod kernel;

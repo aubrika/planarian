@@ -3,6 +3,9 @@
 //! integer time.
 
 #![cfg_attr(verus_keep_ghost, verifier::allow(autoderive_clone_without_spec))]
+// Verus idioms: `&Vec` for its `@` view, explicit `match` and nested `if`
+// rather than `matches!` and let-chains.
+#![allow(clippy::ptr_arg, clippy::match_like_matches_macro, clippy::collapsible_if)]
 
 pub mod backend;
 #[cfg(any(test, feature = "fixtures"))]
