@@ -14,7 +14,7 @@
 
 use crate::render;
 use planarian_diagnose as diagnose;
-use planarian_exec::{Config as ExecConfig, Executor, Submitted, derive::manifest_of};
+use planarian_exec::{Config as ExecConfig, Executor, PrebuildJob, Prebuilt, Submitted, derive::manifest_of};
 use planarian_incident::Manager;
 use planarian_intent::{self as intent, Interpretation};
 use planarian_ipc::{
@@ -96,6 +96,36 @@ pub struct Core<B: Backends + Clone, S: Store> {
     space_noted: Timestamp,
     /// Executor log records waiting for their post-state (I7).
     awaiting_post: Vec<LogRecord>,
+    /// Set by the daemon: a catalog change's stage, evaluate and build are
+    /// handed back as a `PrebuildJob` (`take_deferred`) to run on another
+    /// thread, instead of running inside `handle`. Off in tests and the gym.
+    pub defer: bool,
+    /// Set by the daemon while a deferred change builds elsewhere: what, and since when.
+    pub building: Option<(String, Timestamp)>,
+    deferred: Option<(PrebuildJob<B::Gens>, Resume)>,
+}
+
+/// How to finish a request whose slow part ran elsewhere.
+#[derive(Clone, Debug)]
+pub struct Resume {
+    peer: Peer,
+    kind: ResumeKind,
+}
+
+#[derive(Clone, Debug)]
+enum ResumeKind {
+    Submit { t: Transition, source: Source, reason: String },
+    Request(Request),
+}
+
+impl Resume {
+    /// A few words for "busy with …".
+    pub fn describe(&self) -> String {
+        match &self.kind {
+            ResumeKind::Submit { t, .. } => render::transition(t),
+            ResumeKind::Request(r) => crate::snapshot::describe(r),
+        }
+    }
 }
 
 /// How often the daemon checks the §12b collection bounds.
@@ -166,6 +196,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             next_gc_check: Timestamp(0),
             space_noted: Timestamp(0),
             awaiting_post: Vec::new(),
+            defer: false,
+            building: None,
+            deferred: None,
         };
         if core.cfg.fresh_boot {
             for s in ledger.suppressions.iter().filter(|s| s.until == Until::NextBoot) {
@@ -540,7 +573,35 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
     }
 
+    /// The slow part of the request just handled, if `handle` deferred it:
+    /// run the job anywhere, then pass its result to `resume`. Until then the
+    /// answer `handle` returned is a placeholder, not for the caller.
+    pub fn take_deferred(&mut self) -> Option<(PrebuildJob<B::Gens>, Resume)> {
+        self.deferred.take()
+    }
+
+    /// Finish a deferred request with its prebuilt candidate: plan, decide
+    /// and run it as `handle` would have, against a fresh observation.
+    pub fn resume(&mut self, r: Resume, prebuilt: Prebuilt) -> Response {
+        self.ex.prebuilt = Some(prebuilt);
+        let defer = std::mem::replace(&mut self.defer, false);
+        let resp = match r.kind {
+            ResumeKind::Submit { t, source, reason } => self.user_submit(t, r.peer, source, reason),
+            ResumeKind::Request(req) => self.handle(r.peer, req),
+        };
+        self.defer = defer;
+        self.ex.prebuilt = None;
+        resp
+    }
+
     fn user_submit(&mut self, t: Transition, peer: Peer, source: Source, reason: String) -> Response {
+        if self.defer
+            && self.deferred.is_none()
+            && let Some(job) = self.ex.prebuild_job(&t)
+        {
+            self.deferred = Some((job, Resume { peer, kind: ResumeKind::Submit { t, source, reason } }));
+            return Response::Ok { message: "deferred".into() };
+        }
         let (s, defs) = self.observe();
         let p = self.proposal(t, &s, &defs, source, reason);
         let authz = self.authz(peer);
@@ -596,7 +657,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 })
                 .collect(),
             reconciliation: l.last_reconciliation.map(|r| r.actions),
-            notices: self.notices.iter().cloned().collect(),
+            notices: self
+                .building
+                .as_ref()
+                .map(|(what, since)| {
+                    let mins = self.b.clock().now().0.saturating_sub(since.0) / 60_000;
+                    format!("building {what} ({mins} min so far); repairs go on meanwhile")
+                })
+                .into_iter()
+                .chain(self.notices.iter().cloned())
+                .collect(),
             space: self.b.generations().space_report(),
         }
     }
@@ -807,6 +877,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     return Response::Error {
                         message: "approve requires root at an interactive terminal (Phase A)".into(),
                     };
+                }
+                if self.defer && self.deferred.is_none() {
+                    let t = self.ex.parked.values().find(|p| p.bound_to == hash).map(|p| p.proposal.transition.clone());
+                    if let Some(job) = t.and_then(|t| self.ex.prebuild_job(&t)) {
+                        let req = Request::Approve { hash, tty };
+                        self.deferred = Some((job, Resume { peer, kind: ResumeKind::Request(req) }));
+                        return Response::Ok { message: "deferred".into() };
+                    }
                 }
                 let (s, defs) = self.observe();
                 let r = self.ex.approve(&hash, &s, &defs);

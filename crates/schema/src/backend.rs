@@ -199,7 +199,8 @@ pub trait Clock {
 /// the gym, with fakes.
 pub trait Backends {
     type Units: UnitBackend;
-    type Gens: GenerationBackend;
+    /// Cloned onto a worker thread for the slow part of planning a change.
+    type Gens: GenerationBackend + Clone + Send + 'static;
     type Inv: InventoryBackend;
     type Probes: ProbeBackend;
     type Sessions: SessionBackend;

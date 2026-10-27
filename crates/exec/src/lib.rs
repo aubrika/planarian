@@ -101,6 +101,77 @@ pub struct Executor<B: Backends + Clone, S: Store> {
     /// The derived facts and decision of the last submission that got that
     /// far, for the executor log (I7).
     pub last: Option<(DerivedFacts, Decision)>,
+    /// The result of a `PrebuildJob` run off the daemon's core thread; the
+    /// next `submit` of the same transition uses it if the live override
+    /// file is still the one it was built from.
+    pub prebuilt: Option<Prebuilt>,
+}
+
+/// What stage, evaluate and build produced for a catalog change.
+#[derive(Clone, Debug)]
+pub struct Candidate {
+    staged: StagedSource,
+    eval: EvaluatedGeneration,
+    built: Built,
+    merged: OverrideSet,
+}
+
+/// A `PrebuildJob`'s result.
+#[derive(Clone, Debug)]
+pub struct Prebuilt {
+    transition: Transition,
+    live_hash: Hash,
+    result: Result<Candidate, Submitted>,
+}
+
+/// The slow, pre-journal part of planning a catalog change (§9 steps 1–3:
+/// stage, evaluate, build), detached from the executor so the daemon can run
+/// it on another thread while its core keeps observing and repairing. It
+/// touches no journal: a candidate is only a store path and a GC root until
+/// a transaction is prepared for it.
+pub struct PrebuildJob<G> {
+    gens: G,
+    owner: PinnedSource,
+    catalog: CatalogConfig,
+    transition: Transition,
+    live: OverrideSet,
+    live_hash: Hash,
+}
+
+impl<G: GenerationBackend> PrebuildJob<G> {
+    pub fn run(self) -> Prebuilt {
+        let result = build_candidate(&self.gens, &self.owner, &self.catalog, &self.transition, &self.live);
+        Prebuilt { transition: self.transition, live_hash: self.live_hash, result }
+    }
+}
+
+fn build_candidate<G: GenerationBackend>(
+    gens: &G,
+    owner: &PinnedSource,
+    catalog: &CatalogConfig,
+    transition: &Transition,
+    live: &OverrideSet,
+) -> Result<Candidate, Submitted> {
+    let Transition::ApplyChange { change, args } = transition else {
+        return Err(reject(RejectReason::Other("prebuild".into()), "not a catalog change"));
+    };
+    let set = planarian_changes::handle(catalog, change, args).map_err(|e| match e {
+        planarian_changes::CatalogError::NotInCatalog(_) => reject(RejectReason::NotInCatalog, e.to_string()),
+        e => reject(RejectReason::Other("arguments".into()), e.to_string()),
+    })?;
+    let merged = planarian_changes::merge(live, &set);
+    let fail = |what: &str, o: Outcome| reject(RejectReason::Other(what.into()), outcome_msg(o));
+    let no_space = |what: &str, o: Outcome| {
+        if outcome_msg(o.clone()).contains("No space") {
+            reject(RejectReason::NoSpace, outcome_msg(o))
+        } else {
+            fail(what, o)
+        }
+    };
+    let staged = gens.stage(owner, &merged).map_err(|o| no_space("stage", o))?;
+    let eval = gens.evaluate(&staged).map_err(|o| fail("evaluate", o))?;
+    let built = gens.build(&eval).map_err(|o| no_space("build", o))?;
+    Ok(Candidate { staged, eval, built, merged })
 }
 
 /// An approval token issued at `issued` has expired by `now` (§12 step 4:
@@ -131,6 +202,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             session: Session::default(),
             parked: BTreeMap::new(),
             last: None,
+            prebuilt: None,
         }
     }
 
@@ -168,6 +240,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         authz: &Authorization,
         state: &SystemState,
         defs: &UnitDefs,
+        prebuilt: Option<Prebuilt>,
     ) -> Result<Plan, Submitted> {
         let gens = self.b.generations();
         // §11: actor fields inside a proposal are overwritten from the caller.
@@ -232,29 +305,24 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         let mut cand_overrides: Option<OverrideSet> = None;
         match &transition {
             Transition::ApplyChange { change, args } => {
-                let set = planarian_changes::handle(&self.cfg.catalog, change, args).map_err(|e| match e {
-                    planarian_changes::CatalogError::NotInCatalog(_) => {
-                        reject(RejectReason::NotInCatalog, e.to_string())
+                let _ = (change, args);
+                // Built off the core thread if the daemon did so for this
+                // very transition from this very override file; else here.
+                let pre = match prebuilt {
+                    Some(p) if p.transition == transition && p.live_hash == live_hash => Some(p),
+                    Some(stale) => {
+                        if let Ok(c) = &stale.result {
+                            gens.release_root(&c.built.root);
+                        }
+                        None
                     }
-                    e => reject(RejectReason::Other("arguments".into()), e.to_string()),
-                })?;
-                let merged = planarian_changes::merge(&live, &set);
+                    None => None,
+                };
+                let Candidate { staged, eval, built, merged } = match pre {
+                    Some(p) => p.result?,
+                    None => build_candidate(gens, &self.cfg.owner, &self.cfg.catalog, &transition, &live)?,
+                };
                 let fail = |what: &str, o: Outcome| reject(RejectReason::Other(what.into()), outcome_msg(o));
-                let staged = gens.stage(&self.cfg.owner, &merged).map_err(|o| {
-                    if outcome_msg(o.clone()).contains("No space") {
-                        reject(RejectReason::NoSpace, outcome_msg(o))
-                    } else {
-                        fail("stage", o)
-                    }
-                })?;
-                let eval = gens.evaluate(&staged).map_err(|o| fail("evaluate", o))?;
-                let built = gens.build(&eval).map_err(|o| {
-                    if outcome_msg(o.clone()).contains("No space") {
-                        reject(RejectReason::NoSpace, outcome_msg(o))
-                    } else {
-                        fail("build", o)
-                    }
-                })?;
                 gens.remember_override(&live).map_err(|o| fail("override", o))?;
                 let cand_hash = gens.remember_override(&merged).map_err(|o| fail("override", o))?;
                 plan.candidate = Some((built.generation, built.path.clone()));
@@ -415,6 +483,27 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         }
     }
 
+    /// The slow part of planning `t`, to run elsewhere: `Some` for a catalog
+    /// change, whose staging, evaluation and build can take minutes. Hand
+    /// its result to `prebuilt` before submitting `t`.
+    pub fn prebuild_job(&self, t: &Transition) -> Option<PrebuildJob<B::Gens>>
+    where
+        B::Gens: Clone,
+    {
+        if !matches!(t, Transition::ApplyChange { .. }) {
+            return None;
+        }
+        let (live, live_hash) = self.b.generations().read_overrides().ok()?;
+        Some(PrebuildJob {
+            gens: self.b.generations().clone(),
+            owner: self.cfg.owner.clone(),
+            catalog: self.cfg.catalog.clone(),
+            transition: t.clone(),
+            live,
+            live_hash,
+        })
+    }
+
     /// Submit a proposal. `state` and `defs` are the current observation.
     pub fn submit(&mut self, p: Proposal, authz: Authorization, state: &SystemState, defs: &UnitDefs) -> Submitted {
         let digest = state.digest();
@@ -426,7 +515,8 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             };
         }
         self.last = None;
-        let plan = match self.plan(&p, &authz, state, defs) {
+        let pre = self.prebuilt.take();
+        let plan = match self.plan(&p, &authz, state, defs, pre) {
             Ok(plan) => plan,
             Err(s) => return s,
         };
@@ -523,7 +613,8 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             let _ = self.kernel.reject(parked.txn, RejectReason::Stale);
             return reject(RejectReason::Stale, "your configuration changed after the approval was requested");
         }
-        let plan = match self.plan(&parked.proposal, &parked.authz, state, defs) {
+        let pre = self.prebuilt.take();
+        let plan = match self.plan(&parked.proposal, &parked.authz, state, defs, pre) {
             Ok(p) => p,
             Err(s) => {
                 self.parked.remove(&parked.txn);

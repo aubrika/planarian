@@ -360,3 +360,54 @@ fn reads_are_answered_from_a_snapshot_while_busy() {
     assert_eq!(lines.len(), 1);
     assert!(snap.answer(&apply, &busy).is_none());
 }
+
+#[test]
+fn a_change_builds_elsewhere_while_repairs_go_on() {
+    let mut r = Rig::new();
+    r.core.defer = true;
+    r.ticks(2);
+    let mut args = BTreeMap::new();
+    args.insert("scale".to_string(), Value::Str("1.25".into()));
+    let placeholder = r.core.handle(ALICE, Request::Apply { change: ChangeId("font-scale".into()), args });
+    assert!(matches!(placeholder, Response::Ok { .. }), "{placeholder:?}");
+    let (job, resume) = r.core.take_deferred().expect("deferred");
+    assert_eq!(resume.describe(), "apply font-scale scale=1.25");
+    // The build runs on another thread; meanwhile a service dies and the tick repairs it.
+    let worker = std::thread::spawn(move || job.run());
+    r.core.building = Some((resume.describe(), Timestamp(0)));
+    r.fake.w().kill(&UnitId::service("gym-web"));
+    r.ticks(4);
+    assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
+    assert_eq!(r.calls("restart(service:gym-web)"), 1);
+    let Response::Status(s) = r.core.handle(ALICE, Request::Status) else { panic!() };
+    assert!(s.notices[0].starts_with("building apply font-scale scale=1.25 ("), "{:?}", s.notices);
+    r.core.building = None;
+    let resp = r.core.resume(resume, worker.join().unwrap());
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    // Built once, on the worker: resuming did not build again.
+    assert_eq!(r.fake.w().builds, 1);
+}
+
+#[test]
+fn a_prebuilt_candidate_from_an_older_override_file_is_not_used() {
+    let mut r = Rig::new();
+    r.core.defer = true;
+    r.ticks(2);
+    let apply = |scale: &str| {
+        let mut args = BTreeMap::new();
+        args.insert("scale".to_string(), Value::Str(scale.into()));
+        Request::Apply { change: ChangeId("font-scale".into()), args }
+    };
+    r.core.handle(ALICE, apply("1.25"));
+    let (job, resume) = r.core.take_deferred().expect("deferred");
+    let pre = job.run();
+    // Another change commits first and rewrites the override file.
+    r.core.defer = false;
+    let resp = r.core.handle(ALICE, apply("1.5"));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    r.core.defer = true;
+    let resp = r.core.resume(resume, pre);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    // The stale candidate was rebuilt against the new file.
+    assert_eq!(r.fake.w().builds, 3);
+}

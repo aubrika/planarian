@@ -136,6 +136,8 @@ pub struct World {
     /// blocked when the candidate activates.
     pub edit_on_stage: bool,
     pub nospace_on_build: bool,
+    /// How many times `build` ran.
+    pub builds: usize,
     pub block_on_activate: BTreeSet<UnitId>,
     pub fail_activate: BTreeSet<GenerationId>,
     pub slow_activation: Option<(Millis, bool)>,
@@ -474,6 +476,7 @@ impl GenerationBackend for Fake {
 
     fn build(&self, eval: &EvaluatedGeneration) -> Result<Built, Outcome> {
         let mut w = self.w();
+        w.builds += 1;
         if std::mem::take(&mut w.nospace_on_build) {
             return Err(Outcome::Failed("error: writing to file: No space left on device".into()));
         }

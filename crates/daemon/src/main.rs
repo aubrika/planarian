@@ -2,14 +2,17 @@
 
 use planarian_backend_linux::{Paths, Real};
 use planarian_daemon::config::{CONFIG, FileConfig, is_admin, load_canonical};
+use planarian_daemon::core::Resume;
 use planarian_daemon::snapshot::{self, Busy, Snapshot};
 use planarian_daemon::{Core, CoreConfig, Peer};
 use planarian_exec::Config as ExecConfig;
+use planarian_exec::{PrebuildJob, Prebuilt};
 use planarian_ipc::{Request, Response, SOCKET};
-use planarian_schema::{Clock, Hash, OwnerId, PinnedSource, SourceKind};
+use planarian_schema::{Backends, Clock, Hash, OwnerId, PinnedSource, SourceKind};
 use planarian_txn::journal::Journal;
 use planarian_txn::ledger::Record;
 use planarian_txn::store::FileStore;
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -79,6 +82,15 @@ fn renewer(store_dir: PathBuf, txn_dir: PathBuf, capacity: u64, me: OwnerId) {
     });
 }
 
+type Reply = mpsc::Sender<Response>;
+
+enum Event {
+    /// A request from the socket.
+    Request(Peer, Request, Reply),
+    /// A deferred change's stage, evaluate and build finished.
+    Built(Resume, Box<Prebuilt>, Reply),
+}
+
 fn main() {
     let cfg_path = std::env::var("PLANARIAN_CONFIG").unwrap_or_else(|_| CONFIG.into());
     let file = match FileConfig::load(Path::new(&cfg_path)) {
@@ -135,6 +147,9 @@ fn main() {
         fresh_boot: fresh_boot(&paths.state, &boot),
     };
     let mut core = Core::start(journal, real, me.clone(), core_cfg);
+    // Catalog changes stage, evaluate and build on a worker thread while the
+    // core keeps observing, repairing and answering.
+    core.defer = true;
     renewer(paths.journal_dir(), paths.txn_dir(), file.journal_bytes, me);
 
     // The socket: any local user may connect; identity comes from SO_PEERCRED.
@@ -151,8 +166,8 @@ fn main() {
         }
     };
     let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666));
-    type Job = (Peer, Request, mpsc::Sender<Response>);
-    let (tx, rx) = mpsc::channel::<Job>();
+    let (tx, rx) = mpsc::channel::<Event>();
+    let built_tx = tx.clone();
     let group = file.admin_group.clone();
     // Set while the core handles a request that may take long; read-only
     // requests are answered from the snapshot meanwhile (snapshot.rs).
@@ -180,7 +195,7 @@ fn main() {
                     }
                     Ok(req) => {
                         let (rtx, rrx) = mpsc::channel();
-                        if tx.send((peer, req, rtx)).is_err() {
+                        if tx.send(Event::Request(peer, req, rtx)).is_err() {
                             return;
                         }
                         rrx.recv().unwrap_or(Response::Error { message: "the daemon stopped".into() })
@@ -196,10 +211,24 @@ fn main() {
     eprintln!("planariad: started (pid {})", std::process::id());
     let mut printed = 0usize;
     let mut next_tick = Instant::now();
+    // One build at a time; later ones wait their turn.
+    let mut building = false;
+    let mut queued: VecDeque<(PrebuildJob<<Real as Backends>::Gens>, Resume, Reply)> = VecDeque::new();
+    let start = |job: PrebuildJob<_>, resume: Resume, reply: Reply, core: &mut Core<Real, FileStore>| {
+        let what = resume.describe();
+        core.building = Some((what, core.b.clock().now()));
+        let tx = built_tx.clone();
+        std::thread::spawn(move || {
+            let pre = job.run();
+            let _ = tx.send(Event::Built(resume, Box::new(pre), reply));
+        });
+    };
     loop {
         let wait = next_tick.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
-            Ok((peer, req, reply)) => {
+            Ok(Event::Request(peer, req, reply)) => {
+                // Answered from a snapshot while this runs: anything that
+                // may mutate can hold the core (activation, checks).
                 let long = !snapshot::read_only(&req);
                 if long && let Some(snap) = Snapshot::take(&mut core) {
                     let b = Busy { with: snapshot::describe(&req), since: Instant::now() };
@@ -209,7 +238,30 @@ fn main() {
                 if long {
                     *busy.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
+                match core.take_deferred() {
+                    Some((job, resume)) if building => queued.push_back((job, resume, reply)),
+                    Some((job, resume)) => {
+                        building = true;
+                        start(job, resume, reply, &mut core);
+                    }
+                    None => {
+                        let _ = reply.send(resp);
+                    }
+                }
+            }
+            Ok(Event::Built(resume, pre, reply)) => {
+                core.building = None;
+                if let Some(snap) = Snapshot::take(&mut core) {
+                    let b = Busy { with: resume.describe(), since: Instant::now() };
+                    *busy.lock().unwrap_or_else(|e| e.into_inner()) = Some((b, snap));
+                }
+                let resp = core.resume(resume, *pre);
+                *busy.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 let _ = reply.send(resp);
+                match queued.pop_front() {
+                    Some((job, resume, reply)) => start(job, resume, reply, &mut core),
+                    None => building = false,
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 core.tick();

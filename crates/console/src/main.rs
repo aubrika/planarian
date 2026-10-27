@@ -160,6 +160,9 @@ impl Console {
             let what = n.split(':').next().unwrap_or(n);
             return Some((Motion::Working, format!("{what}. Showing how things stood when it started.")));
         }
+        if let Some(n) = r.status.notices.iter().find(|n| n.starts_with("building ")) {
+            return Some((Motion::Working, n.clone()));
+        }
         r.status.in_flight.first().map(|(t, state, what)| {
             (Motion::Working, format!("working on #{}: {what} ({})", t.0, planarian_state_name(state)))
         })

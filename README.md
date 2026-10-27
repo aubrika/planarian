@@ -115,7 +115,9 @@ The console (`services.planarian.console.enable = true;`, on with the
 reference module) shows the dependency graph with what is desired,
 observed and healthy for each unit, the transaction timeline, the
 generations and the incidents. It starts minimized unless something needs
-attention.
+attention. It is dark, like the rest of the identity (`assets/identity`).
+While Planarian builds or applies a change, the mark in its window moves
+(the kit's "working" motion); set `PLANARIAN_REDUCED_MOTION=1` to keep it still.
 
 Other commands: `planarian incidents`, `planarian log -n 50`, `planarian undo`,
 `planarian gc`, `planarian diagnose <unit>`, `planarian cancel <txn>`,
