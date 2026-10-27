@@ -172,6 +172,22 @@ fn print_status(r: &StatusReport) {
     for (t, s, what) in &r.in_flight {
         println!("\nin progress: transaction {} ({s:?}): {what}", t.0);
     }
+    if let Some(sp) = &r.space {
+        let gb = |n: u64| n as f64 / 1e9;
+        println!(
+            "\nspace: {} generation(s), {:.1} GB of a {:.1} GB budget (last collection removed {})",
+            sp.generations,
+            gb(sp.bytes),
+            gb(sp.max_bytes),
+            sp.collected
+        );
+        if let Some(short) = sp.shortfall {
+            println!(
+                "  over budget by {:.1} GB: the generations Planarian must keep are larger than the budget, so it is a target, not a guarantee",
+                gb(short)
+            );
+        }
+    }
     if let Some(rec) = &r.reconciliation
         && !rec.is_empty()
     {

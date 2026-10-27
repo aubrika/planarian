@@ -29,8 +29,6 @@ use std::time::Duration;
 const NIX: Duration = Duration::from_secs(30 * 60);
 const QUICK: Duration = Duration::from_secs(30);
 pub const ACTIVATION: Duration = Duration::from_secs(16 * 60);
-pub const KEEP_GENERATIONS: usize = 10;
-pub const KEEP_GENERATIONS_EMERGENCY: usize = 3;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Registry {
@@ -131,6 +129,32 @@ pub fn apply_expr(paths: &[String]) -> String {
     format!("c: {{ export = c.config.services.planarian.export; values = {{{values} }}; prios = {{{prios} }}; }}")
 }
 
+/// The total size of the union of the closures of `paths`.
+fn closure_bytes(paths: &[&str]) -> Result<u64, Outcome> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let mut args = vec!["path-info", "--recursive", "--json"];
+    args.extend(paths);
+    let o = nix(&args, QUICK);
+    if !o.ok() {
+        return Err(err(&o));
+    }
+    closure_bytes_of(&o.stdout).ok_or_else(|| Outcome::Failed("nix path-info: unexpected output".into()))
+}
+
+/// Sum `narSize` over the paths `nix path-info --json` lists, in either of
+/// its shapes: an object keyed by path, or an array of objects with `path`.
+pub fn closure_bytes_of(json: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let sizes: Vec<u64> = match &v {
+        serde_json::Value::Object(m) => m.values().map(|x| x["narSize"].as_u64().unwrap_or(0)).collect(),
+        serde_json::Value::Array(a) => a.iter().map(|x| x["narSize"].as_u64().unwrap_or(0)).collect(),
+        _ => return None,
+    };
+    Some(sizes.iter().sum())
+}
+
 fn value_from_json(v: &serde_json::Value) -> Option<Value> {
     Some(match v {
         serde_json::Value::Bool(b) => Value::Bool(*b),
@@ -148,6 +172,7 @@ fn value_from_json(v: &serde_json::Value) -> Option<Value> {
 pub struct Nixos {
     paths: Paths,
     lock: Arc<Mutex<()>>,
+    budget: gc::GcBudget,
 }
 
 fn sha(text: &str) -> Hash {
@@ -204,7 +229,69 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> 
 
 impl Nixos {
     pub fn new(paths: Paths) -> Nixos {
-        Nixos { paths, lock: Arc::new(Mutex::new(())) }
+        Nixos { paths, lock: Arc::new(Mutex::new(())), budget: gc::GcBudget::default() }
+    }
+
+    /// The §12b bounds (`services.planarian.gc`).
+    pub fn with_budget(mut self, budget: gc::GcBudget) -> Nixos {
+        self.budget = budget;
+        self
+    }
+
+    /// The system profile's generations: (profile number, store path).
+    fn profile_generations(&self) -> Vec<(u64, String)> {
+        let dir = self.paths.profile.parent().expect("profile dir");
+        let prefix = format!("{}-", self.paths.profile.file_name().expect("name").to_string_lossy());
+        let mut gens: Vec<(u64, String)> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| {
+                        let n = e.file_name().to_string_lossy().into_owned();
+                        let num = n.strip_prefix(&prefix)?.strip_suffix("-link")?.parse().ok()?;
+                        Some((num, std::fs::canonicalize(e.path()).ok()?.to_string_lossy().into_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        gens.sort();
+        gens
+    }
+
+    /// Plan over profile numbers. Protected generations are the profile
+    /// entries whose store path is a protected generation's.
+    fn plan_profile(
+        &self,
+        protect: &[GenerationId],
+        emergency: bool,
+    ) -> Result<(gc::GcPlan, Vec<(u64, String)>), Outcome> {
+        let protected_paths: BTreeSet<String> =
+            protect.iter().filter_map(|g| self.path_of(*g).ok()).map(|p| p.0).collect();
+        let gens = self.profile_generations();
+        let ids: Vec<GenerationId> = gens.iter().map(|(n, _)| GenerationId(*n)).collect();
+        let keep: Vec<GenerationId> =
+            gens.iter().filter(|(_, p)| protected_paths.contains(p)).map(|(n, _)| GenerationId(*n)).collect();
+        let fs_bytes = match rustix::fs::statvfs("/nix/store") {
+            Ok(v) => v.f_blocks.saturating_mul(v.f_frsize),
+            Err(e) => return Err(Outcome::Failed(format!("statvfs /nix/store: {e}"))),
+        };
+        let count = if emergency { self.budget.keep_emergency } else { self.budget.keep_generations };
+        let mut failure = None;
+        let plan = gc::plan(&ids, &keep, count, self.budget.max_bytes(fs_bytes), |set| {
+            let paths: Vec<&str> =
+                gens.iter().filter(|(n, _)| set.contains(&GenerationId(*n))).map(|(_, p)| p.as_str()).collect();
+            closure_bytes(&paths).unwrap_or_else(|o| {
+                failure = Some(o);
+                0
+            })
+        });
+        match failure {
+            Some(o) => Err(o),
+            None => Ok((plan, gens)),
+        }
+    }
+
+    fn report_path(&self) -> PathBuf {
+        self.paths.state.join("gc-report.json")
     }
 
     fn registry_path(&self) -> PathBuf {
@@ -624,6 +711,14 @@ impl GenerationBackend for Nixos {
         })
     }
 
+    fn gc_plan(&self, protect: &[GenerationId], emergency: bool) -> Result<gc::GcPlan, Outcome> {
+        self.plan_profile(protect, emergency).map(|(p, _)| p)
+    }
+
+    fn space_report(&self) -> Option<gc::SpaceReport> {
+        std::fs::read(self.report_path()).ok().and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
     fn release_root(&self, root: &str) -> bool {
         Path::new(root).starts_with(&self.paths.gcroots) && std::fs::remove_file(root).is_ok()
     }
@@ -632,31 +727,12 @@ impl GenerationBackend for Nixos {
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
         }
-        let keep_n = if emergency { KEEP_GENERATIONS_EMERGENCY } else { KEEP_GENERATIONS };
-        let protected_paths: BTreeSet<String> =
-            protect.iter().filter_map(|g| self.path_of(*g).ok()).map(|p| p.0).collect();
-        // Profile generations: number → store path.
-        let dir = self.paths.profile.parent().expect("profile dir");
-        let prefix = format!("{}-", self.paths.profile.file_name().expect("name").to_string_lossy());
-        let mut gens: Vec<(u64, String)> = std::fs::read_dir(dir)
-            .map(|rd| {
-                rd.flatten()
-                    .filter_map(|e| {
-                        let n = e.file_name().to_string_lossy().into_owned();
-                        let num = n.strip_prefix(&prefix)?.strip_suffix("-link")?.parse().ok()?;
-                        Some((num, std::fs::canonicalize(e.path()).ok()?.to_string_lossy().into_owned()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        gens.sort();
-        let newest: BTreeSet<u64> = gens.iter().rev().take(keep_n).map(|(n, _)| *n).collect();
+        let (plan, _) = match self.plan_profile(protect, emergency) {
+            Ok(p) => p,
+            Err(o) => return o,
+        };
         // Protected generations stay in the profile, so they stay in the boot menu (I1, I3).
-        let delete: Vec<String> = gens
-            .iter()
-            .filter(|(n, p)| !newest.contains(n) && !protected_paths.contains(p))
-            .map(|(n, _)| n.to_string())
-            .collect();
+        let delete: Vec<String> = plan.delete.iter().map(|g| g.0.to_string()).collect();
         if !delete.is_empty() {
             let profile = self.paths.profile.to_string_lossy().into_owned();
             let mut argv = vec!["nix-env", "-p", &profile, "--delete-generations"];
@@ -665,6 +741,14 @@ impl GenerationBackend for Nixos {
             if !o.ok() {
                 return err(&o);
             }
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let report = gc::SpaceReport::of(&plan, Timestamp(now));
+        if let Ok(json) = serde_json::to_vec_pretty(&report) {
+            let _ = std::fs::write(self.report_path(), json);
         }
         for g in protect {
             if let Ok(p) = self.path_of(*g) {
@@ -693,6 +777,15 @@ impl GenerationBackend for Nixos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closure_sizes_from_both_json_shapes() {
+        let object = r#"{"/nix/store/a": {"narSize": 100}, "/nix/store/b": {"narSize": 23}}"#;
+        let array = r#"[{"path": "/nix/store/a", "narSize": 100}, {"path": "/nix/store/b", "narSize": 23}]"#;
+        assert_eq!(closure_bytes_of(object), Some(123));
+        assert_eq!(closure_bytes_of(array), Some(123));
+        assert_eq!(closure_bytes_of("nonsense"), None);
+    }
 
     #[test]
     fn dry_activate() {

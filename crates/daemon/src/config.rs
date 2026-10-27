@@ -38,6 +38,8 @@ pub struct FileConfig {
     /// Device unit name → sysfs path.
     pub devices: BTreeMap<String, PathBuf>,
     pub admin_group: String,
+    /// §12b collection bounds (`services.planarian.gc`).
+    pub gc: planarian_schema::gc::GcBudget,
     pub journal_bytes: u64,
 }
 
@@ -58,6 +60,7 @@ impl Default for FileConfig {
             runtime_options: vec![],
             devices: BTreeMap::new(),
             admin_group: "planarian-admin".into(),
+            gc: Default::default(),
             journal_bytes: planarian_txn::store::DEFAULT_CAPACITY,
         }
     }

@@ -214,6 +214,19 @@ in
       description = "Autonomy: anything above this asks first. It never turns a refusal into a permission.";
     };
 
+    gc = {
+      keepGenerations = mkOption {
+        type = types.ints.positive;
+        default = 10;
+        description = "Keep at most this many system generations (§12b). The generations Planarian must keep (known-good, current, previous, any in flight) are never collected.";
+      };
+      generationsPercent = mkOption {
+        type = types.numbers.between 0 100;
+        default = 20;
+        description = "Generations may use at most this share of the Nix store's filesystem. Older generations are collected first until both bounds hold.";
+      };
+    };
+
     userControllable = {
       units = mkOption { type = types.listOf types.str; default = [ "pipewire" "wireplumber" ]; description = "System units any local user may restart, stop or leave alone."; };
       changes = mkOption { type = types.listOf types.str; default = [ "font-scale" "wifi-select" ]; };
@@ -313,6 +326,11 @@ in
       };
       devices = cfg.export.devices;
       adminGroup = "planarian-admin";
+      gc = {
+        keepGenerations = cfg.gc.keepGenerations;
+        generationsPermille = builtins.floor (cfg.gc.generationsPercent * 10);
+        keepEmergency = 3;
+      };
       journalBytes = 64 * 1024 * 1024;
     };
 

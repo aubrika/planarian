@@ -255,6 +255,29 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
                     }
                 }
             }
+            "gc_protected" => {
+                // I3: none of the named generations was collected.
+                let w = sim.fake.w();
+                let current = w.current;
+                let previous = w.boot_entries.iter().copied().filter(|g| *g < current).max();
+                for name in val.as_array().into_iter().flatten().filter_map(T::as_str) {
+                    let gens: Vec<GenerationId> = match name {
+                        "known_good" => ledger.known_good.into_iter().chain([w.boot_default]).collect(),
+                        "base" => vec![current],
+                        "previous" => previous.into_iter().collect(),
+                        "candidate" => {
+                            ledger.live.values().filter_map(|t| t.txn.candidate.as_ref().map(|(g, _)| *g)).collect()
+                        }
+                        other => {
+                            v.unchecked.push(format!("gc_protected.{other}"));
+                            continue;
+                        }
+                    };
+                    if let Some(g) = gens.iter().find(|g| w.collected.contains(g)) {
+                        fail(&mut v, format!("{name} generation {} was collected", g.0));
+                    }
+                }
+            }
             "status_seen" | "status_never" => {
                 for (u, names) in val.as_table().into_iter().flatten() {
                     let seen = sim.seen_status.get(&unit(u)).cloned().unwrap_or_default();
@@ -321,6 +344,7 @@ pub fn judge(sim: &mut Sim, post: &T) -> Verdict {
                             |x| matches!(x, Response::Done { message, .. } if message.contains("until the next boot")),
                         ),
                         "AwaitingApproval" => notices.contains("needs approval"),
+                        "BudgetUnsatisfiable" => notices.contains("BudgetUnsatisfiable"),
                         _ => {
                             v.unchecked.push(format!("reports.{r}"));
                             continue;
@@ -471,6 +495,7 @@ fn check_txn(sim: &Sim, all: &[TxnView], spec: &T, v: &mut Verdict) {
                     Source::User => src == "user",
                     Source::Intent { .. } => src == "intent",
                     Source::Model(_) => src == "model",
+                    Source::Maintenance => src == "maintenance",
                 }
         });
         if !found {

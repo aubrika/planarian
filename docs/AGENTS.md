@@ -31,4 +31,4 @@ Checks and where they run:
 
 - `nix build .#checks.x86_64-linux.verus`: `decide` verified and the §17a policy properties proved, in the Nix sandbox with the pinned Verus. See `docs/verification.md`.
 
-**Not yet done:** a Verus proof of `schema::digest`; Kani harnesses and proptest for `exec` (§17a); the console; §12b space budgets; the VM harness for generation changes (needs an owner flake that can build inside the VM).
+**Not yet done:** a Verus proof of `schema::digest`; Kani harnesses and proptest for `exec` (§17a); the console; the VM harness for generation changes (needs an owner flake that can build inside the VM).

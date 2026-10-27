@@ -75,7 +75,14 @@ pub struct Core<B: Backends + Clone, S: Store> {
     confirm: Option<(GenerationId, Timestamp)>,
     manifest_gen: GenerationId,
     interlock_noted: bool,
+    /// When to next check the §12b collection bounds.
+    next_gc_check: Timestamp,
+    /// The space report last noticed.
+    space_noted: Timestamp,
 }
+
+/// How often the daemon checks the §12b collection bounds.
+pub const GC_CHECK: Millis = Millis(3600 * 1000);
 
 fn outcome_of(state: &TxnState) -> Outcome {
     match state {
@@ -139,6 +146,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             confirm,
             manifest_gen: current,
             interlock_noted: false,
+            next_gc_check: Timestamp(0),
+            space_noted: Timestamp(0),
         };
         if core.cfg.fresh_boot {
             for s in ledger.suppressions.iter().filter(|s| s.until == Until::NextBoot) {
@@ -302,6 +311,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             if !busy {
                 self.repair_one(&s, &defs, &l);
             }
+            if !busy && now >= self.next_gc_check {
+                self.next_gc_check = now.plus(GC_CHECK);
+                self.collect_if_over(&s, &defs);
+            }
         }
 
         for t in self.ex.expire() {
@@ -313,6 +326,43 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.notice(format!("journal compaction failed: {e:?}"));
         }
         self.confirm_boot(&s, &defs, now);
+        self.note_space();
+    }
+
+    /// §12b: a collection that could not meet the space budget says so.
+    fn note_space(&mut self) {
+        let Some(r) = self.b.generations().space_report() else { return };
+        if r.at <= self.space_noted {
+            return;
+        }
+        self.space_noted = r.at;
+        if let Some(short) = r.shortfall {
+            self.notice(format!(
+                "BudgetUnsatisfiable: the generations Planarian must keep use {} over the space budget of {}; everything else was collected, so the budget is a target, not a guarantee",
+                render::bytes(short),
+                render::bytes(r.max_bytes)
+            ));
+        }
+    }
+
+    /// §12b: when the generations exceed a bound and something can be
+    /// collected, collect (Runtime, daemon-initiated).
+    fn collect_if_over(&mut self, s: &SystemState, defs: &UnitDefs) {
+        let l = self.ledger();
+        let protect = self.protect(&l, s.generation);
+        let Ok(plan) = self.b.generations().gc_plan(&protect, false) else { return };
+        if plan.delete.is_empty() {
+            return;
+        }
+        let reason = format!(
+            "{} generation(s) over the collection bounds (keep {}, {} of {} bytes)",
+            plan.delete.len(),
+            plan.kept.len(),
+            plan.kept_bytes,
+            plan.max_bytes
+        );
+        let p = self.proposal(Transition::CollectGarbage { emergency: false }, s, defs, Source::Maintenance, reason);
+        let _ = self.submit(p, Authorization::daemon(), s, defs);
     }
 
     fn repair_one(&mut self, s: &SystemState, defs: &UnitDefs, l: &Ledger) {
@@ -486,6 +536,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 .collect(),
             reconciliation: l.last_reconciliation.map(|r| r.actions),
             notices: self.notices.iter().cloned().collect(),
+            space: self.b.generations().space_report(),
         }
     }
 
@@ -508,7 +559,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
     pub fn handle(&mut self, peer: Peer, req: Request) -> Response {
         match req {
-            Request::Status => Response::Status(self.status()),
+            Request::Status => Response::Status(Box::new(self.status())),
             Request::Incidents => {
                 Response::Incidents { incidents: self.incidents.incidents.values().cloned().collect() }
             }

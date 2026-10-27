@@ -153,6 +153,10 @@ pub struct World {
     pub external_down: BTreeSet<String>,
     /// Free bytes and size of filesystems, by path.
     pub fs: BTreeMap<String, (u64, u64)>,
+    /// §12b bounds, and the last collection's report. Each generation's
+    /// closure counts as `GEN_BYTES`, nothing shared.
+    pub gc_budget: gc::GcBudget,
+    pub space_report: Option<gc::SpaceReport>,
     pub runtime: BTreeMap<String, Value>,
     // ---- processes ----
     pub alive: BTreeSet<u32>,
@@ -668,28 +672,47 @@ impl GenerationBackend for Fake {
         self.w().gc_roots.remove(root)
     }
 
-    fn collect_garbage(&self, protect: &[GenerationId], _emergency: bool, op: &OpId) -> Outcome {
+    fn collect_garbage(&self, protect: &[GenerationId], emergency: bool, op: &OpId) -> Outcome {
         let mut w = self.w();
         if !self.admit(&mut w, op, "collect_garbage".into()) {
             return Outcome::fenced();
         }
-        let victims: Vec<GenerationId> = w
-            .gens
-            .keys()
-            .copied()
-            .filter(|g| !protect.contains(g) && *g != w.current && *g != w.boot_default && !w.collected.contains(g))
-            .filter(|g| {
-                // Built candidates still rooted under gcroots/planarian/builds survive.
-                let generation = &w.gens[g];
-                !w.gc_roots.iter().any(|r| r.ends_with(&generation.eval.source.to_hex()))
-            })
-            .collect();
-        let freed = victims.len() as u64 * 2_000_000_000;
-        w.collected.extend(victims);
+        let plan = w.gc_plan(protect, emergency);
+        let freed = plan.delete.len() as u64 * GEN_BYTES;
+        w.collected.extend(plan.delete.iter().copied());
         for (free, size) in w.fs.values_mut() {
             *free = (*free + freed).min(*size);
         }
+        w.space_report = Some(gc::SpaceReport::of(&plan, w.now));
         Outcome::Succeeded
+    }
+
+    fn gc_plan(&self, protect: &[GenerationId], emergency: bool) -> Result<gc::GcPlan, Outcome> {
+        Ok(self.w().gc_plan(protect, emergency))
+    }
+
+    fn space_report(&self) -> Option<gc::SpaceReport> {
+        self.w().space_report.clone()
+    }
+}
+
+/// The closure size of one fake generation.
+pub const GEN_BYTES: u64 = 2_000_000_000;
+
+impl World {
+    fn gc_plan(&self, protect: &[GenerationId], emergency: bool) -> gc::GcPlan {
+        let on_disk: Vec<GenerationId> = self.gens.keys().copied().filter(|g| !self.collected.contains(g)).collect();
+        let mut keep: Vec<GenerationId> = protect.to_vec();
+        keep.extend([self.current, self.boot_default]);
+        // Built candidates still rooted under gcroots/planarian/builds survive.
+        keep.extend(on_disk.iter().copied().filter(|g| {
+            let generation = &self.gens[g];
+            self.gc_roots.iter().any(|r| r.ends_with(&generation.eval.source.to_hex()))
+        }));
+        let fs_size = self.fs.get("/nix").map(|(_, size)| *size).unwrap_or(u64::MAX);
+        let b = self.gc_budget;
+        let count = if emergency { b.keep_emergency } else { b.keep_generations };
+        gc::plan(&on_disk, &keep, count, b.max_bytes(fs_size), |gs| gs.len() as u64 * GEN_BYTES)
     }
 }
 

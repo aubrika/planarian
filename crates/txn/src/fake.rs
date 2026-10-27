@@ -264,6 +264,14 @@ impl GenerationBackend for FakeHost {
         }
         Outcome::Succeeded
     }
+
+    fn gc_plan(&self, _protect: &[GenerationId], _emergency: bool) -> Result<planarian_schema::gc::GcPlan, Outcome> {
+        Ok(planarian_schema::gc::plan(&[], &[], 0, 0, |_| 0))
+    }
+
+    fn space_report(&self) -> Option<planarian_schema::gc::SpaceReport> {
+        None
+    }
 }
 
 impl InventoryBackend for FakeHost {

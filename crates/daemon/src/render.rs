@@ -163,3 +163,11 @@ pub fn response(s: &Submitted) -> Response {
         Submitted::Error(e) => Response::Error { message: e.clone() },
     }
 }
+
+/// A size for people: `1.5 GB`, `300 MB`.
+pub fn bytes(n: u64) -> String {
+    const GB: f64 = 1e9;
+    const MB: f64 = 1e6;
+    let x = n as f64;
+    if x >= GB { format!("{:.1} GB", x / GB) } else { format!("{:.0} MB", x / MB) }
+}

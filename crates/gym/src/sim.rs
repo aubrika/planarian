@@ -586,6 +586,14 @@ impl Sim {
                     *free = if get("until") == "full" { 0 } else { *size / 100 };
                 }
             }
+            "set_setting" => match get("key") {
+                "gc.generation_budget_percent" => {
+                    let pct =
+                        s.get("value").and_then(T::as_float).ok_or_else(|| Unsupported("set_setting value".into()))?;
+                    self.fake.w().gc_budget.generations_permille = (pct * 10.0).round() as u32;
+                }
+                k => return Err(Unsupported(format!("set_setting {k}"))),
+            },
             "out_of_band_rebuild" => {
                 let edit = get("edit");
                 let activate = s.get("activate").and_then(T::as_bool).unwrap_or(false);

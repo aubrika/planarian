@@ -115,8 +115,13 @@ pub trait GenerationBackend {
     fn record_override(&self, g: GenerationId, hash: &Hash) -> Result<(), Outcome>;
     /// Remove a GC root symlink this backend created.
     fn release_root(&self, root: &str) -> bool;
-    /// `nix-collect-garbage`, never touching `protect` (I3). Mutating.
+    /// Collect generations under the §12b bounds (`gc::plan`), never touching
+    /// `protect` (I3), then collect store garbage. Mutating.
     fn collect_garbage(&self, protect: &[GenerationId], emergency: bool, op: &OpId) -> Outcome;
+    /// What `collect_garbage` would delete now. Read-only.
+    fn gc_plan(&self, protect: &[GenerationId], emergency: bool) -> Result<crate::gc::GcPlan, Outcome>;
+    /// The last collection's result.
+    fn space_report(&self) -> Option<crate::gc::SpaceReport>;
 }
 
 pub trait SnapshotBackend {

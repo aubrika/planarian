@@ -100,6 +100,9 @@ pub struct StatusReport {
     pub interlock: Vec<(TxnId, String)>,
     pub reconciliation: Option<Vec<String>>,
     pub notices: Vec<String>,
+    /// The last garbage collection's result (§12b).
+    #[serde(default)]
+    pub space: Option<planarian_schema::gc::SpaceReport>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,7 +122,7 @@ pub struct Choice {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Response {
-    Status(StatusReport),
+    Status(Box<StatusReport>),
     Log {
         lines: Vec<LogLine>,
     },

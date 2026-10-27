@@ -390,6 +390,8 @@ pub enum Source {
     },
     Model(ModelId),
     User,
+    /// The daemon's own housekeeping: collection under the §12b bounds.
+    Maintenance,
     /// Confidence in per-mille, as `Confidence`.
     Intent {
         phrase: String,

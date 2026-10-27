@@ -10,6 +10,7 @@
 pub mod backend;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
+pub mod gc;
 pub mod ids;
 pub mod pathmap;
 pub mod spec;

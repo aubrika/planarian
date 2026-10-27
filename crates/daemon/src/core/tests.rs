@@ -280,3 +280,30 @@ fn shared_root_cause_parks_one_approval() {
     r.ticks(8);
     assert_eq!(r.core.ex.parked.len(), 1, "{:?}", r.core.notices);
 }
+
+/// §12b: over the count bound, the daemon collects the oldest unprotected
+/// generations itself (Runtime), at most once an hour, and never the
+/// protected ones.
+#[test]
+fn generations_over_the_bound_are_collected_by_maintenance() {
+    let mut r = Rig::new();
+    {
+        let mut w = r.fake.w();
+        for _ in 0..13 {
+            let g = w.add_generation(&OverrideSet::default());
+            w.boot_entries.insert(g);
+        }
+    }
+    r.ticks(1);
+    let collected = r.fake.w().collected.clone();
+    assert_eq!(collected, vec![GenerationId(2), GenerationId(3), GenerationId(4), GenerationId(5)]);
+    assert!(!collected.contains(&GenerationId(1)), "known-good is protected");
+    assert!(r.core.log.iter().any(|l| l.proposal.source == Source::Maintenance
+        && matches!(l.result, Submitted::Finished { state: TxnState::Committed, .. })));
+    let report = r.fake.w().space_report.clone().expect("a report");
+    assert_eq!((report.generations, report.shortfall), (10, None));
+    // Nothing more to collect: no further collection within the hour or after.
+    let before = r.core.log.len();
+    r.ticks(800);
+    assert!(r.core.log[before..].iter().all(|l| l.proposal.source != Source::Maintenance));
+}
