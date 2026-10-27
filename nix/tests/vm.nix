@@ -87,7 +87,8 @@ pkgs.testers.runNixOSTest {
         machine.succeed("echo corrupt > /var/lib/gym-state/state.json")
         machine.succeed("systemctl kill --signal=SIGTERM gym-state.service")
         # Backoff 10 s, 60 s, 300 s: three attempts, then a cooldown that says so.
-        machine.wait_until_succeeds("planarian status | grep -q 'needs a person'", timeout=1200)
+        machine.wait_until_succeeds("planarian status | grep -q 'gym-state.*needs a person'", timeout=1200)
+        print(machine.succeed("planarian status"))
         attempts = int(machine.succeed("planarian log -n 2000 | grep -c 'restart service:gym-state' || true").strip() or 0)
         assert 1 <= attempts <= 3, f"{attempts} restart attempts"
         machine.fail("planarian log -n 2000 | grep -q 'roll back'")
