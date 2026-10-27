@@ -334,7 +334,7 @@ id = "dep-required-stopped"
 family = "required-dependency-stopped"
 summary = "gym-db is stopped out of band; systemd stops gym-app with it (Requires=). Root cause is gym-db: it is repaired first, then gym-app."
 spec = ["§13 diagnoser step 1"]
-tags = ["question:out-of-band-stop"]
+tags = []
 scoring = "repair"
 harness = ["fake", "vm"]
 intent = { kind = "none" }
@@ -345,6 +345,7 @@ window = "5m"
 units = { "service:gym-db" = "Running", "service:gym-app" = "Running" }
 may_change = ["service:gym-db", "service:gym-app"]
 others_unchanged = true
+reports = ["OutOfBandStopHint"]
 
 [[fault.required_post.txn]]
 transition = "RestartUnit"
@@ -611,6 +612,34 @@ transition = "ApplyChange"
 change = "service-enable"
 args = { service = "sshd", enabled = true }
 terminal = "Committed"
+
+[[fault]]
+id = "owner-rebuild-breaks-service"
+family = "bad-generation-activated"
+summary = "The owner runs nixos-rebuild switch on a config that breaks gym-web. Planarian tries restarts and then escalates; it never rolls back an owner-built generation without AskFirst."
+spec = ["Principle 9", "§13"]
+tags = ["extra"]
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "out_of_band_rebuild", edit = "gym-web ExecStart=/bin/false", activate = true }
+window = "15m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Failed" }
+generation = "owner-built"
+reports = ["DiagnoserExhausted"]
+metrics = { restarts_max = { "service:gym-web" = 3 } }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+state = "Cooldown"
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+decision_not_below = "AskFirst"
+terminal = "Committed"
+count = 0
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Family: daemon-killed  (Activating, Checking, Reverting per §15; plus
@@ -921,7 +950,7 @@ owners_per_epoch_max = 1
 [[fault]]
 id = "crash-runtime-rollback"
 family = "daemon-killed"
-summary = "Killed during a Runtime-tier Rollback; it recovers as a generation operation (serialized, owned, publish_boot, override restored)."
+summary = "Killed during Checking of a Runtime-tier Rollback; it recovers as a generation operation (serialized, owned, publish_boot, override restored) and completes. (Killed before the activation took effect, the crash table reverts instead, which is also correct.)"
 spec = ["§12 execution table: Rollback", "§12 gym cases"]
 tags = []
 scoring = "must-pass"
@@ -932,7 +961,7 @@ setup = [
   { raw = "wait", for = { journal = "Committed" } },
   { transition = "Rollback", source = "user", actor = "user:1001" },
 ]
-inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Checking" } }
 after = [{ raw = "hold_down", process = "planariad" }]
 window = "20m"
 
@@ -1257,7 +1286,7 @@ id = "intent-cli-stop-rewritten"
 family = "intentional-service-stop"
 summary = "An admin issues StopUnit through the CLI; it is rewritten to StopAndSuppress { until: NextBoot }, with a notice."
 spec = ["§14 stopping"]
-tags = ["question:cli-stop-verb"]
+tags = []
 scoring = "intent"
 harness = ["fake", "vm"]
 intent = { kind = "no-intervention", because = "the user stopped it on purpose" }

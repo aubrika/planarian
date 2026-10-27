@@ -2,7 +2,7 @@
 
 Covers `crates/gym/catalog/phase-a.toml` (SPEC §18.0). Per §18.0, work stops here until the owner signs off.
 
-The catalog has 70 entries: 46 `must-pass`, 15 `repair`, 9 `intent`. 53 run on the fake-backend harness and 61 on the NixOS VM; most run on both.
+The catalog has 71 entries: 46 `must-pass`, 16 `repair`, 9 `intent`. 54 run on the fake-backend harness and 61 on the NixOS VM; most run on both.
 
 ## 1. Coverage
 
@@ -86,6 +86,8 @@ These need a schema decision, and none of them is a §19 item. I have not change
 | G10 | The header says the next artifact is "the catalog and the fake-backend transaction kernel"; §18.0 says to stop after the catalog | header vs §18 | I followed §18.0 and stopped |
 
 ## 4. Questions for you
+
+**Decided 2026-10-26: the owner accepted the default on all four.** What that changed: `dep-required-stopped` now asserts an `OutOfBandStopHint` report (Q2), the new entry `owner-rebuild-breaks-service` covers Q3, and the Q4 rule is recorded in `docs/deviations.md`.
 
 - **Q1. What counts as "cleared" for the 60% gate?** `svc-misconfig-state-file` cannot be fixed by restarting. Its Phase A `required_post` is a correct escalation (3 attempts, backoff, report), and it is tagged `phase-b-upgrade`. Does that count as cleared? My default is yes: "cleared" means `required_post` holds, and the separate *repair rate* metric reports the honest number. The stricter reading would count only entries that end with the target healthy.
 - **Q2. Out-of-band `systemctl stop` by root.** `dep-required-stopped` assumes that a stop made outside Planarian is a fault and gets repaired. Principle 9 ("don't fight the user") applies only to stops that go through Planarian. A sysadmin's habitual `systemctl stop` will be undone within about two ticks. Is that the intended behaviour, or should a stop issued by uid 0 through systemd (visible in the job's `org.freedesktop.systemd1` caller) become a suppression? My default: repair it, as the spec currently reads, and print a console hint pointing at `planarian stop`.
