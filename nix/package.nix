@@ -11,6 +11,7 @@ rustPlatform.buildRustPackage {
       ../Cargo.lock
       ../crates
       ../share
+      ../assets/identity/animations/keyframes.json
       ../nix/template/planarian/overrides.nix
     ];
   };

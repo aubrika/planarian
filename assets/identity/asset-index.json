@@ -1,0 +1,646 @@
+{
+  "kit": "planarian Return identity kit",
+  "version": "1.2",
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 6032,
+      "sha256": "4ecbf384d3b186d1ad7382e8f87af687c705218aa42ca74f50146eb2ed4fc51c"
+    },
+    {
+      "path": "animations/README.md",
+      "bytes": 3244,
+      "sha256": "9429eb1a10755b6d44002e41245f02111818914d160f344d09a4b74b2b7bc5d2"
+    },
+    {
+      "path": "animations/keyframes.json",
+      "bytes": 270816,
+      "sha256": "3620fe7f6d066c652a564a162ca6acdcf2c3c7ee7300d81c8e0c6cd22d7b5c41"
+    },
+    {
+      "path": "animations/loading-black.svg",
+      "bytes": 138335,
+      "sha256": "6d242662758cd4b643d5f677d898235ccd9867a2c1a2282c20592aafc7648288"
+    },
+    {
+      "path": "animations/loading-dark.gif",
+      "bytes": 504379,
+      "sha256": "52326e612ea9b48ed5e7b0321c145aa57a7fef45ce39ca16d03d7bd68f5976ff"
+    },
+    {
+      "path": "animations/loading-light.gif",
+      "bytes": 504249,
+      "sha256": "e3501d1c6e94466e55d967f105918d718ac497a43b381592f2d832bff9e85714"
+    },
+    {
+      "path": "animations/loading-white.svg",
+      "bytes": 138335,
+      "sha256": "379a9ea74c1dcb63de08682170b80fff78887e8925675a116adb18e89705e30e"
+    },
+    {
+      "path": "animations/planarian-motion-preview.gif",
+      "bytes": 2896198,
+      "sha256": "a18ce84b404c72b1f12b3f7dfd61b5e720ab0837826d7ba67654664bea88f5f5"
+    },
+    {
+      "path": "animations/planarian-motion.js",
+      "bytes": 10874,
+      "sha256": "c8e1c122263f04a756d5335c707c68b8e5cda0ccb876eac3ccf586b81dcfc31b"
+    },
+    {
+      "path": "animations/poster.png",
+      "bytes": 43215,
+      "sha256": "153b1e4116c7a8fa5f3e1e750d13a89f9690ddb6051e7bad515082b47a0a490c"
+    },
+    {
+      "path": "animations/prototype.html",
+      "bytes": 20729,
+      "sha256": "199339d9b5a99cf94c3d9013ef074a4668d4873da138cf431db3815e528f628c"
+    },
+    {
+      "path": "animations/working-black.svg",
+      "bytes": 138417,
+      "sha256": "bd6407faca6c8985588ebcf67706dff18337349b0a0c5806db10c7735b5ded34"
+    },
+    {
+      "path": "animations/working-dark.gif",
+      "bytes": 335078,
+      "sha256": "7d5babc5fbafbd53388d4598160a2f7471dd6d93922e27ca295bd2d7322f39d3"
+    },
+    {
+      "path": "animations/working-light.gif",
+      "bytes": 335238,
+      "sha256": "a11084e1e275b47878e6e88864268b2d7a606ac8589058b736356a09cd9de293"
+    },
+    {
+      "path": "animations/working-white.svg",
+      "bytes": 138417,
+      "sha256": "0646dc9733478986f6d217820f05b6af5ba951b76740fde19c7ad9f3c88924d0"
+    },
+    {
+      "path": "docs/guide.html",
+      "bytes": 108199,
+      "sha256": "839c2774c25255aa4c2fb2656a0336683f342074748e8a2de4800aa3d9027f2c"
+    },
+    {
+      "path": "icons/dark/planarian-1024.png",
+      "bytes": 52066,
+      "sha256": "2335253c98daab741beaf3bc351f428613a1054620654b793148f4354793055e"
+    },
+    {
+      "path": "icons/dark/planarian-128.png",
+      "bytes": 3580,
+      "sha256": "8f624c063f2685f1b2f61f66c526f74f96af9a9b9d859a8b19577461631cb265"
+    },
+    {
+      "path": "icons/dark/planarian-16.png",
+      "bytes": 512,
+      "sha256": "7301c6f5334bde81632baa304b6184b8adc625fba7183187e20b2700e6544fd9"
+    },
+    {
+      "path": "icons/dark/planarian-192.png",
+      "bytes": 5603,
+      "sha256": "a774b54c1693145bb805f25b8f0a4275d3ce62365cb4d5534d44447a679dfbdb"
+    },
+    {
+      "path": "icons/dark/planarian-20.png",
+      "bytes": 613,
+      "sha256": "29c195f12c22cc14f4c82b838ec61dcb705a6a7be75970b2b1b841babd23bd0a"
+    },
+    {
+      "path": "icons/dark/planarian-24.png",
+      "bytes": 710,
+      "sha256": "b0df89dccdca25f2b99ee6336f610fcfa1b8d273abf148704dd7f6d4765eb4af"
+    },
+    {
+      "path": "icons/dark/planarian-256.png",
+      "bytes": 7914,
+      "sha256": "e0e4a54c832df30d2e1cedc60a9e7452d052ab7711f07fa4d07bfadb17d2836d"
+    },
+    {
+      "path": "icons/dark/planarian-32.png",
+      "bytes": 911,
+      "sha256": "ef8e5636403ae4c7731c7d59114da38cc2f9a5ab7d956557de17f88c2bc49312"
+    },
+    {
+      "path": "icons/dark/planarian-48.png",
+      "bytes": 1380,
+      "sha256": "ad070f469e745c57e17d5f84935201935d3dd01b9e38503d62e3d8a3585d8b89"
+    },
+    {
+      "path": "icons/dark/planarian-512.png",
+      "bytes": 19695,
+      "sha256": "2620ccc1a6c2f2072dcea5f698af22c6195d4ab3d9cb120f8724abbdfa923b60"
+    },
+    {
+      "path": "icons/dark/planarian-64.png",
+      "bytes": 1770,
+      "sha256": "4faa490d8d511f8df9937a6f233a7f0f5b14a2255671199f7d2df3a96f654025"
+    },
+    {
+      "path": "icons/dark/planarian-96.png",
+      "bytes": 2668,
+      "sha256": "7e3254f2859a971aab0e256911e92db9934c306fb7b784742bef635671972242"
+    },
+    {
+      "path": "icons/light/planarian-1024.png",
+      "bytes": 39896,
+      "sha256": "bae52c3384a8384d8aeeedf270aeaf484cd1420cb198b7ec0ec544b950aa74f5"
+    },
+    {
+      "path": "icons/light/planarian-128.png",
+      "bytes": 3307,
+      "sha256": "92e682081c8a4e9fcd1c5cfa47df85c7efe143da17499d4acf703e8969032376"
+    },
+    {
+      "path": "icons/light/planarian-16.png",
+      "bytes": 464,
+      "sha256": "e940a3af2078e8f7fe53e1fc0b87cc04768728de51d17603221bff1b4ec82a18"
+    },
+    {
+      "path": "icons/light/planarian-192.png",
+      "bytes": 5152,
+      "sha256": "c00605ccf87a076be5e67f75701eba2ef9111ab4bc8b5d2190ceb6eb5fa9f3e4"
+    },
+    {
+      "path": "icons/light/planarian-20.png",
+      "bytes": 558,
+      "sha256": "44e48dc7e83e535ed085cd242a49b00f66486fac00c731d5329bcf4834ea2330"
+    },
+    {
+      "path": "icons/light/planarian-24.png",
+      "bytes": 658,
+      "sha256": "bb00ad58e4e98095d68d4d509e6a0c2be2e64a40d6ae00a9d7287fbc99911d52"
+    },
+    {
+      "path": "icons/light/planarian-256.png",
+      "bytes": 7225,
+      "sha256": "5e30a8954ddfd87c4c08e1fa4e32f3e3b28779b43d6415706678a03cd699714d"
+    },
+    {
+      "path": "icons/light/planarian-32.png",
+      "bytes": 868,
+      "sha256": "09ffaba60ff43d4c91cf7c806fbc47f326fec6c4c8dff14ccd280b3ce9fe61f1"
+    },
+    {
+      "path": "icons/light/planarian-48.png",
+      "bytes": 1268,
+      "sha256": "e76a3144bc2b7c874cd5da83f77b76e4cbf7d846a67b89199ec53427221beead"
+    },
+    {
+      "path": "icons/light/planarian-512.png",
+      "bytes": 16704,
+      "sha256": "c4b5927ba085ab05c59ffd83654624b7e947a762f13160c17dc992d872c9bd8a"
+    },
+    {
+      "path": "icons/light/planarian-64.png",
+      "bytes": 1645,
+      "sha256": "d2689f583fa9e37601d01d03346357ce231e49fbb63cfe9e55b5be81ad417971"
+    },
+    {
+      "path": "icons/light/planarian-96.png",
+      "bytes": 2449,
+      "sha256": "cd1086329818211814a532dd93b570ed861bcf66e94eb7907363255eea60b04b"
+    },
+    {
+      "path": "icons/planarian-app-dark-micro.svg",
+      "bytes": 3069,
+      "sha256": "4175e805def2bc91c33ffee8aba58d6360fef0aaa673f47df9be487fdfbe0c72"
+    },
+    {
+      "path": "icons/planarian-app-dark.svg",
+      "bytes": 3054,
+      "sha256": "f613767d6a13e1eab768a564c408aeb81e8d6cdceb900f19a5a7a22b9fce11e0"
+    },
+    {
+      "path": "icons/planarian-app-light-micro.svg",
+      "bytes": 3071,
+      "sha256": "96bc1781ef1ebe7275a82a1e6342da2542461700c7bb86470824f816a8a2ae6d"
+    },
+    {
+      "path": "icons/planarian-app-light.svg",
+      "bytes": 3056,
+      "sha256": "81d061496b035b992cbc4f8d462c6011e369105f485178be30f77dc78c868d2d"
+    },
+    {
+      "path": "icons/symbolic/planarian-symbolic.svg",
+      "bytes": 2911,
+      "sha256": "f6202afa0f72a78ba48c232eacf7af555a7b01ee43dc5ef35f5be342d9528235"
+    },
+    {
+      "path": "integration/linux/hicolor/1024x1024/apps/planarian.png",
+      "bytes": 52066,
+      "sha256": "2335253c98daab741beaf3bc351f428613a1054620654b793148f4354793055e"
+    },
+    {
+      "path": "integration/linux/hicolor/128x128/apps/planarian.png",
+      "bytes": 3580,
+      "sha256": "8f624c063f2685f1b2f61f66c526f74f96af9a9b9d859a8b19577461631cb265"
+    },
+    {
+      "path": "integration/linux/hicolor/16x16/apps/planarian.png",
+      "bytes": 512,
+      "sha256": "7301c6f5334bde81632baa304b6184b8adc625fba7183187e20b2700e6544fd9"
+    },
+    {
+      "path": "integration/linux/hicolor/192x192/apps/planarian.png",
+      "bytes": 5603,
+      "sha256": "a774b54c1693145bb805f25b8f0a4275d3ce62365cb4d5534d44447a679dfbdb"
+    },
+    {
+      "path": "integration/linux/hicolor/20x20/apps/planarian.png",
+      "bytes": 613,
+      "sha256": "29c195f12c22cc14f4c82b838ec61dcb705a6a7be75970b2b1b841babd23bd0a"
+    },
+    {
+      "path": "integration/linux/hicolor/24x24/apps/planarian.png",
+      "bytes": 710,
+      "sha256": "b0df89dccdca25f2b99ee6336f610fcfa1b8d273abf148704dd7f6d4765eb4af"
+    },
+    {
+      "path": "integration/linux/hicolor/256x256/apps/planarian.png",
+      "bytes": 7914,
+      "sha256": "e0e4a54c832df30d2e1cedc60a9e7452d052ab7711f07fa4d07bfadb17d2836d"
+    },
+    {
+      "path": "integration/linux/hicolor/32x32/apps/planarian.png",
+      "bytes": 911,
+      "sha256": "ef8e5636403ae4c7731c7d59114da38cc2f9a5ab7d956557de17f88c2bc49312"
+    },
+    {
+      "path": "integration/linux/hicolor/48x48/apps/planarian.png",
+      "bytes": 1380,
+      "sha256": "ad070f469e745c57e17d5f84935201935d3dd01b9e38503d62e3d8a3585d8b89"
+    },
+    {
+      "path": "integration/linux/hicolor/512x512/apps/planarian.png",
+      "bytes": 19695,
+      "sha256": "2620ccc1a6c2f2072dcea5f698af22c6195d4ab3d9cb120f8724abbdfa923b60"
+    },
+    {
+      "path": "integration/linux/hicolor/64x64/apps/planarian.png",
+      "bytes": 1770,
+      "sha256": "4faa490d8d511f8df9937a6f233a7f0f5b14a2255671199f7d2df3a96f654025"
+    },
+    {
+      "path": "integration/linux/hicolor/96x96/apps/planarian.png",
+      "bytes": 2668,
+      "sha256": "7e3254f2859a971aab0e256911e92db9934c306fb7b784742bef635671972242"
+    },
+    {
+      "path": "integration/linux/hicolor/scalable/apps/planarian.svg",
+      "bytes": 3054,
+      "sha256": "f613767d6a13e1eab768a564c408aeb81e8d6cdceb900f19a5a7a22b9fce11e0"
+    },
+    {
+      "path": "integration/linux/hicolor/symbolic/apps/planarian-symbolic.svg",
+      "bytes": 2911,
+      "sha256": "f6202afa0f72a78ba48c232eacf7af555a7b01ee43dc5ef35f5be342d9528235"
+    },
+    {
+      "path": "integration/linux/planarian.desktop",
+      "bytes": 183,
+      "sha256": "3a4b08c2260b80f251363d597d18c71e93bc4d3132475887b1c2d79ddfaa69b8"
+    },
+    {
+      "path": "marks/planarian-mark-black-1024.png",
+      "bytes": 26648,
+      "sha256": "944e3ef17ac22c7b0773686e19d1b7b68925eaf5adabf1823e5b10c9148829dd"
+    },
+    {
+      "path": "marks/planarian-mark-black-128.png",
+      "bytes": 2114,
+      "sha256": "a74cd9f51edb27071c2c9ea88512727e2435f6fbc01738c5fcc771ed1254b41e"
+    },
+    {
+      "path": "marks/planarian-mark-black-256.png",
+      "bytes": 4661,
+      "sha256": "3cc0d242ccd0537505c7e5bffe4829d098c5c3d1858fcd891894bbd9feafe98d"
+    },
+    {
+      "path": "marks/planarian-mark-black-512.png",
+      "bytes": 10791,
+      "sha256": "fbf10bb7827b0d26cc1ebf60cf83130447a9fdc6bd7f0ab2f937e1940813317c"
+    },
+    {
+      "path": "marks/planarian-mark-black.svg",
+      "bytes": 2906,
+      "sha256": "772b28a1e315c1da791b7dff7eaab16b94d5e4094f3b568861ca64719e965673"
+    },
+    {
+      "path": "marks/planarian-mark-currentcolor.svg",
+      "bytes": 2911,
+      "sha256": "807fedb0741f4ee9f72415e52d938e64fafc6363996714e7c278271735f2b172"
+    },
+    {
+      "path": "marks/planarian-mark-micro-black.svg",
+      "bytes": 2906,
+      "sha256": "6266ef89356c8589c3a1913274ffb22b3e268ed08043849cb69c4ceba847bc47"
+    },
+    {
+      "path": "marks/planarian-mark-micro-currentcolor.svg",
+      "bytes": 2911,
+      "sha256": "f6202afa0f72a78ba48c232eacf7af555a7b01ee43dc5ef35f5be342d9528235"
+    },
+    {
+      "path": "marks/planarian-mark-micro-white.svg",
+      "bytes": 2906,
+      "sha256": "f71d014f2c3c65e7c8deaa5b8aa421d712f1b6ee09f7e4b167b28587c7e3cc58"
+    },
+    {
+      "path": "marks/planarian-mark-white-1024.png",
+      "bytes": 23319,
+      "sha256": "57073640d4f667617c066cfc1548e808e76fafaea447c0574fe2533f2f42e3b4"
+    },
+    {
+      "path": "marks/planarian-mark-white-128.png",
+      "bytes": 2139,
+      "sha256": "71887079e8f5f07780dd0812bc807d15f930efbacce64d2448b0f6a28651b14e"
+    },
+    {
+      "path": "marks/planarian-mark-white-256.png",
+      "bytes": 4560,
+      "sha256": "da61e3c5708c4b5d505432241349d19612ca11c4e0abb9d6a12cc2dca4277d30"
+    },
+    {
+      "path": "marks/planarian-mark-white-512.png",
+      "bytes": 10066,
+      "sha256": "bae101ab9fe22f19cc1a0b1ed69ee2b8aa29de629c5fcc8fcad905fb1ef0608d"
+    },
+    {
+      "path": "marks/planarian-mark-white.svg",
+      "bytes": 2906,
+      "sha256": "bda4f419b628e299cd727cfc2085f1c300b98d0e577c548d65c8b500562cb5d4"
+    },
+    {
+      "path": "previews/boot-dark.png",
+      "bytes": 58784,
+      "sha256": "a59a72e9e18d1420228071cb688358c5b062efd753c652c9f69f9ff227c775b7"
+    },
+    {
+      "path": "previews/boot-dark.svg",
+      "bytes": 5365,
+      "sha256": "7bf2d7496fee1b8fb9b4060a17ef1fe87943096a45dcb85c4a091d72e3a290cd"
+    },
+    {
+      "path": "previews/boot-light.png",
+      "bytes": 27102,
+      "sha256": "99d836ec75e92d5707246c950b7bb0f15eff81245622be4bc6daeb33f524c9f1"
+    },
+    {
+      "path": "previews/boot-light.svg",
+      "bytes": 5365,
+      "sha256": "d7db9985d1519f9caf210670178ef1afe401d09cf824c90431d89a5fa919de91"
+    },
+    {
+      "path": "previews/identity-board.png",
+      "bytes": 140364,
+      "sha256": "8235e30c7735001ae7bec56aa4ab8e615b9122244f5a81dec052cd6c50b5b7b3"
+    },
+    {
+      "path": "previews/identity-board.svg",
+      "bytes": 57428,
+      "sha256": "958dccf6e092dbdd801f92777676e9735c96bc57ddf12a575bc2b53c75539451"
+    },
+    {
+      "path": "previews/master-on-white.png",
+      "bytes": 83321,
+      "sha256": "d55249969395653c9c9a49e4eefd6027c40dc43a8b926d0984e8bf1272337998"
+    },
+    {
+      "path": "previews/software-applications.png",
+      "bytes": 100839,
+      "sha256": "6438f24ed5c7d08e78bf9c7aa019b16dad620d2f2d2ec57c3ff84b448e324eef"
+    },
+    {
+      "path": "previews/software-applications.svg",
+      "bytes": 22789,
+      "sha256": "40268de766121749d786c89bd2d5e533f8c5abbda3522c7ef3cd40717534b2f0"
+    },
+    {
+      "path": "previews/wordmark-on-white.png",
+      "bytes": 27803,
+      "sha256": "41d37435a58a711a5d26d4e57a9f43c5c5f1c85117b9758176a1ea38e154f4e7"
+    },
+    {
+      "path": "social/planarian-avatar-dark.png",
+      "bytes": 56564,
+      "sha256": "5810e7b2f961b147732c53b415d13c6913c66e8923364a5e7b481b4ba80f538f"
+    },
+    {
+      "path": "social/planarian-avatar-dark.svg",
+      "bytes": 3009,
+      "sha256": "a9b8100ff3c1f66eb9fd5918a4ef15ac5745a42c93fff59c3bfe9a645662f662"
+    },
+    {
+      "path": "social/planarian-avatar-light.png",
+      "bytes": 45247,
+      "sha256": "3203c61a41fa626b8dc408377db9f86fd66d84ca69038a177198d94a3b128c28"
+    },
+    {
+      "path": "social/planarian-avatar-light.svg",
+      "bytes": 3009,
+      "sha256": "ec8a1a3fc3ed4ec801ed9f8a215ef745d41933f80765b7e3ea1f0d31fae2cec9"
+    },
+    {
+      "path": "social/planarian-card-dark.png",
+      "bytes": 41071,
+      "sha256": "16dd07cf513ad5a551cb848c8b3015d6bda9e9a2200ef19b677d74d1bd43eef0"
+    },
+    {
+      "path": "social/planarian-card-dark.svg",
+      "bytes": 5457,
+      "sha256": "59bf29b333bed810489a01797ae7346e2a2feafd6ae4fe73ad8ba4f9814f5f1d"
+    },
+    {
+      "path": "social/planarian-card-light.png",
+      "bytes": 29909,
+      "sha256": "51f2b30508055de0837355b4fd2a8a73760ed9be64735c272797e56545cf4f97"
+    },
+    {
+      "path": "social/planarian-card-light.svg",
+      "bytes": 5457,
+      "sha256": "e53ad3e5aaf75ca1fd2b6e199cd108780d2eab1853c077e5b2227d368aa425b5"
+    },
+    {
+      "path": "source/build_kit.py",
+      "bytes": 12547,
+      "sha256": "b859f27df0975899bb59ca8e083b94499c0fac1cb99c73592100ac76c1995011"
+    },
+    {
+      "path": "source/build_motion.cjs",
+      "bytes": 14947,
+      "sha256": "7d1fa205e9371b73ffa293f45a5b7d875b2c6a919cdcfda44496f27aefd4d978"
+    },
+    {
+      "path": "source/export_kit.cjs",
+      "bytes": 2920,
+      "sha256": "0c05538cdef265dee4c566d38d45f2bb7fcadce1dd92807a00a8bf33db2b6977"
+    },
+    {
+      "path": "source/make_guide.py",
+      "bytes": 9091,
+      "sha256": "a0051493c6ce74a7f397f23614761cf8a968f60a18352163b789be86314e590f"
+    },
+    {
+      "path": "source/manifest.json",
+      "bytes": 807,
+      "sha256": "36b1bcfc9e08d686ab94aa6ca42fbd5ed5ac3ad98c800ce241ae44b5473412b3"
+    },
+    {
+      "path": "source/mark-raster.png",
+      "bytes": 209866,
+      "sha256": "1ebbf95decec61738214389dff92a3011419d514959bc27571b2220ae51be9e1"
+    },
+    {
+      "path": "source/package.json",
+      "bytes": 155,
+      "sha256": "34bc65bd7ebab75fb78a7b9f2a0b5b613061945e9a5bbe94fbe93992eebef32d"
+    },
+    {
+      "path": "source/prompts.md",
+      "bytes": 4511,
+      "sha256": "c89eedaa13b7ad1f9b006aad09e15e09c5f6ba7f98659083e1910d60fe2d0a04"
+    },
+    {
+      "path": "source/trace-data.json",
+      "bytes": 18305,
+      "sha256": "3327ac63470329b1742aa70cfb5e6f99b76d14b6452ba70951e950804e0dbc01"
+    },
+    {
+      "path": "web/apple-touch-icon.png",
+      "bytes": 4258,
+      "sha256": "e0fcc7f9a9af18bde775df108b8f01eee142975b42bd904290dba75376d95f3f"
+    },
+    {
+      "path": "web/favicon-16.png",
+      "bytes": 512,
+      "sha256": "7301c6f5334bde81632baa304b6184b8adc625fba7183187e20b2700e6544fd9"
+    },
+    {
+      "path": "web/favicon-24.png",
+      "bytes": 710,
+      "sha256": "b0df89dccdca25f2b99ee6336f610fcfa1b8d273abf148704dd7f6d4765eb4af"
+    },
+    {
+      "path": "web/favicon-32.png",
+      "bytes": 911,
+      "sha256": "ef8e5636403ae4c7731c7d59114da38cc2f9a5ab7d956557de17f88c2bc49312"
+    },
+    {
+      "path": "web/favicon-48.png",
+      "bytes": 1380,
+      "sha256": "ad070f469e745c57e17d5f84935201935d3dd01b9e38503d62e3d8a3585d8b89"
+    },
+    {
+      "path": "web/favicon-64.png",
+      "bytes": 1770,
+      "sha256": "4faa490d8d511f8df9937a6f233a7f0f5b14a2255671199f7d2df3a96f654025"
+    },
+    {
+      "path": "web/favicon.ico",
+      "bytes": 34494,
+      "sha256": "7150bcd3e5dc0e347096ba43aba2f2b4fe39ea7c01c7a123a6ab4340c8c3e598"
+    },
+    {
+      "path": "web/favicon.svg",
+      "bytes": 3085,
+      "sha256": "6bf893206ea71a67e66772a32ac5b013e93e52c95e166077f2f980188d340cba"
+    },
+    {
+      "path": "web/head-snippet.html",
+      "bytes": 355,
+      "sha256": "cc9c6757691b9146c092aaad5e980ce4ecf39a4b9b755e7c6d15a24dfc22212c"
+    },
+    {
+      "path": "web/planarian-mask.svg",
+      "bytes": 2906,
+      "sha256": "772b28a1e315c1da791b7dff7eaab16b94d5e4094f3b568861ca64719e965673"
+    },
+    {
+      "path": "web/planarian-maskable-dark-192.png",
+      "bytes": 4637,
+      "sha256": "56286cfc59f464225751d78d351d28350669a11acafd4ea05f6efe73a05bca47"
+    },
+    {
+      "path": "web/planarian-maskable-dark-512.png",
+      "bytes": 16860,
+      "sha256": "d8ee7abb61d7dc8c9a4bd57ef702c2c079ce1a5feb179e867121c778f97a237d"
+    },
+    {
+      "path": "web/planarian-maskable-dark.svg",
+      "bytes": 3005,
+      "sha256": "f550baff5a3c06b8d7a0e59b9151494a8b301d2e6c8d8b90b33cb4350dc6d9c1"
+    },
+    {
+      "path": "web/planarian-maskable-light-192.png",
+      "bytes": 4434,
+      "sha256": "bec34a5d6774a18a51ab39483eab34fbaebea257000a6a0cf30a5462c3a9436f"
+    },
+    {
+      "path": "web/planarian-maskable-light-512.png",
+      "bytes": 14461,
+      "sha256": "6758707c48a444ab406ee233c44713a9034aab9eea7d01360446df6b376b4d7f"
+    },
+    {
+      "path": "web/planarian-maskable-light.svg",
+      "bytes": 3005,
+      "sha256": "2278b795b98d5e9cd1b18c6dee1aa3030941d9f7215d79b43ce8570e2ce8af45"
+    },
+    {
+      "path": "web/planarian-symbols.svg",
+      "bytes": 5673,
+      "sha256": "fac80b1e5deef38236ae3d24ff095c6941fbf417c9f9acf1ea5bf94085dd650a"
+    },
+    {
+      "path": "web/planarian.css",
+      "bytes": 346,
+      "sha256": "27a5def2e44459758e31a187dd45c994b993d68c4cbb6a0f4555f7de2217343a"
+    },
+    {
+      "path": "web/site.webmanifest",
+      "bytes": 472,
+      "sha256": "6962dc90b77009a1ae271c52ec5577521aadd7f0ec8c35fc470c755d45dc005e"
+    },
+    {
+      "path": "wordmarks/planarian-horizontal-dark.png",
+      "bytes": 30615,
+      "sha256": "846ec13a842515860c88efbdc053461eeffe24d37b777394186b4287f8a04f31"
+    },
+    {
+      "path": "wordmarks/planarian-horizontal-dark.svg",
+      "bytes": 5277,
+      "sha256": "c0d796407d506d7e90dac945c42c25bd95db821408fb0c1a384912af50f1106c"
+    },
+    {
+      "path": "wordmarks/planarian-horizontal-light.png",
+      "bytes": 30565,
+      "sha256": "8a9f1a330cd88c741b31e953425d5bc2161e2c0f6319fdf4a988d3a1187c3d34"
+    },
+    {
+      "path": "wordmarks/planarian-horizontal-light.svg",
+      "bytes": 5277,
+      "sha256": "faf8863e4471dcf05cde2e82c2ef2b0b6d980afe29053aa7bb06f70d6397e9a2"
+    },
+    {
+      "path": "wordmarks/planarian-stacked-dark.png",
+      "bytes": 36373,
+      "sha256": "23fcf9a4be2d23c4805f4c4ae9dc59931354f1b311cef87a5272f0bbb49c4c58"
+    },
+    {
+      "path": "wordmarks/planarian-stacked-dark.svg",
+      "bytes": 5270,
+      "sha256": "04bb001f8e607cd3c2ee96f5c025755c9b1cea55a2f297c594070dfa2bdf1f45"
+    },
+    {
+      "path": "wordmarks/planarian-stacked-light.png",
+      "bytes": 39459,
+      "sha256": "f9e68d058888a1aa4381a200a0f02b046c7e5f135d55b84d23182b4c122fb125"
+    },
+    {
+      "path": "wordmarks/planarian-stacked-light.svg",
+      "bytes": 5270,
+      "sha256": "0bb93349356145d75b4470f1b4c99634dd415f0d89128b032cce41ccedc27954"
+    }
+  ]
+}

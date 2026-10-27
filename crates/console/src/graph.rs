@@ -1,7 +1,7 @@
 //! The Graph view: units laid out in layers by dependency, each with three
 //! indicators (desired, observed, health), edges styled by kind.
 
-use crate::Message;
+use crate::{MUTED, Message, RAISED, TEXT};
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Geometry, LineDash, Path, Stroke, Text};
 use iced::{Color, Point, Rectangle, Renderer, Size, Theme};
@@ -18,6 +18,9 @@ const NODE: Size = Size::new(170.0, 46.0);
 pub struct Graph<'a> {
     pub report: &'a ConsoleReport,
     pub selected: Option<&'a UnitId>,
+    /// Cleared when the report or the selection changes, so animation frames
+    /// elsewhere in the window do not redraw the graph.
+    pub cache: &'a canvas::Cache,
 }
 
 /// Layers by longest chain of functional dependencies: a unit sits below
@@ -129,7 +132,12 @@ impl canvas::Program<Message> for Graph<'_> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        let mut f = Frame::new(renderer, bounds.size());
+        vec![self.cache.draw(renderer, bounds.size(), |f| self.paint(f, bounds))]
+    }
+}
+
+impl Graph<'_> {
+    fn paint(&self, f: &mut Frame, bounds: Rectangle) {
         let pos = layout(self.report, bounds.size());
         let center = |u: &UnitId| pos.get(u).map(|p| Point::new(p.x + NODE.width / 2.0, p.y + NODE.height / 2.0));
 
@@ -146,7 +154,7 @@ impl canvas::Program<Message> for Graph<'_> {
             let stroke = Stroke {
                 line_dash: LineDash { segments, offset: 0 },
                 ..Stroke::default()
-                    .with_color(Color { a: alpha, ..Color::from_rgb8(0x40, 0x40, 0x50) })
+                    .with_color(Color { a: alpha, ..Color::from_rgb8(0xb4, 0xb8, 0xbe) })
                     .with_width(width)
             };
             f.stroke(&Path::line(a, b), stroke);
@@ -155,7 +163,7 @@ impl canvas::Program<Message> for Graph<'_> {
         for n in &self.report.nodes {
             let Some(at) = pos.get(&n.unit) else { continue };
             let rect = Path::rounded_rectangle(*at, NODE, 6.0.into());
-            let fill = if n.stale { Color::from_rgb8(0xe4, 0xe4, 0xe4) } else { Color::WHITE };
+            let fill = if n.stale { Color::from_rgb8(0x2e, 0x31, 0x35) } else { RAISED };
             f.fill(&rect, fill);
             if n.suppressed {
                 // Hatching: diagonal strokes clipped by eye to the box.
@@ -165,7 +173,7 @@ impl canvas::Program<Message> for Graph<'_> {
                     let b = Point::new(at.x + (x - NODE.height).max(0.0), at.y + x.min(NODE.height));
                     f.stroke(
                         &Path::line(a, b),
-                        Stroke::default().with_color(Color::from_rgba8(0x5a, 0x6f, 0xc0, 0.35)).with_width(1.0),
+                        Stroke::default().with_color(Color::from_rgba8(0x7a, 0x8f, 0xe0, 0.35)).with_width(1.0),
                     );
                     x += 9.0;
                 }
@@ -174,18 +182,14 @@ impl canvas::Program<Message> for Graph<'_> {
             f.stroke(
                 &rect,
                 Stroke::default()
-                    .with_color(if selected {
-                        Color::from_rgb8(0x20, 0x60, 0xd0)
-                    } else {
-                        Color::from_rgb8(0x60, 0x60, 0x60)
-                    })
+                    .with_color(if selected { TEXT } else { Color::from_rgb8(0x4a, 0x4f, 0x56) })
                     .with_width(if selected { 2.5 } else { 1.0 }),
             );
             f.fill_text(Text {
                 content: n.unit.name.clone(),
                 position: Point::new(at.x + 8.0, at.y + 6.0),
                 size: 14.0.into(),
-                color: Color::from_rgb8(0x20, 0x20, 0x20),
+                color: TEXT,
                 ..Text::default()
             });
             for (i, c) in [desired_color(n), observed_color(&n.observed), health_color(&n.health)].iter().enumerate() {
@@ -195,13 +199,12 @@ impl canvas::Program<Message> for Graph<'_> {
             if n.stale {
                 // A small clock: no fresh evidence.
                 let c = Point::new(at.x + NODE.width - 16.0, at.y + NODE.height - 14.0);
-                let s = Stroke::default().with_color(Color::from_rgb8(0x50, 0x50, 0x50)).with_width(1.2);
+                let s = Stroke::default().with_color(MUTED).with_width(1.2);
                 f.stroke(&Path::circle(c, 6.0), s);
                 f.stroke(&Path::line(c, Point::new(c.x, c.y - 4.0)), s);
                 f.stroke(&Path::line(c, Point::new(c.x + 3.0, c.y)), s);
             }
         }
-        vec![f.into_geometry()]
     }
 }
 

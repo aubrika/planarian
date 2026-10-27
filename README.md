@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="assets/identity/wordmarks/planarian-horizontal-light.svg">
+    <img alt="planarian" src="assets/identity/wordmarks/planarian-horizontal-dark.svg" width="360">
+  </picture>
+</p>
+
 # Planarian
 
 A self-healing layer for NixOS. It keeps three things separate: what your
@@ -24,6 +31,22 @@ On any Linux machine with Nix (flakes enabled):
 nix run github:aubrika/planarian#vm        # COSMIC desktop with the console, in a window
 nix run github:aubrika/planarian#vm-text   # no desktop: a shell in your terminal
 ```
+
+While the repository is private, Nix needs GitHub credentials of its own
+(it does not use a `gh` or browser login). Any one of these works:
+
+```sh
+# borrow the GitHub CLI's token for one command
+NIX_CONFIG="access-tokens = github.com=$(gh auth token)" nix run github:aubrika/planarian#vm
+# or use your SSH key, as git push does
+nix run 'git+ssh://git@github.com/aubrika/planarian#vm'
+# or from a clone
+nix run .#vm
+```
+
+To make the first permanent, put `access-tokens = github.com=<token>` in
+`~/.config/nix/nix.conf`. The first run builds Planarian and downloads NixOS
+from cache.nixos.org; later runs start in seconds.
 
 The VM logs in as `demo` (password `planarian`; `sudo` needs none) and
 prints what to try: `planarian status`, `ask "make text bigger"`, and

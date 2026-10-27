@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=planarian
+Comment=Self-healing system console
+Exec=planarian-console
+Icon=planarian
+Terminal=false
+Categories=System;Monitor;
+StartupNotify=true

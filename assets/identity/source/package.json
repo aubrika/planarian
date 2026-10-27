@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "Optional SVG to PNG export tooling for the planarian identity kit",
+  "dependencies": {
+    "sharp": "0.35.5"
+  }
+}

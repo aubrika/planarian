@@ -1,0 +1,10 @@
+/* Change the mask URL to match your asset location. Set color on the element. */
+.planarian-mark {
+  display: inline-block;
+  width: 2rem;
+  height: 2rem;
+  flex: 0 0 auto;
+  background-color: currentColor;
+  -webkit-mask: url("./planarian-mask.svg") center / contain no-repeat;
+  mask: url("./planarian-mask.svg") center / contain no-repeat;
+}

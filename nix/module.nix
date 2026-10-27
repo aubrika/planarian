@@ -346,7 +346,8 @@ in
       journalBytes = 64 * 1024 * 1024;
     };
 
-    environment.systemPackages = [ cfg.package ];
+    # With the console: its launcher entry and icons too.
+    environment.systemPackages = [ cfg.package ] ++ lib.optional cfg.console.enable cfg.console.package;
     users.groups.planarian-admin = { };
 
     # The healer is not the patient (Principle 1): no activation restarts or

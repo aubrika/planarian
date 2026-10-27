@@ -10,22 +10,57 @@
 //! or a reverted change.
 
 mod graph;
+mod mark;
 
-use iced::widget::{button, column, container, row, rule, scrollable, text};
-use iced::{Element, Fill, Subscription, Task, Theme, time, window};
+use iced::widget::{button, canvas, column, container, row, rule, scrollable, text};
+use iced::{Color, Element, Fill, Subscription, Task, Theme, color, time, window};
+use mark::{Mark, Motion};
 use planarian_ipc::{ConsoleReport, Request, Response, SOCKET};
 use planarian_schema::{IncidentState, UnitId, Until};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// The identity kit's charcoal surface.
+pub const SURFACE: Color = color!(0x151719);
+/// A raised surface (graph nodes, panels) on the charcoal.
+pub const RAISED: Color = color!(0x222529);
+pub const TEXT: Color = color!(0xeceeef);
+pub const MUTED: Color = color!(0x9a9fa5);
 
 fn main() -> iced::Result {
+    let icon = window::icon::from_rgba(include_bytes!("icon-64.rgba").to_vec(), 64, 64).ok();
     iced::application(Console::new, Console::update, Console::view)
-        .title("Planarian")
+        .title("planarian")
         .subscription(Console::subscription)
         .theme(Console::theme)
-        .window_size((1100.0, 720.0))
+        .window(window::Settings {
+            size: iced::Size::new(1100.0, 720.0),
+            icon,
+            // Matches planarian.desktop, so the shell shows the right icon.
+            platform_specific: window::settings::PlatformSpecific {
+                application_id: "planarian".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
         .run()
+}
+
+/// Dark by default: the kit is monochrome on charcoal. Status colours stay
+/// (health is not identity), toned for a dark surface.
+fn dark() -> Theme {
+    Theme::custom(
+        "planarian dark",
+        iced::theme::Palette {
+            background: SURFACE,
+            text: TEXT,
+            primary: color!(0xe8eaec),
+            success: color!(0x3fb56a),
+            warning: color!(0xe0a43a),
+            danger: color!(0xe0524f),
+        },
+    )
 }
 
 /// One request to the daemon, one answer.
@@ -50,6 +85,7 @@ enum View {
 #[derive(Clone, Debug)]
 enum Message {
     Tick,
+    Frame,
     Show(View),
     Select(UnitId),
     Undo,
@@ -65,6 +101,12 @@ struct Console {
     /// The answer to the last button.
     answer: Option<String>,
     first: bool,
+    /// The animation clock.
+    started: Instant,
+    seconds: f32,
+    /// `PLANARIAN_REDUCED_MOTION=1`: show the still mark instead of motion.
+    reduced_motion: bool,
+    graph_cache: canvas::Cache,
 }
 
 impl Console {
@@ -77,21 +119,67 @@ impl Console {
             "incidents" => View::Incidents,
             _ => View::Graph,
         };
-        let c = Console { view, report: None, error: None, selected: None, answer: None, first: true };
+        let reduced_motion = std::env::var("PLANARIAN_REDUCED_MOTION").is_ok_and(|v| v != "0" && !v.is_empty());
+        let c = Console {
+            view,
+            report: None,
+            error: None,
+            selected: None,
+            answer: None,
+            first: true,
+            started: Instant::now(),
+            seconds: 0.0,
+            reduced_motion,
+            graph_cache: canvas::Cache::new(),
+        };
         (c, Task::done(Message::Tick))
     }
 
     fn theme(&self) -> Theme {
-        Theme::Light
+        dark()
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        time::every(Duration::from_secs(2)).map(|_| Message::Tick)
+        let tick = time::every(Duration::from_secs(2)).map(|_| Message::Tick);
+        if self.motion() == Motion::Still || self.reduced_motion {
+            tick
+        } else {
+            Subscription::batch([tick, time::every(Duration::from_millis(60)).map(|_| Message::Frame)])
+        }
+    }
+
+    /// What the daemon is doing, if anything: "loading" while there is no
+    /// answer yet, "working" while a transaction is in flight or the daemon
+    /// answers from its busy snapshot.
+    fn activity(&self) -> Option<(Motion, String)> {
+        let Some(r) = &self.report else {
+            return self.error.is_none().then(|| (Motion::Loading, "connecting to planariad…".to_string()));
+        };
+        let busy = r.status.notices.iter().find(|n| n.starts_with("busy with"));
+        if let Some(n) = busy {
+            let what = n.split(':').next().unwrap_or(n);
+            return Some((Motion::Working, format!("{what}. Showing how things stood when it started.")));
+        }
+        r.status.in_flight.first().map(|(t, state, what)| {
+            (Motion::Working, format!("working on #{}: {what} ({})", t.0, planarian_state_name(state)))
+        })
+    }
+
+    fn motion(&self) -> Motion {
+        self.activity().map(|a| a.0).unwrap_or(Motion::Still)
+    }
+
+    fn mark(&self, size: f32, motion: Motion) -> Element<'_, Message> {
+        let motion = if self.reduced_motion { Motion::Still } else { motion };
+        canvas(Mark { motion, seconds: self.seconds, color: TEXT }).width(size).height(size).into()
     }
 
     fn refresh(&mut self) {
         match call(&Request::Console) {
             Ok(Response::Console(r)) => {
+                if self.report.as_ref() != Some(&*r) {
+                    self.graph_cache.clear();
+                }
                 self.report = Some(*r);
                 self.error = None;
             }
@@ -116,8 +204,12 @@ impl Console {
                     return window::latest().and_then(|id| window::minimize(id, true));
                 }
             }
+            Message::Frame => self.seconds = self.started.elapsed().as_secs_f32(),
             Message::Show(v) => self.view = v,
-            Message::Select(u) => self.selected = Some(u),
+            Message::Select(u) => {
+                self.selected = Some(u);
+                self.graph_cache.clear();
+            }
             Message::Undo => self.act(Request::Undo),
             Message::Suppress(unit) => self.act(Request::Suppress { unit, until: Until::Explicit }),
             Message::Unsuppress(unit) => self.act(Request::Unsuppress { unit }),
@@ -142,6 +234,9 @@ impl Console {
             if self.view == v { b.style(button::primary) } else { b.style(button::secondary) }
         };
         let header = row![
+            self.mark(28.0, Motion::Still),
+            text("planarian").size(20),
+            iced::widget::space::horizontal().width(12),
             tab("Graph", View::Graph),
             tab("Timeline", View::Timeline),
             tab("Generations", View::Generations),
@@ -149,8 +244,19 @@ impl Console {
             iced::widget::space::horizontal(),
             button(text("Undo last change")).on_press(Message::Undo).style(button::secondary),
         ]
-        .spacing(8);
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
         let mut page = column![header].spacing(10).padding(12);
+        if let Some((motion, what)) = self.activity() {
+            page = page.push(
+                container(
+                    row![self.mark(40.0, motion), text(what).size(14)].spacing(12).align_y(iced::Alignment::Center),
+                )
+                .padding(6)
+                .width(Fill)
+                .style(container::rounded_box),
+            );
+        }
         if let Some(e) = &self.error {
             page = page.push(banner(e.clone(), true));
         }
@@ -164,7 +270,7 @@ impl Console {
         }
         page = page.push(rule::horizontal(1));
         let body: Element<'_, Message> = match (&self.report, self.view) {
-            (None, _) => text("waiting for planariad…").into(),
+            (None, _) => text("").into(),
             (Some(r), View::Graph) => self.graph_view(r),
             (Some(r), View::Timeline) => timeline(r),
             (Some(r), View::Generations) => generations(r),
@@ -174,8 +280,9 @@ impl Console {
     }
 
     fn graph_view<'a>(&'a self, r: &'a ConsoleReport) -> Element<'a, Message> {
-        let canvas =
-            iced::widget::canvas(graph::Graph { report: r, selected: self.selected.as_ref() }).width(Fill).height(Fill);
+        let canvas = canvas(graph::Graph { report: r, selected: self.selected.as_ref(), cache: &self.graph_cache })
+            .width(Fill)
+            .height(Fill);
         let side: Element<'_, Message> =
             match self.selected.as_ref().and_then(|u| r.nodes.iter().find(|n| &n.unit == u)) {
                 None => column![text("Select a unit.").size(14), text(graph::LEGEND).size(12),].spacing(8).into(),

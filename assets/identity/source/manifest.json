@@ -1,0 +1,38 @@
+{
+  "name": "planarian Return identity kit",
+  "version": "1.2",
+  "canvas": 1024,
+  "standard_mark_height": 800,
+  "micro_eye_scale": 1.65,
+  "monochrome": {
+    "black": "#000000",
+    "white": "#ffffff",
+    "surface_dark": "#151719",
+    "surface_light": "#ffffff"
+  },
+  "font": "Nimbus Sans Regular; wordmarks are outlined, with no font dependency",
+  "icon_sizes": [
+    16,
+    20,
+    24,
+    32,
+    48,
+    64,
+    96,
+    128,
+    192,
+    256,
+    512,
+    1024
+  ],
+  "mark_contours": 3,
+  "brand": "planarian",
+  "motion": {
+    "loading_seconds": 3.6,
+    "working_seconds": 2.4,
+    "comparison_seconds": 7.2,
+    "reduced_motion": "static SVG group; interactive prototype paused by default",
+    "loading_body_displacement_multiplier": 3,
+    "working_direction": "counterclockwise"
+  }
+}

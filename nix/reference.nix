@@ -43,6 +43,12 @@ in
       script = "${config.networking.networkmanager.package}/bin/nmcli connection up id ${lib.escapeShellArg cfg.wifiNetwork} || true";
     };
 
+    # Dark boot splash with the planarian mark (identity kit, white on black).
+    boot.plymouth = {
+      enable = lib.mkDefault true;
+      logo = lib.mkDefault ../assets/identity/marks/planarian-mark-white-128.png;
+    };
+
     # The console autostarts on the reference desktop (§16a).
     services.planarian.console.enable = lib.mkDefault true;
 

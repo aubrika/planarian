@@ -14,6 +14,8 @@ rustPlatform.buildRustPackage {
       ../Cargo.lock
       ../crates
       ../share
+      ../assets/identity/animations/keyframes.json
+      ../assets/identity/integration/linux
       ../nix/template/planarian/overrides.nix
     ];
   };
@@ -25,6 +27,10 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [ makeWrapper ];
   postInstall = ''
+    # The identity kit's launcher icons (dark tile) and desktop entry.
+    mkdir -p $out/share/icons $out/share/applications
+    cp -r ${../assets/identity/integration/linux/hicolor} $out/share/icons/hicolor
+    install -m644 ${../assets/identity/integration/linux/planarian.desktop} $out/share/applications/planarian.desktop
     wrapProgram $out/bin/planarian-console \
       --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ libxkbcommon wayland libx11 libxcursor libxrandr libxi libxcb ]}
   '';
