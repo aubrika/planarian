@@ -19,6 +19,8 @@
         {
           services.planarian.enable = true;
           services.planarian.owner = "/etc/nixos";
+          # Administrators approve changes, restart system services and resolve.
+          # users.users.<you>.extraGroups = [ "planarian-admin" ];
         }
       ];
     };

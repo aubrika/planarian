@@ -59,6 +59,8 @@ files. It changes only `planarian/overrides.nix`, which your flake imports.
    planarian.nixosModules.default
    planarian.nixosModules.reference   # optional: COSMIC, PipeWire, NetworkManager, catalog wiring
    { services.planarian.enable = true; services.planarian.owner = "/etc/nixos"; }
+   # and make yourself an administrator (approve, restart system services, resolve):
+   { users.users.<you>.extraGroups = [ "planarian-admin" ]; }
    ```
 
 2. Copy `nix/template/planarian/overrides.nix` into your configuration as

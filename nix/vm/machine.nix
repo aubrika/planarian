@@ -121,7 +121,8 @@ in
 
     users.users.demo = {
       isNormalUser = true;
-      extraGroups = [ "wheel" "networkmanager" ];
+      # The owner: planarian-admin may approve, restart system services, resolve.
+      extraGroups = [ "wheel" "networkmanager" "planarian-admin" ];
       initialPassword = "planarian";
     };
     users.users.root.initialPassword = "planarian";
@@ -195,6 +196,8 @@ in
       '';
     };
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
+    # Without the host's network, builds fail in seconds rather than minutes.
+    nix.settings.connect-timeout = 5;
     security.sudo.wheelNeedsPassword = false;
 
     virtualisation = {
