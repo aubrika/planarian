@@ -16,7 +16,34 @@ model is involved. `policy::decide`, the journal state machine and the
 ledger are verified with Verus (`docs/verification.md`). What is left is
 in `docs/AGENTS.md`.
 
-## Trying it
+## Trying it in a VM (one command)
+
+On any Linux machine with Nix (flakes enabled):
+
+```sh
+nix run github:aubrika/planarian#vm        # COSMIC desktop with the console, in a window
+nix run github:aubrika/planarian#vm-text   # no desktop: a shell in your terminal
+```
+
+The VM logs in as `demo` (password `planarian`; `sudo` needs none) and
+prints what to try: `planarian status`, `ask "make text bigger"`, and
+`demo-fault kill-web` / `corrupt-state` / `crash-loop` to break the fixture
+services and watch Planarian respond. Its `/etc/nixos` is a flake that
+evaluates to exactly the system you booted, so changes Planarian makes inside
+are real rebuilds (they download from cache.nixos.org, so the VM needs the
+host's network).
+
+- It uses KVM when `/dev/kvm` is available and falls back to emulation
+  (slow, especially the desktop) when not. The desktop wants 4 GB of RAM.
+- State lives in `planarian-vm.qcow2` in the directory you ran it from.
+  Delete it to start over. Delete it too after updating Planarian, since the
+  old disk's `/etc/nixos` still points at the old version.
+- Generations built inside survive a restart of the VM, but the VM always
+  boots the system it was launched with, so Planarian will report
+  that the booted generation differs from the one it published.
+- The text variant's terminal is the serial console: `Ctrl-a x` quits QEMU.
+
+## Trying it on your machine
 
 Planarian needs a flake-based NixOS configuration. It never edits your own
 files. It changes only `planarian/overrides.nix`, which your flake imports.
