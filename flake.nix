@@ -31,6 +31,7 @@
       checks = forAll (pkgs: {
         package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         module-eval = import ./nix/tests/eval.nix { inherit pkgs self nixpkgs; };
+        vm-runtime = import ./nix/tests/vm.nix { inherit pkgs self; };
       });
     };
 }

@@ -16,6 +16,7 @@ members = [
     "crates/backends/linux",
     "crates/watchdog",
     "crates/cli",
+    "crates/gym",
 ]
 
 [workspace.package]

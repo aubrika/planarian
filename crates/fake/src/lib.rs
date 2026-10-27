@@ -129,6 +129,14 @@ pub struct World {
     pub gc_roots: BTreeSet<String>,
     pub collected: Vec<GenerationId>,
     pub fail_publish: bool,
+    /// Drivers that bind but cannot drive the device.
+    pub bad_drivers: BTreeSet<String>,
+    /// Hooks for faults that happen during a transaction: the owner edits a
+    /// tracked file while staging; the store fills during the build; a port is
+    /// blocked when the candidate activates.
+    pub edit_on_stage: bool,
+    pub nospace_on_build: bool,
+    pub block_on_activate: BTreeSet<UnitId>,
     pub fail_activate: BTreeSet<GenerationId>,
     pub slow_activation: Option<(Millis, bool)>,
     pub jobs: BTreeMap<JobId, Job>,
@@ -434,6 +442,9 @@ impl GenerationBackend for Fake {
         w.staged.insert(dir.clone(), (overrides.clone(), files.clone()));
         let candidate_override = World::override_hash_of(overrides);
         w.override_store.insert(candidate_override, overrides.clone());
+        if std::mem::take(&mut w.edit_on_stage) {
+            w.owner_files.insert("configuration.nix".into(), "{ edited-during-build = true; }".into());
+        }
         Ok(StagedSource {
             dir,
             base_source: World::source_hash_of(&files, &base),
@@ -459,6 +470,9 @@ impl GenerationBackend for Fake {
 
     fn build(&self, eval: &EvaluatedGeneration) -> Result<Built, Outcome> {
         let mut w = self.w();
+        if std::mem::take(&mut w.nospace_on_build) {
+            return Err(Outcome::Failed("error: writing to file: No space left on device".into()));
+        }
         let staged = w
             .staged
             .values()
@@ -544,6 +558,10 @@ impl GenerationBackend for Fake {
         if w.fail_activate.contains(&g) {
             return Outcome::Failed(format!("switch-to-configuration test failed for {}", g.0));
         }
+        if g != w.booted && !w.block_on_activate.is_empty() {
+            let b = std::mem::take(&mut w.block_on_activate);
+            w.blocked.extend(b);
+        }
         if let Some((delay, cancellable)) = w.slow_activation {
             w.next_job += 1;
             let id = JobId(format!("job-{}", w.next_job));
@@ -560,7 +578,8 @@ impl GenerationBackend for Fake {
         if !self.admit(&mut w, op, format!("publish_boot({})", g.0)) {
             return Outcome::fenced();
         }
-        if w.fail_publish {
+        // Only a generation whose files are not yet on /boot needs new space.
+        if w.fail_publish && !w.boot_entries.contains(&g) {
             return Outcome::Failed("No space left on device (/boot)".into());
         }
         w.boot_entries.insert(g);
@@ -676,7 +695,15 @@ impl GenerationBackend for Fake {
 
 impl InventoryBackend for Fake {
     fn devices(&self) -> Result<Vec<DeviceInfo>, Outcome> {
-        Ok(self.w().devices.iter().map(|(id, d)| DeviceInfo { id: id.clone(), driver: d.clone() }).collect())
+        // A driver that can't drive the device leaves it effectively unbound.
+        let w = self.w();
+        Ok(w.devices
+            .iter()
+            .map(|(id, d)| DeviceInfo {
+                id: id.clone(),
+                driver: d.clone().filter(|d| !w.bad_drivers.contains(&d.name)),
+            })
+            .collect())
     }
 
     fn resources(&self) -> Result<Resources, Outcome> {
@@ -880,6 +907,7 @@ pub fn gym_world(store: MemStore) -> Fake {
         (UnitId::device("gpu0"), Some(DriverRef { name: "virtio_gpu".into(), module: None })),
     ]
     .into();
+    w.bad_drivers.insert("vfio-pci".into());
     w.fs = [
         ("/".to_string(), (40_000_000_000, 100_000_000_000)),
         ("/nix".to_string(), (40_000_000_000, 100_000_000_000)),

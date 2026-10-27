@@ -92,6 +92,9 @@ pub struct LiveTxn {
     pub ops: Vec<OpRecord>,
     /// Journal states this transaction has passed through, in order.
     pub path: Vec<String>,
+    /// The most recent non-empty note on an Advance.
+    #[serde(default)]
+    pub why: String,
 }
 
 impl LiveTxn {
@@ -109,6 +112,8 @@ pub struct TerminalTxn {
     pub owner: OwnerId,
     pub path: Vec<String>,
     pub transition: Transition,
+    /// The most recent reason journaled with a step (why it reverted, …).
+    pub why: String,
 }
 
 pub const TERMINAL_KEEP: usize = 256;
@@ -306,13 +311,19 @@ impl Ledger {
         match &e.record {
             Record::Prepared(t) => {
                 self.next_txn = t.id.0 + 1;
-                self.live.insert(t.id, LiveTxn { txn: (**t).clone(), ops: vec![], path: vec![tag(&t.state).into()] });
+                self.live.insert(
+                    t.id,
+                    LiveTxn { txn: (**t).clone(), ops: vec![], path: vec![tag(&t.state).into()], why: String::new() },
+                );
             }
             Record::Advance { txn, to, note, .. } => {
                 let l = self.live.get_mut(txn).expect("validated");
                 let from = tag(&l.txn.state);
                 l.txn.state = to.clone();
                 l.path.push(tag(to).into());
+                if !note.is_empty() && !note.starts_with("observed: ") && !note.starts_with("Succeeded") {
+                    l.why = note.clone();
+                }
                 if *to == TxnState::RecoveryFailed {
                     self.interlock.insert(
                         *txn,
@@ -337,6 +348,7 @@ impl Ledger {
                             owner: l.txn.lease.owner,
                             path: l.path,
                             transition: l.txn.transition,
+                            why: l.why,
                         },
                     );
                     while self.terminal.len() > TERMINAL_KEEP {

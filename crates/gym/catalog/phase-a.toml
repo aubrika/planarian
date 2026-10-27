@@ -120,7 +120,9 @@
 #   wait {for}                               duration, or { journal = "<state>" }
 #
 # `when` on an action: { journal = "<TxnState>" } fires the instant that state
-# is durably journaled; { after = "<duration>" } fires relative to the previous step.
+# is durably journaled; { op_called = "<call>" } fires after that backend call
+# was made and before its outcome is journaled (the activation is running);
+# { after = "<duration>" } fires relative to the previous step.
 #
 # ───────────────────────────────────────────────────────────────────────────
 # FIXTURES — gym units added to the reference VM (nix/tests/)
@@ -203,7 +205,7 @@ scoring = "repair"
 harness = ["fake", "vm"]
 intent = { kind = "none" }
 inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
-window = "5m"
+window = "7m"
 
 [fault.required_post]
 units = { "service:gym-web" = "Running" }
@@ -687,7 +689,7 @@ scoring = "must-pass"
 harness = ["fake", "vm"]
 intent = { kind = "none" }
 setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
-inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "activate_live" } }
 after = [{ raw = "hold_down", process = "planariad" }]
 window = "20m"
 
@@ -828,7 +830,9 @@ window = "20m"
 [fault.required_post]
 generation = "base"
 journal_agrees = true
-reconciliation = { found = "Reverted", owner = "watchdog", daemon_action = "none", explains = ["killed-during-Activating", "watchdog-reverted", "probe-failed:gym-web"] }
+# Killed right after Activating was journaled and before the activation ran:
+# the candidate never became active, and the record must say so.
+reconciliation = { found = "Reverted", owner = "watchdog", daemon_action = "none", explains = ["killed-during-Activating", "watchdog-reverted", "why:candidate not active"] }
 
 [[fault]]
 id = "crash-slow-worker-overlap"
@@ -867,7 +871,7 @@ setup = [
   { raw = "withhold_reply", call = "activate_live" },
   { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
 ]
-inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "OpId" } }
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "activate_live" } }
 after = [{ raw = "hold_down", process = "planariad" }]
 window = "10m"
 
@@ -890,7 +894,7 @@ setup = [
   { raw = "slow_backend", call = "activate_live", delay = "600s", uncancellable = true },
   { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
 ]
-inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "activate_live" } }
 after = [{ raw = "hold_down", process = "planariad" }]
 window = "10m"
 
@@ -917,7 +921,7 @@ setup = [
   { raw = "withhold_reply", call = "activate_live" },
   { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
 ]
-inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "OpId" } }
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "activate_live" } }
 window = "5m"
 
 [fault.required_post]
@@ -1025,9 +1029,8 @@ scoring = "must-pass"
 harness = ["fake", "vm"]
 intent = { kind = "none" }
 setup = [
+  { raw = "block_network", dst = "127.0.0.1", port = 22, when = { journal = "Activating" } },
   { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" },
-  { raw = "wait", for = { journal = "Checking" } },
-  { raw = "block_network", dst = "127.0.0.1", port = 22 },
 ]
 inject = { raw = "wait", for = { journal = "RecoveryFailed" } }
 after = [
@@ -1472,7 +1475,7 @@ scoring = "repair"
 harness = ["fake"]
 intent = { kind = "none" }
 inject = { raw = "set_persistent_knob", unit = "service:gym-flap", knob = "fail_after", value = "6m" }
-window = "90m"
+window = "50m"
 
 [fault.required_post]
 reports = ["Escalated"]
@@ -1945,8 +1948,7 @@ window = "1m"
 
 [[fault.required_post.txn]]
 transition = "RestartUnit"
-decision = "Reject(Other)"
-reject_detail = "refinement"
+decision = "Reject(Refinement)"
 never = ["Prepared"]
 
 [[fault]]

@@ -196,3 +196,18 @@ fn not_expected_units_open_nothing() {
     sim.ticks(10);
     assert!(sim.active("graphical-session").is_none(), "idle greeter: no incident");
 }
+
+#[test]
+fn stabilizing_incident_is_not_actionable() {
+    // Regression (found by the gym): after a successful repair the incident
+    // stays open for the stabilization window, but must not be acted on again.
+    let mut sim = Sim::new(defs([service("gym-web")]));
+    sim.fail("gym-web");
+    sim.ticks(2);
+    let id = sim.active("gym-web").unwrap().id;
+    sim.m.record_attempt(id, TxnId(1), Outcome::Succeeded, sim.now());
+    sim.heal("gym-web");
+    sim.ticks(10); // past the 10 s backoff, still stabilizing
+    assert!(sim.active("gym-web").is_some());
+    assert!(sim.m.actionable(sim.now()).is_empty());
+}

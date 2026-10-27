@@ -153,6 +153,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         core
     }
 
+    /// The observation the last tick (or request) acted on.
+    pub fn last_observation(&self) -> Option<&(SystemState, UnitDefs)> {
+        self.last.as_ref()
+    }
+
     pub fn notice(&mut self, s: String) {
         if self.notices.len() >= NOTICES_KEPT {
             self.notices.pop_front();
@@ -269,6 +274,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let now = s.observed_at;
 
         for inc in self.incidents.tick(now, &s, &defs) {
+            if matches!(inc.state, IncidentState::Escalated { .. }) && inc.attempts.is_empty() {
+                self.notice(format!(
+                    "{}: escalated: it failed again soon after each of {} repairs; it needs a person (no automatic action for an hour)",
+                    inc.target, inc.regressions
+                ));
+            }
             self.journal(Record::Incident(inc));
         }
         let diag: Vec<UnitId> = self.incidents.diagnostic().iter().map(|i| i.target.clone()).collect();
@@ -351,6 +362,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 match self.submit(p, Authorization::daemon(), s, defs) {
                     Submitted::Finished { txn, state, .. } => {
                         if let Some(i) = self.incidents.record_attempt(inc.id, txn, outcome_of(&state), now) {
+                            if matches!(i.state, IncidentState::Cooldown { .. }) {
+                                self.notice(format!(
+                                    "{}: tried {} time(s) and it keeps failing; it needs a person (I'll try once more in {} min)",
+                                    inc.target,
+                                    i.attempts.len(),
+                                    i.backoff.0 / 60_000
+                                ));
+                            }
                             self.journal(Record::Incident(i));
                         }
                         self.notice(format!("{}: {} → {:?}", inc.target, render::transition(&c.transition), state));

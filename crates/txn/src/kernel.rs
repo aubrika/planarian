@@ -288,13 +288,18 @@ impl<S: Store, H: Host> Kernel<S, H> {
     }
 
     fn run_reobserve(&mut self, txn: &Transaction) -> R<TxnState> {
-        self.advance(txn, TxnState::Activating, "")?;
         let caller = txn.facts.caller.clone();
+        // The suppression is journaled before the stop (§12, §14), and before
+        // Activating: once the user's "stop" is recorded at all, the repair
+        // loop leaves the unit alone, whatever happens to the rest.
+        if let Transition::StopAndSuppress { unit, until, reason } = &txn.transition {
+            let s =
+                Suppression { unit: unit.clone(), until: until.clone(), reason: reason.clone(), by: caller.clone() };
+            self.record(Record::Suppressed(s))?;
+        }
+        self.advance(txn, TxnState::Activating, "")?;
         let outcome = match &txn.transition {
-            Transition::StopAndSuppress { unit, until, reason } => {
-                // The suppression is journaled before the stop (§12, §14).
-                let s = Suppression { unit: unit.clone(), until: until.clone(), reason: reason.clone(), by: caller };
-                self.record(Record::Suppressed(s))?;
+            Transition::StopAndSuppress { unit, .. } => {
                 let stop = Transition::StopUnit(unit.clone());
                 self.call(txn.id, "stop", |h, op| h.execute_runtime(&stop, op))?
             }
@@ -422,7 +427,14 @@ impl<S: Store, H: Host> Kernel<S, H> {
             self.advance(txn, TxnState::Reverting, why)?;
         }
         let to = txn.revert_to;
-        let activated = self.call(txn.id, "activate_live(revert_to)", |h, op| h.generations().activate_live(to, op))?;
+        let (op, activated) =
+            self.call_op(txn.id, "activate_live(revert_to)", |h, op| h.generations().activate_live(to, op))?;
+        if !activated.is_success() {
+            // Never decide from the observed state while the revert's own job may still run.
+            if let Err(why) = self.drain_op(txn.id, &op)? {
+                return self.recovery_failed(txn, &format!("revert activation: {why}"));
+            }
+        }
         if !activated.is_success() && self.host.generations().current().ok() != Some(to) {
             return self.recovery_failed(txn, &format!("revert activation: {activated:?}"));
         }
@@ -675,8 +687,9 @@ impl<S: Store, H: Host> Kernel<S, H> {
         for (id, t) in ledger.terminal.iter().rev().take(16) {
             if t.owner.is_watchdog() {
                 found.push((*id, t.state.clone()));
+                let why = if t.why.is_empty() { String::new() } else { format!("; because {}", t.why) };
                 actions.push(format!(
-                    "txn {}: the watchdog took over and finished it: {} (path {})",
+                    "txn {}: the watchdog took over and finished it: {} (path {}){why}",
                     id.0,
                     tag(&t.state),
                     t.path.join(" → ")

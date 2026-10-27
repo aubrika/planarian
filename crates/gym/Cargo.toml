@@ -1,0 +1,28 @@
+[package]
+name = "planarian-gym"
+description = "The Planarian gym: runs the fault catalog (SPEC §15)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "planarian-gym"
+path = "src/main.rs"
+
+[dependencies]
+planarian-schema.workspace = true
+planarian-txn.workspace = true
+planarian-exec.workspace = true
+planarian-daemon.workspace = true
+planarian-ipc.workspace = true
+planarian-changes.workspace = true
+planarian-policy.workspace = true
+planarian-fake.workspace = true
+planarian-state.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml = "0.9"
+
+[lints]
+workspace = true

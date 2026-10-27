@@ -248,7 +248,9 @@ impl Manager {
         inc
     }
 
-    /// Repair incidents the diagnoser may act on now.
+    /// Repair incidents the diagnoser may act on now. An incident whose target
+    /// currently meets its desired state is stabilizing, not actionable: acting
+    /// on it would find nothing to do and wrongly exhaust it.
     pub fn actionable(&self, now: Timestamp) -> Vec<&Incident> {
         self.incidents
             .values()
@@ -257,6 +259,7 @@ impl Manager {
                     && matches!(i.state, IncidentState::Open | IncidentState::Regressed { .. })
                     && i.budget_left > 0
                     && now >= i.next_attempt
+                    && self.tracks.get(&i.target).is_none_or(|t| t.satisfied_since.is_none())
             })
             .collect()
     }
