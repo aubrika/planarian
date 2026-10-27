@@ -15,13 +15,15 @@ rustPlatform.buildRustPackage {
       ../crates
       ../share
       ../assets/identity/animations/keyframes.json
+      ../assets/identity/marks/planarian-mark-micro-currentcolor.svg
       ../assets/identity/integration/linux
       ../nix/template/planarian/overrides.nix
     ];
   };
 
   cargoLock.lockFile = ../Cargo.lock;
-  cargoBuildFlags = [ "-p" "planarian-console" ];
+  # The console and the status indicator (which starts the console next to it).
+  cargoBuildFlags = [ "-p" "planarian-console" "-p" "planarian-tray" ];
   # The workspace's tests run in the main package.
   doCheck = false;
 

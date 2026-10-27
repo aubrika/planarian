@@ -1,0 +1,22 @@
+[package]
+name = "planarian-tray"
+description = "Planarian's status indicator: a StatusNotifierItem that turns amber or red when something needs you."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "planarian-tray"
+path = "src/main.rs"
+
+[dependencies]
+planarian-schema.workspace = true
+planarian-ipc.workspace = true
+serde_json.workspace = true
+# StatusNotifierItem over zbus; async-io (already in the tree through iced), no tokio, no GTK.
+ksni = { version = "=0.3.7", default-features = false, features = ["async-io", "blocking"] }
+tiny-skia = { version = "0.11", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

@@ -12,6 +12,7 @@ rustPlatform.buildRustPackage {
       ../crates
       ../share
       ../assets/identity/animations/keyframes.json
+      ../assets/identity/marks/planarian-mark-micro-currentcolor.svg
       ../nix/template/planarian/overrides.nix
     ];
   };

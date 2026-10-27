@@ -5,8 +5,8 @@
 //! daemon takes it from `SO_PEERCRED` (§11).
 
 use planarian_schema::{
-    ChangeId, DerivedFacts, EdgeKind, GenerationId, Hash, Incident, ProbeId, Resolution, Timestamp, TxnId, TxnState,
-    UnitId, UnitStatus, Until, Value,
+    ChangeId, DerivedFacts, EdgeKind, GenerationId, Hash, Incident, IncidentState, ProbeId, Resolution, Timestamp,
+    TxnId, TxnState, UnitId, UnitStatus, Until, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -159,6 +159,44 @@ pub struct ConsoleReport {
     /// The daemon's clock when it answered.
     #[serde(default)]
     pub now: Timestamp,
+}
+
+impl ConsoleReport {
+    /// §16a: something needs a person: an open incident, a pending approval,
+    /// the recovery interlock, a reconciliation record, or a reverted change.
+    /// The console starts visible, and the tray turns amber or red.
+    pub fn needs_attention(&self) -> bool {
+        let s = &self.status;
+        s.incidents.iter().any(|i| i.state != IncidentState::Closed)
+            || !s.pending.is_empty()
+            || !s.interlock.is_empty()
+            || s.reconciliation.as_ref().is_some_and(|a| !a.is_empty())
+            || self.last_change_reverted
+    }
+}
+
+/// A unit status in words.
+pub fn status_words(s: &UnitStatus) -> String {
+    use UnitStatus as S;
+    use planarian_schema::Reason;
+    match s {
+        S::Running => "running".into(),
+        S::Degraded(probes) => {
+            let names: Vec<&str> = probes.iter().map(|p| p.0.as_str()).collect();
+            format!("running, but failing its health check ({})", names.join(", "))
+        }
+        S::Stopped => "stopped".into(),
+        S::Suppressed => "left alone on request".into(),
+        S::Unknown => "unknown (no fresh evidence)".into(),
+        S::Failed(Reason::ExitCode(c)) => format!("failed (exit code {c})"),
+        S::Failed(Reason::DriverError(e)) => format!("failed (driver: {e})"),
+        S::Failed(Reason::Backend(e)) => format!("failed ({e})"),
+        S::Absent => "absent".into(),
+        S::Detected => "detected, no driver bound".into(),
+        S::Bound => "bound to its driver".into(),
+        S::Transitioning => "starting or stopping".into(),
+        S::NotExpected => "not expected now".into(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
