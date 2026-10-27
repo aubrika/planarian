@@ -90,6 +90,13 @@ pkgs.testers.runNixOSTest (
             wantedBy = [ "multi-user.target" ];
             serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 -m http.server 8080 --bind ${config.services.gym-web.listenAddress} --directory /etc";
           };
+          # A service the user stops on purpose: generation changes must not start it again.
+          systemd.services.gym-idle = {
+            wantedBy = [ "multi-user.target" ];
+            serviceConfig.ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+          };
+          services.planarian.units.gym-idle = { };
+
           systemd.services.gym-extra = lib.mkIf config.services.gym-extra.enable {
             wantedBy = [ "multi-user.target" ];
             serviceConfig.ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
@@ -127,6 +134,11 @@ pkgs.testers.runNixOSTest (
           print(machine.succeed("script -qec 'planarian mark-good' /dev/null 2>&1"))
           machine.wait_until_succeeds("planarian status | grep -E 'known-good [0-9]+'", timeout=300)
 
+      with subtest("the user stops a service"):
+          machine.wait_for_unit("gym-idle.service")
+          print(machine.succeed("ask 'stop gym-idle until I say' 2>&1"))
+          machine.wait_until_fails("systemctl is-active gym-idle.service", timeout=300)
+
       with subtest("a cataloged change is built, activated, checked and committed"):
           print(machine.succeed("planarian apply service-enable service=gym-extra enabled=true 2>&1 || true"))
           machine.wait_until_succeeds("systemctl is-active gym-extra.service", timeout=1800)
@@ -134,6 +146,8 @@ pkgs.testers.runNixOSTest (
           machine.succeed("test \"$(readlink -f /run/current-system)\" = ${good}")
           machine.succeed("grep -q 'gym-extra' /etc/nixos/planarian/overrides.nix")
           print(machine.succeed("planarian log -n 40"))
+          # Activation restarted every target; the user's stop still holds.
+          machine.fail("systemctl is-active gym-idle.service")
 
       with subtest("a change that breaks a service is reverted"):
           print(machine.succeed("planarian apply listen-address service=gym-web addr=192.0.2.10 2>&1 || true"))
@@ -144,6 +158,7 @@ pkgs.testers.runNixOSTest (
           machine.fail("grep -q 192.0.2.10 /etc/nixos/planarian/overrides.nix")
           machine.wait_until_succeeds("curl -sf http://127.0.0.1:8080/hostname", timeout=600)
           machine.succeed("systemctl is-active gym-extra.service")
+          machine.fail("systemctl is-active gym-idle.service")
     '';
   }
 )

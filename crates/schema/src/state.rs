@@ -188,7 +188,7 @@ struct DigestView<'a> {
     core_hash: Hash,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq)]
 enum ObservedView<'a> {
     Unknown { reason: &'a str },
     Transitioning { from: Box<ObservedView<'a>> },
@@ -358,4 +358,97 @@ mod tests {
         c.generation = GenerationId(3);
         assert_ne!(a.digest(), c.digest());
     }
+
+    /// §18.4, over random states: perturbing resources or any observation
+    /// timestamp never changes the digest; changing what the state says
+    /// always does.
+    mod digest_props {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, FailurePersistence};
+
+        fn observed() -> impl Strategy<Value = Observed> {
+            prop_oneof![
+                Just(Observed::Active),
+                Just(Observed::Bound),
+                Just(Observed::Absent),
+                (0..3i32).prop_map(|c| Observed::Failed(Reason::ExitCode(c))),
+                "[a-c]{1,3}".prop_map(|r| Observed::Unknown { since: Timestamp(1), reason: r }),
+                Just(Observed::Transitioning { from: Box::new(Observed::Active), since: Timestamp(1) }),
+            ]
+        }
+
+        fn result() -> impl Strategy<Value = ProbeResult> {
+            prop_oneof![Just(ProbeResult::Pass), Just(ProbeResult::Timeout), "[xy]{1,2}".prop_map(ProbeResult::Fail)]
+        }
+
+        prop_compose! {
+            fn system()(
+                generation in 1..4u64,
+                units in proptest::collection::btree_map(
+                    "[a-d]{1,2}",
+                    (observed(), proptest::collection::vec(("[pq]", result()), 0..3)),
+                    0..4,
+                ),
+            ) -> SystemState {
+                let mut s = state(1_000);
+                s.generation = GenerationId(generation);
+                for (name, (o, ev)) in units {
+                    let ev = ev.into_iter().map(|(p, r)| super::ev(&p, r, 900)).collect();
+                    s.units.insert(UnitId::service(&name), (o, ev));
+                }
+                s
+            }
+        }
+
+        /// Every timestamp and resource figure in the state, moved.
+        fn perturb(s: &SystemState, by: u64) -> SystemState {
+            let mut t = s.clone();
+            t.observed_at = Timestamp(t.observed_at.0 + by);
+            t.resources.mem_available_mb += by;
+            t.resources.mem_total_mb += 2 * by;
+            for (o, ev) in t.units.values_mut() {
+                match o {
+                    Observed::Unknown { since, .. } | Observed::Transitioning { since, .. } => since.0 += by,
+                    _ => {}
+                }
+                for e in ev {
+                    e.at.0 += by;
+                }
+            }
+            t
+        }
+
+        proptest! {
+            #![proptest_config(Config { cases: 256, failure_persistence: None::<Box<dyn FailurePersistence>>, ..Config::default() })]
+
+            #[test]
+            fn timestamps_and_resources_do_not_count(s in system(), by in 1..1_000_000u64) {
+                prop_assert_eq!(s.digest(), perturb(&s, by).digest());
+            }
+
+            #[test]
+            fn what_the_state_says_does(s in system(), o in observed()) {
+                let mut t = s.clone();
+                t.generation = GenerationId(s.generation.0 + 10);
+                prop_assert_ne!(s.digest(), t.digest());
+                let mut u = s.clone();
+                u.suppressions.push(Suppression {
+                    unit: UnitId::service("z"),
+                    until: Until::Explicit,
+                    reason: String::new(),
+                    by: Actor::Daemon,
+                    stopped: false,
+                });
+                prop_assert_ne!(s.digest(), u.digest());
+                if let Some((id, (old, ev))) = s.units.iter().next() {
+                    let same = ObservedView::of(old) == ObservedView::of(&o);
+                    let mut v = s.clone();
+                    v.units.insert(id.clone(), (o, ev.clone()));
+                    prop_assert_eq!(s.digest() == v.digest(), same);
+                }
+            }
+        }
+    }
 }
+

@@ -12,8 +12,9 @@ separate watchdog finishes or reverts the change.
 - Fault catalog: [`crates/gym/catalog/phase-a.toml`](crates/gym/catalog/phase-a.toml)
 
 **Status: Phase A, ready for initial user testing on NixOS 26.05.** No language
-model is involved. The `policy` proofs verify; the `txn` proofs and the
-visual console are not done yet (see `docs/AGENTS.md`).
+model is involved. `policy::decide`, the journal state machine and the
+ledger are verified with Verus (`docs/verification.md`). What is left is
+in `docs/AGENTS.md`.
 
 ## Trying it
 
@@ -56,6 +57,12 @@ that checkpoint, the generation becomes the known-good baseline.
 | `planarian apply service-enable service=sshd enabled=false` | Security-sensitive, so it asks: `sudo planarian approve <hash>`, at a terminal. |
 | As a normal user: `planarian suppress sshd` | Refused: `Unauthorized`. |
 
+The console (`services.planarian.console.enable = true;`, on with the
+reference module) shows the dependency graph with what is desired,
+observed and healthy for each unit, the transaction timeline, the
+generations and the incidents. It starts minimized unless something needs
+attention.
+
 Other commands: `planarian incidents`, `planarian log -n 50`, `planarian undo`,
 `planarian gc`, `planarian diagnose <unit>`, `planarian cancel <txn>`,
 `planarian mark-good`, `planarian resolve <txn> --as-committed|--as-reverted|--manual-repaired`.
@@ -91,6 +98,8 @@ become `Wants` and ordering edges that are never blamed for a failure. Add
 cargo test                                   # every crate
 cargo run -p planarian-gym -- run            # the fault catalog, fake harness
 crates/gym/demo.sh --harness fake            # the GA demonstration
+cargo run -p planarian-gym -- serve --socket /tmp/p.sock   # a fake machine on a socket:
+PLANARIAN_SOCKET=/tmp/p.sock cargo run -p planarian-console # try the console (or the CLI) against it
 nix build .#checks.x86_64-linux.package      # package + tests in the Nix sandbox
 nix build .#checks.x86_64-linux.module-eval  # a full NixOS system evaluated with the module
 nix build .#checks.x86_64-linux.vm-runtime   # NixOS VM test on real systemd (KVM recommended)

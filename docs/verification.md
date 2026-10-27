@@ -57,8 +57,14 @@ reject (the I5 lemma fails).
 
 ## `schema`
 
-The types `decide` reads are inside `verus!`; `Sensitivities`' operations
-are verified against their specs. `schema::digest` is not yet proved.
+The types `decide` and the ledger read are inside `verus!`;
+`Sensitivities`' operations, the transition-to-recovery table and the
+`TxnState` predicates are verified against their specs.
+
+`schema::digest` is not proved (see `deviations.md` for why). A property
+test over random states checks it: perturbing resources or any observation
+timestamp never changes the digest, and changing the generation, a
+suppression, or a unit's observed state always does.
 
 ## `txn` (Phase A target: done for the state machine and the ledger)
 
