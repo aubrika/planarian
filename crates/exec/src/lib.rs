@@ -127,10 +127,11 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     pub fn adopt_current(&self) {
         let gens = self.b.generations();
         if let (Ok(g), Ok((set, hash))) = (gens.current(), gens.read_overrides())
-            && gens.override_for(g).ok().flatten().is_none() {
-                let _ = gens.remember_override(&set);
-                let _ = gens.record_override(g, &hash);
-            }
+            && gens.override_for(g).ok().flatten().is_none()
+        {
+            let _ = gens.remember_override(&set);
+            let _ = gens.record_override(g, &hash);
+        }
     }
 
     /// Keep the probe-run baselines and the GC protected set current.
@@ -472,11 +473,12 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             .ok()
             .and_then(|l| l.live.get(&parked.txn).and_then(|t| t.txn.base_source));
         if let Some(base) = staged_base
-            && self.b.generations().source_hash(&self.cfg.owner).map(|h| h != base).unwrap_or(true) {
-                self.parked.remove(&parked.txn);
-                let _ = self.kernel.reject(parked.txn, RejectReason::Stale);
-                return reject(RejectReason::Stale, "your configuration changed after the approval was requested");
-            }
+            && self.b.generations().source_hash(&self.cfg.owner).map(|h| h != base).unwrap_or(true)
+        {
+            self.parked.remove(&parked.txn);
+            let _ = self.kernel.reject(parked.txn, RejectReason::Stale);
+            return reject(RejectReason::Stale, "your configuration changed after the approval was requested");
+        }
         let plan = match self.plan(&parked.proposal, &parked.authz, state, defs) {
             Ok(p) => p,
             Err(s) => {

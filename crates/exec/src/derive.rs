@@ -64,9 +64,10 @@ fn touches_canonical(base: &Manifest, cand: &Manifest, canonical: &Canonical) ->
         let Some(core) = canonical.get(&id.name) else { continue };
         for p in &d.probes {
             if let Some(c) = core.iter().find(|c| c.id == p.id)
-                && c != p {
-                    return true;
-                }
+                && c != p
+            {
+                return true;
+            }
         }
         // Present in the base with a canonical probe declared, and the candidate
         // drops that declaration while keeping the unit.

@@ -270,20 +270,49 @@ impl World {
         for (id, sim) in self.units.iter_mut() {
             if sim.observed == Observed::Active
                 && let Some(after) = sim.fail_after
-                    && now.0 >= sim.started_at.0 + after.0 {
-                        sim.observed = Observed::Failed(Reason::ExitCode(1));
-                        sim.failed_at = Some(Timestamp(sim.started_at.0 + after.0));
-                    }
+                && now.0 >= sim.started_at.0 + after.0
+            {
+                sim.observed = Observed::Failed(Reason::ExitCode(1));
+                sim.failed_at = Some(Timestamp(sim.started_at.0 + after.0));
+            }
             if let (Observed::Failed(_), Some(rs), Some(at)) = (&sim.observed, sim.systemd_restart, sim.failed_at)
-                && now.0 >= at.0 + rs.0 {
-                    sim.restarts += 1;
-                    if sim.fail_on_start || broken.contains(id) {
-                        sim.failed_at = Some(now);
-                    } else {
-                        sim.observed = Observed::Active;
-                        sim.started_at = now;
-                    }
+                && now.0 >= at.0 + rs.0
+            {
+                sim.restarts += 1;
+                if sim.fail_on_start || broken.contains(id) {
+                    sim.failed_at = Some(now);
+                } else {
+                    sim.observed = Observed::Active;
+                    sim.started_at = now;
                 }
+            }
+        }
+    }
+
+    /// `systemctl stop` outside Planarian: systemd also stops every unit that
+    /// `Requires=` it (transitively).
+    pub fn stop_out_of_band(&mut self, unit: &UnitId) {
+        let mut todo = vec![unit.clone()];
+        while let Some(u) = todo.pop() {
+            if let Some(sim) = self.units.get_mut(&u) {
+                if sim.observed == Observed::Active {
+                    sim.observed = Observed::Bound;
+                }
+            }
+            for (id, d) in &self.base_units {
+                if d.edges.iter().any(|e| e.to == u && e.kind == EdgeKind::Requires) {
+                    todo.push(id.clone());
+                }
+            }
+        }
+    }
+
+    /// SIGKILL a unit's main process.
+    pub fn kill(&mut self, unit: &UnitId) {
+        let now = self.now;
+        if let Some(sim) = self.units.get_mut(unit) {
+            sim.observed = Observed::Failed(Reason::ExitCode(137));
+            sim.failed_at = Some(now);
         }
     }
 

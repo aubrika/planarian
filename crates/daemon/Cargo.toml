@@ -1,0 +1,31 @@
+[package]
+name = "planarian-daemon"
+description = "planariad: the Planarian daemon (SPEC §10–§16)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "planarian_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+planarian-schema.workspace = true
+planarian-txn.workspace = true
+planarian-policy.workspace = true
+planarian-changes.workspace = true
+planarian-state.workspace = true
+planarian-incident.workspace = true
+planarian-diagnose.workspace = true
+planarian-intent.workspace = true
+planarian-exec.workspace = true
+planarian-ipc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+planarian-fake.workspace = true
+
+[lints]
+workspace = true

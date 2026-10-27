@@ -138,6 +138,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "planarian-daemon"
+version = "0.0.0"
+dependencies = [
+ "planarian-changes",
+ "planarian-diagnose",
+ "planarian-exec",
+ "planarian-fake",
+ "planarian-incident",
+ "planarian-intent",
+ "planarian-ipc",
+ "planarian-policy",
+ "planarian-schema",
+ "planarian-state",
+ "planarian-txn",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "planarian-diagnose"
 version = "0.0.0"
 dependencies = [
@@ -183,6 +202,15 @@ dependencies = [
 
 [[package]]
 name = "planarian-intent"
+version = "0.0.0"
+dependencies = [
+ "planarian-schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "planarian-ipc"
 version = "0.0.0"
 dependencies = [
  "planarian-schema",

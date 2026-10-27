@@ -1,0 +1,15 @@
+[package]
+name = "planarian-ipc"
+description = "Planarian daemon socket protocol: one JSON request, one JSON response, per connection."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+planarian-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

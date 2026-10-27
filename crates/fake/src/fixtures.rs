@@ -68,7 +68,7 @@ pub fn gym_units() -> UnitDefs {
     let db = unit(
         "service:gym-db",
         r,
-        Disruption::DataInterruption,
+        Disruption::Brief,
         vec![user_probe("gym-db-tcp", ProbeKind::Tcp { addr: "127.0.0.1:5432".into() })],
     );
     let mut app = unit(

@@ -76,9 +76,10 @@ impl<B: Backends> ExecHost<B> {
             CheckPhase::Revert => txn.candidate.as_ref().map(|_| txn.revert_to),
         };
         if let Some(g) = want_gen
-            && s.generation != g {
-                out.push(format!("running generation is {} (expected {})", s.generation.0, g.0));
-            }
+            && s.generation != g
+        {
+            out.push(format!("running generation is {} (expected {})", s.generation.0, g.0));
+        }
         if phase == CheckPhase::Candidate {
             for (u, want) in &txn.expected.units {
                 // A unit the candidate no longer defines can't be held to a status.
