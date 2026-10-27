@@ -1,0 +1,20 @@
+[package]
+name = "planarian-txn"
+description = "Planarian transaction kernel: journal, ledger, leases, recovery (SPEC §12)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+planarian-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crc32c.workspace = true
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

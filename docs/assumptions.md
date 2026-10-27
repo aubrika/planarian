@@ -17,3 +17,7 @@ Every externally specified behavior the proofs rely on (SPEC §17a). Each Verus 
 ## Progress assumptions for I12
 
 Some lease holder eventually runs; a fenced worker eventually stops issuing calls or its calls are refused; journal writes eventually succeed; backend calls terminate.
+
+## Fake harness (tests only, not proof sites)
+
+`txn::fake` models the backends in memory. Each kernel test's claim is only as good as the fake's fidelity to the contracts above: fencing refuses a stale epoch before any effect, `jobs_tagged` finds every job an op started (or answers `None`), and `swap_override` is a compare-and-swap. The VM harness exists to check the real backends against these same contracts.

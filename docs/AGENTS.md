@@ -17,5 +17,12 @@ Instructions to coding agents working on Planarian. Source of truth: SPEC §18 (
 
 ## Status
 
-- [x] 0. Phase A fault catalog: `crates/gym/catalog/phase-a.toml`; review notes in `docs/catalog-review.md`. **Awaiting owner review.**
-- [ ] 1. GA demonstration script `gym/demo.sh`.
+- [x] 0. Phase A fault catalog: `crates/gym/catalog/phase-a.toml`; review notes in `docs/catalog-review.md`. Owner accepted the defaults 2026-10-26.
+- [x] 1. GA demonstration script `crates/gym/demo.sh` (written; passes once `gym` exists).
+- Build order (item 3):
+  - [x] `schema`
+  - [x] `txn`: journal, ledger, kernel, crash-recovery table, in-memory fake backend. The fake-harness catalog cases for the kernel are in `crates/txn/tests/`.
+  - [ ] `policy`, with Verus proofs (item 9). Verus is not preinstalled in the dev container; building it from source (git clone works; z3 from PyPI) is the first step.
+  - [ ] everything after `policy`
+
+Verus status: `schema`, `policy` and `txn` are written to the subset's discipline (no `dyn`, no `unsafe`, no floats, integer time), but nothing has been run through Verus yet. The intended proof targets in `txn` are `machine::step_allowed` and `Ledger::validate`/`apply`. Until then, their properties are covered by tests (`machine.rs` unit tests; `tests/kernel.rs`).
