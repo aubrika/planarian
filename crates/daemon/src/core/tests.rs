@@ -341,3 +341,22 @@ fn a_users_stop_survives_generation_changes() {
     assert!(stopped(&r));
     assert_eq!(r.status("service:gym-cache"), UnitStatus::Suppressed);
 }
+
+#[test]
+fn reads_are_answered_from_a_snapshot_while_busy() {
+    use crate::snapshot::{self, Busy, Snapshot};
+    let mut r = Rig::new();
+    r.ticks(2);
+    let apply = Request::Apply { change: ChangeId("service-enable".into()), args: Default::default() };
+    assert!(!snapshot::read_only(&apply) && snapshot::read_only(&Request::Log { limit: 5 }));
+    let snap = Snapshot::take(&mut r.core).expect("snapshot");
+    let busy = Busy { with: snapshot::describe(&apply), since: std::time::Instant::now() };
+    let Some(Response::Status(s)) = snap.answer(&Request::Status, &busy) else { panic!("status") };
+    assert!(s.notices[0].starts_with("busy with the change service-enable for under a minute"), "{:?}", s.notices);
+    assert!(s.units.iter().any(|u| u.unit == UnitId::service("gym-web")));
+    let Some(Response::Console(c)) = snap.answer(&Request::Console, &busy) else { panic!("console") };
+    assert!(c.status.notices[0].starts_with("busy with"));
+    let Some(Response::Log { lines }) = snap.answer(&Request::Log { limit: 1 }, &busy) else { panic!("log") };
+    assert_eq!(lines.len(), 1);
+    assert!(snap.answer(&apply, &busy).is_none());
+}

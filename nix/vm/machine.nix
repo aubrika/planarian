@@ -217,7 +217,7 @@ in
     security.sudo.wheelNeedsPassword = false;
 
     virtualisation = {
-      memorySize = lib.mkDefault (if cfg.desktop then 4096 else 2048);
+      memorySize = lib.mkDefault (if cfg.desktop then 6144 else 3072);
       cores = lib.mkDefault 4;
       # Room for the free-space probes and for generations built inside.
       diskSize = lib.mkDefault 20480;

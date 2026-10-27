@@ -2,6 +2,7 @@
 
 use planarian_backend_linux::{Paths, Real};
 use planarian_daemon::config::{CONFIG, FileConfig, is_admin, load_canonical};
+use planarian_daemon::snapshot::{self, Busy, Snapshot};
 use planarian_daemon::{Core, CoreConfig, Peer};
 use planarian_exec::Config as ExecConfig;
 use planarian_ipc::{Request, Response, SOCKET};
@@ -13,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 const TICK: Duration = Duration::from_secs(5);
@@ -153,10 +154,15 @@ fn main() {
     type Job = (Peer, Request, mpsc::Sender<Response>);
     let (tx, rx) = mpsc::channel::<Job>();
     let group = file.admin_group.clone();
+    // Set while the core handles a request that may take long; read-only
+    // requests are answered from the snapshot meanwhile (snapshot.rs).
+    let busy: Arc<Mutex<Option<(Busy, Snapshot)>>> = Arc::new(Mutex::new(None));
+    let shared = busy.clone();
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
             let tx = tx.clone();
             let group = group.clone();
+            let shared = shared.clone();
             std::thread::spawn(move || {
                 let Some(peer) = peer_of(&conn, &group) else { return };
                 let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
@@ -165,6 +171,13 @@ fn main() {
                     return;
                 }
                 let resp = match serde_json::from_str::<Request>(&line) {
+                    Ok(req) if snapshot::read_only(&req) && shared.lock().is_ok_and(|b| b.is_some()) => {
+                        let b = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        match b.as_ref().and_then(|(busy, snap)| snap.answer(&req, busy)) {
+                            Some(r) => r,
+                            None => Response::Error { message: "the daemon is busy".into() },
+                        }
+                    }
                     Ok(req) => {
                         let (rtx, rrx) = mpsc::channel();
                         if tx.send((peer, req, rtx)).is_err() {
@@ -187,7 +200,15 @@ fn main() {
         let wait = next_tick.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
             Ok((peer, req, reply)) => {
+                let long = !snapshot::read_only(&req);
+                if long && let Some(snap) = Snapshot::take(&mut core) {
+                    let b = Busy { with: snapshot::describe(&req), since: Instant::now() };
+                    *busy.lock().unwrap_or_else(|e| e.into_inner()) = Some((b, snap));
+                }
                 let resp = core.handle(peer, req);
+                if long {
+                    *busy.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
                 let _ = reply.send(resp);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {

@@ -34,7 +34,9 @@ are real rebuilds (they download from cache.nixos.org, so the VM needs the
 host's network).
 
 - It uses KVM when `/dev/kvm` is available and falls back to emulation
-  (slow, especially the desktop) when not. The desktop wants 4 GB of RAM.
+  (slow, especially the desktop) when not. It takes 6 GB of RAM (3 GB for
+  `vm-text`), since Planarian evaluates the whole system inside the VM when
+  it makes a change.
 - State lives in `planarian-vm.qcow2` in the directory you ran it from.
   Delete it to start over. Delete it too after updating Planarian, since the
   old disk's `/etc/nixos` still points at the old version.

@@ -5,5 +5,6 @@
 pub mod config;
 pub mod core;
 pub mod render;
+pub mod snapshot;
 
 pub use core::{Core, CoreConfig, LogRecord, Peer};
