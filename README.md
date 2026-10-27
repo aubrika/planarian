@@ -68,6 +68,22 @@ host's network).
   newest generation Planarian published.
 - The text variant's terminal is the serial console: `Ctrl-a x` quits QEMU.
 
+## Trying it from a USB stick
+
+```sh
+nix build github:aubrika/planarian#iso      # same credentials as above while the repo is private
+sudo dd if=result/iso/planarian-live.iso of=/dev/sdX bs=4M status=progress conv=fsync
+```
+
+(`/dev/sdX` is the flash drive: check with `lsblk` first; `dd` overwrites
+it. Any image writer works, e.g. GNOME Disks or Fedora Media Writer.) Boot
+from it (UEFI or BIOS) and you get the same demo as the VM: COSMIC, the
+console, the welcome terminal, `demo-fault`. It runs entirely in RAM, so
+changes Planarian makes are real rebuilds (with a network), and everything
+is gone at the next boot. Give it at least 8 GB of RAM if you want to try
+configuration changes. It does not install anything; to keep Planarian,
+install NixOS and follow the next section.
+
 ## Trying it on your machine
 
 Planarian needs a flake-based NixOS configuration. It never edits your own

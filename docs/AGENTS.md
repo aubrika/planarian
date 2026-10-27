@@ -31,6 +31,7 @@ Checks and where they run:
 
 - `nix build .#checks.x86_64-linux.boundaries` (or `nix/tests/boundaries.sh`): the dependency rule (§5, §17): core crates use no backends, `std::process`, `/proc`, `/sys` or `/nix`; no `dyn` in schema, policy, txn, exec; nothing lifts `unsafe_code = forbid`.
 - `nix build .#checks.x86_64-linux.vm-generations`: a NixOS VM applies a cataloged change (commits), a bad one (reverts), and keeps a user's stop through both.
+- `nix build .#iso`: the same demo machine as a live USB image (nix/live/iso.nix; shared parts in nix/demo/common.nix), UEFI and BIOS, everything in RAM.
 - `nix run .#vm` / `nix run .#vm-text`: an interactive demo VM (nix/vm/machine.nix) whose /etc/nixos evaluates to the booted system, so changes made inside are real rebuilds. `checks.demo-vm` builds it.
 - `cargo kani -p planarian-txn` and `cargo kani -p planarian-exec`: the Kani harnesses for the kernel's decision rules and token expiry (§17a). Kani is not in nixpkgs: `cargo install --locked kani-verifier && cargo kani setup`. See `docs/verification.md`.
 - `nix build .#checks.x86_64-linux.verus`: `decide` verified and the §17a policy properties proved, in the Nix sandbox with the pinned Verus. See `docs/verification.md`.

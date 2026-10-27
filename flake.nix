@@ -8,10 +8,11 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-      demoVm = system: desktop: nixpkgs.lib.nixosSystem {
+      demoVm = system: desktop: demoOn "demo" system desktop;
+      demoOn = module: system: desktop: nixpkgs.lib.nixosSystem {
         specialArgs.inputs = { inherit nixpkgs; planarian = self; };
         modules = [
-          self.nixosModules.demo
+          self.nixosModules.${module}
           ./nix/template/planarian/overrides.nix
           { nixpkgs.hostPlatform = system; planarian.demo.desktop = desktop; }
         ];
@@ -21,6 +22,8 @@
       packages = forAll (pkgs: rec {
         planarian = pkgs.callPackage ./nix/package.nix { };
         console = pkgs.callPackage ./nix/console.nix { };
+        # The live USB image: `nix build .#iso`, then write result/iso/*.iso to a flash drive.
+        iso = self.nixosConfigurations."planarian-live-${pkgs.stdenv.hostPlatform.system}".config.system.build.isoImage;
         default = planarian;
       });
 
@@ -31,14 +34,16 @@
           services.planarian.console.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.console;
         };
         reference = ./nix/reference.nix;
-        # The demo VM's machine (nix/vm/machine.nix); needs specialArgs.inputs.
+        # The demo machine as a VM and as a live USB image; need specialArgs.inputs.
         demo = ./nix/vm/machine.nix;
+        live = ./nix/live/iso.nix;
       };
 
       # The demo VM: `nix run .#vm` (desktop) or `nix run .#vm-text`.
       nixosConfigurations = nixpkgs.lib.foldl' (acc: system: acc // {
         "planarian-vm-${system}" = demoVm system true;
         "planarian-vm-text-${system}" = demoVm system false;
+        "planarian-live-${system}" = demoOn "live" system true;
       }) { } systems;
 
       apps = forAll (pkgs:
