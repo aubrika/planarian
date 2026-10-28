@@ -497,6 +497,8 @@ impl GenerationBackend for Nixos {
         let candidate = render(overrides);
         std::fs::write(self.override_file(&tmp), &candidate).map_err(|e| Outcome::Failed(e.to_string()))?;
         let staged_source = nar_hash(&tmp)?;
+        #[cfg(feature = "gym-hooks")]
+        eprintln!("gym: staged {}: base {} candidate {}", owner.root, base_source.to_hex(), staged_source.to_hex());
         let dir = self.staged_dir(&staged_source);
         if dir.exists() {
             let _ = std::fs::remove_dir_all(&tmp);
@@ -518,6 +520,8 @@ impl GenerationBackend for Nixos {
         let (tmp, _) = self.copy_owner(Path::new(&owner.root))?;
         let h = nar_hash(&tmp);
         let _ = std::fs::remove_dir_all(&tmp);
+        #[cfg(feature = "gym-hooks")]
+        eprintln!("gym: source hash of {} now {:?}", owner.root, h.as_ref().map(|h| h.to_hex()));
         h
     }
 

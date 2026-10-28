@@ -238,7 +238,7 @@ fn main() {
     });
 
     eprintln!("planariad: started (pid {})", std::process::id());
-    let mut printed = 0usize;
+    let mut printed = 0u64;
     let mut next_tick = Instant::now();
     // One build at a time; later ones wait their turn.
     let mut building = false;
@@ -308,14 +308,12 @@ fn main() {
         }
         let lines: Vec<String> = core.log.drain(..).filter_map(|r| serde_json::to_string(&r).ok()).collect();
         append_log(&paths.state, &lines);
-        // Notices go to the journal (stderr), once each.
-        let n = core.notices.len();
-        if n < printed {
-            printed = 0;
-        }
-        for s in core.notices.iter().skip(printed) {
+        // Notices go to the journal (stderr), once each. Once the deque is
+        // full its length stops growing, so count by the total.
+        let new = core.notices_total.saturating_sub(printed).min(core.notices.len() as u64) as usize;
+        for s in core.notices.iter().skip(core.notices.len() - new) {
             eprintln!("planariad: {s}");
         }
-        printed = n;
+        printed = core.notices_total;
     }
 }

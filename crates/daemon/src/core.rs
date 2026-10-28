@@ -83,6 +83,9 @@ pub struct Core<B: Backends + Clone, S: Store> {
     pub asm: Assembler,
     pub incidents: Manager,
     pub notices: VecDeque<String>,
+    /// How many notices there have ever been (the deque keeps the last
+    /// `NOTICES_KEPT`), so the binary can print each new one once.
+    pub notices_total: u64,
     /// Drained by the binary into the executor log file.
     pub log: Vec<LogRecord>,
     cfg: CoreConfig,
@@ -189,6 +192,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             b,
             asm,
             incidents,
+            notices_total: notices.len() as u64,
             notices,
             log: vec![],
             cfg,
@@ -229,6 +233,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.notices.pop_front();
         }
         self.notices.push_back(s);
+        self.notices_total += 1;
     }
 
     fn journal(&mut self, r: Record) {

@@ -617,6 +617,7 @@ fn step(entry: &T, i: usize, watched: Option<&str>) {
         }
         let actor = st.get("actor").and_then(T::as_str).unwrap_or("user:1001").to_string();
         let r = run_step(&cfg, st, &actor);
+        eprintln!("gym: step {i} at the {state} pause: {r:?}");
         let _ = std::fs::remove_file(&marker);
         if let Err(e) = r {
             die(&format!("step {i}: {e}"));
@@ -877,10 +878,13 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
         "edit_owner_source" => {
             let root = cfg.owner.display().to_string();
             let path = get("path");
-            sh(&format!("echo '# edited by the gym' >> {root}/{path}"));
+            if !sh(&format!("echo '# edited by the gym' >> {root}/{path}")) {
+                return Err(format!("could not edit {root}/{path}"));
+            }
             if st.get("tracked").and_then(T::as_bool) != Some(false) {
                 sh(&format!("cd {root} && git add {path} 2>/dev/null; true"));
             }
+            eprintln!("gym: edited {root}/{path}: {}", sh_out(&format!("git -C {root} status --short")).trim());
         }
         "out_of_band_rebuild" => {
             // The VM carries these as prebuilt specialisations (nix/tests/gym-vm.nix).

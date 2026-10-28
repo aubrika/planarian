@@ -478,7 +478,8 @@ let
             print(machine.execute(
                 "ls -la /run/planarian-gym; cat /run/planarian-gym/hooks.json; echo;"
                 " journalctl -o short-monotonic --no-pager -u planariad -u planarian-recovery -u 'gym-watch-*' | tail -n 150;"
-                " tail -n 40 /var/lib/planarian/log/executor.jsonl"
+                " ls -la /var/lib/planarian /var/lib/planarian/log; planarian log -n 10;"
+                " git -C /etc/nixos status --short; tail -n 3 /etc/nixos/configuration.nix"
             )[1])
             print(machine.succeed(f"{gym} judge --id {ID} 2>&1"))
         machine.copy_from_vm("/var/lib/gym-run/verdict.json", "")
