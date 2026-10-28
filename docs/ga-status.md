@@ -114,9 +114,8 @@ is Unknown rather than Failed), `storage-budget-unsatisfiable`,
 the fake catalog and the GA demonstration, the dependency boundaries, the
 Verus proofs, the Kani harnesses. `vm.yml` on every push: the NixOS VM tests
 (runtime, generations, installer) and the four GA demonstration entries on
-VMs; the whole VM catalog by hand. In a private repository these runs count
-against the Actions quota (about 70 runner minutes per push for `vm.yml`;
-several hundred for the whole catalog).
+VMs; the whole VM catalog by hand (about 70 runner minutes per push for
+`vm.yml`; several hundred for the whole catalog).
 
 ## Not part of the gate, still open
 

@@ -18,96 +18,21 @@ separate watchdog finishes or reverts the change.
 - What differs from the spec, and why: [`docs/deviations.md`](docs/deviations.md)
 - Fault catalog: [`crates/gym/catalog/phase-a.toml`](crates/gym/catalog/phase-a.toml)
 
-**Status: Phase A, ready for initial user testing on NixOS 26.05.** No language
-model is involved. `policy::decide`, the journal state machine and the
-ledger are verified with Verus (`docs/verification.md`). What is left is
-in `docs/AGENTS.md`.
+**Status: under construction.** This is experimental software that restarts
+services and rebuilds and activates your NixOS configuration on its own. Try
+it in a VM, or on a machine you can afford to break. Phase A (the
+deterministic core, NixOS 26.05) is close to its exit gate
+([`docs/ga-status.md`](docs/ga-status.md)); later phases are not started. No
+language model is involved. `policy::decide`, the journal state machine and
+the ledger are verified with Verus (`docs/verification.md`).
 
-## Trying it in a VM (one command)
-
-On any Linux machine with Nix (flakes enabled):
-
-```sh
-nix run github:aubrika/planarian#vm        # COSMIC desktop with the console, in a window
-nix run github:aubrika/planarian#vm-text   # no desktop: a shell in your terminal
-```
-
-While the repository is private, Nix needs GitHub credentials of its own
-(it does not use a `gh` or browser login). Any one of these works:
+A prototype NixOS image with Planarian (a demo VM, a live USB stick and an
+installer) is described in [`docs/planarian-os.md`](docs/planarian-os.md).
+The VM is the safest way to look at it:
 
 ```sh
-# borrow the GitHub CLI's token for one command
-NIX_CONFIG="access-tokens = github.com=$(gh auth token)" nix run github:aubrika/planarian#vm
-# or use your SSH key, as git push does
-nix run 'git+ssh://git@github.com/aubrika/planarian#vm'
-# or from a clone
-nix run .#vm
+nix run github:aubrika/planarian#vm
 ```
-
-To make the first permanent, put `access-tokens = github.com=<token>` in
-`~/.config/nix/nix.conf`. The first run builds Planarian and downloads NixOS
-from cache.nixos.org; later runs start in seconds.
-
-The VM logs in as `demo` (password `planarian`; `sudo` needs none) and
-prints what to try: `planarian status`, `ask "make text bigger"`, and
-`demo-fault kill-web` / `corrupt-state` / `crash-loop` to break the fixture
-services and watch Planarian respond. Its `/etc/nixos` is a flake that
-evaluates to exactly the system you booted, so changes Planarian makes inside
-are real rebuilds (they download from cache.nixos.org, so the VM needs the
-host's network).
-
-- It uses KVM when `/dev/kvm` is available and falls back to emulation
-  (slow, especially the desktop) when not. It takes 6 GB of RAM (3 GB for
-  `vm-text`), since Planarian evaluates the whole system inside the VM when
-  it makes a change.
-- State lives in `planarian-vm.qcow2` in the directory you ran it from.
-  Delete it to start over. Delete it too after updating Planarian, since the
-  old disk's `/etc/nixos` still points at the old version.
-- Generations built inside survive a restart of the VM, but the VM has no
-  boot loader: it always boots the system it was launched with, not the
-  newest generation Planarian published.
-- The text variant's terminal is the serial console: `Ctrl-a x` quits QEMU.
-
-## Trying it from a USB stick
-
-```sh
-nix build github:aubrika/planarian#iso      # same credentials as above while the repo is private
-sudo dd if=result/iso/planarian-live.iso of=/dev/sdX bs=4M status=progress conv=fsync
-```
-
-(`/dev/sdX` is the flash drive: check with `lsblk` first; `dd` overwrites
-it. Any image writer works, e.g. GNOME Disks or Fedora Media Writer.) Boot
-from it (UEFI or BIOS) and you get the same demo as the VM: COSMIC, the
-console, the welcome terminal, `demo-fault`. It runs entirely in RAM, so
-changes Planarian makes are real rebuilds (with a network), and everything
-is gone at the next boot. Give it at least 8 GB of RAM if you want to try
-configuration changes.
-
-## Installing it
-
-The same USB stick installs it. From the live system, open **Install
-Planarian** (or run `sudo planarian-install` in a terminal). It asks for a
-disk, a filesystem (ext4 or btrfs), a computer name, your user name and a
-password, then **erases that disk** and installs NixOS with Planarian, COSMIC
-and the reference configuration. Your user is an administrator
-(`planarian-admin`): you approve the changes Planarian asks about.
-
-- `/etc/nixos` is the installed computer's flake: edit `configuration.nix`;
-  Planarian edits only `planarian/overrides.nix`. It is pinned to the nixpkgs
-  and Planarian the stick was built from, and both sources stay on disk, so
-  Planarian can rebuild without a network. (While the repository is
-  private, `nix flake update` there needs the credentials above.)
-- Installing copies most of the system from the stick; anything missing
-  (firmware, drivers for your hardware) comes from cache.nixos.org, so plug
-  in a network.
-- UEFI machines boot with systemd-boot, BIOS machines with GRUB.
-- On btrfs, the installer turns off copy-on-write for Planarian's journal
-  directory, which its recovery guarantee needs (SPEC §12c). ZFS isn't offered.
-- Unattended: `planarian-install --disk /dev/nvme0n1 --fs btrfs --hostname
-  laptop --user ana --password-file pw --yes`.
-
-It boots quietly behind the planarian splash. Press Esc during boot to see
-the messages, or pick **verbose boot** in the boot menu.
 
 ## Trying it on your machine
 
@@ -123,9 +48,9 @@ files. It changes only `planarian/overrides.nix`, which your flake imports.
    # in nixosSystem { modules = [ … ]; }:
    ./planarian/overrides.nix
    planarian.nixosModules.default
-   planarian.nixosModules.reference   # optional: COSMIC, PipeWire, NetworkManager, a quiet boot
-                                      # behind the planarian splash (planarian.reference.verboseBoot
-                                      # = true for text), catalog wiring
+   # optional, and not for an existing desktop: it switches the machine to
+   # COSMIC, PipeWire, NetworkManager and a quiet boot (PlanarianOS's setup)
+   # planarian.nixosModules.reference
    { services.planarian.enable = true; services.planarian.owner = "/etc/nixos"; }
    # and make yourself an administrator (approve, restart system services, resolve):
    { users.users.<you>.extraGroups = [ "planarian-admin" ]; }
@@ -138,21 +63,29 @@ files. It changes only `planarian/overrides.nix`, which your flake imports.
    match `networking.hostName`, or set `services.planarian.flakeAttr`.
 4. `planarian status`.
 
-For the first 10 minutes Planarian says "no baseline yet" and only takes
-Runtime actions (restarts, stops). When the canonical health checks pass at
-that checkpoint, the generation becomes the known-good baseline.
+Start with it watching only, so it asks before every action:
+
+```nix
+services.planarian.maxTier = "Observe";
+```
+
+Raise it to `"Runtime"` (restarts and stops on its own) or `"Tested"` (also
+builds, activates and reverts configuration changes on its own, the default)
+once you trust what it does. For the first 10 minutes Planarian says "no
+baseline yet" and takes at most Runtime actions. When the canonical health
+checks pass at that checkpoint, the generation becomes the known-good
+baseline.
 
 ## What to try
 
-| Try | What should happen |
-| --- | --- |
-| `sudo systemctl kill -s KILL sshd` | Within about 15 s: an incident, a restart, and `planarian log` shows it. |
-| `ask "stop <service> until I say"` | It stops and stays stopped; Planarian won't "repair" it. `ask "start <service> again"` undoes it. |
-| `planarian stop <service>` | The same, until the next boot. |
-| `ask "make text bigger"` (with the reference module) | A configuration change: built, activated, health-checked, then committed. `planarian log` shows each step. |
-| `planarian apply listen-address service=… addr=…` with an address that can't work | Built, activated, checks fail, reverted automatically. |
-| `planarian apply service-enable service=sshd enabled=false` | Security-sensitive, so it asks: `sudo planarian approve <hash>`, at a terminal. |
-| As a normal user: `planarian suppress sshd` | Refused: `Unauthorized`. |
+`planarian status` shows what it sees: units, health, incidents, pending
+approvals. To watch a repair, pick a service whose loss you don't mind (not
+your SSH server or display manager on a machine you reach remotely) and
+`sudo systemctl kill -s KILL <service>`: within about 15 s there should be
+an incident and a restart, and `planarian log` explains it. `ask "stop
+<service> until I say"` stops it and keeps it stopped; `ask "start <service>
+again"` undoes that. The demo VM has fixture services and fault injection
+for the rest (`docs/planarian-os.md`).
 
 The console (`services.planarian.console.enable = true;`, on with the
 reference module) shows the dependency graph with what is desired,

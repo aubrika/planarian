@@ -15,10 +15,15 @@
         # Planarian changes only this file, and only through transactions.
         ./planarian/overrides.nix
         planarian.nixosModules.default
-        planarian.nixosModules.reference
+        # PlanarianOS's desktop: COSMIC, PipeWire, NetworkManager, a quiet
+        # boot. Not for a machine that already has a desktop you want.
+        # planarian.nixosModules.reference
         {
           services.planarian.enable = true;
           services.planarian.owner = "/etc/nixos";
+          # Asks before every action. "Runtime" restarts and stops on its
+          # own; "Tested" also changes the configuration on its own.
+          services.planarian.maxTier = "Observe";
           # Administrators approve changes, restart system services and resolve.
           # users.users.<you>.extraGroups = [ "planarian-admin" ];
         }

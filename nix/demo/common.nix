@@ -161,7 +161,10 @@ in
     # one off by default that a generation change can turn on.
     systemd.services.gym-web = {
       wantedBy = [ "multi-user.target" ];
+      # Not root: it serves /etc (the probe reads /hostname), and must not
+      # serve /etc/shadow.
       serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 -m http.server 8080 --bind 127.0.0.1 --directory /etc";
+      serviceConfig.DynamicUser = true;
     };
     systemd.services.gym-state = {
       wantedBy = [ "multi-user.target" ];
