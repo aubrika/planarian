@@ -105,7 +105,7 @@ pub fn submitted_short(s: &Submitted) -> String {
     }
 }
 
-fn facts_summary(f: &DerivedFacts) -> String {
+pub fn facts_summary(f: &DerivedFacts) -> String {
     let mut why = vec![];
     if f.sensitivity.contains(Sensitivity::Security) {
         why.push("it touches security-relevant settings".to_string());

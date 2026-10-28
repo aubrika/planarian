@@ -228,7 +228,10 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> 
 }
 
 impl Nixos {
-    fn activate_live_inner(&self, g: GenerationId, op: &OpId) -> Outcome {
+    /// `slow` (gym hooks only): the activation unit first sleeps this long,
+    /// and if `uncancellable`, ignores being stopped; it is the unit that is
+    /// slow, so it outlives the daemon like a real long activation.
+    fn activate_live_inner(&self, g: GenerationId, op: &OpId, slow: Option<(std::time::Duration, bool)>) -> Outcome {
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
         }
@@ -237,20 +240,36 @@ impl Nixos {
             Err(o) => return o,
         };
         let unit = format!("--unit={}", Self::unit_name(op));
-        let o = run(
-            &[
-                "systemd-run",
-                &unit,
-                "--wait",
-                "--collect",
-                "--quiet",
-                "--service-type=oneshot",
-                "--property=TimeoutStartSec=15min",
-                &format!("{}/bin/switch-to-configuration", path.0),
-                "test",
-            ],
-            ACTIVATION,
-        );
+        let switch = format!("{}/bin/switch-to-configuration", path.0);
+        let mut cmd: Vec<String> = [
+            "systemd-run",
+            &unit,
+            "--wait",
+            "--collect",
+            "--quiet",
+            "--service-type=oneshot",
+            "--property=TimeoutStartSec=15min",
+        ]
+        .map(String::from)
+        .to_vec();
+        match slow {
+            None => cmd.extend([switch, "test".into()]),
+            Some((d, uncancellable)) => {
+                if uncancellable {
+                    cmd.extend(
+                        [
+                            "--property=KillSignal=SIGWINCH",
+                            "--property=SendSIGKILL=no",
+                            "--property=TimeoutStopSec=infinity",
+                        ]
+                        .map(String::from),
+                    );
+                }
+                cmd.extend(["sh".into(), "-c".into(), format!("sleep {}; exec {switch} test", d.as_secs())]);
+            }
+        }
+        let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let o = run(&args, ACTIVATION);
         if o.ok() { Outcome::Succeeded } else { err(&o) }
     }
 
@@ -603,10 +622,17 @@ impl GenerationBackend for Nixos {
     }
 
     fn activate_live(&self, g: GenerationId, op: &OpId) -> Outcome {
+        // Gym hooks: the delay goes into the activation unit, not the daemon.
         #[cfg(feature = "gym-hooks")]
-        return crate::gym::around("activate_live", Some(g), || self.activate_live_inner(g, op));
+        let (h, slow) = {
+            let mut h = crate::gym::hook("activate_live", Some(g));
+            let slow = h.delay.take().map(|d| (d, h.uncancellable));
+            (h, slow)
+        };
+        #[cfg(feature = "gym-hooks")]
+        return crate::gym::apply(h, || self.activate_live_inner(g, op, slow));
         #[cfg(not(feature = "gym-hooks"))]
-        self.activate_live_inner(g, op)
+        self.activate_live_inner(g, op, None)
     }
 
     fn publish_boot(&self, g: GenerationId, op: &OpId) -> Outcome {

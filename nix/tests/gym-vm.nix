@@ -39,7 +39,8 @@ let
     #!${pkgs.python3}/bin/python3
     # A gym fixture service: listens on a port (HTTP for --http) and honours
     # knobs in /var/lib/gym-knobs/<name>/: fail_on_start, fail_after,
-    # health (HTTP status), health_delay / probe_delay (answer late).
+    # health (HTTP status), health_delay (answer late), probe_delay (answer
+    # late; the harness also drops packets to the port, so connecting stalls).
     import http.server, os, socketserver, sys, threading, time, json
     name, port = sys.argv[1], int(sys.argv[2])
     http_mode = "--http" in sys.argv

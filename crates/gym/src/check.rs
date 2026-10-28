@@ -2,13 +2,14 @@
 //! cases, never on the absence of errors). Keys the fake harness cannot judge
 //! are reported, and make the result PARTIAL rather than PASS.
 
-use crate::evidence::Evidence;
+use crate::evidence::{Effect, Evidence};
 use crate::sim::{dur, unit};
 use planarian_exec::Submitted;
 use planarian_ipc::Response;
 use planarian_schema::*;
+use planarian_txn::ledger::{Entry, Record};
 use planarian_txn::machine::tag;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use toml::Value as T;
 
 #[derive(Debug, Default)]
@@ -55,6 +56,7 @@ fn state_name(s: &TxnState) -> String {
 }
 
 struct TxnView {
+    id: TxnId,
     transition: Transition,
     path: Vec<String>,
     state: TxnState,
@@ -65,8 +67,9 @@ struct TxnView {
 fn txns(e: &Evidence) -> Vec<TxnView> {
     let l = &e.ledger;
     l.terminal
-        .values()
-        .map(|t| TxnView {
+        .iter()
+        .map(|(id, t)| TxnView {
+            id: *id,
             transition: t.transition.clone(),
             path: t.path.clone(),
             state: t.state.clone(),
@@ -74,6 +77,7 @@ fn txns(e: &Evidence) -> Vec<TxnView> {
             epoch: t.epoch,
         })
         .chain(l.live.values().map(|t| TxnView {
+            id: t.txn.id,
             transition: t.txn.transition.clone(),
             path: t.path.clone(),
             state: t.txn.state.clone(),
@@ -375,6 +379,10 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                             |x| matches!(x, Response::Done { message, .. } if message.contains("until the next boot")),
                         ),
                         "AwaitingApproval" => notices.contains("needs approval"),
+                        "OutOfBandStopHint" => {
+                            notices.contains("stopped, not crashed") && notices.contains("planarian suppress")
+                        }
+                        "DisruptionSessionLoss" => notices.contains("end your graphical session"),
                         "BudgetUnsatisfiable" => notices.contains("BudgetUnsatisfiable"),
                         _ => {
                             v.unchecked.push(format!("reports.{r}"));
@@ -421,10 +429,253 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     check_incident(e, spec, &mut v);
                 }
             }
+            "bound_driver" => match &e.drivers {
+                None => v.unchecked.push(key.clone()),
+                Some(d) => {
+                    for (dev, want) in val.as_table().into_iter().flatten() {
+                        let got = d.get(&unit(dev)).map(String::as_str).unwrap_or("none");
+                        if got != want.as_str().unwrap_or("") {
+                            fail(&mut v, format!("{dev} is bound to {got}, want {want}"));
+                        }
+                    }
+                }
+            },
+            "evaluated_option" => match &e.options {
+                None => v.unchecked.push(key.clone()),
+                Some(o) => {
+                    for (opt, want) in val.as_table().into_iter().flatten() {
+                        let got = o.get(opt).map(value_str);
+                        if got.as_deref() != Some(toml_str(want).as_str()) {
+                            fail(&mut v, format!("{opt} is {got:?}, want {}", toml_str(want)));
+                        }
+                    }
+                }
+            },
+            "probe_definitions_unchanged" if val.as_bool() == Some(true) => match &e.probe_defs {
+                None => v.unchecked.push(key.clone()),
+                Some((before, after)) if before != after => fail(&mut v, "probe definitions changed".into()),
+                Some(_) => {}
+            },
+            "gc_root_released" if val.as_bool() == Some(true) => match &e.gc_roots {
+                None => v.unchecked.push(key.clone()),
+                Some((before, after)) => {
+                    let left: Vec<&String> = after.difference(before).collect();
+                    if !left.is_empty() {
+                        fail(&mut v, format!("build roots left behind: {left:?}"));
+                    }
+                }
+            },
+            "replay_equivalent" if val.as_bool() == Some(true) => match &e.full_replay {
+                None => v.unchecked.push(format!("{key} (no compaction seen)")),
+                Some(full) if full != ledger => {
+                    let a = serde_json::to_value(full).unwrap_or_default();
+                    let b = serde_json::to_value(ledger).unwrap_or_default();
+                    let differ: Vec<&String> = a
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter(|(k, x)| b.get(k.as_str()) != Some(x))
+                        .map(|(k, _)| k)
+                        .collect();
+                    fail(&mut v, format!("checkpoint + tail differs from the full history in {differ:?}"));
+                }
+                Some(_) => {}
+            },
+            "no_overlap" => match &e.effects {
+                None => v.unchecked.push(key.clone()),
+                Some(fx) => {
+                    let names: Vec<&str> = val.as_array().into_iter().flatten().filter_map(T::as_str).collect();
+                    let named: Vec<&Effect> = fx.iter().filter(|f| names.contains(&f.call.as_str())).collect();
+                    for (i, a) in named.iter().enumerate() {
+                        for b in &named[i + 1..] {
+                            if a.call != b.call && overlap(a, b) {
+                                fail(&mut v, format!("{} and {} overlapped", describe(a), describe(b)));
+                            }
+                        }
+                    }
+                }
+            },
+            "quiescence_includes_tagged_jobs" if val.as_bool() == Some(true) => match &e.effects {
+                None => v.unchecked.push(key.clone()),
+                Some(fx) => {
+                    // A later owner of a transaction never mutates while an
+                    // earlier owner's job for it is still running.
+                    let muts: Vec<&Effect> =
+                        fx.iter().filter(|f| !f.call.starts_with("cancel") && !f.call.starts_with("protect")).collect();
+                    for a in &muts {
+                        for b in &muts {
+                            if a.txn == b.txn && a.epoch < b.epoch && overlap(a, b) {
+                                fail(&mut v, format!("{} ran during {}", describe(b), describe(a)));
+                            }
+                        }
+                    }
+                }
+            },
+            "stale_owner_commit" if val.as_bool() == Some(false) => match &e.entries {
+                None => v.unchecked.push(key.clone()),
+                Some(en) => {
+                    let mut epoch: BTreeMap<TxnId, u64> = BTreeMap::new();
+                    for x in en {
+                        match &x.record {
+                            Record::Prepared(t) => {
+                                epoch.insert(t.id, t.lease.epoch);
+                            }
+                            Record::Takeover { txn, lease, .. } => {
+                                epoch.insert(*txn, lease.epoch);
+                            }
+                            Record::Advance { txn, epoch: by, to, .. }
+                                if matches!(to, TxnState::Published | TxnState::Promoted | TxnState::Committed)
+                                    && epoch.get(txn).is_some_and(|cur| by < cur) =>
+                            {
+                                fail(&mut v, format!("txn {} advanced to {} by stale epoch {by}", txn.0, tag(to)));
+                            }
+                            _ => {}
+                        }
+                    }
+                    // A call journaled after a takeover past its epoch must
+                    // have been fenced; one that took effect is a stale write.
+                    if let Some(fx) = &e.effects {
+                        for f in fx {
+                            let begun = en.iter().position(|x| {
+                                matches!(&x.record, Record::OpBegin { op, .. }
+                                    if op.txn == f.txn && op.epoch == f.epoch && op.seq == f.seq)
+                            });
+                            let stale = begun.is_some_and(|b| {
+                                en[..b].iter().any(|x| {
+                                    matches!(&x.record, Record::Takeover { txn, lease, .. }
+                                        if *txn == f.txn && lease.epoch > f.epoch)
+                                })
+                            });
+                            if stale {
+                                fail(&mut v, format!("{} by a fenced owner went through", describe(f)));
+                            }
+                        }
+                    }
+                }
+            },
+            "lease_epochs_strictly_increasing" | "owners_per_epoch_max" => match &e.entries {
+                None => v.unchecked.push(key.clone()),
+                Some(en) => {
+                    let mut seq: BTreeMap<TxnId, Vec<u64>> = BTreeMap::new();
+                    let mut owners: BTreeMap<(TxnId, u64), BTreeSet<String>> = BTreeMap::new();
+                    for x in en {
+                        let claim = match &x.record {
+                            Record::Prepared(t) => Some(&t.lease),
+                            Record::Takeover { lease, .. } => Some(lease),
+                            _ => None,
+                        };
+                        if let Some(l) = claim {
+                            seq.entry(l.txn).or_default().push(l.epoch);
+                            owners.entry((l.txn, l.epoch)).or_default().insert(format!("{:?}", l.owner));
+                        }
+                    }
+                    if key == "lease_epochs_strictly_increasing" && val.as_bool() == Some(true) {
+                        for (t, s) in &seq {
+                            if s.windows(2).any(|w| w[1] <= w[0]) {
+                                fail(&mut v, format!("txn {} epochs {s:?}", t.0));
+                            }
+                        }
+                    }
+                    if key == "owners_per_epoch_max" {
+                        let max = val.as_integer().unwrap_or(1) as usize;
+                        for ((t, ep), o) in &owners {
+                            if o.len() > max {
+                                fail(&mut v, format!("txn {} epoch {ep} had {} owners", t.0, o.len()));
+                            }
+                        }
+                    }
+                }
+            },
+            "journal_order" => match &e.entries {
+                None => v.unchecked.push(key.clone()),
+                Some(en) => {
+                    let mut last = None;
+                    for token in val.as_array().into_iter().flatten().filter_map(T::as_str) {
+                        match position(en, token) {
+                            None => fail(&mut v, format!("no {token} in the journal")),
+                            Some(p) if last.is_some_and(|l| p <= l) => {
+                                fail(&mut v, format!("{token} is out of order"));
+                            }
+                            Some(p) => last = Some(p),
+                        }
+                    }
+                }
+            },
+            "watchdog_probed_before_commit" if val.as_bool() == Some(true) => match &e.entries {
+                None => v.unchecked.push(key.clone()),
+                Some(en) => {
+                    // Published is written only once the writer's own probes
+                    // passed; it must be the watchdog's.
+                    let mut watchdog: BTreeSet<(TxnId, u64)> = BTreeSet::new();
+                    let mut ok = false;
+                    for x in en {
+                        match &x.record {
+                            Record::Takeover { txn, lease, .. } if lease.owner.is_watchdog() => {
+                                watchdog.insert((*txn, lease.epoch));
+                            }
+                            Record::Advance { txn, epoch, to: TxnState::Published, note }
+                                if watchdog.contains(&(*txn, *epoch)) && note == "probes passed" =>
+                            {
+                                ok = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !ok {
+                        fail(&mut v, "the watchdog did not probe before publishing".into());
+                    }
+                }
+            },
             other => v.unchecked.push(other.to_string()),
         }
     }
     v
+}
+
+fn value_str(v: &Value) -> String {
+    match v {
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Str(s) => s.clone(),
+        Value::List(l) => format!("[{}]", l.iter().map(value_str).collect::<Vec<_>>().join(", ")),
+    }
+}
+
+fn toml_str(t: &T) -> String {
+    match t {
+        T::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Two effects overlapped: one began strictly inside the other's run. Two
+/// instants never overlap (the backend serves calls one at a time).
+fn overlap(a: &Effect, b: &Effect) -> bool {
+    let end = |f: &Effect| f.end.unwrap_or(Timestamp(u64::MAX));
+    a.start < end(b) && b.start < end(a)
+}
+
+fn describe(f: &Effect) -> String {
+    format!("{} (txn {} epoch {}, {}–{:?} ms)", f.call, f.txn.0, f.epoch, f.start.0, f.end.map(|t| t.0))
+}
+
+/// The journal position of `Suppression(<unit>)` or `<call>(<unit>)` (an
+/// OpBegin whose call starts with `<call>` in a transaction on that unit).
+fn position(en: &[Entry], token: &str) -> Option<usize> {
+    let (what, u) = token.strip_suffix(')')?.split_once('(')?;
+    let id = unit(u);
+    let mut on: BTreeMap<TxnId, Option<UnitId>> = BTreeMap::new();
+    en.iter().position(|x| match &x.record {
+        Record::Prepared(t) => {
+            on.insert(t.id, target_of(&t.transition));
+            false
+        }
+        Record::Suppressed(s) => what == "Suppression" && s.unit == id,
+        Record::OpBegin { op, call } => {
+            what != "Suppression" && call.starts_with(what) && on.get(&op.txn).cloned().flatten() == Some(id.clone())
+        }
+        _ => false,
+    })
 }
 
 fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
@@ -440,6 +691,16 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
     if let Some(c) = s("change") {
         matching.retain(|x| matches!(&x.transition, Transition::ApplyChange { change, .. } if change.0 == c));
     }
+    // `args` picks the transaction (the same change can run twice with
+    // different arguments).
+    if let Some(want) = spec.get("args").and_then(T::as_table) {
+        matching.retain(|x| match &x.transition {
+            Transition::ApplyChange { args, .. } => {
+                want.iter().all(|(k, w)| args.get(k).map(value_str).as_deref() == Some(toml_str(w).as_str()))
+            }
+            _ => false,
+        });
+    }
     let label = format!(
         "txn {}",
         spec.as_table()
@@ -452,7 +713,7 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             || spec.get("while_interlock").is_some()
             || spec.get("while_incident").is_some()
         {
-            v.unchecked.push(format!("{label} (conditional count)"));
+            conditional_none(e, spec, &label, v);
         } else if !matching.is_empty() {
             v.failures.push(format!("{label}: expected none, found {}", matching.len()));
         }
@@ -563,9 +824,24 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
         Some(d) => v.unchecked.push(format!("{label}: decision {d}")),
         None => {}
     }
+    if let Some(want) = spec.get("facts").and_then(T::as_table) {
+        let facts = e.log.iter().find_map(|r| match &r.result {
+            Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if *txn == t.id => r.facts.clone(),
+            _ => None,
+        });
+        match facts.map(|f| serde_json::to_value(f).unwrap_or_default()) {
+            None => v.failures.push(format!("{label}: no derived facts in the executor log")),
+            Some(got) => {
+                for (k, w) in want {
+                    let w = serde_json::to_value(w).unwrap_or_default();
+                    if got.get(k) != Some(&w) {
+                        v.failures.push(format!("{label}: facts.{k} is {:?}, want {w}", got.get(k)));
+                    }
+                }
+            }
+        }
+    }
     for k in [
-        "facts",
-        "args",
         "not_activated_before",
         "path_option",
         "returns_current_digest",
@@ -576,6 +852,87 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
     ] {
         if spec.get(k).is_some() {
             v.unchecked.push(format!("{label}: {k}"));
+        }
+    }
+}
+
+/// `count = 0` under a condition: no proposal matching the spec went
+/// through (finished or parked) while the condition held.
+fn conditional_none(e: &Evidence, spec: &T, label: &str, v: &mut Verdict) {
+    let s = |k: &str| spec.get(k).and_then(T::as_str);
+    let incident_target: BTreeMap<IncidentId, UnitId> =
+        e.seen_incidents.values().map(|i| (i.id, i.target.clone())).collect();
+    let went: Vec<&planarian_daemon::LogRecord> = e
+        .log
+        .iter()
+        .filter(|r| matches!(r.result, Submitted::Finished { .. } | Submitted::Parked { .. }))
+        .filter(|r| s("transition").is_none_or(|t| transition_name(&r.proposal.transition) == t))
+        .filter(|r| s("target").is_none_or(|u| target_of(&r.proposal.transition) == Some(unit(u))))
+        .filter(|r| {
+            s("source").is_none_or(|src| match &r.proposal.source {
+                Source::Diagnoser { .. } => src == "diagnoser",
+                Source::User => src == "user",
+                Source::Intent { .. } => src == "intent",
+                Source::Model(_) => src == "model",
+                Source::Maintenance => src == "maintenance",
+            })
+        })
+        .collect();
+    if let Some(u) = s("before_unit_running") {
+        let Some(line) = e.status_timeline.as_ref() else {
+            v.unchecked.push(format!("{label} (status timeline)"));
+            return;
+        };
+        let line = line.get(&unit(u)).cloned().unwrap_or_default();
+        for r in &went {
+            let at = line.iter().rev().find(|(t, _)| *t <= r.at).map(|(_, st)| st.as_str()).unwrap_or("unknown");
+            if at != "Running" {
+                v.failures.push(format!("{label}: proposed at {} ms while {u} was {at}", r.at.0));
+            }
+        }
+    }
+    if s("while_interlock") == Some("set") || s("while_incident").is_some() {
+        let Some(en) = e.entries.as_ref() else {
+            v.unchecked.push(format!("{label} (journal history)"));
+            return;
+        };
+        // Spans when the condition held, from the journal.
+        let mut spans: Vec<(Timestamp, Timestamp)> = vec![];
+        let mut since: Option<Timestamp> = None;
+        let target = s("target").map(unit);
+        for x in en {
+            let holds = match (&x.record, s("while_incident")) {
+                (Record::Advance { to: TxnState::RecoveryFailed, .. }, None) => Some(true),
+                (Record::Resolved { .. }, None) => Some(false),
+                (Record::Incident(i), Some(state)) if Some(&i.target) == target.as_ref() => {
+                    Some(format!("{:?}", i.state).starts_with(state))
+                }
+                _ => None,
+            };
+            match (holds, since) {
+                (Some(true), None) => since = Some(x.at),
+                (Some(false), Some(t0)) => {
+                    spans.push((t0, x.at));
+                    since = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(t0) = since {
+            spans.push((t0, Timestamp(u64::MAX)));
+        }
+        for r in &went {
+            if spans.iter().any(|(a, b)| *a <= r.at && r.at < *b) {
+                let inc = match &r.proposal.source {
+                    Source::Diagnoser { incident } => incident_target.get(incident).map(|u| u.to_string()),
+                    _ => None,
+                };
+                v.failures.push(format!(
+                    "{label}: proposed at {} ms while the condition held{}",
+                    r.at.0,
+                    inc.map(|u| format!(" (incident on {u})")).unwrap_or_default()
+                ));
+            }
         }
     }
 }
@@ -622,7 +979,55 @@ fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
             v.unchecked.push(format!("{label}: opened_within (relative to inject)"));
         }
     }
-    for k in ["root_of", "first_candidate", "session_bound"] {
+    if let Some(of) = spec.get("root_of").and_then(T::as_array) {
+        // Where the daemon attributes a unit's divergence to another: a
+        // repair proposal's reason, or an "it needs a person" notice.
+        let by_incident: BTreeMap<IncidentId, UnitId> =
+            e.seen_incidents.values().map(|i| (i.id, i.target.clone())).collect();
+        let mut attributed: BTreeSet<UnitId> = BTreeSet::new();
+        for r in &e.log {
+            if let Source::Diagnoser { incident } = &r.proposal.source
+                && let Some(t) = by_incident.get(incident)
+                && *t != id
+                && target_of(&r.proposal.transition).as_ref() == Some(&id)
+            {
+                attributed.insert(t.clone());
+            }
+        }
+        let marker = format!("(root cause: {id})");
+        for n in e.notices.iter().filter(|n| n.contains(&marker)) {
+            if let Some((t, _)) = n.split_once(": ") {
+                attributed.insert(unit(t));
+            }
+        }
+        let want: BTreeSet<UnitId> = of.iter().filter_map(T::as_str).map(unit).collect();
+        for u in want.difference(&attributed) {
+            v.failures.push(format!("{label}: never named as the root cause of {u}"));
+        }
+        for u in attributed.difference(&want) {
+            v.failures.push(format!("{label}: named as the root cause of {u}, which it isn't"));
+        }
+    }
+    if let Some(first) = spec.get("first_candidate").and_then(T::as_str) {
+        match first.strip_prefix("reobserve:") {
+            Some(probe) => {
+                let said = e.notices.iter().any(|n| {
+                    n.starts_with(&format!("{id}: ")) && n.contains("re-observing through") && n.contains(probe)
+                });
+                let acted = e.log.iter().any(|r| {
+                    matches!(&r.proposal.source, Source::Diagnoser { incident } if found.iter().any(|i| i.id == *incident))
+                });
+                if !said {
+                    v.failures.push(format!("{label}: did not re-observe through {probe}"));
+                }
+                if acted {
+                    v.failures.push(format!("{label}: proposed a transition instead of re-observing"));
+                }
+            }
+            None => v.unchecked.push(format!("{label}: first_candidate {first}")),
+        }
+    }
+    for k in ["session_bound"] {
         if spec.get(k).is_some() {
             v.unchecked.push(format!("{label}: {k}"));
         }

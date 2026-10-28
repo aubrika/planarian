@@ -14,6 +14,8 @@ mod live;
 mod metrics;
 mod serve;
 mod sim;
+#[cfg(test)]
+mod tests;
 
 use sim::Sim;
 use toml::Value as T;
@@ -70,8 +72,7 @@ fn run_entry(entry: &T) -> Run {
     for _ in 0..3 {
         sim.tick();
     }
-    sim.start = sim.now();
-    sim.pre_status = sim.statuses();
+    sim.begin();
     for (i, s) in all.iter().enumerate() {
         if consumed.contains(&i) {
             continue;
@@ -129,6 +130,7 @@ fn main() {
     let mut ids: Vec<String> = vec![];
     let mut harness = "fake".to_string();
     let mut verbose = false;
+    let mut show_notices = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -147,6 +149,7 @@ fn main() {
             "--all" => {}
             "--socket" => i += 1,
             "-v" | "--verbose" => verbose = true,
+            "--notices" => show_notices = true,
             other => {
                 eprintln!("unknown argument {other}");
                 std::process::exit(2);
@@ -196,6 +199,11 @@ fn main() {
                 if verbose || r.result == Result_::Fail || r.result == Result_::Unsupported {
                     for n in &r.notes {
                         println!("             {n}");
+                    }
+                }
+                if show_notices && let Some(sim) = &r.sim {
+                    for n in &sim.notices {
+                        println!("             notice: {n}");
                     }
                 }
             }

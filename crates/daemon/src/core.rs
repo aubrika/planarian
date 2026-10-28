@@ -28,7 +28,7 @@ use planarian_txn::journal::Journal;
 use planarian_txn::ledger::{Ledger, Record};
 use planarian_txn::store::Store;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The 10-minute checkpoint for boot confirmation and initial enrollment (§10, §16).
 pub const CONFIRM_AFTER: Millis = Millis::secs(600);
@@ -92,6 +92,8 @@ pub struct Core<B: Backends + Clone, S: Store> {
     confirm: Option<(GenerationId, Timestamp)>,
     manifest_gen: GenerationId,
     interlock_noted: bool,
+    /// Diagnostic incidents already announced.
+    diag_noted: BTreeSet<IncidentId>,
     /// When to next check the §12b collection bounds.
     next_gc_check: Timestamp,
     /// The space report last noticed.
@@ -196,6 +198,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             confirm,
             manifest_gen: current,
             interlock_noted: false,
+            diag_noted: BTreeSet::new(),
             next_gc_check: Timestamp(0),
             space_noted: Timestamp(0),
             awaiting_post: Vec::new(),
@@ -389,6 +392,34 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     inc.target, inc.regressions
                 ));
             }
+            if inc.kind == IncidentKind::Diagnostic
+                && inc.state != IncidentState::Closed
+                && self.diag_noted.insert(inc.id)
+            {
+                // Re-observe through the Readiness probes that still answer;
+                // never a restart (§10).
+                let answering: Vec<String> = defs
+                    .get(&inc.target)
+                    .map(|d| {
+                        let ev = s.units.get(&inc.target).map(|(_, e)| e.as_slice()).unwrap_or(&[]);
+                        d.probes
+                            .iter()
+                            .filter(|p| p.role == ProbeRole::Readiness)
+                            .filter(|p| {
+                                !ev.iter().any(|e| {
+                                    e.probe == p.id && matches!(e.result, ProbeResult::Timeout | ProbeResult::Error(_))
+                                })
+                            })
+                            .map(|p| p.id.0.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.notice(format!(
+                    "{}: its health is unknown (checks time out); re-observing through {} rather than restarting it",
+                    inc.target,
+                    if answering.is_empty() { "its other checks".into() } else { answering.join(", ") }
+                ));
+            }
             self.journal(Record::Incident(inc));
         }
         let diag: Vec<UnitId> = self.incidents.diagnostic().iter().map(|i| i.target.clone()).collect();
@@ -483,13 +514,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             known_drivers: &self.asm.known_drivers,
             current_planarian_built: l.live_tested == Some(current),
         };
+        // The deepest divergent unit below the target (§13 step 1), named
+        // whenever it isn't the target itself.
+        let root = diagnose::root_cause(&inc.target, &inputs);
+        let because = if root == inc.target { String::new() } else { format!(" (root cause: {root})") };
         match diagnose::next(&inc, &inputs) {
             None => {
                 if let Some(i) = self.incidents.exhausted(inc.id, now) {
                     self.journal(Record::Incident(i));
                 }
                 self.notice(format!(
-                    "{}: {:?} and nothing I know how to do would fix it; it needs a person (I'll look again in an hour)",
+                    "{}: {:?}{because} and nothing I know how to do would fix it; it needs a person (I'll look again in an hour)",
                     inc.target, inc.divergence.1
                 ));
             }
@@ -502,6 +537,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
             }
             Some(c) => {
+                // Stopped cleanly rather than crashed: likely someone outside
+                // Planarian stopped it. Say how to make that stick.
+                if inc.attempts.is_empty()
+                    && matches!(c.transition, Transition::RestartUnit(_))
+                    && s.status(&c.target, defs) == UnitStatus::Stopped
+                {
+                    self.notice(format!(
+                        "{}: it was stopped, not crashed, so I'm starting it again; to keep it stopped: planarian suppress {}",
+                        c.target, c.target
+                    ));
+                }
                 let p = self.proposal(
                     c.transition.clone(),
                     s,
@@ -524,12 +570,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         }
                         self.notice(format!("{}: {} → {:?}", inc.target, render::transition(&c.transition), state));
                     }
-                    Submitted::Parked { txn, approve, .. } => {
+                    Submitted::Parked { txn, approve, facts } => {
                         self.incident_parked.insert(inc.id, txn);
                         self.notice(format!(
-                            "{}: {} needs approval (it is disruptive or sensitive): planarian approve {approve}",
+                            "{}: {} needs approval ({}): planarian approve {approve}",
                             inc.target,
-                            render::transition(&c.transition)
+                            render::transition(&c.transition),
+                            render::facts_summary(&facts)
                         ));
                     }
                     Submitted::Rejected { reason, detail, .. } => {

@@ -15,7 +15,7 @@
 //! it, as in the fake harness; other timed steps run from a watcher.
 
 use crate::check;
-use crate::evidence::Evidence;
+use crate::evidence::{Effect, Evidence};
 use crate::sim::{dur, unit, value};
 use planarian_backend_linux::{Paths, Real};
 use planarian_daemon::LogRecord;
@@ -24,7 +24,7 @@ use planarian_exec::Submitted;
 use planarian_ipc::{ConsoleReport, Request, Response, SOCKET};
 use planarian_schema::*;
 use planarian_txn::journal::Journal;
-use planarian_txn::ledger::Ledger;
+use planarian_txn::ledger::{Entry, Ledger, Record};
 use planarian_txn::store::FileStore;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,6 +72,10 @@ struct Start {
     log_lines: usize,
     pre_status: BTreeMap<UnitId, String>,
     touched: BTreeSet<UnitId>,
+    #[serde(default)]
+    probe_defs: String,
+    #[serde(default)]
+    gc_roots: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -123,6 +127,16 @@ pub fn plan(entry: &T) -> Plan {
             "armed".into()
         } else if let Some(state) = when {
             match raw {
+                // With a slow activation set up, "during Activating" means
+                // while its unit runs: kill the daemon from outside then.
+                "kill_process"
+                    if s(st, "process") == "planariad"
+                        && state == "Activating"
+                        && all.iter().any(|x| s(x, "raw") == "slow_backend" && s(x, "call") == "activate_live") =>
+                {
+                    p.watched.insert(i, "unit:planarian-op-".into());
+                    "armed".into()
+                }
                 "kill_process" if s(st, "process") == "planariad" => {
                     let point =
                         if state == "OpId" { "OpCalled:activate_live".to_string() } else { format!("State:{state}") };
@@ -264,6 +278,21 @@ fn write_json<V: Serialize>(p: &Path, v: &V) {
 
 /// The journal as the daemon left it: a copy, replayed.
 fn ledger(cfg: &FileConfig) -> (Ledger, bool) {
+    match journal_copy(cfg) {
+        Some(j) => (j.ledger().clone(), true),
+        None => (Ledger::default(), false),
+    }
+}
+
+/// The entries since the journal's last checkpoint.
+fn segment(cfg: &FileConfig) -> Vec<Entry> {
+    journal_copy(cfg).and_then(|mut j| j.segment().ok()).unwrap_or_default()
+}
+
+/// Journal entries saved before a forced compaction discarded them.
+const SAVED: &str = "entries-saved.json";
+
+fn journal_copy(cfg: &FileConfig) -> Option<Journal<FileStore>> {
     let paths = Paths { state: cfg.state_dir.clone(), ..Default::default() };
     let tmp = PathBuf::from(format!("{RUN}/journal-copy"));
     let _ = std::fs::remove_dir_all(&tmp);
@@ -274,9 +303,116 @@ fn ledger(cfg: &FileConfig) -> (Ledger, bool) {
         x = paths.txn_dir().display()
     ));
     match FileStore::open(&tmp.join("journal"), &tmp.join("txn"), cfg.journal_bytes).map(Journal::open) {
-        Ok(Ok(j)) => (j.ledger().clone(), true),
-        _ => (Ledger::default(), false),
+        Ok(Ok(j)) => Some(j),
+        _ => None,
     }
+}
+
+/// The probe definitions of the running generation, per unit.
+fn probe_defs(cfg: &FileConfig) -> String {
+    let b = real(cfg);
+    let g = Backends::generations(&b);
+    let eval = g.current().and_then(|c| g.path_of(c)).and_then(|p| g.evaluate_built(&p));
+    match eval {
+        Ok(e) => {
+            let probes: BTreeMap<String, Vec<ProbeDef>> =
+                e.units.iter().map(|(id, d)| (id.to_string(), d.probes.clone())).collect();
+            serde_json::to_string(&probes).expect("serializes")
+        }
+        Err(o) => format!("unreadable: {o:?}"),
+    }
+}
+
+/// The TCP ports a unit's network probes connect to.
+fn probe_ports(cfg: &FileConfig, u: &UnitId) -> Vec<u16> {
+    let b = real(cfg);
+    let g = Backends::generations(&b);
+    let Ok(e) = g.current().and_then(|c| g.path_of(c)).and_then(|p| g.evaluate_built(&p)) else { return vec![] };
+    let port = |hostport: &str| hostport.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+    e.units
+        .get(u)
+        .map(|d| {
+            d.probes
+                .iter()
+                .filter_map(|p| match &p.kind {
+                    ProbeKind::Tcp { addr } => port(addr),
+                    ProbeKind::Http { url, .. } => {
+                        url.split("://").nth(1).and_then(|r| r.split('/').next()).and_then(port)
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn build_roots() -> BTreeSet<String> {
+    std::fs::read_dir("/nix/var/nix/gcroots/planarian/builds")
+        .map(|rd| rd.flatten().map(|e| e.path().display().to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Backend mutations, from the journal's calls: an activation runs as the
+/// transient unit `planarian-op-<txn>-<epoch>-<seq>` and lasts as long as
+/// systemd says it ran; any other call is an instant at its OpBegin. Calls
+/// the backend fenced, and calls never acknowledged that left no unit, are
+/// not effects.
+fn effects(entries: &[Entry], since_unix: u64) -> Vec<Effect> {
+    #[derive(Deserialize)]
+    struct J {
+        #[serde(rename = "UNIT")]
+        unit: Option<String>,
+        #[serde(rename = "MESSAGE")]
+        message: Option<String>,
+        #[serde(rename = "__REALTIME_TIMESTAMP")]
+        at: String,
+    }
+    let mut spans: BTreeMap<String, (Option<Timestamp>, Option<Timestamp>)> = BTreeMap::new();
+    for l in sh_out(&format!("journalctl -o json --no-pager --since @{since_unix} _PID=1")).lines() {
+        let Ok(j) = serde_json::from_str::<J>(l) else { continue };
+        let (Some(u), Some(m)) = (j.unit, j.message) else { continue };
+        let Some(name) = u.strip_suffix(".service").filter(|n| n.starts_with("planarian-op-")) else { continue };
+        let at = Timestamp(j.at.parse::<u64>().unwrap_or(0) / 1000);
+        let span = spans.entry(name.to_string()).or_default();
+        if m.starts_with("Starting") || m.starts_with("Started") {
+            span.0.get_or_insert(at);
+        } else if m.starts_with("Finished")
+            || m.starts_with("Stopped")
+            || m.starts_with("Failed")
+            || m.contains("Deactivated")
+        {
+            span.1 = Some(at);
+        }
+    }
+    let revert_name = |call: &str| -> String {
+        match call {
+            "activate_live" => "activate_live(candidate)".into(),
+            other => other.to_string(),
+        }
+    };
+    let acks: BTreeMap<OpId, Outcome> = entries
+        .iter()
+        .filter_map(|x| match &x.record {
+            Record::OpAck { op, outcome } => Some((*op, outcome.clone())),
+            _ => None,
+        })
+        .collect();
+    entries
+        .iter()
+        .filter_map(|x| {
+            let Record::OpBegin { op, call } = &x.record else { return None };
+            if acks.get(op).is_some_and(Outcome::is_fenced) {
+                return None;
+            }
+            let unit = format!("planarian-op-{}-{}-{}", op.txn.0, op.epoch, op.seq);
+            let (start, end) = match spans.get(&unit) {
+                Some((s, e)) => (s.unwrap_or(x.at), *e),
+                None if acks.contains_key(op) => (x.at, Some(x.at)),
+                None => return None,
+            };
+            Some(Effect { call: revert_name(call), txn: op.txn, epoch: op.epoch, seq: op.seq, start, end })
+        })
+        .collect()
 }
 
 fn journal_reached(cfg: &FileConfig, state: &str) -> bool {
@@ -351,6 +487,8 @@ fn begin(entry: &T) {
             .unwrap_or(0),
         pre_status: statuses(&r),
         touched,
+        probe_defs: probe_defs(&cfg),
+        gc_roots: build_roots(),
     };
     write_json(&dir.join("start.json"), &start);
     let _ = std::fs::write(dir.join("responses.jsonl"), "");
@@ -433,6 +571,13 @@ fn step(entry: &T, i: usize, watched: Option<&str>) {
     if let Some(after) = watched.and_then(|w| w.strip_prefix("after:")) {
         let d = dur(&T::String(after.into())).unwrap_or(Millis(0));
         std::thread::sleep(Duration::from_millis(d.0));
+    } else if let Some(prefix) = watched.and_then(|w| w.strip_prefix("unit:")) {
+        let until = Instant::now() + Duration::from_secs(3600);
+        while sh_out(&format!("systemctl list-units --state=active --no-legend --plain '{prefix}*'")).trim().is_empty()
+            && Instant::now() < until
+        {
+            std::thread::sleep(Duration::from_millis(200));
+        }
     } else if let Some(state) = watched {
         let until = Instant::now() + Duration::from_secs(3600);
         while !journal_reached(&cfg, state) && Instant::now() < until {
@@ -517,6 +662,14 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
         "stop_unit_out_of_band" => {
             let (ctl, name) = unit_cmd(&unit(&get("unit")));
             sh(&format!("{ctl} stop {name}"));
+        }
+        "set_knob" | "set_persistent_knob" if get("knob") == "probe_delay" => {
+            // The probe itself stalls, connecting included: drop the packets
+            // to the unit's probe ports (a connect cannot be made slow from
+            // inside the service).
+            for port in probe_ports(cfg, &unit(&get("unit"))) {
+                sh(&format!("iptables -I INPUT -p tcp --dport {port} -j DROP"));
+            }
         }
         "set_knob" | "set_persistent_knob" => {
             let u = unit(&get("unit"));
@@ -688,14 +841,25 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 ));
             }
         }
-        "force_compaction" => request_as("root", &Request::GymCompact)?,
+        "force_compaction" => {
+            let cfg = config();
+            let mut saved: Vec<Entry> = read_json(&PathBuf::from(RUN).join(SAVED)).unwrap_or_default();
+            for e in segment(&cfg) {
+                if saved.last().is_none_or(|l| l.seq < e.seq) {
+                    saved.push(e);
+                }
+            }
+            write_json(&PathBuf::from(RUN).join(SAVED), &saved);
+            request_as("root", &Request::GymCompact)?
+        }
         "advance_clock" => {
             let d = st.get("by").and_then(dur).ok_or("advance_clock")?;
             sh(&format!("timedatectl set-ntp false 2>/dev/null; date -s \"+{} seconds\"", d.0 / 1000));
         }
         "slow_backend" => {
             let d = st.get("delay").and_then(dur).unwrap_or(Millis::secs(120));
-            hooks_set(&get("call"), serde_json::json!({ "delay_secs": d.0 / 1000 }));
+            let uncancellable = st.get("uncancellable").and_then(T::as_bool).unwrap_or(false);
+            hooks_set(&get("call"), serde_json::json!({ "delay_secs": d.0 / 1000, "uncancellable": uncancellable }));
         }
         "withhold_reply" => {
             hooks_set(&get("call"), serde_json::json!({ "withhold": true }));
@@ -770,7 +934,53 @@ fn evidence() -> Evidence {
             *restarts.entry(u.clone()).or_default() += 1;
         }
     }
+    // The whole journal history: what a forced compaction discarded, then
+    // the current segment.
+    let saved: Option<Vec<Entry>> = read_json(&dir.join(SAVED));
+    let mut entries = saved.clone().unwrap_or_default();
+    for x in segment(&cfg) {
+        if entries.last().is_none_or(|l| l.seq < x.seq) {
+            entries.push(x);
+        }
+    }
+    let full_replay = saved.map(|_| {
+        let mut l = Ledger::default();
+        for x in &entries {
+            let _ = l.apply(x.clone());
+        }
+        l
+    });
+    let mut timeline: BTreeMap<UnitId, Vec<(Timestamp, String)>> = BTreeMap::new();
+    for smp in &samples {
+        for (u, st) in &smp.status {
+            let line = timeline.entry(u.clone()).or_default();
+            if line.last().is_none_or(|(_, n)| n != st) {
+                line.push((smp.at, st.clone()));
+            }
+        }
+    }
+    // The evaluated options a committed change set, as Planarian evaluated
+    // them (the derived facts' config diff), on top of the base.
+    let mut options: BTreeMap<String, Value> = BTreeMap::new();
+    for r in &log {
+        if let (Submitted::Finished { state: TxnState::Committed, .. }, Some(f)) = (&r.result, &r.facts)
+            && let Some(d) = &f.config_diff
+        {
+            for (k, (_, new)) in d.options.iter() {
+                match new {
+                    Some(v) => options.insert(k.clone(), v.clone()),
+                    None => options.remove(k),
+                };
+            }
+        }
+    }
     let backend = real(&cfg);
+    let drivers: BTreeMap<UnitId, String> = start
+        .pre_status
+        .keys()
+        .filter(|u| u.kind == UnitKind::Device)
+        .filter_map(|u| Backends::inventory(&backend).bound_driver(u).ok().flatten().map(|d| (u.clone(), d.name)))
+        .collect();
     let g = Backends::generations(&backend);
     let boot_entries = g.boot_entries().unwrap_or_default();
     let collected = start.boot_entries.iter().copied().filter(|x| !boot_entries.contains(x)).collect();
@@ -802,6 +1012,14 @@ fn evidence() -> Evidence {
         restarts,
         notices,
         responses,
+        entries: Some(entries.iter().filter(|x| x.at >= start.at).cloned().collect()),
+        full_replay,
+        effects: Some(effects(&entries, start.unix)),
+        status_timeline: Some(timeline),
+        drivers: Some(drivers),
+        options: Some(options),
+        probe_defs: Some((start.probe_defs, probe_defs(&cfg))),
+        gc_roots: Some((start.gc_roots, build_roots())),
     }
 }
 

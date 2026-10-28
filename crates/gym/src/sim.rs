@@ -11,7 +11,7 @@ use planarian_policy::{Settings, Tables};
 use planarian_schema::*;
 use planarian_txn::journal::Journal;
 use planarian_txn::kernel::{CrashPoint, Kernel};
-use planarian_txn::ledger::{Ledger, Record};
+use planarian_txn::ledger::{Entry, Ledger, Record};
 use planarian_txn::machine::tag;
 use std::collections::BTreeMap;
 use toml::Value as T;
@@ -82,6 +82,12 @@ pub struct Sim {
     pub pre_status: BTreeMap<UnitId, String>,
     /// Units the entry's own steps act on (exempt from `others_unchanged`).
     pub touched: std::collections::BTreeSet<UnitId>,
+    /// Journal entries saved before a compaction discards them, and whether one happened.
+    history: Vec<Entry>,
+    compacted: bool,
+    timeline: BTreeMap<UnitId, Vec<(Timestamp, String)>>,
+    start_probe_defs: String,
+    start_roots: std::collections::BTreeSet<String>,
 }
 
 pub fn peer(actor: &str) -> Peer {
@@ -160,6 +166,44 @@ impl Sim {
             first_incident_at: BTreeMap::new(),
             pre_status: BTreeMap::new(),
             touched: Default::default(),
+            history: vec![],
+            compacted: false,
+            timeline: BTreeMap::new(),
+            start_probe_defs: String::new(),
+            start_roots: Default::default(),
+        }
+    }
+
+    /// The run proper starts now: what the machine looks like before the first step.
+    pub fn begin(&mut self) {
+        self.start = self.now();
+        self.pre_status = self.statuses();
+        self.start_probe_defs = self.probe_defs();
+        self.start_roots = self.build_roots();
+    }
+
+    fn build_roots(&self) -> std::collections::BTreeSet<String> {
+        self.fake.w().gc_roots.iter().filter(|r| r.contains("/builds/")).cloned().collect()
+    }
+
+    /// The probe definitions the daemon evaluates, per unit.
+    fn probe_defs(&mut self) -> String {
+        let defs = self.observe().1;
+        let probes: BTreeMap<String, Vec<ProbeDef>> =
+            defs.iter().map(|(id, d)| (id.to_string(), d.probes.clone())).collect();
+        serde_json::to_string(&probes).expect("serializes")
+    }
+
+    /// Save the journal's current segment before something discards it.
+    fn save_segment(&mut self) {
+        if let Ok(mut j) = Journal::open(self.fake.store.clone())
+            && let Ok(seg) = j.segment()
+        {
+            for e in seg {
+                if self.history.last().is_none_or(|h| h.seq < e.seq) {
+                    self.history.push(e);
+                }
+            }
         }
     }
 
@@ -186,6 +230,26 @@ impl Sim {
     /// Everything the judge reads (check.rs).
     pub fn evidence(&mut self) -> crate::evidence::Evidence {
         let finals = self.statuses();
+        self.save_segment();
+        let entries: Vec<Entry> = self.history.iter().filter(|e| e.at >= self.start).cloned().collect();
+        let full_replay = self.compacted.then(|| {
+            let mut l = Ledger::default();
+            for e in &self.history {
+                let _ = l.apply(e.clone());
+            }
+            l
+        });
+        let probe_defs = (self.start_probe_defs.clone(), self.probe_defs());
+        let gc_roots = (self.start_roots.clone(), self.build_roots());
+        // Which generation each transaction reverts to, to name activations.
+        let revert_to: BTreeMap<TxnId, GenerationId> = self
+            .history
+            .iter()
+            .filter_map(|e| match &e.record {
+                Record::Prepared(t) => Some((t.id, t.revert_to)),
+                _ => None,
+            })
+            .collect();
         let journal_replays = Journal::open(self.fake.store.clone()).is_ok();
         let w = self.fake.w();
         let mut restarts: BTreeMap<UnitId, i64> = BTreeMap::new();
@@ -194,6 +258,37 @@ impl Sim {
                 *restarts.entry(unit(u)).or_default() += 1;
             }
         }
+        let name = |call: &str, txn: TxnId| -> String {
+            match call.strip_prefix("activate_live(").and_then(|g| g.strip_suffix(')')).and_then(|g| g.parse().ok()) {
+                Some(g) if revert_to.get(&txn) == Some(&GenerationId(g)) => "activate_live(revert_to)".into(),
+                Some(_) => "activate_live(candidate)".into(),
+                None => call.to_string(),
+            }
+        };
+        let jobs: std::collections::BTreeSet<OpId> = w.job_spans.values().map(|(j, _, _)| j.op).collect();
+        let effects: Vec<crate::evidence::Effect> = w
+            .calls
+            .iter()
+            .filter(|c| !c.fenced && !jobs.contains(&c.op))
+            .map(|c| crate::evidence::Effect {
+                call: name(&c.call, c.op.txn),
+                txn: c.op.txn,
+                epoch: c.op.epoch,
+                seq: c.op.seq,
+                start: c.at,
+                end: Some(c.at),
+            })
+            .chain(w.job_spans.values().map(|(j, start, end)| crate::evidence::Effect {
+                call: name(&format!("activate_live({})", j.activates.0), j.op.txn),
+                txn: j.op.txn,
+                epoch: j.op.epoch,
+                seq: j.op.seq,
+                start: *start,
+                end: *end,
+            }))
+            .collect();
+        let drivers = w.devices.iter().filter_map(|(d, r)| r.as_ref().map(|r| (d.clone(), r.name.clone()))).collect();
+        let options = w.gens.get(&w.current).map(|g| g.eval.options.clone()).unwrap_or_default();
         let (current, boot_default, boot_entries, collected, overrides_empty) = (
             w.current,
             w.boot_default,
@@ -235,12 +330,27 @@ impl Sim {
             restarts,
             notices: self.notices.clone(),
             responses: self.responses.clone(),
+            entries: Some(entries),
+            full_replay,
+            effects: Some(effects),
+            status_timeline: Some(self.timeline.clone()),
+            drivers: Some(drivers),
+            options: Some(options),
+            probe_defs: Some(probe_defs),
+            gc_roots: Some(gc_roots),
         }
     }
 
     /// The current status of every unit, by name.
     pub fn statuses(&mut self) -> BTreeMap<UnitId, String> {
-        let (s, defs) = match self.core.as_mut() {
+        let (s, defs) = self.observe();
+        defs.keys()
+            .map(|id| (id.clone(), format!("{:?}", s.status(id, &defs)).split('(').next().unwrap_or("").to_string()))
+            .collect()
+    }
+
+    fn observe(&mut self) -> (SystemState, UnitDefs) {
+        match self.core.as_mut() {
             Some(c) => c.observe(),
             None => {
                 // The daemon is held down: observe the way it would.
@@ -265,10 +375,7 @@ impl Sim {
                 let d = a.defs();
                 (s, d)
             }
-        };
-        defs.keys()
-            .map(|id| (id.clone(), format!("{:?}", s.status(id, &defs)).split('(').next().unwrap_or("").to_string()))
-            .collect()
+        }
     }
 
     /// Record what the daemon saw at the start of the last tick.
@@ -278,6 +385,10 @@ impl Sim {
                 let st = s.status(id, &defs);
                 let name = format!("{st:?}");
                 let name = name.split('(').next().unwrap_or("").to_string();
+                let line = self.timeline.entry(id.clone()).or_default();
+                if line.last().is_none_or(|(_, n)| *n != name) {
+                    line.push((s.observed_at, name.clone()));
+                }
                 self.seen_status.entry(id.clone()).or_default().insert(name);
             }
         }
@@ -409,8 +520,17 @@ impl Sim {
             match get("raw") {
                 "kill_process" if get("process") == "planariad" => {
                     let state: &'static str = Box::leak(state.to_string().into_boxed_str());
-                    let point =
-                        if state == "OpId" { CrashPoint::OpCalled("activate_live") } else { CrashPoint::State(state) };
+                    // With a slow activation worker set up, "during Activating"
+                    // means while that worker runs: once the call has started it.
+                    let slow_worker = steps.iter().any(|x| {
+                        x.get("raw").and_then(T::as_str) == Some("slow_backend")
+                            && x.get("call").and_then(T::as_str) == Some("activate_live")
+                    });
+                    let point = if state == "OpId" || (state == "Activating" && slow_worker) {
+                        CrashPoint::OpCalled("activate_live")
+                    } else {
+                        CrashPoint::State(state)
+                    };
                     if let Some(j) = (0..i).rev().find(|j| is_txn(steps[*j])) {
                         crash = Some((j, point));
                     }
@@ -619,6 +739,8 @@ impl Sim {
                 }
             }
             "force_compaction" => {
+                self.save_segment();
+                self.compacted = true;
                 if let Some(c) = self.core.as_mut() {
                     let _ = c.ex.kernel.journal.compact();
                 } else {
@@ -692,7 +814,8 @@ impl Sim {
         let sim = w.units.get_mut(u).ok_or_else(|| Unsupported(format!("no unit {u}")))?;
         match (knob, v) {
             ("health", Some(T::Integer(503))) => sim.health = Health::Http503,
-            ("health_delay" | "probe_delay", Some(d)) => sim.health = Health::Delay(dur(d).unwrap_or(Millis::secs(15))),
+            ("health_delay", Some(d)) => sim.health = Health::Delay(dur(d).unwrap_or(Millis::secs(15))),
+            ("probe_delay", Some(d)) => sim.health = Health::Stall(dur(d).unwrap_or(Millis::secs(15))),
             ("fail_after", Some(d)) => {
                 sim.fail_after = dur(d);
                 sim.started_at = now;

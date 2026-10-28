@@ -8,9 +8,11 @@
 //!   "jobs_tagged": { "result": "None" } }
 //! ```
 //!
-//! `delay_secs` sleeps before the call; `withhold` makes the call and then
-//! never answers (sleeps for a day); `result` replaces the call. A key with
-//! `@<generation id>` applies only to that generation.
+//! `delay_secs` sleeps before the call (for `activate_live`, inside the
+//! activation unit, which `uncancellable` makes ignore being stopped);
+//! `withhold` makes the call and then never answers (sleeps for a day);
+//! `result` replaces the call. A key with `@<generation id>` applies only to
+//! that generation.
 
 use planarian_schema::{GenerationId, Outcome};
 use std::time::Duration;
@@ -20,6 +22,7 @@ pub const HOOKS: &str = "/run/planarian-gym/hooks.json";
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Hook {
     pub delay: Option<Duration>,
+    pub uncancellable: bool,
     pub withhold: bool,
     pub result: Option<String>,
 }
@@ -31,6 +34,7 @@ pub fn hook(call: &str, g: Option<GenerationId>) -> Hook {
     let Some(h) = specific.or_else(|| v.get(call)) else { return Hook::default() };
     Hook {
         delay: h.get("delay_secs").and_then(|d| d.as_u64()).map(Duration::from_secs),
+        uncancellable: h.get("uncancellable").and_then(|u| u.as_bool()).unwrap_or(false),
         withhold: h.get("withhold").and_then(|w| w.as_bool()).unwrap_or(false),
         result: h.get("result").and_then(|r| r.as_str()).map(String::from),
     }
@@ -38,7 +42,10 @@ pub fn hook(call: &str, g: Option<GenerationId>) -> Hook {
 
 /// Apply a hook around an `Outcome`-returning call.
 pub fn around(call: &str, g: Option<GenerationId>, f: impl FnOnce() -> Outcome) -> Outcome {
-    let h = hook(call, g);
+    apply(hook(call, g), f)
+}
+
+pub fn apply(h: Hook, f: impl FnOnce() -> Outcome) -> Outcome {
     if let Some(d) = h.delay {
         std::thread::sleep(d);
     }

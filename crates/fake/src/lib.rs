@@ -45,8 +45,12 @@ pub enum Health {
     Ok,
     /// Http probes get a 503; the process stays active.
     Http503,
-    /// Network probes answer after this long.
+    /// The service answers requests after this long (Http probes); it still
+    /// accepts connections at once.
     Delay(Millis),
+    /// Every network probe, connecting included, takes this long (the port
+    /// is unreachable rather than slow).
+    Stall(Millis),
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +146,8 @@ pub struct World {
     pub fail_activate: BTreeSet<GenerationId>,
     pub slow_activation: Option<(Millis, bool)>,
     pub jobs: BTreeMap<JobId, Job>,
+    /// When each job started, and when it finished or was cancelled.
+    pub job_spans: BTreeMap<JobId, (Job, Timestamp, Option<Timestamp>)>,
     pub next_job: u64,
     pub jobs_tagged_unknown: bool,
     // ---- systemd / logind / devices ----
@@ -278,6 +284,9 @@ impl World {
         let done: Vec<JobId> = self.jobs.iter().filter(|(_, j)| j.done_at <= now).map(|(k, _)| k.clone()).collect();
         for id in done {
             let job = self.jobs.remove(&id).expect("listed");
+            if let Some(span) = self.job_spans.get_mut(&id) {
+                span.2 = Some(job.done_at);
+            }
             self.apply_generation(job.activates);
         }
         let broken = self.gens.get(&self.current).map(|g| g.broken.clone()).unwrap_or_default();
@@ -332,6 +341,12 @@ impl World {
 
     pub fn reboot(&mut self) {
         self.booted = self.boot_default;
+        let now = self.now;
+        for id in self.jobs.keys() {
+            if let Some(span) = self.job_spans.get_mut(id) {
+                span.2 = Some(now);
+            }
+        }
         self.jobs.clear();
         self.sessions.clear();
         let g = self.boot_default;
@@ -573,7 +588,10 @@ impl GenerationBackend for Fake {
             w.next_job += 1;
             let id = JobId(format!("job-{}", w.next_job));
             let done_at = w.now.plus(delay);
-            w.jobs.insert(id, Job { op: *op, done_at, cancellable, activates: g });
+            let job = Job { op: *op, done_at, cancellable, activates: g };
+            let now = w.now;
+            w.job_spans.insert(id.clone(), (job.clone(), now, None));
+            w.jobs.insert(id, job);
             return Outcome::Unknown("activation job accepted; no reply".into());
         }
         w.apply_generation(g);
@@ -610,6 +628,10 @@ impl GenerationBackend for Fake {
         match w.jobs.get(job) {
             Some(j) if j.cancellable => {
                 w.jobs.remove(job);
+                let now = w.now;
+                if let Some(span) = w.job_spans.get_mut(job) {
+                    span.2 = Some(now);
+                }
                 Outcome::Succeeded
             }
             Some(_) => Outcome::Failed("job cannot be cancelled".into()),
@@ -798,8 +820,11 @@ impl ProbeBackend for Fake {
                         (Health::Ok, _) => ProbeResult::Pass,
                         (Health::Http503, ProbeKind::Http { .. }) => ProbeResult::Fail("HTTP 503".into()),
                         (Health::Http503, _) => ProbeResult::Pass,
-                        (Health::Delay(d), _) if d.0 > p.timeout.0 => ProbeResult::Timeout,
+                        // A slow answer to the request; connecting is still quick.
+                        (Health::Delay(d), ProbeKind::Http { .. }) if d.0 > p.timeout.0 => ProbeResult::Timeout,
                         (Health::Delay(_), _) => ProbeResult::Pass,
+                        (Health::Stall(d), _) if d.0 > p.timeout.0 => ProbeResult::Timeout,
+                        (Health::Stall(_), _) => ProbeResult::Pass,
                     },
                 }
             })

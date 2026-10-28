@@ -498,6 +498,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
     }
 
     /// publish_boot → Published → promote → Promoted → Committed. Each step is idempotent.
+    /// Only after this owner's own probes passed (check_then_commit).
     fn commit_from_checking(&mut self, txn: &Transaction) -> R<TxnState> {
         let cand = Self::candidate(txn).expect("generation transactions have a candidate");
         let published = self.call(txn.id, "publish_boot", |h, op| h.generations().publish_boot(cand, op))?;
@@ -505,7 +506,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
             // /boot full and the like: a Checking failure (§12c).
             return self.revert_generation(txn, &format!("publish_boot: {published:?}"));
         }
-        self.advance(txn, TxnState::Published, "")?;
+        self.advance(txn, TxnState::Published, "probes passed")?;
         self.promote_and_commit(txn)
     }
 

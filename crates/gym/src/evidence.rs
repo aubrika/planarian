@@ -6,7 +6,7 @@
 use planarian_daemon::LogRecord;
 use planarian_ipc::Response;
 use planarian_schema::*;
-use planarian_txn::ledger::Ledger;
+use planarian_txn::ledger::{Entry, Ledger};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -46,4 +46,46 @@ pub struct Evidence {
     /// The daemon's notices, and the answers to the entry's own requests.
     pub notices: Vec<String>,
     pub responses: Vec<Response>,
+
+    // What the harness can supply beyond that; `None` where it cannot, and a
+    // check that needs it is then reported unchecked.
+    /// Every journal entry written during the run, across compactions.
+    #[serde(default)]
+    pub entries: Option<Vec<Entry>>,
+    /// The ledger from replaying that whole history, when the run compacted
+    /// the journal (the live ledger then comes from the checkpoint plus tail).
+    #[serde(default)]
+    pub full_replay: Option<Ledger>,
+    /// Backend mutations that went through (not fenced), with the time each
+    /// one's effect lasted: an instant, or a background job's run.
+    #[serde(default)]
+    pub effects: Option<Vec<Effect>>,
+    /// Each unit's status changes, in order.
+    #[serde(default)]
+    pub status_timeline: Option<BTreeMap<UnitId, Vec<(Timestamp, String)>>>,
+    /// The driver bound to each device at the end.
+    #[serde(default)]
+    pub drivers: Option<BTreeMap<UnitId, String>>,
+    /// The running generation's evaluated options.
+    #[serde(default)]
+    pub options: Option<BTreeMap<String, Value>>,
+    /// The probe definitions in force at the start and at the end.
+    #[serde(default)]
+    pub probe_defs: Option<(String, String)>,
+    /// Planarian's build GC roots at the start and at the end.
+    #[serde(default)]
+    pub gc_roots: Option<(BTreeSet<String>, BTreeSet<String>)>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Effect {
+    /// `activate_live(candidate)`, `activate_live(revert_to)`, `restart(<unit>)`, …
+    pub call: String,
+    pub txn: TxnId,
+    pub epoch: u64,
+    /// The journaled call (`OpBegin`) this effect came from.
+    pub seq: u64,
+    pub start: Timestamp,
+    /// `None`: still running at the end.
+    pub end: Option<Timestamp>,
 }
