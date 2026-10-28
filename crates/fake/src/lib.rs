@@ -139,6 +139,8 @@ pub struct World {
     /// tracked file while staging; the store fills during the build; a port is
     /// blocked when the candidate activates.
     pub edit_on_stage: bool,
+    /// The owner adds this untracked file while staging (after the copy).
+    pub untracked_on_stage: Option<String>,
     pub nospace_on_build: bool,
     /// How many times `build` ran.
     pub builds: usize,
@@ -469,13 +471,17 @@ impl GenerationBackend for Fake {
         if std::mem::take(&mut w.edit_on_stage) {
             w.owner_files.insert("configuration.nix".into(), "{ edited-during-build = true; }".into());
         }
+        let excluded: Vec<String> = w.untracked.iter().cloned().collect();
+        if let Some(f) = w.untracked_on_stage.take() {
+            w.untracked.insert(f);
+        }
         Ok(StagedSource {
             dir,
             base_source: World::source_hash_of(&files, &base),
             staged_source: World::source_hash_of(&files, overrides),
             base_override: World::override_hash_of(&base),
             candidate_override,
-            excluded: w.untracked.iter().cloned().collect(),
+            excluded,
         })
     }
 

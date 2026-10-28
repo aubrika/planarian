@@ -1546,7 +1546,12 @@ harness = ["vm"]
 layouts = ["ext4", "btrfs", "zfs"]
 intent = { kind = "none" }
 inject = { raw = "fill_fs", fs = "device:fs-journal", as_uid = "planariad", until = "reserved-boundary" }
-after = [{ raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }]
+# A repair needs journal records, and compaction writes a new segment:
+# both with the filesystem full.
+after = [
+  { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" },
+  { raw = "force_compaction" },
+]
 window = "10m"
 
 [fault.required_post]

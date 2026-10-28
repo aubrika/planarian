@@ -308,10 +308,8 @@ fn main() {
         }
         let lines: Vec<String> = core.log.drain(..).filter_map(|r| serde_json::to_string(&r).ok()).collect();
         append_log(&paths.state, &lines);
-        // Notices go to the journal (stderr), once each. Once the deque is
-        // full its length stops growing, so count by the total.
-        let new = core.notices_total.saturating_sub(printed).min(core.notices.len() as u64) as usize;
-        for s in core.notices.iter().skip(core.notices.len() - new) {
+        // Notices go to the journal (stderr), once each.
+        for s in core.notices_since(printed) {
             eprintln!("planariad: {s}");
         }
         printed = core.notices_total;

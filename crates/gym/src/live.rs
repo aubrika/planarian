@@ -110,6 +110,16 @@ pub fn plan(entry: &T) -> Plan {
     let all = steps(entry);
     let mut p = Plan { window_secs: crate::window(entry).0 / 1000, ..Default::default() };
     let mut changed_generation = false;
+    // The gym VM's journal filesystem is ext4 (nix/tests/gym-vm.nix).
+    let layouts: Vec<&str> = entry
+        .get("layouts")
+        .and_then(T::as_array)
+        .map(|a| a.iter().filter_map(T::as_str).collect())
+        .unwrap_or_default();
+    if !layouts.is_empty() && !layouts.contains(&"ext4") {
+        p.steps.push(format!("unsupported: a journal on {} (the gym VM's is ext4)", layouts.join(" or ")));
+        return p;
+    }
     for (i, st) in all.iter().enumerate() {
         if matches!(s(st, "transition"), "ApplyChange" | "SwitchGeneration" | "Rollback") {
             changed_generation = true;
@@ -125,7 +135,12 @@ pub fn plan(entry: &T) -> Plan {
         let after = st.get("when").and_then(|w| w.get("after"));
         let raw = s(st, "raw");
         let slow_activation = all.iter().any(|x| s(x, "raw") == "slow_backend" && s(x, "call") == "activate_live");
-        let kind = if op_called == Some("activate_live") && raw == "kill_process" && slow_activation {
+        let kind = if raw == "fill_fs" && s(st, "fs") == "device:fs-nix" {
+            // The test VM's store is the host's, shared in under a tmpfs
+            // overlay: candidates are prebuilt (a build writes nothing) and
+            // collecting garbage cannot free the overlay.
+            "unsupported: a full Nix store (the test VM's store is the host's)".into()
+        } else if op_called == Some("activate_live") && raw == "kill_process" && slow_activation {
             // The slow part runs in the activation's own unit: kill the daemon
             // from outside once that unit is running (an in-daemon crash point
             // would fire only after the slow call returned).
@@ -178,6 +193,12 @@ pub fn plan(entry: &T) -> Plan {
         } else {
             match raw {
                 "reboot" | "suspend" | "hotunplug" | "stop_host_service" | "start_host_service" => "host".into(),
+                "cli"
+                    if st.get("argv").and_then(T::as_array).and_then(|a| a.first()).and_then(T::as_str)
+                        == Some("internal") =>
+                {
+                    format!("unsupported: {raw} {:?} (no such command)", st.get("argv"))
+                }
                 "kill_unit"
                 | "stop_unit_out_of_band"
                 | "set_knob"
@@ -508,7 +529,7 @@ fn begin(entry: &T) {
     let _ = sh(&format!("chmod 666 {RUN}/responses.jsonl"));
     let exe = std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "planarian-gym".into());
     sh(&format!(
-        "systemctl stop gym-sampler 2>/dev/null; systemd-run --unit=gym-sampler -E PLANARIAN_GYM_CATALOG {exe} vm sample"
+        "systemctl stop gym-sampler 2>/dev/null; systemd-run --unit=gym-sampler -E PATH -E PLANARIAN_GYM_CATALOG {exe} vm sample"
     ));
     for state in p.watched.values() {
         if let Some(call) = pause_call(state) {
@@ -517,7 +538,7 @@ fn begin(entry: &T) {
     }
     for (i, state) in &p.watched {
         sh(&format!(
-            "systemd-run --unit=gym-watch-{i} -E PLANARIAN_GYM_CATALOG {exe} vm step --id {} --index {i} --watched {state}",
+            "systemd-run --unit=gym-watch-{i} -E PATH -E PLANARIAN_GYM_CATALOG {exe} vm step --id {} --index {i} --watched {state}",
             s(entry, "id")
         ));
     }
@@ -758,14 +779,17 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
             };
             // A port blocked on this machine refuses connections (as the fake
             // models it); an unreachable remote host just stops answering.
-            if get("dst").starts_with("127.") {
+            let ok = if get("dst").starts_with("127.") {
                 let tcp = if port.is_some() { rule.clone() } else { format!("{rule} -p tcp") };
-                sh(&format!("iptables -I OUTPUT {tcp} -j REJECT --reject-with tcp-reset"));
+                sh(&format!("iptables -I OUTPUT {tcp} -j REJECT --reject-with tcp-reset"))
             } else {
                 sh(&format!(
                     "iptables -I OUTPUT {rule} -j DROP && iptables -I INPUT {} -j DROP",
                     rule.replace("-d ", "-s ").replace("--dport", "--sport")
-                ));
+                ))
+            };
+            if !ok {
+                return Err(format!("could not block {rule}"));
             }
         }
         "unblock_network" => {
@@ -1146,6 +1170,23 @@ fn judge(entry: &T) -> i32 {
     let unsupported: Vec<String> = p.steps.iter().filter(|s| s.starts_with("unsupported")).cloned().collect();
     let full = needs_full_window(&post);
     let end = Instant::now() + Duration::from_secs(p.window_secs);
+    if p.hold {
+        // The daemon was held down so the watchdog would recover alone. Once
+        // it has, let the daemon back: its view is what the statuses are
+        // sampled from, and coming back after a recovery is part of the case.
+        let cfg = config();
+        let until = Instant::now() + Duration::from_secs((p.window_secs / 2).min(300));
+        while !ledger(&cfg).0.live.is_empty() && Instant::now() < until {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        sh(
+            "rm -f /run/systemd/system/planariad.service.d/gym-hold.conf; systemctl daemon-reload; systemctl start planariad",
+        );
+        let until = Instant::now() + Duration::from_secs(60);
+        while console().is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
     let min = Instant::now() + Duration::from_secs(60.min(p.window_secs));
     let (mut v, mut e);
     loop {

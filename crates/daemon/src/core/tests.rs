@@ -412,3 +412,75 @@ fn a_prebuilt_candidate_from_an_older_override_file_is_not_used() {
     // The stale candidate was rebuilt against the new file.
     assert_eq!(r.fake.w().builds, 3);
 }
+
+#[test]
+fn notices_keep_reaching_the_journal_once_the_deque_is_full() {
+    let mut r = Rig::new();
+    let mut printed = r.core.notices_total;
+    let mut seen = vec![];
+    for i in 0..(super::NOTICES_KEPT * 3) {
+        r.core.notice(format!("n{i}"));
+        if i % 7 == 0 {
+            seen.extend(r.core.notices_since(printed).cloned());
+            printed = r.core.notices_total;
+        }
+    }
+    seen.extend(r.core.notices_since(printed).cloned());
+    let want: Vec<String> = (0..super::NOTICES_KEPT * 3).map(|i| format!("n{i}")).collect();
+    assert_eq!(seen, want, "each notice once, in order, also after the first {}", super::NOTICES_KEPT);
+}
+
+#[test]
+fn an_untracked_file_added_during_the_build_is_reported_not_stale() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    r.fake.w().untracked_on_stage = Some("scratch.nix".into());
+    let mut args = BTreeMap::new();
+    args.insert("scale".to_string(), Value::Str("1.25".into()));
+    let resp = r.core.handle(ALICE, Request::Apply { change: ChangeId("font-scale".into()), args });
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert!(
+        r.core.notices.iter().any(|n| n.contains("left out of the build") && n.contains("scratch.nix")),
+        "{:?}",
+        r.core.notices
+    );
+}
+
+#[test]
+fn a_deferred_change_reaches_the_executor_log() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    r.core.log.clear();
+    r.core.defer = true;
+    let mut args = BTreeMap::new();
+    args.insert("scale".to_string(), Value::Str("1.25".into()));
+    let placeholder = r.core.handle(ALICE, Request::Apply { change: ChangeId("font-scale".into()), args });
+    assert!(matches!(placeholder, Response::Ok { .. }), "{placeholder:?}");
+    let (job, resume) = r.core.take_deferred().expect("deferred");
+    let resp = r.core.resume(resume, job.run());
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    r.ticks(1);
+    assert!(
+        r.core.log.iter().any(|l| matches!(l.proposal.transition, Transition::ApplyChange { .. })),
+        "{:?}",
+        r.core.log
+    );
+}
+
+#[test]
+fn executor_log_records_serialize() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    r.fake.w().kill(&UnitId::service("gym-web"));
+    r.ticks(4);
+    let mut args = BTreeMap::new();
+    args.insert("scale".to_string(), Value::Str("1.25".into()));
+    r.core.handle(ALICE, Request::Apply { change: ChangeId("font-scale".into()), args });
+    r.ticks(1);
+    assert!(r.core.log.len() >= 2, "{:?}", r.core.log);
+    for l in &r.core.log {
+        let j = serde_json::to_string(l).unwrap_or_else(|e| panic!("{e}: {l:?}"));
+        let back: LogRecord = serde_json::from_str(&j).unwrap_or_else(|e| panic!("{e}: {j}"));
+        assert_eq!(serde_json::to_string(&back).unwrap(), j);
+    }
+}

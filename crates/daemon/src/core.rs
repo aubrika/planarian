@@ -236,6 +236,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         self.notices_total += 1;
     }
 
+    /// The notices made since `printed` of them (counted by
+    /// `notices_total`) were seen, oldest first: what to journal next.
+    pub fn notices_since(&self, printed: u64) -> impl Iterator<Item = &String> {
+        let new = self.notices_total.saturating_sub(printed).min(self.notices.len() as u64) as usize;
+        self.notices.iter().skip(self.notices.len() - new)
+    }
+
     fn journal(&mut self, r: Record) {
         let now = self.b.clock().now();
         if let Err(e) = self.ex.kernel.journal.append(now, r) {

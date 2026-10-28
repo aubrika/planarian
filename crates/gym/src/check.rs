@@ -756,6 +756,11 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             _ => false,
         });
     }
+    // So does `emergency`: a run can collect both ways (an emergency on a
+    // full journal filesystem, a routine one on another).
+    if let Some(want) = spec.get("emergency").and_then(T::as_bool) {
+        matching.retain(|x| matches!(x.transition, Transition::CollectGarbage { emergency } if emergency == want));
+    }
     let label = format!(
         "txn {}",
         spec.as_table()
@@ -895,12 +900,6 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
                 }
             }
         }
-    }
-    if let Some(Transition::CollectGarbage { emergency }) = Some(&t.transition)
-        && let Some(want) = spec.get("emergency").and_then(T::as_bool)
-        && *emergency != want
-    {
-        v.failures.push(format!("{label}: emergency is {emergency}"));
     }
     // Parked for approval, and activated only once approved.
     if s("not_activated_before") == Some("approval") {

@@ -186,6 +186,14 @@ let
             probes = [ { id = "gym-upstream-tcp"; type = "tcp"; addr = "10.0.2.2:9000"; establishes = "gym-upstream-tcp"; } ];
           };
           snd-hda0 = { kind = "device"; sysfs = "/sys/bus/pci/devices/0000:00:1b.0"; };
+          # As in the fake's fixtures: alice's sound needs the sound card. (A
+          # full definition: beside the module's mkDefault one, a partial one
+          # would replace it and lose the user scope.)
+          pipewire = {
+            scope = "user";
+            synonyms = [ "sound" "audio" ];
+            edges = [ { to = "device:snd-hda0"; kind = "Requires"; } ];
+          };
           net-gym0 = { kind = "device"; sysfs = "/sys/bus/pci/devices/0000:00:1d.0"; sensitivity = [ "External" ]; restartDisruption = "ConnectivityLoss"; };
           gpu0 = { kind = "device"; sysfs = "/sys/bus/pci/devices/0000:00:1c.0"; restartDisruption = "SessionLoss"; };
           # The USB stick's storage interface, wherever it enumerates (udev
@@ -309,6 +317,10 @@ let
       # On a desktop, the session's clients start pipewire (it is socket-
       # activated); these logins have no clients, so start it with the session.
       systemd.user.services.pipewire.wantedBy = [ "default.target" ];
+      # Upstream restarts pipewire on failure, and then Planarian rightly
+      # leaves it to systemd (svc-killed-defer-to-systemd covers that). The
+      # user-scope repair entries need a user service systemd won't restart.
+      systemd.user.services.pipewire.serviceConfig.Restart = lib.mkForce "no";
       systemd.user.services.wireplumber.wantedBy = [ "default.target" ];
       systemd.user.targets.gym-desktop = {
         bindsTo = [ "graphical-session.target" ];
@@ -349,7 +361,10 @@ let
         ];
       };
       boot.kernelModules = [ "snd_hda_intel" "virtio_gpu" "mac80211_hwsim" ];
-      boot.kernelParams = lib.optional (config.gym.kernelParam != "") config.gym.kernelParam;
+      # Suspend to idle: QEMU does not bring this VM back from S3 (deep), and
+      # for systemd and Planarian a suspend is the same either way.
+      boot.kernelParams = [ "mem_sleep_default=s2idle" ]
+        ++ lib.optional (config.gym.kernelParam != "") config.gym.kernelParam;
       # The journal on its own small filesystem (fill_fs fs-journal).
       fileSystems."/var/lib/planarian" = { device = "/dev/vdb"; fsType = "ext4"; autoFormat = true; };
 
@@ -455,16 +470,17 @@ let
                 elif kind == "host":
                     if raw == "reboot":
                         machine.shutdown(); machine.start(); machine.wait_for_unit("planariad.service")
-                        machine.succeed("systemd-run --unit=gym-sampler -E PLANARIAN_GYM_CATALOG planarian-gym vm sample")
+                        machine.succeed("systemd-run --unit=gym-sampler -E PATH -E PLANARIAN_GYM_CATALOG planarian-gym vm sample")
                     elif raw == "suspend":
                         d = st.get("duration", "60s")
                         secs = int(d[:-1]) * (60 if d.endswith("m") else 1)
                         # The RTC alarm wakes it; the monitor command is a backup.
                         machine.succeed(f"rtcwake -m no -s {secs}")
                         machine.execute("systemctl suspend &")
-                        time.sleep(secs + 15)
+                        time.sleep(secs)
                         machine.send_monitor_command("system_wakeup")
-                        machine.wait_until_succeeds("true", timeout=300)
+                        # Bounded: a command sent to a machine that never wakes waits forever.
+                        machine.wait_for_console_text("PM: suspend exit", timeout=300)
                     elif raw == "hotunplug":
                         machine.send_monitor_command("device_del gymusbdev")
                     elif raw in ("stop_host_service", "start_host_service"):
@@ -482,9 +498,9 @@ let
                 " git -C /etc/nixos status --short; tail -n 3 /etc/nixos/configuration.nix"
             )[1])
             print(machine.succeed(f"{gym} judge --id {ID} 2>&1"))
-        machine.copy_from_vm("/var/lib/gym-run/verdict.json", "")
+        machine.copy_from_machine("/var/lib/gym-run/verdict.json", "")
         if machine.execute("test -e /var/lib/gym-run/evidence.json")[0] == 0:
-            machine.copy_from_vm("/var/lib/gym-run/evidence.json", "")
+            machine.copy_from_machine("/var/lib/gym-run/evidence.json", "")
       '';
     };
 in

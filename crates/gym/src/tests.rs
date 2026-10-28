@@ -198,3 +198,41 @@ fn torn_record_really_tears() {
     // transaction still Activating.
     assert!(sim.notices.iter().any(|n| n.contains("found Activating")), "{:?}", sim.notices);
 }
+
+#[test]
+fn emergency_selects_among_collections() {
+    // A routine collection (the entry's own) and an emergency one beside it:
+    // the spec asks for the emergency one, wherever it falls.
+    let (mut e, _) = passing("storage-budget-unsatisfiable");
+    let post: T =
+        toml::from_str("[[txn]]\ntransition = \"CollectGarbage\"\nemergency = true\nterminal = \"Committed\"\n")
+            .unwrap();
+    assert!(!judge(&e, &post).failures.is_empty(), "no emergency collection yet");
+    let (id, routine) = e
+        .ledger
+        .terminal
+        .iter()
+        .find(|(_, t)| matches!(t.transition, Transition::CollectGarbage { emergency: false }))
+        .map(|(id, t)| (*id, t.clone()))
+        .expect("a routine collection");
+    let mut urgent = routine;
+    urgent.transition = Transition::CollectGarbage { emergency: true };
+    e.ledger.terminal.insert(TxnId(id.0 + 1000), urgent);
+    let v = judge(&e, &post);
+    assert!(v.failures.is_empty(), "{:?}", v.failures);
+}
+
+#[test]
+fn vm_plan_refuses_what_the_gym_vm_cannot_be() {
+    let entries = catalog();
+    let get = |id: &str| entries.iter().find(|e| e.get("id").and_then(T::as_str) == Some(id)).expect("entry").clone();
+    let unsupported = |id: &str| crate::live::plan(&get(id)).steps.iter().any(|s| s.starts_with("unsupported"));
+    // A btrfs journal: the gym VM's is ext4, so the entry would pass on the wrong filesystem.
+    assert!(unsupported("storage-journal-btrfs-reuse"));
+    // ext4 is one of its layouts.
+    assert!(!unsupported("storage-journal-fs-full"));
+    // The VM's Nix store is the host's: it cannot really fill or be collected.
+    assert!(unsupported("storage-enospc-during-build"));
+    assert!(unsupported("storage-nix-full-gc"));
+    assert!(!unsupported("storage-boot-full-publish"));
+}
