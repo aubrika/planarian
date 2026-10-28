@@ -54,7 +54,37 @@
     # Dark boot menus: the kit's wordmark on charcoal instead of the NixOS theme.
     grubTheme = null;
     efiSplashImage = ../../assets/boot/efi-splash.png;
+    # 800 x 600: NixOS's BIOS menu (isolinux) runs at that resolution and
+    # draws the background unscaled from the top-left corner.
     splashImage = ../../assets/boot/bios-splash.png;
+    # NixOS's layout with the kit's colours: its defaults are dark text,
+    # chosen for the light NixOS background, and unreadable on charcoal.
+    syslinuxTheme = ''
+      MENU TITLE planarian live
+      MENU RESOLUTION 800 600
+      MENU CLEAR
+      MENU ROWS 6
+      MENU CMDLINEROW -4
+      MENU TIMEOUTROW -3
+      MENU TABMSGROW  -2
+      MENU HELPMSGROW -1
+      MENU HELPMSGENDROW -1
+      MENU MARGIN 0
+
+      #                                FG:AARRGGBB  BG:AARRGGBB   shadow
+      MENU COLOR BORDER       30;44      #00000000    #00000000   none
+      MENU COLOR SCREEN       37;40      #FFD0D3D6    #00000000   none
+      MENU COLOR TABMSG       31;40      #FF8A9096    #00000000   none
+      MENU COLOR TIMEOUT      1;37;40    #FFD0D3D6    #00000000   none
+      MENU COLOR TIMEOUT_MSG  37;40      #FF8A9096    #00000000   none
+      MENU COLOR CMDMARK      1;36;40    #FFFFFFFF    #00000000   none
+      MENU COLOR CMDLINE      37;40      #FFD0D3D6    #00000000   none
+      MENU COLOR TITLE        1;36;44    #00000000    #00000000   none
+      MENU COLOR UNSEL        37;44      #FFD0D3D6    #00000000   none
+      MENU COLOR SEL          7;37;40    #FF151719    #FFE8EAEC   none
+      MENU COLOR HOTKEY       37;40      #FFFFFFFF    #00000000   none
+      MENU COLOR HOTSEL       7;37;40    #FF151719    #FFE8EAEC   none
+    '';
     # Faster to build than the default, a little larger.
     squashfsCompression = "zstd -Xcompression-level 6";
   };
