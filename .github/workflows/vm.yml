@@ -2,15 +2,14 @@
 # gym's fault catalog on real VMs (one NixOS test per entry). Linux runners
 # have KVM once /dev/kvm is opened to the runner user.
 #
-# Cost: in a private repository these minutes count against the Actions
-# quota. A push runs 7 VM jobs (about 70 runner minutes; a newer push
-# cancels them); the whole catalog is 62 jobs (several hundred minutes), so
-# it runs only by hand (Actions → VM tests → Run workflow → catalog).
+# A push runs 7 VM jobs (about 70 runner minutes; a newer push cancels
+# them); the whole catalog is 62 jobs (several hundred minutes), so it runs
+# only by hand (Actions → VM tests → Run workflow → catalog).
 name: VM tests
 
 on:
   push:
-    branches: [ccr-c64ddb68-a5g3k5]
+    branches: [main]
     paths-ignore: ["docs/**", "**.md"]
   workflow_dispatch:
     inputs:
