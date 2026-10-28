@@ -192,6 +192,11 @@ let
       environment.variables.PLANARIAN_GYM_CATALOG = "${catalog}";
       programs.git.config.safe.directory = "*";
 
+      # The test VM's root disk has no partition table, so GRUB can't be
+      # embedded in it: publish_boot would fail on grub-install, not on
+      # anything Planarian does. nodev still writes the boot menu for real.
+      boot.loader.grub.devices = lib.mkForce [ "nodev" ];
+
       # Devices at fixed PCI addresses (their sysfs paths are in the manifest).
       virtualisation = {
         memorySize = 3072;
