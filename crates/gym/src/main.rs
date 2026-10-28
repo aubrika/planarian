@@ -131,6 +131,7 @@ fn main() {
     let mut harness = "fake".to_string();
     let mut verbose = false;
     let mut show_notices = false;
+    let mut strict = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -150,6 +151,7 @@ fn main() {
             "--socket" => i += 1,
             "-v" | "--verbose" => verbose = true,
             "--notices" => show_notices = true,
+            "--strict" => strict = true,
             other => {
                 eprintln!("unknown argument {other}");
                 std::process::exit(2);
@@ -209,10 +211,11 @@ fn main() {
             }
             println!("\n{tally:?}");
             println!("\n{metrics}");
-            std::process::exit(match worst {
-                Result_::Pass | Result_::Partial | Result_::NotFake => 0,
-                _ => 1,
-            });
+            // A failure fails the run, and so does a key left unchecked (a
+            // pass that proves less than it says). Entries this harness
+            // cannot run are listed, and fail it only with --strict.
+            let failed = tally.contains_key("Fail") || tally.contains_key("Partial");
+            std::process::exit(if failed || (strict && worst == Result_::Unsupported) { 1 } else { 0 });
         }
         "serve" => {
             let socket = args.iter().position(|a| a == "--socket").and_then(|i| args.get(i + 1)).cloned();

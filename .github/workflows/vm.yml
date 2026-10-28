@@ -1,0 +1,95 @@
+# NixOS VM tests: the runtime and generation tests, the installer, and the
+# gym's fault catalog on real VMs (one NixOS test per entry). Linux runners
+# have KVM once /dev/kvm is opened to the runner user. The catalog runs on a
+# schedule and by hand rather than per push: it is 62 VMs.
+name: VM tests
+
+on:
+  push:
+    branches: [ccr-c64ddb68-a5g3k5]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      catalog:
+        description: "Also run the whole gym catalog on VMs"
+        type: boolean
+        default: false
+
+jobs:
+  vm:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [vm-runtime, vm-generations, installer]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      - run: nix build -L .#checks.x86_64-linux.${{ matrix.check }}
+
+  ga-demo:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [svc-killed, svc-misconfig-listen-address, crash-activating-bad, crash-daemon-restart-reconciles]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      - run: nix build -L .#legacyPackages.x86_64-linux.gym-vm.${{ matrix.id }} -o verdict
+      - name: Verdict
+        run: |
+          cat verdict/verdict.json
+          jq -e '.result == "PASS"' verdict/verdict.json
+
+  catalog-ids:
+    if: github.event_name == 'schedule' || inputs.catalog
+    runs-on: ubuntu-24.04
+    outputs:
+      ids: ${{ steps.ids.outputs.ids }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ids
+        run: |
+          python3 -c 'import json, tomllib; d = tomllib.load(open("crates/gym/catalog/phase-a.toml", "rb")); print("ids=" + json.dumps([e["id"] for e in d["fault"] if "vm" in e.get("harness", [])]))' >> "$GITHUB_OUTPUT"
+
+  catalog:
+    needs: catalog-ids
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        id: ${{ fromJSON(needs.catalog-ids.outputs.ids) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      - run: nix build -L .#legacyPackages.x86_64-linux.gym-vm.${{ matrix.id }} -o verdict
+      - name: Verdict
+        run: |
+          cat verdict/verdict.json
+          jq -e '.result == "PASS" or .result == "UNSUPPORTED"' verdict/verdict.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verdict-${{ matrix.id }}
+          path: verdict/

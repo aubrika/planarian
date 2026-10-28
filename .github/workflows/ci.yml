@@ -1,0 +1,65 @@
+# The Phase A gates that fit on a standard runner (SPEC §17: tests, the gym's
+# Phase A catalog, the dependency-boundary check, Verus proofs, Kani
+# harnesses). The VM tests are in vm.yml.
+name: CI
+
+on:
+  push:
+    branches: [ccr-c64ddb68-a5g3k5]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: clippy with the gym's fault-injection hooks
+        run: cargo clippy -p planarian-daemon -p planarian-backend-linux --features planarian-daemon/gym-hooks -- -D warnings
+      - run: cargo test --workspace
+      - name: Fault catalog, fake harness (fails on FAIL or PARTIAL)
+        run: cargo run -p planarian-gym -- run
+      - name: GA demonstration, fake harness
+        run: crates/gym/demo.sh --harness fake
+      - name: Dependency boundaries
+        run: bash nix/tests/boundaries.sh .
+
+  nix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Package, module evaluation, boundaries, Verus proofs
+        run: >
+          nix build -L
+          .#checks.x86_64-linux.package
+          .#checks.x86_64-linux.module-eval
+          .#checks.x86_64-linux.boundaries
+          .#checks.x86_64-linux.verus
+
+  kani:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/kani
+            ~/.cargo/bin/cargo-kani
+            ~/.kani
+          key: kani-0.68.0
+      - name: Kani 0.68.0 (docs/pins.md)
+        run: |
+          command -v cargo-kani || cargo install --locked kani-verifier --version 0.68.0
+          cargo kani setup
+      - run: cargo kani -p planarian-txn
+      - run: cargo kani -p planarian-exec
