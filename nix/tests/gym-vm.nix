@@ -46,6 +46,8 @@ let
     import http.server, os, socketserver, sys, threading, time, json
     name, port = sys.argv[1], int(sys.argv[2])
     http_mode = "--http" in sys.argv
+    # --addr: the address to bind (an address on no interface fails to bind).
+    addr = sys.argv[sys.argv.index("--addr") + 1] if "--addr" in sys.argv else "127.0.0.1"
     knobs = f"/var/lib/gym-knobs/{name}"
     def knob(k):
         try: return open(f"{knobs}/{k}").read().strip()
@@ -76,13 +78,13 @@ let
     class S(socketserver.ThreadingMixIn, socketserver.TCPServer):
         allow_reuse_address = True; daemon_threads = True
     if http_mode:
-        S(("127.0.0.1", port), H).serve_forever()
+        S((addr, port), H).serve_forever()
     else:
         class T(socketserver.BaseRequestHandler):
             def handle(self):
                 d = secs(knob("probe_delay"))
                 if d: time.sleep(d)
-        S(("127.0.0.1", port), T).serve_forever()
+        S((addr, port), T).serve_forever()
   '';
 
   svc = name: args: extra: lib.recursiveUpdate {
@@ -199,7 +201,7 @@ let
       systemd.services."hostapd-gym-ap-a" = accessPoints."hostapd-gym-ap-a";
       systemd.services."hostapd-gym-ap-b" = accessPoints."hostapd-gym-ap-b";
       systemd.services = {
-        gym-web = svc "gym-web" "8080 --http" { };
+        gym-web = svc "gym-web" "8080 --http --addr ${config.services.gym-web.listenAddress}" { };
         gym-db = svc "gym-db" "5432" { };
         gym-cache = svc "gym-cache" "6379" { };
         gym-metrics = svc "gym-metrics" "9100" { };
