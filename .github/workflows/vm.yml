@@ -11,6 +11,7 @@ name: VM tests
 on:
   push:
     branches: [ccr-c64ddb68-a5g3k5]
+    paths-ignore: ["docs/**", "**.md"]
   workflow_dispatch:
     inputs:
       catalog:

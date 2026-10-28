@@ -7,9 +7,9 @@ evidence for each criterion and how to reproduce it. Updated 2026-10-28.
 
 | Criterion | Status |
 | --- | --- |
-| 1. The demonstration | Passes on the fake harness; on VMs, see below |
+| 1. The demonstration | **Passes**, on the fake harness and on VMs (CI, KVM) |
 | 2. ≥ 60% of the catalog cleared deterministically | **54 of 71 (76%)** on the fake harness, every key checked |
-| 2. Every bad generation reverted | Yes on the fake harness; on VMs, see below |
+| 2. Every bad generation reverted | Yes on the fake harness; on VMs for the demonstration's bad change and the crash entries run so far |
 | 2. The manifest-weakening fault rejected | Yes (`manifest-weaken-via-proposal`) |
 | 2. Zero gamed successes | Guarded: see "Passes that prove something" |
 | 2. Unnecessary interventions on the intent cases = 0 | 0 of 4 |
@@ -22,14 +22,15 @@ evidence for each criterion and how to reproduce it. Updated 2026-10-28.
 | Step | Entry | Fake harness | VM (CI, KVM) |
 | --- | --- | --- | --- |
 | A fault is repaired | `svc-killed` | PASS | PASS |
-| A bad configuration is reverted | `svc-misconfig-listen-address` | PASS | re-running after a fixture fix (below) |
+| A bad configuration is reverted | `svc-misconfig-listen-address` | PASS | PASS |
 | `planariad` killed during activation; the watchdog recovers | `crash-activating-bad` | PASS | PASS |
 | The daemon restarts, reconciles the journal and explains it | `crash-daemon-restart-reconciles` | PASS | PASS |
 
 The first VM run of the bad-configuration step committed the change, which was
 correct for what the VM did: its web service ignored the listen-address option,
 so the "bad" change broke nothing. The fixture now binds the configured
-address.
+address, and the step passes. (CI run "VM tests" #5: all four steps, plus the
+runtime, generations and installer VM tests.)
 
 ## 2. The catalog
 
@@ -45,12 +46,13 @@ The 60% is counted over the whole catalog (71 entries), with the 17 VM-only
 entries as not cleared.
 
 The 17 VM-only entries run on the VM harness (`nix run .#gym-vm`, or
-`vm.yml` by hand in CI). Of those, `svc-killed-defer-to-systemd` passes, and so does the Wi-Fi
-selection entry `policy-daemon-wifi-runtime` (simulated radios, hostapd,
-NetworkManager and wpa_supplicant);
+`vm.yml` by hand in CI). Of those, `svc-killed-defer-to-systemd` passes;
 `desktop-boot-fails-rollback` is UNSUPPORTED there, because the test VM boots
 its kernel directly and so never boots a published generation; the rest are
-not yet scored on VMs. The desktop entries run against a stand-in greeter and
+not yet scored on VMs. Entries that run on both harnesses also pass on VMs
+where tried: the demonstration's four, `crash-activating-good`, and the Wi-Fi
+selection entry `policy-daemon-wifi-runtime` (simulated radios, hostapd,
+NetworkManager and wpa_supplicant). The desktop entries run against a stand-in greeter and
 compositor (docs/AGENTS.md), not COSMIC.
 
 ### Passes that prove something
