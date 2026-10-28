@@ -360,10 +360,13 @@ let
           "-device usb-storage,bus=xhci.0,drive=gymusb,id=gymusbdev,serial=GYMUSB0"
         ];
       };
-      boot.kernelModules = [ "snd_hda_intel" "virtio_gpu" "mac80211_hwsim" ];
+      # vfio-pci for drv-bind-fails-restores-previous: an admin binds the
+      # sound card to it. The VM has no IOMMU, which vfio needs unless its
+      # no-IOMMU mode is on.
+      boot.kernelModules = [ "snd_hda_intel" "virtio_gpu" "mac80211_hwsim" "vfio-pci" ];
       # Suspend to idle: QEMU does not bring this VM back from S3 (deep), and
       # for systemd and Planarian a suspend is the same either way.
-      boot.kernelParams = [ "mem_sleep_default=s2idle" ]
+      boot.kernelParams = [ "mem_sleep_default=s2idle" "vfio.enable_unsafe_noiommu_mode=1" ]
         ++ lib.optional (config.gym.kernelParam != "") config.gym.kernelParam;
       # The journal on its own small filesystem (fill_fs fs-journal).
       fileSystems."/var/lib/planarian" = { device = "/dev/vdb"; fsType = "ext4"; autoFormat = true; };
@@ -386,7 +389,7 @@ let
         before = [ "planariad.service" ];
         unitConfig.ConditionPathExists = "!/etc/nixos/flake.nix";
         serviceConfig.Type = "oneshot";
-        path = [ pkgs.git pkgs.coreutils ];
+        path = [ pkgs.git pkgs.coreutils config.nix.package ];
         script = ''
           mkdir -p /etc/nixos/planarian
           cd /etc/nixos
@@ -395,6 +398,9 @@ let
           install -m644 ${../template/planarian/overrides.nix} planarian/overrides.nix
           echo '{ }' > configuration.nix
           booted=$(readlink -f /run/booted-system)
+          # An installed NixOS has a system profile from the start; a test VM
+          # boots its kernel directly and has none until a switch.
+          [ -e /nix/var/nix/profiles/system ] || nix-env -p /nix/var/nix/profiles/system --set "$booted"
           ln -sfn $booted sys-base
           for c in ${lib.concatStringsSep " " (lib.attrNames (removeAttrs candidates [ "base" ]))}; do
             ln -sfn $(readlink -f $booted/specialisation/$c) sys-$c

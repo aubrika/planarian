@@ -16,6 +16,8 @@ pub type DeviceMap = BTreeMap<String, PathBuf>;
 pub struct Sysfs {
     devices: DeviceMap,
     txn_dir: PathBuf,
+    /// `/sys` (a test tree in tests).
+    root: PathBuf,
 }
 
 /// `/sys/bus/<bus>/devices/<id>` → (bus, id).
@@ -38,7 +40,12 @@ pub fn bus_and_id(dev: &Path) -> Option<(String, String)> {
 
 impl Sysfs {
     pub fn new(devices: DeviceMap, txn_dir: PathBuf) -> Sysfs {
-        Sysfs { devices, txn_dir }
+        Sysfs { devices, txn_dir, root: "/sys".into() }
+    }
+
+    #[cfg(test)]
+    fn at(root: &Path, devices: DeviceMap, txn_dir: PathBuf) -> Sysfs {
+        Sysfs { devices, txn_dir, root: root.into() }
     }
 
     fn path(&self, device: &UnitId) -> Option<&PathBuf> {
@@ -99,8 +106,15 @@ impl InventoryBackend for Sysfs {
         let Some((bus, id)) = bus_and_id(p) else {
             return Outcome::Failed(format!("cannot tell the bus of {}", p.display()));
         };
-        if Self::driver_of(p).as_ref().map(|d| &d.name) == Some(&driver.name) {
-            return Outcome::Succeeded;
+        match Self::driver_of(p) {
+            Some(d) if d.name == driver.name => return Outcome::Succeeded,
+            // The kernel refuses to bind a device another driver holds.
+            Some(_) => {
+                if let Outcome::Failed(e) = Self::write(&p.join("driver/unbind"), &id) {
+                    return Outcome::Failed(e);
+                }
+            }
+            None => {}
         }
         if let Some(m) = &driver.module {
             let o = crate::cmd::run(&["modprobe", "-d", &m.0, &driver.name], std::time::Duration::from_secs(30));
@@ -108,7 +122,20 @@ impl InventoryBackend for Sysfs {
                 return Outcome::Failed(o.tail());
             }
         }
-        Self::write(&PathBuf::from(format!("/sys/bus/{bus}/drivers/{}/bind", driver.name)), &id)
+        // A driver binds through `bind` only to devices in its own ID table;
+        // a generic one (vfio-pci, pci-stub) matches none. `driver_override`
+        // names the driver the device may bind to; it is cleared after, so
+        // the device is left with its binding and no lasting override.
+        let ov = p.join("driver_override");
+        let overriding = ov.exists();
+        if overriding && let Outcome::Failed(e) = Self::write(&ov, &driver.name) {
+            return Outcome::Failed(e);
+        }
+        let o = Self::write(&self.root.join(format!("bus/{bus}/drivers/{}/bind", driver.name)), &id);
+        if overriding {
+            let _ = Self::write(&ov, "\n");
+        }
+        o
     }
 
     fn unbind(&self, device: &UnitId, op: &OpId) -> Outcome {
@@ -134,6 +161,29 @@ mod tests {
             bus_and_id(Path::new("/sys/bus/pci/devices/0000:00:1b.0")),
             Some(("pci".into(), "0000:00:1b.0".into()))
         );
+    }
+
+    #[test]
+    fn bind_overrides_the_driver_match_and_clears_it() {
+        let d = tempfile::tempdir().unwrap();
+        let dev = d.path().join("bus/pci/devices/0000:00:1b.0");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("driver_override"), "(null)\n").unwrap();
+        let drv = d.path().join("bus/pci/drivers/vfio-pci");
+        std::fs::create_dir_all(&drv).unwrap();
+        let held = d.path().join("bus/pci/drivers/snd_hda_intel");
+        std::fs::create_dir_all(&held).unwrap();
+        std::os::unix::fs::symlink(&held, dev.join("driver")).unwrap();
+        let txn = d.path().join("txn");
+        std::fs::create_dir_all(txn.join("7")).unwrap();
+        std::fs::write(txn.join("7/lease"), "1").unwrap();
+        let s = Sysfs::at(d.path(), [("snd-hda0".to_string(), dev.clone())].into(), txn);
+        let op = OpId { txn: planarian_schema::TxnId(7), epoch: 1, seq: 1 };
+        let o = s.bind(&UnitId::device("snd-hda0"), &DriverRef { name: "vfio-pci".into(), module: None }, &op);
+        assert_eq!(o, Outcome::Succeeded);
+        assert_eq!(std::fs::read_to_string(held.join("unbind")).unwrap(), "0000:00:1b.0", "the holder lets go first");
+        assert_eq!(std::fs::read_to_string(drv.join("bind")).unwrap(), "0000:00:1b.0");
+        assert_eq!(std::fs::read_to_string(dev.join("driver_override")).unwrap(), "\n", "cleared after binding");
     }
 
     #[test]
