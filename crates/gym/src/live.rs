@@ -946,6 +946,38 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
             };
             hooks_set(&key, serde_json::json!({ "result": get("result") }));
         }
+        "set_setting" => {
+            // A copy of the module's config with the setting changed, and the
+            // daemon restarted on it (PLANARIAN_CONFIG, in a runtime drop-in).
+            let (path, value) = match get("key").as_str() {
+                "gc.generation_budget_percent" => {
+                    let pct = st.get("value").and_then(T::as_float).ok_or("set_setting value")?;
+                    (["gc", "generationsPermille"], serde_json::json!((pct * 10.0).round() as u64))
+                }
+                k => return Err(format!("set_setting {k}")),
+            };
+            let src = std::env::var("PLANARIAN_CONFIG").unwrap_or_else(|_| CONFIG.into());
+            let mut v: serde_json::Value = std::fs::read(&src)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .ok_or_else(|| format!("{src}: unreadable"))?;
+            v[path[0]][path[1]] = value;
+            let copy = format!("{HOOKS_DIR}/config.json");
+            let _ = std::fs::create_dir_all(HOOKS_DIR);
+            std::fs::write(&copy, v.to_string()).map_err(|e| e.to_string())?;
+            let ok = sh(&format!(
+                "mkdir -p /run/systemd/system/planariad.service.d && \
+                 printf '[Service]\\nEnvironment=PLANARIAN_CONFIG={copy}\\n' > /run/systemd/system/planariad.service.d/gym-config.conf && \
+                 systemctl daemon-reload && systemctl restart planariad"
+            ));
+            let until = Instant::now() + Duration::from_secs(60);
+            while console().is_none() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            if !ok || console().is_none() {
+                return Err("planariad did not come back on the changed config".into());
+            }
+        }
         other => return Err(format!("raw {other}")),
     }
     Ok(())
