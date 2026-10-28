@@ -142,7 +142,7 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
             "others_unchanged" => {}
             // The ledger refuses any record that would break I6, I12's paths or
             // I15, so a journal that replays cleanly is the check.
-            "invariants" => {
+            "invariants" | "journal_readable" => {
                 if !e.journal_replays {
                     fail(&mut v, "the journal does not replay".into());
                 }
@@ -379,6 +379,13 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                             |x| matches!(x, Response::Done { message, .. } if message.contains("until the next boot")),
                         ),
                         "AwaitingApproval" => notices.contains("needs approval"),
+                        "ApprovalInvalidated" => ledger.terminal.values().any(|t| {
+                            matches!(&t.state, TxnState::Rejected(RejectReason::Other(w)) if w == "approval invalidated")
+                        }),
+                        "TokenReplayRefused" => e.responses.iter().any(|x| {
+                            matches!(x, Response::Rejected { message, .. }
+                                if message.contains("no pending change with that hash") || message.contains("already used"))
+                        }),
                         "OutOfBandStopHint" => {
                             notices.contains("stopped, not crashed") && notices.contains("planarian suppress")
                         }
@@ -691,6 +698,9 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
     if let Some(c) = s("change") {
         matching.retain(|x| matches!(&x.transition, Transition::ApplyChange { change, .. } if change.0 == c));
     }
+    if let Some(want) = s("path_option") {
+        matching.retain(|x| matches!(&x.transition, Transition::SetRuntimeOption { path, .. } if path == want));
+    }
     // `args` picks the transaction (the same change can run twice with
     // different arguments).
     if let Some(want) = spec.get("args").and_then(T::as_table) {
@@ -843,7 +853,6 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
     }
     for k in [
         "not_activated_before",
-        "path_option",
         "returns_current_digest",
         "reject_detail",
         "decision_in",

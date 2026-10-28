@@ -44,6 +44,10 @@ struct MemInner {
     fences: BTreeMap<TxnId, u64>,
     /// Fault injection: the next log write stores only this many bytes, then fails.
     tear_next_write: Option<usize>,
+    /// Fault injection: the next log write whose bytes contain this stores
+    /// half of them, then fails; and whether that has happened.
+    tear_write_containing: Option<Vec<u8>>,
+    torn: bool,
     /// Fault injection: the next checkpoint write fails without replacing the old one.
     fail_next_checkpoint: bool,
     /// Fault injection: log writes fail with ENOSPC.
@@ -84,6 +88,17 @@ impl MemStore {
 
     pub fn tear_next_write(&self, keep: usize) {
         self.inner().tear_next_write = Some(keep);
+    }
+
+    /// Tear the next log write that contains `needle` (e.g. `"Checking"`, to
+    /// tear the record of that state).
+    pub fn tear_write_containing(&self, needle: &str) {
+        self.inner().tear_write_containing = Some(needle.as_bytes().to_vec());
+    }
+
+    /// Whether an injected tear has happened.
+    pub fn torn(&self) -> bool {
+        self.inner().torn
     }
 
     pub fn fail_next_checkpoint(&self) {
@@ -128,7 +143,13 @@ impl Store for MemStore {
         if off + bytes.len() > inner.log.len() {
             return Err(io::Error::from_raw_os_error(28));
         }
+        let matches = inner.tear_write_containing.as_ref().is_some_and(|n| bytes.windows(n.len()).any(|w| w == n));
+        if matches {
+            inner.tear_write_containing = None;
+            inner.tear_next_write = Some(bytes.len() / 2);
+        }
         if let Some(keep) = inner.tear_next_write.take() {
+            inner.torn = true;
             let keep = keep.min(bytes.len());
             inner.log[off..off + keep].copy_from_slice(&bytes[..keep]);
             return Err(io::Error::other("torn write (injected)"));

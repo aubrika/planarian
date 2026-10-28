@@ -93,6 +93,19 @@ let
 
   machineModule = { config, pkgs, ... }:
     let
+      # One hostapd unit per access point (see the Wi-Fi notes below).
+      accessPoints = lib.listToAttrs (lib.imap0 (i: ssid: lib.nameValuePair "hostapd-${ssid}" {
+        wantedBy = [ "multi-user.target" ];
+        bindsTo = [ "sys-subsystem-net-devices-wlan${toString i}.device" ];
+        after = [ "sys-subsystem-net-devices-wlan${toString i}.device" ];
+        serviceConfig.ExecStart = "${pkgs.hostapd}/bin/hostapd ${pkgs.writeText "${ssid}.conf" ''
+          interface=wlan${toString i}
+          driver=nl80211
+          ssid=${ssid}
+          hw_mode=g
+          channel=${toString (1 + 5 * i)}
+        ''}";
+      }) [ "gym-ap-a" "gym-ap-b" ]);
       candidatesJson = pkgs.writeText "candidates.json" (builtins.toJSON (lib.mapAttrsToList (n: a: {
         name = n;
         assign = a;
@@ -151,10 +164,31 @@ let
           snd-hda0 = { kind = "device"; sysfs = "/sys/bus/pci/devices/0000:00:1b.0"; };
           net-gym0 = { kind = "device"; sysfs = "/sys/bus/pci/devices/0000:00:1d.0"; sensitivity = [ "External" ]; restartDisruption = "ConnectivityLoss"; };
           gpu0 = { kind = "device"; sysfs = "/sys/bus/pci/devices/0000:00:1c.0"; restartDisruption = "SessionLoss"; };
+          # The USB stick's storage interface, wherever it enumerates (udev
+          # links it below while the stick is plugged in).
+          # Removable: expected only while it is plugged in.
+          gym-usb0 = { kind = "device"; sysfs = "/run/gym-usb0"; restartDisruption = "None"; whenDevice = "device:gym-usb0"; };
+          NetworkManager = {
+            runtimeRepair = "wifi.network";
+            probes = [ {
+              id = "wifi-associated";
+              type = "exec";
+              argv = [ "${pkgs.writeShellScript "wifi-associated" ''
+                ${pkgs.networkmanager}/bin/nmcli -g GENERAL.STATE device show wlan2 | ${pkgs.gnugrep}/bin/grep -q '^100'
+              ''}" ];
+              establishes = "wlan2 is associated with a network";
+            } ];
+          };
+          gym-usb-reader = {
+            whenDevice = "device:gym-usb0";
+            probes = [ { id = "gym-usb-reader-active"; type = "systemd-active"; establishes = "gym-usb-reader-active"; } ];
+          };
           wireplumber = { scope = "user"; };
         };
       };
 
+      systemd.services."hostapd-gym-ap-a" = accessPoints."hostapd-gym-ap-a";
+      systemd.services."hostapd-gym-ap-b" = accessPoints."hostapd-gym-ap-b";
       systemd.services = {
         gym-web = svc "gym-web" "8080 --http" { };
         gym-db = svc "gym-db" "5432" { };
@@ -171,12 +205,19 @@ let
           startLimitBurst = 3;
         };
         gym-upstream-client = svc "gym-upstream-client" "7003" { };
+        # Runs only while the stick is there: BindsTo its device unit.
+        gym-usb-reader = {
+          wantedBy = [ "dev-gymusb0.device" ];
+          bindsTo = [ "dev-gymusb0.device" ];
+          after = [ "dev-gymusb0.device" ];
+          serviceConfig.ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+        };
         gym-extra = lib.mkIf config.services.gym-extra.enable (svc "gym-extra" "7004" { });
       };
 
       services.openssh.enable = true;
       networking.networkmanager.enable = true;
-      networking.networkmanager.unmanaged = [ "type:ethernet" ];
+      networking.networkmanager.unmanaged = [ "type:ethernet" "interface-name:wlan0" "interface-name:wlan1" ];
       services.pipewire = { enable = true; pulse.enable = true; };
       networking.firewall.enable = false;
       # The catalog's upstream is "the VM host" at 10.0.2.2, which on eth0 is QEMU's
@@ -198,6 +239,28 @@ let
       # anything Planarian does. nodev still writes the boot menu for real.
       boot.loader.grub.devices = lib.mkForce [ "nodev" ];
 
+      # Wi-Fi: three simulated radios in this kernel. wlan0 and wlan1 are the
+      # access points gym-ap-a and gym-ap-b (one hostapd unit each, so one can
+      # go away); wlan2 is NetworkManager's client. It knows both networks
+      # but autoconnects only to gym-ap-a, so choosing gym-ap-b is left to
+      # Planarian (which asks first).
+      boot.extraModprobeConfig = "options mac80211_hwsim radios=3";
+      networking.networkmanager.ensureProfiles.profiles = lib.genAttrs [ "gym-ap-a" "gym-ap-b" ] (ssid: {
+        connection = {
+          id = ssid;
+          type = "wifi";
+          interface-name = "wlan2";
+          autoconnect = if ssid == "gym-ap-a" then "true" else "false";
+        };
+        wifi = { inherit ssid; mode = "infrastructure"; };
+      });
+
+      services.udev.extraRules = ''
+        SUBSYSTEM=="block", ENV{ID_SERIAL_SHORT}=="GYMUSB0", ENV{DEVTYPE}=="disk", SYMLINK+="gymusb0", TAG+="systemd"
+        SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTRS{serial}=="GYMUSB0", ACTION=="add", RUN+="${pkgs.coreutils}/bin/ln -sfn /sys%p /run/gym-usb0"
+        SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTRS{serial}=="GYMUSB0", ACTION=="remove", RUN+="${pkgs.coreutils}/bin/rm -f /run/gym-usb0"
+      '';
+
       # Devices at fixed PCI addresses (their sysfs paths are in the manifest).
       virtualisation = {
         memorySize = 3072;
@@ -209,10 +272,10 @@ let
           "-device virtio-gpu-pci,addr=0x1c"
           "-netdev user,id=gymnet" "-device virtio-net-pci,netdev=gymnet,addr=0x1d"
           "-device qemu-xhci,id=xhci" "-drive if=none,id=gymusb,driver=null-co,size=16M"
-          "-device usb-storage,bus=xhci.0,drive=gymusb,id=gymusbdev"
+          "-device usb-storage,bus=xhci.0,drive=gymusb,id=gymusbdev,serial=GYMUSB0"
         ];
       };
-      boot.kernelModules = [ "snd_hda_intel" "virtio_gpu" ];
+      boot.kernelModules = [ "snd_hda_intel" "virtio_gpu" "mac80211_hwsim" ];
       # The journal on its own small filesystem (fill_fs fs-journal).
       fileSystems."/var/lib/planarian" = { device = "/dev/vdb"; fsType = "ext4"; autoFormat = true; };
 
@@ -326,10 +389,13 @@ let
                         machine.send_monitor_command("system_wakeup")
                     elif raw == "hotunplug":
                         machine.send_monitor_command("device_del gymusbdev")
-                    elif raw == "stop_host_service":
-                        upstream.succeed("systemctl stop gym-upstream")
-                    elif raw == "start_host_service":
-                        upstream.succeed("systemctl start gym-upstream")
+                    elif raw in ("stop_host_service", "start_host_service"):
+                        verb = "stop" if raw == "stop_host_service" else "start"
+                        name = st.get("name", "gym-upstream")
+                        # The access points run beside the client (the radios are
+                        # simulated in one kernel); the upstream on its own node.
+                        node = machine if name.startswith("hostapd-") else upstream
+                        node.succeed(f"systemctl {verb} {name}")
             print(machine.succeed(f"{gym} judge --id {ID} 2>&1"))
         machine.copy_from_vm("/var/lib/gym-run/verdict.json", "")
         if machine.execute("test -e /var/lib/gym-run/evidence.json")[0] == 0:

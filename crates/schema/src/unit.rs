@@ -404,6 +404,11 @@ pub struct UnitDef {
     /// fault (it may still be starting). `None`: the daemon's default.
     #[serde(default)]
     pub startup_grace: Option<Millis>,
+    /// A runtime-settable option (§12a) whose other values can restore this
+    /// unit: `wifi.network` for a Wi-Fi interface. When it diverges, the
+    /// diagnoser may propose another value the backend says is available.
+    #[serde(default)]
+    pub runtime_repair: Option<String>,
 }
 
 pub type UnitDefs = BTreeMap<UnitId, UnitDef>;

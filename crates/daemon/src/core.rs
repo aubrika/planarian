@@ -507,12 +507,23 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             return;
         };
         let current = s.generation;
+        let alternatives: BTreeMap<String, Vec<Value>> = defs
+            .values()
+            .filter_map(|d| d.runtime_repair.clone())
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .map(|opt| {
+                let alts = self.ex.b.runtime().alternatives(&opt);
+                (opt, alts)
+            })
+            .collect();
         let inputs = diagnose::Inputs {
             state: s,
             defs,
             failed_since: &self.asm.failed_since,
             known_drivers: &self.asm.known_drivers,
             current_planarian_built: l.live_tested == Some(current),
+            alternatives: &alternatives,
         };
         // The deepest divergent unit below the target (§13 step 1), named
         // whenever it isn't the target itself.

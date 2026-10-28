@@ -91,6 +91,16 @@ let
         description = "Seconds after this unit comes up during which a failing health probe is not yet a fault. `null`: `services.planarian.startupGrace`.";
       };
       sysfs = mkOption { type = types.nullOr types.str; default = null; description = "Devices: the sysfs directory, e.g. /sys/bus/pci/devices/0000:00:1b.0."; };
+      runtimeRepair = mkOption {
+        type = types.nullOr (types.enum [ "wifi.network" ]);
+        default = null;
+        description = ''
+          A runtime-settable option whose other values can restore this unit:
+          `wifi.network` for a unit with a Wi-Fi association probe. When it
+          fails, Planarian proposes switching to another known network in range
+          (it asks first: the switch drops connectivity).
+        '';
+      };
     };
   };
 
@@ -180,6 +190,7 @@ let
     probes = map probeJSON u.probes;
     systemd_restart = if u.scope == "system" && u.kind == "service" then restartJSON name else null;
     startup_grace = if u.startupGrace == null then null else u.startupGrace * 1000;
+    runtime_repair = u.runtimeRepair;
   };
 
   unitsOf = scope: lib.mapAttrsToList unitJSON (lib.filterAttrs (_: u: u.scope == scope) cfg.units);

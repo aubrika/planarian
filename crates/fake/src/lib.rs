@@ -166,6 +166,9 @@ pub struct World {
     pub gc_budget: gc::GcBudget,
     pub space_report: Option<gc::SpaceReport>,
     pub runtime: BTreeMap<String, Value>,
+    /// Wi-Fi: the networks NetworkManager knows, and those in range.
+    pub wifi_known: Vec<String>,
+    pub wifi_in_range: BTreeSet<String>,
     // ---- processes ----
     pub alive: BTreeSet<u32>,
     pub unkillable: BTreeSet<u32>,
@@ -798,6 +801,13 @@ impl ProbeBackend for Fake {
                 if w.blocked.contains(unit) {
                     return ProbeResult::Fail("connection refused".into());
                 }
+                // A Wi-Fi interface is healthy while associated with a network in range.
+                if w.base_units.get(unit).and_then(|d| d.runtime_repair.as_deref()) == Some("wifi.network") {
+                    return match w.runtime.get("wifi.network") {
+                        Some(Value::Str(n)) if w.wifi_in_range.contains(n) => ProbeResult::Pass,
+                        _ => ProbeResult::Fail("not associated".into()),
+                    };
+                }
                 if let Some(ext) = unit.name.strip_prefix("external:") {
                     return if w.external_down.contains(ext) {
                         ProbeResult::Fail(format!("{ext}: connection refused"))
@@ -854,6 +864,22 @@ impl RuntimeOptionBackend for Fake {
         }
         w.runtime.insert(path.into(), value.clone());
         Outcome::Succeeded
+    }
+
+    fn alternatives(&self, path: &str) -> Vec<Value> {
+        let w = self.w();
+        match path {
+            "wifi.network" => {
+                let current = w.runtime.get(path);
+                w.wifi_known
+                    .iter()
+                    .filter(|n| w.wifi_in_range.contains(*n))
+                    .map(|n| Value::Str(n.clone()))
+                    .filter(|v| Some(v) != current)
+                    .collect()
+            }
+            _ => vec![],
+        }
     }
 }
 
@@ -956,8 +982,12 @@ pub fn gym_world(store: MemStore) -> Fake {
         (UnitId::device("snd-hda0"), Some(DriverRef { name: "snd_hda_intel".into(), module: None })),
         (UnitId::device("net-gym0"), Some(DriverRef { name: "virtio_net".into(), module: None })),
         (UnitId::device("gpu0"), Some(DriverRef { name: "virtio_gpu".into(), module: None })),
+        (UnitId::device("wlan-hwsim"), Some(DriverRef { name: "mac80211_hwsim".into(), module: None })),
     ]
     .into();
+    w.wifi_known = vec!["gym-ap-a".into(), "gym-ap-b".into()];
+    w.wifi_in_range = ["gym-ap-a".to_string(), "gym-ap-b".to_string()].into();
+    w.runtime.insert("wifi.network".into(), Value::Str("gym-ap-a".into()));
     w.bad_drivers.insert("vfio-pci".into());
     w.fs = [
         ("/".to_string(), (40_000_000_000, 100_000_000_000)),

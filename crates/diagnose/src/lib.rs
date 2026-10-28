@@ -27,6 +27,9 @@ pub struct Inputs<'a> {
     /// The running generation was built by a Planarian transaction. Owner-built
     /// generations are never rolled back autonomously (owner decision Q3).
     pub current_planarian_built: bool,
+    /// For each runtime option a unit names as its repair (`runtime_repair`),
+    /// the other values available now (for Wi-Fi: known networks in range).
+    pub alternatives: &'a BTreeMap<String, Vec<Value>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,7 +161,7 @@ pub fn root_cause(target: &UnitId, i: &Inputs<'_>) -> UnitId {
 /// executor's policy decision remains authoritative.
 fn est_tier(t: &Transition) -> u8 {
     match t {
-        Transition::RestartUnit(_) | Transition::CollectGarbage { .. } => 1,
+        Transition::RestartUnit(_) | Transition::CollectGarbage { .. } | Transition::SetRuntimeOption { .. } => 1,
         Transition::BindDriver { .. } | Transition::ApplyChange { .. } => 2,
         _ => 3,
     }
@@ -174,6 +177,25 @@ pub fn candidates(incident: &Incident, i: &Inputs<'_>) -> Vec<Candidate> {
     let status = i.state.status(&root, i.defs);
     let mut out: Vec<(Transition, String)> = vec![];
     let via = if root == incident.target { String::new() } else { format!(" (root cause of {})", incident.target) };
+
+    // A unit restored by choosing another value of a runtime option (§12a):
+    // Wi-Fi to another known network in range. The unit says its health
+    // depends on that value, so when another is available it comes before a
+    // restart (which cannot bring a network back). It drops connectivity, so
+    // the policy floors make it AskFirst.
+    if let Some(opt) = &def.runtime_repair
+        && divergent(def.desired.status, &status)
+        && let Some(v) = i.alternatives.get(opt).and_then(|a| a.first())
+    {
+        let shown = match v {
+            Value::Str(s) => s.clone(),
+            other => format!("{other:?}"),
+        };
+        out.push((
+            Transition::SetRuntimeOption { path: opt.clone(), value: v.clone() },
+            format!("{root} is {status:?}; switch {opt} to {shown}{via}"),
+        ));
+    }
 
     match def.id.kind {
         UnitKind::Device if root.name.starts_with("fs-") => {

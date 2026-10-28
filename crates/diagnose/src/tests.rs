@@ -23,13 +23,14 @@ struct World {
     s: SystemState,
     failed_since: BTreeMap<UnitId, Timestamp>,
     drivers: BTreeMap<UnitId, DriverRef>,
+    alternatives: BTreeMap<String, Vec<Value>>,
 }
 
 impl World {
     fn new(defs: UnitDefs) -> World {
         let mut s = empty_state(1000);
         healthy(&mut s, &defs);
-        World { defs, s, failed_since: BTreeMap::new(), drivers: BTreeMap::new() }
+        World { defs, s, failed_since: BTreeMap::new(), drivers: BTreeMap::new(), alternatives: BTreeMap::new() }
     }
     fn fail(&mut self, u: &str, at: u64) {
         let id: UnitId = u.parse().unwrap();
@@ -43,6 +44,7 @@ impl World {
             failed_since: &self.failed_since,
             known_drivers: &self.drivers,
             current_planarian_built: false,
+            alternatives: &self.alternatives,
         }
     }
 }

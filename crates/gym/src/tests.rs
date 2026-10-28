@@ -185,3 +185,16 @@ fn hints_in_notices() {
     e.notices.retain(|n| !n.contains("graphical session"));
     fails(&e, &post, "DisruptionSessionLoss");
 }
+
+#[test]
+fn torn_record_really_tears() {
+    let entries = catalog();
+    let entry = entries.iter().find(|e| e.get("id").and_then(T::as_str) == Some("journal-torn-write")).expect("entry");
+    let r = run_entry(entry);
+    assert_eq!(r.result, Result_::Pass, "{:?}", r.notes);
+    let sim = r.sim.expect("fake run");
+    assert!(sim.fake.store.torn(), "the Checking record's write was not torn");
+    // The torn record was never read as a transition: recovery found the
+    // transaction still Activating.
+    assert!(sim.notices.iter().any(|n| n.contains("found Activating")), "{:?}", sim.notices);
+}

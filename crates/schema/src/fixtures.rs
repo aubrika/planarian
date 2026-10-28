@@ -33,6 +33,7 @@ pub fn service(name: &str) -> UnitDef {
         synonyms: vec![],
         systemd_restart: None,
         startup_grace: None,
+        runtime_repair: None,
     }
 }
 

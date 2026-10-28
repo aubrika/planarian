@@ -766,6 +766,13 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 ["diagnose", u, "--probe", p] => {
                     Request::Diagnose { unit: unit(u), probe: Some(ProbeId(p.to_string())) }
                 }
+                // The admin connects to a network outside Planarian.
+                ["internal", "wifi-connect", ssid] => {
+                    if !sh(&format!("nmcli connection up id {ssid}")) {
+                        return Err(format!("nmcli could not connect to {ssid}"));
+                    }
+                    return Ok(());
+                }
                 other => return Err(format!("cli {other:?}")),
             };
             request_as(actor, &req)?;

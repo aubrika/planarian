@@ -46,6 +46,7 @@ pub fn unit(id: &str, sens: &[Sensitivity], disruption: Disruption, probes: Vec<
         synonyms: vec![],
         systemd_restart: None,
         startup_grace: None,
+        runtime_repair: None,
     }
 }
 
@@ -122,8 +123,22 @@ pub fn gym_units() -> UnitDefs {
 
     let mut sshd = unit("service:sshd", &[Security], Disruption::Brief, vec![]);
     sshd.synonyms = vec!["ssh".into()];
-    let mut nm = unit("service:NetworkManager", &[External], Disruption::ConnectivityLoss, vec![]);
+    // Healthy while associated with the selected Wi-Fi network; repaired by
+    // selecting another one in range (§12a).
+    let mut nm = unit(
+        "service:NetworkManager",
+        &[External],
+        Disruption::ConnectivityLoss,
+        vec![user_probe(
+            "wifi-associated",
+            ProbeKind::Exec {
+                argv: vec!["nmcli".into(), "-g".into(), "GENERAL.STATE".into(), "device".into(), "show".into()],
+                sandbox: ProbeSandbox { uid: 0, caps: vec![], max_output: 4096, cpu_ms: 500, network: false },
+            },
+        )],
+    );
     nm.synonyms = vec!["wifi".into(), "wi-fi".into(), "network".into(), "internet".into()];
+    nm.runtime_repair = Some("wifi.network".into());
     let dm = unit("service:display-manager", r, Disruption::SessionLoss, vec![]);
     let mut gs = unit("target:graphical-session", r, Disruption::SessionLoss, vec![]);
     gs.desired.when = Condition::SessionEstablished { uid: None };
@@ -138,6 +153,9 @@ pub fn gym_units() -> UnitDefs {
         vec![user_probe("net-gym0-bound", ProbeKind::SystemdActive)],
     );
     let gpu = unit("device:gpu0", r, Disruption::SessionLoss, vec![user_probe("gpu0-bound", ProbeKind::SystemdActive)]);
+
+    // The Wi-Fi radio (mac80211_hwsim in the VM).
+    let wlan = unit("device:wlan-hwsim", &[External], Disruption::ConnectivityLoss, vec![]);
 
     let fs = |name: &str| unit(&format!("device:{name}"), r, Disruption::None, vec![]);
 
@@ -158,6 +176,7 @@ pub fn gym_units() -> UnitDefs {
         snd,
         nic,
         gpu,
+        wlan,
         fs("fs-root"),
         fs("fs-nix"),
         fs("fs-boot"),

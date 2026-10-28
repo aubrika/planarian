@@ -85,6 +85,9 @@ pub struct Sim {
     /// Journal entries saved before a compaction discards them, and whether one happened.
     history: Vec<Entry>,
     compacted: bool,
+    torn_seen: bool,
+    /// Approvals issued and held back (`approve_pending` with `hold_token`).
+    held_tokens: Vec<Hash>,
     timeline: BTreeMap<UnitId, Vec<(Timestamp, String)>>,
     start_probe_defs: String,
     start_roots: std::collections::BTreeSet<String>,
@@ -168,6 +171,8 @@ impl Sim {
             touched: Default::default(),
             history: vec![],
             compacted: false,
+            torn_seen: false,
+            held_tokens: vec![],
             timeline: BTreeMap::new(),
             start_probe_defs: String::new(),
             start_roots: Default::default(),
@@ -454,7 +459,9 @@ impl Sim {
         }
         self.responses.push(r);
         self.harvest();
-        if crashed {
+        // An interrupted journal write is a crash mid-write: the process is gone.
+        if crashed || (self.fake.store.torn() && !self.torn_seen) {
+            self.torn_seen = self.fake.store.torn();
             self.kill_daemon();
             self.crash = None;
         }
@@ -535,6 +542,11 @@ impl Sim {
                         crash = Some((j, point));
                     }
                 }
+                // The write of the record entering this state is torn.
+                "interrupt_write" if get("target") == "record" => {
+                    self.fake.store.tear_write_containing(&format!("\"to\":\"{state}\""));
+                    consumed.insert(i);
+                }
                 "edit_owner_source" if s.get("tracked").and_then(T::as_bool) != Some(false) => {
                     self.fake.w().edit_on_stage = true;
                     consumed.insert(i);
@@ -602,6 +614,16 @@ impl Sim {
                 w.blocked.clear();
                 w.external_down.clear();
             }
+            // An access point goes away: NetworkManager drops the network
+            // and does not pick another (autoconnect is off for the others).
+            "stop_host_service" if get("name").starts_with("hostapd-") => {
+                let ssid = get("name").trim_start_matches("hostapd-").to_string();
+                let mut w = self.fake.w();
+                w.wifi_in_range.remove(&ssid);
+                if w.runtime.get("wifi.network") == Some(&Value::Str(ssid)) {
+                    w.runtime.remove("wifi.network");
+                }
+            }
             "stop_host_service" if get("name") == "gym-upstream" => {
                 self.fake.w().external_down.insert("gym-upstream".into());
             }
@@ -653,12 +675,32 @@ impl Sim {
                     .and_then(T::as_array)
                     .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                     .unwrap_or_default();
+                // Present an approval held earlier (the hash it was issued for).
+                // The admin connects to a network outside Planarian.
+                if let ["internal", "wifi-connect", ssid] =
+                    argv.iter().map(String::as_str).collect::<Vec<_>>().as_slice()
+                {
+                    self.fake.w().runtime.insert("wifi.network".into(), Value::Str(ssid.to_string()));
+                    return Ok(());
+                }
+                if argv.first().map(String::as_str) == Some("internal")
+                    && argv.get(1).map(String::as_str) == Some("present-token")
+                {
+                    for h in self.held_tokens.clone() {
+                        self.request(&actor, Request::Approve { hash: h, tty: true })?;
+                    }
+                    return Ok(());
+                }
                 let req = self.cli(&argv)?;
                 self.request(&actor, req)?;
             }
             "approve_pending" => {
                 let pending: Vec<Hash> =
                     self.core.as_ref().map(|c| c.ex.parked.values().map(|p| p.bound_to).collect()).unwrap_or_default();
+                if s.get("hold_token").and_then(T::as_bool) == Some(true) {
+                    self.held_tokens.extend(pending);
+                    return Ok(());
+                }
                 for h in pending {
                     self.request("root", Request::Approve { hash: h, tty: true })?;
                 }
@@ -709,6 +751,13 @@ impl Sim {
             }
             "backend_result" => match (get("call"), get("result")) {
                 ("jobs_tagged", "None") => self.fake.w().jobs_tagged_unknown = true,
+                // A policy table changes (one no decision here reads), so the
+                // policy version every approval is bound to changes.
+                ("policy_version", "bumped") => {
+                    let c =
+                        self.core.as_mut().ok_or_else(|| Unsupported("policy bump while the daemon is down".into()))?;
+                    c.ex.cfg.tables.model_catalog.push(ModelId("gym:policy-bump".into()));
+                }
                 ("evaluate", "planariad-unit-changed") => {
                     self.fake.w().rules.push(planarian_fake::Rule {
                         option: "planarian.reference.fontScale".into(),
@@ -736,6 +785,18 @@ impl Sim {
                 self.fake.advance(d);
                 if let Some(c) = self.core.as_mut() {
                     c.tick();
+                }
+            }
+            // A checkpoint write is torn: the compaction fails, and the old
+            // checkpoint and log must stand.
+            "interrupt_write" if get("target") == "checkpoint" => {
+                self.save_segment();
+                self.compacted = true;
+                self.fake.store.fail_next_checkpoint();
+                if let Some(c) = self.core.as_mut() {
+                    let _ = c.ex.kernel.journal.compact();
+                } else {
+                    let _ = Journal::open(self.fake.store.clone()).map(|mut j| j.compact());
                 }
             }
             "force_compaction" => {

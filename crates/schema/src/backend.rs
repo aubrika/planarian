@@ -181,6 +181,12 @@ pub trait RuntimeOptionBackend {
     /// `Outcome::Failed("no live mechanism")` when the option can only be
     /// changed through its write-back.
     fn set(&self, path: &str, value: &crate::transition::Value, op: &OpId) -> Outcome;
+    /// Other values the option could take right now (for `wifi.network`:
+    /// known networks in range, besides the current one).
+    fn alternatives(&self, path: &str) -> Vec<crate::transition::Value> {
+        let _ = path;
+        vec![]
+    }
 }
 
 pub trait ProcessBackend {
