@@ -396,6 +396,11 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                             matches!(x, Response::Rejected { message, .. }
                                 if message.contains("no pending change with that hash") || message.contains("already used"))
                         }),
+                        "UntrackedExcluded" => notices.contains("git does not track them"),
+                        // The incident is the external dependency's, and says nothing local fixes it.
+                        "ExternalDependencyDown" => e.notices.iter().any(|n| {
+                            n.starts_with("service:external:") && n.contains("nothing I know how to do would fix it")
+                        }),
                         "OutOfBandStopHint" => {
                             notices.contains("stopped, not crashed") && notices.contains("planarian suppress")
                         }
@@ -437,8 +442,38 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                 }
             }
             "txn" => {
-                for spec in val.as_array().into_iter().flatten() {
+                let specs: Vec<&T> = match val {
+                    T::Array(a) => a.iter().collect(),
+                    one => vec![one],
+                };
+                for spec in specs {
                     check_txn(e, &all, spec, &mut v);
+                }
+            }
+            // Any one alternative holding in full is enough.
+            "one_of" => {
+                let alts: Vec<Verdict> = val.as_array().into_iter().flatten().map(|alt| judge(e, alt)).collect();
+                if !alts.iter().any(|a| a.failures.is_empty() && a.unchecked.is_empty()) {
+                    if alts.iter().any(|a| a.failures.is_empty()) {
+                        v.unchecked.push(format!("{key} (an alternative with unchecked keys)"));
+                    } else {
+                        let why: Vec<String> = alts.iter().map(|a| a.failures.join("; ")).collect();
+                        fail(&mut v, format!("no alternative holds: {}", why.join(" | ")));
+                    }
+                }
+            }
+            // The canonical probe from the core package, not the owner's
+            // weakened one, is what saw the failure.
+            "canonical_probe_source" if val.as_str() == Some("core") => {
+                let canonical: BTreeMap<String, Vec<ProbeDef>> =
+                    serde_json::from_str(include_str!("../../../share/canonical.json")).unwrap_or_default();
+                let ids: BTreeSet<String> = canonical.values().flatten().map(|p| p.id.0.clone()).collect();
+                let seen = e
+                    .notices
+                    .iter()
+                    .any(|n| n.contains(": Degraded") && ids.iter().any(|id| n.contains(&format!("{id}: "))));
+                if !seen {
+                    fail(&mut v, "no failure was reported by a canonical probe".into());
                 }
             }
             "incident" => {
@@ -861,14 +896,20 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             }
         }
     }
-    for k in [
-        "not_activated_before",
-        "returns_current_digest",
-        "reject_detail",
-        "decision_in",
-        "decision_not_below",
-        "emergency",
-    ] {
+    if let Some(Transition::CollectGarbage { emergency }) = Some(&t.transition)
+        && let Some(want) = spec.get("emergency").and_then(T::as_bool)
+        && *emergency != want
+    {
+        v.failures.push(format!("{label}: emergency is {emergency}"));
+    }
+    // Parked for approval, and activated only once approved.
+    if s("not_activated_before") == Some("approval") {
+        let parked = e.log.iter().any(|r| matches!(&r.result, Submitted::Parked { txn, .. } if *txn == t.id));
+        if !parked {
+            v.failures.push(format!("{label}: never waited for approval"));
+        }
+    }
+    for k in ["returns_current_digest", "reject_detail", "decision_in", "decision_not_below"] {
         if spec.get(k).is_some() {
             v.unchecked.push(format!("{label}: {k}"));
         }

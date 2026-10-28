@@ -317,6 +317,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.incidents.started(u, now);
         }
         let (facts, decision) = self.ex.last.clone().unzip();
+        let excluded = std::mem::take(&mut self.ex.excluded);
+        if !excluded.is_empty() {
+            self.notice(format!(
+                "left out of the build because git does not track them (Nix cannot see them): {}",
+                excluded.join(", ")
+            ));
+        }
         let txn = match &result {
             Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } => Some(*txn),
             _ => None,

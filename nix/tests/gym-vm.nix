@@ -58,6 +58,14 @@ let
         for suf, mul in (("ms", .001), ("s", 1), ("m", 60), ("h", 3600)):
             if v.endswith(suf) and v[:-len(suf)].isdigit(): return int(v[:-len(suf)]) * mul
         return 0
+    # A one-off knob (set_knob, marked <knob>.once) lasts until the next start;
+    # a persistent one (set_persistent_knob) survives restarts.
+    if os.path.isdir(knobs):
+        for f in os.listdir(knobs):
+            if f.endswith(".once"):
+                for g in (f, f[:-len(".once")]):
+                    try: os.remove(f"{knobs}/{g}")
+                    except OSError: pass
     if knob("fail_on_start") in ("true", "True"):
         print("failing on start (knob)", file=sys.stderr); sys.exit(1)
     state = f"/var/lib/{name}/state.json"
@@ -65,9 +73,18 @@ let
         try: json.load(open(state))
         except ValueError:
             print(f"{state} is corrupt", file=sys.stderr); sys.exit(1)
-    fa = secs(knob("fail_after"))
-    if fa:
-        threading.Timer(fa, lambda: os._exit(1)).start()
+    # fail_after: exit that long after starting, or after the knob appears,
+    # whichever is later (it can be set while the service runs).
+    def fail_after():
+        since = None
+        while True:
+            fa = secs(knob("fail_after"))
+            if fa and since is None:
+                since = time.monotonic()
+            if fa and time.monotonic() - since >= fa:
+                print(f"failing after {fa}s (knob)", file=sys.stderr); os._exit(1)
+            time.sleep(0.5)
+    threading.Thread(target=fail_after, daemon=True).start()
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             d = secs(knob("health_delay") or knob("probe_delay"))
@@ -289,6 +306,10 @@ let
           exec ${pkgs.coreutils}/bin/sleep infinity
         '';
       };
+      # On a desktop, the session's clients start pipewire (it is socket-
+      # activated); these logins have no clients, so start it with the session.
+      systemd.user.services.pipewire.wantedBy = [ "default.target" ];
+      systemd.user.services.wireplumber.wantedBy = [ "default.target" ];
       systemd.user.targets.gym-desktop = {
         bindsTo = [ "graphical-session.target" ];
         wants = [ "graphical-session.target" ];

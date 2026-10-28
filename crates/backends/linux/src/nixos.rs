@@ -549,6 +549,8 @@ impl GenerationBackend for Nixos {
     }
 
     fn build(&self, eval: &EvaluatedGeneration) -> Result<Built, Outcome> {
+        #[cfg(feature = "gym-hooks")]
+        crate::gym::pause_point("build");
         let dir = self.staged_dir(&eval.source);
         let root = self.paths.gcroots.join("builds").join(eval.source.to_hex());
         std::fs::create_dir_all(root.parent().expect("parent")).map_err(|e| Outcome::Failed(e.to_string()))?;
@@ -636,6 +638,8 @@ impl GenerationBackend for Nixos {
     }
 
     fn publish_boot(&self, g: GenerationId, op: &OpId) -> Outcome {
+        #[cfg(feature = "gym-hooks")]
+        crate::gym::pause_point("publish_boot");
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
         }

@@ -23,6 +23,14 @@ pub fn parse_session(id: &str, text: &str) -> Option<SessionInfo> {
     })
 }
 
+/// One `--property` per property: systemd 260's loginctl prints nothing (and
+/// exits 0) for a comma-separated list, so every session went unseen.
+pub fn show_session_argv(id: &str) -> Vec<String> {
+    let mut a: Vec<String> = ["loginctl", "show-session", id].map(String::from).to_vec();
+    a.extend(["User", "Class", "Seat", "Remote"].map(|p| format!("--property={p}")));
+    a
+}
+
 /// Session ids from `loginctl list-sessions --no-legend` (first column).
 pub fn parse_list(text: &str) -> Vec<String> {
     text.lines().filter_map(|l| l.split_whitespace().next()).map(String::from).collect()
@@ -56,7 +64,7 @@ impl SessionBackend for Logind {
             // Creation time is left 0 (unknown): `state` measures the session
             // deadline from when it first saw the session, at most one tick late,
             // rather than depend on loginctl's timestamp formatting.
-            let o = run(&["loginctl", "show-session", &id, "--property=User,Class,Seat,Remote"], t);
+            let o = run(&show_session_argv(&id).iter().map(String::as_str).collect::<Vec<_>>(), t);
             if !o.ok() {
                 continue;
             }
@@ -75,6 +83,15 @@ impl SessionBackend for Logind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_property_flag_each() {
+        let a = show_session_argv("2");
+        assert!(a.iter().all(|x| !x.starts_with("--property=") || !x.contains(',')), "{a:?}");
+        // What systemd 260 prints for that form, in its own order.
+        let s = parse_session("2", "User=1000\nSeat=seat0\nRemote=no\nClass=user\n").unwrap();
+        assert!(s.establishes());
+    }
 
     #[test]
     fn parses() {

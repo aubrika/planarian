@@ -55,6 +55,44 @@ selection entry `policy-daemon-wifi-runtime` (simulated radios, hostapd,
 NetworkManager and wpa_supplicant). The desktop entries run against a stand-in greeter and
 compositor (docs/AGENTS.md), not COSMIC.
 
+### The VM catalog (CI run "VM tests" #7, 2026-10-28)
+
+The first run of all 62 VM entries on KVM. The jobs show red because their
+last step, uploading artifacts, hit the repository's storage quota; the
+verdicts are read from the logs.
+
+| Verdict | Entries |
+| --- | --- |
+| PASS | 36 |
+| UNSUPPORTED (`desktop-boot-fails-rollback`) | 1 |
+| FAIL | 21 |
+| PARTIAL | 3 |
+| Hung (`suspend-resume`: the VM did not come back from suspend) | 1 |
+
+Most failures were the VM harness, not Planarian, and are fixed for the
+next run: faults timed to `Staged`, which the real backend never journals
+(staging and the build happen before the transaction is prepared; the
+daemon now pauses before the call so the fault lands exactly); a knob read
+only at start, and one-off knobs that outlived a restart; a local blocked
+port that timed out instead of refusing; a kill timed to a slow
+activation's call that fired only after the call returned; three judge
+keys never implemented.
+
+One was a real Planarian bug: on systemd 260, `loginctl show-session` with
+a comma-separated `--property` list prints nothing, so Planarian never saw
+a login session, on any machine. The graphical-session deadline, per-user
+units and the session inputs to authorization were inert. Fixed (one
+`--property` per property, with a test); six desktop and user-unit entries
+failed on it. Untracked files left out of a build are now reported (§9
+step 1), which no entry had noticed.
+
+Still to look at: `crash-stop-and-suppress`, `drv-bind-fails-restores-previous`
+(a real bind of vfio-pci fails at once, so there is no Checking state),
+`net-gateway-down` (a dropped gateway makes probes time out, so the client
+is Unknown rather than Failed), `storage-budget-unsatisfiable`,
+`suspend-resume`, and `storage-nix-full-gc` (the test VM has no separate
+`/nix` filesystem).
+
 ### Passes that prove something
 
 - The judge fails an entry if any key goes unchecked (PARTIAL fails CI), if a

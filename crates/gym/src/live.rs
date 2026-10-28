@@ -124,7 +124,14 @@ pub fn plan(entry: &T) -> Plan {
         let op_called = st.get("when").and_then(|w| w.get("op_called")).and_then(T::as_str);
         let after = st.get("when").and_then(|w| w.get("after"));
         let raw = s(st, "raw");
-        let kind = if let Some(call) = op_called {
+        let slow_activation = all.iter().any(|x| s(x, "raw") == "slow_backend" && s(x, "call") == "activate_live");
+        let kind = if op_called == Some("activate_live") && raw == "kill_process" && slow_activation {
+            // The slow part runs in the activation's own unit: kill the daemon
+            // from outside once that unit is running (an in-daemon crash point
+            // would fire only after the slow call returned).
+            p.watched.insert(i, "unit:planarian-op-".into());
+            "armed".into()
+        } else if let Some(call) = op_called {
             match (0..i).rev().find(|j| is_request(&all[*j])) {
                 Some(j) if raw == "kill_process" => {
                     p.crash_before.insert(j, format!("OpCalled:{call}"));
@@ -139,11 +146,7 @@ pub fn plan(entry: &T) -> Plan {
             match raw {
                 // With a slow activation set up, "during Activating" means
                 // while its unit runs: kill the daemon from outside then.
-                "kill_process"
-                    if s(st, "process") == "planariad"
-                        && state == "Activating"
-                        && all.iter().any(|x| s(x, "raw") == "slow_backend" && s(x, "call") == "activate_live") =>
-                {
+                "kill_process" if s(st, "process") == "planariad" && state == "Activating" && slow_activation => {
                     p.watched.insert(i, "unit:planarian-op-".into());
                     "armed".into()
                 }
@@ -507,6 +510,11 @@ fn begin(entry: &T) {
     sh(&format!(
         "systemctl stop gym-sampler 2>/dev/null; systemd-run --unit=gym-sampler -E PLANARIAN_GYM_CATALOG {exe} vm sample"
     ));
+    for state in p.watched.values() {
+        if let Some(call) = pause_call(state) {
+            hooks_set(call, serde_json::json!({ "pause": state }));
+        }
+    }
     for (i, state) in &p.watched {
         sh(&format!(
             "systemd-run --unit=gym-watch-{i} -E PLANARIAN_GYM_CATALOG {exe} vm step --id {} --index {i} --watched {state}",
@@ -573,6 +581,18 @@ fn unit_cmd(u: &UnitId) -> (String, String) {
 }
 
 /// Run one step inside the VM.
+/// The backend call the daemon pauses before when a step is timed to this
+/// journal state (gym hooks `pause`). Staging and the build happen before
+/// the transaction is prepared, so `Staged` is never journaled: the build
+/// is where the source is staged. Publishing follows `Checking` at once.
+fn pause_call(state: &str) -> Option<&'static str> {
+    match state {
+        "Staged" | "Built" => Some("build"),
+        "Checking" => Some("publish_boot"),
+        _ => None,
+    }
+}
+
 fn step(entry: &T, i: usize, watched: Option<&str>) {
     let cfg = config();
     let all = steps(entry);
@@ -588,6 +608,20 @@ fn step(entry: &T, i: usize, watched: Option<&str>) {
         {
             std::thread::sleep(Duration::from_millis(200));
         }
+    } else if let Some(state) = watched.filter(|w| pause_call(w).is_some()) {
+        // The daemon waits at the marker; inject, then let it go on.
+        let marker = PathBuf::from(HOOKS_DIR).join(format!("paused-{state}"));
+        let until = Instant::now() + Duration::from_secs(3600);
+        while !marker.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let actor = st.get("actor").and_then(T::as_str).unwrap_or("user:1001").to_string();
+        let r = run_step(&cfg, st, &actor);
+        let _ = std::fs::remove_file(&marker);
+        if let Err(e) = r {
+            die(&format!("step {i}: {e}"));
+        }
+        return;
     } else if let Some(state) = watched {
         let until = Instant::now() + Duration::from_secs(3600);
         while !journal_reached(&cfg, state) && Instant::now() < until {
@@ -693,8 +727,14 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 Scope::User { uid, .. } => format!("{}@{uid}", u.name),
                 _ => u.name.clone(),
             };
+            // A one-off knob is marked so the fixture drops it when it restarts.
+            let once = if get("raw") == "set_knob" {
+                format!(" && touch /var/lib/gym-knobs/{n}/{}.once", get("knob"))
+            } else {
+                String::new()
+            };
             sh(&format!(
-                "mkdir -p /var/lib/gym-knobs/{n} && chmod 755 /var/lib/gym-knobs /var/lib/gym-knobs/{n} && printf '%s' '{v}' > /var/lib/gym-knobs/{n}/{k}",
+                "mkdir -p /var/lib/gym-knobs/{n} && chmod 755 /var/lib/gym-knobs /var/lib/gym-knobs/{n} && printf '%s' '{v}' > /var/lib/gym-knobs/{n}/{k}{once}",
                 k = get("knob")
             ));
         }
@@ -715,10 +755,17 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 Some(p) => format!("-d {} -p tcp --dport {p}", get("dst")),
                 None => format!("-d {}", get("dst")),
             };
-            sh(&format!(
-                "iptables -I OUTPUT {rule} -j DROP && iptables -I INPUT {} -j DROP",
-                rule.replace("-d ", "-s ").replace("--dport", "--sport")
-            ));
+            // A port blocked on this machine refuses connections (as the fake
+            // models it); an unreachable remote host just stops answering.
+            if get("dst").starts_with("127.") {
+                let tcp = if port.is_some() { rule.clone() } else { format!("{rule} -p tcp") };
+                sh(&format!("iptables -I OUTPUT {tcp} -j REJECT --reject-with tcp-reset"));
+            } else {
+                sh(&format!(
+                    "iptables -I OUTPUT {rule} -j DROP && iptables -I INPUT {} -j DROP",
+                    rule.replace("-d ", "-s ").replace("--dport", "--sport")
+                ));
+            }
         }
         "unblock_network" => {
             sh("iptables -F OUTPUT; iptables -F INPUT; true");

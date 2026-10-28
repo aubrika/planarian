@@ -101,6 +101,9 @@ pub struct Executor<B: Backends + Clone, S: Store> {
     /// The derived facts and decision of the last submission that got that
     /// far, for the executor log (I7).
     pub last: Option<(DerivedFacts, Decision)>,
+    /// Untracked owner files the last submission's staging left out (§9
+    /// step 1: Nix does not see them; they are reported, never an error).
+    pub excluded: Vec<String>,
     /// The result of a `PrebuildJob` run off the daemon's core thread; the
     /// next `submit` of the same transition uses it if the live override
     /// file is still the one it was built from.
@@ -202,6 +205,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             session: Session::default(),
             parked: BTreeMap::new(),
             last: None,
+            excluded: vec![],
             prebuilt: None,
         }
     }
@@ -521,6 +525,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             Err(s) => return s,
         };
         self.last = Some((plan.facts.clone(), plan.decision.clone()));
+        self.excluded = plan.staged.as_ref().map(|s| s.excluded.clone()).unwrap_or_default();
         if let Decision::Reject(r) = &plan.decision {
             self.release(&plan);
             return reject(r.clone(), "refused by policy");
