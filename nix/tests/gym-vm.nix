@@ -457,10 +457,14 @@ let
                         machine.shutdown(); machine.start(); machine.wait_for_unit("planariad.service")
                         machine.succeed("systemd-run --unit=gym-sampler -E PLANARIAN_GYM_CATALOG planarian-gym vm sample")
                     elif raw == "suspend":
-                        machine.execute("systemctl suspend &")
                         d = st.get("duration", "60s")
-                        time.sleep(int(d[:-1]) * (60 if d.endswith("m") else 1))
+                        secs = int(d[:-1]) * (60 if d.endswith("m") else 1)
+                        # The RTC alarm wakes it; the monitor command is a backup.
+                        machine.succeed(f"rtcwake -m no -s {secs}")
+                        machine.execute("systemctl suspend &")
+                        time.sleep(secs + 15)
                         machine.send_monitor_command("system_wakeup")
+                        machine.wait_until_succeeds("true", timeout=300)
                     elif raw == "hotunplug":
                         machine.send_monitor_command("device_del gymusbdev")
                     elif raw in ("stop_host_service", "start_host_service"):
@@ -470,6 +474,12 @@ let
                         # simulated in one kernel); the upstream on its own node.
                         node = machine if name.startswith("hostapd-") else upstream
                         node.succeed(f"systemctl {verb} {name}")
+            # For triage: what the daemon and the step watchers did.
+            print(machine.execute(
+                "ls -la /run/planarian-gym; cat /run/planarian-gym/hooks.json; echo;"
+                " journalctl -o short-monotonic --no-pager -u planariad -u planarian-recovery -u 'gym-watch-*' | tail -n 150;"
+                " tail -n 40 /var/lib/planarian/log/executor.jsonl"
+            )[1])
             print(machine.succeed(f"{gym} judge --id {ID} 2>&1"))
         machine.copy_from_vm("/var/lib/gym-run/verdict.json", "")
         if machine.execute("test -e /var/lib/gym-run/evidence.json")[0] == 0:

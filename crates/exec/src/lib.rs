@@ -526,6 +526,14 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         };
         self.last = Some((plan.facts.clone(), plan.decision.clone()));
         self.excluded = plan.staged.as_ref().map(|s| s.excluded.clone()).unwrap_or_default();
+        if plan.staged.is_some() {
+            // Also any added while it built: the stale check below ignores them.
+            for f in self.b.generations().untracked(&self.cfg.owner) {
+                if !self.excluded.contains(&f) {
+                    self.excluded.push(f);
+                }
+            }
+        }
         if let Decision::Reject(r) = &plan.decision {
             self.release(&plan);
             return reject(r.clone(), "refused by policy");

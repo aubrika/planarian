@@ -521,6 +521,10 @@ impl GenerationBackend for Nixos {
         h
     }
 
+    fn untracked(&self, owner: &PinnedSource) -> Vec<String> {
+        self.visible_files(Path::new(&owner.root)).map(|(_, skipped)| skipped).unwrap_or_default()
+    }
+
     fn evaluate(&self, src: &StagedSource) -> Result<EvaluatedGeneration, Outcome> {
         let dir = PathBuf::from(&src.dir);
         let text = std::fs::read_to_string(self.override_file(&dir)).map_err(|e| Outcome::Failed(e.to_string()))?;
@@ -912,5 +916,41 @@ mod tests {
             render(&OverrideSet::default()),
             "owner's file untouched"
         );
+    }
+
+    #[test]
+    fn git_owner_edit_after_staging_is_stale() {
+        if run(&["nix-hash", "--version"], QUICK).status != Some(0)
+            || run(&["git", "--version"], QUICK).status != Some(0)
+        {
+            eprintln!("SKIPPED: nix-hash or git not on PATH");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let owner = d.path().join("owner");
+        std::fs::create_dir_all(owner.join("planarian")).unwrap();
+        std::fs::write(owner.join("flake.nix"), "{ }").unwrap();
+        std::fs::write(owner.join("configuration.nix"), "{ }\n").unwrap();
+        std::fs::write(owner.join("planarian/overrides.nix"), render(&OverrideSet::default())).unwrap();
+        let o = owner.to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            let mut a = vec!["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", &o];
+            a.extend_from_slice(args);
+            assert!(run(&a, QUICK).ok(), "{args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "owner"]);
+        let paths = Paths { state: d.path().join("state"), owner: owner.clone(), ..Default::default() };
+        let n = Nixos::new(paths);
+        let src = PinnedSource { root: o.clone(), kind: SourceKind::Directory };
+        let mut set = OverrideSet::default();
+        set.assignments.insert("a.b".into(), Value::Bool(true));
+        let s = n.stage(&src, &set).unwrap();
+        assert_eq!(n.source_hash(&src).unwrap(), s.base_source, "owner tree unchanged → not stale");
+        // As the gym's edit_owner_source does: edit a tracked file, stage it, don't commit.
+        std::fs::write(owner.join("configuration.nix"), "{ }\n# edited by the gym\n").unwrap();
+        git(&["add", "configuration.nix"]);
+        assert_ne!(n.source_hash(&src).unwrap(), s.base_source, "tracked edit → stale");
     }
 }

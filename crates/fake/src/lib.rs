@@ -484,6 +484,10 @@ impl GenerationBackend for Fake {
         Ok(World::source_hash_of(&w.owner_files, &w.overrides))
     }
 
+    fn untracked(&self, _owner: &PinnedSource) -> Vec<String> {
+        self.w().untracked.iter().cloned().collect()
+    }
+
     fn evaluate(&self, src: &StagedSource) -> Result<EvaluatedGeneration, Outcome> {
         let w = self.w();
         let (overrides, _) = w.staged.get(&src.dir).ok_or_else(|| Outcome::Failed("no such stage".into()))?;

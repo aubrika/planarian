@@ -78,6 +78,12 @@ pub trait GenerationBackend {
     fn stage(&self, owner: &PinnedSource, overrides: &OverrideSet) -> Result<StagedSource, Outcome>;
     /// Recompute the NAR hash of the owner's Nix-visible source now (stale check, §9 step 6).
     fn source_hash(&self, owner: &PinnedSource) -> Result<Hash, Outcome>;
+    /// The owner's files Nix cannot see now (untracked in a git flake), to
+    /// report with the stale check: one added during the build was not
+    /// there at staging (§9 step 1).
+    fn untracked(&self, _owner: &PinnedSource) -> Vec<String> {
+        vec![]
+    }
     fn evaluate(&self, src: &StagedSource) -> Result<EvaluatedGeneration, Outcome>;
     /// Store-only; roots its own output.
     fn build(&self, eval: &EvaluatedGeneration) -> Result<Built, Outcome>;
