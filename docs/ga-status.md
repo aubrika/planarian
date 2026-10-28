@@ -49,7 +49,7 @@ The 17 VM-only entries run on the VM harness (`nix run .#gym-vm`, or
 `vm.yml` by hand in CI). Of those, `svc-killed-defer-to-systemd` passes;
 `desktop-boot-fails-rollback` is UNSUPPORTED there, because the test VM boots
 its kernel directly and so never boots a published generation; the rest are
-not yet scored on VMs. Entries that run on both harnesses also pass on VMs
+scored below. Entries that run on both harnesses also pass on VMs
 where tried: the demonstration's four, `crash-activating-good`, and the Wi-Fi
 selection entry `policy-daemon-wifi-runtime` (simulated radios, hostapd,
 NetworkManager and wpa_supplicant). The desktop entries run against a stand-in greeter and
@@ -86,12 +86,42 @@ units and the session inputs to authorization were inert. Fixed (one
 failed on it. Untracked files left out of a build are now reported (§9
 step 1), which no entry had noticed.
 
-Still to look at: `crash-stop-and-suppress`, `drv-bind-fails-restores-previous`
-(a real bind of vfio-pci fails at once, so there is no Checking state),
-`net-gateway-down` (a dropped gateway makes probes time out, so the client
-is Unknown rather than Failed), `storage-budget-unsatisfiable`,
-`suspend-resume`, and `storage-nix-full-gc` (the test VM has no separate
-`/nix` filesystem).
+### Re-run of the 25 (CI run "VM tests" #11, 2026-10-28)
+
+The 25 entries that failed, were partial or hung in run #7, plus four that
+passed but depend on login sessions (to check the session fix broke none):
+
+| Verdict | Entries |
+| --- | --- |
+| PASS | 13: all four session checks, and `drv-unbound-nic-asks`, `flap-30s`, `probe-diagnostic-stale-healthy`, `probe-http-503-degraded`, `journal-compaction-preserves-state`, `manifest-weaken-out-of-band`, `user-unit-after-logout`, `desktop-auth-ok-compositor-fails`, `desktop-second-user-deadline` |
+| FAIL | 15 |
+| Hung | `suspend-resume` |
+
+So far 45 of the 62 VM entries pass on VMs (36 in run #7, 9 more here).
+Of the 16 left:
+
+- A fault timed into a configuration change does not take effect, though
+  the harness now pauses the daemon to inject it: the change commits
+  (`stale-owner-edit-during-build`, `storage-enospc-during-build`,
+  `storage-boot-full-publish`), or a revert meant to fail succeeds
+  (`revert-fails`, `crash-job-outlives-drain`). Planarian's stale check is
+  right on a git owner flake (a backend test); the next run prints the
+  daemon's and the harness's logs to show where the injection goes wrong.
+- `stale-untracked-file-ignored` found a real gap: a file added while a
+  change builds was not reported as left out of the build. Fixed.
+- Storage entries that fill a filesystem see no NoSpace or
+  BudgetUnsatisfiable report (`storage-journal-fs-full`,
+  `storage-journal-btrfs-reuse`, `storage-budget-unsatisfiable`).
+- PipeWire as a user service: not restarted after a kill
+  (`svc-killed-user-scope`), not linked to its sound card's driver
+  (`drv-unbound-audio`).
+- `suspend-resume`: the VM never woke. It now sets an RTC alarm before
+  suspending.
+- Known limits of the test VM: `drv-bind-fails-restores-previous` (a real
+  bind of vfio-pci fails at once, so there is no Checking state),
+  `storage-nix-full-gc` (no separate `/nix` filesystem), `net-gateway-down`
+  (a dropped gateway makes probes time out, so the client is Unknown
+  rather than Failed), `crash-stop-and-suppress`.
 
 ### Passes that prove something
 
