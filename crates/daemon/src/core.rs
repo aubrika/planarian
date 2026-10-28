@@ -92,7 +92,7 @@ pub struct Core<B: Backends + Clone, S: Store> {
     confirm: Option<(GenerationId, Timestamp)>,
     manifest_gen: GenerationId,
     interlock_noted: bool,
-    /// Diagnostic incidents already announced.
+    /// Incidents whose opening was already announced.
     diag_noted: BTreeSet<IncidentId>,
     /// When to next check the §12b collection bounds.
     next_gc_check: Timestamp,
@@ -390,6 +390,27 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 self.notice(format!(
                     "{}: escalated: it failed again soon after each of {} repairs; it needs a person (no automatic action for an hour)",
                     inc.target, inc.regressions
+                ));
+            }
+            // A repair incident opens: say what failed, in the probes' words.
+            if inc.kind == IncidentKind::Repair && inc.attempts.is_empty() && self.diag_noted.insert(inc.id) {
+                let failing: Vec<String> = s
+                    .units
+                    .get(&inc.target)
+                    .map(|(_, ev)| {
+                        ev.iter()
+                            .filter_map(|e| match &e.result {
+                                ProbeResult::Fail(m) => Some(format!("{}: {m}", e.probe.0)),
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.notice(format!(
+                    "{}: {:?}{}",
+                    inc.target,
+                    inc.divergence.1,
+                    if failing.is_empty() { String::new() } else { format!(" ({})", failing.join("; ")) }
                 ));
             }
             if inc.kind == IncidentKind::Diagnostic

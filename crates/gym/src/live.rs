@@ -109,7 +109,17 @@ fn is_request(step: &T) -> bool {
 pub fn plan(entry: &T) -> Plan {
     let all = steps(entry);
     let mut p = Plan { window_secs: crate::window(entry).0 / 1000, ..Default::default() };
+    let mut changed_generation = false;
     for (i, st) in all.iter().enumerate() {
+        if matches!(s(st, "transition"), "ApplyChange" | "SwitchGeneration" | "Rollback") {
+            changed_generation = true;
+        }
+        // The test VM boots its kernel directly, not through its boot menu,
+        // so a reboot always comes back to the system it was started with.
+        if s(st, "raw") == "reboot" && changed_generation {
+            p.steps.push("unsupported: booting a published generation (the test VM has no boot loader)".into());
+            continue;
+        }
         let when = st.get("when").and_then(|w| w.get("journal")).and_then(T::as_str);
         let op_called = st.get("when").and_then(|w| w.get("op_called")).and_then(T::as_str);
         let after = st.get("when").and_then(|w| w.get("after"));
@@ -678,9 +688,13 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 Some(other) => other.to_string(),
                 None => String::new(),
             };
+            // A user unit's knobs are per user (cosmic-comp@1000).
+            let n = match u.scope {
+                Scope::User { uid, .. } => format!("{}@{uid}", u.name),
+                _ => u.name.clone(),
+            };
             sh(&format!(
-                "mkdir -p /var/lib/gym-knobs/{n} && printf '%s' '{v}' > /var/lib/gym-knobs/{n}/{k}",
-                n = u.name,
+                "mkdir -p /var/lib/gym-knobs/{n} && chmod 755 /var/lib/gym-knobs /var/lib/gym-knobs/{n} && printf '%s' '{v}' > /var/lib/gym-knobs/{n}/{k}",
                 k = get("knob")
             ));
         }

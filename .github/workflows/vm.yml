@@ -1,20 +1,26 @@
 # NixOS VM tests: the runtime and generation tests, the installer, and the
 # gym's fault catalog on real VMs (one NixOS test per entry). Linux runners
-# have KVM once /dev/kvm is opened to the runner user. The catalog runs on a
-# schedule and by hand rather than per push: it is 62 VMs.
+# have KVM once /dev/kvm is opened to the runner user.
+#
+# Cost: in a private repository these minutes count against the Actions
+# quota. A push runs 7 VM jobs (about 70 runner minutes; a newer push
+# cancels them); the whole catalog is 62 jobs (several hundred minutes), so
+# it runs only by hand (Actions → VM tests → Run workflow → catalog).
 name: VM tests
 
 on:
   push:
     branches: [ccr-c64ddb68-a5g3k5]
-  schedule:
-    - cron: "17 3 * * 1"
   workflow_dispatch:
     inputs:
       catalog:
         description: "Also run the whole gym catalog on VMs"
         type: boolean
         default: false
+
+concurrency:
+  group: vm-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   vm:
@@ -56,7 +62,7 @@ jobs:
           jq -e '.result == "PASS"' verdict/verdict.json
 
   catalog-ids:
-    if: github.event_name == 'schedule' || inputs.catalog
+    if: inputs.catalog
     runs-on: ubuntu-24.04
     outputs:
       ids: ${{ steps.ids.outputs.ids }}

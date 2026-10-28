@@ -319,6 +319,16 @@ in
         type = types.attrsOf (types.submodule { options = { option = mkOption { type = types.str; }; permitted = mkOption { type = types.listOf types.str; }; }; });
         default = { };
       };
+      gymChoices = mkOption {
+        type = types.attrsOf (types.submodule { options = {
+          option = mkOption { type = types.str; };
+          arg = mkOption { type = types.str; };
+          permitted = mkOption { type = types.listOf types.str; };
+        }; });
+        default = { };
+        internal = true;
+        description = "Test-only catalog entries for the gym's VMs (`gym:<name>`).";
+      };
     };
 
     export = mkOption {
@@ -364,6 +374,7 @@ in
       catalog = {
         inherit (cfg.catalog) services fontScaleOption fontScales keyboardLayoutOptions keyboardLayouts wifiOption wifiNetworks;
         listenAddresses = lib.mapAttrs (_: l: { inherit (l) option permitted; }) cfg.catalog.listenAddresses;
+        gymChoices = lib.mapAttrs (_: c: { inherit (c) option arg permitted; }) cfg.catalog.gymChoices;
       };
       runtimeOptions = lib.optional (cfg.catalog.fontScaleOption != "") {
         path = "font.scale";

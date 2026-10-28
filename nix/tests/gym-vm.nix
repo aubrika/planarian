@@ -26,6 +26,7 @@ let
     font = { planarian.reference.fontScale = "1.25"; };
     sshd-off = { services.openssh.enable = false; };
     sshd-on = { services.openssh.enable = true; };
+    kparam = { gym.kernelParam = "virtio_gpu.modeset=0"; };
   };
   # What Planarian evaluates besides the export (nix/backends apply_expr).
   optionPaths = [
@@ -33,6 +34,7 @@ let
     "planarian.reference.fontScale"
     "services.openssh.enable"
     "services.gym-extra.enable"
+    "gym.kernelParam"
   ];
 
   fixture = pkgs.writeScript "gym-fixture" ''
@@ -118,6 +120,8 @@ let
     options.services.gym-extra.enable = lib.mkEnableOption "gym-extra";
     # Only the booted base sets up /etc/nixos (a specialisation has none of its own).
     options.gym.isBase = lib.mkOption { type = lib.types.bool; default = true; };
+    # A boot-only change for gym:kernel-param (desktop-boot-fails-rollback).
+    options.gym.kernelParam = lib.mkOption { type = lib.types.str; default = ""; };
 
     config = {
       # No desktop in this VM (the desktop entries need the COSMIC variant).
@@ -134,6 +138,7 @@ let
         startupGrace = 20;
         catalog.services = { sshd = "services.openssh.enable"; gym-extra = "services.gym-extra.enable"; };
         catalog.listenAddresses.gym-web = { option = "services.gym-web.listenAddress"; permitted = [ "127.0.0.1" "192.0.2.10" ]; };
+        catalog.gymChoices."gym:kernel-param" = { option = "gym.kernelParam"; arg = "param"; permitted = [ "virtio_gpu.modeset=0" ]; };
         units = {
           gym-web = {
             synonyms = [ "web server" "web" ];
@@ -168,6 +173,10 @@ let
           # links it below while the stick is plugged in).
           # Removable: expected only while it is plugged in.
           gym-usb0 = { kind = "device"; sysfs = "/run/gym-usb0"; restartDisruption = "None"; whenDevice = "device:gym-usb0"; };
+          # The stand-in desktop (below): the login screen, and each session's
+          # graphical-session.target (its canonical probe is the 60 s deadline).
+          display-manager.synonyms = [ "login screen" "greeter" ];
+          graphical-session = { kind = "target"; when = "session"; synonyms = [ "desktop" ]; };
           NetworkManager = {
             runtimeRepair = "wifi.network";
             probes = [ {
@@ -255,6 +264,41 @@ let
         wifi = { inherit ssid; mode = "infrastructure"; };
       });
 
+      # A stand-in desktop. What the desktop entries test is Planarian's side
+      # (a session must reach graphical-session.target within 60 s; a boot
+      # whose greeter fails is not confirmed), not COSMIC itself, which this
+      # VM cannot run quickly without a GPU. The greeter fails when the kernel
+      # has no modesetting, as a real one would; each user's compositor brings
+      # up graphical-session.target unless its knob says it fails.
+      systemd.services.display-manager = {
+        description = "Login screen (gym stand-in)";
+        wantedBy = [ "multi-user.target" ];
+        script = ''
+          if ${pkgs.gnugrep}/bin/grep -q 'virtio_gpu.modeset=0' /proc/cmdline; then
+            echo "no display: modesetting is off" >&2
+            exit 1
+          fi
+          exec ${pkgs.coreutils}/bin/sleep infinity
+        '';
+      };
+      systemd.user.targets.gym-desktop = {
+        bindsTo = [ "graphical-session.target" ];
+        wants = [ "graphical-session.target" ];
+        before = [ "graphical-session.target" ];
+      };
+      systemd.user.services.cosmic-comp = {
+        description = "Compositor (gym stand-in)";
+        wantedBy = [ "default.target" ];
+        script = ''
+          if [ "$(cat /var/lib/gym-knobs/cosmic-comp@$(id -u)/exec_fail 2>/dev/null)" = true ]; then
+            echo "compositor failed to start (knob)" >&2
+            exit 1
+          fi
+          systemctl --user start gym-desktop.target
+          exec ${pkgs.coreutils}/bin/sleep infinity
+        '';
+      };
+
       services.udev.extraRules = ''
         SUBSYSTEM=="block", ENV{ID_SERIAL_SHORT}=="GYMUSB0", ENV{DEVTYPE}=="disk", SYMLINK+="gymusb0", TAG+="systemd"
         SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTRS{serial}=="GYMUSB0", ACTION=="add", RUN+="${pkgs.coreutils}/bin/ln -sfn /sys%p /run/gym-usb0"
@@ -276,6 +320,7 @@ let
         ];
       };
       boot.kernelModules = [ "snd_hda_intel" "virtio_gpu" "mac80211_hwsim" ];
+      boot.kernelParams = lib.optional (config.gym.kernelParam != "") config.gym.kernelParam;
       # The journal on its own small filesystem (fill_fs fs-journal).
       fileSystems."/var/lib/planarian" = { device = "/dev/vdb"; fsType = "ext4"; autoFormat = true; };
 

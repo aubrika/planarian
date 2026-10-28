@@ -31,6 +31,18 @@ pub struct CatalogConfig {
     pub wifi_option: String,
     pub wifi_networks: Vec<String>,
     pub listen_addresses: BTreeMap<String, ListenAddress>,
+    /// Test-only entries for the gym (`gym:<name>`, e.g. `gym:kernel-param`):
+    /// set `option` to one of `permitted`, given as the argument `arg`. Ids
+    /// not starting with `gym:` are ignored.
+    pub gym_choices: BTreeMap<String, GymChoice>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GymChoice {
+    pub option: String,
+    pub arg: String,
+    pub permitted: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +148,15 @@ pub fn entries(cfg: &CatalogConfig) -> Vec<Entry> {
             repair: false,
         });
     }
+    for (id, c) in cfg.gym_choices.iter().filter(|(id, _)| id.starts_with("gym:")) {
+        out.push(Entry {
+            id: ChangeId(id.clone()),
+            description: format!("(gym) set {}", c.option),
+            args: vec![one_of(&c.arg, &c.permitted)],
+            affected_modules: vec![c.option.clone()],
+            repair: false,
+        });
+    }
     out
 }
 
@@ -198,6 +219,11 @@ pub fn handle(
             let la = &cfg.listen_addresses[svc];
             let addr = permitted("addr", arg_str(args, "addr")?, &la.permitted)?;
             a.insert(la.option.clone(), Value::Str(addr.into()));
+        }
+        id if id.starts_with("gym:") && cfg.gym_choices.contains_key(id) => {
+            let c = &cfg.gym_choices[id];
+            let v = permitted(&c.arg, arg_str(args, &c.arg)?, &c.permitted)?;
+            a.insert(c.option.clone(), Value::Str(v.into()));
         }
         _ => return Err(CatalogError::NotInCatalog(change.clone())),
     }
@@ -330,6 +356,21 @@ mod tests {
                 },
             )]
             .into(),
+            gym_choices: [
+                (
+                    "gym:kernel-param".into(),
+                    GymChoice {
+                        option: "gym.kernelParam".into(),
+                        arg: "param".into(),
+                        permitted: vec!["virtio_gpu.modeset=0".into()],
+                    },
+                ),
+                (
+                    "kernel-param".into(),
+                    GymChoice { option: "boot.x".into(), arg: "param".into(), permitted: vec!["y".into()] },
+                ),
+            ]
+            .into(),
         }
     }
 
@@ -376,7 +417,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(la.assignments["services.gym-web.listenAddress"], Value::Str("192.0.2.10".into()));
-        assert_eq!(entries(&c).len(), 6);
+        assert_eq!(entries(&c).len(), 7, "the six shipped kinds and one gym: choice");
     }
 
     #[test]
@@ -397,6 +438,23 @@ mod tests {
         assert_eq!(render(&back), text);
         assert!(parse("{ lib, ... }: { x = import /etc/evil; }").is_none());
         assert_eq!(parse(&render(&OverrideSet::default())), Some(OverrideSet::default()));
+    }
+
+    #[test]
+    fn gym_choices_only_with_the_prefix() {
+        let c = cfg();
+        let ids: Vec<String> = entries(&c).into_iter().map(|e| e.id.0).collect();
+        assert!(ids.contains(&"gym:kernel-param".to_string()));
+        assert!(!ids.contains(&"kernel-param".to_string()), "a choice without gym: is not an entry");
+        let args = [("param".to_string(), Value::Str("virtio_gpu.modeset=0".into()))].into();
+        let set = handle(&c, &ChangeId("gym:kernel-param".into()), &args).unwrap();
+        assert_eq!(set.assignments["gym.kernelParam"], Value::Str("virtio_gpu.modeset=0".into()));
+        let bad = [("param".to_string(), Value::Str("init=/bin/sh".into()))].into();
+        assert!(matches!(
+            handle(&c, &ChangeId("gym:kernel-param".into()), &bad),
+            Err(CatalogError::NotPermitted { .. })
+        ));
+        assert!(matches!(handle(&c, &ChangeId("kernel-param".into()), &args), Err(CatalogError::NotInCatalog(_))));
     }
 }
 

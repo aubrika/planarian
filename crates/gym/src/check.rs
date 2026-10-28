@@ -113,6 +113,10 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
     let may_change: Vec<UnitId> =
         post.get("may_change").and_then(T::as_array).into_iter().flatten().filter_map(T::as_str).map(unit).collect();
 
+    // Every unit the machine showed. A key naming any other unit would hold
+    // vacuously, so naming one is a failure of the entry itself.
+    let known: BTreeSet<&UnitId> = e.pre_status.keys().chain(e.finals.keys()).chain(e.seen_status.keys()).collect();
+    let unknown = |u: &str| !known.is_empty() && !known.contains(&unit(u));
     for (key, val) in post {
         let fail = |v: &mut Verdict, m: String| v.failures.push(format!("{key}: {m}"));
         match key.as_str() {
@@ -236,6 +240,9 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
             }
             "no_txn_on" => {
                 for u in val.as_array().into_iter().flatten().filter_map(T::as_str) {
+                    if unknown(u) {
+                        fail(&mut v, format!("{u} is not a unit on this machine"));
+                    }
                     let id = unit(u);
                     if all.iter().any(|t| target_of(&t.transition).as_ref() == Some(&id)) {
                         fail(&mut v, format!("a transaction targeted {u}"));
@@ -255,6 +262,9 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
             }
             "no_incident_on" => {
                 for u in val.as_array().into_iter().flatten().filter_map(T::as_str) {
+                    if unknown(u) {
+                        fail(&mut v, format!("{u} is not a unit on this machine"));
+                    }
                     let id = unit(u);
                     if e.seen_incidents.values().any(|i| i.target == id && i.kind == IncidentKind::Repair) {
                         fail(&mut v, format!("an incident opened on {u}"));
@@ -1036,9 +1046,11 @@ fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
             None => v.unchecked.push(format!("{label}: first_candidate {first}")),
         }
     }
-    for k in ["session_bound"] {
-        if spec.get(k).is_some() {
-            v.unchecked.push(format!("{label}: {k}"));
-        }
+    // The incident is about that user's session: the daemon's account of it
+    // names the session's uid.
+    if let Some(uid) = spec.get("session_bound").and_then(T::as_integer)
+        && !e.notices.iter().any(|n| n.starts_with(&format!("{id}: ")) && n.contains(&format!("(uid {uid})")))
+    {
+        v.failures.push(format!("{label}: not tied to the session of uid {uid}"));
     }
 }

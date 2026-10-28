@@ -1760,7 +1760,7 @@ window = "10m"
 
 [fault.required_post]
 units = { "service:display-manager" = "Running" }
-no_incident_on = ["service:graphical-session"]
+no_incident_on = ["target:graphical-session"]
 no_autonomous_txn = true
 
 [[fault]]
@@ -1777,7 +1777,7 @@ inject = { raw = "logout", uid = 1000 }
 window = "5m"
 
 [fault.required_post]
-no_incident_on = ["service@1000:pipewire", "service:graphical-session"]
+no_incident_on = ["service@1000:pipewire", "target:graphical-session"]
 no_autonomous_txn = true
 
 [[fault]]
@@ -1814,7 +1814,7 @@ inject = { raw = "greeter_login", uid = 1000 }
 window = "5m"
 
 [[fault.required_post.incident]]
-target = "service:graphical-session"
+target = "target:graphical-session"
 opened_within = "65s"
 session_bound = 1000
 
@@ -1833,7 +1833,7 @@ after = [{ raw = "greeter_login", uid = 1002, when = { after = "50s" } }]
 window = "5m"
 
 [[fault.required_post.incident]]
-target = "service:graphical-session"
+target = "target:graphical-session"
 opened_within = "65s"
 session_bound = 1000
 
