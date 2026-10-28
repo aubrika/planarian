@@ -264,7 +264,13 @@ let
           autoconnect = if ssid == "gym-ap-a" then "true" else "false";
         };
         wifi = { inherit ssid; mode = "infrastructure"; };
+        # Nothing on the simulated APs hands out addresses; association is
+        # what the probe checks.
+        ipv4.method = "disabled";
+        ipv6.method = "disabled";
       });
+      # NetworkManager's wpa_supplicant; test VMs turn Wi-Fi off (mkVMOverride).
+      networking.wireless.enable = lib.mkOverride 9 true;
 
       # A stand-in desktop. What the desktop entries test is Planarian's side
       # (a session must reach graphical-session.target within 60 s; a boot
