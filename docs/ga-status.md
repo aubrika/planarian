@@ -86,42 +86,40 @@ units and the session inputs to authorization were inert. Fixed (one
 failed on it. Untracked files left out of a build are now reported (§9
 step 1), which no entry had noticed.
 
-### Re-run of the 25 (CI run "VM tests" #11, 2026-10-28)
-
-The 25 entries that failed, were partial or hung in run #7, plus four that
-passed but depend on login sessions (to check the session fix broke none):
+### The whole VM catalog again (CI run "VM tests" #18, 2026-10-29)
 
 | Verdict | Entries |
 | --- | --- |
-| PASS | 13: all four session checks, and `drv-unbound-nic-asks`, `flap-30s`, `probe-diagnostic-stale-healthy`, `probe-http-503-degraded`, `journal-compaction-preserves-state`, `manifest-weaken-out-of-band`, `user-unit-after-logout`, `desktop-auth-ok-compositor-fails`, `desktop-second-user-deadline` |
-| FAIL | 15 |
-| Hung | `suspend-resume` |
+| PASS | 50 |
+| UNSUPPORTED | 5 |
+| FAIL | 6 |
+| Hung | `suspend-resume` (the VM did not wake) |
 
-So far 45 of the 62 VM entries pass on VMs (36 in run #7, 9 more here).
-Of the 16 left:
+UNSUPPORTED on the gym VM, with the reason, and still run on the fake
+where they can be: `desktop-boot-fails-rollback` (the VM boots its kernel
+directly, never a published generation), `storage-nix-full-gc` and
+`storage-enospc-during-build` (the VM's Nix store is the host's: it cannot
+fill or be collected), `storage-journal-btrfs-reuse` (the VM's journal is
+ext4), and `policy-daemon-wifi-runtime` (a mistake in the plan, fixed:
+it passed before and runs again).
 
-- A fault timed into a configuration change does not take effect, though
-  the harness now pauses the daemon to inject it: the change commits
-  (`stale-owner-edit-during-build`, `storage-enospc-during-build`,
-  `storage-boot-full-publish`), or a revert meant to fail succeeds
-  (`revert-fails`, `crash-job-outlives-drain`). Planarian's stale check is
-  right on a git owner flake (a backend test); the next run prints the
-  daemon's and the harness's logs to show where the injection goes wrong.
-- `stale-untracked-file-ignored` found a real gap: a file added while a
-  change builds was not reported as left out of the build. Fixed.
-- Storage entries that fill a filesystem see no NoSpace or
-  BudgetUnsatisfiable report (`storage-journal-fs-full`,
-  `storage-journal-btrfs-reuse`, `storage-budget-unsatisfiable`).
-- PipeWire as a user service: not restarted after a kill
-  (`svc-killed-user-scope`), not linked to its sound card's driver
-  (`drv-unbound-audio`).
-- `suspend-resume`: the VM never woke. It now sets an RTC alarm before
-  suspending.
-- Known limits of the test VM: `drv-bind-fails-restores-previous` (a real
-  bind of vfio-pci fails at once, so there is no Checking state),
-  `storage-nix-full-gc` (no separate `/nix` filesystem), `net-gateway-down`
-  (a dropped gateway makes probes time out, so the client is Unknown
-  rather than Failed), `crash-stop-and-suppress`.
+What the runs since #11 found:
+
+- Real Planarian bugs, fixed, each with a test that fails without the fix:
+  notices stopped reaching the journal once 64 had accumulated; a file
+  added during a build was not reported as left out; binding a device to
+  another driver never worked on real hardware (the current driver was not
+  unbound first, and generic drivers such as vfio-pci bind only through
+  `driver_override`).
+- Gym VM harness and fixtures, fixed: the step watchers and the slow
+  activation hook ran without a PATH, so faults timed into a change never
+  happened; the journal's and /boot's own filesystems were never mounted;
+  no system profile; pipewire restarted itself and had no link to its sound
+  card; S3 suspend never resumed; held-down entries judged statuses frozen
+  at the crash; the judge picked an arbitrary collection for `emergency`.
+- Open: `net-gateway-down` expects an incident when traffic to the gateway
+  is dropped, but SPEC §10 makes a timed-out probe Unknown, never Failed,
+  so Planarian (rightly, by the spec) opens none. A question for the owner.
 
 ### Passes that prove something
 
