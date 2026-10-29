@@ -183,3 +183,10 @@ The kill cases above switch to `SIGSEGV` (as `quiet-repair-not-deferred` already
   - The VM runs it with software rendering as a regression check on every run; a real reference machine runs it at phase gates.
   - Fallback if you'd rather have a racing game: SuperTuxKart's benchmark mode.
 - **Q8. Coverage threshold for the personal-profile gate.** Still yours; I have left it open.
+
+## 9. Decisions (2026-10-29)
+
+- **Q5:** accepted as proposed. The unattributed residue is a termination signal (`SIGKILL`, `SIGTERM`, `SIGINT`, `SIGHUP`) with `Result=signal`, or a `systemctl stop` not issued by Planarian. A crash signal, a non-zero exit, `Result=oom-kill`, a failed start and a timeout are faults. A device found unbound is always a fault. The v4.3 kill cases switch to `SIGSEGV`, and `dep-required-stopped` becomes a residue case.
+- **Q6:** accepted. Change the types, extend the existing proofs, and add proofs as needed (I16, I19). Report the verification ratio before and after.
+- **Q7:** accepted. The reference game is Xonotic's `timedemo`, with MangoHud frame logging.
+- **Q8:** left to my discretion, aiming high. The personal-profile gate needs every `must-pass` and `intent` entry to PASS on each harness it lists, and no acceptance case to be UNSUPPORTED on the VM unless a `docs/deviations.md` row moves it to the fake (Q4). It also needs at least 95% of all entries cleared on at least one harness.
