@@ -53,6 +53,9 @@ let
       exit 0
     fi
     touch "/run/planarian/failed-$class"
+    # I20: no agent principal runs while Planarian is failed (their
+    # ConditionPathExistsGlob keeps them from starting again).
+    ${optionalString (cfg.agentUnits != [ ]) "systemctl stop ${concatStringsSep " " cfg.agentUnits} || true"}
     # Alarm: on the login screen (getty's issue) and in every session; the
     # tray and the console read /run/planarian/alarm.
     printf '%s\n%s\n' "$class" "$text" > /run/planarian/alarm
@@ -118,6 +121,7 @@ let
     rm -f /run/planarian/alarm /run/issue.d/50-planarian.issue /run/planarian/failed-* /run/planarian/sshd/posture.conf
     ${optionalString config.services.openssh.enable "systemctl try-reload-or-restart sshd.service || true"}
     systemctl stop 'planarian-failed@*.target' 'planarian-respond@*.service' || true
+    ${optionalString (cfg.agentUnits != [ ]) "systemctl is-active --quiet planarian-ready.target && systemctl start --no-block ${concatStringsSep " " cfg.agentUnits} || true"}
     echo "acknowledged ($class); restrictions lifted"
   '';
 
@@ -173,17 +177,21 @@ in
     systemd.targets.planarian-ready = {
       description = "Planarian is ready";
       wantedBy = [ "multi-user.target" ];
-      requires = [ "planariad.service" ];
+      # BindsTo, not Requires: a required unit that fails (rather than is
+      # stopped) leaves its dependents up, which would read as ready with
+      # planariad dead. Restarts within the budget keep planariad activating
+      # (RestartMode=direct), so they do not take the target down.
+      bindsTo = [ "planariad.service" ];
       after = [ "planariad.service" ];
-      # Not stopped when planariad stops: its own stop routes to Absent.
       unitConfig.StopWhenUnneeded = false;
     };
 
     systemd.targets."planarian-failed@" = {
       description = "Planarian failure: %i";
       wants = [ "planarian-respond@%i.service" ];
-      # I20: no agent principal runs while Planarian is failed.
-      conflicts = cfg.agentUnits;
+      # I20 is held by the respond unit (it stops the agents) and by the
+      # agents' own condition, not Conflicts=: that is symmetric, so an agent
+      # started by a later planarian-ready.target would stop this target.
       unitConfig.DefaultDependencies = false;
     };
 
@@ -262,10 +270,12 @@ in
     });
   }
   {
-    # I20: agents start only once Planarian is ready.
+    # I20: agents start only once Planarian is ready, and never while a
+    # failure class is raised.
     systemd.services = lib.genAttrs (map (lib.removeSuffix ".service") cfg.agentUnits) (_: {
       requires = [ "planarian-ready.target" ];
       after = [ "planarian-ready.target" ];
+      unitConfig.ConditionPathExistsGlob = "!/run/planarian/failed-*";
     });
   }
   ]);
