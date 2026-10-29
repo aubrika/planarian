@@ -10,6 +10,9 @@ let
       self.nixosModules.default
       self.nixosModules.reference
       ../template/planarian/overrides.nix
+      # §11 sensitivity completeness (B-5): the named security units,
+      # declared with no sensitivity given.
+      ({ lib, ... }: { services.planarian.units = lib.genAttrs securityNamed (_: { }); })
       ({ lib, ... }: {
         networking.hostName = "planarian-eval";
         system.stateVersion = "26.05";
@@ -34,6 +37,10 @@ let
       })
     ];
   };
+  # The named list (§11): firewall, openssh, fail2ban, usbguard, AppArmor,
+  # audit and VPN units.
+  securityNamed = [ "firewall" "nftables" "sshd" "fail2ban" "usbguard" "apparmor" "auditd" "wg-quick-wg0" "wireguard-wg0" "openvpn-office" "tailscaled" "strongswan" ];
+  securityTrees = [ "security" "networking.firewall" "networking.nftables" "networking.wireguard" "networking.wg-quick" "services.openssh" "services.fail2ban" "services.usbguard" "services.openvpn" "services.tailscale" "services.strongswan" ];
   cfg = sys.config;
   export = cfg.services.planarian.export;
   unit = id: builtins.head (builtins.filter (u: u.id == id) export.units);
@@ -50,6 +57,8 @@ let
     (check (app.systemd_restart.restart_sec == 5000) "RestartSec parsed")
     (check (app.systemd_restart.start_limit_burst == 3) "StartLimitBurst (a string in NixOS) is a number")
     (check ((unit "service:sshd").sensitivity == [ "Security" ]) "sshd is Security")
+    (check (builtins.all (n: (unit "service:${n}").sensitivity == [ "Security" ]) securityNamed) "every named security unit is Security without a tag (B-5)")
+    (check (builtins.all (t: (cfg.services.planarian.optionSensitivity.${t} or [ ]) == [ "Security" ]) securityTrees) "every named option tree is Security (B-5)")
     (check (!cfg.systemd.services.planariad.restartIfChanged) "planariad survives activation")
     (check (!cfg.systemd.services.planarian-recovery.stopIfChanged) "the watchdog survives activation")
     (check (export.coreUnits."planariad.service" != "") "core unit hashes exported")

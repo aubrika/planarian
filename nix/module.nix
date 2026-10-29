@@ -65,8 +65,15 @@ let
   disruptions = [ "None" "Brief" "SessionLoss" "DataInterruption" "ConnectivityLoss" ];
 
   # Shipped tables (§9): the defaults when a unit doesn't say.
+  # §11 sensitivity completeness (B-5): the units the security, firewall,
+  # openssh, fail2ban, usbguard and VPN option trees create are Security
+  # without a tag. By name, since a unit does not record the option tree
+  # that declared it.
+  securityUnit = name:
+    builtins.elem name [ "sshd" "polkit" "systemd-logind" "firewall" "nftables" "fail2ban" "usbguard" "apparmor" "auditd" "tailscaled" "strongswan" "strongswan-swanctl" ]
+    || lib.any (p: lib.hasPrefix p name) [ "wg-quick-" "wireguard-" "openvpn-" ];
   defaultSensitivity = name:
-    if builtins.elem name [ "sshd" "polkit" "systemd-logind" ] then [ "Security" ]
+    if securityUnit name then [ "Security" ]
     else if builtins.elem name [ "NetworkManager" "wpa_supplicant" "systemd-networkd" ] then [ "External" ]
     else [ "Routine" ];
   defaultDisruption = name:
@@ -424,6 +431,14 @@ in
         "security" = [ "Security" ];
         "users" = [ "Security" ];
         "networking.firewall" = [ "Security" ];
+        "networking.nftables" = [ "Security" ];
+        "networking.wireguard" = [ "Security" ];
+        "networking.wg-quick" = [ "Security" ];
+        "services.fail2ban" = [ "Security" ];
+        "services.usbguard" = [ "Security" ];
+        "services.openvpn" = [ "Security" ];
+        "services.tailscale" = [ "Security" ];
+        "services.strongswan" = [ "Security" ];
         "services.planarian" = [ "Security" ];
         "networking" = [ "External" ];
         "boot" = [ "Security" ];

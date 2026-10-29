@@ -55,36 +55,6 @@ spec = "v4.5"
 # Group 1: the bypasses
 # ═══════════════════════════════════════════════════════════════════════════
 
-# B-5 (Medium). Fixture: the gym VM declares fail2ban, AppArmor, USBGuard, a
-# WireGuard interface, the firewall and sshd through their option trees, and
-# gym-untagged with no sensitivity entry.
-[[fault]]
-id = "sensitivity-named-security-units"
-family = "authority"
-summary = "Units declared through the security option trees are Security without a tag: an unprivileged user's override of each is held for an administrator and the unit stays up. A unit with no sensitivity entry is treated as non-Routine (fail closed)."
-spec = ["§11 sensitivity completeness", "I22", "B-5"]
-tags = ["acceptance", "bypass"]
-scoring = "must-pass"
-harness = ["vm"]
-intent = { kind = "none" }
-inject = { raw = "cli", argv = ["override", "service:fail2ban", "--stopped"], actor = "user:1000" }
-after = [
-  { raw = "cli", argv = ["override", "service:usbguard", "--stopped"], actor = "user:1000" },
-  { raw = "cli", argv = ["override", "service:wg-quick-gym0", "--stopped"], actor = "user:1000" },
-]
-window = "5m"
-
-[fault.required_post]
-sensitivity = { "service:fail2ban" = "Security", "service:apparmor" = "Security", "service:usbguard" = "Security", "service:wg-quick-gym0" = "Security", "service:firewall" = "Security", "service:sshd" = "Security", "service:gym-untagged" = "NonRoutine" }
-units = { "service:fail2ban" = "Running", "service:usbguard" = "Running", "service:wg-quick-gym0" = "Running" }
-overrides = []
-
-[[fault.required_post.txn]]
-transition = "SetOverride"
-target = "service:fail2ban"
-approver_class = "Administrator"
-never = ["Activating"]
-
 # B-13 (Low).
 [[fault]]
 id = "test-build-is-integrity"

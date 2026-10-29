@@ -31,9 +31,24 @@ fn unit_facts<'a>(units: impl IntoIterator<Item = &'a UnitId>, defs: &UnitDefs) 
     let mut sens = Sensitivities::default();
     let mut disruption = Disruption::None;
     for u in units {
-        if let Some(d) = defs.get(u) {
-            sens = sens.union(&d.sensitivity);
-            disruption = disruption.max(d.restart_disruption);
+        // Fail closed (§11 sensitivity completeness, B-5): a unit with no
+        // sensitivity entry, or none in the manifest at all, is not taken
+        // as Routine. External: nothing is known about what it touches.
+        let unknown = Sensitivities::of(&[Sensitivity::External]);
+        match defs.get(u) {
+            Some(d) => {
+                let empty = !(d.sensitivity.routine
+                    || d.sensitivity.security
+                    || d.sensitivity.user_data
+                    || d.sensitivity.external
+                    || d.sensitivity.core);
+                sens = sens.union(if empty { &unknown } else { &d.sensitivity });
+                disruption = disruption.max(d.restart_disruption);
+            }
+            // A user-scope unit runs with that user's rights only; an
+            // undeclared one stays Routine (deviations.md).
+            None if matches!(u.scope, Scope::User { .. }) => {}
+            None => sens = sens.union(&unknown),
         }
         if CORE_UNITS.contains(&u.name.as_str()) {
             sens.insert(Sensitivity::Core);
@@ -287,4 +302,29 @@ pub fn floor_fact(f: &mut DerivedFacts, t: &Transition, s: &SystemState) {
         _ => None,
     };
     f.below_security_floor = target.is_some_and(|g| g.0 < floor.0);
+}
+
+#[cfg(test)]
+mod sensitivity_completeness {
+    use super::*;
+
+    /// §11 (B-5): a system unit with no sensitivity entry, or none in the
+    /// manifest, is not Routine; a user's own undeclared user unit is.
+    #[test]
+    fn unknown_units_fail_closed() {
+        let mut defs = UnitDefs::new();
+        let mut empty = planarian_fake::fixtures::gym_units()[&UnitId::service("gym-web")].clone();
+        empty.id = UnitId::service("gym-untagged");
+        empty.sensitivity = Sensitivities::default();
+        defs.insert(empty.id.clone(), empty.clone());
+        let (s, _) = unit_facts([&empty.id], &defs);
+        assert!(s.external && !s.routine, "an empty sensitivity is External: {s:?}");
+        let ghost = UnitId::service("not-in-the-manifest");
+        let (s, _) = unit_facts([&ghost], &defs);
+        assert!(s.external && !s.routine, "an undeclared system unit is External: {s:?}");
+        let own =
+            UnitId { kind: UnitKind::Service, name: "notes".into(), scope: Scope::User { uid: 1000, session: None } };
+        let (s, _) = unit_facts([&own], &defs);
+        assert!(!s.external, "an undeclared user unit stays as it was: {s:?}");
+    }
 }
