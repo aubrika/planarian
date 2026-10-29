@@ -26,12 +26,12 @@ because "0v:0t" reads as zero times v.)
 
 ```mermaid
 flowchart TB
-  subgraph V["𝒱 · proven base (Verus, every CI run)"]
+  subgraph V["𝒱 · proven base (Verus)"]
     schema["schema<br/>types, TxnState predicates,<br/>recovery table, Sensitivities<br/>(17 obligations)"]
     policy["policy<br/>decide == decide_spec,<br/>may_approve, may_grant<br/>(52 obligations)"]
     txn["txn: machine + ledger<br/>step_allowed == step_spec,<br/>validate, apply, well_formed<br/>(42 obligations)"]
   end
-  subgraph K["model-checked (Kani, by hand: not in nixpkgs)"]
+  subgraph K["model-checked (Kani)"]
     kern["txn::kernel decisions<br/>recovery_action, should_take_over,<br/>next_epoch / fence_admits, swap_step"]
     tok["exec::token_expired"]
   end
@@ -41,7 +41,7 @@ flowchart TB
     journal["journal hash chain (I18)"]
     backends["backends: systemd, nixos, runtime"]
   end
-  subgraph A["𝒯 · trusted base (docs/assumptions.md)"]
+  subgraph A["𝒯 · trusted base"]
     vstd["V1–V6: vstd specs, serde,<br/>opaque types, ledger helpers"]
     plat["P1–P9: backends honest, fsync durable,<br/>SHA-256, systemd and kernel correct,<br/>fencing effective, facts derived honestly"]
     prog["G1–G4: progress (a lease holder runs,<br/>writes succeed, calls terminate)"]
@@ -56,6 +56,9 @@ flowchart TB
   K -.->|rests on| A
   T -.->|rests on| A
 ```
+
+Verus runs on every CI run; Kani runs by hand (it is not in nixpkgs);
+every item of 𝒯 is a line in `assumptions.md`.
 
 Read the arrows as "everything that changes the machine passes through a
 proven gate": every journal record goes through `Ledger::validate` and
@@ -268,16 +271,20 @@ sequenceDiagram
   participant L as Ledger (Verus)
   participant J as journal file (hash chain tested)
   participant B as backend (trusted, P1)
-  K->>L: validate(record)
+  K->>L: validate(OpBegin)
   Note over L: seq is next · lease epoch is current (I15)<br/>step follows step_spec · I6 kept<br/>OpAck answers an OpBegin · interlock respected
   L-->>K: accepted / refused
   K->>J: append + fsync (P4)
-  K->>L: apply(record)
+  K->>L: apply(OpBegin)
   Note over L: invariant preserved · epochs never fall<br/>RecoveryFailed sets the interlock
   K->>B: the call the OpBegin named
   B-->>K: Outcome (Succeeded / Failed / Unknown)
   K->>L: validate + apply(OpAck)
 ```
+
+Every record (Advance, Takeover, OpBegin, OpAck, …) takes the same
+validate, write, apply path; the OpBegin is shown because it is the one
+that must reach the disk before the backend call it names.
 
 Replay after a crash runs the same `validate` and `apply` over the
 journal, so a ledger rebuilt from disk satisfies the same invariant as the
