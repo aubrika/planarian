@@ -286,7 +286,7 @@ let
         carol = { isNormalUser = true; uid = 1002; };
       };
 
-      environment.systemPackages = [ gymPkg pkgs.git pkgs.util-linux pkgs.iptables pkgs.curl ];
+      environment.systemPackages = [ gymPkg pkgs.git pkgs.util-linux pkgs.iptables pkgs.curl pkgs.jq ];
       environment.variables.PLANARIAN_GYM_CATALOG = "${catalog}";
       programs.git.config.safe.directory = "*";
 
@@ -534,7 +534,8 @@ let
                 "ls -la /run/planarian-gym; cat /run/planarian-gym/hooks.json; echo;"
                 " journalctl -o short-monotonic --no-pager -u planariad -u planarian-recovery -u 'gym-watch-*' | tail -n 150;"
                 " ls -la /var/lib/planarian /var/lib/planarian/log; planarian log -n 10;"
-                " git -C /etc/nixos status --short; tail -n 3 /etc/nixos/configuration.nix"
+                " git -C /etc/nixos status --short; tail -n 3 /etc/nixos/configuration.nix;"
+                " echo 'status changes (sampler):'; jq -c '.status' /var/lib/gym-run/samples.jsonl 2>/dev/null | uniq | tail -n 12"
             )[1])
             print(machine.succeed(f"{gym} judge --id {ID} 2>&1"))
         machine.copy_from_machine("/var/lib/gym-run/verdict.json", "")

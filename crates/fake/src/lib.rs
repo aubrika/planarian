@@ -623,6 +623,10 @@ impl GenerationBackend for Fake {
         }
         // Only a generation whose files are not yet on /boot needs new space.
         if w.fail_publish && !w.boot_entries.contains(&g) {
+            // /boot is full from here on, as on the gym VM.
+            if let Some((free, _)) = w.fs.get_mut("/boot") {
+                *free = 0;
+            }
             return Outcome::Failed("No space left on device (/boot)".into());
         }
         w.boot_entries.insert(g);

@@ -112,9 +112,17 @@ impl<B: Backends> ExecHost<B> {
                 continue;
             }
             let now = s.status(u, defs);
-            if now != UnitStatus::Running {
-                out.push(format!("{u} was Running before and is now {now:?}"));
+            if now == UnitStatus::Running {
+                continue;
             }
+            // A revert neither causes nor cures a full filesystem (§12c: /boot
+            // full at publish is a Checking failure and the change reverts);
+            // the storage units' own incidents take it from there. Anything
+            // else that did not come back fails the revert.
+            if phase == CheckPhase::Revert && matches!(now, UnitStatus::Degraded(_)) && space_only(u, s, defs) {
+                continue;
+            }
+            out.push(format!("{u} was Running before and is now {now:?}"));
         }
         out
     }
@@ -204,6 +212,15 @@ impl<B: Backends> Host for ExecHost<B> {
     fn pid_alive(&self, pid: u32) -> bool {
         self.b.processes().alive(pid)
     }
+}
+
+/// `u` fails only free-space probes.
+fn space_only(u: &UnitId, s: &SystemState, defs: &UnitDefs) -> bool {
+    let failing = s.failing_readiness(u, defs);
+    !failing.is_empty()
+        && defs.get(u).is_some_and(|d| {
+            failing.iter().all(|f| d.probes.iter().any(|p| &p.id == f && matches!(p.kind, ProbeKind::FreeSpace { .. })))
+        })
 }
 
 /// Units that differ between two manifests, or exist in only one.
