@@ -99,6 +99,11 @@ pub trait UnitBackend {
         vec![]
     }
     fn list(&self) -> Result<Vec<UnitId>, Outcome>;
+    /// Start an agent as its own principal (§11, §16): the transient unit
+    /// `planarian-agent-<name>`, under a dynamic uid of its own.
+    fn start_agent(&self, _name: &str, _argv: &[String]) -> Outcome {
+        Outcome::Failed("this backend cannot start agents".into())
+    }
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome;
     fn stop(&self, id: &UnitId, op: &OpId) -> Outcome;
 }
@@ -292,4 +297,16 @@ pub trait Backends {
     fn runtime(&self) -> &Self::Runtime;
     fn processes(&self) -> &Self::Procs;
     fn clock(&self) -> &Self::Clock;
+}
+
+/// An agent's name: 1-32 of `a-z`, `0-9` and `-`, not starting with `-`.
+pub fn valid_agent_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && !name.starts_with('-')
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The unit an agent runs in (§11, §16).
+pub fn agent_unit(name: &str) -> String {
+    format!("planarian-agent-{name}")
 }

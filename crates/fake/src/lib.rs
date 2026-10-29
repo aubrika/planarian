@@ -596,6 +596,14 @@ impl UnitBackend for Fake {
         Ok(self.w().units.keys().cloned().collect())
     }
 
+    fn start_agent(&self, name: &str, _argv: &[String]) -> Outcome {
+        let mut w = self.w();
+        let now = w.now;
+        let id = UnitId::service(&format!("planarian-agent-{name}"));
+        w.units.insert(World::key(&id), UnitSim::active(now));
+        Outcome::Succeeded
+    }
+
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome {
         self.run(op, format!("restart({id})"), |w| w.start(id))
     }

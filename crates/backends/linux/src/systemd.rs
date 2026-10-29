@@ -191,6 +191,27 @@ impl UnitBackend for Systemd {
             .collect())
     }
 
+    fn start_agent(&self, name: &str, argv: &[String]) -> Outcome {
+        if !planarian_schema::backend::valid_agent_name(name) {
+            return Outcome::Failed(format!("bad agent name {name:?}"));
+        }
+        // A uid of its own (DynamicUser), so it is never the person who
+        // started it (§11); no privilege it could gain by exec.
+        let unit = format!("--unit={}", planarian_schema::backend::agent_unit(name));
+        let mut a: Vec<&str> = vec![
+            "systemd-run",
+            &unit,
+            "--collect",
+            "--quiet",
+            "--property=DynamicUser=yes",
+            "--property=NoNewPrivileges=yes",
+            "--",
+        ];
+        a.extend(argv.iter().map(String::as_str));
+        let o = run(&a, JOB_TIMEOUT);
+        if o.ok() { Outcome::Succeeded } else { Outcome::Failed(o.tail()) }
+    }
+
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome {
         self.job("restart", id, op)
     }

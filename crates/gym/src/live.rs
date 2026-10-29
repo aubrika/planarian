@@ -240,6 +240,7 @@ pub fn plan(entry: &T) -> Plan {
                 | "corrupt_core_hash"
                 | "break_journal_chain"
                 | "plant_early_unit"
+                | "agent_run"
                 | "oom" => "vm".into(),
                 "force_compaction" => "vm".into(),
                 "interrupt_write" => format!("unsupported: {raw} needs to interrupt the daemon's own write"),
@@ -682,6 +683,18 @@ fn request_as(actor: &str, req: &Request) -> Result<(), String> {
     let json = serde_json::to_string(req).expect("serializes");
     let user = user_for(actor);
     let q = json.replace('\'', "'\\''");
+    // An agent: a process in its unit's cgroup, under its dynamic uid, which
+    // is what makes a real agent process one (§11).
+    if let Some(name) = actor.strip_prefix("agent:") {
+        let unit = planarian_schema::backend::agent_unit(name);
+        let cmd = format!(
+            "uid=$(systemctl show -p UID --value {unit}); gid=$(systemctl show -p GID --value {unit}); \
+             [ -n \"$uid\" ] && [ \"$uid\" != \"[not set]\" ] || exit 1; \
+             sh -c 'echo $$ > /sys/fs/cgroup/system.slice/{unit}.service/cgroup.procs && \
+             exec setpriv --reuid=$0 --regid=$1 --clear-groups {exe} vm request --json \"$2\"' \"$uid\" \"$gid\" '{q}'"
+        );
+        return if sh(&cmd) { Ok(()) } else { Err(format!("request as {actor} failed")) };
+    }
     let cmd = if user == "root" {
         format!("{exe} vm request --json '{q}'")
     } else {
@@ -1085,6 +1098,7 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                     desired: planarian_schema::OverrideDesired::Stopped,
                 },
                 ["stop", u] => Request::Stop { unit: unit(u) },
+                ["restart", u] => Request::Restart { unit: unit(u) },
                 ["release", u] => Request::LiftOverride { unit: unit(u) },
                 ["resolve", _, how] => {
                     let txn = *ledger(cfg).0.interlock.keys().next().ok_or("resolve: nothing interlocked")?;
@@ -1139,10 +1153,23 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
             request_as(actor, &req)?;
         }
         "approve_pending" => {
+            // As the step's actor, at a terminal unless `via = "no-tty"`.
+            let actor = st.get("actor").and_then(T::as_str).unwrap_or("root");
+            let tty = st.get("via").and_then(T::as_str) != Some("no-tty");
             let r = console().ok_or("daemon down")?;
             for p in r.status.pending {
-                request_as("root", &Request::Approve { hash: p.approve, tty: true })?;
+                // A refused approval is the step's outcome, not the harness's error.
+                let _ = request_as(actor, &Request::Approve { hash: p.approve, tty });
             }
+        }
+        "agent_run" => {
+            let argv: Vec<String> = st
+                .get("argv")
+                .and_then(T::as_array)
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let by = st.get("as").and_then(T::as_str).unwrap_or("user:1001");
+            request_as(by, &Request::AgentRun { name: get("name"), argv })?;
         }
         "greeter_login" => {
             let uid = st.get("uid").and_then(T::as_integer).unwrap_or(1000);

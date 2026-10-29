@@ -134,8 +134,25 @@ fn peer_of(s: &UnixStream, admin_group: &str) -> Option<Peer> {
             .and_then(|u| u.parse::<u32>().ok())
             == Some(uid)
     });
+    // A process in an agent's unit is that agent, whatever uid it runs as
+    // (§11): never an administrator, never in a session.
+    if let Some(name) = agent_of_cgroup(&cgroup) {
+        return Some(Peer::agent(uid, &name));
+    }
     let session = if same_uid { session_of_cgroup(&cgroup, uid) } else { None };
-    Some(Peer { uid, admin: is_admin(uid, admin_group), session })
+    Some(Peer { uid, admin: is_admin(uid, admin_group), session, agent: None })
+}
+
+/// The agent whose unit (`/system.slice/planarian-agent-<name>.service`,
+/// or below it) holds this cgroup, if any.
+fn agent_of_cgroup(cgroup: &str) -> Option<String> {
+    let line = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let mut parts = line.split('/').filter(|c| !c.is_empty());
+    if parts.next()? != "system.slice" {
+        return None;
+    }
+    let name = parts.next()?.strip_prefix("planarian-agent-")?.strip_suffix(".service")?;
+    planarian_schema::backend::valid_agent_name(name).then(|| name.to_string())
 }
 
 /// `sd_pid_get_session` (systemd's `cg_path_get_session`): the logind
@@ -538,6 +555,17 @@ fn hooks_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_from_cgroup() {
+        assert_eq!(agent_of_cgroup("0::/system.slice/planarian-agent-coder.service\n"), Some("coder".into()));
+        assert_eq!(agent_of_cgroup("0::/system.slice/planarian-agent-coder.service/sub\n"), Some("coder".into()));
+        assert_eq!(agent_of_cgroup("0::/system.slice/cron.service\n"), None);
+        // Only systemd's own unit counts: a user's delegated cgroup named like
+        // an agent unit is not one, and neither is a bad name.
+        assert_eq!(agent_of_cgroup("0::/user.slice/user-1000.slice/planarian-agent-coder.service\n"), None);
+        assert_eq!(agent_of_cgroup("0::/system.slice/planarian-agent-Coder.service\n"), None);
+    }
 
     #[test]
     fn session_from_cgroup() {

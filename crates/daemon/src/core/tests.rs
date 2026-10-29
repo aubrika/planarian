@@ -219,6 +219,44 @@ fn unprivileged_override_of_a_security_unit_is_held_for_an_administrator() {
     assert_eq!(l.overrides[0].by.uid(), Some(1000), "attributed to alice, not the approver");
 }
 
+/// B-1 (§11): an agent is its own principal, granted nothing, even when an
+/// administrator started it.
+#[test]
+fn an_agent_is_its_own_principal_and_holds_nothing() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let resp = r.core.handle(ADMIN, Request::AgentRun { name: "coder".into(), argv: vec!["true".into()] });
+    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    r.ticks(1);
+    // Planarian does not manage the agent's unit: it is not in the manifest.
+    assert_eq!(r.status("service:planarian-agent-coder"), UnitStatus::NotExpected);
+    let coder = Peer::agent(61184, "coder");
+    let sshd = UnitId::service("sshd");
+    for req in [
+        Request::SetOverride { unit: sshd.clone(), until: Until::Explicit, desired: OverrideDesired::Stopped },
+        Request::Stop { unit: UnitId::service("gym-web") },
+        Request::Restart { unit: UnitId::service("planarian-agent-coder") },
+        Request::Gc,
+        Request::AgentRun { name: "helper".into(), argv: vec!["true".into()] },
+    ] {
+        let resp = r.core.handle(coder.clone(), req.clone());
+        assert!(
+            matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized")
+                || matches!(&resp, Response::Error { .. }),
+            "{req:?} -> {resp:?}"
+        );
+    }
+    // A change an administrator proposed cannot be approved by the agent.
+    let req = Request::SetOverride { unit: sshd.clone(), until: Until::Explicit, desired: OverrideDesired::Stopped };
+    let Response::NeedsApproval { approve, .. } = r.core.handle(ALICE, req) else { panic!() };
+    let resp = r.core.handle(coder, Request::Approve { hash: approve, tty: true });
+    assert!(!matches!(resp, Response::Done { .. }), "{resp:?}");
+    r.ticks(2);
+    assert_eq!(r.status("service:sshd"), UnitStatus::Running);
+    assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
+    assert!(r.core.ledger().overrides.is_empty());
+}
+
 #[test]
 fn cli_stop_is_rewritten() {
     let mut r = Rig::new();

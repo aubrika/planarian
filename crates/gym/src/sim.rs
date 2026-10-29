@@ -138,6 +138,10 @@ pub fn peer(actor: &str) -> Peer {
         Some((w, s)) => (w, Some(s)),
         None => (actor, None),
     };
+    if let Some(name) = who.strip_prefix("agent:") {
+        // A dynamic uid, as systemd would give it.
+        return Peer::agent(61184, name);
+    }
     let p = match who {
         "root" => Peer::new(0, true),
         "user:1001" => Peer::new(1001, true),
@@ -562,10 +566,17 @@ impl Sim {
 
     fn track_candidate(&mut self) {
         let l = self.ledger();
+        // The generation the entry's change builds: a rollback's, revert's or
+        // switch's target is an existing generation, not a candidate.
         if let Some(c) = l
             .live
             .values()
-            .chain(std::iter::empty())
+            .filter(|t| {
+                !matches!(
+                    t.txn.transition,
+                    Transition::Rollback | Transition::Revert { .. } | Transition::SwitchGeneration { .. }
+                )
+            })
             .filter_map(|t| t.txn.candidate.as_ref().map(|(g, _)| *g))
             .next_back()
         {
@@ -807,6 +818,16 @@ impl Sim {
                 None => {}
             },
             "ask" => self.request(&actor, Request::Ask { phrase: get("phrase").into(), choice: None })?,
+            "agent_run" => {
+                let name = get("name");
+                let argv: Vec<String> = s
+                    .get("argv")
+                    .and_then(T::as_array)
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let actor = s.get("as").and_then(T::as_str).unwrap_or("user:1001").to_string();
+                self.request(&actor, Request::AgentRun { name: name.to_string(), argv })?;
+            }
             "cli" => {
                 let argv: Vec<String> = s
                     .get("argv")
@@ -839,8 +860,11 @@ impl Sim {
                     self.held_tokens.extend(pending);
                     return Ok(());
                 }
+                // As the step's actor, at a terminal unless `via = "no-tty"`.
+                let actor = s.get("actor").and_then(T::as_str).unwrap_or("root").to_string();
+                let tty = s.get("via").and_then(T::as_str) != Some("no-tty");
                 for h in pending {
-                    self.request("root", Request::Approve { hash: h, tty: true })?;
+                    self.request(&actor, Request::Approve { hash: h, tty })?;
                 }
             }
             "greeter_login" => {
@@ -1167,6 +1191,7 @@ impl Sim {
                 desired: planarian_schema::OverrideDesired::Stopped,
             },
             ["stop", u] => Request::Stop { unit: unit(u) },
+            ["restart", u] => Request::Restart { unit: unit(u) },
             ["release", u] => Request::LiftOverride { unit: unit(u) },
             ["resolve", _, how] => {
                 let l = self.ledger();

@@ -63,17 +63,32 @@ pub struct Peer {
     pub admin: bool,
     /// The logind session of the calling process (`sd_pid_get_session`), if any.
     pub session: Option<String>,
+    /// The agent this process belongs to: its cgroup is the unit
+    /// `planarian-agent-<name>` (§11). An agent is its own principal, never
+    /// the uid it runs under, and is never an administrator or in a session.
+    pub agent: Option<String>,
 }
 
 impl Peer {
     pub const fn new(uid: u32, admin: bool) -> Peer {
-        Peer { uid, admin, session: None }
+        Peer { uid, admin, session: None, agent: None }
+    }
+
+    pub fn agent(uid: u32, name: &str) -> Peer {
+        Peer { uid, admin: false, session: None, agent: Some(name.into()) }
     }
 
     pub fn in_session(mut self, session: &str) -> Peer {
         self.session = Some(session.into());
         self
     }
+}
+
+/// An agent's principal id: in its own range, above every uid and the
+/// daemon's ids, stable across restarts (FNV-1a of the name).
+pub fn agent_principal(name: &str) -> PrincipalId {
+    let h = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    PrincipalId((1 << 40) | (h & 0xffff_ffff))
 }
 
 /// The executor log (I7): one record per submitted proposal.
@@ -1261,6 +1276,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// §10: `Actor::User { uid, session, seat, active }` from the caller's
     /// logind session; a remote session has no seat and is never local.
     fn authz(&self, peer: &Peer) -> Authorization {
+        if let Some(name) = &peer.agent {
+            // Granted nothing (§11; `agents_and_unattributed_are_refused`).
+            let actor = Actor::Agent(agent_principal(name));
+            return Authorization { principal: actor.principal(), actor, capabilities: Capabilities::default() };
+        }
         let info =
             peer.session.as_ref().and_then(|id| self.asm.sessions.iter().find(|x| &x.id == id && x.uid == peer.uid));
         let actor = Actor::User {
@@ -1574,6 +1594,30 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 Source::User,
                 "from the CLI".into(),
             ),
+            Request::AgentRun { name, argv } => {
+                if peer.agent.is_some() {
+                    return Response::Rejected {
+                        reason: "Unauthorized".into(),
+                        message: "an agent cannot start agents".into(),
+                    };
+                }
+                if !planarian_schema::backend::valid_agent_name(&name) || argv.is_empty() {
+                    return Response::Error {
+                        message: "agent run <name> -- <command>: the name is 1-32 of a-z, 0-9 and -".into(),
+                    };
+                }
+                match self.b.units().start_agent(&name, &argv) {
+                    Outcome::Succeeded => {
+                        self.notice(format!(
+                            "agent {name} started by uid {} as its own principal ({}), granted nothing",
+                            peer.uid,
+                            planarian_schema::backend::agent_unit(&name)
+                        ));
+                        Response::Ok { message: format!("agent {name} is running as its own principal") }
+                    }
+                    other => Response::Error { message: format!("could not start agent {name}: {other:?}") },
+                }
+            }
             Request::Undo => {
                 let current = self.b.generations().current().unwrap_or_default();
                 let prev =

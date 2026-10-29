@@ -86,6 +86,13 @@ pub enum Request {
     },
     /// The gym's VM harness: compact the journal now. `gym-hooks` only.
     GymCompact,
+    /// `planarian agent run <name> -- <argv>` (§11, §16): start an agent as
+    /// its own principal, in the transient unit `planarian-agent-<name>`
+    /// with a dynamic uid. It is granted nothing.
+    AgentRun {
+        name: String,
+        argv: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

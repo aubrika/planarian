@@ -119,6 +119,9 @@ fn parse(args: &[String]) -> Result<(Request, bool), String> {
                 _ => return Err("resolve needs --as-committed, --as-reverted or --manual-repaired".into()),
             },
         },
+        ["agent", "run", name, "--", argv @ ..] if !argv.is_empty() => {
+            Request::AgentRun { name: name.to_string(), argv: argv.iter().map(|s| s.to_string()).collect() }
+        }
         ["mark-security-floor"] => Request::MarkSecurityFloor,
         ["mark-good"] => Request::MarkGood { accept_unconfirmed: false },
         ["mark-good", "--accept-unconfirmed"] => Request::MarkGood { accept_unconfirmed: true },

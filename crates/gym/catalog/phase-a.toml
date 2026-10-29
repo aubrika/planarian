@@ -2688,3 +2688,52 @@ reports = ["alarm"]
 transition = "RestartUnit"
 target = "service:sshd"
 decision = "Allow(Runtime)"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v4.5: bypasses (docs/bypasses.md), signed off 2026-10-29
+# ═══════════════════════════════════════════════════════════════════════════
+
+# B-1 (High).
+[[fault]]
+id = "agent-run-own-principal"
+family = "authority"
+summary = "An administrator (uid 1001, planarian-admin) starts an agent with `planarian agent run coder`. The agent runs under a dynamic uid of its own, never the administrator's: its override of sshd, its stop of gym-web, its restart of its own unit and its approval of a pending change are all refused, attributed to agent:coder. Agents are granted nothing in Phase A (§11; the lemma agents_and_unattributed_are_refused)."
+spec = ["§11 principals", "§16 agent run", "B-1"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "agent_run", name = "coder", as = "user:1001", argv = ["/run/current-system/sw/bin/sleep", "infinity"] },
+]
+inject = { raw = "cli", argv = ["override", "service:sshd", "--stopped"], actor = "agent:coder" }
+after = [
+  { raw = "cli", argv = ["stop", "service:gym-web"], actor = "agent:coder" },
+  { raw = "cli", argv = ["restart", "service:planarian-agent-coder"], actor = "agent:coder" },
+  { raw = "approve_pending", actor = "agent:coder", via = "tty" },
+]
+window = "3m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running", "service:gym-web" = "Running" }
+overrides = []
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+decision = "Reject(Unauthorized)"
+caller = "agent:coder"
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+decision = "Reject(Unauthorized)"
+caller = "agent:coder"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+decision = "Reject(Unauthorized)"
+caller = "agent:coder"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]

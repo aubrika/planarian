@@ -1006,6 +1006,7 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             .unwrap_or_default();
         let refused = e.log.iter().any(|r| {
             s("transition").is_none_or(|t| transition_name(&r.proposal.transition) == t)
+                && s("caller").is_none_or(|c| caller_is(&r.caller, c))
                 && match &r.result {
                     Submitted::Rejected { reason, .. } => wanted.iter().any(|w| *w == format!("Rejected({reason:?})")),
                     _ => false,
@@ -1334,5 +1335,16 @@ fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
         })
     {
         v.failures.push(format!("{label}: not tied to the session of uid {uid}"));
+    }
+}
+
+/// The executor log's caller is the catalog's principal: `root`,
+/// `user:<uid>` or `agent:<name>` (an agent's own principal, §11).
+fn caller_is(a: &Actor, want: &str) -> bool {
+    match (a, want.split_once(':')) {
+        (Actor::User { uid, .. }, None) => want == "root" && *uid == 0,
+        (Actor::User { uid, .. }, Some(("user", n))) => n.parse() == Ok(*uid),
+        (Actor::Agent(p), Some(("agent", name))) => *p == planarian_daemon::core::agent_principal(name),
+        _ => false,
     }
 }
