@@ -484,3 +484,29 @@ fn executor_log_records_serialize() {
         assert_eq!(serde_json::to_string(&back).unwrap(), j);
     }
 }
+
+#[test]
+fn an_unreachable_external_dependency_is_said_not_repaired() {
+    // Traffic to the gateway is dropped: every probe on the way times out.
+    let mut r = Rig::new();
+    r.ticks(2);
+    let client = UnitId::service("gym-upstream-client");
+    r.fake.w().external_unreachable.insert("gym-upstream".into());
+    r.ticks(12);
+    assert!(!r.core.notices.iter().any(|n| n.contains("can't reach")), "not before it has lasted");
+    r.ticks(24);
+    let said: Vec<&String> = r.core.notices.iter().filter(|n| n.contains("can't reach")).collect();
+    assert_eq!(said.len(), 1, "{:?}", r.core.notices);
+    assert!(said[0].starts_with("service:external:gym-upstream:"), "{said:?}");
+    assert_eq!(r.status("service:gym-upstream-client"), UnitStatus::Unknown);
+    // Unknown opens a diagnostic incident (re-observe, no budget), never a repair.
+    assert!(
+        r.core.incidents.active_for(&client).is_none_or(|i| i.kind == IncidentKind::Diagnostic),
+        "{:?}",
+        r.core.incidents.active_for(&client)
+    );
+    assert_eq!(r.calls("restart("), 0, "nothing local is restarted");
+    r.fake.w().external_unreachable.clear();
+    r.ticks(4);
+    assert!(r.core.notices.iter().any(|n| n == "service:external:gym-upstream: answers again"), "{:?}", r.core.notices);
+}

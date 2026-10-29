@@ -401,6 +401,10 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                         "ExternalDependencyDown" => e.notices.iter().any(|n| {
                             n.starts_with("service:external:") && n.contains("nothing I know how to do would fix it")
                         }),
+                        // Dropped traffic: said, not an incident (§10: a timeout is Unknown).
+                        "ExternalDependencyUnreachable" => e.notices.iter().any(|n| {
+                            n.starts_with("service:external:") && n.contains("can't reach it")
+                        }),
                         "OutOfBandStopHint" => {
                             notices.contains("stopped, not crashed") && notices.contains("planarian suppress")
                         }

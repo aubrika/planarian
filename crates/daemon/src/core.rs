@@ -33,6 +33,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 /// The 10-minute checkpoint for boot confirmation and initial enrollment (§10, §16).
 pub const CONFIRM_AFTER: Millis = Millis::secs(600);
 const NOTICES_KEPT: usize = 64;
+/// How long an external dependency's probes time out before it is said.
+const UNREACHABLE_AFTER: Millis = Millis::secs(120);
 
 #[derive(Clone, Debug)]
 pub struct CoreConfig {
@@ -97,6 +99,9 @@ pub struct Core<B: Backends + Clone, S: Store> {
     interlock_noted: bool,
     /// Incidents whose opening was already announced.
     diag_noted: BTreeSet<IncidentId>,
+    /// External dependencies whose probes time out: since when, and
+    /// whether that was said (§10: Unknown, never Failed, so no incident).
+    unreachable: BTreeMap<UnitId, (Timestamp, bool)>,
     /// When to next check the §12b collection bounds.
     next_gc_check: Timestamp,
     /// The space report last noticed.
@@ -203,6 +208,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             manifest_gen: current,
             interlock_noted: false,
             diag_noted: BTreeSet::new(),
+            unreachable: BTreeMap::new(),
             next_gc_check: Timestamp(0),
             space_noted: Timestamp(0),
             awaiting_post: Vec::new(),
@@ -498,6 +504,42 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
         self.confirm_boot(&s, &defs, now);
         self.note_space();
+        self.note_unreachable(&s, &defs, now);
+    }
+
+    /// §10: a probe that times out yields Unknown, never Failed, so an
+    /// external dependency that stops answering (traffic dropped at a
+    /// gateway) opens no incident and nothing local is touched. Still, say
+    /// so once it has lasted, and again when it answers.
+    fn note_unreachable(&mut self, s: &SystemState, defs: &UnitDefs, now: Timestamp) {
+        for (id, def) in defs {
+            if !def.sensitivity.contains(Sensitivity::External) {
+                continue;
+            }
+            let timing_out: Vec<String> = match (s.status(id, defs), s.units.get(id)) {
+                (UnitStatus::Unknown, Some((_, ev))) => ev
+                    .iter()
+                    .filter(|e| matches!(e.result, ProbeResult::Timeout | ProbeResult::Error(_)))
+                    .map(|e| e.probe.0.clone())
+                    .collect(),
+                _ => vec![],
+            };
+            if timing_out.is_empty() {
+                if let Some((_, true)) = self.unreachable.remove(id) {
+                    self.notice(format!("{id}: answers again"));
+                }
+                continue;
+            }
+            let (since, said) = *self.unreachable.entry(id.clone()).or_insert((now, false));
+            if !said && now >= since.plus(UNREACHABLE_AFTER) {
+                self.unreachable.insert(id.clone(), (since, true));
+                self.notice(format!(
+                    "{id}: can't reach it: {} timing out for {} min; it may be the network on the way there, so nothing local is restarted",
+                    timing_out.join(", "),
+                    (now.0 - since.0) / 60_000
+                ));
+            }
+        }
     }
 
     /// §12b: a collection that could not meet the space budget says so.

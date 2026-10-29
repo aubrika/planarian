@@ -604,15 +604,16 @@ impl Sim {
                 ("127.0.0.1", Some(22)) => {
                     self.fake.w().blocked.insert(UnitId::service("sshd"));
                 }
+                // Dropped, as the VM's iptables DROP does: probes time out.
                 ("10.0.2.2", None) => {
-                    self.fake.w().external_down.insert("gym-upstream".into());
+                    self.fake.w().external_unreachable.insert("gym-upstream".into());
                 }
                 (d, p) => return Err(Unsupported(format!("block_network {d} {p:?}"))),
             },
             "unblock_network" => {
                 let mut w = self.fake.w();
                 w.blocked.clear();
-                w.external_down.clear();
+                w.external_unreachable.clear();
             }
             // An access point goes away: NetworkManager drops the network
             // and does not pick another (autoconnect is off for the others).

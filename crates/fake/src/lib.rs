@@ -161,6 +161,9 @@ pub struct World {
     pub blocked: BTreeSet<UnitId>,
     /// External dependencies that are down, by name (`gym-upstream`).
     pub external_down: BTreeSet<String>,
+    /// External dependencies whose traffic is dropped on the way (a dead
+    /// gateway): their probes, and their clients', time out.
+    pub external_unreachable: BTreeSet<String>,
     /// Free bytes and size of filesystems, by path.
     pub fs: BTreeMap<String, (u64, u64)>,
     /// §12b bounds, and the last collection's report. Each generation's
@@ -817,6 +820,17 @@ impl ProbeBackend for Fake {
                         Some(Value::Str(n)) if w.wifi_in_range.contains(n) => ProbeResult::Pass,
                         _ => ProbeResult::Fail("not associated".into()),
                     };
+                }
+                let unreachable = |u: &UnitId| {
+                    u.name.strip_prefix("external:").is_some_and(|x| w.external_unreachable.contains(x))
+                        || w.base_units.get(u).is_some_and(|d| {
+                            d.edges.iter().any(|e| {
+                                e.to.name.strip_prefix("external:").is_some_and(|x| w.external_unreachable.contains(x))
+                            })
+                        })
+                };
+                if unreachable(unit) {
+                    return ProbeResult::Timeout;
                 }
                 if let Some(ext) = unit.name.strip_prefix("external:") {
                     return if w.external_down.contains(ext) {
