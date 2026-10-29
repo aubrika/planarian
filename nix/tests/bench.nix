@@ -20,6 +20,8 @@
 
 pkgs.testers.runNixOSTest {
   name = "planarian-invisibility";
+  # The report is a free-form dict; the driver's type checker cannot follow it.
+  skipTypeCheck = true;
 
   nodes.machine = { pkgs, ... }: {
     imports = [ self.nixosModules.default ];
@@ -154,7 +156,7 @@ pkgs.testers.runNixOSTest {
 
     encoded = base64.b64encode(json.dumps(report).encode()).decode()
     machine.succeed(f"echo {encoded} | base64 -d > /tmp/bench/report.json")
-    machine.copy_from_vm("/tmp/bench/report.json", "")
+    machine.copy_from_machine("/tmp/bench/report.json", "")
 
     # The budget (a ratchet: failing it fails this test).
     idle = report["idle"]
