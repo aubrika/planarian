@@ -32,7 +32,7 @@ pub fn serve(socket: &str) {
     let core = sim.core.as_mut().expect("core");
     eprintln!("{:?}", core.handle(peer("root"), Request::Stop { unit: unit("gym-cache") }));
     sim.fake.w().blocked.insert(unit("gym-metrics"));
-    sim.fake.w().kill(&unit("gym-db"));
+    sim.fake.w().signal(&unit("gym-db"), 11);
     for _ in 0..12 {
         sim.tick();
     }

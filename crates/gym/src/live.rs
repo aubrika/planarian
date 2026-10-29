@@ -862,6 +862,7 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                     desired: planarian_schema::OverrideDesired::Stopped,
                 },
                 ["stop", u] => Request::Stop { unit: unit(u) },
+                ["release", u] => Request::LiftOverride { unit: unit(u) },
                 ["resolve", _, how] => {
                     let txn = *ledger(cfg).0.interlock.keys().next().ok_or("resolve: nothing interlocked")?;
                     let resolution = match *how {
@@ -995,11 +996,12 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
         "set_setting" => {
             // A copy of the module's config with the setting changed, and the
             // daemon restarted on it (PLANARIAN_CONFIG, in a runtime drop-in).
-            let (path, value) = match get("key").as_str() {
+            let (path, value): (Vec<&str>, _) = match get("key").as_str() {
                 "gc.generation_budget_percent" => {
                     let pct = st.get("value").and_then(T::as_float).ok_or("set_setting value")?;
-                    (["gc", "generationsPermille"], serde_json::json!((pct * 10.0).round() as u64))
+                    (vec!["gc", "generationsPermille"], serde_json::json!((pct * 10.0).round() as u64))
                 }
+                "posture" => (vec!["posture"], serde_json::json!(get("value"))),
                 k => return Err(format!("set_setting {k}")),
             };
             let src = std::env::var("PLANARIAN_CONFIG").unwrap_or_else(|_| CONFIG.into());
@@ -1007,7 +1009,11 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .ok_or_else(|| format!("{src}: unreadable"))?;
-            v[path[0]][path[1]] = value;
+            match path.as_slice() {
+                [a] => v[*a] = value,
+                [a, b] => v[*a][*b] = value,
+                _ => unreachable!("one or two keys"),
+            }
             let copy = format!("{HOOKS_DIR}/config.json");
             let _ = std::fs::create_dir_all(HOOKS_DIR);
             std::fs::write(&copy, v.to_string()).map_err(|e| e.to_string())?;

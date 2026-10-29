@@ -59,6 +59,8 @@ pub enum Health {
 #[derive(Clone, Debug)]
 pub struct UnitSim {
     pub observed: Observed,
+    /// How the main process last ended (`ended_by`).
+    pub ended: Option<Ending>,
     pub health: Health,
     /// Exits this long after each start (flapping).
     pub fail_after: Option<Millis>,
@@ -75,6 +77,7 @@ impl UnitSim {
     pub fn active(now: Timestamp) -> UnitSim {
         UnitSim {
             observed: Observed::Active,
+            ended: None,
             health: Health::Ok,
             fail_after: None,
             fail_on_start: false,
@@ -285,6 +288,7 @@ impl World {
             let sim = self.units.entry(id.clone()).or_insert_with(|| UnitSim::active(now));
             if generation.broken.contains(id) || sim.fail_on_start {
                 sim.observed = Observed::Failed(Reason::ExitCode(1));
+                sim.ended = Some(Ending::Exited(1));
                 sim.failed_at = Some(now);
             } else if sim.observed != Observed::Active {
                 sim.observed = Observed::Active;
@@ -324,6 +328,7 @@ impl World {
                 && now.0 >= sim.started_at.0 + after.0
             {
                 sim.observed = Observed::Failed(Reason::ExitCode(1));
+                sim.ended = Some(Ending::Exited(1));
                 sim.failed_at = Some(Timestamp(sim.started_at.0 + after.0));
             }
             if let (Observed::Failed(_), Some(rs), Some(at)) = (&sim.observed, sim.systemd_restart, sim.failed_at)
@@ -348,7 +353,9 @@ impl World {
             if let Some(sim) = self.units.get_mut(&u)
                 && sim.observed == Observed::Active
             {
+                // A stop job: SIGTERM, then inactive.
                 sim.observed = Observed::Bound;
+                sim.ended = Some(Ending::Signal(15));
             }
             for (id, d) in &self.base_units {
                 if d.edges.iter().any(|e| e.to == u && e.kind == EdgeKind::Requires) {
@@ -360,8 +367,30 @@ impl World {
 
     /// SIGKILL a unit's main process.
     pub fn kill(&mut self, unit: &UnitId) {
+        self.signal(unit, 9);
+    }
+
+    /// Send `sig` to a unit's main process, as `systemctl kill` does. SIGTERM,
+    /// SIGINT, SIGHUP and SIGPIPE are clean exits to systemd (inactive); any
+    /// other signal fails the unit.
+    pub fn signal(&mut self, unit: &UnitId, sig: i32) {
         let now = self.now;
         if let Some(sim) = self.units.get_mut(unit) {
+            sim.ended = Some(Ending::Signal(sig));
+            if matches!(sig, 1 | 2 | 13 | 15) {
+                sim.observed = Observed::Bound;
+            } else {
+                sim.observed = Observed::Failed(Reason::ExitCode(128 + sig));
+                sim.failed_at = Some(now);
+            }
+        }
+    }
+
+    /// The kernel's OOM killer ends the unit (`Result=oom-kill`).
+    pub fn oom(&mut self, unit: &UnitId) {
+        let now = self.now;
+        if let Some(sim) = self.units.get_mut(unit) {
+            sim.ended = Some(Ending::OomKill);
             sim.observed = Observed::Failed(Reason::ExitCode(137));
             sim.failed_at = Some(now);
         }
@@ -396,6 +425,7 @@ impl World {
         sim.restarts += 1;
         if broken || sim.fail_on_start {
             sim.observed = Observed::Failed(Reason::ExitCode(1));
+            sim.ended = Some(Ending::Exited(1));
             sim.failed_at = Some(now);
             return Outcome::Failed(format!("{id} failed to start"));
         }
@@ -440,6 +470,10 @@ impl UnitBackend for Fake {
     fn observe(&self, id: &UnitId) -> Result<Observed, Outcome> {
         let w = self.w();
         Ok(w.units.get(&World::key(id)).map(|s| s.observed.clone()).unwrap_or(Observed::Absent))
+    }
+
+    fn ended_by(&self, id: &UnitId) -> Option<Ending> {
+        self.w().units.get(&World::key(id)).and_then(|s| s.ended)
     }
 
     fn list(&self) -> Result<Vec<UnitId>, Outcome> {

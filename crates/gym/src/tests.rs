@@ -72,7 +72,7 @@ fn repair_while_escalated() {
 
 #[test]
 fn restart_before_dependency_runs() {
-    let (mut e, post) = passing("dep-required-stopped");
+    let (mut e, post) = passing("dep-required-stopped-guarded");
     let line = e.status_timeline.as_mut().expect("timeline").get_mut(&unit("service:gym-db")).expect("gym-db");
     line.retain(|(t, _)| t.0 <= e.start.0);
     line.push((e.start, "Stopped".into()));
@@ -87,7 +87,7 @@ fn root_cause_named_and_not_named() {
     );
     fails(&e, &post, "named as the root cause of service:gym-app");
 
-    let (mut e, post) = passing("dep-required-stopped");
+    let (mut e, post) = passing("dep-required-stopped-guarded");
     for r in &mut e.log {
         r.proposal.source = Source::User;
     }
@@ -177,9 +177,21 @@ fn snapshot_checks() {
 
 #[test]
 fn hints_in_notices() {
-    let (mut e, post) = passing("dep-required-stopped");
+    let (mut e, post) = passing("dep-required-stopped-guarded");
     e.notices.retain(|n| !n.contains("planarian override"));
     fails(&e, &post, "OutOfBandStopHint");
+
+    // The residue: the notice must offer the undo, and the override must be
+    // the inferred, unattributed one the entry declares.
+    let (mut e, post) = passing("dep-required-stopped");
+    e.notices.retain(|n| !n.contains("planarian release"));
+    fails(&e, &post, "Undo");
+    let (mut e, post) = passing("dep-required-stopped");
+    e.ledger.overrides[0].attribution = Attribution::Attested;
+    fails(&e, &post, "attribution");
+    let (mut e, post) = passing("dep-required-stopped");
+    e.ledger.overrides[0].by = Actor::Daemon;
+    fails(&e, &post, "gamed success");
 
     let (mut e, post) = passing("policy-daemon-session-drop-rebind");
     e.notices.retain(|n| !n.contains("graphical session"));

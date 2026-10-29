@@ -402,69 +402,8 @@ no_incident_on = ["service@1000:pipewire"]
 no_autonomous_txn = true
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Family: unattributed-residue (§11) — Standard posture
+# Family: unattributed-residue (§11), VM only for now
 # ═══════════════════════════════════════════════════════════════════════════
-
-[[fault]]
-id = "residue-kill9-service"
-family = "unattributed-residue"
-summary = "A raw kill -9 of gym-web (Restart=no, not Security-sensitive). Under Standard it is accepted until next boot as an inferred, unattributed override, with a notice and an undo. No restart."
-spec = ["§11 unattributed residue", "§15 v4.4"]
-tags = ["acceptance"]
-scoring = "intent"
-harness = ["fake", "vm"]
-intent = { kind = "no-intervention", because = "an unattributed stop under Standard is inferred as intended" }
-inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
-window = "2m"
-
-[fault.required_post]
-units = { "service:gym-web" = "Overridden" }
-overrides = [{ unit = "service:gym-web", by = "Unattributed", attribution = "Inferred", until = "NextBoot" }]
-reports = ["InferredOverride", "Undo"]
-no_txn_on = ["service:gym-web"]
-
-[[fault]]
-id = "residue-kill9-undo"
-family = "unattributed-residue"
-summary = "Continuation: alice uses the offered undo. The inferred override is lifted by an authorized principal and gym-web is started."
-spec = ["§11 unattributed residue"]
-tags = ["extra"]
-scoring = "must-pass"
-harness = ["fake"]
-intent = { kind = "none" }
-setup = [{ raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }, { raw = "wait", for = "30s" }]
-inject = { raw = "cli", argv = ["release", "service:gym-web"], actor = "user:1001" }
-window = "2m"
-
-[fault.required_post]
-units = { "service:gym-web" = "Running" }
-overrides = []
-
-[[fault.required_post.txn]]
-transition = "LiftOverride"
-actor = "user:1001"
-
-[[fault]]
-id = "residue-kill9-security"
-family = "unattributed-residue"
-summary = "A raw kill -9 of gym-guard (Security-sensitive) is a fault under every posture: restarted and alarmed, never inferred."
-spec = ["§11 unattributed residue", "§15 v4.4"]
-tags = ["acceptance"]
-scoring = "repair"
-harness = ["fake", "vm"]
-intent = { kind = "none" }
-inject = { raw = "kill_unit", unit = "service:gym-guard", signal = "SIGKILL" }
-window = "2m"
-
-[fault.required_post]
-units = { "service:gym-guard" = "Running" }
-overrides = []
-reports = ["alarm"]
-
-[[fault.required_post.txn]]
-transition = "RestartUnit"
-target = "service:gym-guard"
-terminal = "Committed"
 
 [[fault]]
 id = "residue-stop-firewall"
@@ -481,26 +420,6 @@ window = "2m"
 [fault.required_post]
 units = { "service:firewall" = "Running" }
 reports = ["alarm"]
-
-[[fault]]
-id = "residue-oom-kill"
-family = "unattributed-residue"
-summary = "gym-web is driven past MemoryMax and the kernel kills it (Result=oom-kill). OOM kills are always faults: restarted, no inferred override."
-spec = ["§11 unattributed residue", "§15 v4.4"]
-tags = ["acceptance"]
-scoring = "repair"
-harness = ["fake", "vm"]
-intent = { kind = "none" }
-inject = { raw = "oom", unit = "service:gym-web" }
-window = "2m"
-
-[fault.required_post]
-units = { "service:gym-web" = "Running" }
-overrides = []
-
-[[fault.required_post.txn]]
-transition = "RestartUnit"
-target = "service:gym-web"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Family: journal-integrity (§12c, I18)

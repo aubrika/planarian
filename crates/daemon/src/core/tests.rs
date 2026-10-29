@@ -41,6 +41,7 @@ fn config() -> CoreConfig {
         runtime_options: vec![],
         fresh_boot: true,
         startup_grace: planarian_incident::STARTUP_GRACE,
+        posture: planarian_schema::Posture::Standard,
     }
 }
 
@@ -52,12 +53,16 @@ struct Rig {
 impl Rig {
     /// A machine past initial enrollment (generation 1 is known-good).
     fn new() -> Rig {
+        Rig::with(config())
+    }
+
+    fn with(cfg: CoreConfig) -> Rig {
         let store = MemStore::new(8 << 20);
         let fake = gym_world(store.clone());
         fake.w().alive.insert(100);
         let mut j = Journal::open(store).unwrap();
         j.append(fake.w().now, Record::KnownGood(GenerationId(1))).unwrap();
-        let core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config());
+        let core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, cfg);
         Rig { fake, core }
     }
 
@@ -83,7 +88,7 @@ impl Rig {
 fn svc_killed_is_repaired_once_and_closes() {
     let mut r = Rig::new();
     r.ticks(2);
-    r.fake.w().kill(&UnitId::service("gym-web"));
+    r.fake.w().signal(&UnitId::service("gym-web"), 11);
     r.ticks(4);
     assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
     assert_eq!(r.calls("restart(service:gym-web)"), 1);
@@ -101,25 +106,81 @@ fn svc_killed_defer_to_systemd() {
     assert_eq!(r.calls("restart(service:gym-restartful)"), 0, "systemd did it");
 }
 
+/// dep-required-stopped under v4.4 (owner decision Q5): root's `systemctl
+/// stop gym-db` outside Planarian is the unattributed residue. Under
+/// Standard it is taken as intended until the next boot, with gym-app (which
+/// systemd stopped with it) linked to it; nothing is restarted; one release
+/// undoes both.
 #[test]
-fn dep_required_stopped_repairs_the_dependency_first() {
+fn out_of_band_stop_is_an_inferred_override_with_an_undo() {
     let mut r = Rig::new();
     r.ticks(2);
     r.fake.w().stop_out_of_band(&UnitId::service("gym-db"));
     r.ticks(40);
-
+    assert_eq!(r.status("service:gym-db"), UnitStatus::Overridden(OverrideDesired::Stopped));
+    assert_eq!(r.status("service:gym-app"), UnitStatus::Overridden(OverrideDesired::Stopped));
+    assert_eq!(r.calls("restart"), 0, "not fought");
+    let l = r.core.ledger();
+    for o in &l.overrides {
+        assert_eq!(
+            (o.by.clone(), o.attribution, o.until.clone()),
+            (Actor::Unattributed, Attribution::Inferred, Until::NextBoot)
+        );
+    }
+    assert!(r.core.notices.iter().any(|n| n.contains("planarian release service:gym-db")), "{:?}", r.core.notices);
+    let resp = r.core.handle(ADMIN, Request::LiftOverride { unit: UnitId::service("gym-db") });
+    assert!(matches!(resp, Response::Done { .. }), "{resp:?}");
+    r.ticks(40);
     assert_eq!(r.status("service:gym-db"), UnitStatus::Running);
     assert_eq!(r.status("service:gym-app"), UnitStatus::Running);
-    let calls: Vec<String> =
-        r.fake.w().calls.iter().filter(|c| c.call.starts_with("restart")).map(|c| c.call.clone()).collect();
-    assert_eq!(calls.first().map(String::as_str), Some("restart(service:gym-db)"), "{calls:?}");
+}
+
+/// residue-kill9-security: a Security-sensitive unit stopped outside
+/// Planarian is a fault under every posture: alarmed, never inferred, and
+/// its restart proposed (the §11 table holds a Security restart for
+/// approval; catalog-review G16).
+#[test]
+fn security_unit_stop_is_a_fault_and_alarmed() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    r.fake.w().kill(&UnitId::service("sshd"));
+    r.ticks(10);
+    assert!(r.core.notices.iter().any(|n| n.starts_with("ALARM: service:sshd")), "{:?}", r.core.notices);
+    assert!(r.core.ledger().overrides.is_empty());
+    assert!(
+        r.core.ex.parked.values().any(|p| p.proposal.transition == Transition::RestartUnit(UnitId::service("sshd"))),
+        "restart proposed"
+    );
+}
+
+/// residue-oom-kill: the OOM killer's SIGKILL is a fault, not a person.
+#[test]
+fn oom_kill_is_repaired() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    r.fake.w().oom(&UnitId::service("gym-web"));
+    r.ticks(6);
+    assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
+    assert!(r.core.ledger().overrides.is_empty());
+}
+
+/// residue-kill9-service under Guarded: no inference; repaired.
+#[test]
+fn guarded_posture_does_not_infer() {
+    let mut cfg = config();
+    cfg.posture = Posture::Guarded;
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    r.fake.w().kill(&UnitId::service("gym-web"));
+    r.ticks(6);
+    assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
 }
 
 #[test]
 fn ordering_only_predecessor_is_not_blamed() {
     let mut r = Rig::new();
     r.ticks(2);
-    r.fake.w().kill(&UnitId::service("gym-cache"));
+    r.fake.w().signal(&UnitId::service("gym-cache"), 11);
     r.ticks(10);
     assert_eq!(r.calls("restart(service:gym-app)"), 0);
     assert_eq!(r.status("service:gym-cache"), UnitStatus::Running);
@@ -390,7 +451,7 @@ fn a_change_builds_elsewhere_while_repairs_go_on() {
     // The build runs on another thread; meanwhile a service dies and the tick repairs it.
     let worker = std::thread::spawn(move || job.run());
     r.core.building = Some((resume.describe(), Timestamp(0)));
-    r.fake.w().kill(&UnitId::service("gym-web"));
+    r.fake.w().signal(&UnitId::service("gym-web"), 11);
     r.ticks(4);
     assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
     assert_eq!(r.calls("restart(service:gym-web)"), 1);
@@ -485,7 +546,7 @@ fn a_deferred_change_reaches_the_executor_log() {
 fn executor_log_records_serialize() {
     let mut r = Rig::new();
     r.ticks(2);
-    r.fake.w().kill(&UnitId::service("gym-web"));
+    r.fake.w().signal(&UnitId::service("gym-web"), 11);
     r.ticks(4);
     let mut args = BTreeMap::new();
     args.insert("scale".to_string(), Value::Str("1.25".into()));
@@ -537,7 +598,7 @@ fn a_definite_failure_is_repaired_promptly_while_probes_time_out() {
     r.fake.w().units.get_mut(&web).unwrap().health = planarian_fake::Health::Delay(Millis::secs(60));
     r.ticks(12);
     assert_eq!(r.status("service:gym-web"), UnitStatus::Unknown);
-    r.fake.w().kill(&web);
+    r.fake.w().signal(&web, 11);
     let mut n = 0;
     while r.calls("restart(service:gym-web)") == 0 && n < 60 {
         r.ticks(1);

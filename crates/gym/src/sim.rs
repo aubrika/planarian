@@ -70,12 +70,15 @@ pub fn config() -> CoreConfig {
         runtime_options: vec![],
         fresh_boot: true,
         startup_grace: planarian_daemon::STARTUP_GRACE,
+        posture: planarian_schema::Posture::Standard,
     }
 }
 
 pub struct Sim {
     pub fake: Fake,
     pub core: Option<Core<Fake, MemStore>>,
+    /// The posture `set_setting posture` chose; kept across daemon restarts.
+    pub posture: planarian_schema::Posture,
     daemon_pid: u32,
     /// The daemon is killed and must not be restarted (catalog `hold_down`).
     held: bool,
@@ -188,6 +191,7 @@ impl Sim {
         Sim {
             fake,
             core: Some(core),
+            posture: planarian_schema::Posture::Standard,
             daemon_pid: DAEMON_PID,
             held: false,
             crash: None,
@@ -477,6 +481,7 @@ impl Sim {
         let j = Journal::open(self.fake.store.clone()).expect("journal");
         let mut cfg = config();
         cfg.fresh_boot = false;
+        cfg.posture = self.posture;
         self.core = Some(Core::start(j, self.fake.clone(), OwnerId::Daemon { pid, boot_id: Hash::ZERO }, cfg));
         self.harvest();
     }
@@ -623,7 +628,18 @@ impl Sim {
             return self.transition(t, s, &actor);
         }
         match get("raw") {
-            "kill_unit" => self.fake.w().kill(&unit(get("unit"))),
+            "kill_unit" => {
+                let sig = match get("signal") {
+                    "SIGHUP" => 1,
+                    "SIGINT" => 2,
+                    "SIGABRT" => 6,
+                    "SIGSEGV" => 11,
+                    "SIGTERM" => 15,
+                    _ => 9,
+                };
+                self.fake.w().signal(&unit(get("unit")), sig)
+            }
+            "oom" => self.fake.w().oom(&unit(get("unit"))),
             "stop_unit_out_of_band" => self.fake.w().stop_out_of_band(&unit(get("unit"))),
             "set_knob" | "set_persistent_knob" => self.knob(&unit(get("unit")), get("knob"), s.get("value"))?,
             "corrupt_state" => {
@@ -873,6 +889,18 @@ impl Sim {
                         s.get("value").and_then(T::as_float).ok_or_else(|| Unsupported("set_setting value".into()))?;
                     self.fake.w().gc_budget.generations_permille = (pct * 10.0).round() as u32;
                 }
+                "posture" => {
+                    self.posture = match s.get("value").and_then(T::as_str) {
+                        Some("Relaxed") => planarian_schema::Posture::Relaxed,
+                        Some("Guarded") => planarian_schema::Posture::Guarded,
+                        Some("Sealed") => planarian_schema::Posture::Sealed,
+                        _ => planarian_schema::Posture::Standard,
+                    };
+                    let p = self.posture;
+                    if let Some(c) = self.core.as_mut() {
+                        c.set_posture(p);
+                    }
+                }
                 k => return Err(Unsupported(format!("set_setting {k}"))),
             },
             "out_of_band_rebuild" => {
@@ -943,6 +971,7 @@ impl Sim {
                 desired: planarian_schema::OverrideDesired::Stopped,
             },
             ["stop", u] => Request::Stop { unit: unit(u) },
+            ["release", u] => Request::LiftOverride { unit: unit(u) },
             ["resolve", _, how] => {
                 let l = self.ledger();
                 let txn =

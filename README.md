@@ -81,8 +81,11 @@ baseline.
 `planarian status` shows what it sees: units, health, incidents, pending
 approvals. To watch a repair, pick a service whose loss you don't mind (not
 your SSH server or display manager on a machine you reach remotely) and
-`sudo systemctl kill -s KILL <service>`: within about 15 s there should be
-an incident and a restart, and `planarian log` explains it. `ask "stop
+simulate a crash with `sudo systemctl kill -s SEGV <service>`: within about
+15 s there should be an incident and a restart, and `planarian log` explains
+it. A plain `kill` or `systemctl stop` is different: Planarian takes that as
+something you meant, leaves the service stopped until the next boot, and says
+how to undo it (`planarian release <service>`). `ask "stop
 <service> until I say"` stops it and keeps it stopped; `ask "start <service>
 again"` undoes that. The demo VM has fixture services and fault injection
 for the rest (`docs/planarian-os.md`).
@@ -142,7 +145,7 @@ for slow machines or slow-starting services.
 ```
 cargo test                                   # every crate
 cargo run -p planarian-gym -- run            # the fault catalog, fake harness
-nix run .#gym-vm -- svc-killed-defer-to-systemd   # entries on real NixOS VMs (no ids: all 62; wants KVM)
+nix run .#gym-vm -- svc-killed-defer-to-systemd   # entries on real NixOS VMs (no ids: every VM entry; wants KVM)
 crates/gym/demo.sh --harness fake            # the GA demonstration
 cargo run -p planarian-gym -- serve --socket /tmp/p.sock   # a fake machine on a socket:
 PLANARIAN_SOCKET=/tmp/p.sock cargo run -p planarian-console # try the console (or the CLI) against it

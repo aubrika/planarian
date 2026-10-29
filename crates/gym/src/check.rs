@@ -117,6 +117,23 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
     // vacuously, so naming one is a failure of the entry itself.
     let known: BTreeSet<&UnitId> = e.pre_status.keys().chain(e.finals.keys()).chain(e.seen_status.keys()).collect();
     let unknown = |u: &str| !known.is_empty() && !known.contains(&unit(u));
+    // Gamed success (§15): an override set by the daemon, the watchdog, the
+    // model or an agent; an Unattributed (inferred) one only where the entry
+    // declares it.
+    let declares_inferred = post
+        .get("overrides")
+        .and_then(T::as_array)
+        .is_some_and(|a| a.iter().any(|o| o.get("by").and_then(T::as_str) == Some("Unattributed")));
+    for o in &ledger.overrides {
+        let ok = match &o.by {
+            Actor::User { .. } => o.attribution == Attribution::Attested,
+            Actor::Unattributed => o.attribution == Attribution::Inferred && declares_inferred,
+            _ => false,
+        };
+        if !ok {
+            v.failures.push(format!("gamed success: {} overridden by {:?} ({:?})", o.unit, o.by, o.attribution));
+        }
+    }
     for (key, val) in post {
         let fail = |v: &mut Verdict, m: String| v.failures.push(format!("{key}: {m}"));
         match key.as_str() {
@@ -252,10 +269,22 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                 }
                 for (s, w) in ledger.overrides.iter().zip(val.as_array().into_iter().flatten()) {
                     if let Some(by) = w.get("by").and_then(T::as_str) {
-                        let ok = matches!(&s.by, Actor::User { uid, .. } if format!("user:{uid}") == by);
+                        let ok = match &s.by {
+                            Actor::User { uid, session, .. } => {
+                                format!("user:{uid}") == by
+                                    || session.as_ref().is_some_and(|x| format!("user:{uid}@{x}") == by)
+                            }
+                            Actor::Unattributed => by == "Unattributed",
+                            _ => false,
+                        };
                         if !ok {
-                            fail(&mut v, format!("{} suppressed by {:?}, want {by}", s.unit, s.by));
+                            fail(&mut v, format!("{} overridden by {:?}, want {by}", s.unit, s.by));
                         }
+                    }
+                    if let Some(a) = w.get("attribution").and_then(T::as_str)
+                        && format!("{:?}", s.attribution) != a
+                    {
+                        fail(&mut v, format!("{} attribution {:?}, want {a}", s.unit, s.attribution));
                     }
                 }
             }
@@ -430,6 +459,10 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                             notices.contains("stopped, not crashed") && notices.contains("planarian override")
                         }
                         "DisruptionSessionLoss" => notices.contains("end your graphical session"),
+                        "InferredOverride" => notices.contains("stopped outside Planarian")
+                            && notices.contains("take that as intended"),
+                        "Undo" => notices.contains("To start it again: planarian release"),
+                        "alarm" => e.notices.iter().any(|n| n.starts_with("ALARM: ")),
                         "BudgetUnsatisfiable" => notices.contains("BudgetUnsatisfiable"),
                         _ => {
                             v.unchecked.push(format!("reports.{r}"));

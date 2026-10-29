@@ -62,8 +62,31 @@ pub struct Built {
     pub activation: ActivationPlan,
 }
 
+/// How a unit's main process last ended, as the supervisor reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Ending {
+    /// It exited with this status.
+    Exited(i32),
+    /// A signal ended it (`systemctl stop` sends SIGTERM).
+    Signal(i32),
+    /// The kernel's OOM killer ended it (`Result=oom-kill`).
+    OomKill,
+}
+
+impl Ending {
+    /// §11 residue: a termination signal, which a person (or a stop job) sends,
+    /// as opposed to a crash signal or an exit status. Owner decision Q5.
+    pub fn is_termination(&self) -> bool {
+        matches!(self, Ending::Signal(1 | 2 | 9 | 15))
+    }
+}
+
 pub trait UnitBackend {
     fn observe(&self, id: &UnitId) -> Result<Observed, Outcome>;
+    /// How the unit's main process last ended; None if the backend cannot say.
+    fn ended_by(&self, _id: &UnitId) -> Option<Ending> {
+        None
+    }
     fn list(&self) -> Result<Vec<UnitId>, Outcome>;
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome;
     fn stop(&self, id: &UnitId, op: &OpId) -> Outcome;

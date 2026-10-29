@@ -190,3 +190,10 @@ The kill cases above switch to `SIGSEGV` (as `quiet-repair-not-deferred` already
 - **Q6:** accepted. Change the types, extend the existing proofs, and add proofs as needed (I16, I19). Report the verification ratio before and after.
 - **Q7:** accepted. The reference game is Xonotic's `timedemo`, with MangoHud frame logging.
 - **Q8:** left to my discretion, aiming high. The personal-profile gate needs every `must-pass` and `intent` entry to PASS on each harness it lists, and no acceptance case to be UNSUPPORTED on the VM unless a `docs/deviations.md` row moves it to the fake (Q4). It also needs at least 95% of all entries cleared on at least one harness.
+
+## 10. Found while implementing (2026-10-29)
+
+| # | Gap | Where | What I did |
+| --- | --- | --- | --- |
+| G16 | §11 says a Security-sensitive unit stopped outside Planarian is "restarted and alarmed", but §11's table makes a `RestartUnit` on a Security-sensitive unit AskFirst. Read together, the firewall stays down until someone approves. | §11 | Followed the verified table: the stop is alarmed (an `ALARM:` notice), never inferred as intended, and the restart is proposed and held for approval (`residue-kill9-security`). If you want the restart to run on its own, the table needs an exception: "restoring a Security unit to its desired Running state is Runtime". That is a policy change and needs its proof. **Your call.** |
+| G17 | On a one-person machine, I19 holds per principal, not per person: you propose as your uid and approve as root, and those are two principals. | §11, §16 | As written; recorded in `deviations.md`. A broker (Phase C) could bind both to one human. |

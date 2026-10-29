@@ -210,6 +210,7 @@ fn main() {
         runtime_options: file.runtime_options(),
         fresh_boot: fresh_boot(&paths.state, &boot),
         startup_grace: planarian_schema::Millis::secs(file.startup_grace_secs),
+        posture: file.posture,
     };
     let mut core = Core::start(journal, real, me.clone(), core_cfg);
     // Catalog changes stage, evaluate and build on a worker thread while the

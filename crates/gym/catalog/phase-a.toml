@@ -205,7 +205,7 @@ tags = ["ga-demo"]
 scoring = "repair"
 harness = ["fake", "vm"]
 intent = { kind = "none" }
-inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }
 window = "7m"
 
 [fault.required_post]
@@ -257,7 +257,7 @@ setup = [
   { raw = "greeter_login", uid = 1000 },
   { raw = "wait", for = "30s" },
 ]
-inject = { raw = "kill_unit", unit = "service@1000:pipewire", signal = "SIGKILL" }
+inject = { raw = "kill_unit", unit = "service@1000:pipewire", signal = "SIGSEGV" }
 window = "5m"
 
 [fault.required_post]
@@ -286,7 +286,7 @@ scoring = "repair"
 harness = ["vm"]
 intent = { kind = "none" }
 setup = [{ raw = "corrupt_state", unit = "service:gym-web", path = "/var/lib/gym-web/state.json" }]
-inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGTERM" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }
 window = "10m"
 
 [fault.required_post]
@@ -335,12 +335,35 @@ path = ["Prepared", "Activating", "Checking", "Reverting", "Reverted"]
 [[fault]]
 id = "dep-required-stopped"
 family = "required-dependency-stopped"
-summary = "gym-db is stopped out of band; systemd stops gym-app with it (Requires=). Root cause is gym-db: it is repaired first, then gym-app."
-spec = ["§13 diagnoser step 1"]
+summary = "root stops gym-db out of band; systemd stops gym-app with it (Requires=). v4.4 (owner decision Q5): the unattributed residue. Under Standard both are taken as intended until the next boot (gym-app linked to gym-db), nothing is restarted, and the notice offers the undo."
+spec = ["§11 unattributed residue", "§13 diagnoser step 1"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "an unattributed stop under Standard is inferred as intended" }
+inject = { raw = "stop_unit_out_of_band", unit = "service:gym-db", actor = "root" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-db" = "Overridden", "service:gym-app" = "Overridden" }
+overrides = [
+  { unit = "service:gym-db", until = "NextBoot", by = "Unattributed", attribution = "Inferred" },
+  { unit = "service:gym-app", until = "NextBoot", by = "Unattributed", attribution = "Inferred" },
+]
+reports = ["InferredOverride", "Undo"]
+no_txn_on = ["service:gym-db", "service:gym-app"]
+no_autonomous_txn = true
+
+[[fault]]
+id = "dep-required-stopped-guarded"
+family = "required-dependency-stopped"
+summary = "As dep-required-stopped, under the Guarded posture, where an unattributed stop is not inferred as intended (§11; Phase A repairs it, without the ask window). Root cause is gym-db: it is repaired first, then gym-app."
+spec = ["§11 unattributed residue", "§13 diagnoser step 1"]
 tags = []
 scoring = "repair"
 harness = ["fake", "vm"]
 intent = { kind = "none" }
+setup = [{ raw = "set_setting", key = "posture", value = "Guarded" }]
 inject = { raw = "stop_unit_out_of_band", unit = "service:gym-db", actor = "root" }
 window = "5m"
 
@@ -348,6 +371,7 @@ window = "5m"
 units = { "service:gym-db" = "Running", "service:gym-app" = "Running" }
 may_change = ["service:gym-db", "service:gym-app"]
 others_unchanged = true
+overrides = []
 reports = ["OutOfBandStopHint"]
 
 [[fault.required_post.txn]]
@@ -380,7 +404,7 @@ tags = []
 scoring = "repair"
 harness = ["fake", "vm"]
 intent = { kind = "none" }
-inject = { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGKILL" }
+inject = { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGSEGV" }
 window = "5m"
 
 [fault.required_post]
@@ -404,7 +428,7 @@ scoring = "must-pass"
 harness = ["fake", "vm"]
 intent = { kind = "none" }
 setup = [{ raw = "set_persistent_knob", unit = "service:gym-metrics", knob = "fail_on_start", value = true }]
-inject = { raw = "kill_unit", unit = "service:gym-metrics", signal = "SIGKILL" }
+inject = { raw = "kill_unit", unit = "service:gym-metrics", signal = "SIGSEGV" }
 window = "10m"
 
 [fault.required_post]
@@ -1037,7 +1061,7 @@ setup = [
 ]
 inject = { raw = "wait", for = { journal = "RecoveryFailed" } }
 after = [
-  { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGKILL" },
+  { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGSEGV" },
   { raw = "wait", for = "3m" },
   { raw = "unblock_network", dst = "127.0.0.1" },
   { raw = "cli", argv = ["resolve", "<txn>", "--manual-repaired"], actor = "user:1001" },
@@ -1079,7 +1103,7 @@ inject = { raw = "force_compaction" }
 after = [
   { raw = "restart_process", process = "planariad" },
   { raw = "restart_process", process = "planarian-recovery" },
-  { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGKILL" },
+  { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGSEGV" },
   { raw = "wait", for = "3m" },
 ]
 window = "10m"
@@ -1151,7 +1175,7 @@ setup = [
   { raw = "set_knob", unit = "service:gym-app", knob = "probe_delay", value = "60s" },
   { raw = "wait", for = "stale_after" },
 ]
-inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }
 window = "2m"
 
 [fault.required_post]
@@ -1577,7 +1601,7 @@ inject = { raw = "fill_fs", fs = "device:fs-journal", as_uid = "planariad", unti
 # A repair needs journal records, and compaction writes a new segment:
 # both with the filesystem full.
 after = [
-  { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" },
+  { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" },
   { raw = "force_compaction" },
 ]
 window = "10m"
@@ -2094,4 +2118,88 @@ transition = "Rollback"
 decision = "Allow(AskFirst)"
 approver_class = "Administrator"
 terminal = "Committed"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: unattributed-residue (§11, owner decision Q5) — Standard posture
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "residue-kill9-service"
+family = "unattributed-residue"
+summary = "A raw kill -9 of gym-web (Restart=no, not Security-sensitive). Under Standard it is accepted until next boot as an inferred, unattributed override, with a notice and an undo. No restart."
+spec = ["§11 unattributed residue", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "an unattributed stop under Standard is inferred as intended" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", by = "Unattributed", attribution = "Inferred", until = "NextBoot" }]
+reports = ["InferredOverride", "Undo"]
+no_txn_on = ["service:gym-web"]
+
+[[fault]]
+id = "residue-kill9-undo"
+family = "unattributed-residue"
+summary = "Continuation: alice uses the offered undo. The inferred override is lifted by an authorized principal and gym-web is started."
+spec = ["§11 unattributed residue"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }, { raw = "wait", for = "30s" }]
+inject = { raw = "cli", argv = ["release", "service:gym-web"], actor = "user:1001" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+overrides = []
+
+[[fault.required_post.txn]]
+transition = "LiftOverride"
+actor = "user:1001"
+
+[[fault]]
+id = "residue-kill9-security"
+family = "unattributed-residue"
+summary = "A raw kill -9 of sshd (Security-sensitive) is a fault under every posture: alarmed, never inferred, and its restart proposed. The §11 table holds a Security restart for approval (catalog-review G16)."
+spec = ["§11 unattributed residue", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "kill_unit", unit = "service:sshd", signal = "SIGKILL" }
+window = "2m"
+
+[fault.required_post]
+overrides = []
+reports = ["alarm"]
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:sshd"
+decision = "Allow(AskFirst)"
+
+[[fault]]
+id = "residue-oom-kill"
+family = "unattributed-residue"
+summary = "gym-web is driven past MemoryMax and the kernel kills it (Result=oom-kill). OOM kills are always faults: restarted, no inferred override."
+spec = ["§11 unattributed residue", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "oom", unit = "service:gym-web" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+overrides = []
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
 

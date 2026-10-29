@@ -68,7 +68,7 @@ let
       planarian log -n 20               what it did and why
 
     Faults to inject (then watch `planarian status`):
-      demo-fault kill-web               SIGKILL gym-web: repaired by restart
+      demo-fault kill-web               crash gym-web (SIGSEGV): repaired by restart
       demo-fault corrupt-state          gym-state cannot start: tried, then handed to you
       demo-fault fix-state              undo the corruption
       demo-fault crash-loop             gym-restartful: systemd restarts it, Planarian stays out
@@ -191,9 +191,9 @@ in
       (pkgs.writeShellScriptBin "demo-fault" ''
         set -e
         case "''${1:-}" in
-          kill-web) sudo systemctl kill --signal=SIGKILL gym-web.service ;;
+          kill-web) sudo systemctl kill --signal=SIGSEGV gym-web.service ;;
           corrupt-state) echo corrupt | sudo tee /var/lib/gym-state/state.json >/dev/null
-                         sudo systemctl kill --signal=SIGTERM gym-state.service ;;
+                         sudo systemctl kill --signal=SIGSEGV gym-state.service ;;
           fix-state) sudo rm -f /var/lib/gym-state/state.json ;;
           crash-loop) sudo systemctl kill --signal=SIGKILL gym-restartful.service ;;
           *) echo "usage: demo-fault kill-web|corrupt-state|fix-state|crash-loop" >&2; exit 2 ;;

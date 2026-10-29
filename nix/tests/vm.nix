@@ -57,7 +57,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("a killed service is repaired"):
         before = int(machine.succeed("planarian log -n 1000 | grep -c 'restart service:gym-web' || true").strip() or 0)
-        machine.succeed("systemctl kill --signal=SIGKILL gym-web.service")
+        machine.succeed("systemctl kill --signal=SIGSEGV gym-web.service")
         machine.wait_until_succeeds(
             f"test $(planarian log -n 1000 | grep -c 'restart service:gym-web') -gt {before}", timeout=600
         )

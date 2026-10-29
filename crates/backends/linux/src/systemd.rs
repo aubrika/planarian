@@ -7,7 +7,7 @@
 
 use crate::admitted;
 use crate::cmd::run;
-use planarian_schema::{Observed, OpId, Outcome, Reason, Scope, Timestamp, UnitBackend, UnitId, UnitKind};
+use planarian_schema::{Ending, Observed, OpId, Outcome, Reason, Scope, Timestamp, UnitBackend, UnitId, UnitKind};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -40,6 +40,21 @@ pub fn systemctl(scope: &Scope) -> Vec<String> {
 /// Parse `systemctl show` key=value output.
 pub fn parse_show(text: &str) -> BTreeMap<String, String> {
     text.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+/// `Result`, `ExecMainCode` (1 exited, 2 killed, 3 dumped core) and
+/// `ExecMainStatus` → how the main process last ended.
+pub fn ending_from(props: &BTreeMap<String, String>) -> Option<Ending> {
+    let get = |k: &str| props.get(k).map(String::as_str).unwrap_or("");
+    let status: i32 = get("ExecMainStatus").parse().ok()?;
+    if get("Result") == "oom-kill" {
+        return Some(Ending::OomKill);
+    }
+    match get("ExecMainCode") {
+        "1" => Some(Ending::Exited(status)),
+        "2" | "3" => Some(Ending::Signal(status)),
+        _ => None,
+    }
 }
 
 pub fn observed_from(props: &BTreeMap<String, String>, now: Timestamp) -> Observed {
@@ -109,6 +124,15 @@ impl UnitBackend for Systemd {
         Ok(observed_from(&parse_show(&o.stdout), now()))
     }
 
+    fn ended_by(&self, id: &UnitId) -> Option<Ending> {
+        let o = self.ctl(
+            &id.scope,
+            &["show", "--property=Result,ExecMainCode,ExecMainStatus", &unit_name(id)],
+            QUERY_TIMEOUT,
+        );
+        o.ok().then(|| ending_from(&parse_show(&o.stdout))).flatten()
+    }
+
     fn list(&self) -> Result<Vec<UnitId>, Outcome> {
         let o = self.ctl(
             &Scope::System,
@@ -143,6 +167,12 @@ mod tests {
     fn mapping() {
         let o = |s: &str| observed_from(&parse_show(s), Timestamp(0));
         assert_eq!(o("LoadState=loaded\nActiveState=active\nSubState=running\nExecMainStatus=0\n"), Observed::Active);
+        let e = |t: &str| ending_from(&parse_show(t));
+        assert_eq!(e("Result=signal\nExecMainCode=2\nExecMainStatus=9\n"), Some(Ending::Signal(9)));
+        assert_eq!(e("Result=success\nExecMainCode=2\nExecMainStatus=15\n"), Some(Ending::Signal(15)));
+        assert_eq!(e("Result=core-dump\nExecMainCode=3\nExecMainStatus=11\n"), Some(Ending::Signal(11)));
+        assert_eq!(e("Result=oom-kill\nExecMainCode=2\nExecMainStatus=9\n"), Some(Ending::OomKill));
+        assert_eq!(e("Result=exit-code\nExecMainCode=1\nExecMainStatus=3\n"), Some(Ending::Exited(3)));
         assert_eq!(
             o("LoadState=loaded\nActiveState=failed\nExecMainStatus=137\n"),
             Observed::Failed(Reason::ExitCode(137))

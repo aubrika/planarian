@@ -45,6 +45,8 @@ pub struct CoreConfig {
     pub fresh_boot: bool,
     /// The default startup grace (units may set their own).
     pub startup_grace: Millis,
+    /// The failure posture the generation declares (§12d); Phase A ships Standard.
+    pub posture: Posture,
 }
 
 /// How often the running daemon re-reads its journal's hash chain (I18).
@@ -123,6 +125,12 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// A broken chain found while running; `main` stops on it (§12d: the
     /// response is in the posture units, not here).
     pub integrity: Option<String>,
+    /// Each unit's status at the previous tick, to see transitions (§11 residue).
+    prev_status: BTreeMap<UnitId, UnitStatus>,
+    /// Units Planarian's own transactions touched since the previous tick, and
+    /// whether a generation changed: their stops are not someone else's.
+    touched: BTreeSet<UnitId>,
+    generation_touched: bool,
     /// When to next check the §12b collection bounds.
     next_gc_check: Timestamp,
     /// The space report last noticed.
@@ -232,6 +240,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             unreachable: BTreeMap::new(),
             chain_checked: None,
             integrity: None,
+            prev_status: BTreeMap::new(),
+            touched: BTreeSet::new(),
+            generation_touched: false,
             next_gc_check: Timestamp(0),
             space_noted: Timestamp(0),
             awaiting_post: Vec::new(),
@@ -355,6 +366,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let policy = self.ex.policy_version();
         let caller = authz.actor.clone();
         let mut result = self.ex.submit(p.clone(), authz.clone(), s, defs);
+        if let Some((facts, _)) = &self.ex.last {
+            self.touched.extend(facts.affected_units.iter().cloned());
+        }
+        self.generation_touched |= p.transition.changes_generation();
         if let Some((g, fixes)) = self.ex.floor_raised.take() {
             self.notice(format!(
                 "security floor is now generation {} (it fixes {}); going back below it needs an administrator",
@@ -437,9 +452,108 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     /// One tick of the loop.
+    /// Change the posture (the gym's `set_setting posture`; on a machine the
+    /// generation declares it, §12d).
+    pub fn set_posture(&mut self, p: Posture) {
+        self.cfg.posture = p;
+    }
+
+    /// §11, the unattributed residue: a unit seen running at the last tick and
+    /// now ended by a termination signal (a `kill`, or a `systemctl stop`
+    /// Planarian did not issue), which systemd will not restart and which is
+    /// not Security-sensitive, is taken as intended under the Relaxed and
+    /// Standard postures: an inferred `Override` until the next boot, recorded
+    /// as an observation (it never passes through `decide`), with a notice
+    /// and an undo. Units that went down with it are linked to it. A
+    /// Security-sensitive unit's stop is always a fault, and alarmed; crash
+    /// signals, exit statuses and OOM kills are faults. Owner decision Q5.
+    /// Returns whether it recorded anything.
+    fn residue(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {
+        let now = s.observed_at;
+        let lenient = matches!(self.cfg.posture, Posture::Relaxed | Posture::Standard);
+        let mut down: BTreeMap<UnitId, Ending> = BTreeMap::new();
+        let mut current = BTreeMap::new();
+        for (u, def) in defs {
+            let st = s.status(u, defs);
+            let was_up = matches!(self.prev_status.get(u), Some(UnitStatus::Running | UnitStatus::Degraded(_)));
+            let now_down = matches!(st, UnitStatus::Failed(_) | UnitStatus::Stopped);
+            current.insert(u.clone(), st);
+            if !(was_up && now_down)
+                || def.id.kind != UnitKind::Service
+                || self.touched.contains(u)
+                || self.generation_touched
+                || !s.expected(u, defs)
+            {
+                continue;
+            }
+            let Some(e) = self.b.units().ended_by(u).filter(Ending::is_termination) else { continue };
+            if def.sensitivity.contains(Sensitivity::Security) {
+                self.notice(format!(
+                    "ALARM: {u}, which is security-sensitive, was stopped outside Planarian ({}); starting it again",
+                    signal_name(e)
+                ));
+                continue;
+            }
+            let restartful = def.systemd_restart.as_ref().is_some_and(|p| p.restart);
+            if lenient && !restartful {
+                down.insert(u.clone(), e);
+            }
+        }
+        self.prev_status = current;
+        self.touched.clear();
+        self.generation_touched = false;
+        if down.is_empty() {
+            return false;
+        }
+        // The units whose stop no other stop in this batch explains.
+        let roots: Vec<UnitId> = down
+            .keys()
+            .filter(|u| !down.keys().any(|r| r != *u && planarian_schema::spec::dependents(r, defs).contains(*u)))
+            .cloned()
+            .collect();
+        for r in roots {
+            let with: Vec<UnitId> = planarian_schema::spec::dependents(&r, defs)
+                .into_iter()
+                .filter(|d| *d != r && down.contains_key(d))
+                .collect();
+            let how = signal_name(down[&r]);
+            let mut record = |unit: UnitId, reason: String| {
+                let o = Override {
+                    unit,
+                    desired: OverrideDesired::Stopped,
+                    until: Until::NextBoot,
+                    reason,
+                    by: Actor::Unattributed,
+                    attribution: Attribution::Inferred,
+                };
+                self.journal(Record::OverrideSet(o));
+            };
+            record(r.clone(), format!("stopped outside Planarian ({how})"));
+            for d in &with {
+                record(d.clone(), format!("stopped together with {r}"));
+            }
+            let also = if with.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (and {}, which went down with it)",
+                    with.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", ")
+                )
+            };
+            self.notice(format!(
+                "{r}: stopped outside Planarian ({how}); I take that as intended and leave it stopped until the next boot{also}. To start it again: planarian release {r}"
+            ));
+        }
+        let _ = now;
+        true
+    }
+
     pub fn tick(&mut self) {
         let (s, defs) = self.observe();
         let now = s.observed_at;
+
+        // §11: stops nobody attributed, before anything treats them as faults.
+        let (s, defs) = if self.residue(&s, &defs) { self.observe() } else { (s, defs) };
 
         // I18: re-read the retained journal against the head this daemon holds.
         if self.chain_checked.is_none_or(|t| now.0.saturating_sub(t.0) >= CHAIN_CHECK_EVERY.0) {
@@ -1073,8 +1187,24 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 self.user_submit(Transition::SetOverride(s), peer, Source::User, "from the CLI".into())
             }
             Request::LiftOverride { unit } => {
-                let r =
-                    self.user_submit(Transition::LiftOverride(unit.clone()), peer, Source::User, "from the CLI".into());
+                let r = self.user_submit(
+                    Transition::LiftOverride(unit.clone()),
+                    peer.clone(),
+                    Source::User,
+                    "from the CLI".into(),
+                );
+                // Releasing an inferred stop also releases what went down with it.
+                let with = format!("stopped together with {unit}");
+                let linked: Vec<UnitId> = self
+                    .ledger()
+                    .overrides
+                    .iter()
+                    .filter(|o| o.attribution == Attribution::Inferred && o.reason == with)
+                    .map(|o| o.unit.clone())
+                    .collect();
+                for u in linked {
+                    let _ = self.user_submit(Transition::LiftOverride(u), peer.clone(), Source::User, with.clone());
+                }
                 let now = self.b.clock().now();
                 if let Some(i) = self.incidents.human_acted(&unit, now) {
                     self.journal(Record::Incident(i));
@@ -1280,3 +1410,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
 #[cfg(test)]
 mod tests;
+
+fn signal_name(e: Ending) -> String {
+    match e {
+        Ending::Signal(1) => "SIGHUP".into(),
+        Ending::Signal(2) => "SIGINT".into(),
+        Ending::Signal(9) => "SIGKILL".into(),
+        Ending::Signal(15) => "SIGTERM, as `systemctl stop` sends".into(),
+        Ending::Signal(n) => format!("signal {n}"),
+        Ending::Exited(n) => format!("exit status {n}"),
+        Ending::OomKill => "the OOM killer".into(),
+    }
+}
