@@ -14,6 +14,11 @@ No `assume` and no `external_body` function. Trusted instead:
 | **V4** `Expectation`, `CheckContext`, `ApprovalToken`, `Incident` are opaque external types | `schema::txn`, `schema::transition` |
 | **V5** Ledger bookkeeping helpers (`push_tag`, `tag_string`, `note_why`, `archive`, `set_override`, `lift_override`, `record_incident`, `use_token`) are `external_body` with no postcondition: each receives only the field it updates, so the verified fields are untouched by construction; trusted only to terminate | `txn::ledger` |
 | **V6** vstd's specifications of `Vec::push`, `insert`, `remove`, `is_empty` and `Box` | `txn::ledger` |
+| **V7** The specifications the proofs prove against (`decide_spec`, `step_spec`, `inv`, `chained`, the lemma statements) say what the SPEC's English means. A proof certifies a wrong specification as readily as a right one; each proved invariant has a gym entry written from the English to catch the difference (§17a). | `policy`, `txn`, `schema` |
+| **V8** Verus is sound: what it reports verified holds of the code. | every proof |
+| **V9** Z3, the solver Verus calls, is sound. | every proof |
+| **V10** rustc compiles the verified code to a program with the semantics Verus checked. | every proof |
+| **V11** Kani and its back end CBMC are sound within the stated bounds. | `txn::kani`, `exec::kani` |
 
 See `verification.md` for what is proved.
 
@@ -29,13 +34,27 @@ See `verification.md` for what is proved.
 | **P6** systemd reports unit state truthfully over D-Bus and honors `X-RestartIfChanged` / `X-StopIfChanged` | — |
 | **P7** Fencing is effective: a stale-epoch call is refused before it mutates | — |
 | **P8** The kernel and systemd are correct | — |
-| **P9** The executor derives `DerivedFacts` from the evaluated generation, never from a proposal (I14's other half; property-tested, verified in Phase C) | `exec::derive` |
+| **P10** A pidfd names one process for as long as it is held, and `SO_PEERPIDFD` (Linux ≥ 6.5) names the process that connected; so a recycled pid can never be mistaken for the peer (§10, B-6). The gym cannot exercise pid reuse itself: Linux hands out pids in increasing order and wraps only after `pid_max` (4 194 304 on 64-bit systems, 32 768 on some), so the same pid coming back to another process of the same uid, in another session, inside one request's lifetime, cannot be arranged reproducibly. `identity-peer-exited` checks the case the pidfd rule decides (a peer gone before it is resolved). The rarity is not the protection; the pidfd is. | `daemon::session_of` |
+
+P9 (facts derived honestly) moved to U1 in the v4.5 re-accounting: it is Planarian's own code, not an assumption about the world.
+
+## Internal unproven code (not assumptions; work not yet proved)
+
+Planarian's own code that the proven gates take input from (SPEC §17a). Counted as the **internal-unproven count**, never in the trust count; it must not grow and is expected to fall from Phase C. Invariants that rest on one cite its id.
+
+| Id | Code | Proved in |
+| --- | --- | --- |
+| **U1** | `exec::derive`: `DerivedFacts` from the evaluated generation, never from a proposal (I14's other half; property-tested) | C |
+| **U2** | `user_authorization` and the administrator lookup (`planarian-admin` membership, root) | C |
+| **U3** | The residue classifier (§11: which unit endings are a person's stop) | Kani in A, Verus in C |
+| **U4** | Journal I/O around the verified chain: framing, torn-tail truncation, checkpoint replace | C |
+| **U5** | Identity resolution (§10): peer credentials and pidfd to logind session, seat, terminal | C |
 
 ## Progress assumptions for I12
 
 **G1** Some lease holder eventually runs. **G2** A fenced worker eventually stops issuing calls, or its calls are refused. **G3** Journal writes eventually succeed. **G4** Backend calls terminate.
 
-The ids (V, P, G) are what `docs/verification-ratio.toml` cites; the trust count is their number plus every `external_body` and `assume` site in the verified crates (`planarian-gym verification`).
+The ids (V, P, G, U) are what `docs/verification-ratio.toml` cites. The trust count is the number of V, P and G ids plus every `external_body` and `assume` site in the verified crates; the internal-unproven count is the number of U ids (`planarian-gym verification`). Per invariant, `assumes` lists what that invariant specifically rests on; proof-validity trust (V7–V11) underlies every proof alike and is counted once, in the trust count, not repeated on each row.
 
 ## Fake harness (tests only, not proof sites)
 

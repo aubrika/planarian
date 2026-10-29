@@ -3,7 +3,7 @@
 //!   planarian-gym list    [--catalog FILE]
 //!   planarian-gym run     [--catalog FILE] --harness fake [--id ID ...] [--all]
 //!   planarian-gym show-reconciliation --harness fake --id ID
-//!   planarian-gym verification [--write-baseline]   the d:a report (§17a)
+//!   planarian-gym verification [--write-baseline] [--gate]   d:a, trust and bypass report (§17a, §17b)
 //!
 //! The fake harness runs the real daemon core, executor, kernel and watchdog
 //! logic against the in-memory machine (`planarian-fake`). The VM harness is
@@ -128,7 +128,7 @@ fn load(path: &str) -> Vec<T> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("verification") {
-        let r = verification::run(args.iter().any(|a| a == "--write-baseline"));
+        let r = verification::run(args.iter().any(|a| a == "--write-baseline"), args.iter().any(|a| a == "--gate"));
         print!("{}", r.text);
         std::process::exit(if r.ok { 0 } else { 1 });
     }

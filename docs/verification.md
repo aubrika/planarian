@@ -44,6 +44,18 @@ obligations in `schema` / `policy` / `txn` before the v4.4 types, and
 new types and add I16 and I19. The ledger adds v4.4's I6 and the boot-only
 path.
 
+## The trust count, the internal-unproven count and the bypass register (v4.5)
+
+`planarian-gym verification` reports three numbers (§17a): the **trust
+count** (V, P and G entries in `assumptions.md` plus `external_body` and
+`assume` sites: 37 after the v4.5 re-accounting), the **internal-unproven
+count** (U entries: Planarian's own unproven code the gates take input from:
+5), and **d:a** (47:56). It also checks `docs/bypasses.md`'s format and lists
+its open rows by severity (§17b). On every push it fails if any number
+regresses or the register is malformed; with `--gate` (run at every phase
+gate) it also fails on an open High row. The v4.5 re-accounting and its
+reason are in `verification-ratio.toml`.
+
 ## `policy` (Phase A target: done)
 
 `decide` itself is verified: its postcondition is `r == decide_spec(*i)`,

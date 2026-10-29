@@ -4,31 +4,31 @@
 #   "crate::name": a Verus `proof fn` (or a function verified against its
 #   `ensures`) or a Kani harness. Tests do not discharge anything; they are
 #   listed under `tested` and not counted.
-# `assumes`: the docs/assumptions.md ids (V, P, G) the invariant rests on.
+# `assumes`: the docs/assumptions.md ids (V, P, G, U) the invariant rests on.
 #
 # `planarian-gym verification` checks that every name exists in the source
 # and every id in assumptions.md, prints the report, and fails if a ratio
 # fell or the trust count grew against [baseline] (the ratchet: every gate).
 
+
+# Re-accounted for SPEC v4.5 (2026-10-29), once, as §17a allows; not a
+# regression. Trust count 32 -> 37: proof-validity entries added (V7 the
+# specifications, V8 Verus, V9 Z3, V10 rustc, V11 Kani/CBMC), P10 added
+# (pidfd semantics, B-6), and P9 moved out to U1. Internal-unproven count
+# 0 -> 5 (U1-U5: derive, authorization, the residue classifier, journal
+# I/O, identity resolution), reported apart from the trust count. d:a
+# 47:50 -> 47:56 because I17-I19, I21 and I22 now cite the U code they rest
+# on. Earlier: 28:43 at GA; 32:43 (four obligations mapped to I6 and I12);
+# 42:50 (I21-I23); 47:50 (I18's hash chain). Change these only when a change
+# improves them.
 [baseline]
-# GA (2026-10-29), from `planarian-gym verification --write-baseline`;
-# raised the same day when four proved obligations were mapped (I6, I12)
-# and again when I21-I23 were added to the SPEC for ten more, and when
-# I18's hash chain was proved (txn::chain).
-# Change these only when a change improves them.
-trust_count = 32
+trust_count = 37
+internal_unproven = 5
 discharged = 47
-assumed = 50
+assumed = 56
 
 [baseline.per_invariant]
 I1 = [0, 2]
-I2 = [0, 2]
-I3 = [0, 2]
-I4 = [0, 1]
-I5 = [4, 3]
-I6 = [7, 5]
-I7 = [0, 1]
-I8 = [1, 1]
 I10 = [1, 2]
 I11 = [2, 2]
 I12 = [9, 8]
@@ -36,13 +36,20 @@ I13 = [0, 1]
 I14 = [1, 2]
 I15 = [2, 2]
 I16 = [2, 3]
-I17 = [0, 1]
-I18 = [5, 2]
-I19 = [3, 1]
+I17 = [0, 2]
+I18 = [5, 3]
+I19 = [3, 3]
+I2 = [0, 2]
 I20 = [0, 2]
-I21 = [2, 3]
-I22 = [5, 3]
+I21 = [2, 4]
+I22 = [5, 4]
 I23 = [3, 1]
+I3 = [0, 2]
+I4 = [0, 1]
+I5 = [4, 3]
+I6 = [7, 5]
+I7 = [0, 1]
+I8 = [1, 1]
 
 [[invariant]]
 id = "I1"
@@ -112,7 +119,7 @@ statement = "No change that alters a canonical probe executes below AskFirst; ca
 phase = "A"
 tested = ["state tests", "gym probe-tamper"]
 discharged = ["policy::i10_canonical_probe_changes_ask"]
-assumes = ["V1", "P9"]
+assumes = ["V1", "U1"]
 
 [[invariant]]
 id = "I11"
@@ -142,7 +149,7 @@ id = "I14"
 statement = "Policy facts are derived by the executor from the evaluated generation, never read from a proposal."
 phase = "A (proof)"
 discharged = ["policy::i14_facts_caller_is_not_authority"]
-assumes = ["P9", "V3"]
+assumes = ["U1", "V3"]
 
 [[invariant]]
 id = "I15"
@@ -166,7 +173,7 @@ statement = "The set of principals holding administrator capability is never emp
 phase = "A"
 tested = ["policy::i17_root_is_always_an_administrator"]
 discharged = []
-assumes = ["P8"]
+assumes = ["P8", "U2"]
 
 [[invariant]]
 id = "I18"
@@ -174,14 +181,14 @@ statement = "Every journal record commits to its predecessor's hash; a broken ch
 phase = "A (proof, trusting SHA-256)"
 tested = ["txn journal tests", "gym journal-record-edited", "gym posture-integrity-journal-chain"]
 discharged = ["txn::follows", "txn::verify", "txn::next_link", "txn::appending_keeps_the_chain", "txn::an_edited_record_breaks_the_chain"]
-assumes = ["P5", "P4"]
+assumes = ["P5", "P4", "U4"]
 
 [[invariant]]
 id = "I19"
 statement = "No principal approves its own proposal or grants itself a capability it does not hold."
 phase = "A (proof), C"
 discharged = ["policy::i19_no_self_approval", "policy::may_approve", "policy::may_grant"]
-assumes = ["V1"]
+assumes = ["V1", "U2", "U5"]
 
 [[invariant]]
 id = "I20"
@@ -196,7 +203,7 @@ id = "I21"
 statement = "No irreversible transition, or one that may lose a session, user data or connectivity, runs below AskFirst unless the loss falls only on the caller's own session (with a seat, for connectivity); a loss reaching another user's session needs an administrator."
 phase = "A (proof)"
 discharged = ["policy::global_floors", "policy::own_session_is_per_session"]
-assumes = ["V1", "V2", "P9"]
+assumes = ["V1", "V2", "U1", "U5"]
 
 [[invariant]]
 id = "I22"
@@ -204,7 +211,7 @@ statement = "Generation changes, garbage collection, driver binding, resolving t
 phase = "A (proof)"
 tested = ["gym residue-kill9-security", "gym residue-stop-security-unit"]
 discharged = ["policy::users_cannot_change_generations", "policy::only_administrators_resolve", "policy::security_override_held_for_administrator", "policy::security_restart_runs_alone_only_to_restore", "policy::agents_and_unattributed_are_refused"]
-assumes = ["V1", "P8", "P9"]
+assumes = ["V1", "P8", "U1", "U2"]
 
 [[invariant]]
 id = "I23"
