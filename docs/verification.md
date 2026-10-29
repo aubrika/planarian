@@ -34,7 +34,7 @@ phases are in SPEC §8).
 
 Before and after v4.4 (owner decision Q6): Verus verified 17 / 37 / 38
 obligations in `schema` / `policy` / `txn` before the v4.4 types, and
-17 / 51 / 42 after. No proof was weakened. The policy lemmas extend to the
+17 / 52 / 42 after (52 with the G16 lemma). No proof was weakened. The policy lemmas extend to the
 new types and add I16 and I19. The ledger adds v4.4's I6 and the boot-only
 path.
 
@@ -56,6 +56,7 @@ lemmas about `decide_spec` in `crates/policy/src/proofs.rs`:
 | `i16_below_floor_needs_administrator` | A target below the security floor is AskFirst with `ApproverClass::Administrator`, or refused, for every transition kind, caller and autonomy setting (I16, the `decide` part). |
 | `administrator_class_only_on_ask_first` | An Administrator approver class only ever comes with AskFirst. |
 | `security_override_held_for_administrator` | A non-administrator's override (`SetOverride`, `LiftOverride`, `StopAndSuppress`) of a Security-sensitive unit is never `Unauthorized` and never runs on its own: AskFirst for an administrator, or another refusal. |
+| `security_restart_runs_alone_only_to_restore` | A restart of a Security-sensitive unit runs below AskFirst only when it restores an unattributed stop (`restores_unattributed_stop`) of a unit that is not also External (§11, G16). |
 | `agents_and_unattributed_are_refused` | An agent (reserved) and the unattributed actor are always `Unauthorized`: an inferred override never passes through `decide`. |
 | `i19_no_self_approval` | `may_approve` never lets a principal approve its own proposal, requires `Approve`, and requires `Administrator` for that class; `may_grant` never grants to the approver itself, never on its own proposal, and only a capability the approver holds (I19). |
 | `i10_canonical_probe_changes_ask` | A change to a canonical probe's definition (probe tampering) is AskFirst or Reject. |

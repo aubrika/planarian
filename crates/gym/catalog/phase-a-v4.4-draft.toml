@@ -1,6 +1,9 @@
 # Planarian — Phase A fault catalog, v4.4 additions
 #
 # DRAFT FOR OWNER REVIEW (SPEC §18.0). Spec revision: v4.4.
+#
+# All entries have moved into phase-a.toml (2026-10-29); this file keeps
+# the format notes they were drafted with.
 # Review notes, conflicts with the v4.3 entries, and questions:
 # docs/catalog-review.md §5–§8.
 #
@@ -84,22 +87,6 @@ spec = "v4.4"
 # ═══════════════════════════════════════════════════════════════════════════
 # Family: unattributed-residue (§11), VM only for now
 # ═══════════════════════════════════════════════════════════════════════════
-
-[[fault]]
-id = "residue-stop-firewall"
-family = "unattributed-residue"
-summary = "The NixOS firewall (a oneshot) is stopped out of band by root. Security-sensitive, so it is restarted and alarmed."
-spec = ["§11 unattributed residue", "§15 v4.4"]
-tags = ["acceptance"]
-scoring = "repair"
-harness = ["vm"]
-intent = { kind = "none" }
-inject = { raw = "stop_unit_out_of_band", unit = "service:firewall", actor = "root" }
-window = "2m"
-
-[fault.required_post]
-units = { "service:firewall" = "Running" }
-reports = ["alarm"]
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Family: journal-integrity (§12c, I18)

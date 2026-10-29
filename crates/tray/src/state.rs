@@ -160,6 +160,7 @@ mod tests {
                 touches_canonical_probe: false,
                 changes_desired: true,
                 below_security_floor: false,
+                restores_unattributed_stop: false,
                 other_sessions_affected: false,
                 affected_sessions: Vec::new(),
                 touches_core: false,

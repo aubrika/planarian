@@ -51,6 +51,7 @@ fn facts(
         changes_desired: flags & 4 != 0,
         touches_core: flags & 8 != 0,
         below_security_floor: flags & 16 != 0,
+        restores_unattributed_stop: flags & 128 != 0,
         other_sessions_affected: flags & 32 != 0,
         affected_sessions: if flags & 64 != 0 { vec!["s1".into()] } else { vec![] },
         caller: Actor::Daemon,
@@ -159,7 +160,7 @@ fn grid(mut f: impl FnMut(&Transition, &DerivedFacts, &Authorization, &Session, 
         for s in sens {
             for d in disruptions {
                 for r in recoveries {
-                    for flags in 0..128u8 {
+                    for flags in 0..=255u8 {
                         for diff in diffs {
                             let fa = facts(s, d, r, flags, diff);
                             for a in callers() {

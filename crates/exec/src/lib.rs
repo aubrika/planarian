@@ -375,6 +375,12 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         let sessions = self.b.sessions().sessions().unwrap_or_default();
         derive::session_facts(&mut plan.facts, &sessions);
         derive::floor_fact(&mut plan.facts, &transition, state);
+        // §11: and whether a restart restores an unattributed stop.
+        let ended = match &transition {
+            Transition::RestartUnit(u) => self.b.units().ended_by(u),
+            _ => None,
+        };
+        derive::stop_fact(&mut plan.facts, &transition, state, defs, ended);
 
         // §12 step 3: `expected` must refine the spec's prediction.
         let predicted = predict(&transition, state, defs);

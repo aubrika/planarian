@@ -137,8 +137,7 @@ fn out_of_band_stop_is_an_inferred_override_with_an_undo() {
 
 /// residue-kill9-security: a Security-sensitive unit stopped outside
 /// Planarian is a fault under every posture: alarmed, never inferred, and
-/// its restart proposed (the §11 table holds a Security restart for
-/// approval; catalog-review G16).
+/// restored on its own (§11; catalog-review G16, decided 2026-10-29).
 #[test]
 fn security_unit_stop_is_a_fault_and_alarmed() {
     let mut r = Rig::new();
@@ -147,10 +146,8 @@ fn security_unit_stop_is_a_fault_and_alarmed() {
     r.ticks(10);
     assert!(r.core.notices.iter().any(|n| n.starts_with("ALARM: service:sshd")), "{:?}", r.core.notices);
     assert!(r.core.ledger().overrides.is_empty());
-    assert!(
-        r.core.ex.parked.values().any(|p| p.proposal.transition == Transition::RestartUnit(UnitId::service("sshd"))),
-        "restart proposed"
-    );
+    assert!(r.core.ex.parked.is_empty(), "restored without asking");
+    assert_eq!(r.status("service:sshd"), UnitStatus::Running);
 }
 
 /// residue-oom-kill: the OOM killer's SIGKILL is a fault, not a person.
@@ -352,7 +349,9 @@ fn shared_root_cause_parks_one_approval() {
     r.fake.w().base_units.insert(client.id.clone(), client);
     r.fake.w().units.insert(UnitId::service("ssh-tunnel"), planarian_fake::UnitSim::active(Timestamp(0)));
     r.ticks(2);
-    r.fake.w().stop_out_of_band(&UnitId::service("sshd"));
+    // A crash: restoring a Security unit after a crash still asks (only an
+    // unattributed stop is restored on its own).
+    r.fake.w().signal(&UnitId::service("sshd"), 11);
     r.ticks(8);
     assert_eq!(r.core.ex.parked.len(), 1, "{:?}", r.core.notices);
 }

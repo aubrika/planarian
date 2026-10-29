@@ -124,6 +124,7 @@ pub fn facts(caller: Actor) -> DerivedFacts {
         touches_canonical_probe: false,
         changes_desired: false,
         below_security_floor: false,
+        restores_unattributed_stop: false,
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
         touches_core: false,

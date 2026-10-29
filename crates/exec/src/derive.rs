@@ -121,6 +121,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         changes_desired: false,
         touches_core: false,
         below_security_floor: false,
+        restores_unattributed_stop: false,
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
         caller: i.caller.clone(),
@@ -252,6 +253,27 @@ pub fn session_facts(f: &mut DerivedFacts, sessions: &[SessionInfo]) {
         && matches!(f.disruption, Disruption::SessionLoss | Disruption::ConnectivityLoss)
         && live.iter().any(|x| Some(x.uid) != caller);
     f.affected_sessions = hit.into_iter().collect();
+}
+
+/// §11: whether a RestartUnit restores a unit stopped outside Planarian and
+/// not attributed: stopped by `systemctl stop` or a termination signal (not
+/// a crash), under no override, and desired Running now. From systemd's state, never
+/// from the proposal (I14).
+pub fn stop_fact(f: &mut DerivedFacts, t: &Transition, s: &SystemState, defs: &UnitDefs, ended: Option<Ending>) {
+    let Transition::RestartUnit(u) = t else { return };
+    // Inactive after a `systemctl stop` (an orderly exit or a termination
+    // signal), or failed with Result=signal from a termination signal
+    // (kill -9). A crash, a non-zero exit or the OOM killer is a fault.
+    let stopped = match (s.units.get(u).map(|(o, _)| o), ended) {
+        (Some(Observed::Bound), None) => true,
+        (Some(Observed::Bound), Some(e)) => e.is_termination() || e == Ending::Exited(0),
+        (Some(Observed::Failed(_)), Some(e)) => e.is_termination(),
+        _ => false,
+    };
+    f.restores_unattributed_stop = stopped
+        && s.override_of(u).is_none()
+        && s.expected(u, defs)
+        && defs.get(u).is_some_and(|d| d.desired.status == DesiredStatus::Running);
 }
 
 /// §12e: whether the generation a transition goes to is below the security

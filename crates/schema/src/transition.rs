@@ -185,6 +185,11 @@ pub struct DerivedFacts {
     /// session; empty means not known, which never counts as own. Not in §8.
     #[serde(default)]
     pub affected_sessions: Vec<String>,
+    /// A RestartUnit that restores a unit stopped outside Planarian and not
+    /// attributed (§11 residue): stopped, not failed, under no override.
+    /// Derived from systemd's state, never from a proposal.
+    #[serde(default)]
+    pub restores_unattributed_stop: bool,
     pub caller: Actor,
     pub config_diff: Option<ConfigDiff>,
 }

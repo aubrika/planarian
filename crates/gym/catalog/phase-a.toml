@@ -2165,7 +2165,7 @@ actor = "user:1001"
 [[fault]]
 id = "residue-kill9-security"
 family = "unattributed-residue"
-summary = "A raw kill -9 of sshd (Security-sensitive) is a fault under every posture: alarmed, never inferred, and its restart proposed. The §11 table holds a Security restart for approval (catalog-review G16)."
+summary = "A raw kill -9 of sshd (Security-sensitive) is a fault under every posture: alarmed, never inferred, and restored on its own (§11; catalog-review G16, decided 2026-10-29)."
 spec = ["§11 unattributed residue", "§15 v4.4"]
 tags = ["acceptance"]
 scoring = "must-pass"
@@ -2175,13 +2175,14 @@ inject = { raw = "kill_unit", unit = "service:sshd", signal = "SIGKILL" }
 window = "2m"
 
 [fault.required_post]
+units = { "service:sshd" = "Running" }
 overrides = []
 reports = ["alarm"]
 
 [[fault.required_post.txn]]
 transition = "RestartUnit"
 target = "service:sshd"
-decision = "Allow(AskFirst)"
+decision = "Allow(Runtime)"
 
 [[fault]]
 id = "residue-oom-kill"
@@ -2668,3 +2669,27 @@ window = "10m"
 [fault.required_post]
 generation = "base"
 reports = ["NeedsApproval"]
+
+# §11 (v4.4; G16 decided 2026-10-29). Drafted as residue-stop-firewall; the
+# gym VM runs without the NixOS firewall, so sshd stands in for it.
+[[fault]]
+id = "residue-stop-security-unit"
+family = "unattributed-residue"
+summary = "Root stops sshd (Security-sensitive) with systemctl stop outside Planarian. An unattributed stop of a Security unit is never taken as intended: it is restored on its own and alarmed."
+spec = ["§11 unattributed residue", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "stop_unit_out_of_band", unit = "service:sshd", actor = "root" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+overrides = []
+reports = ["alarm"]
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:sshd"
+decision = "Allow(Runtime)"

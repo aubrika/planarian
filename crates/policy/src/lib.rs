@@ -560,7 +560,12 @@ pub open spec fn override_spec(f: DerivedFacts, a: Authorization) -> Decision {
 pub open spec fn base_spec(i: Input) -> Decision {
     let f = *i.facts;
     match *i.transition {
-        Transition::RestartUnit(_) => allow(ask_if(sec_or_ext(f.sensitivity), Tier::Runtime)),
+        // §11: a Security-sensitive unit stopped outside Planarian and not
+        // attributed is restored on its own (and alarmed); otherwise a
+        // Security or External restart asks.
+        Transition::RestartUnit(_) => allow(
+            ask_if(sec_or_ext(f.sensitivity) && (f.sensitivity.external || !f.restores_unattributed_stop), Tier::Runtime),
+        ),
         Transition::StopUnit(_) => allow(ask_if(sec_or_ext(f.sensitivity), Tier::Runtime)),
         Transition::SetOverride(_) => override_spec(f, *i.authz),
         Transition::LiftOverride(_) => override_spec(f, *i.authz),
@@ -782,7 +787,12 @@ fn base_tier(i: &Input) -> (r: Decision)
 {
     let f = i.facts;
     match i.transition {
-        Transition::RestartUnit(_) => allow_exec(ask_if_exec(sec_or_ext_exec(&f.sensitivity), Tier::Runtime)),
+        Transition::RestartUnit(_) => allow_exec(
+            ask_if_exec(
+                sec_or_ext_exec(&f.sensitivity) && (f.sensitivity.external || !f.restores_unattributed_stop),
+                Tier::Runtime,
+            ),
+        ),
         Transition::StopUnit(_) => allow_exec(ask_if_exec(sec_or_ext_exec(&f.sensitivity), Tier::Runtime)),
         Transition::SetOverride(_) => override_exec(f, i.authz),
         Transition::LiftOverride(_) => override_exec(f, i.authz),
