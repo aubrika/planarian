@@ -8,11 +8,12 @@ evidence for each criterion and how to reproduce it. Updated 2026-10-29.
 | Criterion | Status |
 | --- | --- |
 | 1. The demonstration | **Passes**, on the fake harness and on VMs (CI, KVM, on every push) |
-| 2. ≥ 60% of the catalog cleared deterministically | **70 of 72 (97%)**: 58 PASS on the fake harness, 58 PASS on VMs (48 entries run on both), every key checked |
+| 2. ≥ 60% of the catalog cleared deterministically | **99 of 101 (98%)**, provisional (see §2): 81 PASS on the fake harness, 74 PASS and 2 UNSUPPORTED on VMs, every key checked; the 101st is the invisibility benchmark, still running |
+| Q8, the personal-profile gate (owner decision) | **Met, provisionally:** every must-pass and intent entry passes on each harness it lists (the benchmark's entry pending); no acceptance entry is UNSUPPORTED on VMs; 98% cleared (≥ 95%). Final once the whole VM catalog passes on one commit (run dispatched 2026-10-29 on 5368267) |
 | 2. Every bad generation reverted | Yes, on both harnesses, including a full /boot at publish and a daemon killed mid-change |
 | 2. The manifest-weakening fault rejected | Yes (`manifest-weaken-via-proposal`; `manifest-weaken-out-of-band` on VMs) |
 | 2. Zero gamed successes | Guarded: see "Passes that prove something"; entries a harness cannot run faithfully are UNSUPPORTED there, never passed |
-| 2. Unnecessary interventions on the intent cases = 0 | 0 of 9 |
+| 2. Unnecessary interventions on the intent cases = 0 | 0, on the 8 intent entries the fake harness runs and the VM runs of all 12 |
 | 3. `policy` proofs pass in CI | Yes: `ci.yml`'s `nix` job runs the Verus check |
 | 4. Baselines: the invisibility budget (§21) | Idle (VM, 5 min, run "Invisibility budget" #2): **0.063% of one core, 7.9 MB resident, 1.58 wakeups/s** (targets < 0.5%, < 50 MB). The game frame-time comparison has not completed yet: the first runs found no Xonotic demo (harness fix pending a run). |
 | 4. Baselines: the verification ratio (§17a) | **Trust count = 32; global d:a = 47:50 (28:43 at GA; then four proved obligations mapped to I6 and I12, I21–I23 added for ten more, and I18's hash chain proved)** (`planarian-gym verification`, a CI ratchet; per invariant in `docs/verification.md`) |
@@ -36,21 +37,42 @@ runtime, generations and installer VM tests.)
 
 ## 2. The catalog
 
-The final runs, 2026-10-29:
+The latest results, 2026-10-29 (v4.4 catalog: 101 entries):
 
 | Harness | PASS | UNSUPPORTED | FAIL / PARTIAL | Not run there |
 | --- | --- | --- | --- | --- |
-| Fake (`cargo run -p planarian-gym -- run`, in CI on every push) | 58 | 0 | 0 | 14 VM-only |
-| VMs (`vm.yml` by hand, run "VM tests" #28, all 62 VM entries on KVM) | 58 | 4 | 0 | 10 fake-only |
+| Fake (`cargo run -p planarian-gym -- run`, in CI on every push) | 81 | 0 | 0 | 19 VM-only, 1 benchmark |
+| VMs (`vm.yml`, all 76 VM entries on KVM) | 74 | 2 | 0 | 24 fake-only, 1 benchmark |
+| Benchmark (`bench.yml`) | — | — | — | `quiet-reference-workload`: run #5 in progress |
 
-Cleared on at least one harness: 70 of 72. Not cleared anywhere:
-`desktop-boot-fails-rollback` (the test VM boots its kernel directly, never
-a published generation) and `storage-journal-btrfs-reuse` (the gym VM's
-journal is ext4). UNSUPPORTED on VMs but cleared on the fake:
-`storage-nix-full-gc` and `storage-enospc-during-build` (the test VM's Nix
-store is the host's). Fake-only by deviation: `suspend-resume` (QEMU never
-woke the VM; docs/deviations.md). The desktop entries run against a
-stand-in greeter and compositor (docs/AGENTS.md), not COSMIC.
+**Provisional:** the VM verdicts come from the full run on 8f3f296 (71
+PASS) plus re-runs of the entries fixed afterwards on 06560cb and 6e72eff
+(`storage-journal-btrfs-reuse`, `residue-oom-kill`, and
+`policy-daemon-session-drop-rebind`, whose first run hung when its VM
+froze). Later commits changed the journal (I18's proof moved the chain
+check into `txn::chain`), so a full run on the head is dispatched; this
+table becomes final when it passes.
+
+Cleared on at least one harness: 99 of 101. Not cleared: 
+`desktop-boot-fails-rollback` (UNSUPPORTED: the test VM boots its kernel
+directly, never a published generation; a repair entry, VM-only) and
+`quiet-reference-workload` (pending the benchmark). UNSUPPORTED on VMs but
+cleared on the fake: `storage-nix-full-gc` (the test VM's Nix store is the
+host's). Fake-only by deviation: `suspend-resume` and
+`storage-enospc-during-build` (docs/deviations.md). Now run on VMs that
+were not before: `storage-journal-btrfs-reuse` (a btrfs journal disk,
+snapshot and churn) and `residue-oom-kill` (a real cgroup OOM kill). The
+desktop entries run against a stand-in greeter and compositor
+(docs/AGENTS.md), not COSMIC.
+
+**Q8, the personal-profile gate** (owner decision, catalog-review §9),
+checked against these results:
+
+| Condition | Result |
+| --- | --- |
+| Every must-pass and intent entry (81) passes on each harness it lists | Yes on the fake and on VMs; `quiet-reference-workload` (must-pass, benchmark) pending |
+| No acceptance entry (47) UNSUPPORTED on VMs without a deviation | Yes: the two UNSUPPORTED entries are repair entries, neither tagged acceptance |
+| At least 95% of entries cleared on at least one harness | 99 of 101 (98%); 100 of 101 if the benchmark passes |
 
 The history of the VM runs follows; each found real bugs.
 
