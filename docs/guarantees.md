@@ -57,7 +57,8 @@ flowchart TB
   T -.->|rests on| A
 ```
 
-Verus runs on every CI run; Kani runs by hand (it is not in nixpkgs);
+Verus and Kani run on every CI run (Kani in `ci.yml`'s `kani` job, not as
+a flake check, since it is not in nixpkgs);
 every item of 𝒯 is a line in `assumptions.md`.
 
 Read the arrows as "everything that changes the machine passes through a
@@ -315,8 +316,8 @@ none is proved yet.
   I22 (authority) and I23 (persistent configuration) on 2026-10-29. d:a
   went from 28:43 to 42:50. The assumptions grew with it: each new
   invariant cites what it rests on.
-- **Kani is not a flake check** (not packaged in nixpkgs); it runs by hand
-  from `cargo kani`.
+- **Kani is not a flake check** (not packaged in nixpkgs): CI runs it as
+  its own job (`ci.yml`, `kani`), pinned to 0.68.0.
 
 ## 8. The trust count, itemised (\|𝒯\| = 32)
 

@@ -196,8 +196,9 @@ cargo kani -p planarian-txn
 cargo kani -p planarian-exec
 ```
 
-Kani is not packaged in nixpkgs, so there is no flake check; it runs from
-`cargo kani` (version in `pins.md`). Timings are on 4 cores.
+Kani is not packaged in nixpkgs, so there is no flake check; CI runs it as
+its own job (`ci.yml`, `kani`) from `cargo kani`, at the version in
+`pins.md`. Timings are on 4 cores.
 
 | Harness | Proves | Time |
 | --- | --- | --- |

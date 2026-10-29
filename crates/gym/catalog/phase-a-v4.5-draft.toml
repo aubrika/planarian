@@ -1,0 +1,599 @@
+# Planarian — Phase A fault catalog, v4.5 additions
+#
+# DRAFT FOR OWNER REVIEW (SPEC §18.0, v4.5 handoff step 0). Spec revision: v4.5.
+#
+# Two groups:
+#   1. One entry (or two) per bypass the handoff names: B-1, B-2, B-3, B-5,
+#      B-6, B-7, B-11, B-13 (docs/bypasses.md; SPEC §27 names each case).
+#   2. One entry per proved invariant, written from the SPEC's English (§7),
+#      not from the formal specification (§17a: a proof certifies a wrong
+#      specification as readily as a right one). Each tests a consequence the
+#      English states and the proof's specification does not mention, so a
+#      gap between the two shows up as a failure here.
+#
+# Kept apart from phase-a.toml until sign-off, as with v4.4.
+#
+# Format: as in phase-a.toml. Additions this file uses, all proposed:
+#
+#   raw actions
+#     agent_run {name, as, argv}         `planarian agent run <name> -- argv` by `as`;
+#                                        later steps act as `agent:<name>`
+#     approve_pending {actor, via}       via adds "no-tty": the same root peer
+#                                        with no controlling terminal
+#     request_then_exit {actor, request} the peer sends a request and exits
+#                                        before the daemon resolves it
+#     set_wall_clock {by}                move CLOCK_REALTIME only (fake: the
+#                                        wall clock; boot time unchanged)
+#     advance_clock {by}                 unchanged: both clocks (fake only)
+#     plant_test_build                   install the gym-hooks package's
+#                                        binaries over the real ones (VM)
+#     delete_journal_record {record}     remove a retained record's frame,
+#                                        re-framing the rest (VM and fake)
+#     edit_override_file {at}            a third party rewrites the override
+#                                        file; at = { journal = "<state>" }
+#     forge_proposal_fields {fields}     a proposal carrying caller, sensitivity
+#                                        or other fact fields it must not set
+#     concurrent {steps}                 submit the listed requests together
+#
+#   required_post keys
+#     principals          { "<principal>" = { uid = "dynamic" | N, grants = [...] } }
+#     sensitivity         { "<unit>" = "Security" | "NonRoutine" | ... } derived
+#     console_inferred    units the console lists as inferred overrides
+#     boot_entries_unchanged  true: no boot entry written in the window
+#     override_file       "untouched" | "<hash symbol>"
+#     unattributed_never  true: no transition carries an actor the peer did
+#                         not establish
+#     [[...txn]] fields   refused_with (a RejectReason), tier, executed (bool)
+#
+# Where an entry needs a fixture the gym VM does not have yet, its comment says
+# so; those fixtures are part of implementing the entry, after sign-off.
+
+schema_version = 1
+spec = "v4.5"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Group 1: the bypasses
+# ═══════════════════════════════════════════════════════════════════════════
+
+# B-1 (High). Fixture: services.planarian.agents.coder (a script that makes
+# the requests below), uid 1001 is in planarian-admin.
+[[fault]]
+id = "agent-run-own-principal"
+family = "authority"
+summary = "An administrator starts an agent with `planarian agent run coder`. The agent runs under a dynamic uid of its own, not the administrator's: its attempts to override sshd, stop gym-web and approve a pending change are refused or held; it may restart its own unit."
+spec = ["§11 principals", "§16 agent run", "B-1"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "gym-cache", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "agent_run", name = "coder", as = "user:1001", argv = ["gym-agent-script"] },
+]
+inject = { raw = "cli", argv = ["override", "service:sshd", "--stopped"], actor = "agent:coder" }
+after = [
+  { raw = "cli", argv = ["stop", "service:gym-web"], actor = "agent:coder" },
+  { raw = "approve_pending", actor = "agent:coder", via = "tty" },
+  { raw = "cli", argv = ["restart", "service:agent-coder"], actor = "agent:coder" },
+]
+window = "5m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running", "service:gym-web" = "Running" }
+overrides = []
+principals = { "agent:coder" = { uid = "dynamic", grants = ["OwnScope"] } }
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+target = "service:sshd"
+refused_with = "Unauthorized"
+
+[[fault.required_post.txn]]
+transition = "StopUnit"
+target = "service:gym-web"
+refused_with = "Unauthorized"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:agent-coder"
+terminal = "Committed"
+
+# B-2 (High). Fixture: an overlay marking the base generation's openssh with
+# knownVulnerabilities = ["GYM-0001"]; the candidate's openssh lacks it.
+# openssh is a service package, not in environment.systemPackages.
+[[fault]]
+id = "floor-service-package-fix"
+family = "security-floor"
+summary = "A generation whose only security fix is in a service package (openssh, not in environment.systemPackages) commits. The floor moves to it, because the floor is derived from the whole closure. A later failure does not revert below it."
+spec = ["§12e", "I16", "B-2"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "gym:openssh-fix", args = {}, source = "user", actor = "root" },
+  { raw = "set_persistent_knob", unit = "service:gym-web", knob = "fail_on_start", value = true },
+]
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }
+window = "10m"
+
+[fault.required_post]
+security_floor = "candidate"
+escalation = "RevertBlockedByFloor"
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+never = ["Activating"]
+
+# B-3 (Medium).
+[[fault]]
+id = "approve-needs-real-terminal"
+family = "policy"
+summary = "A root process with no controlling terminal (a systemd service) sends Approve for a pending AskFirst change. The daemon reads the peer's terminal from its pidfd, finds none, and refuses; the same change approved by root at a terminal then runs. The request carries no tty field to claim."
+spec = ["§11 approval", "§16 CLI", "B-3", "I14"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "service-enable", args = { service = "gym-cache", enabled = false }, source = "user", actor = "user:1001" }]
+inject = { raw = "approve_pending", actor = "root", via = "no-tty" }
+after = [{ raw = "approve_pending", actor = "root", via = "tty" }]
+window = "5m"
+
+[fault.required_post]
+reports = ["ApprovalNeedsTerminal"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+approved_by = "root"
+
+# B-5 (Medium). Fixture: the gym VM declares fail2ban, AppArmor, USBGuard, a
+# WireGuard interface, the firewall and sshd through their option trees, and
+# gym-untagged with no sensitivity entry.
+[[fault]]
+id = "sensitivity-named-security-units"
+family = "authority"
+summary = "Units declared through the security option trees are Security without a tag: an unprivileged user's override of each is held for an administrator and the unit stays up. A unit with no sensitivity entry is treated as non-Routine (fail closed)."
+spec = ["§11 sensitivity completeness", "I22", "B-5"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { raw = "cli", argv = ["override", "service:fail2ban", "--stopped"], actor = "user:1000" }
+after = [
+  { raw = "cli", argv = ["override", "service:usbguard", "--stopped"], actor = "user:1000" },
+  { raw = "cli", argv = ["override", "service:wg-quick-gym0", "--stopped"], actor = "user:1000" },
+]
+window = "5m"
+
+[fault.required_post]
+sensitivity = { "service:fail2ban" = "Security", "service:apparmor" = "Security", "service:usbguard" = "Security", "service:wg-quick-gym0" = "Security", "service:firewall" = "Security", "service:sshd" = "Security", "service:gym-untagged" = "NonRoutine" }
+units = { "service:fail2ban" = "Running", "service:usbguard" = "Running", "service:wg-quick-gym0" = "Running" }
+overrides = []
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+target = "service:fail2ban"
+approver_class = "Administrator"
+never = ["Activating"]
+
+# B-6 (Medium).
+[[fault]]
+id = "identity-peer-exited"
+family = "authority"
+summary = "A seated user's process sends a request that would be exempt only for its own session (stopping its own session's audio) and exits before the daemon resolves it. With no pidfd to resolve, the peer has no session: the request is decided as remote, never attributed to whichever process now holds that pid."
+spec = ["§10 actors and sessions", "I21", "B-6"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { raw = "request_then_exit", actor = "user:1000", request = { transition = "StopUnit", target = "service@1000:pipewire" } }
+window = "2m"
+
+[fault.required_post]
+unattributed_never = true
+
+[[fault.required_post.txn]]
+transition = "StopUnit"
+target = "service@1000:pipewire"
+tier = "AskFirst"
+
+# B-7 (Medium). Fake only: a VM cannot advance boot time by 24 h.
+[[fault]]
+id = "token-wall-clock-moved-back"
+family = "policy"
+summary = "An approval token is issued, then the wall clock is moved back 48 h. The token still expires 24 h after issue, timed on CLOCK_BOOTTIME (§12h)."
+spec = ["§12h", "I8", "B-7"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty", hold_token = true },
+  { raw = "set_wall_clock", by = "-48h" },
+  { raw = "advance_clock", by = "24h1m" },
+]
+inject = { raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }
+window = "1m"
+
+[fault.required_post]
+reports = ["TokenExpired"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+
+# B-11 (Medium). Fixture: gym-backup, a service with inferStops = false.
+[[fault]]
+id = "residue-infer-stops-false"
+family = "unattributed-residue"
+summary = "A raw kill -9 of gym-backup, whose manifest sets inferStops = false, under Standard: never inferred as intended; restarted and alarmed, like a Security-sensitive unit."
+spec = ["§11 unattributed residue", "B-11"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "kill_unit", unit = "service:gym-backup", signal = "SIGKILL" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-backup" = "Running" }
+overrides = []
+reports = ["alarm"]
+
+[[fault]]
+id = "residue-inferred-listed-until-ack"
+family = "unattributed-residue"
+summary = "An inferred override (gym-web killed under Standard) stays listed in the console until a user acknowledges it; acknowledging removes it from the list and does not lift the override."
+spec = ["§11 unattributed residue", "B-11"]
+tags = ["acceptance", "bypass"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "an unattributed stop under Standard is inferred as intended" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+after = [{ raw = "cli", argv = ["ack"], actor = "user:1000", when = { after = "1m" } }]
+window = "3m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", by = "Unattributed", attribution = "Inferred", until = "NextBoot" }]
+console_inferred = []
+reports = ["InferredOverride", "InferredOverrideAcknowledged"]
+no_txn_on = ["service:gym-web"]
+
+# B-13 (Low).
+[[fault]]
+id = "test-build-is-integrity"
+family = "failure-posture"
+summary = "The gym-hooks package's binaries are found in place of the real ones outside the gym. The boot report raises Integrity: exactly the Integrity responses, no agent starts. (The module assertion that refuses such a configuration is checked by evaluation, in `nix flake check`.)"
+spec = ["§12d", "§15 test builds", "B-13"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { raw = "plant_test_build" }
+after = [{ raw = "reboot" }]
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Integrity", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"] }
+not_started = ["service:gym-agent"]
+reports = ["BootReport(TestBuild)"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Group 2: one entry per proved invariant, from the English (§7)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# I5: "Decision::Reject is never converted to any tier by any setting."
+[[fault]]
+id = "en-i5-reject-survives-every-setting"
+family = "english"
+summary = "With autonomy at its maximum and every user setting at its most permissive, a change touching Planarian's core is still refused, and stays refused through a settings change made while it is pending."
+spec = ["I5"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "set_setting", key = "max_tier", value = "Tested" }]
+inject = { transition = "ApplyChange", change = "gym:touch-core", args = {}, source = "user", actor = "root" }
+after = [{ raw = "set_setting", key = "max_tier", value = "AskFirst" }]
+window = "2m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = "CoreTarget"
+
+# I6: "No transition executes during Activating, Published, Promoted or Reverting."
+[[fault]]
+id = "en-i6-repair-waits-for-activation"
+family = "english"
+summary = "While a slow generation change sits in Activating, gym-web crashes. Its restart is not executed until the activation leaves the exclusive states; then it runs."
+spec = ["I6"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "slow_backend", call = "activate_live", delay = "90s" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+]
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV", when = { journal = "Activating" } }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+terminal = "Committed"
+started_after = { transition = "ApplyChange", left = "Activating" }
+
+# I8: "...an approval token bound to the concrete candidate, re-validated immediately before execution."
+[[fault]]
+id = "en-i8-token-bound-to-candidate"
+family = "english"
+summary = "An AskFirst change is approved; before it runs, the owner edits the configuration so the candidate it would build differs. The token, bound to the old candidate, does not authorise the new one."
+spec = ["I8"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty", hold_token = true },
+  { raw = "edit_owner_source", path = "configuration.nix", tracked = true },
+]
+inject = { raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }
+window = "5m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+
+# I10: "No change that removes or alters a canonical probe executes below AskFirst."
+[[fault]]
+id = "en-i10-removing-a-probe-asks"
+family = "english"
+summary = "A change that removes sshd's canonical probe (not weakens it: removes it) is held at AskFirst."
+spec = ["I10"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:drop-probe", args = { unit = "sshd", probe = "sshd-tcp" }, source = "user", actor = "root" }
+window = "2m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+tier = "AskFirst"
+never = ["Activating"]
+
+# I11: "A session's cumulative effect is classified at least as high as any single transition producing it."
+[[fault]]
+id = "en-i11-three-small-steps"
+family = "english"
+summary = "Three changes in one session, each Routine on its own, together disable the firewall's ruleset. The third is classified at least as high as the cumulative diff (AskFirst), not as itself."
+spec = ["I11"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "gym:firewall-step", args = { step = 1 }, source = "user", actor = "root", session = "s1" },
+  { transition = "ApplyChange", change = "gym:firewall-step", args = { step = 2 }, source = "user", actor = "root", session = "s1" },
+]
+inject = { transition = "ApplyChange", change = "gym:firewall-step", args = { step = 3 }, source = "user", actor = "root", session = "s1" }
+window = "3m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+args = { step = 3 }
+tier = "AskFirst"
+
+# I12: "every transaction in the journal reaches a terminal state; RecoveryFailed always alerts and sets the recovery interlock."
+[[fault]]
+id = "en-i12-nothing-left-open"
+family = "english"
+summary = "The daemon and then the watchdog are killed at successive points of a generation change whose revert also fails. At the end no journaled transaction is non-terminal, the failed one is RecoveryFailed, an alert was raised, and an autonomous restart of gym-web is refused while the interlock holds."
+spec = ["I12"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "backend_result", call = "activate_live", result = "fail_revert" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+  { raw = "kill_process", process = "planariad", when = { journal = "Activating" } },
+  { raw = "kill_process", process = "planarian-recovery", when = { journal = "Reverting" } },
+]
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }
+window = "10m"
+
+[fault.required_post]
+interlock = "set"
+reports = ["alarm"]
+no_txn_on = ["service:gym-web"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "RecoveryFailed"
+
+# I14: "Policy facts ... are derived by the executor ..., never read from a proposal" (v4.5: or any request field).
+[[fault]]
+id = "en-i14-forged-fields-ignored"
+family = "english"
+summary = "An unprivileged user submits a change to sshd whose proposal claims caller root, sensitivity Routine and no affected units. The claims are ignored: the change is decided on derived facts (Security, sshd affected) and held for an administrator."
+spec = ["I14", "principle 6"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "forge_proposal_fields", fields = { caller = "root", sensitivity = "Routine", affected_units = [] }, request = { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false } }, actor = "user:1000" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+
+# I15: "a mutating call with a stale epoch is refused; only the lease holder advances the journal."
+[[fault]]
+id = "en-i15-old-worker-cannot-finish"
+family = "english"
+summary = "The watchdog takes over a generation change while the old activation worker is still alive and later tries to report success. Its report is refused, and only the watchdog's records follow in the journal."
+spec = ["I15"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "slow_backend", call = "activate_live", delay = "120s", uncancellable = true },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+]
+inject = { raw = "kill_process", process = "planariad", when = { op_called = "activate_live" } }
+window = "10m"
+
+[fault.required_post]
+reports = ["Fenced"]
+journal_owner_after_takeover = "watchdog"
+
+# I16: "No automatic revert, rollback, or boot fallback selects a generation below the security floor."
+[[fault]]
+id = "en-i16-boot-fallback-respects-floor"
+family = "english"
+summary = "The floor generation fails to boot. The automatic boot fallback does not select a generation below the floor; the machine stays at the floor and the incident says why."
+spec = ["I16"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "gym:security-fix", args = { version = "1.1" }, source = "user", actor = "root" }]
+inject = { raw = "reboot", fail_boot = true }
+window = "15m"
+
+[fault.required_post]
+security_floor = "candidate"
+boot_entries = { "base" = { automatic_fallback = false } }
+
+# I18: "Every journal record commits to the hash of its predecessor; a broken chain is detected on read."
+[[fault]]
+id = "en-i18-deleted-record-detected"
+family = "english"
+summary = "A retained journal record is deleted (not edited) and the rest re-framed so every frame is intact. The next read detects the break as an Integrity failure."
+spec = ["I18"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" },
+  { raw = "wait", for = "30s" },
+]
+inject = { raw = "delete_journal_record", record = 1 }
+after = [{ raw = "restart_process", process = "planariad" }]
+window = "3m"
+
+[fault.required_post]
+reports = ["JournalChainBroken"]
+posture = { class = "Integrity" }
+
+# I19: "No principal approves its own proposal, and no principal grants itself ... a capability it does not hold."
+[[fault]]
+id = "en-i19-no-self-approval"
+family = "english"
+summary = "Root proposes an AskFirst change and then, at a terminal, tries to approve it: refused. A planarian-admin member without Merge tries to grant itself Merge: refused."
+spec = ["I19"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "root" }]
+inject = { raw = "approve_pending", actor = "root", via = "tty" }
+after = [{ raw = "cli", argv = ["grant", "user:1001", "Merge"], actor = "user:1001" }]
+window = "3m"
+
+[fault.required_post]
+reports = ["SelfApprovalRefused", "SelfGrantRefused"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+
+# I21: "No transition that cannot be reversed ... executes below AskFirst, unless the loss falls only on the caller's own session."
+[[fault]]
+id = "en-i21-irreversible-asks-even-for-root"
+family = "english"
+summary = "Root, at maximum autonomy, starts a garbage collection that would delete the only copy of a user's generation history (irreversible). It is held at AskFirst."
+spec = ["I21"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "set_setting", key = "max_tier", value = "Tested" }]
+inject = { transition = "CollectGarbage", args = { delete_generations = "all-but-current" }, source = "user", actor = "root" }
+window = "2m"
+
+[[fault.required_post.txn]]
+transition = "CollectGarbage"
+tier = "AskFirst"
+
+# I22: "Changing the generation, collecting garbage, binding drivers, resolving the recovery interlock ... are administrator operations."
+[[fault]]
+id = "en-i22-user-cannot-do-admin-things"
+family = "english"
+summary = "A seated, unprivileged user tries, in turn, to roll back, collect garbage, bind a driver and resolve the interlock. Each is refused Unauthorized; nothing executes."
+spec = ["I22"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { transition = "Rollback", source = "user", actor = "user:1000" }
+after = [
+  { transition = "CollectGarbage", source = "user", actor = "user:1000" },
+  { transition = "BindDriver", args = { device = "device:snd-hda0", driver = "snd_hda_intel" }, source = "user", actor = "user:1000" },
+  { raw = "cli", argv = ["resolve", "any", "--as-reverted"], actor = "user:1000" },
+]
+window = "3m"
+
+[fault.required_post]
+no_txn_executed = true
+reports = ["Unauthorized"]
+
+# I23: "a runtime transaction never publishes, promotes or reverts; the override file is replaced only by compare-and-swap."
+[[fault]]
+id = "en-i23-third-party-override-kept"
+family = "english"
+summary = "While a change's override promotion is pending, a third party rewrites the override file. Planarian does not overwrite it: the change fails cleanly and the third party's file stands. A runtime restart in the same window writes no boot entry."
+spec = ["I23"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+  { raw = "edit_override_file", at = { journal = "Published" } },
+]
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }
+window = "10m"
+
+[fault.required_post]
+override_file = "third-party"
+units = { "service:gym-web" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Committed"]
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+boot_entries_unchanged = true
