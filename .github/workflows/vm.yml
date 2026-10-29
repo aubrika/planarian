@@ -94,6 +94,21 @@ jobs:
           cat verdict/verdict.json
           jq -e '.result == "PASS"' verdict/verdict.json
 
+  # The Firecracker microVM target (SPEC §4, Phase A): non-gating, allowed to
+  # stay red. Boots Planarian under Firecracker and checks one repair.
+  firecracker:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+      - run: nix build -L .#firecracker-target -o fc
+      - run: fc/bin/run-firecracker-target
+
   catalog-ids:
     if: inputs.catalog
     runs-on: ubuntu-24.04

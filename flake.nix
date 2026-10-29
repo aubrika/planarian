@@ -24,6 +24,8 @@
         console = pkgs.callPackage ./nix/console.nix { };
         # The live USB image: `nix build .#iso`, then write result/iso/*.iso to a flash drive.
         iso = self.nixosConfigurations."planarian-live-${pkgs.stdenv.hostPlatform.system}".config.system.build.isoImage;
+        # The gym's non-gating Firecracker target: `nix build .#firecracker-target`.
+        firecracker-target = import ./nix/firecracker.nix { inherit nixpkgs self; system = pkgs.stdenv.hostPlatform.system; };
         default = planarian;
       });
 

@@ -160,7 +160,7 @@ The fake harness: 57 of 72 entries, all PASS (the rest are VM-only).
 `ci.yml` on every push: fmt, clippy (also with the gym's hooks), the tests,
 the fake catalog and the GA demonstration, the dependency boundaries, the
 Verus proofs, the Kani harnesses. `vm.yml` on every push: the NixOS VM tests
-(runtime, generations, installer), the four GA demonstration entries on
+(runtime, generations, posture, installer), the four GA demonstration entries on
 VMs, and three entries that guard the gym harness itself (a step timed into
 a change, a user session with a device, a real /boot); the whole VM catalog
 by hand (about 70 runner minutes per push for
@@ -169,6 +169,7 @@ by hand (about 70 runner minutes per push for
 ## Not part of the gate, still open
 
 - The Asterinas VM target (allowed to stay red; not started).
+- The Firecracker microVM target (`nix build .#firecracker-target`, CI job `firecracker`, non-gating): boots Planarian under Firecracker and checks one repair.
 - Booting into a published generation in a VM (needs a VM that boots through
   its own boot loader).
 - COSMIC itself in the gym VM.
