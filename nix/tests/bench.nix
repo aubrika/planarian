@@ -22,6 +22,8 @@ pkgs.testers.runNixOSTest {
   name = "planarian-invisibility";
   # The report is a free-form dict; the driver's type checker cannot follow it.
   skipTypeCheck = true;
+  # Idle (7 min) plus fifteen game runs of up to 15 min each.
+  globalTimeout = 16200;
 
   nodes.machine = { pkgs, ... }: {
     imports = [ self.nixosModules.default ];
@@ -98,17 +100,19 @@ pkgs.testers.runNixOSTest {
             machine.wait_for_unit("planarian-ready.target")
             machine.succeed("systemctl unmask --runtime planarian-failed@absent.target")
 
-    def run(cond, i):
+    def run(cond, i, limit=900):
         assert demo
         out = f"/tmp/mh/{cond}-{i}"
         machine.succeed(f"rm -rf {out}; mkdir -p {out}")
         busy = cond == "busy"
         if busy:
-            machine.succeed("systemd-run --unit=bench-crasher sh -c 'while true; do sleep 30; systemctl kill --signal=SIGSEGV bench-svc; done'")
+            machine.succeed("systemd-run --unit=bench-crasher ${pkgs.runtimeShell} -c "
+                            "'while true; do ${pkgs.coreutils}/bin/sleep 30; ${pkgs.systemd}/bin/systemctl kill --signal=SIGSEGV bench-svc; done'")
         _, log = machine.execute(
             f"MANGOHUD_CONFIG=no_display,autostart_log=1,output_folder={out} "
-            f"timeout 600 xvfb-run -a -s '-screen 0 640x480x24' mangohud --dlsym {game} "
-            f"-nosound -benchmark {demo.removesuffix('.dem')} +vid_fullscreen 0 +vid_width 640 +vid_height 480 2>&1 | tail -n 40")
+            f"timeout -s INT {limit} xvfb-run -a -s '-screen 0 320x240x24' mangohud --dlsym {game} "
+            f"-nosound -benchmark {demo.removesuffix('.dem')} +exec effects-low.cfg +vid_fullscreen 0 "
+            f"+vid_width 320 +vid_height 240 2>&1 | tail -n 40")
         if busy:
             machine.execute("systemctl stop bench-crasher")
         csv = machine.succeed(f"cat {out}/*.csv 2>/dev/null || true")
@@ -133,8 +137,11 @@ pkgs.testers.runNixOSTest {
         if p99 is None and engine and float(engine.group(4)) > 0:
             p99 = 1000.0 / float(engine.group(4))
             source = "darkplaces one-second min"
-        return {"frames": len(times) or (int(engine.group(1)) if engine else 0), "p99_ms": p99, "source": source,
-                "engine": engine.group(0) if engine else None, "tail": log.splitlines()[-12:]}
+        result = {"frames": len(times) or (int(engine.group(1)) if engine else 0), "p99_ms": p99, "source": source,
+                  "engine": engine.group(0) if engine else None, "tail": log.splitlines()[-12:],
+                  "mangohud_files": machine.succeed(f"ls -la {out}").splitlines()[1:]}
+        print(f"{cond}-{i}:", json.dumps(result, indent=1))
+        return result
 
     def mann_whitney_p(a, b):
         # Exact two-sided p of the U statistic, by enumerating every split.
@@ -150,6 +157,12 @@ pkgs.testers.runNixOSTest {
             hits += abs(u(xa, xb) - len(a) * len(b) / 2) >= observed - 1e-9
         return hits / n
 
+    print(json.dumps(report["game"], indent=1))
+    if demo:
+        # A short probe first, for the log: what the game prints and what
+        # MangoHud writes in three minutes.
+        with subtest("probe"):
+            report["game"]["probe"] = run("probe", 0, limit=180)
     if demo:
         with subtest("game"):
             runs = {"stopped": [], "idle": [], "busy": []}
@@ -159,6 +172,11 @@ pkgs.testers.runNixOSTest {
                     runs[cond].append(run(cond, i))
                     if cond == "stopped":
                         stopped(False)
+                # A first round without one frame-time sample will not get
+                # better: stop, and say so, instead of spending hours.
+                if i == 0 and all(runs[c][0]["p99_ms"] is None for c in runs):
+                    report["game"]["error"] = "the first round recorded no frame times"
+                    break
             report["game"]["runs"] = runs
             p99 = {c: [r["p99_ms"] for r in rs if r["p99_ms"] is not None] for c, rs in runs.items()}
             report["game"]["p99_ms_median"] = {c: statistics.median(v) if v else None for c, v in p99.items()}
@@ -166,7 +184,7 @@ pkgs.testers.runNixOSTest {
                 if len(p99[c]) == 5 and len(p99["stopped"]) == 5:
                     report["game"][f"p_{c}_vs_stopped"] = mann_whitney_p(p99[c], p99["stopped"])
             print(json.dumps(report["game"], indent=1))
-    else:
+    elif "error" not in report["game"]:
         report["game"]["error"] = "no demo in the Xonotic data"
 
     encoded = base64.b64encode(json.dumps(report).encode()).decode()
@@ -177,7 +195,7 @@ pkgs.testers.runNixOSTest {
     idle = report["idle"]
     assert idle["cpu_percent_of_one_core"] < 0.5, f"idle CPU {idle['cpu_percent_of_one_core']}% of a core"
     assert idle["resident_mb"] < 50, f"resident {idle['resident_mb']} MB"
-    assert demo, "no demo to run"
+    assert demo and "error" not in report["game"], report["game"].get("error")
     for c in ("idle", "busy"):
         p = report["game"].get(f"p_{c}_vs_stopped")
         assert p is not None, f"{c}: not enough frame-time samples"
