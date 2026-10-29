@@ -337,6 +337,13 @@ fn banners<'a>(r: &ConsoleReport) -> Vec<Element<'a, Message>> {
     for p in &s.pending {
         out.push(banner(format!("Waiting for approval: {} (as root: planarian approve {})", p.what, p.approve), false));
     }
+    // §11 (B-11): stops taken as someone's intent, until a user acknowledges.
+    for (u, why) in &s.inferred {
+        out.push(banner(
+            format!("Left stopped: {u} was {why}; Planarian took that as intended. If it was not, start it again; `planarian ack` once seen."),
+            false,
+        ));
+    }
     if let Some(n) = &s.baseline_note {
         out.push(banner(n.clone(), false));
     }

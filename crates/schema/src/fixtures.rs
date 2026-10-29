@@ -34,6 +34,7 @@ pub fn service(name: &str) -> UnitDef {
         systemd_restart: None,
         startup_grace: None,
         runtime_repair: None,
+        stops_are_faults: false,
     }
 }
 

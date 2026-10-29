@@ -1029,6 +1029,7 @@ mod tests {
                 systemd_restart: None,
                 startup_grace: None,
                 runtime_repair: None,
+                stops_are_faults: false,
             }],
             ..Default::default()
         };

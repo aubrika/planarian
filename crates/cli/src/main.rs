@@ -126,6 +126,8 @@ fn parse(args: &[String]) -> Result<(Request, bool), String> {
         ["agent", "run", name, "--", argv @ ..] if !argv.is_empty() => {
             Request::AgentRun { name: name.to_string(), argv: argv.iter().map(|s| s.to_string()).collect() }
         }
+        ["ack"] => Request::Acknowledge { unit: None },
+        ["ack", u] => Request::Acknowledge { unit: Some(unit(u)?) },
         ["mark-security-floor"] => Request::MarkSecurityFloor,
         ["mark-good"] => Request::MarkGood { accept_unconfirmed: false },
         ["mark-good", "--accept-unconfirmed"] => Request::MarkGood { accept_unconfirmed: true },
@@ -225,6 +227,12 @@ fn print_status(r: &StatusReport) {
         println!("\nafter the last restart:");
         for a in rec {
             println!("  {a}");
+        }
+    }
+    if !r.inferred.is_empty() {
+        println!("\ntaken as intended (stopped outside Planarian; `planarian ack` once seen):");
+        for (u, why) in &r.inferred {
+            println!("  {u}: {why}");
         }
     }
     if !r.notices.is_empty() {

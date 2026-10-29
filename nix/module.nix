@@ -135,6 +135,18 @@ let
         description = "Seconds after this unit comes up during which a failing health probe is not yet a fault. `null`: `services.planarian.startupGrace`.";
       };
       sysfs = mkOption { type = types.nullOr types.str; default = null; description = "Devices: the sysfs directory, e.g. /sys/bus/pci/devices/0000:00:1b.0."; };
+      inferStops = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Whether a stop outside Planarian (a signal, an unissued systemctl
+          stop) may be taken, under the Relaxed and Standard postures, as the
+          person's intent (an inferred override until the next boot). False
+          for units whose absence is harm whoever caused it (backup, sync, the
+          desktop's own units): such a stop is a fault, restarted and alarmed
+          (§11). Security-sensitive units are always treated so.
+        '';
+      };
       runtimeRepair = mkOption {
         type = types.nullOr (types.enum [ "wifi.network" ]);
         default = null;
@@ -235,6 +247,7 @@ let
     systemd_restart = if u.scope == "system" && u.kind == "service" then restartJSON name else null;
     startup_grace = if u.startupGrace == null then null else u.startupGrace * 1000;
     runtime_repair = u.runtimeRepair;
+    stops_are_faults = !u.inferStops;
   };
 
   unitsOf = scope: lib.mapAttrsToList unitJSON (lib.filterAttrs (_: u: u.scope == scope) cfg.units);
@@ -463,7 +476,8 @@ in
       fs-nix = mkIf (config.fileSystems ? "/nix") (mkDefault { kind = "device"; });
       sshd = mkIf config.services.openssh.enable (mkDefault { synonyms = [ "ssh" ]; });
       NetworkManager = mkIf config.networking.networkmanager.enable (mkDefault { synonyms = [ "wifi" "wi-fi" "network" "internet" ]; });
-      ${dmUnit} = mkIf hasDm (mkDefault { synonyms = [ "login screen" "greeter" ]; });
+      # The desktop's own unit: its absence is harm, whoever stopped it (§11).
+      ${dmUnit} = mkIf hasDm (mkDefault { synonyms = [ "login screen" "greeter" ]; inferStops = false; });
       graphical-session = mkIf hasDesktop (mkDefault { kind = "target"; when = "session"; synonyms = [ "desktop" ]; });
       pipewire = mkIf config.services.pipewire.enable (mkDefault { scope = "user"; synonyms = [ "sound" "audio" ]; });
     };

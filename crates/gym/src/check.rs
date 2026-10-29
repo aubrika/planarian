@@ -368,6 +368,21 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     fail(&mut v, format!("interlock is {}", if set { "set" } else { "clear" }));
                 }
             }
+            // §11 (B-11): the inferred overrides still listed (not yet
+            // acknowledged) at the end.
+            "inferred_listed" => {
+                let want: BTreeSet<String> =
+                    val.as_array().into_iter().flatten().filter_map(T::as_str).map(String::from).collect();
+                let got: BTreeSet<String> = ledger
+                    .overrides
+                    .iter()
+                    .filter(|o| o.attribution == Attribution::Inferred && !o.acknowledged)
+                    .map(|o| o.unit.to_string())
+                    .collect();
+                if got != want {
+                    fail(&mut v, format!("inferred overrides listed: {got:?}, want {want:?}"));
+                }
+            }
             "overrides" => {
                 let want: Vec<(String, String)> = val
                     .as_array()

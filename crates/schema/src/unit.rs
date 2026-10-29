@@ -68,6 +68,10 @@ pub struct Override {
     /// `Actor::Unattributed` exactly when `attribution == Inferred`.
     pub by: Actor,
     pub attribution: Attribution,
+    /// An `Inferred` override a user has acknowledged: the console stops
+    /// listing it; it still holds until it ends (§11, B-11).
+    #[serde(default)]
+    pub acknowledged: bool,
 }
 
 /// What the override holds the unit to (§8). A `Stopped` override also undoes
@@ -249,7 +253,7 @@ impl Actor {
 impl Override {
     /// An attested override: the action reached Planarian with `by`'s identity first.
     pub fn attested(unit: UnitId, desired: OverrideDesired, until: Until, reason: String, by: Actor) -> Override {
-        Override { unit, desired, until, reason, by, attribution: Attribution::Attested }
+        Override { unit, desired, until, reason, by, attribution: Attribution::Attested, acknowledged: false }
     }
 }
 
@@ -489,6 +493,11 @@ pub struct UnitDef {
     /// diagnoser may propose another value the backend says is available.
     #[serde(default)]
     pub runtime_repair: Option<String>,
+    /// The manifest's `inferStops = false` (§11, B-11): a stop outside
+    /// Planarian is a fault (restarted and alarmed), never inferred as a
+    /// person's intent. Backup, sync and the desktop's own units.
+    #[serde(default)]
+    pub stops_are_faults: bool,
 }
 
 pub type UnitDefs = BTreeMap<UnitId, UnitDef>;

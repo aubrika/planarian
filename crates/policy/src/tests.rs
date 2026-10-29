@@ -72,6 +72,7 @@ fn transitions() -> Vec<Transition> {
             by: Actor::Daemon,
             desired: OverrideDesired::LeaveAlone,
             attribution: Attribution::Attested,
+            acknowledged: false,
         }),
         Transition::LiftOverride(u.clone()),
         Transition::StopAndSuppress { unit: u.clone(), until: Until::NextBoot, reason: String::new() },
@@ -315,6 +316,7 @@ fn i14_actor_field_is_not_authority() {
             by: claimed,
             desired: OverrideDesired::LeaveAlone,
             attribution: Attribution::Attested,
+            acknowledged: false,
         });
         let d = decide(&Input {
             transition: &t,
@@ -361,6 +363,7 @@ fn catalog_policy_cases() {
         by: Actor::Daemon,
         desired: OverrideDesired::LeaveAlone,
         attribution: Attribution::Attested,
+        acknowledged: false,
     });
     assert_eq!(
         one(
@@ -400,6 +403,7 @@ fn catalog_policy_cases() {
         by: Actor::Daemon,
         desired: OverrideDesired::LeaveAlone,
         attribution: Attribution::Attested,
+        acknowledged: false,
     });
     assert_eq!(one(own, routine(), alice.clone()), at(Tier::Runtime));
 

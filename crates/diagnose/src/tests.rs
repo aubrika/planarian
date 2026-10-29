@@ -161,6 +161,7 @@ fn suppressed_root_is_never_a_target() {
         by: Actor::user(0),
         desired: OverrideDesired::LeaveAlone,
         attribution: Attribution::Attested,
+        acknowledged: false,
     });
     let app = UnitId::service("gym-app");
     observe(&mut w.s, &w.defs, &app, Observed::Bound, ProbeResult::Fail("x".into()));

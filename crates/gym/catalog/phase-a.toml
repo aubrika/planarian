@@ -2827,3 +2827,41 @@ window = "2m"
 [[fault.required_post.txn]]
 transition = "StopAndSuppress"
 caller = "user:1000@-"
+
+# B-11 (Medium).
+[[fault]]
+id = "residue-infer-stops-false"
+family = "unattributed-residue"
+summary = "A raw kill -9 of gym-backup, whose manifest sets inferStops = false, under Standard: never taken as intended; alarmed and started again, as a fault."
+spec = ["§11 unattributed residue", "B-11"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "kill_unit", unit = "service:gym-backup", signal = "SIGKILL" }
+window = "3m"
+
+[fault.required_post]
+units = { "service:gym-backup" = "Running" }
+overrides = []
+reports = ["alarm"]
+
+[[fault]]
+id = "residue-inferred-listed-until-ack"
+family = "unattributed-residue"
+summary = "An inferred override (gym-web killed under Standard) is listed until a user acknowledges it with `planarian ack`; acknowledging stops the listing and does not lift the override."
+spec = ["§11 unattributed residue", "B-11"]
+tags = ["acceptance", "bypass"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "an unattributed stop under Standard is inferred as intended" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+after = [{ raw = "wait", for = "1m" }, { raw = "cli", argv = ["ack"], actor = "user:1000" }]
+window = "3m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", by = "Unattributed", attribution = "Inferred", until = "NextBoot" }]
+inferred_listed = []
+reports = ["InferredOverride"]
+no_txn_on = ["service:gym-web"]

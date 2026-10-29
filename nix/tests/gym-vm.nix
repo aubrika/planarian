@@ -203,6 +203,10 @@ let
             ];
           };
           gym-db.probes = [ { id = "gym-db-tcp"; type = "tcp"; addr = "127.0.0.1:5432"; establishes = "gym-db-tcp"; } ];
+          gym-backup = {
+            inferStops = false;
+            probes = [ { id = "gym-backup-tcp"; type = "tcp"; addr = "127.0.0.1:8095"; establishes = "gym-backup-tcp"; } ];
+          };
           gym-app.probes = [ { id = "gym-app-tcp"; type = "tcp"; addr = "127.0.0.1:8081"; establishes = "gym-app-tcp"; } ];
           gym-cache.probes = [ { id = "gym-cache-tcp"; type = "tcp"; addr = "127.0.0.1:6379"; establishes = "gym-cache-tcp"; } ];
           gym-metrics = {
@@ -287,6 +291,8 @@ let
         gym-web = svc "gym-web" "8080 --http --addr ${config.services.gym-web.listenAddress}" { };
         gym-db = svc "gym-db" "5432" { };
         gym-cache = svc "gym-cache" "6379" { };
+        # inferStops = false (§11, B-11).
+        gym-backup = svc "gym-backup" "8095" { };
         gym-metrics = svc "gym-metrics" "9100" { };
         gym-app = svc "gym-app" "8081" {
           requires = [ "gym-db.service" ];

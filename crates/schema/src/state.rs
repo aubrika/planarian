@@ -275,6 +275,7 @@ mod tests {
             systemd_restart: None,
             startup_grace: None,
             runtime_repair: None,
+            stops_are_faults: false,
         }
     }
 
@@ -368,6 +369,7 @@ mod tests {
             by: Actor::user(1000),
             desired: OverrideDesired::LeaveAlone,
             attribution: Attribution::Attested,
+            acknowledged: false,
         });
         assert_eq!(s.status(&id, &defs), UnitStatus::Overridden(OverrideDesired::LeaveAlone));
         s.observed_at = Timestamp(200_000);
@@ -472,6 +474,7 @@ mod tests {
                     by: Actor::Daemon,
                     desired: OverrideDesired::LeaveAlone,
                     attribution: Attribution::Attested,
+                    acknowledged: false,
                 });
                 prop_assert_ne!(s.digest(), u.digest());
                 if let Some((id, (old, ev))) = s.units.iter().next() {

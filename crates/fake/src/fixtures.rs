@@ -47,6 +47,7 @@ pub fn unit(id: &str, sens: &[Sensitivity], disruption: Disruption, probes: Vec<
         systemd_restart: None,
         startup_grace: None,
         runtime_repair: None,
+        stops_are_faults: false,
     }
 }
 
@@ -173,6 +174,15 @@ pub fn gym_units() -> UnitDefs {
     let wlan = unit("device:wlan-hwsim", &[External], Disruption::ConnectivityLoss, vec![]);
 
     let fs = |name: &str| unit(&format!("device:{name}"), r, Disruption::None, vec![]);
+    // inferStops = false (§11, B-11): a backup job's absence is harm,
+    // whoever stopped it.
+    let mut backup = unit(
+        "service:gym-backup",
+        r,
+        Disruption::Brief,
+        vec![user_probe("gym-backup-active", ProbeKind::SystemdActive)],
+    );
+    backup.stops_are_faults = true;
 
     [
         web,
@@ -192,6 +202,7 @@ pub fn gym_units() -> UnitDefs {
         nic,
         gpu,
         wlan,
+        backup,
         fs("fs-root"),
         fs("fs-nix"),
         fs("fs-boot"),

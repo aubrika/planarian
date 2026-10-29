@@ -1220,6 +1220,8 @@ impl Sim {
             },
             ["stop", u] => Request::Stop { unit: unit(u) },
             ["restart", u] => Request::Restart { unit: unit(u) },
+            ["ack"] => Request::Acknowledge { unit: None },
+            ["ack", u] => Request::Acknowledge { unit: Some(unit(u)) },
             ["release", u] => Request::LiftOverride { unit: unit(u) },
             ["resolve", _, how] => {
                 let l = self.ledger();

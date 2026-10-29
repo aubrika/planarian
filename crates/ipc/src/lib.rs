@@ -94,6 +94,11 @@ pub enum Request {
         name: String,
         argv: Vec<String>,
     },
+    /// `planarian ack [<unit>]`: acknowledge inferred overrides (all, or one
+    /// unit's), so they stop being listed (§11, B-11). They still hold.
+    Acknowledge {
+        unit: Option<UnitId>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +137,10 @@ pub struct StatusReport {
     /// The last garbage collection's result (§12b).
     #[serde(default)]
     pub space: Option<planarian_schema::gc::SpaceReport>,
+    /// Inferred overrides no user has acknowledged yet (§11, B-11): stops
+    /// Planarian took as someone's intent. Listed until `planarian ack`.
+    #[serde(default)]
+    pub inferred: Vec<(UnitId, String)>,
 }
 
 /// One node of the console's Graph view: what is desired, what is observed,

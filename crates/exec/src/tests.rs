@@ -225,6 +225,7 @@ fn authz_and_refinement_and_digest() {
         by: Actor::Daemon,
         desired: OverrideDesired::LeaveAlone,
         attribution: Attribution::Attested,
+        acknowledged: false,
     });
     // Held for an administrator (§11), not refused; alice can't approve it.
     let Submitted::Parked { approve, .. } = r.propose(sup, alice()) else { panic!("not parked") };
@@ -273,6 +274,7 @@ fn forged_actor_is_overwritten() {
         by: Actor::Daemon,
         desired: OverrideDesired::LeaveAlone,
         attribution: Attribution::Attested,
+        acknowledged: false,
     });
     assert_eq!(finished(&r.propose(sup, alice())), TxnState::Committed);
     let l = r.ex.kernel.journal.sync_ledger().unwrap();

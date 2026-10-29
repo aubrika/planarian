@@ -70,6 +70,10 @@ in
       "plymouth.use-simpledrm"
     ];
 
+    # §11 (B-11): a sync service's absence is harm, whoever stopped it.
+    # (Backup jobs run as oneshots: there is no running unit to infer from.)
+    services.planarian.units.syncthing = lib.mkIf (config.services.syncthing.enable or false) { inferStops = lib.mkDefault false; };
+
     # The console autostarts on the reference desktop (§16a).
     services.planarian.console.enable = lib.mkDefault true;
 

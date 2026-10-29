@@ -652,6 +652,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 ));
                 continue;
             }
+            // inferStops = false (B-11): never inferred as intent; a fault,
+            // which the incident manager repairs.
+            if def.stops_are_faults {
+                self.notice(format!(
+                    "ALARM: {u}, which must keep running, was stopped outside Planarian ({}); starting it again",
+                    signal_name(e)
+                ));
+                continue;
+            }
             let restartful = def.systemd_restart.as_ref().is_some_and(|p| p.restart);
             if lenient && !restartful {
                 down.insert(u.clone(), e);
@@ -683,6 +692,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     reason,
                     by: Actor::Unattributed,
                     attribution: Attribution::Inferred,
+                    acknowledged: false,
                 };
                 self.journal(Record::OverrideSet(o));
             };
@@ -1390,6 +1400,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 })
                 .collect(),
             reconciliation: l.last_reconciliation.map(|r| r.actions),
+            inferred: l
+                .overrides
+                .iter()
+                .filter(|o| o.attribution == Attribution::Inferred && !o.acknowledged)
+                .map(|o| (o.unit.clone(), o.reason.clone()))
+                .collect(),
             notices: self
                 .building
                 .as_ref()
@@ -1605,6 +1621,35 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 Source::User,
                 "from the CLI".into(),
             ),
+            Request::Acknowledge { unit } => {
+                if peer.agent.is_some() {
+                    return Response::Rejected {
+                        reason: "Unauthorized".into(),
+                        message: "an agent cannot acknowledge".into(),
+                    };
+                }
+                let open: Vec<Override> = self
+                    .ledger()
+                    .overrides
+                    .iter()
+                    .filter(|o| o.attribution == Attribution::Inferred && !o.acknowledged)
+                    .filter(|o| unit.as_ref().is_none_or(|u| *u == o.unit))
+                    .cloned()
+                    .collect();
+                for o in &open {
+                    self.journal(Record::OverrideSet(Override { acknowledged: true, ..o.clone() }));
+                }
+                if !open.is_empty() {
+                    self.notice(format!(
+                        "uid {} acknowledged: {}",
+                        peer.uid,
+                        open.iter().map(|o| format!("{} (inferred override)", o.unit)).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                Response::Ok {
+                    message: format!("{} inferred override(s) acknowledged; they hold until they end", open.len()),
+                }
+            }
             Request::AgentRun { name, argv } => {
                 if peer.agent.is_some() {
                     return Response::Rejected {

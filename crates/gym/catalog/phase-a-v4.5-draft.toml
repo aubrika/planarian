@@ -85,44 +85,6 @@ target = "service:fail2ban"
 approver_class = "Administrator"
 never = ["Activating"]
 
-# B-11 (Medium). Fixture: gym-backup, a service with inferStops = false.
-[[fault]]
-id = "residue-infer-stops-false"
-family = "unattributed-residue"
-summary = "A raw kill -9 of gym-backup, whose manifest sets inferStops = false, under Standard: never inferred as intended; restarted and alarmed, like a Security-sensitive unit."
-spec = ["§11 unattributed residue", "B-11"]
-tags = ["acceptance", "bypass"]
-scoring = "must-pass"
-harness = ["fake", "vm"]
-intent = { kind = "none" }
-inject = { raw = "kill_unit", unit = "service:gym-backup", signal = "SIGKILL" }
-window = "2m"
-
-[fault.required_post]
-units = { "service:gym-backup" = "Running" }
-overrides = []
-reports = ["alarm"]
-
-[[fault]]
-id = "residue-inferred-listed-until-ack"
-family = "unattributed-residue"
-summary = "An inferred override (gym-web killed under Standard) stays listed in the console until a user acknowledges it; acknowledging removes it from the list and does not lift the override."
-spec = ["§11 unattributed residue", "B-11"]
-tags = ["acceptance", "bypass"]
-scoring = "intent"
-harness = ["fake", "vm"]
-intent = { kind = "no-intervention", because = "an unattributed stop under Standard is inferred as intended" }
-inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
-after = [{ raw = "cli", argv = ["ack"], actor = "user:1000", when = { after = "1m" } }]
-window = "3m"
-
-[fault.required_post]
-units = { "service:gym-web" = "Overridden" }
-overrides = [{ unit = "service:gym-web", by = "Unattributed", attribution = "Inferred", until = "NextBoot" }]
-console_inferred = []
-reports = ["InferredOverride", "InferredOverrideAcknowledged"]
-no_txn_on = ["service:gym-web"]
-
 # B-13 (Low).
 [[fault]]
 id = "test-build-is-integrity"

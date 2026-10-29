@@ -153,6 +153,7 @@ fn suppression_closes_and_is_never_a_target() {
         by: Actor::user(1000),
         desired: OverrideDesired::LeaveAlone,
         attribution: Attribution::Attested,
+        acknowledged: false,
     });
     sim.ticks(3);
     assert!(sim.active("gym-web").is_none());
