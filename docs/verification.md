@@ -27,8 +27,11 @@ CI if the global or any per-invariant ratio falls or the trust count grows.
 
 GA baseline (2026-10-29): **trust count = 32** (19 `assumptions.md` entries
 plus 13 `external_body` sites: 8 ledger helpers and 5 opaque types);
-**global d:a = 28:43**. Invariants with a proof claim in Phase A:
-I5 4:3, I6 5:5, I11 2:2, I12 7:8, I14 1:2, I15 2:2, I16 2:3, I19 3:1.
+**global d:a = 28:43**, raised to **32:43** the same day by mapping four
+proved obligations (`only_generations_publish` and
+`boot_only_never_activates` to I6, `step_allowed` and `add_interlock` to
+I12; arguments in `guarantees.md` §3). Invariants with a proof claim in
+Phase A: I5 4:3, I6 7:5, I11 2:2, I12 9:8, I14 1:2, I15 2:2, I16 2:3, I19 3:1.
 I1–I4, I7, I13, I17, I18 and I20 are tested, not proved (their proof
 phases are in SPEC §8).
 

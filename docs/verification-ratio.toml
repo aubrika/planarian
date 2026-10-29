@@ -11,10 +11,11 @@
 # fell or the trust count grew against [baseline] (the ratchet: every gate).
 
 [baseline]
-# GA (2026-10-29), from `planarian-gym verification --write-baseline`.
+# GA (2026-10-29), from `planarian-gym verification --write-baseline`;
+# raised the same day when four proved obligations were mapped (I6, I12).
 # Change these only when a change improves them.
 trust_count = 32
-discharged = 28
+discharged = 32
 assumed = 43
 
 [baseline.per_invariant]
@@ -23,12 +24,12 @@ I2 = [0, 2]
 I3 = [0, 2]
 I4 = [0, 1]
 I5 = [4, 3]
-I6 = [5, 5]
+I6 = [7, 5]
 I7 = [0, 1]
 I8 = [1, 1]
 I10 = [1, 2]
 I11 = [2, 2]
-I12 = [7, 8]
+I12 = [9, 8]
 I13 = [0, 1]
 I14 = [1, 2]
 I15 = [2, 2]
@@ -81,7 +82,7 @@ assumes = ["V1", "V2", "V3"]
 id = "I6"
 statement = "At most one generation-changing transaction is active; nothing executes during Activating, Published, Promoted or Reverting."
 phase = "A (proof)"
-discharged = ["txn::validate", "txn::apply", "txn::well_formed", "txn::i6_one_generation_active", "txn::compatible_exec"]
+discharged = ["txn::validate", "txn::apply", "txn::well_formed", "txn::i6_one_generation_active", "txn::compatible_exec", "txn::only_generations_publish", "txn::boot_only_never_activates"]
 assumes = ["V3", "V4", "V5", "V6", "P4"]
 
 [[invariant]]
@@ -120,7 +121,7 @@ id = "I12"
 statement = "Under the progress assumptions, every transaction reaches a terminal state; RecoveryFailed alerts and sets the interlock."
 phase = "A (proof, conditional)"
 tested = ["exec crash-point property tests", "gym fake-assumptions-conformance"]
-discharged = ["txn::i12_steps_terminate", "txn::i12_terminal_always_reachable", "txn::terminal_is_final", "txn::refusal_only_before_mutation", "txn::apply", "txn::recovery_table_follows_the_state_machine", "txn::watchdog_takes_over_only_when_it_should"]
+discharged = ["txn::i12_steps_terminate", "txn::i12_terminal_always_reachable", "txn::terminal_is_final", "txn::refusal_only_before_mutation", "txn::apply", "txn::recovery_table_follows_the_state_machine", "txn::watchdog_takes_over_only_when_it_should", "txn::step_allowed", "txn::add_interlock"]
 assumes = ["G1", "G2", "G3", "G4", "P1", "P4", "P7", "V5"]
 
 [[invariant]]
