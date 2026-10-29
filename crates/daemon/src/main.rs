@@ -37,6 +37,25 @@ fn fresh_boot(state: &Path, boot: &str) -> bool {
     fresh
 }
 
+/// `sd_notify(3)`: one datagram to `$NOTIFY_SOCKET`, if systemd gave one.
+fn sd_notify(msg: &str) {
+    let Some(path) = std::env::var_os("NOTIFY_SOCKET") else { return };
+    let Ok(s) = std::os::unix::net::UnixDatagram::unbound() else { return };
+    let path = std::path::PathBuf::from(path);
+    // An abstract socket is written with a leading '@'.
+    let sent = match path.to_str().and_then(|p| p.strip_prefix('@')) {
+        Some(name) => {
+            use std::os::linux::net::SocketAddrExt;
+            std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+                .and_then(|a| s.send_to_addr(msg.as_bytes(), &a))
+        }
+        None => s.send_to(msg.as_bytes(), &path),
+    };
+    if let Err(e) = sent {
+        eprintln!("planariad: sd_notify: {e}");
+    }
+}
+
 /// Exit status for an `Integrity` failure (§12d). The response lives in
 /// `nix/posture.nix`, never here: this only reports what was found and stops.
 pub const EXIT_INTEGRITY: i32 = 78;
@@ -233,6 +252,10 @@ fn main() {
         }
     };
     let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o666));
+    // Ready (§12d): the journal is open and reconciled and the socket is up.
+    // systemd then reaches planarian-ready.target, after which the units that
+    // admit principals start.
+    sd_notify("READY=1");
     let (tx, rx) = mpsc::channel::<Event>();
     let built_tx = tx.clone();
     let group = file.admin_group.clone();

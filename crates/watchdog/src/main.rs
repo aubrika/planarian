@@ -37,6 +37,7 @@ fn main() {
     };
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
     let me = OwnerId::Watchdog { pid: std::process::id(), boot_id: Hash::of(boot.trim().as_bytes()) };
+    core_hash_check();
     eprintln!("planarian-recovery: watching {}", paths.journal_dir().display());
     loop {
         if let Err(e) = pass(&paths, &file, &canonical, &me) {
@@ -80,4 +81,23 @@ fn pass(
         }
     }
     Ok(())
+}
+
+/// I2 in Phase A (§12d's independent check): the installed core binary's
+/// SHA-256 equals the hash recorded at build time. A mismatch is an Integrity
+/// failure: report it and stop with status 78; the posture units respond.
+fn core_hash_check() {
+    let (Ok(record), Ok(binary)) = (std::env::var("PLANARIAN_CORE_HASH"), std::env::var("PLANARIAN_CORE_BINARY"))
+    else {
+        return;
+    };
+    let want = std::fs::read_to_string(&record).unwrap_or_default().trim().to_string();
+    let have = std::fs::read(&binary).map(|b| Hash::of(&b).to_hex()).unwrap_or_default();
+    if want.is_empty() || have != want {
+        let why = format!("core: {binary} hashes to {have:?}, but {record} records {want:?}");
+        eprintln!("planarian-recovery: INTEGRITY: {why}");
+        let _ = std::fs::create_dir_all("/run/planarian");
+        let _ = std::fs::write("/run/planarian/integrity", format!("{why}\n"));
+        std::process::exit(78);
+    }
 }

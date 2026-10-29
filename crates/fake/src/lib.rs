@@ -168,6 +168,8 @@ pub struct World {
     /// Whether the compositor runs in each session's cgroup (§9); a session
     /// not listed falls back to the user's graphical-session target.
     pub compositors: BTreeMap<String, bool>,
+    /// Units planted outside the generation (the boot report finds them).
+    pub foreign_units: Vec<String>,
     /// Sessions in which foreground work holds (§10 quiet mode).
     pub foreground: BTreeSet<String>,
     pub power: Option<PowerSource>,
@@ -479,6 +481,10 @@ impl UnitBackend for Fake {
 
     fn ended_by(&self, id: &UnitId) -> Option<Ending> {
         self.w().units.get(&World::key(id)).and_then(|s| s.ended)
+    }
+
+    fn foreign_units(&self) -> Vec<String> {
+        self.w().foreign_units.clone()
     }
 
     fn list(&self) -> Result<Vec<UnitId>, Outcome> {

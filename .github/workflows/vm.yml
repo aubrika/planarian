@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        check: [vm-runtime, vm-generations, installer]
+        check: [vm-runtime, vm-generations, vm-posture, installer]
     steps:
       - uses: actions/checkout@v4
       - name: Enable KVM

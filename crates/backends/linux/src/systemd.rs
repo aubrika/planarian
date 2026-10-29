@@ -57,6 +57,16 @@ pub fn ending_from(props: &BTreeMap<String, String>) -> Option<Ending> {
     }
 }
 
+/// A unit file that belongs to the generation: in the store (directly or
+/// through /etc's links into it), written by a systemd generator, or none at
+/// all (scopes, slices, devices, mounts systemd makes up).
+pub fn declared(fragment: &str) -> bool {
+    if fragment.is_empty() || fragment.starts_with("/nix/store/") || fragment.starts_with("/run/systemd/generator") {
+        return true;
+    }
+    std::fs::canonicalize(fragment).is_ok_and(|p| p.starts_with("/nix/store/"))
+}
+
 pub fn observed_from(props: &BTreeMap<String, String>, now: Timestamp) -> Observed {
     let get = |k: &str| props.get(k).map(String::as_str).unwrap_or("");
     if get("LoadState") == "not-found" {
@@ -124,6 +134,26 @@ impl UnitBackend for Systemd {
         Ok(observed_from(&parse_show(&o.stdout), now()))
     }
 
+    fn foreign_units(&self) -> Vec<String> {
+        let o = self.ctl(
+            &Scope::System,
+            &["list-units", "--state=active", "--no-legend", "--plain", "--all"],
+            QUERY_TIMEOUT,
+        );
+        if !o.ok() {
+            return vec![];
+        }
+        let mut out = vec![];
+        for name in o.stdout.lines().filter_map(|l| l.split_whitespace().next()) {
+            let s = self.ctl(&Scope::System, &["show", "--property=FragmentPath", "--value", name], QUERY_TIMEOUT);
+            let frag = s.stdout.trim();
+            if s.ok() && !declared(frag) {
+                out.push(format!("{name} ({frag})"));
+            }
+        }
+        out
+    }
+
     fn ended_by(&self, id: &UnitId) -> Option<Ending> {
         let o = self.ctl(
             &id.scope,
@@ -167,6 +197,10 @@ mod tests {
     fn mapping() {
         let o = |s: &str| observed_from(&parse_show(s), Timestamp(0));
         assert_eq!(o("LoadState=loaded\nActiveState=active\nSubState=running\nExecMainStatus=0\n"), Observed::Active);
+        assert!(
+            declared("") && declared("/nix/store/abc-unit/x.service") && declared("/run/systemd/generator/a.mount")
+        );
+        assert!(!declared("/etc/systemd/system/planted-by-hand-0000.service"));
         let e = |t: &str| ending_from(&parse_show(t));
         assert_eq!(e("Result=signal\nExecMainCode=2\nExecMainStatus=9\n"), Some(Ending::Signal(9)));
         assert_eq!(e("Result=success\nExecMainCode=2\nExecMainStatus=15\n"), Some(Ending::Signal(15)));

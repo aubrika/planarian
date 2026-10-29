@@ -207,6 +207,8 @@ let
   hasDm = (config.services.greetd.enable or false) || (config.services.displayManager.enable or false);
 in
 {
+  imports = [ ./posture.nix ];
+
   options.services.planarian = {
     enable = mkEnableOption "Planarian, a self-healing layer for this NixOS system";
 

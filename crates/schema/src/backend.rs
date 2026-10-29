@@ -87,6 +87,12 @@ pub trait UnitBackend {
     fn ended_by(&self, _id: &UnitId) -> Option<Ending> {
         None
     }
+    /// The boot report's unit check (§10): active units whose definition does
+    /// not come from the running generation (a file outside the store that is
+    /// not a generator's).
+    fn foreign_units(&self) -> Vec<String> {
+        vec![]
+    }
     fn list(&self) -> Result<Vec<UnitId>, Outcome>;
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome;
     fn stop(&self, id: &UnitId, op: &OpId) -> Outcome;

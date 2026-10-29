@@ -127,6 +127,8 @@ pub struct Core<B: Backends + Clone, S: Store> {
     pub integrity: Option<String>,
     /// Each unit's status at the previous tick, to see transitions (§11 residue).
     prev_status: BTreeMap<UnitId, UnitStatus>,
+    /// The boot report runs on the first tick after boot (§10).
+    boot_report_due: bool,
     /// Units Planarian's own transactions touched since the previous tick, and
     /// whether a generation changed: their stops are not someone else's.
     touched: BTreeSet<UnitId>,
@@ -184,6 +186,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// Start: adopt the running generation, reconcile the journal, restore
     /// incidents, load the manifest, and schedule boot confirmation.
     pub fn start(journal: Journal<S>, b: B, me: OwnerId, cfg: CoreConfig) -> Core<B, S> {
+        let fresh = cfg.fresh_boot;
         let mut ex = Executor::new(journal, b.clone(), me, cfg.exec.clone());
         ex.adopt_current();
         let mut notices = VecDeque::new();
@@ -241,6 +244,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             chain_checked: None,
             integrity: None,
             prev_status: BTreeMap::new(),
+            boot_report_due: fresh,
             touched: BTreeSet::new(),
             generation_touched: false,
             next_gc_check: Timestamp(0),
@@ -572,6 +576,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     pub fn tick(&mut self) {
         let (s, defs) = self.observe();
         let now = s.observed_at;
+
+        // §10 boot report, on the first tick after boot: units from outside the
+        // generation are an Integrity failure (§12d); the journal chain was
+        // checked when it was opened, and the core hash by planarian-recovery.
+        if std::mem::take(&mut self.boot_report_due) {
+            let foreign = self.b.units().foreign_units();
+            for u in &foreign {
+                self.notice(format!("INTEGRITY: boot report: {u} runs, but this generation does not declare it"));
+            }
+            if !foreign.is_empty() {
+                self.integrity = Some(format!("boot report: undeclared units: {}", foreign.join(", ")));
+                return;
+            }
+        }
 
         // §11: stops nobody attributed, before anything treats them as faults.
         let (s, defs) = if self.residue(&s, &defs) { self.observe() } else { (s, defs) };
