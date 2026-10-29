@@ -920,8 +920,15 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
         "unbind_driver" => {
             let dev = unit(&get("device"));
             let sysfs = cfg.devices.get(&dev.name).ok_or(format!("no sysfs path for {dev}"))?;
+            // A display device: detach fbcon from framebuffers first. Tearing
+            // down a DRM driver fbcon is drawing on can deadlock the kernel
+            // (it froze the VM in two catalog runs); the serial console the
+            // tests read is not a framebuffer.
             sh(&format!(
-                "d=$(readlink -f {s}); drv=$(readlink -f $d/driver); echo $(basename $d) > $drv/unbind",
+                "d=$(readlink -f {s}); drv=$(readlink -f $d/driver); \
+                 if [ -d $d/drm ]; then for v in /sys/class/vtconsole/vtcon*; do \
+                 grep -q 'frame buffer' $v/name && echo 0 > $v/bind; done; fi; \
+                 echo $(basename $d) > $drv/unbind",
                 s = sysfs.display()
             ));
         }
