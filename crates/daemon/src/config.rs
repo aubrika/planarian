@@ -50,6 +50,16 @@ pub struct FileConfig {
     #[serde(default)]
     pub posture: planarian_schema::Posture,
     pub journal_bytes: u64,
+    /// The signed external desired-state source (§9 hook); none by default.
+    #[serde(default)]
+    pub external_source: Option<crate::hooks::ExternalSourceConfig>,
+    /// Seconds between signed health reports (§10 hook); 0 turns them off.
+    #[serde(default = "default_health_secs")]
+    pub health_report_secs: u64,
+}
+
+fn default_health_secs() -> u64 {
+    3600
 }
 
 impl Default for FileConfig {
@@ -74,6 +84,8 @@ impl Default for FileConfig {
             journal_bytes: planarian_txn::store::DEFAULT_CAPACITY,
             posture: Default::default(),
             session_compositors: vec![],
+            external_source: None,
+            health_report_secs: default_health_secs(),
         }
     }
 }

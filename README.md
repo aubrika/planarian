@@ -139,6 +139,9 @@ for slow machines or slow-starting services.
   everything asks first.
 - The daemon logs to the journal: `journalctl -u planariad -u planarian-recovery`.
   The executor log is `/var/lib/planarian/log/executor.jsonl`.
+- A signed health report is kept at `/var/lib/planarian/health-report.json`
+  (signature in `.sig`, public key in `health.pub`). It holds only unit
+  statuses and open incident kinds; it is not sent anywhere.
 
 ## Development
 

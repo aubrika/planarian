@@ -260,6 +260,42 @@ in
       '';
     };
 
+    externalSource = mkOption {
+      type = types.nullOr (types.submodule {
+        options = {
+          publicKey = mkOption {
+            type = types.strMatching "[0-9a-f]{64}";
+            description = "The Ed25519 public key (64 hex digits) the document must verify against.";
+          };
+          path = mkOption {
+            type = types.str;
+            default = "/var/lib/planarian/external/desired.json";
+            description = "Where a producer leaves the document, with its signature at `<path>.sig`.";
+          };
+        };
+      });
+      default = null;
+      description = ''
+        A signed external desired-state source (SPEC §9 hook). Its units join
+        this generation's; a unit the generation declares stays the
+        generation's. An older or unreadable document leaves the last valid
+        one in force; an invalid signature is an integrity failure (§12d).
+        Phase A has no producer. Security-sensitive, like all of
+        services.planarian.
+      '';
+    };
+
+    healthReport.interval = mkOption {
+      type = types.ints.unsigned;
+      default = 3600;
+      description = ''
+        Seconds between signed health reports (SPEC §10 hook), written to
+        /var/lib/planarian/health-report.json with its signature beside it
+        and the key's public half in health.pub. Minimal disclosure: unit
+        statuses and incident kinds only. 0 turns them off.
+      '';
+    };
+
     posture = mkOption {
       type = types.enum [ "Relaxed" "Standard" "Guarded" "Sealed" ];
       default = "Standard";
@@ -420,7 +456,8 @@ in
       journalBytes = 64 * 1024 * 1024;
       startupGraceSecs = cfg.startupGrace;
       sessionCompositors = cfg.sessionCompositors;
-      inherit (cfg) posture;
+      inherit (cfg) posture externalSource;
+      healthReportSecs = cfg.healthReport.interval;
     };
 
     # With the console: its launcher entry and icons too.

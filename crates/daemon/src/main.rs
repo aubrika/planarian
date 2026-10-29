@@ -3,6 +3,7 @@
 use planarian_backend_linux::{Paths, Real};
 use planarian_daemon::config::{CONFIG, FileConfig, is_admin, load_canonical};
 use planarian_daemon::core::Resume;
+use planarian_daemon::hooks::{self, ExternalSource, Poll};
 use planarian_daemon::snapshot::{self, Busy, Snapshot};
 use planarian_daemon::{Core, CoreConfig, Peer};
 use planarian_exec::Config as ExecConfig;
@@ -62,14 +63,17 @@ pub const EXIT_INTEGRITY: i32 = 78;
 /// Where the reason goes, for the boot report and the posture units.
 const INTEGRITY_NOTE: &str = "/run/planarian/integrity";
 
+/// Report an integrity finding and stop with 78 (§12d).
+fn integrity_failure(who: &str, what: &str) -> ! {
+    eprintln!("{who}: INTEGRITY: {what}");
+    let _ = std::fs::create_dir_all("/run/planarian");
+    let _ = std::fs::write(INTEGRITY_NOTE, format!("{what}\n"));
+    std::process::exit(EXIT_INTEGRITY);
+}
+
 fn journal_failure(who: &str, e: &JournalError) -> ! {
     match e {
-        JournalError::Integrity(why) => {
-            eprintln!("{who}: INTEGRITY: the journal's hash chain is broken: {why}");
-            let _ = std::fs::create_dir_all("/run/planarian");
-            let _ = std::fs::write(INTEGRITY_NOTE, format!("journal: {why}\n"));
-            std::process::exit(EXIT_INTEGRITY);
-        }
+        JournalError::Integrity(why) => integrity_failure(who, &format!("journal: the hash chain is broken: {why}")),
         JournalError::Legacy => {
             eprintln!(
                 "{who}: the journal under /var/lib/planarian/journal was written by an earlier Planarian (format 1, \
@@ -233,6 +237,38 @@ fn main() {
         posture: file.posture,
     };
     let mut core = Core::start(journal, real, me.clone(), core_cfg);
+    // §9 hook: the external desired-state source, from its verified cache
+    // first; an altered cache is an integrity finding like any other.
+    let mut external = match &file.external_source {
+        None => None,
+        Some(c) => match ExternalSource::new(c, &paths.state) {
+            Ok(mut src) => {
+                if let Err(e) = src.load_cache() {
+                    integrity_failure("planariad", &e);
+                }
+                if let Some(v) = &src.current {
+                    core.set_external(Some(v.doc.clone()));
+                }
+                Some(src)
+            }
+            Err(e) => {
+                eprintln!("planariad: {e}");
+                std::process::exit(78);
+            }
+        },
+    };
+    // §10 hook: the signed health report, locally, on the declared cadence.
+    let health = match file.health_report_secs {
+        0 => None,
+        secs => match hooks::health_key(&paths.state) {
+            Ok(k) => Some((k, Duration::from_secs(secs))),
+            Err(e) => {
+                eprintln!("planariad: health report key: {e}; no health reports");
+                None
+            }
+        },
+    };
+    let mut next_report = Instant::now();
     // Catalog changes stage, evaluate and build on a worker thread while the
     // core keeps observing, repairing and answering.
     core.defer = true;
@@ -320,8 +356,9 @@ fn main() {
             next_tick = Instant::now() + TICK;
         }
         if let Some(why) = core.integrity.take() {
-            journal_failure("planariad", &JournalError::Integrity(why));
+            integrity_failure("planariad", &why);
         }
+        hooks_tick(&mut core, &mut external, &health, &paths.state, &mut next_report);
         let wait = next_tick.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
             Ok(Event::Request(peer, req, reply)) => {
@@ -382,6 +419,37 @@ fn main() {
             eprintln!("planariad: {s}");
         }
         printed = core.notices_total;
+    }
+}
+
+/// The hooks, once per loop: poll the external source; emit the report when due.
+fn hooks_tick(
+    core: &mut Core<Real, FileStore>,
+    external: &mut Option<ExternalSource>,
+    health: &Option<(ed25519_dalek::SigningKey, Duration)>,
+    state: &Path,
+    next_report: &mut Instant,
+) {
+    if let Some(src) = external.as_mut() {
+        match src.poll() {
+            Poll::Unchanged => {}
+            Poll::Accepted(v) => core.set_external(Some(v.doc)),
+            Poll::Refused(why) => {
+                core.notice(format!("external desired state not taken: {why}; the one in force stays"))
+            }
+            Poll::Stale(why) => {
+                eprintln!("planariad: external desired state unreadable ({why}); the one in force stays")
+            }
+            Poll::Integrity(why) => integrity_failure("planariad", &why),
+        }
+    }
+    if let Some((key, every)) = health
+        && Instant::now() >= *next_report
+    {
+        *next_report = Instant::now() + *every;
+        if let Err(e) = hooks::emit(state, key, &core.health_report()) {
+            eprintln!("planariad: health report: {e}");
+        }
     }
 }
 

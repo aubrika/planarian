@@ -114,6 +114,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     incident_parked: BTreeMap<IncidentId, TxnId>,
     confirm: Option<(GenerationId, Timestamp)>,
     manifest_gen: GenerationId,
+    /// The running generation's manifest, before the external source joins it.
+    gen_manifest: planarian_schema::Manifest,
+    /// The external desired-state document in force (§9 hook), verified by `main`.
+    pub external: Option<crate::hooks::DesiredDoc>,
     interlock_noted: bool,
     /// Incidents whose opening was already announced.
     diag_noted: BTreeSet<IncidentId>,
@@ -228,7 +232,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 Default::default()
             }
         };
-        let asm = Assembler::new(manifest, cfg.exec.canonical.clone());
+        let asm = Assembler::new(manifest.clone(), cfg.exec.canonical.clone());
         let now = b.clock().now();
         let last_booted = b.generations().last_booted().ok();
         let confirm = match ledger.known_good {
@@ -256,6 +260,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             incident_parked: BTreeMap::new(),
             confirm,
             manifest_gen: current,
+            gen_manifest: manifest,
+            external: None,
             interlock_noted: false,
             diag_noted: BTreeSet::new(),
             unreachable: BTreeMap::new(),
@@ -365,7 +371,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let current = self.b.generations().current().unwrap_or(self.manifest_gen);
         if current != self.manifest_gen {
             if let Ok(e) = self.b.generations().path_of(current).and_then(|p| self.b.generations().evaluate_built(&p)) {
-                self.asm.set_manifest(manifest_of(&e));
+                self.gen_manifest = manifest_of(&e);
+                self.asm.set_manifest(self.effective_manifest().0);
             }
             self.manifest_gen = current;
         }
@@ -619,6 +626,68 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         true
     }
 
+    /// The generation's manifest with the external document's units joined
+    /// (§9): a unit the generation declares stays the generation's. Returns
+    /// the units the document declared that the generation overrode.
+    fn effective_manifest(&self) -> (planarian_schema::Manifest, Vec<UnitId>) {
+        let mut m = self.gen_manifest.clone();
+        let mut shadowed = vec![];
+        for (id, def) in self.external.iter().flat_map(|d| d.units.iter()) {
+            if m.units.contains_key(id) {
+                shadowed.push(id.clone());
+            } else {
+                m.units.insert(id.clone(), def.clone());
+            }
+        }
+        (m, shadowed)
+    }
+
+    /// Where a unit's declaration came from, when not the generation (§9;
+    /// future-work T5: an implant has a provenance trail).
+    pub fn origin_of(&self, unit: &UnitId) -> Option<String> {
+        let d = self.external.as_ref()?;
+        (d.units.contains_key(unit) && !self.gen_manifest.units.contains_key(unit)).then(|| {
+            format!(
+                "the external desired-state source (issuer {:?}, sequence {})",
+                if d.issuer.is_empty() { "unnamed" } else { &d.issuer },
+                d.seq
+            )
+        })
+    }
+
+    /// The health report (§10 hook), with the profile the core computes.
+    pub fn health_report(&mut self) -> crate::hooks::HealthReport {
+        let (s, defs) = self.observe();
+        crate::hooks::report(crate::hooks::DisclosureProfile::Minimal, &s, &defs, self.incidents.incidents.values())
+    }
+
+    /// A verified external document is now in force (or, with `None`, the
+    /// configuration dropped the source).
+    pub fn set_external(&mut self, doc: Option<crate::hooks::DesiredDoc>) {
+        let said = doc.as_ref().map(|d| {
+            let names: Vec<String> = d.units.keys().map(|u| u.to_string()).collect();
+            format!(
+                "external desired state in force: sequence {} from {:?}, declaring {}",
+                d.seq,
+                if d.issuer.is_empty() { "an unnamed issuer" } else { &d.issuer },
+                if names.is_empty() { "nothing".to_string() } else { names.join(", ") }
+            )
+        });
+        self.external = doc;
+        let (m, shadowed) = self.effective_manifest();
+        self.asm.set_manifest(m);
+        if let Some(s) = said {
+            self.notice(s);
+        }
+        if !shadowed.is_empty() {
+            let names: Vec<String> = shadowed.iter().map(|u| u.to_string()).collect();
+            self.notice(format!(
+                "the external desired state also declares {}, which this generation declares; the generation's declaration stands",
+                names.join(", ")
+            ));
+        }
+    }
+
     pub fn tick(&mut self) {
         let (s, defs) = self.observe();
         let now = s.observed_at;
@@ -663,7 +732,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         if self.chain_checked.is_none_or(|t| now.0.saturating_sub(t.0) >= CHAIN_CHECK_EVERY.0) {
             self.chain_checked = Some(now);
             if let Err(JournalError::Integrity(why)) = self.ex.kernel.journal.verify_chain() {
-                self.integrity = Some(why);
+                self.integrity = Some(format!("journal: the hash chain is broken: {why}"));
                 return;
             }
         }
@@ -706,8 +775,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 };
                 let root = diagnose::root_cause(&inc.target, &inputs);
                 let because = if root == inc.target { String::new() } else { format!(" (root cause: {root})") };
+                let origin = self.origin_of(&inc.target).map(|o| format!("; declared by {o}")).unwrap_or_default();
                 self.notice(format!(
-                    "{}: {:?}{because}{}",
+                    "{}: {:?}{because}{}{origin}",
                     inc.target,
                     inc.divergence.1,
                     if failing.is_empty() { String::new() } else { format!(" ({})", failing.join("; ")) }

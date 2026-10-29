@@ -12,6 +12,8 @@ pkgs.testers.runNixOSTest {
     services.planarian.enable = true;
     services.planarian.bootReadyTimeout = 20;
     services.planarian.agentUnits = [ "gym-agent.service" ];
+    # §9 hook, with RFC 8032's first test key; no producer.
+    services.planarian.externalSource.publicKey = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
     services.openssh.enable = true;
     users.users.alice = { isNormalUser = true; uid = 1000; };
     users.users.admin = { isNormalUser = true; uid = 1001; extraGroups = [ "planarian-admin" ]; };
@@ -39,6 +41,13 @@ pkgs.testers.runNixOSTest {
         # I20: the agent is ordered after ready.
         machine.succeed("systemctl show gym-agent.service -p After | grep -q planarian-ready.target")
 
+    with subtest("the signed health report is written locally, minimal"):
+        machine.wait_until_succeeds("test -s /var/lib/planarian/health-report.json", timeout=60)
+        machine.succeed("test $(tr -d '\\n' < /var/lib/planarian/health-report.json.sig | wc -c) = 128")
+        machine.succeed("test $(stat -c %a /var/lib/planarian/health.key) = 600")
+        machine.succeed("grep -q '\"profile\": \"Minimal\"' /var/lib/planarian/health-report.json")
+        machine.fail("grep -q /nix/store /var/lib/planarian/health-report.json")
+
     with subtest("Absent: planariad stopped outside a shutdown"):
         machine.succeed("systemctl stop planariad.service")
         machine.wait_until_succeeds("test -e /run/planarian/alarm", timeout=60)
@@ -63,6 +72,20 @@ pkgs.testers.runNixOSTest {
         machine.succeed("systemctl reset-failed planariad.service")
         machine.succeed("systemctl start planariad.service")
         machine.wait_until_succeeds("test ! -e /run/planarian/alarm", timeout=120)
+
+    with subtest("Integrity: an external desired-state document with an invalid signature"):
+        machine.succeed("mkdir -p /var/lib/planarian/external")
+        machine.succeed("echo '{\"seq\": 1, \"issued\": 0, \"units\": {}}' > /var/lib/planarian/external/desired.json")
+        machine.succeed("printf '%0128d' 0 > /var/lib/planarian/external/desired.json.sig")
+        machine.wait_until_succeeds("test -e /run/planarian/failed-integrity", timeout=120)
+        assert alarm().startswith("integrity"), alarm()
+        machine.succeed("grep -q 'external desired-state source' /run/planarian/integrity")
+        machine.fail("systemctl is-active gym-agent.service")
+        machine.succeed("rm -r /var/lib/planarian/external")
+        machine.succeed("planarian-ack")
+        machine.succeed("systemctl restart planariad.service")
+        machine.wait_until_succeeds("test ! -e /run/planarian/alarm", timeout=120)
+        machine.succeed("systemctl start gym-agent.service")
 
     with subtest("Integrity: a retained journal record edited on disk"):
         machine.succeed("systemctl stop planariad.service planarian-recovery.service")

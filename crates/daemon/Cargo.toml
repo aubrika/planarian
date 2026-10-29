@@ -28,6 +28,8 @@ planarian-ipc.workspace = true
 planarian-backend-linux.workspace = true
 rustix = { version = "1", features = ["net"] }
 serde.workspace = true
+ed25519-dalek.workspace = true
+rand_core.workspace = true
 serde_json.workspace = true
 
 [features]
@@ -36,6 +38,7 @@ gym-hooks = ["planarian-backend-linux/gym-hooks"]
 
 [dev-dependencies]
 planarian-fake.workspace = true
+planarian-schema = { workspace = true, features = ["fixtures"] }
 
 [lints]
 workspace = true

@@ -733,3 +733,48 @@ fn waiting_generation_is_prepared_again_after_a_restart() {
             .any(|t| t.state == TxnState::Committed && matches!(t.transition, Transition::ApplyChange { .. }))
     );
 }
+
+/// §9 hook: a verified external document's units join the generation's;
+/// a failure of one says where its declaration came from (future-work T5);
+/// a unit the generation declares stays the generation's.
+#[test]
+fn external_desired_state_joins_with_provenance() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let web = UnitId::service("gym-web");
+    let ext = UnitId::service("gym-ext");
+    let mut def = r.core.asm.manifest().units[&web].clone();
+    def.id = ext.clone();
+    def.probes.clear();
+    let mut shadow = def.clone();
+    shadow.id = web.clone();
+    shadow.synonyms = vec!["from outside".into()];
+    let doc = crate::hooks::DesiredDoc {
+        seq: 7,
+        issued: Timestamp(1),
+        issuer: "fleet-test".into(),
+        units: [(ext.clone(), def), (web.clone(), shadow)].into(),
+    };
+    r.core.set_external(Some(doc));
+    assert!(
+        r.core.notices.iter().any(|n| n.contains("sequence 7") && n.contains("fleet-test")),
+        "{:?}",
+        r.core.notices
+    );
+    assert!(r.core.notices.iter().any(|n| n.contains("the generation's declaration stands")));
+    assert!(r.core.asm.manifest().units.contains_key(&ext));
+    assert!(r.core.asm.manifest().units[&web].synonyms.iter().all(|s| s != "from outside"));
+    assert!(r.core.origin_of(&web).is_none());
+    r.ticks(6);
+    assert!(
+        r.core
+            .notices
+            .iter()
+            .any(|n| n.starts_with("service:gym-ext") && n.contains("declared by the external desired-state source")),
+        "{:?}",
+        r.core.notices
+    );
+    // Dropped: the unit is no longer desired.
+    r.core.set_external(None);
+    assert!(!r.core.asm.manifest().units.contains_key(&ext));
+}
