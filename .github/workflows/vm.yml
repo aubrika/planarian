@@ -65,6 +65,30 @@ jobs:
           cat verdict/verdict.json
           jq -e '.result == "PASS"' verdict/verdict.json
 
+  # Catalog entries that guard the gym harness itself on every push: a step
+  # timed into a change (the pause handshake, a PATH-dependent fault), a
+  # user session with a device and its root cause, and a real /boot.
+  gym-smoke:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [stale-owner-edit-during-build, drv-unbound-audio, storage-boot-full-publish]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      - run: nix build -L .#legacyPackages.x86_64-linux.gym-vm.${{ matrix.id }} -o verdict
+      - name: Verdict
+        run: |
+          cat verdict/verdict.json
+          jq -e '.result == "PASS"' verdict/verdict.json
+
   catalog-ids:
     if: inputs.catalog
     runs-on: ubuntu-24.04

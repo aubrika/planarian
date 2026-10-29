@@ -163,8 +163,10 @@ The fake harness: 57 of 73 entries, all PASS (the rest are VM-only).
 `ci.yml` on every push: fmt, clippy (also with the gym's hooks), the tests,
 the fake catalog and the GA demonstration, the dependency boundaries, the
 Verus proofs, the Kani harnesses. `vm.yml` on every push: the NixOS VM tests
-(runtime, generations, installer) and the four GA demonstration entries on
-VMs; the whole VM catalog by hand (about 70 runner minutes per push for
+(runtime, generations, installer), the four GA demonstration entries on
+VMs, and three entries that guard the gym harness itself (a step timed into
+a change, a user session with a device, a real /boot); the whole VM catalog
+by hand (about 70 runner minutes per push for
 `vm.yml`; several hundred for the whole catalog).
 
 ## Not part of the gate, still open
