@@ -295,6 +295,30 @@ let
       # anything Planarian does. nodev still writes the boot menu for real.
       boot.loader.grub.devices = lib.mkForce [ "nodev" ];
 
+      # Failure-posture fixtures (§12d; catalog family failure-posture).
+      # The stand-in agent principal, stopped by every failure class (I20).
+      services.planarian.agentUnits = [ "gym-agent.service" ];
+      services.planarian.bootReadyTimeout = 30;
+      systemd.services.gym-agent = {
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig.ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+      };
+      # The administrator (bob) runs `sudo planarian-ack` without a password.
+      security.sudo.wheelNeedsPassword = false;
+      # /etc/systemd/system is the store's here, so `systemctl mask` cannot
+      # last across a reboot: a generator masks what the harness lists (in
+      # the early directory, which outranks every other).
+      systemd.generators.gym-mask = pkgs.writeShellScript "gym-mask" ''
+        [ -r /var/lib/gym-posture/masked ] || exit 0
+        while read -r u; do [ -n "$u" ] && ln -sf /dev/null "$2/$u"; done < /var/lib/gym-posture/masked
+      '';
+      # The recovery check reads the core hash from a writable copy that the
+      # harness can corrupt (corrupt_core_hash); the check itself is unchanged.
+      systemd.services.planarian-recovery.environment.PLANARIAN_CORE_HASH = lib.mkForce "/var/lib/gym-posture/core.sha256";
+      systemd.services.planarian-recovery.preStart = ''
+        [ -e /var/lib/gym-posture/core.sha256 ] || { mkdir -p /var/lib/gym-posture; cp /etc/planarian/core.sha256 /var/lib/gym-posture/core.sha256; }
+      '';
+
       # Wi-Fi: three simulated radios in this kernel. wlan0 and wlan1 are the
       # access points gym-ap-a and gym-ap-b (one hostapd unit each, so one can
       # go away); wlan2 is NetworkManager's client. It knows both networks
@@ -502,7 +526,9 @@ let
                     print(machine.execute(f"{gym} step --id {ID} --index {i} 2>&1")[1])
                 elif kind == "host":
                     if raw == "reboot":
-                        machine.shutdown(); machine.start(); machine.wait_for_unit("planariad.service")
+                        machine.shutdown(); machine.start(); machine.wait_for_unit("multi-user.target")
+                        # planariad, or (failure-posture entries) the posture's alarm.
+                        machine.wait_until_succeeds("systemctl is-active planariad.service || test -e /run/planarian/alarm", timeout=600)
                         machine.succeed("systemd-run --unit=gym-sampler -E PATH -E PLANARIAN_GYM_CATALOG planarian-gym vm sample")
                     elif raw == "suspend":
                         d = st.get("duration", "60s")

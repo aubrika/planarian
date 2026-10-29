@@ -73,7 +73,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        id: [stale-owner-edit-during-build, drv-unbound-audio, storage-boot-full-publish]
+        # The v4.4 posture and journal-integrity entries run on every push:
+        # their responses are systemd's, so only the VM can judge them.
+        id: [stale-owner-edit-during-build, drv-unbound-audio, storage-boot-full-publish,
+             posture-absent-masked, posture-crashed-budget, posture-integrity-core-hash,
+             posture-integrity-journal-chain, posture-integrity-undeclared-early-unit, journal-record-edited]
     steps:
       - uses: actions/checkout@v4
       - name: Enable KVM

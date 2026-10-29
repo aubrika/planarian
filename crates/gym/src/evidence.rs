@@ -75,6 +75,30 @@ pub struct Evidence {
     /// Planarian's build GC roots at the start and at the end.
     #[serde(default)]
     pub gc_roots: Option<(BTreeSet<String>, BTreeSet<String>)>,
+    /// The failure posture (§12d) as the run left it.
+    #[serde(default)]
+    pub posture: PostureSeen,
+}
+
+/// What the failure posture did. The fake harness models only planariad's
+/// side (it stops with status 78, routed to Integrity); the responses are
+/// systemd's and only the VM harness observes them (`responses: None`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PostureSeen {
+    /// Failure classes reached during the run (`absent`, `crashed`, `integrity`).
+    pub classes: BTreeSet<String>,
+    /// The integrity finding planariad reported.
+    pub finding: Option<String>,
+    /// Responses observed while failed: alarm, notify_admins, disable_agents,
+    /// restrict_remote, restrict_login, halt_to_recovery, alarm_dismissable.
+    pub responses: Option<BTreeSet<String>>,
+    /// Acknowledgements journaled (`user:1001`) and refused (`user:1000`).
+    pub acks: Vec<String>,
+    pub refused_acks: Vec<String>,
+    /// The restrictions were lifted once ready again.
+    pub lifted: bool,
+    /// The journal's open at the end failed its chain check (I18 detected).
+    pub chain_broken: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

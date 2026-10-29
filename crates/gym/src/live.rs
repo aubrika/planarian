@@ -182,7 +182,7 @@ pub fn plan(entry: &T) -> Plan {
                 }
                 other => format!("unsupported: {other} timed to the journal"),
             }
-        } else if st.get("when").is_some() {
+        } else if st.get("when").is_some() && raw != "break_journal_chain" {
             format!("unsupported: {} timed by {:?}", raw, st.get("when"))
         } else if st.get("transition").is_some() {
             match s(st, "transition") {
@@ -231,7 +231,13 @@ pub fn plan(entry: &T) -> Plan {
                 | "slow_backend"
                 | "withhold_reply"
                 | "backend_result"
-                | "set_setting" => "vm".into(),
+                | "set_setting"
+                | "mask_unit"
+                | "unmask_unit"
+                | "ack_alarm"
+                | "corrupt_core_hash"
+                | "break_journal_chain"
+                | "plant_early_unit" => "vm".into(),
                 "force_compaction" => "vm".into(),
                 "interrupt_write" => format!("unsupported: {raw} needs to interrupt the daemon's own write"),
                 other => format!("unsupported: {other}"),
@@ -567,8 +573,97 @@ fn sample() {
             };
             let _ = writeln!(f, "{}", serde_json::to_string(&smp).expect("serializes"));
         }
+        // The posture runs while planariad is down, so it is sampled apart.
+        let (classes, responses) = posture_snapshot();
+        if !classes.is_empty()
+            && let Ok(mut f) =
+                std::fs::OpenOptions::new().create(true).append(true).open(PathBuf::from(RUN).join("posture.jsonl"))
+        {
+            let _ = writeln!(f, "{}", serde_json::to_string(&(classes, responses)).expect("serializes"));
+        }
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+/// The failure classes in force (nix/posture.nix's /run/planarian/failed-*)
+/// and the responses observable right now (§12d).
+fn posture_snapshot() -> (BTreeSet<String>, BTreeSet<String>) {
+    let classes: BTreeSet<String> = std::fs::read_dir("/run/planarian")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_prefix("failed-")).map(String::from))
+        .collect();
+    let mut r = BTreeSet::new();
+    if classes.is_empty() {
+        return (classes, r);
+    }
+    if Path::new("/run/planarian/alarm").exists() && Path::new("/run/issue.d/50-planarian.issue").exists() {
+        r.insert("alarm".to_string());
+    }
+    if sh("journalctl -q -t planarian-posture -p alert --no-pager | grep -q 'failure class'") {
+        r.insert("notify_admins".into());
+    }
+    if sh("systemctl is-active --quiet gym-agent.service") {
+        r.insert("agents_running".into());
+    } else {
+        r.insert("disable_agents".into());
+    }
+    if Path::new("/run/planarian/sshd/posture.conf").exists() {
+        r.insert("restrict_remote".into());
+    }
+    if Path::new("/run/nologin").exists() || Path::new("/etc/nologin").exists() {
+        r.insert("restrict_login".into());
+    }
+    if sh("systemctl is-active --quiet rescue.target || systemctl is-active --quiet emergency.target") {
+        r.insert("halt_to_recovery".into());
+    }
+    (classes, r)
+}
+
+/// The posture's record of the run: the samples, and the posture units' and
+/// planariad's journal since the start.
+fn posture_seen(cfg: &FileConfig, since_unix: u64) -> crate::evidence::PostureSeen {
+    let mut p = crate::evidence::PostureSeen::default();
+    let mut responses = BTreeSet::new();
+    for line in std::fs::read_to_string(PathBuf::from(RUN).join("posture.jsonl")).unwrap_or_default().lines() {
+        if let Ok((c, r)) = serde_json::from_str::<(BTreeSet<String>, BTreeSet<String>)>(line) {
+            p.classes.extend(c);
+            responses.extend(r);
+        }
+    }
+    p.responses = Some(responses);
+    let actor = |name: &str| match name {
+        "root" => "root".to_string(),
+        "alice" => "user:1000".into(),
+        "carol" => "user:1002".into(),
+        _ => "user:1001".into(),
+    };
+    for l in sh_out(&format!("journalctl -q -o cat --no-pager --since @{since_unix} -t planarian-posture")).lines() {
+        if let Some(c) = l.strip_prefix("failure class ").and_then(|r| r.split(':').next()) {
+            p.classes.insert(c.to_string());
+        } else if let Some(who) = l.split("acknowledged by ").nth(1) {
+            p.acks.push(actor(who.trim()));
+        } else if let Some(who) = l.strip_prefix("acknowledgement refused for ").and_then(|r| r.split(' ').next()) {
+            p.refused_acks.push(actor(who));
+        } else if l.contains("restrictions lifted") {
+            p.lifted = true;
+        }
+    }
+    for line in std::fs::read_to_string(PathBuf::from(RUN).join("acks.jsonl")).unwrap_or_default().lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(a) = v["actor"].as_str()
+        {
+            p.refused_acks.push(a.to_string());
+        }
+    }
+    p.finding = std::fs::read_to_string("/run/planarian/integrity").ok().map(|s| s.trim().to_string());
+    let paths = Paths { state: cfg.state_dir.clone(), ..Default::default() };
+    p.chain_broken = matches!(
+        FileStore::open(&paths.journal_dir(), &paths.txn_dir(), cfg.journal_bytes).map(Journal::open),
+        Ok(Err(planarian_txn::journal::JournalError::Integrity(_)))
+    );
+    p
 }
 
 /// Send a request as the step's actor and record the answer.
@@ -808,6 +903,14 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
         "unblock_network" => {
             sh("iptables -F OUTPUT; iptables -F INPUT; true");
         }
+        // Past its restart budget (5 in 300 s): crash it until systemd gives up.
+        "kill_process" if get("process") == "planariad" && get("repeat") == "past-budget" => {
+            let sig = if get("signal").is_empty() { "SIGSEGV".to_string() } else { get("signal") };
+            for _ in 0..8 {
+                sh(&format!("systemctl kill --signal={sig} planariad || true"));
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        }
         "kill_process" => match get("process").as_str() {
             "planariad" => {
                 sh("systemctl kill --signal=SIGKILL planariad");
@@ -823,10 +926,86 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 if get("process") == "planarian-recovery" { "planarian-recovery" } else { "planariad" }
             ));
         }
+        "release" if get("process") == "gym-agent" => {
+            sh("systemctl start gym-agent.service");
+        }
+        // Masked now and across reboots (the gym VM's gym-mask generator).
+        "mask_unit" | "unmask_unit" => {
+            let u = unit(&get("unit"));
+            let file = format!("{}.service", u.name);
+            let list = "/var/lib/gym-posture/masked";
+            let mut v: Vec<String> =
+                std::fs::read_to_string(list).unwrap_or_default().lines().map(String::from).collect();
+            v.retain(|l| l != &file);
+            if get("raw") == "mask_unit" {
+                v.push(file.clone());
+            }
+            let _ = std::fs::create_dir_all("/var/lib/gym-posture");
+            std::fs::write(list, v.join("\n") + "\n").map_err(|e| e.to_string())?;
+            let verb = if get("raw") == "mask_unit" { "mask" } else { "unmask" };
+            sh(&format!("systemctl {verb} --runtime {file}; systemctl daemon-reload"));
+        }
+        // `sudo planarian-ack` as the actor; a refusal (not an administrator,
+        // or not a sudoer) is recorded for the judge.
+        "ack_alarm" => {
+            let user = user_for(actor);
+            let ok = if user == "root" {
+                sh("planarian-ack")
+            } else {
+                sh(&format!("runuser -u {user} -- sudo -n planarian-ack"))
+            };
+            if !ok {
+                let line = serde_json::json!({ "actor": actor, "ok": false }).to_string();
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(PathBuf::from(RUN).join("acks.jsonl"))
+                    .and_then(|mut f| writeln!(f, "{line}"));
+            }
+        }
+        // The hash planarian-recovery checks the binary against (I2).
+        "corrupt_core_hash" => {
+            sh("mkdir -p /var/lib/gym-posture && printf '%064d\\n' 0 > /var/lib/gym-posture/core.sha256");
+        }
+        // I18: a retained record's bytes edited in place (CRC recomputed).
+        "break_journal_chain" => {
+            let off = get("when") == "powered-off";
+            if off {
+                sh("systemctl stop planariad planarian-recovery");
+            }
+            let paths = Paths { state: cfg.state_dir.clone(), ..Default::default() };
+            let store = FileStore::open(&paths.journal_dir(), &paths.txn_dir(), cfg.journal_bytes)
+                .map_err(|e| format!("journal: {e}"))?;
+            let n = segment(cfg).len();
+            if n < 3 {
+                return Err("break_journal_chain: fewer than 3 records".into());
+            }
+            let edited = planarian_txn::journal::tamper(&store, n / 2, |p| {
+                if let Some(b) = p.iter_mut().find(|b| b.is_ascii_digit()) {
+                    *b = if *b == b'9' { b'1' } else { *b + 1 };
+                }
+            });
+            if !matches!(edited, Ok(true)) {
+                return Err(format!("break_journal_chain: {edited:?}"));
+            }
+        }
+        // A unit from outside the generation's closure, started before
+        // planarian-ready (§10 boot report). /etc/systemd/system is the
+        // store's; system.control is on the unit path and writable.
+        "plant_early_unit" => {
+            let name = unit(&get("unit")).name;
+            let dir = "/etc/systemd/system.control";
+            sh(&format!(
+                "mkdir -p {dir}/sysinit.target.wants && \
+                 printf '[Unit]\\nDefaultDependencies=no\\nBefore=sysinit.target planariad.service\\n[Service]\\nExecStart=/run/current-system/sw/bin/sleep infinity\\n' > {dir}/{name}.service && \
+                 ln -sf ../{name}.service {dir}/sysinit.target.wants/{name}.service && systemctl daemon-reload"
+            ));
+        }
         "release" | "restart_process" => {
             sh("rm -f /run/systemd/system/planariad.service.d/gym-hold.conf; systemctl daemon-reload");
             let name = if get("process") == "planarian-recovery" { "planarian-recovery" } else { "planariad" };
-            sh(&format!("systemctl restart {name}"));
+            // An administrator's restart: past a spent start budget too.
+            sh(&format!("systemctl reset-failed {name}; systemctl restart {name}"));
         }
         "wait" => match st.get("for") {
             Some(T::Table(t)) if t.contains_key("journal") => {
@@ -1176,6 +1355,7 @@ fn evidence() -> Evidence {
         options: Some(options),
         probe_defs: Some((start.probe_defs, probe_defs(&cfg))),
         gc_roots: Some((start.gc_roots, build_roots())),
+        posture: posture_seen(&cfg, start.unix),
     }
 }
 

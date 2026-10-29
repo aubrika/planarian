@@ -9,7 +9,7 @@ use planarian_fake::{Fake, Health, MemStore, fixtures, gym_world};
 use planarian_ipc::{Request, Response};
 use planarian_policy::{Settings, Tables};
 use planarian_schema::*;
-use planarian_txn::journal::Journal;
+use planarian_txn::journal::{Journal, JournalError};
 use planarian_txn::kernel::{CrashPoint, Kernel};
 use planarian_txn::ledger::{Entry, Ledger, Record};
 use planarian_txn::machine::tag;
@@ -123,6 +123,8 @@ pub struct Sim {
     timeline: BTreeMap<UnitId, Vec<(Timestamp, String)>>,
     start_probe_defs: String,
     start_roots: std::collections::BTreeSet<String>,
+    /// planariad's side of the failure posture (§12d); see `PostureSeen`.
+    pub posture_seen: crate::evidence::PostureSeen,
 }
 
 /// `root`, `user:<uid>` or `user:<uid>@<session>`; user:1001 is the gym's administrator.
@@ -229,6 +231,7 @@ impl Sim {
             timeline: BTreeMap::new(),
             start_probe_defs: String::new(),
             start_roots: Default::default(),
+            posture_seen: Default::default(),
         }
     }
 
@@ -396,6 +399,10 @@ impl Sim {
             options: Some(options),
             probe_defs: Some(probe_defs),
             gc_roots: Some(gc_roots),
+            posture: crate::evidence::PostureSeen {
+                chain_broken: matches!(Journal::open(self.fake.store.clone()), Err(JournalError::Integrity(_))),
+                ..self.posture_seen.clone()
+            },
         }
     }
 
@@ -477,6 +484,10 @@ impl Sim {
         self.fake.advance(TICK);
         if let Some(c) = self.core.as_mut() {
             c.tick();
+            if let Some(why) = c.integrity.take() {
+                self.harvest();
+                self.integrity(why);
+            }
         }
         self.record_status();
         if ((self.now().0 - self.start.0) / TICK.0).is_multiple_of(2) {
@@ -494,11 +505,26 @@ impl Sim {
         self.core = None;
     }
 
+    /// planariad stopped with status 78: posture.nix routes it to Integrity.
+    fn integrity(&mut self, why: String) {
+        self.kill_daemon();
+        self.held = true;
+        self.posture_seen.classes.insert("integrity".into());
+        self.posture_seen.finding = Some(why.clone());
+        self.notices.push(format!("INTEGRITY: {why}"));
+    }
+
     fn start_daemon(&mut self) {
         self.daemon_pid += 1;
         let pid = self.daemon_pid;
+        let j = match Journal::open(self.fake.store.clone()) {
+            Ok(j) => j,
+            Err(JournalError::Integrity(why)) => {
+                return self.integrity(format!("journal: the hash chain is broken: {why}"));
+            }
+            Err(e) => panic!("journal: {e:?}"),
+        };
         self.fake.w().alive.insert(pid);
-        let j = Journal::open(self.fake.store.clone()).expect("journal");
         let mut cfg = config();
         cfg.fresh_boot = std::mem::take(&mut self.fresh_boot);
         cfg.posture = self.posture;
@@ -717,9 +743,44 @@ impl Sim {
                 p => return Err(Unsupported(format!("kill_process {p}"))),
             },
             "hold_down" => self.held = true,
+            // I18: edit a retained record's bytes in place, CRC recomputed, so
+            // only the hash chain can tell (the next record's `prev`).
+            "break_journal_chain" => {
+                if get("when") == "powered-off" {
+                    self.kill_daemon();
+                }
+                let n = Journal::open(self.fake.store.clone())
+                    .and_then(|mut j| j.segment())
+                    .map(|seg| seg.len())
+                    .map_err(|e| Unsupported(format!("break_journal_chain: {e:?}")))?;
+                if n < 3 {
+                    return Err(Unsupported("break_journal_chain: fewer than 3 records".into()));
+                }
+                let edited = planarian_txn::journal::tamper(&self.fake.store, n / 2, |p| {
+                    if let Some(b) = p.iter_mut().find(|b| b.is_ascii_digit()) {
+                        *b = if *b == b'9' { b'1' } else { *b + 1 };
+                    }
+                });
+                if !matches!(edited, Ok(true)) {
+                    return Err(Unsupported(format!("break_journal_chain: {edited:?}")));
+                }
+            }
+            // `sudo planarian-ack` (nix/posture.nix): an administrator's clears
+            // the alarm, journaled with identity; anyone else's is refused.
+            "ack_alarm" => {
+                if peer(&actor).admin {
+                    self.posture_seen.acks.push(actor.clone());
+                } else {
+                    self.posture_seen.refused_acks.push(actor.clone());
+                }
+            }
             "release" | "restart_process" => match get("process") {
                 "planariad" => {
                     self.held = false;
+                    // `systemctl restart`: a running daemon stops first.
+                    if get("raw") == "restart_process" && self.core.is_some() {
+                        self.kill_daemon();
+                    }
                     if self.core.is_none() {
                         self.start_daemon();
                     }

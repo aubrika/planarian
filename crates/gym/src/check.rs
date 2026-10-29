@@ -174,9 +174,58 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
             "others_unchanged" => {}
             // The ledger refuses any record that would break I6, I12's paths or
             // I15, so a journal that replays cleanly is the check.
+            // I18 entries edit the journal on purpose: there the check is that
+            // the chain refuses to open, not that it replays.
             "invariants" | "journal_readable" => {
-                if !e.journal_replays {
+                let i18 = val.as_array().is_some_and(|a| a.iter().any(|x| x.as_str() == Some("I18")));
+                if i18 && e.posture.chain_broken {
+                    if !e.posture.finding.as_deref().is_some_and(|f| f.contains("journal")) {
+                        fail(&mut v, "the chain is broken but planariad did not report it".into());
+                    }
+                } else if !e.journal_replays {
                     fail(&mut v, "the journal does not replay".into());
+                }
+            }
+            // I20: these agents never ran while a failure class was raised
+            // (the posture samples; VM only), and were stopped by it.
+            "not_started" | "unit_after_failure" => match &e.posture.responses {
+                None => v.unchecked.push(format!("{key} (systemd's; the VM harness observes it)")),
+                Some(seen) => {
+                    if key == "not_started" && seen.contains("agents_running") {
+                        fail(&mut v, "an agent ran while Planarian was failed".into());
+                    }
+                    if key == "unit_after_failure" && !seen.contains("disable_agents") {
+                        fail(&mut v, "the agents were not stopped".into());
+                    }
+                }
+            },
+            // §12d: the failure class reached, the posture target, and (VM only)
+            // the responses systemd applied.
+            "posture" => {
+                let class = val.get("class").and_then(T::as_str).unwrap_or("").to_lowercase();
+                if !e.posture.classes.contains(&class) {
+                    fail(&mut v, format!("class {class} not reached (reached: {:?})", e.posture.classes));
+                }
+                if let Some(t) = val.get("target_reached").and_then(T::as_str)
+                    && t.to_lowercase() != format!("planarian-failed@{class}.target")
+                {
+                    fail(&mut v, format!("{t} is not the target for class {class}"));
+                }
+                let want: Vec<&str> =
+                    val.get("responses").and_then(T::as_array).into_iter().flatten().filter_map(T::as_str).collect();
+                let not: Vec<&str> =
+                    val.get("not").and_then(T::as_array).into_iter().flatten().filter_map(T::as_str).collect();
+                match &e.posture.responses {
+                    None if want.is_empty() && not.is_empty() => {}
+                    None => v.unchecked.push("posture.responses (systemd's; the VM harness observes them)".into()),
+                    Some(seen) => {
+                        for r in want.iter().filter(|r| !seen.contains(**r)) {
+                            fail(&mut v, format!("response {r} not applied"));
+                        }
+                        for r in not.iter().filter(|r| seen.contains(**r)) {
+                            fail(&mut v, format!("response {r} applied, must not be"));
+                        }
+                    }
                 }
             }
             "generation" | "boot_default" => {
@@ -456,10 +505,25 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                         "Flapping" | "Escalated" => {
                             notices.contains("needs a person") || notices.contains("keeps failing")
                         }
-                        "Unauthorized" => e
-                            .responses
-                            .iter()
-                            .any(|x| matches!(x, Response::Rejected { reason, .. } if reason == "Unauthorized")),
+                        "Unauthorized" => {
+                            e.responses
+                                .iter()
+                                .any(|x| matches!(x, Response::Rejected { reason, .. } if reason == "Unauthorized"))
+                                || !e.posture.refused_acks.is_empty()
+                        }
+                        "JournalChainBroken" | "BootReport(JournalChainBroken)" => {
+                            e.posture.finding.as_deref().is_some_and(|f| f.contains("journal"))
+                        }
+                        "PostureLifted" => e.posture.lifted,
+                        r if r.starts_with("BootReport(UndeclaredEarly: ") => {
+                            let u = r.trim_start_matches("BootReport(UndeclaredEarly: ").trim_end_matches(')');
+                            let name = unit(u).name;
+                            e.posture.finding.as_deref().is_some_and(|f| f.contains("undeclared") && f.contains(&name))
+                        }
+                        r if r.starts_with("AlarmAcknowledged(") => {
+                            let who = r.trim_start_matches("AlarmAcknowledged(").trim_end_matches(')');
+                            e.posture.acks.iter().any(|a| a == who)
+                        }
                         "RecoveryFailed" | "alert" => {
                             ledger.terminal.values().any(|t| t.state == TxnState::RecoveryFailed)
                         }
