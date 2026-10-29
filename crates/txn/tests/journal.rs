@@ -262,3 +262,95 @@ fn ledger_invariant_checked_on_load() {
     assert!(json["live"]["1"].is_object());
     assert_eq!(serde_json::from_value::<Ledger>(json).unwrap(), l);
 }
+
+// ---------- I18: the hash chain ----------
+
+fn filled(n: usize) -> (MemStore, Journal<MemStore>) {
+    let store = MemStore::new(1 << 20);
+    let mut j = Journal::open(store.clone()).unwrap();
+    for e in history().into_iter().take(n) {
+        j.append(e.at, e.record).unwrap();
+    }
+    (store, j)
+}
+
+/// Change one digit of the record's timestamp, keeping its length.
+fn edit_at(p: &mut Vec<u8>) {
+    #![allow(clippy::ptr_arg)] // the `tamper` callback type
+    let s = String::from_utf8(p.clone()).unwrap();
+    let i = s.find("\"at\":").unwrap() + 5;
+    p[i] = if p[i] == b'9' { b'1' } else { p[i] + 1 };
+}
+
+#[test]
+fn edited_record_breaks_the_chain_on_read() {
+    let (store, j) = filled(10);
+    drop(j);
+    assert!(planarian_txn::journal::tamper(&store, 4, edit_at).unwrap());
+    match Journal::open(store.clone()) {
+        Err(JournalError::Integrity(why)) => assert!(why.contains("record 6"), "{why}"),
+        other => panic!("{:?}", other.map(|j| j.ledger().last_seq)),
+    }
+    // Nothing was truncated: the evidence stays.
+    assert!(planarian_txn::journal::tamper(&store, 9, |_| {}).unwrap(), "record 10 still there");
+}
+
+#[test]
+fn damaged_middle_record_is_not_a_torn_tail() {
+    let (store, j) = filled(10);
+    // A byte a quarter of the way in: inside an early record, with later ones after it.
+    let off = j.offset() / 4;
+    drop(j);
+    let mut b = store.read_at(off, 1).unwrap();
+    b[0] ^= 0x40;
+    store.write_at(off, &b).unwrap();
+    assert!(matches!(Journal::open(store.clone()), Err(JournalError::Integrity(_))));
+}
+
+#[test]
+fn torn_tail_is_still_truncated() {
+    let (store, mut j) = filled(5);
+    store.tear_next_write(20);
+    assert!(j.append(Timestamp(9), Record::LiveTested(None)).is_err());
+    let j = Journal::open(store).unwrap();
+    assert_eq!(j.ledger().last_seq, 5);
+}
+
+#[test]
+fn edit_after_read_is_caught_by_verify_chain() {
+    let (store, mut j) = filled(8);
+    j.verify_chain().unwrap();
+    assert!(planarian_txn::journal::tamper(&store, 2, edit_at).unwrap());
+    assert!(matches!(j.verify_chain(), Err(JournalError::Integrity(_))));
+}
+
+#[test]
+fn compaction_carries_the_chain_head() {
+    let (store, mut j) = filled(6);
+    let head = j.head();
+    j.compact().unwrap();
+    j.append(Timestamp(1), Record::LiveTested(None)).unwrap();
+    let mut k = Journal::open(store.clone()).unwrap();
+    assert_eq!(k.ledger().last_seq, 7);
+    assert_ne!(k.head(), head);
+    k.verify_chain().unwrap();
+    // Editing the record after the checkpoint is detected against the checkpoint's head.
+    j.append(Timestamp(2), Record::LiveTested(None)).unwrap();
+    assert!(planarian_txn::journal::tamper(&store, 0, edit_at).unwrap());
+    assert!(matches!(Journal::open(store), Err(JournalError::Integrity(_))));
+}
+
+#[test]
+fn format_one_journal_is_refused_not_truncated() {
+    let store = MemStore::new(1 << 16);
+    // A format-1 frame: len | crc32c(seq | payload) | seq | payload.
+    let payload = br#"{"seq":1}"#;
+    let mut body = 1u64.to_le_bytes().to_vec();
+    body.extend_from_slice(payload);
+    let mut f = (payload.len() as u32).to_le_bytes().to_vec();
+    f.extend_from_slice(&crc32c::crc32c(&body).to_le_bytes());
+    f.extend_from_slice(&body);
+    store.write_at(0, &f).unwrap();
+    assert!(matches!(Journal::open(store.clone()), Err(JournalError::Legacy)));
+    assert_eq!(store.read_at(0, f.len()).unwrap(), f, "left as found");
+}

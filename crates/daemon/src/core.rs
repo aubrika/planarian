@@ -24,7 +24,7 @@ use planarian_policy::{authorization_of, user_authorization};
 use planarian_schema::spec::predict;
 use planarian_schema::*;
 use planarian_state::{Assembler, Context};
-use planarian_txn::journal::Journal;
+use planarian_txn::journal::{Journal, JournalError};
 use planarian_txn::ledger::{Ledger, Record};
 use planarian_txn::store::Store;
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,9 @@ pub struct CoreConfig {
     /// The default startup grace (units may set their own).
     pub startup_grace: Millis,
 }
+
+/// How often the running daemon re-reads its journal's hash chain (I18).
+pub const CHAIN_CHECK_EVERY: Millis = Millis::secs(3600);
 
 /// The caller of a request, from `SO_PEERCRED`, group membership and logind.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +118,11 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// External dependencies whose probes time out: since when, and
     /// whether that was said (§10: Unknown, never Failed, so no incident).
     unreachable: BTreeMap<UnitId, (Timestamp, bool)>,
+    /// When the journal's hash chain was last re-read from disk (I18).
+    chain_checked: Option<Timestamp>,
+    /// A broken chain found while running; `main` stops on it (§12d: the
+    /// response is in the posture units, not here).
+    pub integrity: Option<String>,
     /// When to next check the §12b collection bounds.
     next_gc_check: Timestamp,
     /// The space report last noticed.
@@ -222,6 +230,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             interlock_noted: false,
             diag_noted: BTreeSet::new(),
             unreachable: BTreeMap::new(),
+            chain_checked: None,
+            integrity: None,
             next_gc_check: Timestamp(0),
             space_noted: Timestamp(0),
             awaiting_post: Vec::new(),
@@ -423,6 +433,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     pub fn tick(&mut self) {
         let (s, defs) = self.observe();
         let now = s.observed_at;
+
+        // I18: re-read the retained journal against the head this daemon holds.
+        if self.chain_checked.is_none_or(|t| now.0.saturating_sub(t.0) >= CHAIN_CHECK_EVERY.0) {
+            self.chain_checked = Some(now);
+            if let Err(JournalError::Integrity(why)) = self.ex.kernel.journal.verify_chain() {
+                self.integrity = Some(why);
+                return;
+            }
+        }
 
         for inc in self.incidents.tick(now, &s, &defs) {
             if matches!(inc.state, IncidentState::Escalated { .. }) && inc.attempts.is_empty() {

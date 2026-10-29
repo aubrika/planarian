@@ -595,3 +595,30 @@ fn a_repaired_root_cause_is_named_for_its_dependents() {
         r.core.notices
     );
 }
+
+/// journal-record-edited (I18): a retained record edited on disk while the
+/// daemon runs is caught at the next chain check; the daemon reports an
+/// Integrity failure instead of acting on the edited history.
+#[test]
+fn edited_journal_record_is_an_integrity_failure() {
+    let mut r = Rig::new();
+    let resp = r.core.handle(ADMIN, Request::Restart { unit: UnitId::service("gym-web") });
+    assert!(matches!(resp, Response::Done { .. }), "{resp:?}");
+    r.ticks(2);
+    assert!(r.core.integrity.is_none());
+    let store = r.fake.store.clone();
+    assert!(
+        planarian_txn::journal::tamper(&store, 1, |p| {
+            let i = p.iter().position(|b| b.is_ascii_digit()).unwrap();
+            p[i] = if p[i] == b'9' { b'1' } else { p[i] + 1 };
+        })
+        .unwrap()
+    );
+    r.fake.advance(CHAIN_CHECK_EVERY);
+    r.core.tick();
+    assert!(
+        r.core.integrity.as_deref().is_some_and(|w| w.contains("hash chain") || w.contains("no longer")),
+        "{:?}",
+        r.core.integrity
+    );
+}

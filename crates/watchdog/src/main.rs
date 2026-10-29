@@ -11,7 +11,7 @@ use planarian_backend_linux::{Paths, Real};
 use planarian_daemon::config::{CONFIG, FileConfig, load_canonical};
 use planarian_exec::host::ExecHost;
 use planarian_schema::{Hash, OwnerId};
-use planarian_txn::journal::Journal;
+use planarian_txn::journal::{Journal, JournalError};
 use planarian_txn::kernel::Kernel;
 use planarian_txn::store::FileStore;
 use std::path::Path;
@@ -54,7 +54,18 @@ fn pass(
 ) -> Result<(), String> {
     let store = FileStore::open(&paths.journal_dir(), &paths.txn_dir(), file.journal_bytes)
         .map_err(|e| format!("journal: {e}"))?;
-    let journal = Journal::open(store).map_err(|e| format!("journal: {e:?}"))?;
+    let journal = match Journal::open(store) {
+        Ok(j) => j,
+        // planarian-recovery's independent check (§12d): report and stop with
+        // the Integrity status; the posture units respond.
+        Err(JournalError::Integrity(why)) => {
+            eprintln!("planarian-recovery: INTEGRITY: the journal's hash chain is broken: {why}");
+            let _ = std::fs::create_dir_all("/run/planarian");
+            let _ = std::fs::write("/run/planarian/integrity", format!("journal: {why}\n"));
+            std::process::exit(78);
+        }
+        Err(e) => return Err(format!("journal: {e:?}")),
+    };
     let real = Real::new(paths.clone(), file.devices.clone());
     let mut k = Kernel::new(journal, ExecHost::new(real, canonical.clone()), me.clone());
     let live: Vec<_> = k.journal.ledger().live.values().map(|l| l.txn.clone()).collect();

@@ -9,7 +9,7 @@ use planarian_exec::Config as ExecConfig;
 use planarian_exec::{PrebuildJob, Prebuilt};
 use planarian_ipc::{Request, Response, SOCKET};
 use planarian_schema::{Backends, Clock, Hash, OwnerId, PinnedSource, SourceKind};
-use planarian_txn::journal::Journal;
+use planarian_txn::journal::{Journal, JournalError};
 use planarian_txn::ledger::Record;
 use planarian_txn::store::FileStore;
 use std::collections::VecDeque;
@@ -35,6 +35,35 @@ fn fresh_boot(state: &Path, boot: &str) -> bool {
     let fresh = std::fs::read_to_string(&p).map(|s| s.trim() != boot).unwrap_or(true);
     let _ = std::fs::write(&p, boot);
     fresh
+}
+
+/// Exit status for an `Integrity` failure (§12d). The response lives in
+/// `nix/posture.nix`, never here: this only reports what was found and stops.
+pub const EXIT_INTEGRITY: i32 = 78;
+/// Where the reason goes, for the boot report and the posture units.
+const INTEGRITY_NOTE: &str = "/run/planarian/integrity";
+
+fn journal_failure(who: &str, e: &JournalError) -> ! {
+    match e {
+        JournalError::Integrity(why) => {
+            eprintln!("{who}: INTEGRITY: the journal's hash chain is broken: {why}");
+            let _ = std::fs::create_dir_all("/run/planarian");
+            let _ = std::fs::write(INTEGRITY_NOTE, format!("journal: {why}\n"));
+            std::process::exit(EXIT_INTEGRITY);
+        }
+        JournalError::Legacy => {
+            eprintln!(
+                "{who}: the journal under /var/lib/planarian/journal was written by an earlier Planarian (format 1, \
+                 before the hash chain). Move it aside to keep it for inspection, then restart: \
+                 sudo mv /var/lib/planarian/journal /var/lib/planarian/journal.v1"
+            );
+            std::process::exit(74);
+        }
+        e => {
+            eprintln!("{who}: journal: {e:?}");
+            std::process::exit(74);
+        }
+    }
 }
 
 fn peer_of(s: &UnixStream, admin_group: &str) -> Option<Peer> {
@@ -161,10 +190,7 @@ fn main() {
     };
     let journal = match Journal::open(store) {
         Ok(j) => j,
-        Err(e) => {
-            eprintln!("planariad: journal: {e:?}");
-            std::process::exit(74);
-        }
+        Err(e) => journal_failure("planariad", &e),
     };
     let (boot_hash, boot) = boot_id();
     let me = OwnerId::Daemon { pid: std::process::id(), boot_id: boot_hash };
@@ -267,6 +293,9 @@ fn main() {
         if Instant::now() >= next_tick {
             core.tick();
             next_tick = Instant::now() + TICK;
+        }
+        if let Some(why) = core.integrity.take() {
+            journal_failure("planariad", &JournalError::Integrity(why));
         }
         let wait = next_tick.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
