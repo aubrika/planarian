@@ -265,7 +265,12 @@ impl Nixos {
                         .map(String::from),
                     );
                 }
-                cmd.extend(["sh".into(), "-c".into(), format!("sleep {}; exec {switch} test", d.as_secs())]);
+                // A transient unit's PATH is systemd's default, empty on NixOS.
+                cmd.extend([
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("PATH=/run/current-system/sw/bin; sleep {}; exec {switch} test", d.as_secs()),
+                ]);
             }
         }
         let args: Vec<&str> = cmd.iter().map(String::as_str).collect();

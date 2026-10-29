@@ -235,4 +235,6 @@ fn vm_plan_refuses_what_the_gym_vm_cannot_be() {
     assert!(unsupported("storage-enospc-during-build"));
     assert!(unsupported("storage-nix-full-gc"));
     assert!(!unsupported("storage-boot-full-publish"));
+    // `internal wifi-connect` is the harness's own; the others do not exist.
+    assert!(!unsupported("policy-daemon-wifi-runtime"));
 }

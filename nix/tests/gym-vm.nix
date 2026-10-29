@@ -193,6 +193,15 @@ let
             scope = "user";
             synonyms = [ "sound" "audio" ];
             edges = [ { to = "device:snd-hda0"; kind = "Requires"; } ];
+            # Real pipewire keeps running when its card goes; the user just
+            # loses sound. As the fake models it, pipewire degrades without a
+            # card to drive (the kernel lists none).
+            probes = [ {
+              id = "pipewire-has-a-card";
+              type = "exec";
+              argv = [ "${pkgs.gnugrep}/bin/grep" "-qv" "no soundcards" "/proc/asound/cards" ];
+              establishes = "pipewire has a sound card to drive";
+            } ];
           };
           net-gym0 = { kind = "device"; sysfs = "/sys/bus/pci/devices/0000:00:1d.0"; sensitivity = [ "External" ]; restartDisruption = "ConnectivityLoss"; };
           gpu0 = { kind = "device"; sysfs = "/sys/bus/pci/devices/0000:00:1c.0"; restartDisruption = "SessionLoss"; };
@@ -351,7 +360,7 @@ let
         memorySize = 3072;
         cores = 2;
         diskSize = 8192;
-        emptyDiskImages = [ 512 ];
+        emptyDiskImages = [ 512 256 ];
         qemu.options = [
           "-device intel-hda,addr=0x1b" "-device hda-duplex"
           "-device virtio-gpu-pci,addr=0x1c"
@@ -369,7 +378,14 @@ let
       boot.kernelParams = [ "mem_sleep_default=s2idle" "vfio.enable_unsafe_noiommu_mode=1" ]
         ++ lib.optional (config.gym.kernelParam != "") config.gym.kernelParam;
       # The journal on its own small filesystem (fill_fs fs-journal).
-      fileSystems."/var/lib/planarian" = { device = "/dev/vdb"; fsType = "ext4"; autoFormat = true; };
+      # (virtualisation.fileSystems: in a test VM, plain fileSystems entries
+      # are replaced by the VM's own, and were never mounted.)
+      virtualisation.fileSystems."/var/lib/planarian" = { device = "/dev/vdb"; fsType = "ext4"; autoFormat = true; };
+      # /boot on its own small filesystem, as on an installed machine
+      # (fill_fs fs-boot; GRUB copies the kernels there since the store is
+      # elsewhere). The test VM boots its kernel directly; this is what
+      # publishing a generation writes.
+      virtualisation.fileSystems."/boot" = { device = "/dev/vdc"; fsType = "ext4"; autoFormat = true; };
 
       # The prebuilt candidates and out-of-band generations.
       specialisation = lib.mapAttrs (_: s: { configuration = { imports = [ s ]; gym.isBase = false; }; }) ((lib.mapAttrs (n: a:
@@ -481,6 +497,12 @@ let
                         d = st.get("duration", "60s")
                         secs = int(d[:-1]) * (60 if d.endswith("m") else 1)
                         # The RTC alarm wakes it; the monitor command is a backup.
+                        # s2idle wakes on interrupts marked as wakeup sources: the RTC's.
+                        print(machine.succeed(
+                            "for w in /sys/class/rtc/rtc0/device/power/wakeup /sys/class/rtc/rtc0/power/wakeup; do"
+                            " [ -e $w ] && echo enabled > $w; done; cat /sys/power/mem_sleep;"
+                            " grep -H . /sys/class/rtc/rtc0/device/power/wakeup /sys/class/rtc/rtc0/power/wakeup 2>&1 || true"
+                        ))
                         machine.succeed(f"rtcwake -m no -s {secs}")
                         machine.execute("systemctl suspend &")
                         time.sleep(secs)

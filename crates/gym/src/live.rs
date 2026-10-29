@@ -194,8 +194,15 @@ pub fn plan(entry: &T) -> Plan {
             match raw {
                 "reboot" | "suspend" | "hotunplug" | "stop_host_service" | "start_host_service" => "host".into(),
                 "cli"
-                    if st.get("argv").and_then(T::as_array).and_then(|a| a.first()).and_then(T::as_str)
-                        == Some("internal") =>
+                    if {
+                        // `internal` commands the harness runs itself (in run_step).
+                        let argv: Vec<&str> = st
+                            .get("argv")
+                            .and_then(T::as_array)
+                            .map(|a| a.iter().filter_map(T::as_str).collect())
+                            .unwrap_or_default();
+                        argv.first() == Some(&"internal") && argv.get(1) != Some(&"wifi-connect")
+                    } =>
                 {
                     format!("unsupported: {raw} {:?} (no such command)", st.get("argv"))
                 }
@@ -624,7 +631,9 @@ fn step(entry: &T, i: usize, watched: Option<&str>) {
         std::thread::sleep(Duration::from_millis(d.0));
     } else if let Some(prefix) = watched.and_then(|w| w.strip_prefix("unit:")) {
         let until = Instant::now() + Duration::from_secs(3600);
-        while sh_out(&format!("systemctl list-units --state=active --no-legend --plain '{prefix}*'")).trim().is_empty()
+        while sh_out(&format!("systemctl list-units --state=activating,active --no-legend --plain '{prefix}*'"))
+            .trim()
+            .is_empty()
             && Instant::now() < until
         {
             std::thread::sleep(Duration::from_millis(200));
