@@ -354,6 +354,14 @@ impl Nixos {
     /// The boot menu is the one for `path`: as recorded after the last
     /// successful install, or, before any (a machine installed before this
     /// record existed), when `path` is the system that booted.
+    /// The number of the profile generation the profile link points at
+    /// (`system-<n>-link`).
+    fn profile_generation(&self) -> Option<u64> {
+        let l = std::fs::read_link(&self.paths.profile).ok()?;
+        let name = l.file_name()?.to_string_lossy().into_owned();
+        name.strip_suffix("-link")?.rsplit('-').next()?.parse().ok()
+    }
+
     fn boot_menu_for(&self, path: &str) -> bool {
         match std::fs::read_to_string(self.boot_menu_path()) {
             Ok(p) => p.trim() == path,
@@ -719,6 +727,61 @@ impl GenerationBackend for Nixos {
             }
         }
         err(&o)
+    }
+
+    /// The boot-only path with systemd-boot (§12f): `g` gets its own profile
+    /// generation and boot entry, `keep` is made the newest profile
+    /// generation again (so the menu's default stays `keep`), and the entry
+    /// for `g` is set to boot once (`bootctl set-oneshot`). All or nothing:
+    /// on any failure the profile is put back on `keep`'s boot menu.
+    fn publish_boot_once(&self, g: GenerationId, keep: GenerationId, op: &OpId) -> Outcome {
+        if !admitted(&self.paths.txn_dir(), op) {
+            return Outcome::fenced();
+        }
+        let (Ok(path), Ok(kept)) = (self.path_of(g), self.path_of(keep)) else {
+            return Outcome::Failed("unknown generation".into());
+        };
+        let profile = self.paths.profile.to_string_lossy().into_owned();
+        let set = |p: &str| run(&["nix-env", "-p", &profile, "--set", p], QUICK);
+        let o = set(&path.0);
+        if !o.ok() {
+            return err(&o);
+        }
+        let Some(n) = self.profile_generation() else {
+            let _ = set(&kept.0);
+            return Outcome::Failed("cannot read the profile generation".into());
+        };
+        let o = set(&kept.0);
+        if !o.ok() {
+            return err(&o);
+        }
+        let o = run(&[&format!("{}/bin/switch-to-configuration", kept.0), "boot"], Duration::from_secs(300));
+        if !o.ok() {
+            return err(&o);
+        }
+        let _ = std::fs::write(self.boot_menu_path(), &kept.0);
+        let o = run(&["bootctl", "set-oneshot", &format!("nixos-generation-{n}.conf")], QUICK);
+        if o.ok() { Outcome::Succeeded } else { err(&o) }
+    }
+
+    /// The pending one-shot entry, from systemd-boot's `LoaderEntryOneShot`
+    /// EFI variable: `nixos-generation-<n>.conf` → the profile generation's path.
+    fn one_shot_pending(&self) -> Result<Option<GenerationId>, Outcome> {
+        let efivars = Path::new("/sys/firmware/efi/efivars");
+        if !efivars.is_dir() {
+            return Err(Outcome::Unknown("no EFI variables".into()));
+        }
+        let var = efivars.join("LoaderEntryOneShot-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f");
+        let Ok(bytes) = std::fs::read(&var) else { return Ok(None) };
+        // 4 bytes of attributes, then UTF-16LE.
+        let units: Vec<u16> =
+            bytes.get(4..).unwrap_or(&[]).chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let name = String::from_utf16_lossy(&units).trim_end_matches('\0').to_string();
+        let Some(n) = name.strip_prefix("nixos-generation-").and_then(|r| r.strip_suffix(".conf")) else {
+            return Ok(None);
+        };
+        let link = self.paths.profile.with_file_name(format!("system-{n}-link"));
+        self.id_of_link(&link).map(Some)
     }
 
     fn protect(&self, g: GenerationId, op: &OpId) -> Outcome {

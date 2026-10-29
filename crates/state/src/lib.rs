@@ -13,12 +13,15 @@
 //! goes through the backend traits (§6).
 
 use planarian_schema::{
-    Backends, Cadence, Clock, Condition, DriverRef, Evidence, GenerationBackend, GenerationId, Hash, InventoryBackend,
-    Millis, Observed, Override, PowerSource, ProbeBackend, ProbeCost, ProbeDef, ProbeId, ProbeKind, ProbeOrigin,
-    ProbeResult, ProbeRole, Reason, Scope, SessionBackend, SessionInfo, SystemState, Timestamp, UnitBackend, UnitDef,
-    UnitDefs, UnitId, UnitKind,
+    Backends, Cadence, Clock, Condition, Disruption, DriverRef, Evidence, GenerationBackend, GenerationId, Hash,
+    InventoryBackend, Millis, Observed, Override, PowerSource, ProbeBackend, ProbeCost, ProbeDef, ProbeId, ProbeKind,
+    ProbeOrigin, ProbeResult, ProbeRole, Reason, Scope, SessionBackend, SessionInfo, SystemState, Timestamp,
+    UnitBackend, UnitDef, UnitDefs, UnitId, UnitKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Quiet mode's probe interval for units foreground work does not depend on.
+pub const QUIET_INTERVAL: Millis = Millis::secs(60);
 
 pub const TICK: Millis = Millis::secs(5);
 pub const MIN_STALE: Millis = Millis::secs(30);
@@ -58,6 +61,9 @@ pub struct Context {
 
 #[derive(Clone, Debug, Default)]
 pub struct Assembler {
+    /// Quiet mode (§12f): Readiness probes of units foreground work does not
+    /// depend on drop to their slowest interval.
+    pub quiet: bool,
     manifest: Manifest,
     canonical: Canonical,
     evidence: BTreeMap<(UnitId, ProbeId), Evidence>,
@@ -172,6 +178,20 @@ impl Assembler {
     fn stale_after(&self, p: &ProbeDef) -> Millis {
         let interval = self.interval(p).unwrap_or(TICK);
         Millis((interval.0 * 3).max(p.timeout.0 * 2 + TICK.0).max(MIN_STALE.0))
+    }
+
+    /// Quiet mode holds back a probe of a unit foreground work does not
+    /// plausibly depend on (audio, the compositor, input devices, the
+    /// network), to once a minute.
+    fn quieted(&self, def: &UnitDef, p: &ProbeDef, now: Timestamp) -> bool {
+        if !self.quiet || self.on_demand.contains(&(def.id.clone(), p.id.clone())) {
+            return false;
+        }
+        let depended_on = matches!(def.id.scope, Scope::User { .. })
+            || def.id.kind == UnitKind::Device
+            || matches!(def.restart_disruption, Disruption::SessionLoss | Disruption::ConnectivityLoss);
+        !depended_on
+            && self.last_run.get(&(def.id.clone(), p.id.clone())).is_some_and(|last| now.0 < last.0 + QUIET_INTERVAL.0)
     }
 
     fn due(&self, unit: &UnitId, p: &ProbeDef, now: Timestamp) -> bool {
@@ -360,6 +380,14 @@ impl Assembler {
         let mut local: Vec<(UnitId, ProbeDef, ProbeResult)> = vec![];
         for def in defs.values() {
             for p in &def.probes {
+                if self.quieted(def, p, now) {
+                    // Held back, not lost: its evidence stays valid for the
+                    // slower interval.
+                    if let Some(e) = self.evidence.get_mut(&(def.id.clone(), p.id.clone())) {
+                        e.stale_after = Millis(e.stale_after.0.max(QUIET_INTERVAL.0 * 3));
+                    }
+                    continue;
+                }
                 if !self.due(&def.id, p, now) {
                     continue;
                 }

@@ -189,53 +189,6 @@ target = "service:gym-planted"
 # Family: boot-only-change (§12 step 7, §12f, AwaitingBoot)
 # ═══════════════════════════════════════════════════════════════════════════
 
-[[fault]]
-id = "boot-only-kernel-confirmed"
-family = "boot-only-change"
-summary = "A kernel parameter change takes the boot-only path: published as a one-shot next-boot entry, AwaitingBoot, a non-urgent 'restart to finish' notice, known_good still the default. After the reboot and the 10-minute check it commits and becomes known_good."
-spec = ["§12 step 7", "§12f", "§10 boot confirmation", "§15 v4.4"]
-tags = ["acceptance"]
-scoring = "must-pass"
-harness = ["fake", "vm"]
-intent = { kind = "none" }
-inject = { transition = "ApplyChange", change = "gym:kernel-param", source = "user", actor = "user:1001" }
-after = [{ raw = "wait", for = { journal = "AwaitingBoot" } }, { raw = "reboot" }]
-window = "20m"
-
-[fault.required_post]
-generation = "candidate"
-known_good = "candidate"
-reports = ["RestartToFinish"]
-
-[[fault.required_post.txn]]
-transition = "ApplyChange"
-path = ["Built", "AwaitingBoot", "Committed"]
-never = "LiveTested"
-
-[[fault]]
-id = "boot-only-kernel-boot-fails"
-family = "boot-only-change"
-summary = "Same change, but the one-shot boot fails. The next boot falls back to known_good and the transaction is Reverted."
-spec = ["§12 step 7", "§12f", "I1", "§15 v4.4"]
-tags = ["acceptance"]
-scoring = "must-pass"
-harness = ["fake", "vm"]
-intent = { kind = "none" }
-setup = [{ raw = "fail_boot", generation = "candidate" }]
-inject = { transition = "ApplyChange", change = "gym:kernel-param", source = "user", actor = "user:1001" }
-after = [{ raw = "wait", for = { journal = "AwaitingBoot" } }, { raw = "reboot" }]
-window = "20m"
-
-[fault.required_post]
-generation = "base"
-boot_default = "known_good"
-known_good = "unchanged"
-journal_agrees = true
-
-[[fault.required_post.txn]]
-transition = "ApplyChange"
-path = ["AwaitingBoot", "Reverted"]
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Family: authorization (§11)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -290,49 +243,6 @@ invariants = ["I18"]
 # ═══════════════════════════════════════════════════════════════════════════
 # Family: activation-scheduling (§12f)
 # ═══════════════════════════════════════════════════════════════════════════
-
-[[fault]]
-id = "quiet-staged-update-foreground"
-family = "activation-scheduling"
-summary = "A verified change that would restart a session unit (keyboard layout → compositor reload) is staged while a GameMode client holds Foreground. It waits in Built; once Foreground ends it activates in the window and commits."
-spec = ["§12f", "I6", "§15 v4.4"]
-tags = ["acceptance"]
-scoring = "must-pass"
-harness = ["fake", "vm"]
-intent = { kind = "none" }
-setup = [
-  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
-  { raw = "foreground", session = "s1", on = true },
-]
-inject = { transition = "ApplyChange", change = "keyboard-layout", args = { layout = "de" }, source = "user", actor = "user:1000@s1" }
-after = [{ raw = "wait", for = "3m" }, { raw = "foreground", session = "s1", on = false }]
-window = "10m"
-
-[[fault.required_post.txn]]
-transition = "ApplyChange"
-waited_in = { state = "Built", until = "foreground-ended" }
-terminal = "Committed"
-
-[[fault]]
-id = "quiet-repair-not-deferred"
-family = "activation-scheduling"
-summary = "While Foreground holds, PipeWire crashes. Repairs of units foreground work depends on are not deferred: repaired at once, exactly one notice."
-spec = ["§12f quiet mode"]
-tags = ["acceptance"]
-scoring = "repair"
-harness = ["fake", "vm"]
-intent = { kind = "none" }
-setup = [
-  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
-  { raw = "foreground", session = "s1", on = true },
-]
-# SIGSEGV, not SIGKILL: see catalog-review §6 C1.
-inject = { raw = "kill_unit", unit = "service@1000:pipewire", signal = "SIGSEGV" }
-window = "2m"
-
-[fault.required_post]
-units = { "service@1000:pipewire" = "Running" }
-notices_count = { match = "pipewire", count = 1 }
 
 [[fault]]
 id = "quiet-reference-workload"

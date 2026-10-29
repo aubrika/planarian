@@ -2321,3 +2321,98 @@ transition = "SetOverride"
 decision = "Allow(AskFirst)"
 approver_class = "Administrator"
 terminal = "Committed"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: activation scheduling (§12 step 7, §12f)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "boot-only-kernel-confirmed"
+family = "boot-only-change"
+summary = "A kernel parameter change takes the boot-only path: published as a one-shot next-boot entry, AwaitingBoot, a 'restart to finish' notice, the base still the default. At the next boot it is confirmed, becomes the default, and commits."
+spec = ["§12 step 7", "§12f", "§10 boot confirmation", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }]
+window = "5m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+reports = ["RestartToFinish"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Built", "AwaitingBoot", "Promoted", "Committed"]
+never = ["Activating"]
+
+[[fault]]
+id = "boot-only-kernel-boot-fails"
+family = "boot-only-change"
+summary = "The same change, but the one-shot boot fails; the boot loader falls back to the default (the base), and the transaction is Reverted."
+spec = ["§12 step 7", "§12f", "I1", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "fail_boot" }]
+inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }]
+window = "5m"
+
+[fault.required_post]
+generation = "base"
+boot_default = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["AwaitingBoot", "Reverted"]
+
+[[fault]]
+id = "quiet-staged-update-foreground"
+family = "activation-scheduling"
+summary = "alice changes her font scale while a game holds Foreground in her session. The verified candidate waits in Built; once Foreground ends it activates in that window and commits."
+spec = ["§12f", "I6", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "foreground", session = "s1", on = true },
+]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" }
+after = [{ raw = "wait", for = "3m" }, { raw = "foreground", session = "s1", on = false }]
+window = "5m"
+
+[fault.required_post]
+reports = ["WaitsForWindow"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Built", "Activating", "Committed"]
+terminal = "Committed"
+
+[[fault]]
+id = "quiet-repair-not-deferred"
+family = "activation-scheduling"
+summary = "While a game holds Foreground, alice's PipeWire crashes. Repairs of what foreground work depends on are not deferred: it is repaired at once, with exactly one notice."
+spec = ["§12f quiet mode"]
+tags = ["acceptance"]
+scoring = "repair"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "foreground", session = "s1", on = true },
+  { raw = "wait", for = "1m" },
+]
+inject = { raw = "kill_unit", unit = "service@1000:pipewire", signal = "SIGSEGV" }
+window = "2m"
+
+[fault.required_post]
+units = { "service@1000:pipewire" = "Running" }
+notices_count = { match = "pipewire", count = 1 }

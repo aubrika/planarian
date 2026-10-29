@@ -392,6 +392,18 @@ pub struct ActivationPlan {
     pub needs_reboot_to_confirm: bool,
 }
 
+impl ActivationPlan {
+    /// Takes effect only at boot (kernel, initrd, drivers): nothing to start,
+    /// stop, restart or reload now (§12f boot-only path).
+    pub fn boot_only(&self) -> bool {
+        self.needs_reboot_to_confirm
+            && self.start.is_empty()
+            && self.stop.is_empty()
+            && self.restart.is_empty()
+            && self.reload.is_empty()
+    }
+}
+
 pub trait TransitionSpec {
     fn precondition(&self, s: &SystemState, defs: &UnitDefs) -> bool;
     fn predict(&self, s: &SystemState, defs: &UnitDefs) -> Expectation;

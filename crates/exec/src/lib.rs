@@ -113,6 +113,8 @@ pub struct Executor<B: Backends + Clone, S: Store> {
     /// Set when the last commit raised the security floor (§12e): the
     /// generation and the packages it fixed, for the daemon to report.
     pub floor_raised: Option<(GenerationId, Vec<String>)>,
+    /// Generation transactions waiting in `Built` for an activation window (§12f).
+    waiting: BTreeMap<TxnId, Plan>,
 }
 
 /// What stage, evaluate and build produced for a catalog change.
@@ -213,6 +215,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             excluded: vec![],
             prebuilt: None,
             floor_raised: None,
+            waiting: BTreeMap::new(),
         }
     }
 
@@ -571,7 +574,78 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             );
             return Submitted::Parked { txn: id, approve: bound_to, facts: plan.facts };
         }
+        self.schedule(id, plan, &p.source, state)
+    }
+
+    /// §12f: a generation candidate that takes effect only at boot takes the
+    /// boot-only path; one that would disturb a session, or any while
+    /// foreground work holds, waits in `Built` for an activation window
+    /// (`activate_waiting`); everything else runs now.
+    fn schedule(&mut self, id: TxnId, plan: Plan, source: &Source, state: &SystemState) -> Submitted {
+        if !plan.transition.changes_generation() {
+            return self.run(id, &plan);
+        }
+        if plan.built.as_ref().is_some_and(|b| b.activation.boot_only()) {
+            return match self.kernel.run_boot_only(id) {
+                Ok(end) => Submitted::Finished { txn: id, state: end, followup: None },
+                Err(e) => Self::kernel_error(e),
+            };
+        }
+        let foreground = state.conditions.iter().any(|c| matches!(c, Condition::Foreground { .. }));
+        let user_asked = matches!(source, Source::User | Source::Intent { .. });
+        let disturbs = plan.built.as_ref().is_some_and(|b| self.disturbs_a_session(&b.activation));
+        if foreground || (disturbs && !user_asked && !self.sessions_idle()) {
+            let why = if foreground { "waiting: foreground work holds" } else { "waiting: a session is in use" };
+            return match self.kernel.wait_built(id, why) {
+                Ok(end) => {
+                    self.waiting.insert(id, plan);
+                    Submitted::Finished { txn: id, state: end, followup: None }
+                }
+                Err(e) => Self::kernel_error(e),
+            };
+        }
         self.run(id, &plan)
+    }
+
+    /// The activation would restart or reload something an active user
+    /// session uses (§12f): a user unit, or one whose restart drops a session.
+    fn disturbs_a_session(&self, a: &ActivationPlan) -> bool {
+        let sessions = self.b.sessions().sessions().unwrap_or_default();
+        if !sessions.iter().any(|s| s.establishes() && s.active) {
+            return false;
+        }
+        a.stop.iter().chain(&a.restart).chain(&a.reload).any(|u| {
+            matches!(u.scope, Scope::User { .. }) || ["display-manager", "graphical-session"].contains(&u.name.as_str())
+        })
+    }
+
+    fn sessions_idle(&self) -> bool {
+        self.b.sessions().sessions().unwrap_or_default().iter().filter(|s| s.establishes() && s.active).all(|s| s.idle)
+    }
+
+    /// Activate transactions waiting in `Built` whose window has opened: no
+    /// foreground work, and the sessions idle (or the change does not disturb
+    /// one). Returns what ran.
+    pub fn activate_waiting(&mut self, state: &SystemState) -> Vec<(TxnId, Submitted)> {
+        let foreground = state.conditions.iter().any(|c| matches!(c, Condition::Foreground { .. }));
+        if foreground || self.waiting.is_empty() {
+            return vec![];
+        }
+        let ready: Vec<TxnId> = self
+            .waiting
+            .iter()
+            .filter(|(_, p)| {
+                !p.built.as_ref().is_some_and(|b| self.disturbs_a_session(&b.activation)) || self.sessions_idle()
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let mut out = vec![];
+        for id in ready {
+            if let Some(plan) = self.waiting.remove(&id) {
+                out.push((id, self.run(id, &plan)));
+            }
+        }
+        out
     }
 
     fn run(&mut self, id: TxnId, plan: &Plan) -> Submitted {
@@ -704,7 +778,8 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         let _ =
             self.kernel.journal.append(now, Record::TokenUsed { nonce, expires: parked.issued.plus(TOKEN_LIFETIME) });
         self.parked.remove(&parked.txn);
-        self.run(parked.txn, &plan)
+        let source = parked.proposal.source.clone();
+        self.schedule(parked.txn, plan, &source, state)
     }
 
     fn expire_one(&mut self, txn: TxnId) -> Submitted {

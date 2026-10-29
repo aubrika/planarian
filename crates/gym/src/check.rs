@@ -245,6 +245,15 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     }
                 }
             }
+            // Exactly this many notices mention `match` (§12f: one notice per repair).
+            "notices_count" => {
+                let m = val.get("match").and_then(T::as_str).unwrap_or("");
+                let want = val.get("count").and_then(T::as_integer).unwrap_or(0) as usize;
+                let got = e.notices.iter().filter(|n| n.contains(m)).count();
+                if got != want {
+                    fail(&mut v, format!("{got} notices mention {m}, want {want}: {:?}", e.notices));
+                }
+            }
             // An incident escalated with this reason during the run.
             "escalation" => {
                 let want = val.as_str().unwrap_or("");
@@ -482,6 +491,8 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                             notices.contains("stopped, not crashed") && notices.contains("planarian override")
                         }
                         "DisruptionSessionLoss" => notices.contains("end your graphical session"),
+                        "RestartToFinish" => notices.contains("restart to finish"),
+                        "WaitsForWindow" => notices.contains("waits for a quiet moment"),
                         "InferredOverride" => notices.contains("stopped outside Planarian")
                             && notices.contains("take that as intended"),
                         "Undo" => notices.contains("To start it again: planarian release"),

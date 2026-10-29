@@ -636,6 +636,7 @@ fn a_repaired_root_cause_is_named_for_its_dependents() {
         seat: Some("seat0".into()),
         remote: false,
         active: true,
+        idle: false,
         created: now,
     });
     for name in ["pipewire", "wireplumber"] {
@@ -681,5 +682,54 @@ fn edited_journal_record_is_an_integrity_failure() {
         r.core.integrity.as_deref().is_some_and(|w| w.contains("hash chain") || w.contains("no longer")),
         "{:?}",
         r.core.integrity
+    );
+}
+
+/// quiet-staged-update-foreground across a restart (§12f): a generation
+/// waiting in Built is Rejected(Interrupted) when the daemon restarts, and
+/// prepared again; with Foreground still holding, it waits again.
+#[test]
+fn waiting_generation_is_prepared_again_after_a_restart() {
+    let mut r = Rig::new();
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: Timestamp(0),
+        active: true,
+        idle: false,
+    });
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    let mut args = BTreeMap::new();
+    args.insert("scale".to_string(), Value::Str("1.25".into()));
+    let resp = r.core.handle(ALICE.in_session("s1"), Request::Apply { change: ChangeId("font-scale".into()), args });
+    assert!(matches!(resp, Response::Done { state: TxnState::Built, .. }), "{resp:?}");
+
+    // The daemon restarts.
+    let store = r.fake.store.clone();
+    r.fake.w().alive.insert(101);
+    r.core = Core::start(
+        Journal::open(store).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO },
+        config(),
+    );
+    r.ticks(2);
+    let l = r.core.ledger();
+    assert!(l.terminal.values().any(|t| t.state == TxnState::Rejected(RejectReason::Interrupted)));
+    assert!(l.live.values().any(|t| t.txn.state == TxnState::Built), "prepared again, waiting again");
+
+    // Foreground ends: it activates in that window.
+    r.fake.w().foreground.clear();
+    r.ticks(4);
+    let l = r.core.ledger();
+    assert!(l.live.is_empty());
+    assert!(
+        l.terminal
+            .values()
+            .any(|t| t.state == TxnState::Committed && matches!(t.transition, Transition::ApplyChange { .. }))
     );
 }

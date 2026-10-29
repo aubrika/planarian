@@ -129,6 +129,11 @@ pub struct Core<B: Backends + Clone, S: Store> {
     prev_status: BTreeMap<UnitId, UnitStatus>,
     /// The boot report runs on the first tick after boot (§10).
     boot_report_due: bool,
+    /// Quiet mode (§12f) and the notices it holds back.
+    quiet: bool,
+    quiet_queue: Vec<String>,
+    /// Waiting generations interrupted by a restart, to prepare again (§12f).
+    reprepare: Vec<Transition>,
     /// Units Planarian's own transactions touched since the previous tick, and
     /// whether a generation changed: their stops are not someone else's.
     touched: BTreeSet<UnitId>,
@@ -190,6 +195,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let mut ex = Executor::new(journal, b.clone(), me, cfg.exec.clone());
         ex.adopt_current();
         let mut notices = VecDeque::new();
+        let terminal_before: BTreeSet<TxnId> = ex.kernel.journal.ledger().terminal.keys().copied().collect();
         match ex.kernel.reconcile() {
             Ok(waiting) if !waiting.is_empty() => {
                 notices.push_back(format!("waiting for the recovery watchdog to finish transaction(s) {waiting:?}"))
@@ -198,6 +204,18 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             Err(e) => notices.push_back(format!("journal reconciliation failed: {e:?}")),
         }
         let ledger = ex.kernel.journal.ledger().clone();
+        // §12f: a generation that was waiting in Built for an activation
+        // window is Rejected(Interrupted) by the crash table, and re-prepared.
+        let reprepare: Vec<Transition> = ledger
+            .terminal
+            .iter()
+            .filter(|(id, t)| {
+                !terminal_before.contains(id)
+                    && t.state == TxnState::Rejected(RejectReason::Interrupted)
+                    && t.path.iter().rev().nth(1).is_some_and(|p| p == "Built")
+            })
+            .map(|(_, t)| t.transition.clone())
+            .collect();
         let mut incidents = Manager::restore(ledger.incidents.values().cloned());
         incidents.startup_grace = cfg.startup_grace;
         let current = b.generations().current().unwrap_or_default();
@@ -245,6 +263,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             integrity: None,
             prev_status: BTreeMap::new(),
             boot_report_due: fresh,
+            quiet: false,
+            quiet_queue: vec![],
+            reprepare: vec![],
             touched: BTreeSet::new(),
             generation_touched: false,
             next_gc_check: Timestamp(0),
@@ -264,6 +285,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 core.notice(format!("reconciliation: {a}"));
             }
         }
+        core.reprepare = reprepare;
         core
     }
 
@@ -273,6 +295,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     pub fn notice(&mut self, s: String) {
+        // Quiet mode (§12f): non-urgent notices wait and come as one batch.
+        if self.quiet && !urgent(&s) {
+            self.quiet_queue.push(s);
+            return;
+        }
+        self.say(s);
+    }
+
+    fn say(&mut self, s: String) {
         if self.notices.len() >= NOTICES_KEPT {
             self.notices.pop_front();
         }
@@ -395,6 +426,21 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
         self.generation_touched |= p.transition.changes_generation();
+        if let Submitted::Finished { txn, state, .. } = &result {
+            match state {
+                TxnState::Built => self.notice(format!(
+                    "transaction {}: {} is ready and waits for a quiet moment (it would interrupt what you are doing)",
+                    txn.0,
+                    render::transition(&p.transition)
+                )),
+                TxnState::AwaitingBoot => self.notice(format!(
+                    "transaction {}: {} takes effect when you restart; restart to finish",
+                    txn.0,
+                    render::transition(&p.transition)
+                )),
+                _ => {}
+            }
+        }
         if let Some((g, fixes)) = self.ex.floor_raised.take() {
             self.notice(format!(
                 "security floor is now generation {} (it fixes {}); going back below it needs an administrator",
@@ -577,6 +623,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let (s, defs) = self.observe();
         let now = s.observed_at;
 
+        // §12f quiet mode: while foreground work holds in any session.
+        let quiet = s.conditions.iter().any(|c| matches!(c, Condition::Foreground { .. }));
+        if self.quiet && !quiet && !self.quiet_queue.is_empty() {
+            let batch = std::mem::take(&mut self.quiet_queue);
+            self.say(format!("while you were busy ({}): {}", batch.len(), batch.join(" · ")));
+        }
+        self.quiet = quiet;
+        self.asm.quiet = quiet;
+
         // §10 boot report, on the first tick after boot: units from outside the
         // generation are an Integrity failure (§12d); the journal chain was
         // checked when it was opened, and the core hash by planarian-recovery.
@@ -589,6 +644,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 self.integrity = Some(format!("boot report: undeclared units: {}", foreign.join(", ")));
                 return;
             }
+        }
+
+        for t in std::mem::take(&mut self.reprepare) {
+            let p = self.proposal(t.clone(), &s, &defs, Source::Maintenance, "prepared again after a restart".into());
+            let r = self.submit(p, authorization_of(Actor::Daemon), &s, &defs);
+            self.notice(format!(
+                "{}: prepared again after a restart: {}",
+                render::transition(&t),
+                render::submitted_short(&r)
+            ));
         }
 
         // §11: stops nobody attributed, before anything treats them as faults.
@@ -611,7 +676,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 ));
             }
             // A repair incident opens: say what failed, in the probes' words.
-            if inc.kind == IncidentKind::Repair && inc.attempts.is_empty() && self.diag_noted.insert(inc.id) {
+            // In quiet mode the repair's own notice is the one notice (§12f).
+            if inc.kind == IncidentKind::Repair
+                && inc.attempts.is_empty()
+                && !self.quiet
+                && self.diag_noted.insert(inc.id)
+            {
                 let failing: Vec<String> = s
                     .units
                     .get(&inc.target)
@@ -689,11 +759,23 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         } else {
             self.interlock_noted = false;
-            let busy = l.live.values().any(|t| !t.txn.state.is_pre_mutation());
+            // Unit repairs may run while a generation awaits its boot (I6).
+            let busy = l.live.values().any(|t| !t.txn.state.is_pre_mutation() && t.txn.state != TxnState::AwaitingBoot);
             if !busy {
                 self.repair_one(&s, &defs, &l);
             }
-            if !busy && now >= self.next_gc_check {
+            // §12f: an activation window opened for a waiting generation.
+            if !busy {
+                for (id, r) in self.ex.activate_waiting(&s) {
+                    self.notice(format!(
+                        "transaction {}: activated now that nothing is in the way: {}",
+                        id.0,
+                        render::submitted_short(&r)
+                    ));
+                }
+            }
+            // Quiet mode defers garbage collection (§12f).
+            if !busy && !self.quiet && now >= self.next_gc_check {
                 self.next_gc_check = now.plus(GC_CHECK);
                 self.collect_if_over(&s, &defs);
             }
@@ -1461,4 +1543,14 @@ fn signal_name(e: Ending) -> String {
         Ending::Exited(n) => format!("exit status {n}"),
         Ending::OomKill => "the OOM killer".into(),
     }
+}
+
+/// Notices quiet mode never holds back (§12f): alarms, integrity findings,
+/// what a repair did, and anything that needs a person.
+fn urgent(s: &str) -> bool {
+    s.starts_with("ALARM")
+        || s.starts_with("INTEGRITY")
+        || s.contains(" → ")
+        || s.contains("needs a person")
+        || s.contains("needs approval")
 }

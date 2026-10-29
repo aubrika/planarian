@@ -34,6 +34,7 @@ pub fn config() -> CoreConfig {
                     "listen-address",
                     "repair:reenable-predicted",
                     "gym:security-fix",
+                    "gym:kernel-param",
                 ]
                 .map(|s| ChangeId(s.into()))
                 .into(),
@@ -53,14 +54,24 @@ pub fn config() -> CoreConfig {
                     },
                 )]
                 .into(),
-                gym_choices: [(
-                    "gym:security-fix".into(),
-                    planarian_changes::GymChoice {
-                        option: "gym.vulnlib".into(),
-                        arg: "version".into(),
-                        permitted: vec!["1.1".into()],
-                    },
-                )]
+                gym_choices: [
+                    (
+                        "gym:security-fix".into(),
+                        planarian_changes::GymChoice {
+                            option: "gym.vulnlib".into(),
+                            arg: "version".into(),
+                            permitted: vec!["1.1".into()],
+                        },
+                    ),
+                    (
+                        "gym:kernel-param".into(),
+                        planarian_changes::GymChoice {
+                            option: "gym.kernelParam".into(),
+                            arg: "param".into(),
+                            permitted: vec!["virtio_gpu.modeset=0".into()],
+                        },
+                    ),
+                ]
                 .into(),
                 ..Default::default()
             },
@@ -79,6 +90,9 @@ pub struct Sim {
     pub core: Option<Core<Fake, MemStore>>,
     /// The posture `set_setting posture` chose; kept across daemon restarts.
     pub posture: planarian_schema::Posture,
+    /// Reboots so far: the boot id the daemon and watchdog see.
+    pub boots: u64,
+    fresh_boot: bool,
     daemon_pid: u32,
     /// The daemon is killed and must not be restarted (catalog `hold_down`).
     held: bool,
@@ -192,6 +206,8 @@ impl Sim {
             fake,
             core: Some(core),
             posture: planarian_schema::Posture::Standard,
+            boots: 0,
+            fresh_boot: false,
             daemon_pid: DAEMON_PID,
             held: false,
             crash: None,
@@ -446,7 +462,7 @@ impl Sim {
         let mut k = Kernel::new(
             j,
             ExecHost::new(self.fake.clone(), fixtures::canonical()),
-            OwnerId::Watchdog { pid: WATCHDOG_PID, boot_id: Hash::ZERO },
+            OwnerId::Watchdog { pid: WATCHDOG_PID, boot_id: self.boot_id() },
         );
         let live: Vec<Transaction> = k.journal.ledger().live.values().map(|l| l.txn.clone()).collect();
         for t in live {
@@ -469,6 +485,10 @@ impl Sim {
         self.harvest();
     }
 
+    fn boot_id(&self) -> Hash {
+        if self.boots == 0 { Hash::ZERO } else { Hash::of(format!("boot {}", self.boots).as_bytes()) }
+    }
+
     fn kill_daemon(&mut self) {
         self.fake.w().alive.remove(&self.daemon_pid);
         self.core = None;
@@ -480,9 +500,10 @@ impl Sim {
         self.fake.w().alive.insert(pid);
         let j = Journal::open(self.fake.store.clone()).expect("journal");
         let mut cfg = config();
-        cfg.fresh_boot = false;
+        cfg.fresh_boot = std::mem::take(&mut self.fresh_boot);
         cfg.posture = self.posture;
-        self.core = Some(Core::start(j, self.fake.clone(), OwnerId::Daemon { pid, boot_id: Hash::ZERO }, cfg));
+        let boot_id = self.boot_id();
+        self.core = Some(Core::start(j, self.fake.clone(), OwnerId::Daemon { pid, boot_id }, cfg));
         self.harvest();
     }
 
@@ -766,6 +787,7 @@ impl Sim {
                     seat: Some("seat0".into()),
                     remote: false,
                     active: true,
+                    idle: false,
                     created: now,
                 });
                 let sim = planarian_fake::UnitSim::active(now);
@@ -789,6 +811,16 @@ impl Sim {
                     sim,
                 );
             }
+            // The machine restarts: the boot loader picks the entry (a one-shot
+            // first, unless it fails), and the daemon starts on a fresh boot.
+            "reboot" => {
+                self.kill_daemon();
+                self.fake.w().reboot();
+                self.boots += 1;
+                self.fresh_boot = true;
+                self.start_daemon();
+            }
+            "fail_boot" => self.fake.w().fail_one_shot = true,
             "logout" => {
                 let uid = s.get("uid").and_then(T::as_integer).unwrap_or(1000) as u32;
                 self.fake.w().sessions.retain(|x| x.uid != uid);
@@ -808,6 +840,7 @@ impl Sim {
                     remote: seat.is_none(),
                     seat,
                     active: true,
+                    idle: false,
                     created: now,
                 });
                 w.compositors.insert(id, get("compositor") != "fails");

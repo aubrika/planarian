@@ -168,6 +168,10 @@ pub struct World {
     /// Whether the compositor runs in each session's cgroup (§9); a session
     /// not listed falls back to the user's graphical-session target.
     pub compositors: BTreeMap<String, bool>,
+    /// A generation published to boot once (§12f), and generations whose boot
+    /// fails (the gym's `fail_boot`).
+    pub one_shot: Option<GenerationId>,
+    pub fail_one_shot: bool,
     /// Units planted outside the generation (the boot report finds them).
     pub foreign_units: Vec<String>,
     /// Sessions in which foreground work holds (§10 quiet mode).
@@ -404,7 +408,12 @@ impl World {
     }
 
     pub fn reboot(&mut self) {
-        self.booted = self.boot_default;
+        // A one-shot entry boots once; one that fails to boot falls back to
+        // the default (the boot loader's own fallback).
+        self.booted = match self.one_shot.take() {
+            Some(g) if !self.fail_one_shot => g,
+            _ => self.boot_default,
+        };
         let now = self.now;
         for id in self.jobs.keys() {
             if let Some(span) = self.job_spans.get_mut(id) {
@@ -413,7 +422,7 @@ impl World {
         }
         self.jobs.clear();
         self.sessions.clear();
-        let g = self.boot_default;
+        let g = self.booted;
         for sim in self.units.values_mut() {
             sim.observed = Observed::Bound;
         }
@@ -695,6 +704,21 @@ impl GenerationBackend for Fake {
         w.boot_entries.insert(g);
         w.boot_default = g;
         Outcome::Succeeded
+    }
+
+    fn publish_boot_once(&self, g: GenerationId, keep: GenerationId, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, format!("publish_boot_once({})", g.0)) {
+            return Outcome::fenced();
+        }
+        w.boot_entries.insert(g);
+        w.boot_default = keep;
+        w.one_shot = Some(g);
+        Outcome::Succeeded
+    }
+
+    fn one_shot_pending(&self) -> Result<Option<GenerationId>, Outcome> {
+        Ok(self.w().one_shot)
     }
 
     fn protect(&self, g: GenerationId, op: &OpId) -> Outcome {
@@ -1066,12 +1090,19 @@ pub fn gym_world(store: MemStore) -> Fake {
         ("services.openssh.enable".to_string(), Value::Bool(true)),
         ("planarian.reference.fontScale".to_string(), Value::Str("1".into())),
         ("gym.vulnlib".to_string(), Value::Str("1.0".into())),
+        ("gym.kernelParam".to_string(), Value::Str("".into())),
     ]
     .into();
     // gym-vulnlib 1.0 carries knownVulnerabilities; 1.1 fixes them (§12e).
     w.base_packages = [("gym-vulnlib".to_string(), "1.0".to_string())].into();
     w.base_insecure = ["gym-vulnlib".to_string()].into();
     w.rules = vec![
+        // A kernel parameter: takes effect only at boot (§12f).
+        Rule {
+            option: "gym.kernelParam".into(),
+            value: Value::Str("virtio_gpu.modeset=0".into()),
+            effect: Effect::NeedsReboot,
+        },
         Rule {
             option: "gym.vulnlib".into(),
             value: Value::Str("1.1".into()),

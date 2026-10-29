@@ -374,6 +374,47 @@ impl<S: Store, H: Host> Kernel<S, H> {
         Ok(to)
     }
 
+    // ---------- Activation scheduling (§12f) ----------
+
+    /// A verified generation candidate waits in `Built` for an activation
+    /// window. It holds no lease-gated mutation and counts as active for I6;
+    /// `run` takes it on from there.
+    pub fn wait_built(&mut self, id: TxnId, why: &str) -> R<TxnState> {
+        let l = self.live(id)?;
+        if l.txn.state != TxnState::Built {
+            self.advance(&l.txn, TxnState::Built, why)?;
+        }
+        Ok(TxnState::Built)
+    }
+
+    /// The boot-only path (§12 step 7): publish the candidate as a one-shot
+    /// next-boot entry, the base still the default, and wait in
+    /// `AwaitingBoot`; the boot it was published for confirms or reverts it
+    /// (`await_boot`).
+    pub fn run_boot_only(&mut self, id: TxnId) -> R<TxnState> {
+        let l = self.live(id)?;
+        if self.held.get(&id) != Some(&l.txn.lease.epoch) {
+            return Err(KernelError::LostLease(id));
+        }
+        let txn = l.txn;
+        let Some((cand, path)) = txn.candidate.clone() else {
+            return self.reject(id, RejectReason::Other("no candidate".into()));
+        };
+        let expected = txn.staged_source.unwrap_or(Hash::ZERO);
+        if self.host.generations().verify_candidate(&path, &expected) != Ok(true) {
+            return self.reject(id, RejectReason::Other("candidate failed verification".into()));
+        }
+        self.wait_built(id, "takes effect at boot")?;
+        let base = txn.base;
+        let o = self.call(id, "publish_boot_once", |h, op| h.generations().publish_boot_once(cand, base, op))?;
+        if !o.is_success() {
+            // All or nothing (the backend's contract): nothing was published.
+            return self.reject(id, RejectReason::Other(format!("publish_boot_once: {o:?}")));
+        }
+        self.advance(&txn, TxnState::AwaitingBoot, "published to boot once; restart to finish")?;
+        Ok(TxnState::AwaitingBoot)
+    }
+
     // ---------- Fresh execution ----------
 
     /// Execute a prepared (and, if AskFirst, approved) transaction to a terminal state.
@@ -545,20 +586,22 @@ impl<S: Store, H: Host> Kernel<S, H> {
     }
 
     /// The crash table's AwaitingBoot row (§12): no reboot since the one-shot
-    /// entry was published, leave it; after a reboot, the candidate booted →
+    /// entry was published (it is still pending), leave it; after a reboot,
+    /// the candidate booted →
     /// the boot-confirmation probes decide (pass: it becomes the default,
     /// Promoted, Committed; fail: revert); it did not boot → Reverted.
     pub fn await_boot(&mut self, txn: &Transaction) -> R<TxnState> {
-        let boot_of = |o: &OwnerId| match o {
-            OwnerId::Daemon { boot_id, .. } | OwnerId::Watchdog { boot_id, .. } => *boot_id,
-        };
-        if boot_of(&txn.lease.owner) == boot_of(&self.me) {
-            return Ok(TxnState::AwaitingBoot);
-        }
         let Some(cand) = Self::candidate(txn) else {
             return self.recovery_failed(txn, "AwaitingBoot without a candidate");
         };
-        if self.host.generations().last_booted().ok() != Some(cand) {
+        let gens = self.host.generations();
+        // Still pending, or the boot loader cannot say: no reboot yet; leave it.
+        match gens.one_shot_pending() {
+            Ok(Some(g)) if g == cand => return Ok(TxnState::AwaitingBoot),
+            Err(_) => return Ok(TxnState::AwaitingBoot),
+            _ => {}
+        }
+        if gens.last_booted().ok() != Some(cand) {
             self.advance(txn, TxnState::Reverted, "the boot-only candidate did not boot; the default entry did")?;
             return Ok(TxnState::Reverted);
         }

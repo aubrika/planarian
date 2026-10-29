@@ -521,6 +521,7 @@ fn session(id: &str, uid: u32) -> SessionInfo {
         remote: false,
         created: Timestamp(0),
         active: true,
+        idle: false,
     }
 }
 

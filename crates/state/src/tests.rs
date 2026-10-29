@@ -59,6 +59,7 @@ fn user_units_follow_sessions_and_desktop_deadline() {
         seat: Some("seat0".into()),
         remote: false,
         active: true,
+        idle: false,
         created,
     });
     // The compositor never reaches graphical-session.target.
@@ -90,6 +91,7 @@ fn user_units_follow_sessions_and_desktop_deadline() {
         seat: Some("seat0".into()),
         remote: false,
         active: true,
+        idle: false,
         created,
     }];
     let (s, defs) = tick(&fake, &mut a);
@@ -131,6 +133,7 @@ fn unknown_session_creation_time_counts_from_first_sight() {
         seat: Some("seat0".into()),
         remote: false,
         active: true,
+        idle: false,
         created: Timestamp(0),
     });
     let (s, defs) = tick(&fake, &mut a);
@@ -153,6 +156,7 @@ fn second_session_of_one_uid_is_judged_on_its_own() {
             seat: Some("seat0".into()),
             remote: false,
             active: id == "s2",
+            idle: false,
             created,
         });
     }

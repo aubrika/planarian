@@ -128,6 +128,15 @@ pub trait GenerationBackend {
     fn activate_live(&self, g: GenerationId, op: &OpId) -> Outcome;
     /// Boot entry only; no re-activation.
     fn publish_boot(&self, g: GenerationId, op: &OpId) -> Outcome;
+    /// The boot-only path (§12 step 7, §12f): `g` boots once, at the next
+    /// boot; `keep` stays the default. All or nothing.
+    fn publish_boot_once(&self, _g: GenerationId, _keep: GenerationId, _op: &OpId) -> Outcome {
+        Outcome::Failed("this boot loader cannot boot a generation once".into())
+    }
+    /// The generation a one-shot entry will boot next, if one is pending.
+    fn one_shot_pending(&self) -> Result<Option<GenerationId>, Outcome> {
+        Err(Outcome::Unknown("this boot loader has no one-shot entries".into()))
+    }
     fn protect(&self, g: GenerationId, op: &OpId) -> Outcome;
     fn cancel(&self, job: &JobId, op: &OpId) -> Outcome;
     /// Atomically replace the live override file with the content whose hash is
@@ -193,6 +202,9 @@ pub struct SessionInfo {
     /// logind `State=active`: the session in the foreground of its seat.
     #[serde(default)]
     pub active: bool,
+    /// logind `IdleHint`: nobody has used it for a while.
+    #[serde(default)]
+    pub idle: bool,
 }
 
 impl SessionInfo {
