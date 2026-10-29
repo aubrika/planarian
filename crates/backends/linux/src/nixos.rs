@@ -340,6 +340,24 @@ impl Nixos {
         }
     }
 
+    /// The store path the boot menu was last installed for.
+    fn boot_menu_path(&self) -> PathBuf {
+        self.paths.state.join("boot-menu")
+    }
+
+    /// The boot menu is the one for `path`: as recorded after the last
+    /// successful install, or, before any (a machine installed before this
+    /// record existed), when `path` is the system that booted.
+    fn boot_menu_for(&self, path: &str) -> bool {
+        match std::fs::read_to_string(self.boot_menu_path()) {
+            Ok(p) => p.trim() == path,
+            Err(_) => {
+                std::fs::canonicalize("/run/booted-system").ok().map(|p| p.to_string_lossy().into_owned())
+                    == Some(path.to_string())
+            }
+        }
+    }
+
     fn report_path(&self) -> PathBuf {
         self.paths.state.join("gc-report.json")
     }
@@ -661,9 +679,14 @@ impl GenerationBackend for Nixos {
             Err(o) => return o,
         };
         let profile = self.paths.profile.to_string_lossy().into_owned();
-        // Idempotent: only add a profile generation if the profile points elsewhere.
         let already = std::fs::canonicalize(&self.paths.profile).ok().map(|p| p.to_string_lossy().into_owned())
             == Some(path.0.clone());
+        // Idempotent: the profile points at g and the boot menu was installed
+        // for it (a revert after a publish that failed and was undone, or a
+        // retry after a crash past the install).
+        if already && self.boot_menu_for(&path.0) {
+            return Outcome::Succeeded;
+        }
         if !already {
             let o = run(&["nix-env", "-p", &profile, "--set", &path.0], QUICK);
             if !o.ok() {
@@ -671,7 +694,25 @@ impl GenerationBackend for Nixos {
             }
         }
         let o = run(&[&format!("{}/bin/switch-to-configuration", path.0), "boot"], Duration::from_secs(300));
-        if o.ok() { Outcome::Succeeded } else { err(&o) }
+        if o.ok() {
+            let _ = std::fs::write(self.boot_menu_path(), &path.0);
+            return Outcome::Succeeded;
+        }
+        // All or nothing: the boot loader failed (a full /boot), so the menu on
+        // disk is still the previous one. Point the profile back at what that
+        // menu boots and drop the new profile generation, so the boot default
+        // is not left naming a generation the menu does not have.
+        if !already {
+            let added = std::fs::read_link(&self.paths.profile)
+                .ok()
+                .and_then(|l| l.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .and_then(|n| n.rsplit('-').nth(1).map(String::from));
+            let _ = run(&["nix-env", "-p", &profile, "--rollback"], QUICK);
+            if let Some(n) = added {
+                let _ = run(&["nix-env", "-p", &profile, "--delete-generations", &n], QUICK);
+            }
+        }
+        err(&o)
     }
 
     fn protect(&self, g: GenerationId, op: &OpId) -> Outcome {

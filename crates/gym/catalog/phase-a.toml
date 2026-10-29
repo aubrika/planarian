@@ -891,7 +891,9 @@ scoring = "must-pass"
 harness = ["fake", "vm"]
 intent = { kind = "none" }
 setup = [
-  { raw = "slow_backend", call = "activate_live", delay = "600s", uncancellable = true },
+  # Longer than the window: the job still holds on when the run is judged
+  # (its activation, at the end of the delay, would come after).
+  { raw = "slow_backend", call = "activate_live", delay = "1800s", uncancellable = true },
   { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
 ]
 inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "activate_live" } }
@@ -1376,7 +1378,9 @@ summary = "S3 suspend for 2 min, then resume. Evidence goes stale while suspende
 spec = ["§10 evidence"]
 tags = []
 scoring = "intent"
-harness = ["vm"]
+# The fake only (docs/deviations.md): QEMU never woke the test VM from S3
+# or from suspend-to-idle with an RTC alarm.
+harness = ["fake"]
 intent = { kind = "no-intervention", because = "a suspend is not a fault" }
 setup = [{ raw = "greeter_login", uid = 1000 }]
 inject = { raw = "suspend", duration = "2m" }

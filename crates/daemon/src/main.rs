@@ -253,6 +253,11 @@ fn main() {
         });
     };
     loop {
+        // A steady stream of requests must not starve the repair loop.
+        if Instant::now() >= next_tick {
+            core.tick();
+            next_tick = Instant::now() + TICK;
+        }
         let wait = next_tick.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
             Ok(Event::Request(peer, req, reply)) => {

@@ -89,6 +89,16 @@ impl<B: Backends> ExecHost<B> {
                 let got = s.status(u, defs);
                 if &got != want {
                     out.push(format!("{u}: expected {want:?}, observed {got:?}"));
+                } else if *want == UnitStatus::Bound {
+                    // Bound to a driver that cannot drive it (§12 DeviceOp
+                    // gym case): the device's own checks say so.
+                    let failing = s.failing_readiness(u, defs);
+                    if !failing.is_empty() {
+                        out.push(format!(
+                            "{u}: bound, but {} failing",
+                            failing.iter().map(|p| p.0.as_str()).collect::<Vec<_>>().join(", ")
+                        ));
+                    }
                 }
             }
         }

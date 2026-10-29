@@ -144,8 +144,23 @@ pub fn gym_units() -> UnitDefs {
     gs.desired.when = Condition::SessionEstablished { uid: None };
     gs.synonyms = vec!["desktop".into()];
 
-    let snd =
-        unit("device:snd-hda0", r, Disruption::Brief, vec![user_probe("snd-hda0-bound", ProbeKind::SystemdActive)]);
+    let snd = unit(
+        "device:snd-hda0",
+        r,
+        Disruption::Brief,
+        vec![
+            user_probe("snd-hda0-bound", ProbeKind::SystemdActive),
+            // As the gym VM's: the kernel lists a sound card (a driver that
+            // binds but cannot drive the card leaves none).
+            user_probe(
+                "snd-hda0-driven",
+                ProbeKind::Exec {
+                    argv: vec!["grep".into(), "-qv".into(), "no soundcards".into(), "/proc/asound/cards".into()],
+                    sandbox: ProbeSandbox { uid: 0, caps: vec![], max_output: 4096, cpu_ms: 500, network: false },
+                },
+            ),
+        ],
+    );
     let nic = unit(
         "device:net-gym0",
         &[External],

@@ -756,7 +756,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     fn status(&mut self) -> StatusReport {
-        let (s, defs) = self.observe();
+        // The tick's observation (at most a tick old): answering a status
+        // request must not run the probes again, or frequent readers (the
+        // tray, the console) hold the core for a probe timeout each.
+        let (s, defs) = self.last.clone().unwrap_or_else(|| self.observe());
         let l = self.ledger();
         let units = defs
             .keys()

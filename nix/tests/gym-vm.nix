@@ -185,7 +185,18 @@ let
             deriveEdges = false;
             probes = [ { id = "gym-upstream-tcp"; type = "tcp"; addr = "10.0.2.2:9000"; establishes = "gym-upstream-tcp"; } ];
           };
-          snd-hda0 = { kind = "device"; sysfs = "/sys/bus/pci/devices/0000:00:1b.0"; };
+          snd-hda0 = {
+            kind = "device";
+            sysfs = "/sys/bus/pci/devices/0000:00:1b.0";
+            # Driven, not just bound: a driver that binds but cannot drive
+            # the card (vfio-pci) leaves the kernel with no sound card.
+            probes = [ {
+              id = "snd-hda0-driven";
+              type = "exec";
+              argv = [ "${pkgs.gnugrep}/bin/grep" "-qv" "no soundcards" "/proc/asound/cards" ];
+              establishes = "the sound card is driven";
+            } ];
+          };
           # As in the fake's fixtures: alice's sound needs the sound card. (A
           # full definition: beside the module's mkDefault one, a partial one
           # would replace it and lose the user scope.)

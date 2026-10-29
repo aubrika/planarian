@@ -781,6 +781,12 @@ impl Sim {
                     self.fake.w().untracked.insert(path);
                 }
             }
+            // Suspended: time passes and nothing runs, the daemon included;
+            // on resume its evidence is stale and it ticks on as before.
+            "suspend" => {
+                let d = s.get("duration").and_then(dur).ok_or_else(|| Unsupported("suspend duration".into()))?;
+                self.fake.advance(d);
+            }
             "advance_clock" => {
                 let d = s.get("by").and_then(dur).ok_or_else(|| Unsupported("advance_clock".into()))?;
                 self.fake.advance(d);

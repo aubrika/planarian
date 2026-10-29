@@ -93,6 +93,26 @@ impl SystemState {
         }
     }
 
+    /// Readiness probes of `id` whose fresh evidence is a failure. For a
+    /// device this is what `status` leaves out: §8 derives a bound device's
+    /// status from `Observed` alone, so one bound to a driver that cannot
+    /// drive it still reads Bound.
+    pub fn failing_readiness(&self, id: &UnitId, defs: &UnitDefs) -> Vec<ProbeId> {
+        let (Some(def), Some((_, evidence))) = (defs.get(id), self.units.get(id)) else { return vec![] };
+        def.probes
+            .iter()
+            .filter(|p| p.role == ProbeRole::Readiness)
+            .filter(|p| {
+                evidence
+                    .iter()
+                    .filter(|e| e.probe == p.id)
+                    .max_by_key(|e| e.at)
+                    .is_some_and(|e| e.fresh_at(self.observed_at) && matches!(e.result, ProbeResult::Fail(_)))
+            })
+            .map(|p| p.id.clone())
+            .collect()
+    }
+
     /// Status derivation, in the order §8 gives:
     /// Suppressed; not expected; definite Failed; Unknown on stale or timed-out
     /// Readiness evidence; Running / Degraded from Active; otherwise from `Observed`.

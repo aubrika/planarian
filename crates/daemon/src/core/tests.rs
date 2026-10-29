@@ -510,3 +510,40 @@ fn an_unreachable_external_dependency_is_said_not_repaired() {
     r.ticks(4);
     assert!(r.core.notices.iter().any(|n| n == "service:external:gym-upstream: answers again"), "{:?}", r.core.notices);
 }
+
+#[test]
+fn a_definite_failure_is_repaired_promptly_while_probes_time_out() {
+    // probe-failed-beats-stale: gym-web's HTTP answer is slow (Unknown,
+    // re-observed), then the process is killed: Failed, and repaired
+    // within a tick or two plus the first backoff, not after the
+    // re-observation's backoff.
+    let mut r = Rig::new();
+    r.ticks(2);
+    let web = UnitId::service("gym-web");
+    r.fake.w().units.get_mut(&web).unwrap().health = planarian_fake::Health::Delay(Millis::secs(60));
+    r.ticks(12);
+    assert_eq!(r.status("service:gym-web"), UnitStatus::Unknown);
+    r.fake.w().kill(&web);
+    let mut n = 0;
+    while r.calls("restart(service:gym-web)") == 0 && n < 60 {
+        r.ticks(1);
+        n += 1;
+    }
+    assert!(n <= 6, "restarted after {n} ticks ({} s): {:?}", n * 5, r.core.notices);
+}
+
+#[test]
+fn status_requests_do_not_run_the_probes() {
+    // Readers (the tray, the console, the gym's sampler) ask often; each
+    // probe run can take a probe timeout, which held the core for minutes.
+    let mut r = Rig::new();
+    r.ticks(2);
+    let before = r.fake.w().probe_batches;
+    for _ in 0..5 {
+        // Time passes (the probes fall due) but no tick runs.
+        r.fake.advance(planarian_state::TICK);
+        assert!(matches!(r.core.handle(ALICE, Request::Status), Response::Status(_)));
+        assert!(matches!(r.core.handle(ALICE, Request::Console), Response::Console(_)));
+    }
+    assert_eq!(r.fake.w().probe_batches, before);
+}

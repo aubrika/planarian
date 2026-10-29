@@ -164,6 +164,8 @@ pub struct World {
     /// External dependencies whose traffic is dropped on the way (a dead
     /// gateway): their probes, and their clients', time out.
     pub external_unreachable: BTreeSet<String>,
+    /// How many probe batches ran (a status request must not run one).
+    pub probe_batches: u64,
     /// Free bytes and size of filesystems, by path.
     pub fs: BTreeMap<String, (u64, u64)>,
     /// §12b bounds, and the last collection's report. Each generation's
@@ -761,13 +763,7 @@ impl InventoryBackend for Fake {
     fn devices(&self) -> Result<Vec<DeviceInfo>, Outcome> {
         // A driver that can't drive the device leaves it effectively unbound.
         let w = self.w();
-        Ok(w.devices
-            .iter()
-            .map(|(id, d)| DeviceInfo {
-                id: id.clone(),
-                driver: d.clone().filter(|d| !w.bad_drivers.contains(&d.name)),
-            })
-            .collect())
+        Ok(w.devices.iter().map(|(id, d)| DeviceInfo { id: id.clone(), driver: d.clone() }).collect())
     }
 
     fn resources(&self) -> Result<Resources, Outcome> {
@@ -799,7 +795,8 @@ impl InventoryBackend for Fake {
 
 impl ProbeBackend for Fake {
     fn run_batch(&self, jobs: &[(UnitId, ProbeDef)]) -> Vec<ProbeResult> {
-        let w = self.w();
+        let mut w = self.w();
+        w.probe_batches += 1;
         jobs.iter()
             .map(|(unit, p)| {
                 if let ProbeKind::FreeSpace { path, min_bytes, min_permille } = &p.kind {
@@ -813,6 +810,14 @@ impl ProbeBackend for Fake {
                 }
                 if w.blocked.contains(unit) {
                     return ProbeResult::Fail("connection refused".into());
+                }
+                // A device's own check: driven by a driver that can drive it.
+                if unit.kind == UnitKind::Device && matches!(p.kind, ProbeKind::Exec { .. }) {
+                    return match w.devices.get(unit).cloned().flatten() {
+                        Some(d) if !w.bad_drivers.contains(&d.name) => ProbeResult::Pass,
+                        Some(d) => ProbeResult::Fail(format!("{} cannot drive it", d.name)),
+                        None => ProbeResult::Fail("no driver".into()),
+                    };
                 }
                 // A Wi-Fi interface is healthy while associated with a network in range.
                 if w.base_units.get(unit).and_then(|d| d.runtime_repair.as_deref()) == Some("wifi.network") {
