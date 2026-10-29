@@ -28,7 +28,7 @@ Seeded from the spec vulnerability review of 2026-10-29 against commit `1bc09b2`
 | B-14 | Specifications and proof tools (Verus, Z3, rustc) are trusted but uncounted; a wrong spec is certified by its proof | Correct (proof) | Low | Open (v4.5 §17a) | Counted as proof-validity trust; a gym entry per proved invariant written from the English | A |
 | B-15 | Many dynamic-uid services can fill the global connection cap | Always invoked (availability) | Low | Open (v4.5 §16) | Reserved slots for administrators and sessions | A |
 | B-16 | The external source's replay protection lives in a root-writable cache | Correct (I14 input) | Low | Open (v4.5 §12c) | Last accepted sequence number in the journal checkpoint | A (before any producer) |
-| B-17 | `guarantees.md` says Kani runs by hand; CI runs it | — | Low | Open | Correct the doc | A |
+| B-17 | `guarantees.md` says Kani runs by hand; CI runs it | — | Low | Closed (8bf52c9) | Corrected in `guarantees.md` and `verification.md` | A |
 | B-18 | The model service escapes its sandbox before I9 is proved, and becomes a process with its uid's capabilities (it parses untrusted text and drives a GPU) | Tamperproof (I9) | Medium | Open (v4.5 §20, I9) | Normative sandbox: dynamic uid, no capabilities, strict read-only filesystem, Unix sockets only, syscall allowlist, render node only, proposal socket as the only write path; gym case attempting every other write path | B sandbox and case; E proof |
 
 ## Accepted
