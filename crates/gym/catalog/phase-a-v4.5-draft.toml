@@ -474,7 +474,9 @@ summary = "The floor generation fails to boot. The automatic boot fallback does 
 spec = ["I16"]
 tags = ["english"]
 scoring = "must-pass"
-harness = ["vm"]
+# The test VM boots its kernel directly (no boot loader), so the fallback is
+# the fake's, as for the other floor entries.
+harness = ["fake"]
 intent = { kind = "none" }
 setup = [{ transition = "ApplyChange", change = "gym:security-fix", args = { version = "1.1" }, source = "user", actor = "root" }]
 inject = { raw = "reboot", fail_boot = true }
