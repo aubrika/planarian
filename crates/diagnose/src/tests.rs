@@ -154,12 +154,13 @@ fn storage_gc_and_owner_built_never_rolls_back() {
 fn suppressed_root_is_never_a_target() {
     let mut w = World::new(gym());
     w.fail("service:gym-db", 1);
-    w.s.suppressions.push(Suppression {
+    w.s.overrides.push(Override {
         unit: UnitId::service("gym-db"),
         until: Until::Explicit,
         reason: String::new(),
-        by: Actor::User { uid: 0 },
-        stopped: false,
+        by: Actor::user(0),
+        desired: OverrideDesired::LeaveAlone,
+        attribution: Attribution::Attested,
     });
     let app = UnitId::service("gym-app");
     observe(&mut w.s, &w.defs, &app, Observed::Bound, ProbeResult::Fail("x".into()));

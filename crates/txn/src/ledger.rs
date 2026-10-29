@@ -11,12 +11,12 @@
 //! Verified with Verus (docs/verification.md): `validate` accepts a record
 //! only when `rules` hold, and `apply` preserves `inv` (I6 among the live
 //! transactions, unique ids, leases naming their transaction). Bookkeeping no
-//! invariant reads (the terminal archive, suppressions, incidents, tokens) is
+//! invariant reads (the terminal archive, overrides, incidents, tokens) is
 //! done by small unverified helpers that cannot reach the verified fields.
 
 use crate::machine::{step_allowed, tag};
 use planarian_schema::{
-    Actor, GenerationId, Hash, Incident, IncidentId, Lease, OpId, Outcome, OwnerId, Resolution, Suppression, Timestamp,
+    Actor, GenerationId, Hash, Incident, IncidentId, Lease, OpId, Outcome, Override, OwnerId, Resolution, Timestamp,
     Transaction, Transition, TxnId, TxnState, UnitId,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -64,12 +64,15 @@ pub enum Record {
         op: OpId,
         outcome: Outcome,
     },
-    Suppressed(Suppression),
-    Unsuppressed(UnitId),
+    OverrideSet(Override),
+    OverrideLifted(UnitId),
     Incident(Incident),
     KnownGood(GenerationId),
     LiveTested(Option<GenerationId>),
     AcceptedBaseline(Option<GenerationId>),
+    /// The security floor (§12e): derived when a generation commits, or set by
+    /// an administrator's `mark-security-floor`; never by a proposal.
+    SecurityFloor(Option<GenerationId>),
     TokenUsed {
         nonce: [u8; 16],
         expires: Timestamp,
@@ -154,12 +157,14 @@ pub struct Ledger {
     pub next_txn: u64,
     pub live: IdMap<LiveTxn>,
     pub terminal: BTreeMap<TxnId, TerminalTxn>,
-    pub suppressions: Vec<Suppression>,
+    pub overrides: Vec<Override>,
     pub incidents: BTreeMap<IncidentId, Incident>,
     pub tokens_used: Vec<([u8; 16], Timestamp)>,
     pub known_good: Option<GenerationId>,
     pub live_tested: Option<GenerationId>,
     pub accepted_baseline: Option<GenerationId>,
+    #[serde(default)]
+    pub security_floor: Option<GenerationId>,
     pub interlock: IdMap<InterlockEntry>,
     pub last_reconciliation: Option<Reconciliation>,
 }
@@ -213,6 +218,26 @@ pub open spec fn generation(x: LiveTxn) -> bool {
     x.txn.transition.changes_generation_spec()
 }
 
+/// A state in which a transaction may have mutated and has not finished.
+pub open spec fn flying(s: TxnState) -> bool {
+    !s.pre_mutation() && !s.terminal()
+}
+
+/// I6 (v4.4) for a pair of states, `g` saying whether each transaction
+/// changes the generation. A generation transaction in flight excludes every
+/// other in-flight transaction, except while it is `AwaitingBoot` (unit and
+/// device repairs may run then); and at most one generation transaction is
+/// active, where waiting in `Built` and `AwaitingBoot` count as active.
+pub open spec fn compatible(s1: TxnState, g1: bool, s2: TxnState, g2: bool) -> bool {
+    let excl1 = g1 && flying(s1) && !(s1 is AwaitingBoot);
+    let excl2 = g2 && flying(s2) && !(s2 is AwaitingBoot);
+    let act1 = g1 && (flying(s1) || s1 is Built);
+    let act2 = g2 && (flying(s2) || s2 is Built);
+    &&& excl1 ==> !flying(s2)
+    &&& excl2 ==> !flying(s1)
+    &&& !(act1 && act2)
+}
+
 pub open spec fn has_id<V>(s: Seq<(TxnId, V)>, id: TxnId) -> bool {
     exists|i: int| 0 <= i < s.len() && (#[trigger] s[i]).0 == id
 }
@@ -232,15 +257,15 @@ pub open spec fn live_ok(x: (TxnId, LiveTxn), next_txn: u64) -> bool {
     &&& x.1.txn.recovery == x.1.txn.transition.recovery_spec()
 }
 
-/// Two distinct live transactions: different ids, and (I6) when both are in
-/// flight, neither changes the generation.
+/// Two distinct live transactions: different ids, and compatible (I6).
 pub open spec fn pair_ok(a: (TxnId, LiveTxn), b: (TxnId, LiveTxn)) -> bool {
     &&& a.0 != b.0
-    &&& (in_flight(a.1) && in_flight(b.1)) ==> !generation(a.1) && !generation(b.1)
+    &&& compatible(a.1.txn.state, generation(a.1), b.1.txn.state, generation(b.1))
 }
 
-/// The ledger invariant. I6: at most one generation-changing transaction
-/// is in flight, and while one is, no other transaction is.
+/// The ledger invariant. I6: at most one generation-changing transaction is
+/// active, and while one is in flight (other than awaiting a boot), no other
+/// transaction is.
 pub open spec fn inv(l: Ledger) -> bool {
     let e = l.live.entries@;
     &&& forall|i: int| 0 <= i < e.len() ==> live_ok(#[trigger] e[i], l.next_txn)
@@ -304,22 +329,62 @@ pub open spec fn rules(l: Ledger, e: Entry) -> bool {
 }
 
 /// An Advance of the live transaction at `i`: by its lease holder (I15),
-/// along the state machine, and if it starts mutating, not while the
-/// interlock holds for an autonomous caller, and not alongside another
-/// in-flight transaction when either changes the generation (I6).
+/// along the state machine; if it starts mutating, not while the interlock
+/// holds for an autonomous caller; and its new state compatible with every
+/// other live transaction (I6).
 pub open spec fn advance_ok(l: Ledger, i: int, epoch: u64, to: TxnState) -> bool {
     let live = l.live.entries@;
     let x = live[i].1;
     &&& x.txn.lease.epoch == epoch
     &&& crate::machine::step_spec(x.txn.state, to, x.txn.recovery)
-    &&& (x.txn.state.pre_mutation() && !to.pre_mutation() && !to.terminal()) ==> {
-        &&& !(interlocked(l) && autonomous(x.txn.facts.caller))
-        &&& forall|j: int| 0 <= j < live.len() && j != i && in_flight(#[trigger] live[j].1) ==> !generation(x)
-            && !generation(live[j].1)
-    }
+    &&& (x.txn.state.pre_mutation() && !to.pre_mutation() && !to.terminal()) ==> !(interlocked(l) && autonomous(
+        x.txn.facts.caller,
+    ))
+    &&& forall|j: int| 0 <= j < live.len() && j != i ==> compatible(
+        to,
+        generation(x),
+        (#[trigger] live[j]).1.txn.state,
+        generation(live[j].1),
+    )
 }
 
 // ---------- Small verified helpers ----------
+
+fn flying_exec(s: &TxnState) -> (r: bool)
+    ensures
+        r == flying(*s),
+{
+    !s.is_pre_mutation() && !s.is_terminal()
+}
+
+fn compatible_exec(s1: &TxnState, g1: bool, s2: &TxnState, g2: bool) -> (r: bool)
+    ensures
+        r == compatible(*s1, g1, *s2, g2),
+{
+    let awaiting1 = match s1 {
+        TxnState::AwaitingBoot => true,
+        _ => false,
+    };
+    let awaiting2 = match s2 {
+        TxnState::AwaitingBoot => true,
+        _ => false,
+    };
+    let built1 = match s1 {
+        TxnState::Built => true,
+        _ => false,
+    };
+    let built2 = match s2 {
+        TxnState::Built => true,
+        _ => false,
+    };
+    let f1 = flying_exec(s1);
+    let f2 = flying_exec(s2);
+    let excl1 = g1 && f1 && !awaiting1;
+    let excl2 = g2 && f2 && !awaiting2;
+    let act1 = g1 && (f1 || built1);
+    let act2 = g2 && (f2 || built2);
+    !(excl1 && f2 || excl2 && f1 || act1 && act2)
+}
 
 fn find<V>(m: &IdMap<V>, id: TxnId) -> (r: Option<usize>)
     ensures
@@ -418,9 +483,12 @@ impl Ledger {
                 if j != i {
                     let a = &self.live.entries[i];
                     let b = &self.live.entries[j];
-                    let both = !a.1.txn.state.is_pre_mutation() && !b.1.txn.state.is_pre_mutation();
-                    let ok = a.0.0 != b.0.0 && (!both || (!a.1.txn.transition.changes_generation()
-                        && !b.1.txn.transition.changes_generation()));
+                    let ok = a.0.0 != b.0.0 && compatible_exec(
+                        &a.1.txn.state,
+                        a.1.txn.transition.changes_generation(),
+                        &b.1.txn.state,
+                        b.1.txn.transition.changes_generation(),
+                    );
                     if !ok {
                         assert(!pair_ok(self.live.entries@[i as int], self.live.entries@[j as int]));
                         return false;
@@ -478,23 +546,27 @@ impl Ledger {
                     if !self.interlock.entries.is_empty() && is_autonomous(&l.txn.facts.caller) {
                         return Err(LedgerError::Interlocked { txn: *txn });
                     }
-                    let mine = l.txn.transition.changes_generation();
-                    let mut j: usize = 0;
-                    while j < self.live.entries.len()
-                        invariant
-                            j <= self.live.entries@.len(),
-                            forall|k: int|
-                                0 <= k < j && k != i && in_flight(#[trigger] self.live.entries@[k].1) ==> !generation(
-                                    self.live.entries@[i as int].1,
-                                ) && !generation(self.live.entries@[k].1),
-                        decreases self.live.entries.len() - j,
-                    {
-                        let o = &self.live.entries[j].1;
-                        if j != i && !o.txn.state.is_pre_mutation() && (mine || o.txn.transition.changes_generation()) {
-                            return Err(LedgerError::Exclusive { txn: *txn, blocker: o.txn.id });
-                        }
-                        j += 1;
+                }
+                let mine = l.txn.transition.changes_generation();
+                let mut j: usize = 0;
+                while j < self.live.entries.len()
+                    invariant
+                        j <= self.live.entries@.len(),
+                        mine == generation(self.live.entries@[i as int].1),
+                        forall|k: int|
+                            0 <= k < j && k != i ==> compatible(
+                                *to,
+                                mine,
+                                (#[trigger] self.live.entries@[k]).1.txn.state,
+                                generation(self.live.entries@[k].1),
+                            ),
+                    decreases self.live.entries.len() - j,
+                {
+                    let o = &self.live.entries[j].1;
+                    if j != i && !compatible_exec(to, mine, &o.txn.state, o.txn.transition.changes_generation()) {
+                        return Err(LedgerError::Exclusive { txn: *txn, blocker: o.txn.id });
                     }
+                    j += 1;
                 }
                 assert(advance_ok(*self, i as int, *epoch, *to));
                 Ok(())
@@ -653,13 +725,13 @@ fn archive(terminal: &mut BTreeMap<TxnId, TerminalTxn>, id: TxnId, l: LiveTxn) {
 }
 
 #[verifier::external_body]
-fn suppress(list: &mut Vec<Suppression>, s: Suppression) {
+fn set_override(list: &mut Vec<Override>, s: Override) {
     list.retain(|x| x.unit != s.unit);
     list.push(s);
 }
 
 #[verifier::external_body]
-fn unsuppress(list: &mut Vec<Suppression>, u: &UnitId) {
+fn lift_override(list: &mut Vec<Override>, u: &UnitId) {
     list.retain(|x| &x.unit != u);
 }
 
@@ -767,12 +839,13 @@ impl Ledger {
             Record::Renew { txn, epoch, worker_pid } => self.apply_renew(txn, epoch, at, worker_pid),
             Record::OpBegin { op, call } => self.apply_op_begin(op, call),
             Record::OpAck { op, outcome } => self.apply_op_ack(op, outcome),
-            Record::Suppressed(s) => suppress(&mut self.suppressions, s),
-            Record::Unsuppressed(u) => unsuppress(&mut self.suppressions, &u),
+            Record::OverrideSet(s) => set_override(&mut self.overrides, s),
+            Record::OverrideLifted(u) => lift_override(&mut self.overrides, &u),
             Record::Incident(i) => record_incident(&mut self.incidents, i),
             Record::KnownGood(g) => self.known_good = Some(g),
             Record::LiveTested(g) => self.live_tested = g,
             Record::AcceptedBaseline(g) => self.accepted_baseline = g,
+            Record::SecurityFloor(g) => self.security_floor = g,
             Record::TokenUsed { nonce, expires } => use_token(&mut self.tokens_used, at, nonce, expires),
             Record::Resolved { txn, .. } => {
                 if let Some(k) = find(&self.interlock, txn) {
@@ -1025,10 +1098,33 @@ impl Ledger {
     }
 }
 
+/// I6, as SPEC §7 states it, from the invariant: of two live generation
+/// transactions at most one is active (in flight, or waiting in `Built`);
+/// and while a generation transaction is in flight other than awaiting a
+/// boot, no other transaction is in flight.
+pub proof fn i6_one_generation_active(l: Ledger, a: int, b: int)
+    requires
+        inv(l),
+        0 <= a < l.live.entries@.len(),
+        0 <= b < l.live.entries@.len(),
+        a != b,
+    ensures
+        ({
+            let x = l.live.entries@[a].1;
+            let y = l.live.entries@[b].1;
+            &&& (generation(x) && generation(y)) ==> !((flying(x.txn.state) || x.txn.state is Built) && (flying(
+                y.txn.state,
+            ) || y.txn.state is Built))
+            &&& (generation(x) && flying(x.txn.state) && !(x.txn.state is AwaitingBoot)) ==> !flying(y.txn.state)
+        }),
+{
+    assert(pair_ok(l.live.entries@[a], l.live.entries@[b]));
+}
+
 /// Changing one live transaction keeps the invariant when its id, its
 /// lease's transaction, its transition and recovery stay, its epoch does not
-/// drop, it does not leave flight or re-enter it except as `advance_ok`
-/// allows (the caller shows the I6 condition below).
+/// drop, and its state stays or is compatible with every other live
+/// transaction, as `advance_ok` requires (I6).
 proof fn lemma_update(pre: Ledger, post: Ledger, i: int)
     requires
         inv(pre),
@@ -1039,10 +1135,13 @@ proof fn lemma_update(pre: Ledger, post: Ledger, i: int)
         post.live.entries@[i].0 == pre.live.entries@[i].0,
         generation(post.live.entries@[i].1) == generation(pre.live.entries@[i].1),
         post.live.entries@[i].1.txn.lease.epoch >= pre.live.entries@[i].1.txn.lease.epoch,
-        in_flight(post.live.entries@[i].1) ==> (in_flight(pre.live.entries@[i].1) || forall|j: int|
-            0 <= j < pre.live.entries@.len() && j != i && in_flight(#[trigger] pre.live.entries@[j].1) ==> !generation(
-                pre.live.entries@[i].1,
-            ) && !generation(pre.live.entries@[j].1)),
+        post.live.entries@[i].1.txn.state == pre.live.entries@[i].1.txn.state || forall|j: int|
+            0 <= j < pre.live.entries@.len() && j != i ==> compatible(
+                post.live.entries@[i].1.txn.state,
+                generation(post.live.entries@[i].1),
+                (#[trigger] pre.live.entries@[j]).1.txn.state,
+                generation(pre.live.entries@[j].1),
+            ),
     ensures
         inv(post),
         epochs_grow(pre, post),
@@ -1112,7 +1211,7 @@ proof fn lemma_push(pre: Ledger, post: Ledger)
         ({
             let x = post.live.entries@[pre.live.entries@.len() as int];
             &&& live_ok(x, post.next_txn)
-            &&& !in_flight(x.1)
+            &&& x.1.txn.state is Prepared
             &&& x.0.0 >= pre.next_txn
         }),
     ensures

@@ -40,7 +40,17 @@ fn fresh_boot(state: &Path, boot: &str) -> bool {
 fn peer_of(s: &UnixStream, admin_group: &str) -> Option<Peer> {
     let cred = rustix::net::sockopt::socket_peercred(s).ok()?;
     let uid = cred.uid.as_raw();
-    Some(Peer { uid, admin: is_admin(uid, admin_group) })
+    let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", cred.pid.as_raw_nonzero())).unwrap_or_default();
+    Some(Peer { uid, admin: is_admin(uid, admin_group), session: session_of_cgroup(&cgroup) })
+}
+
+/// `sd_pid_get_session`: the logind session is the `session-<id>.scope` in the
+/// process's cgroup path (§10). None for a process outside any session.
+fn session_of_cgroup(cgroup: &str) -> Option<String> {
+    cgroup.lines().filter_map(|l| l.rsplit_once(':')).find_map(|(_, path)| {
+        path.split('/')
+            .find_map(|c| c.strip_prefix("session-").and_then(|c| c.strip_suffix(".scope")).map(String::from))
+    })
 }
 
 fn append_log(state: &Path, lines: &[String]) {
@@ -318,5 +328,18 @@ fn main() {
             eprintln!("planariad: {s}");
         }
         printed = core.notices_total;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_from_cgroup() {
+        assert_eq!(session_of_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"), Some("3".into()));
+        assert_eq!(session_of_cgroup("0::/system.slice/cron.service\n"), None);
+        let user_manager = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n";
+        assert_eq!(session_of_cgroup(user_manager), None);
     }
 }

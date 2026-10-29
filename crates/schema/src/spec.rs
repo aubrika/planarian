@@ -7,7 +7,7 @@
 use crate::ids::Millis;
 use crate::state::{SystemState, UnitStatus};
 use crate::transition::{Expectation, Settle, Transition};
-use crate::unit::{EdgeKind, UnitDefs, UnitId, UnitKind};
+use crate::unit::{Attribution, EdgeKind, OverrideDesired, UnitDefs, UnitId, UnitKind};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const DEFAULT_SETTLE: Millis = Millis::secs(15);
@@ -32,13 +32,14 @@ pub fn precondition(t: &Transition, s: &SystemState, defs: &UnitDefs) -> bool {
     match t {
         Transition::RestartUnit(u) => {
             defs.get(u).is_some_and(|d| d.id.kind != UnitKind::Device && !u.name.starts_with("external:"))
-                && !s.suppressed(u)
+                && !s.overridden(u)
         }
         Transition::StopUnit(u) | Transition::StopAndSuppress { unit: u, .. } => defs.contains_key(u),
-        Transition::Suppress(sup) => !s.suppressed(&sup.unit),
-        Transition::Unsuppress(u) => s.suppressed(u),
+        // An inferred override is replaced only by an authorized principal setting a new one (§11).
+        Transition::SetOverride(sup) => s.override_of(&sup.unit).is_none_or(|o| o.attribution == Attribution::Inferred),
+        Transition::LiftOverride(u) => s.overridden(u),
         Transition::BindDriver { device, .. } => {
-            defs.get(device).is_some_and(|d| d.id.kind == UnitKind::Device) && !s.suppressed(device)
+            defs.get(device).is_some_and(|d| d.id.kind == UnitKind::Device) && !s.overridden(device)
         }
         Transition::Rollback => s.generation != s.known_good,
         Transition::SwitchGeneration(g) => *g != s.generation,
@@ -75,14 +76,14 @@ pub fn predict(t: &Transition, s: &SystemState, defs: &UnitDefs) -> Expectation 
         Transition::RestartUnit(u) => unit(u, UnitStatus::Running, ready(u)),
         Transition::StopUnit(u) => unit(u, UnitStatus::Stopped, Settle::Duration(DEFAULT_SETTLE)),
         Transition::StopAndSuppress { unit: u, .. } => {
-            unit(u, UnitStatus::Suppressed, Settle::Duration(DEFAULT_SETTLE))
+            unit(u, UnitStatus::Overridden(OverrideDesired::Stopped), Settle::Duration(DEFAULT_SETTLE))
         }
-        Transition::Suppress(sup) => Expectation {
-            units: BTreeMap::from([(sup.unit.clone(), UnitStatus::Suppressed)]),
+        Transition::SetOverride(sup) => Expectation {
+            units: BTreeMap::from([(sup.unit.clone(), UnitStatus::Overridden(sup.desired))]),
             may_change: BTreeSet::from([sup.unit.clone()]),
             ..none()
         },
-        Transition::Unsuppress(u) => Expectation { may_change: BTreeSet::from([u.clone()]), ..none() },
+        Transition::LiftOverride(u) => Expectation { may_change: BTreeSet::from([u.clone()]), ..none() },
         Transition::BindDriver { device, .. } => unit(device, UnitStatus::Bound, Settle::Duration(DEFAULT_SETTLE)),
         Transition::SwitchGeneration(g) | Transition::Revert { to: g } => {
             Expectation { generation: Some(*g), others_unchanged: false, ..none() }

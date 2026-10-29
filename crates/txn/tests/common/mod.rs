@@ -123,6 +123,9 @@ pub fn facts(caller: Actor) -> DerivedFacts {
         touches_manifest: false,
         touches_canonical_probe: false,
         changes_desired: false,
+        below_security_floor: false,
+        other_sessions_affected: false,
+        affected_sessions: Vec::new(),
         touches_core: false,
         caller,
         config_diff: None,
@@ -172,10 +175,8 @@ pub fn txn(transition: Transition, caller: Actor) -> Transaction {
 
 /// An `ApplyChange` from G1 to G2 that swaps the override file base → candidate.
 pub fn change(name: &str) -> Transaction {
-    let mut t = txn(
-        Transition::ApplyChange { change: ChangeId(name.into()), args: BTreeMap::new() },
-        Actor::User { uid: ADMIN },
-    );
+    let mut t =
+        txn(Transition::ApplyChange { change: ChangeId(name.into()), args: BTreeMap::new() }, Actor::user(ADMIN));
     t.candidate = Some((G2, path(G2)));
     t.base_override = Some(base_override());
     t.candidate_override = Some(cand_override());

@@ -17,6 +17,7 @@ pub fn parse_session(id: &str, text: &str) -> Option<SessionInfo> {
         class: get("Class"),
         seat: Some(get("Seat")).filter(|s| !s.is_empty()),
         remote: get("Remote") == "yes",
+        active: get("State") == "active",
         // `Timestamp` is printed; `TimestampMonotonic` is not wall time. Use the
         // realtime microseconds logind exports in `--value` form when present.
         created: Timestamp(get("TimestampUSec").parse::<u64>().map(|us| us / 1000).unwrap_or(0)),
@@ -27,7 +28,7 @@ pub fn parse_session(id: &str, text: &str) -> Option<SessionInfo> {
 /// exits 0) for a comma-separated list, so every session went unseen.
 pub fn show_session_argv(id: &str) -> Vec<String> {
     let mut a: Vec<String> = ["loginctl", "show-session", id].map(String::from).to_vec();
-    a.extend(["User", "Class", "Seat", "Remote"].map(|p| format!("--property={p}")));
+    a.extend(["User", "Class", "Seat", "Remote", "State"].map(|p| format!("--property={p}")));
     a
 }
 

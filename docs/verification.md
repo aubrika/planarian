@@ -26,16 +26,28 @@ lemmas about `decide_spec` in `crates/policy/src/proofs.rs`:
 
 | Lemma | Property |
 | --- | --- |
-| `i5_autonomy_never_touches_reject` | The autonomy setting never turns a Reject into a tier or back, never changes a reason, yields no tier above itself but AskFirst, and raising it never makes a decision stricter. |
+| `i5_autonomy_never_touches_reject` | The autonomy setting never turns a Reject into a tier or back, never changes a reason, yields no tier above itself but AskFirst, never changes the approver class, and raising it never makes a decision stricter. |
 | `i11_non_routine_session_asks` | A non-Routine diff, this change's or the session's cumulative one, means AskFirst or Reject. |
 | `i11_session_only_raises` | A change inside a session is decided at least as strictly as on its own. |
-| `global_floors` | Non-reversible; session or data loss unless the user's own session; connectivity loss unless a local user: AskFirst or Reject, for every transition kind. |
+| `global_floors` | Non-reversible; session or data loss unless the user's own session; connectivity loss unless the caller has a seat; a session or connectivity loss reaching another uid's session unless an administrator: AskFirst or Reject, for every transition kind. |
+| `own_session_is_per_session` | A session loss lands on the caller's own session only when it is exactly the caller's session; another session of the same uid, or an unknown one, asks. |
+| `i16_below_floor_needs_administrator` | A target below the security floor is AskFirst with `ApproverClass::Administrator`, or refused, for every transition kind, caller and autonomy setting (I16, the `decide` part). |
+| `administrator_class_only_on_ask_first` | An Administrator approver class only ever comes with AskFirst. |
+| `security_override_held_for_administrator` | A non-administrator's override (`SetOverride`, `LiftOverride`, `StopAndSuppress`) of a Security-sensitive unit is never `Unauthorized` and never runs on its own: AskFirst for an administrator, or another refusal. |
+| `agents_and_unattributed_are_refused` | An agent (reserved) and the unattributed actor are always `Unauthorized`: an inferred override never passes through `decide`. |
+| `i19_no_self_approval` | `may_approve` never lets a principal approve its own proposal, requires `Approve`, and requires `Administrator` for that class; `may_grant` never grants to the approver itself, never on its own proposal, and only a capability the approver holds (I19). |
 | `i10_canonical_probe_changes_ask` | A change to a canonical probe's definition (probe tampering) is AskFirst or Reject. |
 | `unauthorized_is_refused_first` | An unauthorized caller gets `Reject(Unauthorized)`, whatever else holds. |
 | `core_is_never_a_target` | A transition touching the core is rejected. |
 | `only_administrators_resolve` | Only an administrator can clear the recovery interlock. |
 | `users_cannot_change_generations` | A non-admin user cannot switch, revert, roll back, load models, restore snapshots, collect garbage, bind drivers or resolve. |
 | `i14_facts_caller_is_not_authority` | The `caller` field in the derived facts has no effect on the decision. |
+
+Authorization (§11, v4.4) is by capability: `Authorization { principal, actor,
+capabilities }` is computed by the daemon from `SO_PEERCRED`, the caller's
+logind session and group membership (`user_authorization`), and capabilities
+count only for users in Phase A. `may_approve` and `may_grant` (I19) are
+verified the same way as `decide`.
 
 `decide` takes no `Proposal`, so I14 in §17a's sense ("`decide` has no
 `Proposal` input") holds by its signature.
@@ -63,8 +75,8 @@ The types `decide` and the ledger read are inside `verus!`;
 
 `schema::digest` is not proved (see `deviations.md` for why). A property
 test over random states checks it: perturbing resources or any observation
-timestamp never changes the digest, and changing the generation, a
-suppression, or a unit's observed state always does.
+timestamp never changes the digest, and changing the generation, an
+override, or a unit's observed state always does.
 
 ## `txn` (Phase A target: done for the state machine and the ledger)
 
@@ -80,23 +92,28 @@ Every record goes through `Ledger::validate` before it is written and
 | `terminal_is_final` | Terminal states have no successors. |
 | `refusal_only_before_mutation` | Rejected and Cancelled only before anything was mutated. |
 | `runtime_never_reverts` | Runtime operations never revert, publish or promote. |
-| `only_generations_publish`, `generations_commit_after_promotion` | Only generation operations publish; they commit only from Promoted. |
+| `only_generations_publish`, `generations_commit_after_promotion` | Only generation operations publish (a one-shot boot entry included); they commit only from Promoted. |
+| `boot_only_never_activates` | The boot-only path (§12 step 7): `AwaitingBoot` is entered only from `Built`, so the candidate is never live-activated, and left only for `Promoted` or a revert. |
 
 Together with the progress assumptions (`assumptions.md`), these are I12: a
 lease holder that keeps stepping reaches a terminal state within eight steps.
 
 **Ledger** (`ledger.rs`). `inv` holds that live transactions have unique ids,
 issued ids, leases naming them, non-terminal states, the recovery strategy
-their transition fixes, and (I6) that while a generation-changing
-transaction is in flight no other transaction is. Proved on the code:
+their transition fixes, and I6 as v4.4 states it: every two live
+transactions are `compatible`, meaning at most one generation-changing
+transaction is active (in flight, or waiting in `Built`), and while one is in
+flight other than `AwaitingBoot`, no other transaction is (unit and device
+repairs may run while one awaits a boot). `i6_one_generation_active` states
+this from `inv`. Proved on the code:
 
 - `validate` accepts a record only if `rules` hold: the sequence number is
   next; an Advance, Takeover, Renew or OpBegin carries the transaction's
   current lease epoch (I15: only the lease holder advances the journal); an
   Advance follows `step_spec`, and one that starts mutating is refused while
-  the interlock is set for an autonomous caller (§12c) and when it would
-  overlap another in-flight transaction where either changes the generation
-  (I6); a Takeover strictly raises the epoch; an OpAck names an op that was
+  the interlock is set for an autonomous caller (§12c), and every Advance is
+  refused when its new state would not be compatible with another live
+  transaction (I6); a Takeover strictly raises the epoch; an OpAck names an op that was
   begun and not yet acknowledged (write-ahead at the journal: no outcome
   without its OpBegin); a Prepared transaction gets a fresh id and epoch 1,
   and is refused while the interlock is set for an autonomous caller.
@@ -107,7 +124,9 @@ transaction is in flight no other transaction is. Proved on the code:
 
 **Mutation check.** Each of these fails verification: skipping the I6
 exclusivity check in `validate`; accepting a takeover with an equal epoch;
-not setting the interlock on RecoveryFailed; dropping I6 from the rule.
+not setting the interlock on RecoveryFailed; dropping I6 from the rule;
+dropping the "one active generation transaction" clause from the
+executable compatibility check.
 
 **Not proved here:** that the kernel journals OpBegin before the backend
 call it names (it does, in `kernel.rs`, which is not verified; §17a puts

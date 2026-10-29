@@ -10,7 +10,7 @@ verus! {
 pub open spec fn is_reject(d: Decision) -> bool {
     match d {
         Decision::Reject(_) => true,
-        Decision::Allow(_) => false,
+        Decision::Allow { .. } => false,
     }
 }
 
@@ -18,14 +18,14 @@ pub open spec fn is_reject(d: Decision) -> bool {
 pub open spec fn asks_or_rejects(d: Decision) -> bool {
     match d {
         Decision::Reject(_) => true,
-        Decision::Allow(t) => t == Tier::AskFirst,
+        Decision::Allow { tier, .. } => tier == Tier::AskFirst,
     }
 }
 
 /// The tier's rank; a Reject ranks above every tier.
 pub open spec fn strictness(d: Decision) -> int {
     match d {
-        Decision::Allow(t) => t.rank() as int,
+        Decision::Allow { tier, .. } => tier.rank() as int,
         Decision::Reject(_) => 4,
     }
 }
@@ -33,6 +33,22 @@ pub open spec fn strictness(d: Decision) -> int {
 /// `x` is the same Reject as `y`, or a tier at least as high as `y`'s.
 pub open spec fn at_least_as_strict(x: Decision, y: Decision) -> bool {
     (is_reject(y) && x == y) || (!is_reject(x) && !is_reject(y) && strictness(x) >= strictness(y))
+}
+
+/// The approver class of an Allow; AnyApprover for a Reject.
+pub open spec fn approver_of(d: Decision) -> ApproverClass {
+    match d {
+        Decision::Allow { approver, .. } => approver,
+        Decision::Reject(_) => ApproverClass::AnyApprover,
+    }
+}
+
+/// AskFirst for an administrator, or refused.
+pub open spec fn asks_admin_or_rejects(d: Decision) -> bool {
+    match d {
+        Decision::Reject(_) => true,
+        Decision::Allow { tier, approver } => tier == Tier::AskFirst && approver == ApproverClass::Administrator,
+    }
 }
 
 /// The inputs agree on everything `decide` reads except the settings' `max_tier`.
@@ -63,7 +79,9 @@ pub proof fn i5_autonomy_never_touches_reject(a: Input, b: Input)
         is_reject(decide_spec(a)) ==> decide_spec(a) == decide_spec(b),
         is_reject(decide_spec(a)) ==> decide_spec(a) == uncapped_spec(a),
         !is_reject(decide_spec(a)) ==> (strictness(decide_spec(a)) <= a.settings.max_tier.rank()
-            || decide_spec(a) == Decision::Allow(Tier::AskFirst)),
+            || asks_or_rejects(decide_spec(a))),
+        // The autonomy setting never changes who may approve.
+        approver_of(decide_spec(a)) == approver_of(uncapped_spec(a)),
         a.settings.max_tier.rank() <= b.settings.max_tier.rank() ==> at_least_as_strict(
             decide_spec(a),
             decide_spec(b),
@@ -112,9 +130,87 @@ pub proof fn global_floors(i: Input)
     ensures
         i.facts.recovery == Recovery::NonReversible ==> asks_or_rejects(decide_spec(i)),
         ((i.facts.disruption == Disruption::SessionLoss || i.facts.disruption == Disruption::DataInterruption)
-            && !(is_user(i.authz.caller) && i.authz.owns_affected_session)) ==> asks_or_rejects(decide_spec(i)),
-        (i.facts.disruption == Disruption::ConnectivityLoss && !(is_user(i.authz.caller)
-            && i.authz.local_session)) ==> asks_or_rejects(decide_spec(i)),
+            && !(is_user(i.authz.actor) && own_session(i.authz.actor, *i.facts))) ==> asks_or_rejects(
+            decide_spec(i),
+        ),
+        (i.facts.disruption == Disruption::ConnectivityLoss && !is_local(i.authz.actor)) ==> asks_or_rejects(
+            decide_spec(i),
+        ),
+        (i.facts.other_sessions_affected && (i.facts.disruption == Disruption::SessionLoss || i.facts.disruption
+            == Disruption::ConnectivityLoss) && !is_admin(*i.authz)) ==> asks_or_rejects(decide_spec(i)),
+{
+}
+
+/// "Own session" is per session: a user whose other session (or no session)
+/// would be disrupted gets the floor, and so does a disruption whose sessions
+/// are not known.
+pub proof fn own_session_is_per_session(i: Input)
+    requires
+        i.facts.disruption == Disruption::SessionLoss,
+        i.facts.affected_sessions@.len() != 1 || match i.authz.actor {
+            Actor::User { session, .. } => match session {
+                Some(s) => i.facts.affected_sessions@[0]@ != s@,
+                None => true,
+            },
+            _ => true,
+        },
+    ensures
+        asks_or_rejects(decide_spec(i)),
+{
+}
+
+/// I16 (the `decide` part): a transition whose target generation is below the
+/// security floor is AskFirst for an administrator, or refused, whatever the
+/// autonomy setting, the transition kind, or the caller.
+pub proof fn i16_below_floor_needs_administrator(i: Input)
+    requires
+        i.facts.below_security_floor,
+    ensures
+        asks_admin_or_rejects(decide_spec(i)),
+{
+}
+
+/// An Administrator approver class only ever comes with AskFirst.
+pub proof fn administrator_class_only_on_ask_first(i: Input)
+    ensures
+        approver_of(decide_spec(i)) == ApproverClass::Administrator ==> asks_or_rejects(decide_spec(i)),
+{
+}
+
+/// §11: a non-administrator's override of a Security-sensitive unit is held
+/// for an administrator, never rejected as unauthorized and never run on its
+/// own; other rejections (the core, a lock) still apply.
+pub proof fn security_override_held_for_administrator(i: Input)
+    requires
+        is_override(*i.transition),
+        i.facts.sensitivity.security,
+        is_user(i.authz.actor),
+        !is_admin(*i.authz),
+    ensures
+        decide_spec(i) != Decision::Reject(RejectReason::Unauthorized),
+        asks_admin_or_rejects(decide_spec(i)),
+{
+}
+
+/// I19: no approver approves its own proposal, and an Administrator class is
+/// approved only by an administrator; nobody grants a capability to
+/// themselves or one they do not hold.
+pub proof fn i19_no_self_approval(approver: Authorization, proposer: PrincipalId, class: ApproverClass, g: Grant)
+    ensures
+        may_approve_spec(approver, proposer, class) ==> approver.principal != proposer && approver.capabilities.approve,
+        may_approve_spec(approver, proposer, ApproverClass::Administrator) ==> approver.capabilities.administrator,
+        may_grant_spec(approver, proposer, g) ==> approver.principal != g.to && approver.principal != proposer
+            && approver.capabilities.has(g.capability),
+{
+}
+
+/// Neither an agent (reserved) nor the unattributed actor is ever authorized:
+/// an inferred override never passes through `decide` (§11).
+pub proof fn agents_and_unattributed_are_refused(i: Input)
+    requires
+        i.authz.actor is Agent || i.authz.actor is Unattributed,
+    ensures
+        decide_spec(i) == Decision::Reject(RejectReason::Unauthorized),
 {
 }
 
@@ -153,7 +249,7 @@ pub proof fn only_administrators_resolve(i: Input)
     requires
         i.transition is Resolve,
     ensures
-        !is_reject(decide_spec(i)) ==> is_user(i.authz.caller) && i.authz.admin,
+        !is_reject(decide_spec(i)) ==> is_admin(*i.authz),
 {
 }
 
@@ -161,8 +257,8 @@ pub proof fn only_administrators_resolve(i: Input)
 /// models, snapshots or the store.
 pub proof fn users_cannot_change_generations(i: Input)
     requires
-        is_user(i.authz.caller),
-        !i.authz.admin,
+        is_user(i.authz.actor),
+        !i.authz.capabilities.administrator,
         i.transition is SwitchGeneration || i.transition is Revert || i.transition is Rollback
             || i.transition is LoadModel || i.transition is RestoreSnapshot || i.transition is CollectGarbage
             || i.transition is BindDriver || i.transition is Resolve,
@@ -184,6 +280,9 @@ pub proof fn i14_facts_caller_is_not_authority(a: Input, b: Input)
         a.facts.touches_canonical_probe == b.facts.touches_canonical_probe,
         a.facts.changes_desired == b.facts.changes_desired,
         a.facts.touches_core == b.facts.touches_core,
+        a.facts.below_security_floor == b.facts.below_security_floor,
+        a.facts.other_sessions_affected == b.facts.other_sessions_affected,
+        a.facts.affected_sessions == b.facts.affected_sessions,
         a.facts.config_diff == b.facts.config_diff,
         a.known_good == b.known_good,
         a.live_tested == b.live_tested,

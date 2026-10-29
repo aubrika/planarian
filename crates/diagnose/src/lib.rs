@@ -170,7 +170,7 @@ fn est_tier(t: &Transition) -> u8 {
 /// Candidate transitions for an incident, in the order to try them (§13 steps 2–3).
 pub fn candidates(incident: &Incident, i: &Inputs<'_>) -> Vec<Candidate> {
     let root = root_cause(&incident.target, i);
-    if i.state.suppressed(&root) {
+    if i.state.overridden(&root) {
         return vec![]; // I13
     }
     let Some(def) = i.defs.get(&root) else { return vec![] };

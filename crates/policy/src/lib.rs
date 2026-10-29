@@ -3,9 +3,10 @@
 //!
 //! `decide` has no `Proposal` parameter, so nothing a proposer writes can
 //! reach it except the transition itself (I14). Its order:
-//! 1. authorization (§11 caller identity),
+//! 1. authorization (§11 caller identity and capabilities),
 //! 2. hard rejections (core target, catalog, locked option, allowlists),
-//! 3. the per-transition table, then the global floors,
+//! 3. the per-transition table, then the global floors (including the
+//!    security floor, which asks an administrator: I16),
 //! 4. cumulative-session classification (I11),
 //! 5. the autonomy setting, which can only raise a tier to AskFirst and never
 //!    touches a `Reject` (I5).
@@ -18,11 +19,18 @@
 
 // Verus idioms: `&Vec` for its `@` view, explicit `match` and nested `if`
 // rather than `matches!` and let-chains.
-#![allow(clippy::ptr_arg, clippy::match_like_matches_macro, clippy::collapsible_if)]
+#![allow(
+    clippy::ptr_arg,
+    clippy::match_like_matches_macro,
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::redundant_pattern_matching
+)]
 
 use planarian_schema::{
-    Actor, ChangeId, ConfigDiff, Decision, DerivedFacts, Disruption, GenerationId, Hash, ModelId, PolicyVersion,
-    Recovery, RejectReason, Scope, Sensitivities, Tier, Transition, UnitId,
+    Actor, ApproverClass, Authorization, Capabilities, ChangeId, ConfigDiff, Decision, DerivedFacts, Disruption,
+    GenerationId, Grant, Hash, ModelId, PolicyVersion, PrincipalId, Recovery, RejectReason, Scope, Sensitivities, Tier,
+    Transition, UnitId,
 };
 use serde::{Deserialize, Serialize};
 use vstd::prelude::*;
@@ -30,7 +38,7 @@ use vstd::prelude::*;
 pub mod proofs;
 
 /// Bumped by hand whenever the decision logic changes; part of `PolicyVersion`.
-pub const POLICY_REVISION: &str = "phase-a.2";
+pub const POLICY_REVISION: &str = "phase-a.3";
 
 verus! {
 
@@ -320,19 +328,6 @@ pub fn any_locked(locked: &Vec<String>, d: &ConfigDiff) -> (r: bool)
 
 // ---------- Authorization (§11) ----------
 
-/// Established by the daemon from `SO_PEERCRED` and logind, never from the proposal.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[verifier::external_derive]
-pub struct Authorization {
-    pub caller: Actor,
-    /// Root, or a member of `planarian-admin`.
-    pub admin: bool,
-    /// The caller has a local (non-remote) session.
-    pub local_session: bool,
-    /// The session the transition would disrupt is the caller's own.
-    pub owns_affected_session: bool,
-}
-
 pub open spec fn is_user(a: Actor) -> bool {
     match a {
         Actor::User { .. } => true,
@@ -340,11 +335,38 @@ pub open spec fn is_user(a: Actor) -> bool {
     }
 }
 
-/// A unit a non-admin user `uid` may act on directly.
-pub open spec fn unit_ok(u: UnitId, uid: u32, s: Settings) -> bool {
+/// A user holding administrator capability. Capabilities count only for
+/// users in Phase A: agents are not constructed, and the daemon, watchdog and
+/// model are never authorized users.
+pub open spec fn is_admin(a: Authorization) -> bool {
+    is_user(a.actor) && a.capabilities.administrator
+}
+
+/// A caller with a seat: a local, not a remote, session.
+pub open spec fn is_local(a: Actor) -> bool {
+    match a {
+        Actor::User { seat, .. } => seat is Some,
+        _ => false,
+    }
+}
+
+/// The disruption lands on exactly the caller's own session (per session, not per uid).
+pub open spec fn own_session(a: Actor, f: DerivedFacts) -> bool {
+    match a {
+        Actor::User { session, .. } => match session {
+            Some(s) => f.affected_sessions@.len() == 1 && f.affected_sessions@[0]@ == s@,
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// A unit a non-admin user `uid` may act on directly: their own user scope
+/// (`OwnScope`) or a user-controllable system unit (`UserControllable`).
+pub open spec fn unit_ok(u: UnitId, uid: u32, c: Capabilities, s: Settings) -> bool {
     match u.scope {
-        Scope::User { uid: owner, .. } => owner == uid,
-        Scope::System => has_str(s.user_controllable_units@, u.name@),
+        Scope::User { uid: owner, .. } => c.own_scope && owner == uid,
+        Scope::System => c.user_controllable && has_str(s.user_controllable_units@, u.name@),
     }
 }
 
@@ -360,24 +382,43 @@ pub open spec fn all_may_affect(units: Seq<UnitId>, uid: u32) -> bool {
     forall|j: int| 0 <= j < units.len() ==> may_affect(#[trigger] units[j], uid)
 }
 
+/// An override: `SetOverride`, `LiftOverride` or `StopAndSuppress`.
+pub open spec fn is_override(t: Transition) -> bool {
+    match t {
+        Transition::SetOverride(_) | Transition::LiftOverride(_) | Transition::StopAndSuppress { .. } => true,
+        _ => false,
+    }
+}
+
 /// §11: a user may act on units in their own user scope and on
-/// user-controllable system units; everything else needs administrator
-/// authority. The daemon, the watchdog and the model are not users; their
-/// proposals are governed by tiers, except `Resolve`, which only an
-/// administrator may issue.
+/// user-controllable system units; every other system action needs
+/// administrator authority. Authorized to start a unit means authorized to
+/// override it, and a non-administrator may also *ask* to override a
+/// Security-sensitive unit (held for an administrator by the table). The
+/// daemon, the watchdog and the model are not users: their proposals are
+/// governed by tiers, except `Resolve`, which only an administrator may issue.
+/// An agent (reserved) and the unattributed actor are never authorized.
 pub open spec fn authorized_spec(t: Transition, f: DerivedFacts, a: Authorization, s: Settings) -> bool {
-    match a.caller {
-        Actor::User { uid } => a.admin || match t {
-            Transition::RestartUnit(u) => unit_ok(u, uid, s),
-            Transition::StopUnit(u) => unit_ok(u, uid, s),
-            Transition::Unsuppress(u) => unit_ok(u, uid, s),
-            Transition::Suppress(sup) => unit_ok(sup.unit, uid, s),
-            Transition::StopAndSuppress { unit, .. } => unit_ok(unit, uid, s),
-            Transition::ApplyChange { change, .. } => has_change(s.user_controllable_changes@, change)
-                && all_may_affect(f.affected_units@, uid),
-            Transition::SetRuntimeOption { path, .. } => has_str(s.user_controllable_options@, path@),
+    match a.actor {
+        Actor::User { uid, .. } => a.capabilities.administrator || match t {
+            Transition::RestartUnit(u) => unit_ok(u, uid, a.capabilities, s),
+            Transition::StopUnit(u) => unit_ok(u, uid, a.capabilities, s),
+            Transition::LiftOverride(u) => unit_ok(u, uid, a.capabilities, s) || f.sensitivity.security,
+            Transition::SetOverride(o) => unit_ok(o.unit, uid, a.capabilities, s) || f.sensitivity.security,
+            Transition::StopAndSuppress { unit, .. } => unit_ok(unit, uid, a.capabilities, s)
+                || f.sensitivity.security,
+            Transition::ApplyChange { change, .. } => a.capabilities.user_controllable && has_change(
+                s.user_controllable_changes@,
+                change,
+            ) && all_may_affect(f.affected_units@, uid),
+            Transition::SetRuntimeOption { path, .. } => a.capabilities.user_controllable && has_str(
+                s.user_controllable_options@,
+                path@,
+            ),
             _ => false,
         },
+        Actor::Agent(_) => false,
+        Actor::Unattributed => false,
         _ => match t {
             Transition::Resolve { .. } => false,
             _ => true,
@@ -385,13 +426,13 @@ pub open spec fn authorized_spec(t: Transition, f: DerivedFacts, a: Authorizatio
     }
 }
 
-fn unit_ok_exec(u: &UnitId, uid: u32, s: &Settings) -> (r: bool)
+fn unit_ok_exec(u: &UnitId, uid: u32, c: &Capabilities, s: &Settings) -> (r: bool)
     ensures
-        r == unit_ok(*u, uid, *s),
+        r == unit_ok(*u, uid, *c, *s),
 {
     match &u.scope {
-        Scope::User { uid: owner, .. } => *owner == uid,
-        Scope::System => contains_str(&s.user_controllable_units, u.name.as_str()),
+        Scope::User { uid: owner, .. } => c.own_scope && *owner == uid,
+        Scope::System => c.user_controllable && contains_str(&s.user_controllable_units, u.name.as_str()),
     }
 }
 
@@ -400,8 +441,10 @@ pub fn authorized(t: &Transition, facts: &DerivedFacts, authz: &Authorization, s
     ensures
         r == authorized_spec(*t, *facts, *authz, *settings),
 {
-    let uid = match &authz.caller {
-        Actor::User { uid } => *uid,
+    let uid = match &authz.actor {
+        Actor::User { uid, .. } => *uid,
+        Actor::Agent(_) => return false,
+        Actor::Unattributed => return false,
         _ => {
             return match t {
                 Transition::Resolve { .. } => false,
@@ -409,17 +452,19 @@ pub fn authorized(t: &Transition, facts: &DerivedFacts, authz: &Authorization, s
             };
         },
     };
-    if authz.admin {
+    let c = &authz.capabilities;
+    if c.administrator {
         return true;
     }
+    let security = facts.sensitivity.security;
     match t {
-        Transition::RestartUnit(u) => unit_ok_exec(u, uid, settings),
-        Transition::StopUnit(u) => unit_ok_exec(u, uid, settings),
-        Transition::Unsuppress(u) => unit_ok_exec(u, uid, settings),
-        Transition::Suppress(sup) => unit_ok_exec(&sup.unit, uid, settings),
-        Transition::StopAndSuppress { unit, .. } => unit_ok_exec(unit, uid, settings),
+        Transition::RestartUnit(u) => unit_ok_exec(u, uid, c, settings),
+        Transition::StopUnit(u) => unit_ok_exec(u, uid, c, settings),
+        Transition::LiftOverride(u) => unit_ok_exec(u, uid, c, settings) || security,
+        Transition::SetOverride(o) => unit_ok_exec(&o.unit, uid, c, settings) || security,
+        Transition::StopAndSuppress { unit, .. } => unit_ok_exec(unit, uid, c, settings) || security,
         Transition::ApplyChange { change, .. } => {
-            if !contains_change(&settings.user_controllable_changes, change) {
+            if !c.user_controllable || !contains_change(&settings.user_controllable_changes, change) {
                 return false;
             }
             let mut i: usize = 0;
@@ -441,7 +486,10 @@ pub fn authorized(t: &Transition, facts: &DerivedFacts, authz: &Authorization, s
             }
             true
         },
-        Transition::SetRuntimeOption { path, .. } => contains_str(&settings.user_controllable_options, path.as_str()),
+        Transition::SetRuntimeOption { path, .. } => c.user_controllable && contains_str(
+            &settings.user_controllable_options,
+            path.as_str(),
+        ),
         _ => false,
     }
 }
@@ -458,6 +506,19 @@ pub open spec fn ask_if(c: bool, t: Tier) -> Tier {
     } else {
         t
     }
+}
+
+/// `Administrator` if `c`, else `k`: classes only ever rise.
+pub open spec fn admin_if(c: bool, k: ApproverClass) -> ApproverClass {
+    if c {
+        ApproverClass::Administrator
+    } else {
+        k
+    }
+}
+
+pub open spec fn allow(t: Tier) -> Decision {
+    Decision::Allow { tier: t, approver: ApproverClass::AnyApprover }
 }
 
 /// Known-good, or the live-tested generation: already shown to work.
@@ -482,29 +543,34 @@ pub struct Input<'a> {
     pub revert_to: Option<GenerationId>,
 }
 
-/// The per-transition table (§11).
+/// The override row (§11): AskFirst when the caller is not a user or the unit
+/// is External-sensitive; held for an administrator when it is
+/// Security-sensitive and the caller is not one.
+pub open spec fn override_spec(f: DerivedFacts, a: Authorization) -> Decision {
+    let held = f.sensitivity.security && !is_admin(a);
+    Decision::Allow {
+        tier: ask_if(!is_user(a.actor) || f.sensitivity.external || held, Tier::Runtime),
+        approver: admin_if(held, ApproverClass::AnyApprover),
+    }
+}
+
+/// The per-transition table (§11). The security-floor escalations of the
+/// SwitchGeneration, Revert and Rollback rows are the `below_security_floor`
+/// floor, which applies to every transition kind.
 pub open spec fn base_spec(i: Input) -> Decision {
     let f = *i.facts;
     match *i.transition {
-        Transition::RestartUnit(_) => Decision::Allow(ask_if(sec_or_ext(f.sensitivity), Tier::Runtime)),
-        Transition::StopUnit(_) => Decision::Allow(ask_if(sec_or_ext(f.sensitivity), Tier::Runtime)),
-        Transition::Suppress(_) => Decision::Allow(
-            ask_if(!is_user(i.authz.caller) || sec_or_ext(f.sensitivity), Tier::Runtime),
-        ),
-        Transition::Unsuppress(_) => Decision::Allow(
-            ask_if(!is_user(i.authz.caller) || sec_or_ext(f.sensitivity), Tier::Runtime),
-        ),
-        Transition::StopAndSuppress { .. } => Decision::Allow(
-            ask_if(!is_user(i.authz.caller) || sec_or_ext(f.sensitivity), Tier::Runtime),
-        ),
-        Transition::BindDriver { .. } => Decision::Allow(ask_if(f.sensitivity.security, Tier::Tested)),
-        Transition::ApplyChange { .. } => Decision::Allow(
+        Transition::RestartUnit(_) => allow(ask_if(sec_or_ext(f.sensitivity), Tier::Runtime)),
+        Transition::StopUnit(_) => allow(ask_if(sec_or_ext(f.sensitivity), Tier::Runtime)),
+        Transition::SetOverride(_) => override_spec(f, *i.authz),
+        Transition::LiftOverride(_) => override_spec(f, *i.authz),
+        Transition::StopAndSuppress { .. } => override_spec(f, *i.authz),
+        Transition::BindDriver { .. } => allow(ask_if(f.sensitivity.security, Tier::Tested)),
+        Transition::ApplyChange { .. } => allow(
             ask_if(!f.sensitivity.routine_only() || f.touches_manifest || f.touches_canonical_probe, Tier::Tested),
         ),
-        Transition::SwitchGeneration(g) => Decision::Allow(
-            ask_if(!vetted(g, i.known_good, i.live_tested), Tier::Tested),
-        ),
-        Transition::Revert { to } => Decision::Allow(
+        Transition::SwitchGeneration(g) => allow(ask_if(!vetted(g, i.known_good, i.live_tested), Tier::Tested)),
+        Transition::Revert { to } => allow(
             ask_if(
                 !vetted(to, i.known_good, i.live_tested) || match i.revert_to {
                     Some(r) => r != to,
@@ -513,28 +579,32 @@ pub open spec fn base_spec(i: Input) -> Decision {
                 Tier::Tested,
             ),
         ),
-        Transition::Rollback => Decision::Allow(ask_if(sec_or_ext(f.sensitivity), Tier::Runtime)),
+        Transition::Rollback => allow(ask_if(sec_or_ext(f.sensitivity), Tier::Runtime)),
         Transition::LoadModel(m) => if has_model(i.tables.model_catalog@, m) {
-            Decision::Allow(Tier::Tested)
+            allow(Tier::Tested)
         } else {
             Decision::Reject(RejectReason::NotInCatalog)
         },
-        Transition::RestoreSnapshot(_) => Decision::Allow(Tier::AskFirst),
-        Transition::CollectGarbage { .. } => Decision::Allow(Tier::Runtime),
+        Transition::RestoreSnapshot(_) => allow(Tier::AskFirst),
+        Transition::CollectGarbage { .. } => allow(Tier::Runtime),
         Transition::SetRuntimeOption { path, .. } => if has_str(i.tables.runtime_allowlist@, path@) {
-            Decision::Allow(Tier::Runtime)
+            allow(Tier::Runtime)
         } else {
             Decision::Reject(RejectReason::NotInCatalog)
         },
-        Transition::Resolve { .. } => Decision::Allow(Tier::Runtime),
+        Transition::Resolve { .. } => allow(Tier::Runtime),
     }
 }
 
-/// The global floors (§11), for every transition kind.
+/// The global floors (§11) that ask any approver, for every transition kind:
+/// non-reversible; session or data loss unless the user's own session;
+/// connectivity loss unless a user with a seat; a session or connectivity loss
+/// reaching another uid's session unless an administrator.
 pub open spec fn floor_spec(f: DerivedFacts, a: Authorization) -> bool {
     f.recovery == Recovery::NonReversible || ((f.disruption == Disruption::SessionLoss || f.disruption
-        == Disruption::DataInterruption) && !(is_user(a.caller) && a.owns_affected_session)) || (f.disruption
-        == Disruption::ConnectivityLoss && !(is_user(a.caller) && a.local_session))
+        == Disruption::DataInterruption) && !(is_user(a.actor) && own_session(a.actor, f))) || (f.disruption
+        == Disruption::ConnectivityLoss && !is_local(a.actor)) || (f.other_sessions_affected && (f.disruption
+        == Disruption::SessionLoss || f.disruption == Disruption::ConnectivityLoss) && !is_admin(a))
 }
 
 /// I11: this change's diff, or the session's cumulative diff, is non-Routine.
@@ -567,21 +637,28 @@ pub open spec fn uncapped_spec(i: Input) -> Decision {
         Decision::Reject(RejectReason::LockedOption)
     } else {
         match base_spec(i) {
-            Decision::Allow(b) => Decision::Allow(
-                ask_if(floor_spec(f, *i.authz) || cumulative_spec(i) || f.touches_canonical_probe, b),
-            ),
+            Decision::Allow { tier, approver } => Decision::Allow {
+                tier: ask_if(
+                    floor_spec(f, *i.authz) || cumulative_spec(i) || f.touches_canonical_probe
+                        || f.below_security_floor,
+                    tier,
+                ),
+                // I16: going below the security floor needs an administrator.
+                approver: admin_if(f.below_security_floor, approver),
+            },
             other => other,
         }
     }
 }
 
-/// The autonomy setting: raises a tier above `max` to AskFirst; a Reject passes through.
+/// The autonomy setting: raises a tier above `max` to AskFirst, keeping the
+/// approver class; a Reject passes through.
 pub open spec fn cap(d: Decision, max: Tier) -> Decision {
     match d {
-        Decision::Allow(t) => if t.rank() > max.rank() {
-            Decision::Allow(Tier::AskFirst)
+        Decision::Allow { tier, approver } => if tier.rank() > max.rank() {
+            Decision::Allow { tier: Tier::AskFirst, approver }
         } else {
-            Decision::Allow(t)
+            Decision::Allow { tier, approver }
         },
         other => other,
     }
@@ -597,6 +674,39 @@ fn is_user_exec(a: &Actor) -> (r: bool)
 {
     match a {
         Actor::User { .. } => true,
+        _ => false,
+    }
+}
+
+fn is_admin_exec(a: &Authorization) -> (r: bool)
+    ensures
+        r == is_admin(*a),
+{
+    is_user_exec(&a.actor) && a.capabilities.administrator
+}
+
+fn is_local_exec(a: &Actor) -> (r: bool)
+    ensures
+        r == is_local(*a),
+{
+    match a {
+        Actor::User { seat, .. } => match seat {
+            Some(_) => true,
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+fn own_session_exec(a: &Actor, f: &DerivedFacts) -> (r: bool)
+    ensures
+        r == own_session(*a, *f),
+{
+    match a {
+        Actor::User { session, .. } => match session {
+            Some(s) => f.affected_sessions.len() == 1 && str_eq(f.affected_sessions[0].as_str(), s.as_str()),
+            None => false,
+        },
         _ => false,
     }
 }
@@ -619,6 +729,24 @@ fn ask_if_exec(c: bool, t: Tier) -> (r: Tier)
     }
 }
 
+fn admin_if_exec(c: bool, k: ApproverClass) -> (r: ApproverClass)
+    ensures
+        r == admin_if(c, k),
+{
+    if c {
+        ApproverClass::Administrator
+    } else {
+        k
+    }
+}
+
+fn allow_exec(t: Tier) -> (r: Decision)
+    ensures
+        r == allow(t),
+{
+    Decision::Allow { tier: t, approver: ApproverClass::AnyApprover }
+}
+
 fn gen_eq(a: GenerationId, b: GenerationId) -> (r: bool)
     ensures
         r == (a == b),
@@ -637,31 +765,36 @@ fn vetted_exec(g: GenerationId, known_good: GenerationId, live_tested: Option<Ge
     live || gen_eq(g, known_good)
 }
 
+fn override_exec(f: &DerivedFacts, a: &Authorization) -> (r: Decision)
+    ensures
+        r == override_spec(*f, *a),
+{
+    let held = f.sensitivity.security && !is_admin_exec(a);
+    Decision::Allow {
+        tier: ask_if_exec(!is_user_exec(&a.actor) || f.sensitivity.external || held, Tier::Runtime),
+        approver: admin_if_exec(held, ApproverClass::AnyApprover),
+    }
+}
+
 fn base_tier(i: &Input) -> (r: Decision)
     ensures
         r == base_spec(*i),
 {
     let f = i.facts;
     match i.transition {
-        Transition::RestartUnit(_) => Decision::Allow(ask_if_exec(sec_or_ext_exec(&f.sensitivity), Tier::Runtime)),
-        Transition::StopUnit(_) => Decision::Allow(ask_if_exec(sec_or_ext_exec(&f.sensitivity), Tier::Runtime)),
-        Transition::Suppress(_) => Decision::Allow(
-            ask_if_exec(!is_user_exec(&i.authz.caller) || sec_or_ext_exec(&f.sensitivity), Tier::Runtime),
-        ),
-        Transition::Unsuppress(_) => Decision::Allow(
-            ask_if_exec(!is_user_exec(&i.authz.caller) || sec_or_ext_exec(&f.sensitivity), Tier::Runtime),
-        ),
-        Transition::StopAndSuppress { .. } => Decision::Allow(
-            ask_if_exec(!is_user_exec(&i.authz.caller) || sec_or_ext_exec(&f.sensitivity), Tier::Runtime),
-        ),
-        Transition::BindDriver { .. } => Decision::Allow(ask_if_exec(f.sensitivity.security, Tier::Tested)),
-        Transition::ApplyChange { .. } => Decision::Allow(
+        Transition::RestartUnit(_) => allow_exec(ask_if_exec(sec_or_ext_exec(&f.sensitivity), Tier::Runtime)),
+        Transition::StopUnit(_) => allow_exec(ask_if_exec(sec_or_ext_exec(&f.sensitivity), Tier::Runtime)),
+        Transition::SetOverride(_) => override_exec(f, i.authz),
+        Transition::LiftOverride(_) => override_exec(f, i.authz),
+        Transition::StopAndSuppress { .. } => override_exec(f, i.authz),
+        Transition::BindDriver { .. } => allow_exec(ask_if_exec(f.sensitivity.security, Tier::Tested)),
+        Transition::ApplyChange { .. } => allow_exec(
             ask_if_exec(
                 !f.sensitivity.only_routine() || f.touches_manifest || f.touches_canonical_probe,
                 Tier::Tested,
             ),
         ),
-        Transition::SwitchGeneration(g) => Decision::Allow(
+        Transition::SwitchGeneration(g) => allow_exec(
             ask_if_exec(!vetted_exec(*g, i.known_good, i.live_tested), Tier::Tested),
         ),
         Transition::Revert { to } => {
@@ -669,22 +802,22 @@ fn base_tier(i: &Input) -> (r: Decision)
                 Some(r) => !gen_eq(r, *to),
                 None => false,
             };
-            Decision::Allow(ask_if_exec(!vetted_exec(*to, i.known_good, i.live_tested) || mismatched, Tier::Tested))
+            allow_exec(ask_if_exec(!vetted_exec(*to, i.known_good, i.live_tested) || mismatched, Tier::Tested))
         },
-        Transition::Rollback => Decision::Allow(ask_if_exec(sec_or_ext_exec(&f.sensitivity), Tier::Runtime)),
+        Transition::Rollback => allow_exec(ask_if_exec(sec_or_ext_exec(&f.sensitivity), Tier::Runtime)),
         Transition::LoadModel(m) => if contains_model(&i.tables.model_catalog, m) {
-            Decision::Allow(Tier::Tested)
+            allow_exec(Tier::Tested)
         } else {
             Decision::Reject(RejectReason::NotInCatalog)
         },
-        Transition::RestoreSnapshot(_) => Decision::Allow(Tier::AskFirst),
-        Transition::CollectGarbage { .. } => Decision::Allow(Tier::Runtime),
+        Transition::RestoreSnapshot(_) => allow_exec(Tier::AskFirst),
+        Transition::CollectGarbage { .. } => allow_exec(Tier::Runtime),
         Transition::SetRuntimeOption { path, .. } => if contains_str(&i.tables.runtime_allowlist, path.as_str()) {
-            Decision::Allow(Tier::Runtime)
+            allow_exec(Tier::Runtime)
         } else {
             Decision::Reject(RejectReason::NotInCatalog)
         },
-        Transition::Resolve { .. } => Decision::Allow(Tier::Runtime),
+        Transition::Resolve { .. } => allow_exec(Tier::Runtime),
     }
 }
 
@@ -692,7 +825,7 @@ fn floors(f: &DerivedFacts, a: &Authorization) -> (r: bool)
     ensures
         r == floor_spec(*f, *a),
 {
-    let user = is_user_exec(&a.caller);
+    let user = is_user_exec(&a.actor);
     let non_reversible = match f.recovery {
         Recovery::NonReversible => true,
         _ => false,
@@ -705,7 +838,13 @@ fn floors(f: &DerivedFacts, a: &Authorization) -> (r: bool)
         Disruption::ConnectivityLoss => true,
         _ => false,
     };
-    non_reversible || (session && !(user && a.owns_affected_session)) || (connectivity && !(user && a.local_session))
+    let reaches_others = match f.disruption {
+        Disruption::SessionLoss | Disruption::ConnectivityLoss => f.other_sessions_affected,
+        _ => false,
+    };
+    non_reversible || (session && !(user && own_session_exec(&a.actor, f))) || (connectivity && !is_local_exec(
+        &a.actor,
+    )) || (reaches_others && !is_admin_exec(a))
 }
 
 pub fn decide(i: &Input) -> (r: Decision)
@@ -729,20 +868,64 @@ pub fn decide(i: &Input) -> (r: Decision)
             return Decision::Reject(RejectReason::LockedOption);
         }
     }
-    let base = match base_tier(i) {
-        Decision::Allow(t) => t,
+    let (base, class) = match base_tier(i) {
+        Decision::Allow { tier, approver } => (tier, approver),
         Decision::Reject(r) => return Decision::Reject(r),
     };
     let cumulative = match &f.config_diff {
         Some(d) => any_non_routine(i.tables, d) || any_non_routine(i.tables, i.cumulative),
         None => false,
     };
-    let tier = ask_if_exec(floors(f, i.authz) || cumulative || f.touches_canonical_probe, base);
+    let tier = ask_if_exec(
+        floors(f, i.authz) || cumulative || f.touches_canonical_probe || f.below_security_floor,
+        base,
+    );
+    let approver = admin_if_exec(f.below_security_floor, class);
     if tier.rank_of() > i.settings.max_tier.rank_of() {
-        Decision::Allow(Tier::AskFirst)
+        Decision::Allow { tier: Tier::AskFirst, approver }
     } else {
-        Decision::Allow(tier)
+        Decision::Allow { tier, approver }
     }
+}
+
+// ---------- Approval (§11, I19) ----------
+
+/// `approver` may approve, with class `class`, a proposal made by `proposer`:
+/// a different principal, holding `Approve`, and `Administrator` too when the
+/// class asks for it. Remote principals hold no approval capability by default;
+/// the daemon computes capabilities, so that is a fact of `approver`.
+pub open spec fn may_approve_spec(approver: Authorization, proposer: PrincipalId, class: ApproverClass) -> bool {
+    is_user(approver.actor) && approver.principal != proposer && approver.capabilities.approve && match class {
+        ApproverClass::AnyApprover => true,
+        ApproverClass::Administrator => approver.capabilities.administrator,
+    }
+}
+
+pub fn may_approve(approver: &Authorization, proposer: PrincipalId, class: ApproverClass) -> (r: bool)
+    ensures
+        r == may_approve_spec(*approver, proposer, class),
+{
+    let holds_class = match class {
+        ApproverClass::AnyApprover => true,
+        ApproverClass::Administrator => approver.capabilities.administrator,
+    };
+    is_user_exec(&approver.actor) && approver.principal.0 != proposer.0 && approver.capabilities.approve
+        && holds_class
+}
+
+/// A capability grant (§11, I19): approved by an administrator who is neither
+/// the grantee nor the proposer, and who holds the capability being granted.
+pub open spec fn may_grant_spec(approver: Authorization, proposer: PrincipalId, grant: Grant) -> bool {
+    may_approve_spec(approver, proposer, ApproverClass::Administrator) && approver.principal != grant.to
+        && approver.capabilities.has(grant.capability)
+}
+
+pub fn may_grant(approver: &Authorization, proposer: PrincipalId, grant: &Grant) -> (r: bool)
+    ensures
+        r == may_grant_spec(*approver, proposer, *grant),
+{
+    may_approve(approver, proposer, ApproverClass::Administrator) && approver.principal.0 != grant.to.0
+        && approver.capabilities.contains(grant.capability)
 }
 
 } // verus!
@@ -796,10 +979,23 @@ pub fn policy_version(tables: &Tables) -> PolicyVersion {
     PolicyVersion(Hash::of(&bytes))
 }
 
-impl Authorization {
-    pub fn daemon() -> Authorization {
-        Authorization { caller: Actor::Daemon, admin: false, local_session: false, owns_affected_session: false }
-    }
+/// The authorization of a non-user actor: no capabilities (§11).
+pub fn authorization_of(actor: Actor) -> Authorization {
+    Authorization { principal: actor.principal(), actor, capabilities: Capabilities::default() }
+}
+
+/// Phase A's capability grants (§11): every user acts on their own scope and
+/// the user-controllable units; root and `planarian-admin` members are
+/// administrators and approvers. I17 holds because root always is.
+pub fn user_authorization(actor: Actor, admin: bool) -> Authorization {
+    use planarian_schema::Capability::*;
+    let admin = admin || actor.uid() == Some(0);
+    let caps = if admin {
+        Capabilities::of(&[OwnScope, UserControllable, Administrator, Approve])
+    } else {
+        Capabilities::of(&[OwnScope, UserControllable])
+    };
+    Authorization { principal: actor.principal(), actor, capabilities: caps }
 }
 
 impl std::fmt::Debug for Input<'_> {

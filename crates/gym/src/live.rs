@@ -187,7 +187,7 @@ pub fn plan(entry: &T) -> Plan {
         } else if st.get("transition").is_some() {
             match s(st, "transition") {
                 "ApplyChange" | "RestartUnit" | "CollectGarbage" | "Rollback" | "SwitchGeneration" | "BindDriver"
-                | "Suppress" => "vm".into(),
+                | "SetOverride" => "vm".into(),
                 t => format!("unsupported: transition {t}"),
             }
         } else {
@@ -703,7 +703,11 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
             },
             "RestartUnit" => Request::Restart { unit: unit(&get("unit")) },
             "CollectGarbage" => Request::Gc,
-            "Suppress" => Request::Suppress { unit: unit(&get("unit")), until: Until::Explicit },
+            "SetOverride" => Request::SetOverride {
+                unit: unit(&get("unit")),
+                until: Until::Explicit,
+                desired: planarian_schema::OverrideDesired::LeaveAlone,
+            },
             "Rollback" => {
                 Request::GymPropose { transition: Transition::Rollback, stale_digest: false, may_change: None }
             }
@@ -847,7 +851,16 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 .unwrap_or_default();
             let a: Vec<&str> = argv.iter().map(String::as_str).collect();
             let req = match a.as_slice() {
-                ["suppress", u] => Request::Suppress { unit: unit(u), until: Until::Explicit },
+                ["override", u] => Request::SetOverride {
+                    unit: unit(u),
+                    until: Until::Explicit,
+                    desired: planarian_schema::OverrideDesired::LeaveAlone,
+                },
+                ["override", u, "--stop" | "--stopped"] => Request::SetOverride {
+                    unit: unit(u),
+                    until: Until::Explicit,
+                    desired: planarian_schema::OverrideDesired::Stopped,
+                },
                 ["stop", u] => Request::Stop { unit: unit(u) },
                 ["resolve", _, how] => {
                     let txn = *ledger(cfg).0.interlock.keys().next().ok_or("resolve: nothing interlocked")?;

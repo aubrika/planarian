@@ -13,6 +13,9 @@ verus! {
 /// - `ReobserveOnly` never reverts and never publishes (Runtime outcomes never
 ///   trigger generation reversion); it may commit from Activating (crash table).
 /// - Only generation operations pass through Published and Promoted.
+/// - The boot-only path (§12 step 7, §12f): Built → AwaitingBoot (a one-shot
+///   next-boot entry) → Promoted (it booted and passed) or Reverted (it did
+///   not; the bootloader already fell back), or Reverting to withdraw the entry.
 /// - Any state in which mutation may have happened can end in RecoveryFailed.
 pub open spec fn step_spec(from: TxnState, to: TxnState, strategy: RecoveryStrategy) -> bool {
     let generation = strategy.reverts_generation();
@@ -27,6 +30,10 @@ pub open spec fn step_spec(from: TxnState, to: TxnState, strategy: RecoveryStrat
             (TxnState::Staged, TxnState::Built) => true,
             (TxnState::Staged, TxnState::Activating) => true,
             (TxnState::Built, TxnState::Activating) => true,
+            (TxnState::Built, TxnState::AwaitingBoot) => generation,
+            (TxnState::AwaitingBoot, TxnState::Promoted) => generation,
+            (TxnState::AwaitingBoot, TxnState::Reverting) => generation,
+            (TxnState::AwaitingBoot, TxnState::Reverted) => generation,
             (_, TxnState::Rejected(_)) => from.pre_mutation(),
             (_, TxnState::Cancelled(_)) => from.pre_mutation(),
             (TxnState::Activating, TxnState::Checking) => true,
@@ -72,6 +79,10 @@ pub fn step_allowed(from: &TxnState, to: &TxnState, strategy: RecoveryStrategy) 
         (TxnState::Staged, TxnState::Built) => true,
         (TxnState::Staged, TxnState::Activating) => true,
         (TxnState::Built, TxnState::Activating) => true,
+        (TxnState::Built, TxnState::AwaitingBoot) => generation,
+        (TxnState::AwaitingBoot, TxnState::Promoted) => generation,
+        (TxnState::AwaitingBoot, TxnState::Reverting) => generation,
+        (TxnState::AwaitingBoot, TxnState::Reverted) => generation,
         (_, TxnState::Rejected(_)) => from.is_pre_mutation(),
         (_, TxnState::Cancelled(_)) => from.is_pre_mutation(),
         (TxnState::Activating, TxnState::Checking) => true,
@@ -99,6 +110,7 @@ pub open spec fn rank(s: TxnState) -> nat {
         TxnState::Activating => 5,
         TxnState::Checking => 4,
         TxnState::Published => 3,
+        TxnState::AwaitingBoot => 3,
         TxnState::Promoted => 2,
         TxnState::Reverting => 1,
         _ => 0,
@@ -157,13 +169,24 @@ pub proof fn runtime_never_reverts(from: TxnState, to: TxnState)
 {
 }
 
-/// Only generation operations publish a boot entry or promote overrides.
+/// Only generation operations publish a boot entry (also a one-shot one) or promote overrides.
 pub proof fn only_generations_publish(from: TxnState, to: TxnState, strategy: RecoveryStrategy)
     requires
         step_spec(from, to, strategy),
-        to is Published || to is Promoted,
+        to is Published || to is Promoted || to is AwaitingBoot,
     ensures
         strategy.reverts_generation(),
+{
+}
+
+/// A boot-only candidate is never live-activated: it reaches AwaitingBoot only
+/// from Built, and leaves it only for Promoted or a revert.
+pub proof fn boot_only_never_activates(from: TxnState, to: TxnState, strategy: RecoveryStrategy)
+    requires
+        step_spec(from, to, strategy),
+    ensures
+        to is AwaitingBoot ==> from is Built,
+        from is AwaitingBoot ==> (to is Promoted || to is Reverting || to is Reverted || to is RecoveryFailed),
 {
 }
 
@@ -186,6 +209,7 @@ pub fn tag(s: &TxnState) -> &'static str {
         TxnState::Activating => "Activating",
         TxnState::Checking => "Checking",
         TxnState::Published => "Published",
+        TxnState::AwaitingBoot => "AwaitingBoot",
         TxnState::Promoted => "Promoted",
         TxnState::Committed => "Committed",
         TxnState::Reverting => "Reverting",
@@ -217,7 +241,7 @@ mod tests {
             TxnState::Reverted,
             TxnState::RecoveryFailed,
             TxnState::Rejected(RejectReason::Stale),
-            TxnState::Cancelled(Actor::User { uid: 1000 }),
+            TxnState::Cancelled(Actor::user(1000)),
         ]
     }
 

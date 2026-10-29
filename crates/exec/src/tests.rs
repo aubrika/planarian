@@ -2,6 +2,7 @@
 
 use super::*;
 use planarian_fake::{Fake, MemStore, fixtures, gym_world};
+use planarian_policy::{authorization_of, user_authorization};
 use planarian_state::{Assembler, Context, Manifest};
 use planarian_txn::kernel::CrashPoint;
 
@@ -73,7 +74,8 @@ impl Rig {
             known_good: GenerationId(1),
             live_tested: l.live_tested,
             accepted_baseline: None,
-            suppressions: l.suppressions,
+            security_floor: l.security_floor,
+            overrides: l.overrides,
             core_hash: Hash::ZERO,
         };
         self.ex.update_context(ctx.clone(), vec![GenerationId(1)]);
@@ -95,7 +97,7 @@ impl Rig {
 
     fn approve(&mut self, h: Hash) -> Submitted {
         let (s, defs) = self.observe();
-        self.ex.approve(&h, &s, &defs)
+        self.ex.approve(&h, &root(), &s, &defs)
     }
 
     /// The status on the daemon's next tick.
@@ -106,12 +108,18 @@ impl Rig {
     }
 }
 
+/// An administrator (in `planarian-admin`) who proposes changes.
 fn admin() -> Authorization {
-    Authorization { caller: Actor::User { uid: 0 }, admin: true, local_session: true, owns_affected_session: true }
+    user_authorization(Actor::local(1001, "1"), true)
+}
+
+/// Root at a terminal: the Phase A approver (§16), a different principal (I19).
+fn root() -> Authorization {
+    user_authorization(Actor::user(0), true)
 }
 
 fn alice() -> Authorization {
-    Authorization { caller: Actor::User { uid: ALICE }, admin: false, local_session: true, owns_affected_session: true }
+    user_authorization(Actor::local(ALICE, "2"), false)
 }
 
 fn change(id: &str, args: &[(&str, Value)]) -> Transition {
@@ -134,7 +142,7 @@ fn svc_killed_restart_commits() {
     let web = UnitId::service("gym-web");
     r.fake.w().units.get_mut(&web).unwrap().observed = Observed::Failed(Reason::ExitCode(137));
     assert!(matches!(r.status(&web), UnitStatus::Failed(_)));
-    let s = r.propose(Transition::RestartUnit(web.clone()), Authorization::daemon());
+    let s = r.propose(Transition::RestartUnit(web.clone()), authorization_of(Actor::Daemon));
     assert_eq!(finished(&s), TxnState::Committed);
     assert_eq!(r.status(&web), UnitStatus::Running);
 }
@@ -210,14 +218,27 @@ fn untracked_files_do_not_make_it_stale() {
 #[test]
 fn authz_and_refinement_and_digest() {
     let mut r = Rig::new();
-    let sup = Transition::Suppress(Suppression {
+    let sup = Transition::SetOverride(Override {
         unit: UnitId::service("sshd"),
         until: Until::Explicit,
         reason: String::new(),
         by: Actor::Daemon,
-        stopped: false,
+        desired: OverrideDesired::LeaveAlone,
+        attribution: Attribution::Attested,
     });
-    assert!(matches!(r.propose(sup, alice()), Submitted::Rejected { reason: RejectReason::Unauthorized, .. }));
+    // Held for an administrator (§11), not refused; alice can't approve it.
+    let Submitted::Parked { approve, .. } = r.propose(sup, alice()) else { panic!("not parked") };
+    let (s, defs) = r.observe();
+    assert!(matches!(
+        r.ex.approve(&approve, &alice(), &s, &defs),
+        Submitted::Rejected { reason: RejectReason::Unauthorized, .. }
+    ));
+    // Nor can an administrator who is not an approver of this class: the daemon.
+    assert!(matches!(
+        r.ex.approve(&approve, &authorization_of(Actor::Daemon), &s, &defs),
+        Submitted::Rejected { reason: RejectReason::Unauthorized, .. }
+    ));
+    assert!(matches!(r.ex.approve(&approve, &root(), &s, &defs), Submitted::Finished { .. }));
 
     let (s, defs) = r.observe();
     let t = Transition::RestartUnit(UnitId::service("gym-web"));
@@ -245,16 +266,18 @@ fn forged_actor_is_overwritten() {
     let mut r = Rig::new();
     let pw =
         UnitId { kind: UnitKind::Service, name: "pipewire".into(), scope: Scope::User { uid: ALICE, session: None } };
-    let sup = Transition::Suppress(Suppression {
+    let sup = Transition::SetOverride(Override {
         unit: pw.clone(),
         until: Until::Explicit,
         reason: String::new(),
         by: Actor::Daemon,
-        stopped: false,
+        desired: OverrideDesired::LeaveAlone,
+        attribution: Attribution::Attested,
     });
     assert_eq!(finished(&r.propose(sup, alice())), TxnState::Committed);
     let l = r.ex.kernel.journal.sync_ledger().unwrap();
-    assert_eq!(l.suppressions[0].by, Actor::User { uid: ALICE });
+    assert_eq!(l.overrides[0].by.uid(), Some(ALICE));
+    assert_eq!(l.overrides[0].attribution, Attribution::Attested);
 }
 
 #[test]
@@ -378,7 +401,7 @@ mod props {
             4 => (addr("127.0.0.1"), admin()),
             5 => (Transition::Rollback, admin()),
             6 => (Transition::StopAndSuppress { unit: web, until: Until::Explicit, reason: "test".into() }, admin()),
-            7 => (Transition::Unsuppress(web), admin()),
+            7 => (Transition::LiftOverride(web), admin()),
             8 => (Transition::CollectGarbage { emergency: false }, admin()),
             _ => (Transition::SwitchGeneration(GenerationId(1)), admin()),
         }

@@ -114,6 +114,13 @@ pub struct TxnId(pub u64);
 #[verifier::external_derive]
 pub struct ModelId(pub String);
 
+/// A principal (§11): a human maps to a uid, an agent to a registered key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+#[verifier::external_derive]
+pub struct PrincipalId(pub u64);
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]

@@ -14,8 +14,8 @@
 
 use planarian_schema::{
     Backends, Cadence, Clock, Condition, DriverRef, Evidence, GenerationBackend, GenerationId, Hash, InventoryBackend,
-    Millis, Observed, PowerSource, ProbeBackend, ProbeCost, ProbeDef, ProbeId, ProbeKind, ProbeOrigin, ProbeResult,
-    ProbeRole, Reason, Scope, SessionBackend, SessionInfo, Suppression, SystemState, Timestamp, UnitBackend, UnitDef,
+    Millis, Observed, Override, PowerSource, ProbeBackend, ProbeCost, ProbeDef, ProbeId, ProbeKind, ProbeOrigin,
+    ProbeResult, ProbeRole, Reason, Scope, SessionBackend, SessionInfo, SystemState, Timestamp, UnitBackend, UnitDef,
     UnitDefs, UnitId, UnitKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,13 +44,15 @@ pub fn apply_canonical(def: &mut UnitDef, canonical: &Canonical) {
     def.probes.extend(core);
 }
 
-/// Baselines and suppressions from the journal, which `state` does not own.
+/// Baselines and overrides from the journal, which `state` does not own.
 #[derive(Clone, Debug, Default)]
 pub struct Context {
     pub known_good: GenerationId,
     pub live_tested: Option<GenerationId>,
     pub accepted_baseline: Option<GenerationId>,
-    pub suppressions: Vec<Suppression>,
+    /// §12e, from the ledger.
+    pub security_floor: Option<GenerationId>,
+    pub overrides: Vec<Override>,
     pub core_hash: Hash,
 }
 
@@ -360,8 +362,9 @@ impl Assembler {
             known_good: ctx.known_good,
             live_tested: ctx.live_tested,
             accepted_baseline: ctx.accepted_baseline,
+            security_floor: ctx.security_floor,
             units,
-            suppressions: ctx.suppressions.clone(),
+            overrides: ctx.overrides.clone(),
             conditions,
             resources,
             core_hash: ctx.core_hash,

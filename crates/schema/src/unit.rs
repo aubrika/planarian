@@ -44,23 +44,56 @@ pub enum Scope {
 pub enum Actor {
     Daemon,
     Watchdog,
-    User { uid: u32 },
+    /// Filled from `SO_PEERCRED` → pid → logind (§10). `session` is None only
+    /// for callers outside any logind session (a root timer), which never
+    /// satisfy an "own session" floor; `seat` is None for SSH and other remote
+    /// sessions, which are never local.
+    User { uid: u32, session: Option<String>, seat: Option<String>, active: bool },
     Model(crate::ids::ModelId),
+    /// Reserved: remote principals via a relay. Not constructed in Phase A.
+    Agent(crate::ids::PrincipalId),
+    /// The actor of an `Inferred` override (§11): never a caller, never authorized.
+    Unattributed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[derive(Serialize, Deserialize)]
 #[verifier::external_derive]
-pub struct Suppression {
+pub struct Override {
     pub unit: UnitId,
+    pub desired: OverrideDesired,
     pub until: Until,
     pub reason: String,
     /// Always overwritten by the daemon from the caller's credentials (§11).
+    /// `Actor::Unattributed` exactly when `attribution == Inferred`.
     pub by: Actor,
-    /// The user's "stop": the unit was stopped as well as left alone, so a
-    /// generation activation that starts it again is undone (principle 9).
-    #[serde(default)]
-    pub stopped: bool,
+    pub attribution: Attribution,
+}
+
+/// What the override holds the unit to (§8). A `Stopped` override also undoes
+/// a generation activation that starts the unit again (principle 9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum OverrideDesired {
+    /// Do not repair; take no action.
+    LeaveAlone,
+    /// Stop or kill a service.
+    Stopped,
+    /// Disable or mask.
+    Absent,
+    /// Unmount, eject or unbind a device.
+    Detected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum Attribution {
+    /// Reached Planarian with the actor's identity before it took effect.
+    Attested,
+    /// The unattributed residue (§11): recorded as an inference, never as fact.
+    Inferred,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -177,6 +210,48 @@ impl Sensitivities {
 }
 
 } // verus!
+
+impl Actor {
+    /// A user outside any logind session (a root timer, a test). Never local,
+    /// never "own session".
+    pub fn user(uid: u32) -> Actor {
+        Actor::User { uid, session: None, seat: None, active: false }
+    }
+
+    /// A user in the active local session `session` on `seat0`.
+    pub fn local(uid: u32, session: &str) -> Actor {
+        Actor::User { uid, session: Some(session.into()), seat: Some("seat0".into()), active: true }
+    }
+
+    /// The principal behind this actor (§11). A human is their uid; the
+    /// non-human actors of Phase A have fixed ids above every uid.
+    pub fn principal(&self) -> crate::ids::PrincipalId {
+        use crate::ids::PrincipalId;
+        const BASE: u64 = 1 << 32;
+        match self {
+            Actor::User { uid, .. } => PrincipalId(*uid as u64),
+            Actor::Daemon => PrincipalId(BASE),
+            Actor::Watchdog => PrincipalId(BASE + 1),
+            Actor::Model(_) => PrincipalId(BASE + 2),
+            Actor::Unattributed => PrincipalId(BASE + 3),
+            Actor::Agent(p) => *p,
+        }
+    }
+
+    pub fn uid(&self) -> Option<u32> {
+        match self {
+            Actor::User { uid, .. } => Some(*uid),
+            _ => None,
+        }
+    }
+}
+
+impl Override {
+    /// An attested override: the action reached Planarian with `by`'s identity first.
+    pub fn attested(unit: UnitId, desired: OverrideDesired, until: Until, reason: String, by: Actor) -> Override {
+        Override { unit, desired, until, reason, by, attribution: Attribution::Attested }
+    }
+}
 
 impl Sensitivities {
     pub const ALL: [Sensitivity; 5] =
@@ -301,6 +376,11 @@ pub enum Condition {
     DeviceConnected(UnitId),
     OnAcPower,
     OnBattery,
+    /// Quiet mode (§12f; signals in §10): a GameMode client, a gamescope
+    /// session, a fullscreen surface holding an idle-inhibitor, or Do Not Disturb.
+    Foreground {
+        session: String,
+    },
     All(Vec<Condition>),
     Any(Vec<Condition>),
 }
@@ -334,8 +414,8 @@ pub struct Desired {
     pub when: Condition,
 }
 
-impl Suppression {
-    /// `NextBoot` suppressions are dropped by state assembly on boot, so here they hold.
+impl Override {
+    /// `NextBoot` overrides are dropped by state assembly on boot, so here they hold.
     pub fn holds_at(&self, now: Timestamp) -> bool {
         match self.until {
             Until::At(t) => now < t,
@@ -446,6 +526,15 @@ pub enum ProbeKind {
         url: String,
         status: u16,
     },
+    DBus {
+        service: String,
+        path: String,
+        method: String,
+    },
+    FilePresent {
+        path: String,
+    },
+    /// Administrator-authored manifest entries only; flagged in the console and journal (§9).
     Exec {
         argv: Vec<String>,
         sandbox: ProbeSandbox,

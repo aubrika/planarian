@@ -21,7 +21,7 @@ pub mod host;
 use derive::{DeriveInput, derive, manifest_of};
 use host::ExecHost;
 use planarian_changes::CatalogConfig;
-use planarian_policy::{Authorization, Input, Settings, Tables, decide, policy_version};
+use planarian_policy::{Input, Settings, Tables, decide, may_approve, policy_version};
 use planarian_schema::spec::{predict, refines};
 use planarian_schema::*;
 use planarian_state::Canonical;
@@ -73,6 +73,8 @@ pub struct Parked {
     pub txn: TxnId,
     pub proposal: Proposal,
     pub authz: Authorization,
+    /// Who may approve it (the decision's class, §11).
+    pub class: ApproverClass,
     pub bound_to: Hash,
     pub issued: Timestamp,
     pub facts: DerivedFacts,
@@ -249,7 +251,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         let gens = self.b.generations();
         // §11: actor fields inside a proposal are overwritten from the caller.
         let transition = match &p.transition {
-            Transition::Suppress(s) => Transition::Suppress(Suppression { by: authz.caller.clone(), ..s.clone() }),
+            Transition::SetOverride(s) => Transition::SetOverride(Override { by: authz.actor.clone(), ..s.clone() }),
             t => t.clone(),
         };
         // Only generation changes need the running generation's evaluation and
@@ -292,7 +294,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 activation: None,
                 base_overrides: &live,
                 candidate_overrides: None,
-                caller: authz.caller.clone(),
+                caller: authz.actor.clone(),
                 tables: &self.cfg.tables,
                 canonical: &self.cfg.canonical,
             }),
@@ -354,7 +356,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             activation: plan.built.as_ref().map(|b| &b.activation),
             base_overrides: &live,
             candidate_overrides: cand_overrides.as_ref(),
-            caller: authz.caller.clone(),
+            caller: authz.actor.clone(),
             tables: &self.cfg.tables,
             canonical: &self.cfg.canonical,
         });
@@ -550,11 +552,13 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 return Self::kernel_error(e);
             }
         };
-        if plan.decision == Decision::Allow(Tier::AskFirst) {
+        if let Decision::Allow { tier: Tier::AskFirst, approver: class } = plan.decision {
             let bound_to = self.binding(&p, &plan, state);
             let now = self.b.clock().now();
-            self.parked
-                .insert(id, Parked { txn: id, proposal: p, authz, bound_to, issued: now, facts: plan.facts.clone() });
+            self.parked.insert(
+                id,
+                Parked { txn: id, proposal: p, authz, class, bound_to, issued: now, facts: plan.facts.clone() },
+            );
             return Submitted::Parked { txn: id, approve: bound_to, facts: plan.facts };
         }
         self.run(id, &plan)
@@ -603,10 +607,28 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
 
     /// `planarian approve <hash>` (§12 step 4): re-derive, re-decide, rebind.
     /// The caller has checked root and an interactive TTY (Phase A).
-    pub fn approve(&mut self, hash: &Hash, state: &SystemState, defs: &UnitDefs) -> Submitted {
+    pub fn approve(
+        &mut self,
+        hash: &Hash,
+        approver: &Authorization,
+        state: &SystemState,
+        defs: &UnitDefs,
+    ) -> Submitted {
         let Some(parked) = self.parked.values().find(|p| p.bound_to == *hash).cloned() else {
             return reject(RejectReason::Other("approval".into()), "no pending change with that hash");
         };
+        // I19: never the proposer; an Administrator class needs an administrator.
+        // A refused approval leaves the request pending for someone who may.
+        if !may_approve(approver, parked.authz.principal, parked.class) {
+            let why = if approver.principal == parked.authz.principal {
+                "you can't approve your own request"
+            } else if parked.class == ApproverClass::Administrator {
+                "this needs an administrator's approval"
+            } else {
+                "you can't approve requests"
+            };
+            return reject(RejectReason::Unauthorized, why);
+        }
         let now = self.b.clock().now();
         if token_expired(now, parked.issued) {
             return self.expire_one(parked.txn);
@@ -636,7 +658,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             }
         };
         let rebound = self.binding(&parked.proposal, &plan, state);
-        if rebound != parked.bound_to || !matches!(plan.decision, Decision::Allow(_)) {
+        if rebound != parked.bound_to || !matches!(plan.decision, Decision::Allow { .. }) {
             // Something the approval covered changed: the token is void. Withdraw
             // this transaction and, if still allowed, park the new one.
             self.parked.remove(&parked.txn);

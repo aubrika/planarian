@@ -5,13 +5,17 @@
 //! daemon takes it from `SO_PEERCRED` (§11).
 
 use planarian_schema::{
-    ChangeId, DerivedFacts, EdgeKind, GenerationId, Hash, Incident, IncidentState, ProbeId, Resolution, Timestamp,
-    Transition, TxnId, TxnState, UnitId, UnitStatus, Until, Value,
+    ChangeId, DerivedFacts, EdgeKind, GenerationId, Hash, Incident, IncidentState, OverrideDesired, ProbeId,
+    Resolution, Timestamp, Transition, TxnId, TxnState, UnitId, UnitStatus, Until, Value,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const SOCKET: &str = "/run/planarian/planariad.sock";
+
+fn leave_alone() -> OverrideDesired {
+    OverrideDesired::LeaveAlone
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
@@ -30,11 +34,13 @@ pub enum Request {
         change: ChangeId,
         args: BTreeMap<String, Value>,
     },
-    Suppress {
+    SetOverride {
         unit: UnitId,
         until: Until,
+        #[serde(default = "leave_alone")]
+        desired: OverrideDesired,
     },
-    Unsuppress {
+    LiftOverride {
         unit: UnitId,
     },
     /// A `StopUnit` from the CLI; rewritten to `StopAndSuppress { NextBoot }` (§14).
@@ -196,7 +202,12 @@ pub fn status_words(s: &UnitStatus) -> String {
             format!("running, but failing its health check ({})", names.join(", "))
         }
         S::Stopped => "stopped".into(),
-        S::Suppressed => "left alone on request".into(),
+        S::Overridden(d) => match d {
+            planarian_schema::OverrideDesired::LeaveAlone => "left alone on request".into(),
+            planarian_schema::OverrideDesired::Stopped => "stopped on request".into(),
+            planarian_schema::OverrideDesired::Absent => "disabled on request".into(),
+            planarian_schema::OverrideDesired::Detected => "detached on request".into(),
+        },
         S::Unknown => "unknown (no fresh evidence)".into(),
         S::Failed(Reason::ExitCode(c)) => format!("failed (exit code {c})"),
         S::Failed(Reason::DriverError(e)) => format!("failed (driver: {e})"),
@@ -288,9 +299,13 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let r = Request::Suppress { unit: "service:gym-web".parse().unwrap(), until: Until::Explicit };
+        let r = Request::SetOverride {
+            unit: "service:gym-web".parse().unwrap(),
+            until: Until::Explicit,
+            desired: planarian_schema::OverrideDesired::LeaveAlone,
+        };
         let s = r.encode();
-        assert!(s.contains("\"op\":\"suppress\""), "{s}");
+        assert!(s.contains("\"op\":\"set-override\""), "{s}");
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
         let a = Request::Ask { phrase: "restart wifi".into(), choice: None };
         assert_eq!(serde_json::from_str::<Request>(&a.encode()).unwrap(), a);

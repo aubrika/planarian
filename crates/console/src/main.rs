@@ -3,7 +3,7 @@
 //! Views: Graph (desired, observed and health per unit as three indicators;
 //! edge style by kind; suppressed units hatched; Unknown units grey with a
 //! stale-clock mark), Timeline (transactions with their journal states),
-//! Generations, Incidents. Buttons: undo, suppress and unsuppress, which the
+//! Generations, Incidents. Buttons: undo, override and release, which the
 //! daemon runs as Runtime transitions with the user as the actor. It reads
 //! only the daemon's socket. It starts minimized unless something needs
 //! attention: an open incident, a pending approval, a reconciliation record,
@@ -91,7 +91,7 @@ enum Message {
     Select(UnitId),
     Undo,
     Suppress(UnitId),
-    Unsuppress(UnitId),
+    LiftOverride(UnitId),
 }
 
 struct Console {
@@ -218,8 +218,12 @@ impl Console {
                 self.graph_cache.clear();
             }
             Message::Undo => self.act(Request::Undo),
-            Message::Suppress(unit) => self.act(Request::Suppress { unit, until: Until::Explicit }),
-            Message::Unsuppress(unit) => self.act(Request::Unsuppress { unit }),
+            Message::Suppress(unit) => self.act(Request::SetOverride {
+                unit,
+                until: Until::Explicit,
+                desired: planarian_schema::OverrideDesired::LeaveAlone,
+            }),
+            Message::LiftOverride(unit) => self.act(Request::LiftOverride { unit }),
         }
         Task::none()
     }
@@ -290,7 +294,7 @@ impl Console {
                 None => column![text("Select a unit.").size(14), text(graph::LEGEND).size(12),].spacing(8).into(),
                 Some(n) => {
                     let action = if n.suppressed {
-                        button(text("Let it run again")).on_press(Message::Unsuppress(n.unit.clone()))
+                        button(text("Let it run again")).on_press(Message::LiftOverride(n.unit.clone()))
                     } else {
                         button(text("Leave it alone")).on_press(Message::Suppress(n.unit.clone()))
                     };
@@ -435,7 +439,7 @@ fn incidents<'a>(r: &'a ConsoleReport) -> Element<'a, Message> {
     for i in &r.status.incidents {
         let state = match &i.state {
             IncidentState::Cooldown { until } => format!("cooling down for {}", minutes(until.0, r.now.0)),
-            IncidentState::Escalated { until } => {
+            IncidentState::Escalated { until, .. } => {
                 format!("needs a person (no automatic action for {})", minutes(until.0, r.now.0))
             }
             IncidentState::Open => "open".into(),

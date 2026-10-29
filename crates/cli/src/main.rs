@@ -2,7 +2,9 @@
 //! `planarian ask`) it interprets a phrase.
 
 use planarian_ipc::{Request, Response, SOCKET, StatusReport};
-use planarian_schema::{ChangeId, Hash, IncidentState, Resolution, TxnId, UnitId, UnitStatus, Until, Value};
+use planarian_schema::{
+    ChangeId, Hash, IncidentState, OverrideDesired, Resolution, TxnId, UnitId, UnitStatus, Until, Value,
+};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
@@ -15,8 +17,8 @@ const USAGE: &str = "usage:
   planarian apply <change> [key=value ...]
   planarian stop <unit>               stop it and leave it stopped until the next boot
   planarian restart <unit>
-  planarian suppress <unit> [--until next-boot|explicit|<N>m]
-  planarian unsuppress <unit>
+  planarian override <unit> [--leave-alone|--stopped|--absent|--detached] [--until next-boot|explicit|<N>m]
+  planarian release <unit>
   planarian gc
   planarian undo
   planarian diagnose <unit> [probe]
@@ -66,20 +68,36 @@ fn parse(args: &[String]) -> Result<(Request, bool), String> {
         }
         ["stop", u] => Request::Stop { unit: unit(u)? },
         ["restart", u] => Request::Restart { unit: unit(u)? },
-        ["suppress", u] => Request::Suppress { unit: unit(u)?, until: Until::Explicit },
-        ["suppress", u, "--until", when] => {
-            let until = match *when {
-                "next-boot" => Until::NextBoot,
-                "explicit" => Until::Explicit,
-                m => {
-                    let mins: u64 =
-                        m.trim_end_matches('m').parse().map_err(|_| "--until takes next-boot, explicit or <N>m")?;
-                    Until::At(planarian_schema::Timestamp(now_ms() + mins * 60_000))
+        ["override", u, flags @ ..] => {
+            let mut until = Until::Explicit;
+            let mut desired = OverrideDesired::LeaveAlone;
+            let mut it = flags.iter();
+            while let Some(f) = it.next() {
+                match *f {
+                    "--leave-alone" => desired = OverrideDesired::LeaveAlone,
+                    "--stopped" | "--stop" => desired = OverrideDesired::Stopped,
+                    "--absent" => desired = OverrideDesired::Absent,
+                    "--detached" => desired = OverrideDesired::Detected,
+                    "--until" => {
+                        until = match it.next().copied() {
+                            Some("next-boot") => Until::NextBoot,
+                            Some("explicit") => Until::Explicit,
+                            Some(m) => {
+                                let mins: u64 = m
+                                    .trim_end_matches('m')
+                                    .parse()
+                                    .map_err(|_| "--until takes next-boot, explicit or <N>m")?;
+                                Until::At(planarian_schema::Timestamp(now_ms() + mins * 60_000))
+                            }
+                            None => return Err("--until takes next-boot, explicit or <N>m".into()),
+                        }
+                    }
+                    other => return Err(format!("override: unknown flag {other}")),
                 }
-            };
-            Request::Suppress { unit: unit(u)?, until }
+            }
+            Request::SetOverride { unit: unit(u)?, until, desired }
         }
-        ["unsuppress", u] => Request::Unsuppress { unit: unit(u)? },
+        ["release", u] => Request::LiftOverride { unit: unit(u)? },
         ["gc"] => Request::Gc,
         ["undo"] => Request::Undo,
         ["diagnose", u] => Request::Diagnose { unit: unit(u)?, probe: None },
@@ -120,7 +138,7 @@ fn symbol(s: &UnitStatus, expected: bool) -> &'static str {
     match s {
         UnitStatus::Running => "ok",
         _ if !expected => "  ",
-        UnitStatus::Suppressed => "--",
+        UnitStatus::Overridden(_) => "--",
         UnitStatus::Unknown | UnitStatus::Transitioning => "??",
         UnitStatus::Bound => "ok",
         _ => "!!",
@@ -145,7 +163,7 @@ fn print_status(r: &StatusReport) {
     }
     println!();
     for u in &r.units {
-        let st = if u.expected || u.status == UnitStatus::Suppressed {
+        let st = if u.expected || matches!(u.status, UnitStatus::Overridden(_)) {
             format!("{:?}", u.status)
         } else {
             "not expected now".into()
@@ -329,8 +347,8 @@ mod tests {
         assert_eq!(p("status"), Request::Status);
         assert_eq!(p("stop sshd"), Request::Stop { unit: UnitId::service("sshd") });
         assert_eq!(
-            p("unsuppress service@1000:pipewire"),
-            Request::Unsuppress { unit: "service@1000:pipewire".parse().unwrap() }
+            p("release service@1000:pipewire"),
+            Request::LiftOverride { unit: "service@1000:pipewire".parse().unwrap() }
         );
         assert_eq!(p("ask reconnect wifi"), Request::Ask { phrase: "reconnect wifi".into(), choice: None });
         match p("apply font-scale scale=1.25") {
@@ -344,7 +362,7 @@ mod tests {
             p("resolve 4 --manual-repaired"),
             Request::Resolve { resolution: Resolution::ManualRepaired, .. }
         ));
-        assert!(matches!(p("suppress backup --until 20m"), Request::Suppress { until: Until::At(_), .. }));
+        assert!(matches!(p("override backup --until 20m"), Request::SetOverride { until: Until::At(_), .. }));
         assert!(parse(&["bogus".into()]).is_err());
     }
 }

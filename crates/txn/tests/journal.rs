@@ -17,7 +17,7 @@ fn history() -> Vec<Entry> {
     d.run(a).unwrap();
     let t = txn(
         Transition::StopAndSuppress { unit: web(), until: Until::Explicit, reason: "working on it".into() },
-        Actor::User { uid: ADMIN },
+        Actor::user(ADMIN),
     );
     let s = d.prepare(t).unwrap();
     d.run(s).unwrap();
@@ -49,9 +49,8 @@ fn history() -> Vec<Entry> {
     let f = d.prepare(bad).unwrap();
     assert_eq!(d.run(f).unwrap(), TxnState::RecoveryFailed);
     rig.w().env_fault = false;
-    let r = d
-        .prepare(txn(Transition::Resolve { txn: f, resolution: Resolution::AsReverted }, Actor::User { uid: ADMIN }))
-        .unwrap();
+    let r =
+        d.prepare(txn(Transition::Resolve { txn: f, resolution: Resolution::AsReverted }, Actor::user(ADMIN))).unwrap();
     d.run(r).unwrap();
     d.journal.segment().unwrap()
 }
@@ -83,8 +82,8 @@ fn replay_from_checkpoint_equals_full_replay() {
     }
 
     // The checkpointed state includes what §12c requires to survive.
-    assert_eq!(full_ledger.suppressions.len(), 1);
-    assert_eq!(full_ledger.suppressions[0].until, Until::Explicit);
+    assert_eq!(full_ledger.overrides.len(), 1);
+    assert_eq!(full_ledger.overrides[0].until, Until::Explicit);
     assert_eq!(full_ledger.incidents[&IncidentId(7)].budget_left, 0);
     assert!(!full_ledger.interlocked(), "resolved");
     assert_eq!(full_ledger.live_tested, Some(G2));

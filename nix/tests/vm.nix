@@ -67,7 +67,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed("ask 'stop gym-web until I say'")
         machine.sleep(60)
         machine.fail("systemctl is-active gym-web.service")
-        machine.succeed("planarian status | grep -E 'service:gym-web +Suppressed'")
+        machine.succeed("planarian status | grep -E 'service:gym-web +Overridden'")
         machine.succeed("ask 'start gym-web again'")
         machine.wait_until_succeeds("systemctl is-active gym-web.service", timeout=600)
 

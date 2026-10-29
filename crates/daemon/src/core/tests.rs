@@ -6,8 +6,8 @@ use planarian_exec::Config;
 use planarian_fake::{Fake, MemStore, fixtures, gym_world};
 use planarian_policy::{Settings, Tables};
 
-const ADMIN: Peer = Peer { uid: 0, admin: true };
-const ALICE: Peer = Peer { uid: 1000, admin: false };
+const ADMIN: Peer = Peer::new(0, true);
+const ALICE: Peer = Peer::new(1000, false);
 
 fn config() -> CoreConfig {
     CoreConfig {
@@ -132,7 +132,7 @@ fn intent_user_stops_service_and_it_stays_stopped() {
     let resp = r.core.handle(ADMIN, Request::Ask { phrase: "stop gym-web until I say".into(), choice: None });
     assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
     r.ticks(60);
-    assert_eq!(r.status("service:gym-web"), UnitStatus::Suppressed);
+    assert_eq!(r.status("service:gym-web"), UnitStatus::Overridden(OverrideDesired::Stopped));
     assert_eq!(r.calls("restart(service:gym-web)"), 0, "no repair race");
     let resp = r.core.handle(ADMIN, Request::Ask { phrase: "start gym-web again".into(), choice: None });
     assert!(matches!(resp, Response::Done { .. }), "{resp:?}");
@@ -141,10 +141,24 @@ fn intent_user_stops_service_and_it_stays_stopped() {
 }
 
 #[test]
-fn unprivileged_user_cannot_suppress_sshd() {
+fn unprivileged_override_of_a_security_unit_is_held_for_an_administrator() {
     let mut r = Rig::new();
-    let resp = r.core.handle(ALICE, Request::Suppress { unit: UnitId::service("sshd"), until: Until::Explicit });
-    assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
+    r.ticks(2);
+    let sshd = UnitId::service("sshd");
+    let req = Request::SetOverride { unit: sshd.clone(), until: Until::Explicit, desired: OverrideDesired::Stopped };
+    let resp = r.core.handle(ALICE, req);
+    let Response::NeedsApproval { approve, .. } = resp else { panic!("{resp:?}") };
+    r.ticks(2);
+    assert_eq!(r.status("service:sshd"), UnitStatus::Running, "stays up while held");
+    // I19: never the proposer; Phase A approval is root at a terminal.
+    let resp = r.core.handle(ALICE, Request::Approve { hash: approve, tty: true });
+    assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
+    let resp = r.core.handle(ADMIN, Request::Approve { hash: approve, tty: true });
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    r.ticks(2);
+    assert_eq!(r.status("service:sshd"), UnitStatus::Overridden(OverrideDesired::Stopped));
+    let l = r.core.ledger();
+    assert_eq!(l.overrides[0].by.uid(), Some(1000), "attributed to alice, not the approver");
 }
 
 #[test]
@@ -154,7 +168,7 @@ fn cli_stop_is_rewritten() {
     let Response::Done { message, .. } = resp else { panic!("{resp:?}") };
     assert!(message.contains("until the next boot"));
     let l = r.core.ledger();
-    assert_eq!(l.suppressions[0].until, Until::NextBoot);
+    assert_eq!(l.overrides[0].until, Until::NextBoot);
 }
 
 #[test]
@@ -340,7 +354,7 @@ fn a_users_stop_survives_generation_changes() {
     assert!(stopped(&r), "a revert left the user's stop in place");
     r.ticks(20);
     assert!(stopped(&r));
-    assert_eq!(r.status("service:gym-cache"), UnitStatus::Suppressed);
+    assert_eq!(r.status("service:gym-cache"), UnitStatus::Overridden(OverrideDesired::Stopped));
 }
 
 #[test]
@@ -560,6 +574,7 @@ fn a_repaired_root_cause_is_named_for_its_dependents() {
         class: "user".into(),
         seat: Some("seat0".into()),
         remote: false,
+        active: true,
         created: now,
     });
     for name in ["pipewire", "wireplumber"] {

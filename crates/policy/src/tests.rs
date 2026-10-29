@@ -12,8 +12,9 @@ fn state() -> SystemState {
         known_good: GenerationId(4),
         live_tested: Some(GenerationId(5)),
         accepted_baseline: None,
+        security_floor: None,
         units: BTreeMap::new(),
-        suppressions: vec![],
+        overrides: vec![],
         conditions: Default::default(),
         resources: Default::default(),
         core_hash: Hash::ZERO,
@@ -49,6 +50,9 @@ fn facts(
         touches_canonical_probe: flags & 2 != 0,
         changes_desired: flags & 4 != 0,
         touches_core: flags & 8 != 0,
+        below_security_floor: flags & 16 != 0,
+        other_sessions_affected: flags & 32 != 0,
+        affected_sessions: if flags & 64 != 0 { vec!["s1".into()] } else { vec![] },
         caller: Actor::Daemon,
         config_diff: diff.map(|p| ConfigDiff { options: [(p.to_owned(), (None, Some(Value::Bool(true))))].into() }),
     }
@@ -60,14 +64,15 @@ fn transitions() -> Vec<Transition> {
     vec![
         Transition::RestartUnit(u.clone()),
         Transition::StopUnit(sshd.clone()),
-        Transition::Suppress(Suppression {
+        Transition::SetOverride(Override {
             unit: sshd.clone(),
             until: Until::Explicit,
             reason: String::new(),
             by: Actor::Daemon,
-            stopped: false,
+            desired: OverrideDesired::LeaveAlone,
+            attribution: Attribution::Attested,
         }),
-        Transition::Unsuppress(u.clone()),
+        Transition::LiftOverride(u.clone()),
         Transition::StopAndSuppress { unit: u.clone(), until: Until::NextBoot, reason: String::new() },
         Transition::BindDriver {
             device: UnitId::device("gpu0"),
@@ -88,21 +93,37 @@ fn transitions() -> Vec<Transition> {
     ]
 }
 
-fn callers() -> Vec<Authorization> {
-    let user = |uid, admin, local, own| Authorization {
-        caller: Actor::User { uid },
-        admin,
-        local_session: local,
-        owns_affected_session: own,
+/// A user in session `s1` (`local`: with a seat) or outside any session.
+fn user(uid: u32, admin: bool, local: bool, in_session: bool) -> Authorization {
+    let a = Actor::User {
+        uid,
+        session: in_session.then(|| "s1".to_string()),
+        seat: local.then(|| "seat0".to_string()),
+        active: true,
     };
+    user_authorization(a, admin)
+}
+
+fn callers() -> Vec<Authorization> {
     vec![
-        Authorization::daemon(),
-        Authorization { caller: Actor::Model(ModelId("m".into())), ..Authorization::daemon() },
+        authorization_of(Actor::Daemon),
+        authorization_of(Actor::Model(ModelId("m".into()))),
+        authorization_of(Actor::Unattributed),
+        authorization_of(Actor::Agent(PrincipalId(7))),
         user(1000, false, true, true),
         user(1000, false, false, false),
+        user(1000, false, true, false),
         user(0, true, true, false),
         user(0, true, false, true),
     ]
+}
+
+fn ask(class: ApproverClass) -> Decision {
+    Decision::Allow { tier: Tier::AskFirst, approver: class }
+}
+
+fn at(t: Tier) -> Decision {
+    Decision::Allow { tier: t, approver: ApproverClass::AnyApprover }
 }
 
 /// Every combination; calls `f(input-without-max-tier, decisions by max_tier)`.
@@ -138,7 +159,7 @@ fn grid(mut f: impl FnMut(&Transition, &DerivedFacts, &Authorization, &Session, 
         for s in sens {
             for d in disruptions {
                 for r in recoveries {
-                    for flags in 0..16u8 {
+                    for flags in 0..128u8 {
                         for diff in diffs {
                             let fa = facts(s, d, r, flags, diff);
                             for a in callers() {
@@ -177,7 +198,7 @@ fn grid(mut f: impl FnMut(&Transition, &DerivedFacts, &Authorization, &Session, 
 
 fn tier(d: &Decision) -> Option<Tier> {
     match d {
-        Decision::Allow(t) => Some(*t),
+        Decision::Allow { tier, .. } => Some(*tier),
         Decision::Reject(_) => None,
     }
 }
@@ -202,7 +223,7 @@ fn i5_autonomy_never_touches_reject() {
             }
         }
     });
-    assert!(n > 100_000, "{n}");
+    assert!(n > 1_000_000, "{n}");
 }
 
 /// I11: when the session's cumulative diff (with this change) is non-Routine,
@@ -215,7 +236,10 @@ fn i11_cumulative_classification() {
             let cumulative = session.cumulative.then(diff);
             if !tb.diff_sensitivity(&cumulative).only_routine() {
                 for d in &decisions {
-                    assert!(matches!(d, Decision::Allow(Tier::AskFirst) | Decision::Reject(_)), "{t:?} {d:?}");
+                    assert!(
+                        matches!(d, Decision::Allow { tier: Tier::AskFirst, .. } | Decision::Reject(_)),
+                        "{t:?} {d:?}"
+                    );
                 }
             }
         }
@@ -226,23 +250,47 @@ fn i11_cumulative_classification() {
 #[test]
 fn floors_and_canonical_probes() {
     grid(|t, f, a, _, decisions| {
-        let is_user = matches!(a.caller, Actor::User { .. });
+        let is_user = matches!(a.actor, Actor::User { .. });
+        let admin = is_user && a.capabilities.administrator;
+        let (session, seat) = match &a.actor {
+            Actor::User { session, seat, .. } => (session.clone(), seat.is_some()),
+            _ => (None, false),
+        };
+        let own = session.is_some_and(|s| f.affected_sessions == vec![s]);
         let must_ask = f.recovery == Recovery::NonReversible
             || f.touches_canonical_probe
-            || (matches!(f.disruption, Disruption::SessionLoss | Disruption::DataInterruption)
-                && !(is_user && a.owns_affected_session))
-            || (f.disruption == Disruption::ConnectivityLoss && !(is_user && a.local_session));
-        if must_ask {
-            for d in &decisions {
+            || (matches!(f.disruption, Disruption::SessionLoss | Disruption::DataInterruption) && !(is_user && own))
+            || (f.disruption == Disruption::ConnectivityLoss && !seat)
+            || (f.other_sessions_affected
+                && matches!(f.disruption, Disruption::SessionLoss | Disruption::ConnectivityLoss)
+                && !admin);
+        for d in &decisions {
+            if must_ask {
                 assert!(
-                    matches!(d, Decision::Allow(Tier::AskFirst) | Decision::Reject(_)),
+                    matches!(d, Decision::Allow { tier: Tier::AskFirst, .. } | Decision::Reject(_)),
                     "{t:?} {f:?} {a:?} → {d:?}"
                 );
             }
-        }
-        if f.touches_core {
-            for d in &decisions {
+            // I16: below the floor, an administrator approves, or it is refused.
+            if f.below_security_floor {
+                assert!(
+                    matches!(
+                        d,
+                        Decision::Allow { tier: Tier::AskFirst, approver: ApproverClass::Administrator }
+                            | Decision::Reject(_)
+                    ),
+                    "{t:?} {f:?} {a:?} → {d:?}"
+                );
+            }
+            // An administrator class only comes with AskFirst.
+            if let Decision::Allow { tier, approver: ApproverClass::Administrator } = d {
+                assert_eq!(*tier, Tier::AskFirst);
+            }
+            if f.touches_core {
                 assert!(matches!(d, Decision::Reject(_)));
+            }
+            if matches!(a.actor, Actor::Agent(_) | Actor::Unattributed) {
+                assert_eq!(*d, Decision::Reject(RejectReason::Unauthorized));
             }
         }
     });
@@ -255,21 +303,17 @@ fn i14_actor_field_is_not_authority() {
     let st = state();
     let tb = tables();
     let settings = Settings::default();
-    let alice = Authorization {
-        caller: Actor::User { uid: 1000 },
-        admin: false,
-        local_session: true,
-        owns_affected_session: true,
-    };
+    let alice = user(1000, false, true, true);
     let mut f = facts(&[Sensitivity::Security], Disruption::None, Recovery::Revertible, 0, None);
-    f.caller = alice.caller.clone();
-    for claimed in [Actor::Daemon, Actor::User { uid: 0 }, Actor::Watchdog] {
-        let t = Transition::Suppress(Suppression {
+    f.caller = alice.actor.clone();
+    for claimed in [Actor::Daemon, Actor::user(0), Actor::Watchdog] {
+        let t = Transition::SetOverride(Override {
             unit: UnitId::service("sshd"),
             until: Until::Explicit,
             reason: String::new(),
             by: claimed,
-            stopped: false,
+            desired: OverrideDesired::LeaveAlone,
+            attribution: Attribution::Attested,
         });
         let d = decide(&Input {
             transition: &t,
@@ -283,7 +327,7 @@ fn i14_actor_field_is_not_authority() {
             locked: &vec![],
             revert_to: None,
         });
-        assert_eq!(d, Decision::Reject(RejectReason::Unauthorized));
+        assert_eq!(d, ask(ApproverClass::Administrator));
     }
 }
 
@@ -304,23 +348,18 @@ fn one(t: Transition, f: DerivedFacts, a: Authorization) -> Decision {
 
 #[test]
 fn catalog_policy_cases() {
-    let alice = Authorization {
-        caller: Actor::User { uid: 1000 },
-        admin: false,
-        local_session: true,
-        owns_affected_session: true,
-    };
-    let admin =
-        Authorization { caller: Actor::User { uid: 0 }, admin: true, local_session: true, owns_affected_session: true };
+    let alice = user(1000, false, true, true);
+    let admin = user(0, true, true, true);
     let routine = || facts(&[Sensitivity::Routine], Disruption::Brief, Recovery::Idempotent, 0, None);
 
-    // authz-unprivileged-suppress-security
-    let sup = Transition::Suppress(Suppression {
+    // authz-unprivileged-override-security: held for an administrator.
+    let sup = Transition::SetOverride(Override {
         unit: UnitId::service("sshd"),
         until: Until::Explicit,
         reason: String::new(),
         by: Actor::Daemon,
-        stopped: false,
+        desired: OverrideDesired::LeaveAlone,
+        attribution: Attribution::Attested,
     });
     assert_eq!(
         one(
@@ -328,15 +367,28 @@ fn catalog_policy_cases() {
             facts(&[Sensitivity::Security], Disruption::None, Recovery::Revertible, 0, None),
             alice.clone()
         ),
-        Decision::Reject(RejectReason::Unauthorized)
+        ask(ApproverClass::Administrator)
     );
-    // An admin may, but it is Security: AskFirst.
+    // An administrator may override a Security unit at Runtime (§11 table).
     assert_eq!(
         one(sup, facts(&[Sensitivity::Security], Disruption::None, Recovery::Revertible, 0, None), admin.clone()),
-        Decision::Allow(Tier::AskFirst)
+        at(Tier::Runtime)
+    );
+    // authz-unprivileged-stop-unauthorized: gym-db is neither Security nor user-controllable.
+    assert_eq!(
+        one(
+            Transition::StopAndSuppress {
+                unit: UnitId::service("gym-db"),
+                until: Until::NextBoot,
+                reason: String::new()
+            },
+            routine(),
+            alice.clone()
+        ),
+        Decision::Reject(RejectReason::Unauthorized)
     );
     // alice may suppress her own user unit.
-    let own = Transition::Suppress(Suppression {
+    let own = Transition::SetOverride(Override {
         unit: UnitId {
             kind: UnitKind::Service,
             name: "pipewire".into(),
@@ -345,9 +397,10 @@ fn catalog_policy_cases() {
         until: Until::Explicit,
         reason: String::new(),
         by: Actor::Daemon,
-        stopped: false,
+        desired: OverrideDesired::LeaveAlone,
+        attribution: Attribution::Attested,
     });
-    assert_eq!(one(own, routine(), alice.clone()), Decision::Allow(Tier::Runtime));
+    assert_eq!(one(own, routine(), alice.clone()), at(Tier::Runtime));
 
     // policy-daemon-session-drop-rebind
     let bind = Transition::BindDriver {
@@ -358,9 +411,9 @@ fn catalog_policy_cases() {
         one(
             bind,
             facts(&[Sensitivity::Routine], Disruption::SessionLoss, Recovery::Revertible, 0, None),
-            Authorization::daemon()
+            authorization_of(Actor::Daemon)
         ),
-        Decision::Allow(Tier::AskFirst)
+        ask(ApproverClass::AnyApprover)
     );
     // policy-daemon-wifi-runtime
     let wifi = Transition::SetRuntimeOption { path: "wifi.network".into(), value: Value::Str("gym-ap-b".into()) };
@@ -368,9 +421,9 @@ fn catalog_policy_cases() {
         one(
             wifi.clone(),
             facts(&[Sensitivity::Routine], Disruption::ConnectivityLoss, Recovery::Revertible, 0, None),
-            Authorization::daemon()
+            authorization_of(Actor::Daemon)
         ),
-        Decision::Allow(Tier::AskFirst)
+        ask(ApproverClass::AnyApprover)
     );
     // …but alice at her own laptop may switch her Wi-Fi at Runtime.
     assert_eq!(
@@ -379,7 +432,53 @@ fn catalog_policy_cases() {
             facts(&[Sensitivity::Routine], Disruption::ConnectivityLoss, Recovery::Revertible, 0, None),
             alice.clone()
         ),
-        Decision::Allow(Tier::Runtime)
+        at(Tier::Runtime)
+    );
+    // authz-ssh-not-local: the same from a session without a seat asks.
+    assert_eq!(
+        one(
+            Transition::SetRuntimeOption { path: "wifi.network".into(), value: Value::Str("gym-ap-b".into()) },
+            facts(&[Sensitivity::Routine], Disruption::ConnectivityLoss, Recovery::Revertible, 0, None),
+            user(1000, false, false, true)
+        ),
+        ask(ApproverClass::AnyApprover)
+    );
+    // authz-nonadmin-stops-network-other-session: another uid is online.
+    let net = Transition::StopAndSuppress {
+        unit: UnitId::service("pipewire"),
+        until: Until::NextBoot,
+        reason: String::new(),
+    };
+    assert_eq!(
+        one(
+            net.clone(),
+            facts(&[Sensitivity::Routine], Disruption::ConnectivityLoss, Recovery::Revertible, 32, None),
+            alice.clone()
+        ),
+        ask(ApproverClass::AnyApprover)
+    );
+    assert_eq!(
+        one(
+            net,
+            facts(&[Sensitivity::Routine], Disruption::ConnectivityLoss, Recovery::Revertible, 32, None),
+            admin.clone()
+        ),
+        at(Tier::Runtime)
+    );
+    // Own session is per session: alice dropping her own session s1 runs; another of hers asks.
+    let mut drop_s1 = facts(&[Sensitivity::Routine], Disruption::SessionLoss, Recovery::Revertible, 64, None);
+    let restart_pw = Transition::RestartUnit(UnitId::service("pipewire"));
+    assert_eq!(one(restart_pw.clone(), drop_s1.clone(), alice.clone()), at(Tier::Runtime));
+    drop_s1.affected_sessions = vec!["s2".into()];
+    assert_eq!(one(restart_pw, drop_s1, alice.clone()), ask(ApproverClass::AnyApprover));
+    // floor-revert-blocked / floor-manual-rollback-needs-admin: below the floor asks an administrator.
+    assert_eq!(
+        one(
+            Transition::Rollback,
+            facts(&[Sensitivity::Routine], Disruption::Brief, Recovery::Revertible, 16, None),
+            admin.clone()
+        ),
+        ask(ApproverClass::Administrator)
     );
 
     // manifest-weaken-via-proposal: no such catalog entry.
@@ -405,7 +504,7 @@ fn catalog_policy_cases() {
             facts(&[Sensitivity::Routine], Disruption::None, Recovery::Revertible, 0, Some("fonts.scale")),
             alice.clone()
         ),
-        Decision::Allow(Tier::Tested)
+        at(Tier::Tested)
     );
     // gen-disable-reenable-canonical: changing desired state is not tampering, but sshd is Security.
     let disable = Transition::ApplyChange { change: ChangeId("service-enable".into()), args: Default::default() };
@@ -421,7 +520,7 @@ fn catalog_policy_cases() {
             ),
             admin.clone()
         ),
-        Decision::Allow(Tier::AskFirst)
+        ask(ApproverClass::AnyApprover)
     );
     assert_eq!(one(disable, routine(), alice.clone()), Decision::Reject(RejectReason::Unauthorized));
     // Locked option.
@@ -436,16 +535,19 @@ fn catalog_policy_cases() {
 
     // Resolve: administrators only.
     let resolve = Transition::Resolve { txn: TxnId(1), resolution: Resolution::AsReverted };
-    assert_eq!(one(resolve.clone(), routine(), Authorization::daemon()), Decision::Reject(RejectReason::Unauthorized));
+    assert_eq!(
+        one(resolve.clone(), routine(), authorization_of(Actor::Daemon)),
+        Decision::Reject(RejectReason::Unauthorized)
+    );
     assert_eq!(one(resolve.clone(), routine(), alice), Decision::Reject(RejectReason::Unauthorized));
-    assert_eq!(one(resolve, routine(), admin.clone()), Decision::Allow(Tier::Runtime));
+    assert_eq!(one(resolve, routine(), admin.clone()), at(Tier::Runtime));
 
     // gen-bad-switch: a generation never live-tested asks.
     assert_eq!(
         one(Transition::SwitchGeneration(GenerationId(9)), routine(), admin.clone()),
-        Decision::Allow(Tier::AskFirst)
+        ask(ApproverClass::AnyApprover)
     );
-    assert_eq!(one(Transition::SwitchGeneration(GenerationId(5)), routine(), admin), Decision::Allow(Tier::Tested));
+    assert_eq!(one(Transition::SwitchGeneration(GenerationId(5)), routine(), admin), at(Tier::Tested));
 }
 
 #[test]
@@ -465,4 +567,36 @@ fn policy_version_ignores_list_order() {
     b.runtime_allowlist.reverse();
     b.runtime_allowlist.push(b.runtime_allowlist[0].clone());
     assert_eq!(policy_version(&a), policy_version(&b));
+}
+
+/// I19, executable: never one's own proposal; Administrator class needs one;
+/// no self-grant; non-users never approve.
+#[test]
+fn i19_approval_and_grants() {
+    let admin = user(0, true, true, true);
+    let other_admin = user(1001, true, true, true);
+    let alice = user(1000, false, true, true);
+    for class in [ApproverClass::AnyApprover, ApproverClass::Administrator] {
+        assert!(!may_approve(&admin, admin.principal, class), "own proposal");
+        assert!(may_approve(&admin, alice.principal, class));
+        assert!(!may_approve(&alice, admin.principal, class), "alice holds no Approve");
+        assert!(!may_approve(&authorization_of(Actor::Daemon), alice.principal, class));
+    }
+    let g = Grant {
+        to: other_admin.principal,
+        capability: Capability::Approve,
+        approved_by: admin.principal,
+        txn: TxnId(1),
+    };
+    assert!(may_grant(&admin, alice.principal, &g));
+    assert!(!may_grant(&other_admin, alice.principal, &g), "self-grant");
+    assert!(!may_grant(&admin, admin.principal, &g), "own proposal");
+    let merge = Grant { capability: Capability::Merge, ..g };
+    assert!(!may_grant(&admin, alice.principal, &merge), "cannot grant what it does not hold");
+}
+
+/// I17 in Phase A: root is always an administrator.
+#[test]
+fn i17_root_is_always_an_administrator() {
+    assert!(user_authorization(Actor::user(0), false).capabilities.administrator);
 }

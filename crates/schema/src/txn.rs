@@ -1,10 +1,12 @@
 //! Transactions, leases, approvals and incidents (§8).
 
 use crate::ids::{
-    GenerationId, Hash, IncidentId, JobId, Millis, PolicyVersion, SnapshotId, StorePath, Timestamp, TxnId,
+    GenerationId, Hash, IncidentId, JobId, Millis, PolicyVersion, PrincipalId, SnapshotId, StorePath, Timestamp, TxnId,
 };
 use crate::state::UnitStatus;
-use crate::transition::{ConfigDiff, DerivedFacts, DriverRef, Expectation, RecoveryStrategy, RejectReason, Transition};
+use crate::transition::{
+    ApproverClass, ConfigDiff, DerivedFacts, DriverRef, Expectation, RecoveryStrategy, RejectReason, Transition,
+};
 use crate::unit::{Actor, DesiredStatus, UnitId};
 use serde::{Deserialize, Serialize};
 use vstd::prelude::*;
@@ -22,6 +24,9 @@ pub enum TxnState {
     Checking,
     /// Boot entry written.
     Published,
+    /// A boot-only candidate published as a one-shot next-boot entry (§12f);
+    /// active for I6, confirmed or reverted at that boot.
+    AwaitingBoot,
     /// Override source promoted.
     Promoted,
     Committed,
@@ -230,6 +235,9 @@ pub struct ApprovalToken {
     /// policy version, cumulative-diff hash, derived facts, expected, revert_to,
     /// recovery strategy).
     pub bound_to: Hash,
+    /// Differs from the proposer and holds `class` (I19).
+    pub approver: PrincipalId,
+    pub class: ApproverClass,
     pub issued: Timestamp,
     pub expires: Timestamp,
     pub nonce: [u8; 16],
@@ -257,11 +265,22 @@ pub enum IncidentState {
     /// `until` is not in §8; without it the hold could not survive a restart.
     Escalated {
         until: Timestamp,
+        reason: EscalationReason,
     },
     Closed,
     Regressed {
         count: u8,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EscalationReason {
+    Regressed,
+    BudgetExhausted,
+    DiagnoserExhausted,
+    /// No eligible known-good generation above the security floor (§12e).
+    RevertBlockedByFloor,
+    RecoveryFailed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

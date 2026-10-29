@@ -58,6 +58,7 @@ fn user_units_follow_sessions_and_desktop_deadline() {
         class: "user".into(),
         seat: Some("seat0".into()),
         remote: false,
+        active: true,
         created,
     });
     // The compositor never reaches graphical-session.target.
@@ -87,6 +88,7 @@ fn user_units_follow_sessions_and_desktop_deadline() {
         class: "greeter".into(),
         seat: Some("seat0".into()),
         remote: false,
+        active: true,
         created,
     }];
     let (s, defs) = tick(&fake, &mut a);
@@ -127,6 +129,7 @@ fn unknown_session_creation_time_counts_from_first_sight() {
         class: "user".into(),
         seat: Some("seat0".into()),
         remote: false,
+        active: true,
         created: Timestamp(0),
     });
     let (s, defs) = tick(&fake, &mut a);

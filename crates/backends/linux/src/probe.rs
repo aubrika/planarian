@@ -142,6 +142,34 @@ pub fn exec(argv: &[String], sb: &ProbeSandbox, timeout: Duration) -> ProbeResul
     }
 }
 
+/// Calls `method` (`interface.Member`, no arguments) on `service` at `path` on
+/// the system bus; any reply passes. A missing name or an error reply fails.
+pub fn dbus(service: &str, path: &str, method: &str, timeout: Duration) -> ProbeResult {
+    let Some((iface, member)) = method.rsplit_once('.') else {
+        return ProbeResult::Error(format!("method {method:?} is not interface.Member"));
+    };
+    let secs = format!("--timeout={}ms", timeout.as_millis().max(1));
+    let argv = ["busctl", "--system", "--quiet", secs.as_str(), "call", service, path, iface, member];
+    let o = run_limited(&argv, timeout + Duration::from_secs(2), 4096);
+    if o.timed_out {
+        ProbeResult::Timeout
+    } else if o.ok() {
+        ProbeResult::Pass
+    } else if o.status.is_none() {
+        ProbeResult::Error(o.tail())
+    } else {
+        ProbeResult::Fail(o.tail())
+    }
+}
+
+pub fn file_present(path: &str) -> ProbeResult {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => ProbeResult::Pass,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ProbeResult::Fail(format!("{path}: absent")),
+        Err(e) => ProbeResult::Error(format!("{path}: {e}")),
+    }
+}
+
 pub fn free_space(path: &str, min_bytes: u64, min_permille: u16) -> ProbeResult {
     match rustix::fs::statvfs(path) {
         Ok(s) => {
@@ -167,6 +195,8 @@ fn run_one(p: &ProbeDef) -> ProbeResult {
         ProbeKind::Tcp { addr } => tcp(addr, timeout),
         ProbeKind::Http { url, status } => http(url, *status, timeout, bytes_max),
         ProbeKind::Exec { argv, sandbox } => exec(argv, sandbox, timeout),
+        ProbeKind::DBus { service, path, method } => dbus(service, path, method, timeout),
+        ProbeKind::FilePresent { path } => file_present(path),
         ProbeKind::FreeSpace { path, min_bytes, min_permille } => free_space(path, *min_bytes, *min_permille),
         ProbeKind::SystemdActive | ProbeKind::SessionTarget { .. } => {
             ProbeResult::Error("evaluated by state, not the probe backend".into())
@@ -190,6 +220,16 @@ impl ProbeBackend for Probes {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn file_present_passes_and_fails() {
+        let d = std::env::temp_dir().join(format!("planarian-fp-{}", std::process::id()));
+        let path = d.to_str().unwrap();
+        assert!(matches!(file_present(path), ProbeResult::Fail(_)));
+        std::fs::write(&d, b"").unwrap();
+        assert_eq!(file_present(path), ProbeResult::Pass);
+        std::fs::remove_file(&d).unwrap();
+    }
 
     #[test]
     fn url_and_status() {

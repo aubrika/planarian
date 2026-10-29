@@ -161,6 +161,9 @@ pub struct SessionInfo {
     pub seat: Option<String>,
     pub remote: bool,
     pub created: Timestamp,
+    /// logind `State=active`: the session in the foreground of its seat.
+    #[serde(default)]
+    pub active: bool,
 }
 
 impl SessionInfo {

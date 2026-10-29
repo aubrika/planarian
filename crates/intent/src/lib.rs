@@ -291,7 +291,7 @@ pub fn interpret(phrase: &str, idx: &Index, now: Timestamp) -> Interpretation {
             .or_else(|| p.strip_prefix("turn ").and_then(|r| r.strip_suffix(" on")).map(String::from));
     if let Some(obj) = start_again {
         matches.extend(unit_matches(&obj, idx, |id| {
-            (Transition::Unsuppress(id.clone()), format!("let {id} run again and repair it if needed"))
+            (Transition::LiftOverride(id.clone()), format!("let {id} run again and repair it if needed"))
         }));
     }
     for (pre, bigger) in [("make ", true), ("make ", false)] {

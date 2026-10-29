@@ -74,8 +74,8 @@ fn stopping_forms() {
         Transition::StopAndSuppress { until: Until::NextBoot, .. } => {}
         t => panic!("{t:?}"),
     }
-    assert_eq!(propose("start gym-web again"), Transition::Unsuppress(UnitId::service("gym-web")));
-    assert_eq!(propose("done with backups"), Transition::Unsuppress(backup.clone()));
+    assert_eq!(propose("start gym-web again"), Transition::LiftOverride(UnitId::service("gym-web")));
+    assert_eq!(propose("done with backups"), Transition::LiftOverride(backup.clone()));
     for phrase in ["stop gym-web", "turn sound off", "stop backups for 2 hours"] {
         assert!(matches!(propose(phrase), Transition::StopAndSuppress { .. }), "{phrase}");
     }

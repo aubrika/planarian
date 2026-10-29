@@ -4,8 +4,8 @@
 //! incident that changes is returned so the daemon can journal it.
 
 use planarian_schema::{
-    DesiredStatus, Incident, IncidentId, IncidentKind, IncidentState, Millis, Outcome, SystemState, Timestamp, TxnId,
-    UnitDefs, UnitId, UnitStatus,
+    DesiredStatus, EscalationReason, Incident, IncidentId, IncidentKind, IncidentState, Millis, Outcome, SystemState,
+    Timestamp, TxnId, UnitDefs, UnitId, UnitStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -134,7 +134,7 @@ impl Manager {
         // Holds that ended.
         for i in self.incidents.values_mut() {
             match i.state {
-                IncidentState::Cooldown { until } | IncidentState::Escalated { until } if now >= until => {
+                IncidentState::Cooldown { until } | IncidentState::Escalated { until, .. } if now >= until => {
                     i.state = IncidentState::Open;
                     i.budget_left = 1;
                     i.next_attempt = now;
@@ -149,7 +149,7 @@ impl Manager {
             let desired = def.desired.status;
             let active = self.active_id(id);
 
-            if status == UnitStatus::Suppressed || status == UnitStatus::NotExpected {
+            if matches!(status, UnitStatus::Overridden(_) | UnitStatus::NotExpected) {
                 // A suppression closes the incident (I13); so does a condition
                 // that stopped holding (logout, unplug).
                 if let Some(a) = active {
@@ -234,7 +234,10 @@ impl Manager {
                 };
                 let mut inc = self.open(id, IncidentKind::Repair, (desired, status), now, next_attempt, regressions);
                 if regressions >= ESCALATE_AT {
-                    inc.state = IncidentState::Escalated { until: now.plus(COOLDOWN_FIRST) };
+                    inc.state = IncidentState::Escalated {
+                        until: now.plus(COOLDOWN_FIRST),
+                        reason: EscalationReason::Regressed,
+                    };
                 } else if regressions > 0 {
                     inc.state = IncidentState::Regressed { count: regressions };
                 }
@@ -343,7 +346,15 @@ impl Manager {
         Some(i.clone())
     }
 
-    /// A human acted on the target (unsuppress, explicit request): lift any hold.
+    /// Hand the incident to a person, with why (§13): no autonomous action
+    /// until the hold ends or someone acts on the target.
+    pub fn escalate(&mut self, id: IncidentId, reason: EscalationReason, now: Timestamp) -> Option<Incident> {
+        let i = self.incidents.get_mut(&id)?;
+        i.state = IncidentState::Escalated { until: now.plus(COOLDOWN_LATER), reason };
+        Some(i.clone())
+    }
+
+    /// A human acted on the target (release, explicit request): lift any hold.
     pub fn human_acted(&mut self, target: &UnitId, now: Timestamp) -> Option<Incident> {
         let i = self.incidents.values_mut().find(|i| &i.target == target)?;
         i.state = IncidentState::Open;

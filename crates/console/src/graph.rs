@@ -79,7 +79,7 @@ fn health_color(s: &UnitStatus) -> Color {
         UnitStatus::Running | UnitStatus::Bound => Color::from_rgb8(0x2e, 0x9e, 0x4f),
         UnitStatus::Degraded(_) | UnitStatus::Transitioning => Color::from_rgb8(0xe0, 0x9a, 0x1a),
         UnitStatus::Failed(_) => Color::from_rgb8(0xc8, 0x32, 0x32),
-        UnitStatus::Suppressed => Color::from_rgb8(0x5a, 0x6f, 0xc0),
+        UnitStatus::Overridden(_) => Color::from_rgb8(0x5a, 0x6f, 0xc0),
         UnitStatus::Stopped | UnitStatus::Absent | UnitStatus::Detected => Color::from_rgb8(0x80, 0x80, 0x80),
         UnitStatus::Unknown | UnitStatus::NotExpected => Color::from_rgb8(0xb0, 0xb0, 0xb0),
     }

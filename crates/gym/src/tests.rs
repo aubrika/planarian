@@ -152,8 +152,8 @@ fn watchdog_committed_without_probing() {
 #[test]
 fn compaction_lost_state() {
     let (mut e, post) = passing("journal-compaction-preserves-state");
-    e.full_replay.as_mut().expect("compacted").suppressions.clear();
-    fails(&e, &post, "suppressions");
+    e.full_replay.as_mut().expect("compacted").overrides.clear();
+    fails(&e, &post, "overrides");
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn snapshot_checks() {
 #[test]
 fn hints_in_notices() {
     let (mut e, post) = passing("dep-required-stopped");
-    e.notices.retain(|n| !n.contains("planarian suppress"));
+    e.notices.retain(|n| !n.contains("planarian override"));
     fails(&e, &post, "OutOfBandStopHint");
 
     let (mut e, post) = passing("policy-daemon-session-drop-rebind");

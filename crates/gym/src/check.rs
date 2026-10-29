@@ -31,8 +31,8 @@ fn transition_name(t: &Transition) -> &'static str {
         Transition::RestoreSnapshot(_) => "RestoreSnapshot",
         Transition::CollectGarbage { .. } => "CollectGarbage",
         Transition::SetRuntimeOption { .. } => "SetRuntimeOption",
-        Transition::Suppress(_) => "Suppress",
-        Transition::Unsuppress(_) => "Unsuppress",
+        Transition::SetOverride(_) => "SetOverride",
+        Transition::LiftOverride(_) => "LiftOverride",
         Transition::StopAndSuppress { .. } => "StopAndSuppress",
         Transition::Resolve { .. } => "Resolve",
     }
@@ -40,10 +40,10 @@ fn transition_name(t: &Transition) -> &'static str {
 
 fn target_of(t: &Transition) -> Option<UnitId> {
     match t {
-        Transition::RestartUnit(u) | Transition::StopUnit(u) | Transition::Unsuppress(u) => Some(u.clone()),
+        Transition::RestartUnit(u) | Transition::StopUnit(u) | Transition::LiftOverride(u) => Some(u.clone()),
         Transition::BindDriver { device, .. } => Some(device.clone()),
         Transition::StopAndSuppress { unit, .. } => Some(unit.clone()),
-        Transition::Suppress(s) => Some(s.unit.clone()),
+        Transition::SetOverride(s) => Some(s.unit.clone()),
         _ => None,
     }
 }
@@ -200,7 +200,7 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     fail(&mut v, format!("interlock is {}", if set { "set" } else { "clear" }));
                 }
             }
-            "suppressions" => {
+            "overrides" => {
                 let want: Vec<(String, String)> = val
                     .as_array()
                     .into_iter()
@@ -213,7 +213,7 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     })
                     .collect();
                 let have: Vec<(String, String)> = ledger
-                    .suppressions
+                    .overrides
                     .iter()
                     .map(|s| {
                         (
@@ -229,9 +229,9 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                 if want != have {
                     fail(&mut v, format!("have {have:?}, want {want:?}"));
                 }
-                for (s, w) in ledger.suppressions.iter().zip(val.as_array().into_iter().flatten()) {
+                for (s, w) in ledger.overrides.iter().zip(val.as_array().into_iter().flatten()) {
                     if let Some(by) = w.get("by").and_then(T::as_str) {
-                        let ok = matches!(&s.by, Actor::User { uid } if format!("user:{uid}") == by);
+                        let ok = matches!(&s.by, Actor::User { uid, .. } if format!("user:{uid}") == by);
                         if !ok {
                             fail(&mut v, format!("{} suppressed by {:?}, want {by}", s.unit, s.by));
                         }
@@ -406,7 +406,7 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                             n.starts_with("service:external:") && n.contains("can't reach it")
                         }),
                         "OutOfBandStopHint" => {
-                            notices.contains("stopped, not crashed") && notices.contains("planarian suppress")
+                            notices.contains("stopped, not crashed") && notices.contains("planarian override")
                         }
                         "DisruptionSessionLoss" => notices.contains("end your graphical session"),
                         "BudgetUnsatisfiable" => notices.contains("BudgetUnsatisfiable"),
@@ -715,7 +715,7 @@ fn describe(f: &Effect) -> String {
     format!("{} (txn {} epoch {}, {}–{:?} ms)", f.call, f.txn.0, f.epoch, f.start.0, f.end.map(|t| t.0))
 }
 
-/// The journal position of `Suppression(<unit>)` or `<call>(<unit>)` (an
+/// The journal position of `Override(<unit>)` or `<call>(<unit>)` (an
 /// OpBegin whose call starts with `<call>` in a transaction on that unit).
 fn position(en: &[Entry], token: &str) -> Option<usize> {
     let (what, u) = token.strip_suffix(')')?.split_once('(')?;
@@ -726,9 +726,9 @@ fn position(en: &[Entry], token: &str) -> Option<usize> {
             on.insert(t.id, target_of(&t.transition));
             false
         }
-        Record::Suppressed(s) => what == "Suppression" && s.unit == id,
+        Record::OverrideSet(s) => what == "Override" && s.unit == id,
         Record::OpBegin { op, call } => {
-            what != "Suppression" && call.starts_with(what) && on.get(&op.txn).cloned().flatten() == Some(id.clone())
+            what != "Override" && call.starts_with(what) && on.get(&op.txn).cloned().flatten() == Some(id.clone())
         }
         _ => false,
     })
@@ -814,8 +814,21 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
     let t = matching.last().expect("non-empty");
     if let Some(want) = s("terminal") {
         let got = state_name(&t.state);
-        if got != want {
+        // "pending": still waiting for an approval at the end of the window.
+        let pending = want == "pending" && got == "Prepared";
+        if got != want && !pending {
             v.failures.push(format!("{label}: ended {got}"));
+        }
+    }
+    if let Some(want) = s("approver_class") {
+        let class = e.log.iter().find_map(|r| match (&r.result, &r.decision) {
+            (Submitted::Parked { txn, .. }, Some(Decision::Allow { approver, .. })) if *txn == t.id => Some(*approver),
+            _ => None,
+        });
+        match class {
+            Some(c) if format!("{c:?}") == want => {}
+            Some(c) => v.failures.push(format!("{label}: approver class {c:?}")),
+            None => v.failures.push(format!("{label}: never asked for approval")),
         }
     }
     if let Some(want) = s("terminal_prefix")

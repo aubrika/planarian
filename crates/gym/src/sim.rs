@@ -93,12 +93,30 @@ pub struct Sim {
     start_roots: std::collections::BTreeSet<String>,
 }
 
+/// `root`, `user:<uid>` or `user:<uid>@<session>`; user:1001 is the gym's administrator.
 pub fn peer(actor: &str) -> Peer {
-    match actor {
-        "root" => Peer { uid: 0, admin: true },
-        "user:1001" => Peer { uid: 1001, admin: true },
-        a => Peer { uid: a.strip_prefix("user:").and_then(|u| u.parse().ok()).unwrap_or(1000), admin: false },
+    let (who, session) = match actor.split_once('@') {
+        Some((w, s)) => (w, Some(s)),
+        None => (actor, None),
+    };
+    let p = match who {
+        "root" => Peer::new(0, true),
+        "user:1001" => Peer::new(1001, true),
+        a => Peer::new(a.strip_prefix("user:").and_then(|u| u.parse().ok()).unwrap_or(1000), false),
+    };
+    match session {
+        Some(s) => p.in_session(s),
+        None => p,
     }
+}
+
+/// The authorization the daemon would compute for `actor` on the gym's seat:
+/// a local, active session (`gym` unless the actor names one).
+fn gym_authz(actor: &str) -> planarian_schema::Authorization {
+    let pe = peer(actor);
+    let session = pe.session.clone().unwrap_or_else(|| "gym".into());
+    let a = Actor::User { uid: pe.uid, session: Some(session), seat: Some("seat0".into()), active: true };
+    planarian_policy::user_authorization(a, pe.admin)
 }
 
 /// "90s", "5m", "24h1m"; "stale_after" means a probe's staleness window (30 s
@@ -373,7 +391,8 @@ impl Sim {
                     known_good: l.known_good.unwrap_or(g),
                     live_tested: l.live_tested,
                     accepted_baseline: l.accepted_baseline,
-                    suppressions: l.suppressions.clone(),
+                    security_floor: l.security_floor,
+                    overrides: l.overrides.clone(),
                     core_hash: Hash::ZERO,
                 };
                 let s = a.observe(&self.fake, &ctx);
@@ -715,6 +734,7 @@ impl Sim {
                     class: "user".into(),
                     seat: Some("seat0".into()),
                     remote: false,
+                    active: true,
                     created: now,
                 });
                 let sim = planarian_fake::UnitSim::active(now);
@@ -897,7 +917,16 @@ impl Sim {
     fn cli(&self, argv: &[String]) -> Result<Request, Unsupported> {
         let a: Vec<&str> = argv.iter().map(String::as_str).collect();
         Ok(match a.as_slice() {
-            ["suppress", u] => Request::Suppress { unit: unit(u), until: Until::Explicit },
+            ["override", u] => Request::SetOverride {
+                unit: unit(u),
+                until: Until::Explicit,
+                desired: planarian_schema::OverrideDesired::LeaveAlone,
+            },
+            ["override", u, "--stop" | "--stopped"] => Request::SetOverride {
+                unit: unit(u),
+                until: Until::Explicit,
+                desired: planarian_schema::OverrideDesired::Stopped,
+            },
             ["stop", u] => Request::Stop { unit: unit(u) },
             ["resolve", _, how] => {
                 let l = self.ledger();
@@ -937,12 +966,7 @@ impl Sim {
                 let observed = if s.get("observed").is_some() { Hash::ZERO } else { st.digest() };
                 let p = Proposal { observed, expected, transition: t, reason: "gym".into(), source: Source::User };
                 let pe = peer(actor);
-                let authz = planarian_policy::Authorization {
-                    caller: Actor::User { uid: pe.uid },
-                    admin: pe.admin,
-                    local_session: true,
-                    owns_affected_session: true,
-                };
+                let authz = gym_authz(actor);
                 let policy = core.ex.policy_version();
                 let r = core.ex.submit(p.clone(), authz, &st, &defs);
                 let (facts, decision) = core.ex.last.clone().unzip();
@@ -950,7 +974,7 @@ impl Sim {
                 self.log.push(planarian_daemon::LogRecord {
                     at: now,
                     proposal: p,
-                    caller: Actor::User { uid: pe.uid },
+                    caller: Actor::user(pe.uid),
                     pre_digest: st.digest(),
                     policy,
                     result: r,
@@ -975,7 +999,11 @@ impl Sim {
                 let driver = DriverRef { name: get("driver"), module: None };
                 return self.direct(actor, Transition::BindDriver { device, driver });
             }
-            "Suppress" => Request::Suppress { unit: unit(&get("unit")), until: Until::Explicit },
+            "SetOverride" => Request::SetOverride {
+                unit: unit(&get("unit")),
+                until: Until::Explicit,
+                desired: planarian_schema::OverrideDesired::LeaveAlone,
+            },
             other => return Err(Unsupported(format!("transition {other}"))),
         };
         self.request(actor, req)
@@ -995,12 +1023,7 @@ impl Sim {
             source: Source::User,
         };
         let pe = peer(actor);
-        let authz = planarian_policy::Authorization {
-            caller: Actor::User { uid: pe.uid },
-            admin: pe.admin,
-            local_session: true,
-            owns_affected_session: true,
-        };
+        let authz = gym_authz(actor);
         let policy = core.ex.policy_version();
         let r = core.ex.submit(p.clone(), authz, &st, &defs);
         let (facts, decision) = core.ex.last.clone().unzip();
@@ -1012,7 +1035,7 @@ impl Sim {
         self.log.push(planarian_daemon::LogRecord {
             at: now,
             proposal: p,
-            caller: Actor::User { uid: pe.uid },
+            caller: Actor::user(pe.uid),
             pre_digest: st.digest(),
             policy,
             result: r,

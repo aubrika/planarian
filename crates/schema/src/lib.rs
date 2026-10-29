@@ -7,6 +7,7 @@
 // rather than `matches!` and let-chains.
 #![allow(clippy::ptr_arg, clippy::match_like_matches_macro, clippy::collapsible_if)]
 
+pub mod authz;
 pub mod backend;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
@@ -19,6 +20,7 @@ pub mod transition;
 pub mod txn;
 pub mod unit;
 
+pub use authz::*;
 pub use backend::*;
 pub use ids::*;
 pub use pathmap::PathMap;

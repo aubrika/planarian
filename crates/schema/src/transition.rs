@@ -3,7 +3,7 @@
 use crate::ids::{ChangeId, GenerationId, Hash, IncidentId, Millis, ModelId, SnapshotId, StorePath, TxnId};
 use crate::pathmap::PathMap;
 use crate::state::{SystemState, UnitStatus};
-use crate::unit::{Actor, Disruption, Recovery, Sensitivities, Suppression, UnitDefs, UnitId, Until};
+use crate::unit::{Actor, Disruption, Override, Recovery, Sensitivities, UnitDefs, UnitId, Until};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use vstd::prelude::*;
@@ -89,8 +89,8 @@ pub enum Transition {
         value: Value,
     },
     /// Leave-alone only; does not stop anything.
-    Suppress(Suppression),
-    Unsuppress(UnitId),
+    SetOverride(Override),
+    LiftOverride(UnitId),
     /// The user's "stop X": suppression journaled, then stop.
     StopAndSuppress {
         unit: UnitId,
@@ -120,8 +120,20 @@ pub enum Tier {
 #[derive(Serialize, Deserialize)]
 #[verifier::external_derive]
 pub enum Decision {
-    Allow(Tier),
+    Allow { tier: Tier, approver: ApproverClass },
     Reject(RejectReason),
+}
+
+/// Who may approve an AskFirst decision. The class is the maximum over every
+/// floor and table row that raised the decision; it is ignored below AskFirst.
+/// `Administrator` requires the approver to hold `Capability::Administrator`
+/// as well as `Capability::Approve`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum ApproverClass {
+    AnyApprover,
+    Administrator,
 }
 
 /// `Unauthorized`, `Interrupted` and `NoSpace` are used by §11, §12 and §12c
@@ -162,6 +174,17 @@ pub struct DerivedFacts {
     /// Not tampering (§9; missing from §8, G2).
     pub changes_desired: bool,
     pub touches_core: bool,
+    /// The target generation (revert, rollback, switch) is below the security floor (§12e).
+    #[serde(default)]
+    pub below_security_floor: bool,
+    /// A system-scope effect reaches another uid's online or active session (§11).
+    #[serde(default)]
+    pub other_sessions_affected: bool,
+    /// Logind sessions the transition's disruption lands on, sorted. The
+    /// "own session" floor (§11) holds only when this is exactly the caller's
+    /// session; empty means not known, which never counts as own. Not in §8.
+    #[serde(default)]
+    pub affected_sessions: Vec<String>,
     pub caller: Actor,
     pub config_diff: Option<ConfigDiff>,
 }
@@ -217,7 +240,7 @@ impl Transition {
             Transition::RestartUnit(_) | Transition::StopUnit(_) | Transition::SetRuntimeOption { .. } => {
                 Handler::UnitOp
             },
-            Transition::Suppress(_) | Transition::Unsuppress(_) | Transition::StopAndSuppress { .. }
+            Transition::SetOverride(_) | Transition::LiftOverride(_) | Transition::StopAndSuppress { .. }
             | Transition::Resolve { .. } => Handler::IntentOp,
             Transition::CollectGarbage { .. } => Handler::GcOp,
             Transition::ApplyChange { .. } | Transition::SwitchGeneration(_) | Transition::Revert { .. }
@@ -249,7 +272,7 @@ impl Transition {
             Transition::RestartUnit(_) | Transition::StopUnit(_) | Transition::SetRuntimeOption { .. } => {
                 Handler::UnitOp
             },
-            Transition::Suppress(_) | Transition::Unsuppress(_) | Transition::StopAndSuppress { .. }
+            Transition::SetOverride(_) | Transition::LiftOverride(_) | Transition::StopAndSuppress { .. }
             | Transition::Resolve { .. } => Handler::IntentOp,
             Transition::CollectGarbage { .. } => Handler::GcOp,
             Transition::ApplyChange { .. } | Transition::SwitchGeneration(_) | Transition::Revert { .. }

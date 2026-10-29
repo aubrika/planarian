@@ -1,7 +1,8 @@
 # Planarian — Phase A fault catalog
 #
 # First deliverable per SPEC §18.0. Status: DRAFT FOR OWNER REVIEW.
-# Spec revision: v4.3. Review notes, coverage matrix and open questions:
+# Spec revision: v4.4 (v4.4 renames applied; v4.4 cases join as they are
+# implemented, from phase-a-v4.4-draft.toml). Review notes, coverage matrix and open questions:
 # docs/catalog-review.md.
 #
 # ───────────────────────────────────────────────────────────────────────────
@@ -35,7 +36,7 @@
 #   boot_default, override_source, known_good, live_tested   generation-level state
 #   journal_agrees      running generation, boot default, override source and the
 #                       journal's terminal state all describe the same outcome
-#   suppressions        suppressions that must hold at the end
+#   overrides        overrides that must hold at the end
 #   no_txn_on           no transaction (any source) targets these units
 #   no_autonomous_txn   no transaction from a non-user source after setup
 #   no_incident_on      no incident opened for these units
@@ -59,7 +60,7 @@
 # ───────────────────────────────────────────────────────────────────────────
 #
 #   * Gamed success fails the run (§15): any transaction that changes a probe
-#     definition; StopUnit on an incident target; a Suppression whose `by` is not
+#     definition; StopUnit on an incident target; a Override whose `by` is not
 #     a User; a Diagnostic probe result that changed a UnitStatus.
 #   * I5, I6, I7, I12, I13, I14, I15 are monitored for the whole window.
 #   * RecoveryFailed count must be 0 unless the entry asserts interlock = "set".
@@ -129,7 +130,7 @@
 # ───────────────────────────────────────────────────────────────────────────
 
 schema_version = 1
-spec = "v4.3"
+spec = "v4.4"
 
 [[fixture]]
 unit = "service:gym-web"
@@ -987,7 +988,7 @@ owner = "watchdog"
 [[fault]]
 id = "crash-stop-and-suppress"
 family = "daemon-killed"
-summary = "Killed during a user's StopAndSuppress. It recovers as a unit operation: the suppression (journaled before the stop) holds, the unit is not restarted, and no generation rollback is attempted."
+summary = "Killed during a user's StopAndSuppress. It recovers as a unit operation: the override (journaled before the stop) holds, the unit is not restarted, and no generation rollback is attempted."
 spec = ["§12 execution table", "§14 stopping"]
 tags = []
 scoring = "must-pass"
@@ -999,8 +1000,8 @@ after = [{ raw = "hold_down", process = "planariad" }]
 window = "10m"
 
 [fault.required_post]
-units = { "service:gym-web" = "Suppressed" }
-suppressions = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
 generation = "base"
 
 [[fault.required_post.txn]]
@@ -1265,7 +1266,7 @@ terminal = "Committed"
 [[fault]]
 id = "intent-user-stops-service"
 family = "intentional-service-stop"
-summary = "An admin asks to stop gym-web until they say otherwise. It stays stopped. The suppression is journaled before the stop, so there is no window in which a repair can race it."
+summary = "An admin asks to stop gym-web until they say otherwise. It stays stopped. The override is journaled before the stop, so there is no window in which a repair can race it."
 spec = ["§14 stopping", "I13", "§15 v4-review"]
 tags = ["acceptance"]
 scoring = "intent"
@@ -1276,10 +1277,10 @@ inject = { raw = "wait", for = "10m" }
 window = "10m"
 
 [fault.required_post]
-units = { "service:gym-web" = "Suppressed" }
-suppressions = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
 no_autonomous_txn = true
-journal_order = ["Suppression(service:gym-web)", "stop(service:gym-web)"]
+journal_order = ["Override(service:gym-web)", "stop(service:gym-web)"]
 
 [[fault.required_post.txn]]
 transition = "StopAndSuppress"
@@ -1300,15 +1301,15 @@ inject = { raw = "wait", for = "5m" }
 window = "5m"
 
 [fault.required_post]
-units = { "service:gym-web" = "Suppressed" }
-suppressions = [{ unit = "service:gym-web", until = "NextBoot", by = "user:1001" }]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", until = "NextBoot", by = "user:1001" }]
 no_autonomous_txn = true
 reports = ["StopRewrittenNotice"]
 
 [[fault]]
 id = "intent-start-again-repairs"
 family = "intentional-service-stop"
-summary = "After a user stop, \"start gym-web again\" lifts the suppression, and the unit is desired Running again and repaired."
+summary = "After a user stop, \"start gym-web again\" lifts the override, and the unit is desired Running again and repaired."
 spec = ["§14 stopping"]
 tags = []
 scoring = "repair"
@@ -1323,49 +1324,50 @@ window = "5m"
 
 [fault.required_post]
 units = { "service:gym-web" = "Running" }
-suppressions = []
+overrides = []
 
 [[fault.required_post.txn]]
-transition = "Unsuppress"
+transition = "LiftOverride"
 target = "service:gym-web"
 terminal = "Committed"
 
 [[fault]]
-id = "authz-unprivileged-suppress-security"
+id = "authz-unprivileged-override-security"
 family = "intentional-service-stop"
-summary = "alice (unprivileged) tries to suppress sshd, a system Security unit, and is rejected as Unauthorized."
+summary = "alice tries to override sshd, a system Security unit. It is held as AskFirst for an administrator; sshd stays up meanwhile."
 spec = ["§11 authorization", "§15 v4-review"]
 tags = ["acceptance"]
 scoring = "must-pass"
 harness = ["fake", "vm"]
 intent = { kind = "none" }
-inject = { raw = "cli", argv = ["suppress", "service:sshd"], actor = "user:1000" }
+inject = { raw = "cli", argv = ["override", "service:sshd", "--stop"], actor = "user:1000" }
 window = "1m"
 
 [fault.required_post]
 units = { "service:sshd" = "Running" }
-suppressions = []
-reports = ["Unauthorized"]
+overrides = []
 
 [[fault.required_post.txn]]
-transition = "Suppress"
-decision = "Reject(Unauthorized)"
+transition = "SetOverride"
+decision = "Allow(AskFirst)"
+approver_class = "Administrator"
+terminal = "pending"
 
 [[fault]]
 id = "authz-forged-actor-overwritten"
 family = "intentional-service-stop"
-summary = "alice submits a Suppress for her own pipewire with by = Daemon. SO_PEERCRED overwrites the actor to user:1000; the suppression is allowed and attributed to her."
+summary = "alice submits a SetOverride for her own pipewire with by = Daemon. SO_PEERCRED overwrites the actor to user:1000; the override is allowed and attributed to her."
 spec = ["§11 caller identity", "I14"]
 tags = ["extra"]
 scoring = "must-pass"
 harness = ["fake", "vm"]
 intent = { kind = "none" }
 setup = [{ raw = "greeter_login", uid = 1000 }]
-inject = { transition = "Suppress", unit = "service@1000:pipewire", until = "Explicit", reason = "test", by = "daemon", source = "user", actor = "user:1000" }
+inject = { transition = "SetOverride", unit = "service@1000:pipewire", until = "Explicit", reason = "test", by = "daemon", source = "user", actor = "user:1000" }
 window = "1m"
 
 [fault.required_post]
-suppressions = [{ unit = "service@1000:pipewire", until = "Explicit", by = "user:1000" }]
+overrides = [{ unit = "service@1000:pipewire", until = "Explicit", by = "user:1000" }]
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Family: suspend-resume
@@ -1663,7 +1665,7 @@ terminal = "Reverted"
 [[fault]]
 id = "journal-compaction-preserves-state"
 family = "storage-full"
-summary = "Compaction is forced while an Explicit suppression is live and an incident's budget is exhausted, then both processes crash and restart. Both survive, and replay from checkpoint plus tail equals replay from full history."
+summary = "Compaction is forced while an Explicit override is live and an incident's budget is exhausted, then both processes crash and restart. Both survive, and replay from checkpoint plus tail equals replay from full history."
 spec = ["§12c checkpoint"]
 tags = []
 scoring = "must-pass"
@@ -1682,7 +1684,7 @@ after = [
 window = "10m"
 
 [fault.required_post]
-suppressions = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
+overrides = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
 replay_equivalent = true
 
 [[fault.required_post.incident]]

@@ -1,7 +1,7 @@
 //! Observed state, derived status, and the state digest (§8).
 
 use crate::ids::{GenerationId, Hash, ProbeId, Timestamp};
-use crate::unit::{Condition, Evidence, ProbeResult, ProbeRole, Suppression, UnitDefs, UnitId, UnitKind};
+use crate::unit::{Condition, Evidence, Override, OverrideDesired, ProbeResult, ProbeRole, UnitDefs, UnitId, UnitKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,7 +40,7 @@ pub enum UnitStatus {
     Running,
     Degraded(Vec<ProbeId>),
     Stopped,
-    Suppressed,
+    Overridden(OverrideDesired),
     Unknown,
     Failed(Reason),
     Absent,
@@ -68,8 +68,11 @@ pub struct SystemState {
     pub live_tested: Option<GenerationId>,
     /// Set by `mark-good --accept-unconfirmed`; never replaces `known_good` in the boot menu (§16, G3).
     pub accepted_baseline: Option<GenerationId>,
+    /// §12e: derived when a generation commits, never set by a proposal.
+    #[serde(default)]
+    pub security_floor: Option<GenerationId>,
     pub units: BTreeMap<UnitId, (Observed, Vec<Evidence>)>,
-    pub suppressions: Vec<Suppression>,
+    pub overrides: Vec<Override>,
     /// Atomic conditions that currently hold.
     pub conditions: BTreeSet<Condition>,
     /// Excluded from the digest.
@@ -80,15 +83,20 @@ pub struct SystemState {
 }
 
 impl SystemState {
-    pub fn suppressed(&self, id: &UnitId) -> bool {
-        self.suppressions.iter().any(|s| &s.unit == id && s.holds_at(self.observed_at))
+    /// The override holding `id` right now, if any.
+    pub fn override_of(&self, id: &UnitId) -> Option<&Override> {
+        self.overrides.iter().find(|s| &s.unit == id && s.holds_at(self.observed_at))
+    }
+
+    pub fn overridden(&self, id: &UnitId) -> bool {
+        self.override_of(id).is_some()
     }
 
     /// Whether the unit is expected to be in its desired status right now:
-    /// it is defined, its desired condition holds, and it is not suppressed.
+    /// it is defined, its desired condition holds, and no override holds it.
     pub fn expected(&self, id: &UnitId, defs: &UnitDefs) -> bool {
         match defs.get(id) {
-            Some(def) => !self.suppressed(id) && def.desired.when.holds(&self.conditions),
+            Some(def) => !self.overridden(id) && def.desired.when.holds(&self.conditions),
             None => false,
         }
     }
@@ -114,12 +122,12 @@ impl SystemState {
     }
 
     /// Status derivation, in the order §8 gives:
-    /// Suppressed; not expected; definite Failed; Unknown on stale or timed-out
+    /// Overridden; not expected; definite Failed; Unknown on stale or timed-out
     /// Readiness evidence; Running / Degraded from Active; otherwise from `Observed`.
     /// Diagnostic probes never affect the result.
     pub fn status(&self, id: &UnitId, defs: &UnitDefs) -> UnitStatus {
-        if self.suppressed(id) {
-            return UnitStatus::Suppressed;
+        if let Some(o) = self.override_of(id) {
+            return UnitStatus::Overridden(o.desired);
         }
         let Some(def) = defs.get(id) else {
             return UnitStatus::NotExpected;
@@ -165,7 +173,7 @@ impl SystemState {
     /// Hash of everything that describes the system's state, excluding
     /// `resources` and all observation timestamps (`observed_at`, `Evidence::at`,
     /// `Unknown::since`, `Transitioning::since`). Two observations of an unchanged
-    /// system therefore have the same digest. Suppression deadlines (`Until::At`)
+    /// system therefore have the same digest. Override deadlines (`Until::At`)
     /// are desired-state data and are included.
     pub fn digest(&self) -> Hash {
         let view = DigestView {
@@ -182,8 +190,8 @@ impl SystemState {
                     (id, ObservedView::of(obs), results)
                 })
                 .collect(),
-            suppressions: {
-                let mut s: Vec<&Suppression> = self.suppressions.iter().collect();
+            overrides: {
+                let mut s: Vec<&Override> = self.overrides.iter().collect();
                 s.sort();
                 s
             },
@@ -203,7 +211,7 @@ struct DigestView<'a> {
     live_tested: Option<GenerationId>,
     accepted_baseline: Option<GenerationId>,
     units: Vec<UnitView<'a>>,
-    suppressions: Vec<&'a Suppression>,
+    overrides: Vec<&'a Override>,
     conditions: &'a BTreeSet<Condition>,
     core_hash: Hash,
 }
@@ -280,8 +288,9 @@ mod tests {
             known_good: GenerationId(1),
             live_tested: None,
             accepted_baseline: None,
+            security_floor: None,
             units: BTreeMap::new(),
-            suppressions: vec![],
+            overrides: vec![],
             conditions: BTreeSet::new(),
             resources: Resources::default(),
             core_hash: Hash::ZERO,
@@ -352,14 +361,15 @@ mod tests {
         s.conditions.insert(Condition::SessionEstablished { uid: Some(1000) });
         assert_eq!(s.status(&id, &defs), UnitStatus::Stopped);
         assert!(s.expected(&id, &defs));
-        s.suppressions.push(Suppression {
+        s.overrides.push(Override {
             unit: id.clone(),
             until: Until::At(Timestamp(200_000)),
             reason: String::new(),
-            by: Actor::User { uid: 1000 },
-            stopped: false,
+            by: Actor::user(1000),
+            desired: OverrideDesired::LeaveAlone,
+            attribution: Attribution::Attested,
         });
-        assert_eq!(s.status(&id, &defs), UnitStatus::Suppressed);
+        assert_eq!(s.status(&id, &defs), UnitStatus::Overridden(OverrideDesired::LeaveAlone));
         s.observed_at = Timestamp(200_000);
         assert_eq!(s.status(&id, &defs), UnitStatus::Stopped);
     }
@@ -455,12 +465,13 @@ mod tests {
                 t.generation = GenerationId(s.generation.0 + 10);
                 prop_assert_ne!(s.digest(), t.digest());
                 let mut u = s.clone();
-                u.suppressions.push(Suppression {
+                u.overrides.push(Override {
                     unit: UnitId::service("z"),
                     until: Until::Explicit,
                     reason: String::new(),
                     by: Actor::Daemon,
-                    stopped: false,
+                    desired: OverrideDesired::LeaveAlone,
+                    attribution: Attribution::Attested,
                 });
                 prop_assert_ne!(s.digest(), u.digest());
                 if let Some((id, (old, ev))) = s.units.iter().next() {

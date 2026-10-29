@@ -119,6 +119,9 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         touches_canonical_probe: false,
         changes_desired: false,
         touches_core: false,
+        below_security_floor: false,
+        other_sessions_affected: false,
+        affected_sessions: Vec::new(),
         caller: i.caller.clone(),
         config_diff: None,
     };
@@ -135,12 +138,12 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         Transition::StopUnit(u) | Transition::StopAndSuppress { unit: u, .. } => {
             unit_op(&mut f, u, Recovery::Revertible)
         }
-        Transition::Suppress(s) => {
+        Transition::SetOverride(s) => {
             unit_op(&mut f, &s.unit, Recovery::Idempotent);
             f.affected_units = vec![s.unit.clone()];
             f.disruption = Disruption::None;
         }
-        Transition::Unsuppress(u) => {
+        Transition::LiftOverride(u) => {
             unit_op(&mut f, u, Recovery::Idempotent);
             f.affected_units = vec![u.clone()];
             f.disruption = Disruption::None;

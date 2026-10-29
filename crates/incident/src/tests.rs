@@ -146,12 +146,13 @@ fn suppression_closes_and_is_never_a_target() {
     sim.fail("gym-web");
     sim.ticks(2);
     assert!(sim.active("gym-web").is_some());
-    sim.s.suppressions.push(Suppression {
+    sim.s.overrides.push(Override {
         unit: UnitId::service("gym-web"),
         until: Until::Explicit,
         reason: String::new(),
-        by: Actor::User { uid: 1000 },
-        stopped: false,
+        by: Actor::user(1000),
+        desired: OverrideDesired::LeaveAlone,
+        attribution: Attribution::Attested,
     });
     sim.ticks(3);
     assert!(sim.active("gym-web").is_none());

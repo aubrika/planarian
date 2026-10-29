@@ -55,9 +55,9 @@ pub fn describe(req: &Request) -> String {
 impl Snapshot {
     /// One observation: the console report carries the status report.
     pub fn take<B: Backends + Clone, S: Store>(core: &mut Core<B, S>) -> Option<Snapshot> {
-        let me = Peer { uid: 0, admin: false };
-        let Response::Console(console) = core.handle(me, Request::Console) else { return None };
-        let Response::Incidents { incidents } = core.handle(me, Request::Incidents) else { return None };
+        let me = Peer::new(0, false);
+        let Response::Console(console) = core.handle(me.clone(), Request::Console) else { return None };
+        let Response::Incidents { incidents } = core.handle(me.clone(), Request::Incidents) else { return None };
         let Response::Log { lines } = core.handle(me, Request::Log { limit: LOG_LINES }) else { return None };
         Some(Snapshot { console: *console, incidents, log: lines })
     }

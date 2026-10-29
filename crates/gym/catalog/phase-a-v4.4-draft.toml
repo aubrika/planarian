@@ -324,30 +324,6 @@ path = ["AwaitingBoot", "Reverted"]
 # Family: authorization (§11)
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Replaces phase-a.toml's authz-unprivileged-suppress-security (v4.3 rejected
-# it; v4.4 holds it for an administrator).
-[[fault]]
-id = "authz-unprivileged-override-security"
-family = "intentional-service-stop"
-summary = "alice tries to override sshd, a system Security unit. It is held as AskFirst for an administrator; sshd stays up meanwhile."
-spec = ["§11 authorization", "§15 v4-review"]
-tags = ["acceptance", "replaces:authz-unprivileged-suppress-security"]
-scoring = "must-pass"
-harness = ["fake", "vm"]
-intent = { kind = "none" }
-inject = { raw = "cli", argv = ["override", "service:sshd", "--stop"], actor = "user:1000" }
-window = "1m"
-
-[fault.required_post]
-units = { "service:sshd" = "Running" }
-overrides = []
-
-[[fault.required_post.txn]]
-transition = "SetOverride"
-decision = "Allow(AskFirst)"
-approver_class = "Administrator"
-terminal = "pending"
-
 [[fault]]
 id = "authz-user-overrides-firewall"
 family = "intentional-service-stop"

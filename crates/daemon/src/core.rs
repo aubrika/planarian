@@ -20,7 +20,7 @@ use planarian_intent::{self as intent, Interpretation};
 use planarian_ipc::{
     Choice, ConsoleReport, GraphEdge, GraphNode, LogLine, Pending, Request, Response, StatusReport, TxnSummary, UnitRow,
 };
-use planarian_policy::Authorization;
+use planarian_policy::{authorization_of, user_authorization};
 use planarian_schema::spec::predict;
 use planarian_schema::*;
 use planarian_state::{Assembler, Context};
@@ -41,18 +41,31 @@ pub struct CoreConfig {
     pub exec: ExecConfig,
     /// Keywords and steps for "make X bigger" (§14).
     pub runtime_options: Vec<intent::RuntimeOption>,
-    /// The first start of the daemon on this boot (NextBoot suppressions end).
+    /// The first start of the daemon on this boot (NextBoot overrides end).
     pub fresh_boot: bool,
     /// The default startup grace (units may set their own).
     pub startup_grace: Millis,
 }
 
-/// The caller of a request, from `SO_PEERCRED` and group membership.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The caller of a request, from `SO_PEERCRED`, group membership and logind.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
     pub uid: u32,
     /// Root, or a member of `planarian-admin`.
     pub admin: bool,
+    /// The logind session of the calling process (`sd_pid_get_session`), if any.
+    pub session: Option<String>,
+}
+
+impl Peer {
+    pub const fn new(uid: u32, admin: bool) -> Peer {
+        Peer { uid, admin, session: None }
+    }
+
+    pub fn in_session(mut self, session: &str) -> Peer {
+        self.session = Some(session.into());
+        self
+    }
 }
 
 /// The executor log (I7): one record per submitted proposal.
@@ -217,8 +230,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             deferred: None,
         };
         if core.cfg.fresh_boot {
-            for s in ledger.suppressions.iter().filter(|s| s.until == Until::NextBoot) {
-                core.journal(Record::Unsuppressed(s.unit.clone()));
+            for s in ledger.overrides.iter().filter(|s| s.until == Until::NextBoot) {
+                core.journal(Record::OverrideLifted(s.unit.clone()));
             }
         }
         if let Some(r) = &ledger.last_reconciliation {
@@ -266,7 +279,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             known_good: l.known_good.unwrap_or(current),
             live_tested: l.live_tested,
             accepted_baseline: l.accepted_baseline,
-            suppressions: l.suppressions.iter().filter(|s| s.holds_at(now)).cloned().collect(),
+            overrides: l.overrides.iter().filter(|s| s.holds_at(now)).cloned().collect(),
+            security_floor: l.security_floor,
             core_hash: Hash::ZERO,
         }
     }
@@ -329,7 +343,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let now = self.b.clock().now();
         let pre = s.digest();
         let policy = self.ex.policy_version();
-        let caller = authz.caller.clone();
+        let caller = authz.actor.clone();
         let mut result = self.ex.submit(p.clone(), authz.clone(), s, defs);
         if let (Transition::RestartUnit(u), Submitted::Finished { .. }) = (&p.transition, &result) {
             self.incidents.started(u, now);
@@ -587,7 +601,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             plan.max_bytes
         );
         let p = self.proposal(Transition::CollectGarbage { emergency: false }, s, defs, Source::Maintenance, reason);
-        let _ = self.submit(p, Authorization::daemon(), s, defs);
+        let _ = self.submit(p, authorization_of(Actor::Daemon), s, defs);
     }
 
     fn repair_one(&mut self, s: &SystemState, defs: &UnitDefs, l: &Ledger) {
@@ -661,7 +675,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     && s.status(&c.target, defs) == UnitStatus::Stopped
                 {
                     self.notice(format!(
-                        "{}: it was stopped, not crashed, so I'm starting it again; to keep it stopped: planarian suppress {}",
+                        "{}: it was stopped, not crashed, so I'm starting it again; to keep it stopped: planarian override {}",
                         c.target, c.target
                     ));
                 }
@@ -672,7 +686,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     Source::Diagnoser { incident: inc.id },
                     c.reason.clone(),
                 );
-                match self.submit(p, Authorization::daemon(), s, defs) {
+                match self.submit(p, authorization_of(Actor::Daemon), s, defs) {
                     Submitted::Finished { txn, state, .. } => {
                         if let Some(i) = self.incidents.record_attempt(inc.id, txn, outcome_of(&state), now) {
                             if matches!(i.state, IncidentState::Cooldown { .. }) {
@@ -753,16 +767,18 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
     // ---------- Requests ----------
 
-    fn authz(&self, peer: Peer) -> Authorization {
-        let sessions = &self.asm.sessions;
-        let own = sessions.iter().any(|x| x.uid == peer.uid && x.establishes());
-        let local = sessions.iter().any(|x| x.uid == peer.uid && x.seat.is_some() && !x.remote);
-        Authorization {
-            caller: Actor::User { uid: peer.uid },
-            admin: peer.admin,
-            local_session: local,
-            owns_affected_session: own,
-        }
+    /// §10: `Actor::User { uid, session, seat, active }` from the caller's
+    /// logind session; a remote session has no seat and is never local.
+    fn authz(&self, peer: &Peer) -> Authorization {
+        let info =
+            peer.session.as_ref().and_then(|id| self.asm.sessions.iter().find(|x| &x.id == id && x.uid == peer.uid));
+        let actor = Actor::User {
+            uid: peer.uid,
+            session: info.map(|x| x.id.clone()),
+            seat: info.filter(|x| !x.remote).and_then(|x| x.seat.clone()),
+            active: info.is_some_and(|x| x.active),
+        };
+        user_authorization(actor, peer.admin)
     }
 
     /// The slow part of the request just handled, if `handle` deferred it:
@@ -796,7 +812,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
         let (s, defs) = self.observe();
         let p = self.proposal(t, &s, &defs, source, reason);
-        let authz = self.authz(peer);
+        let authz = self.authz(&peer);
         let r = self.submit(p, authz, &s, &defs);
         render::response(&r)
     }
@@ -890,7 +906,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     expected: s.expected(u, &defs),
                     observed,
                     stale: health == UnitStatus::Unknown,
-                    suppressed: health == UnitStatus::Suppressed,
+                    suppressed: matches!(health, UnitStatus::Overridden(_)),
                     health,
                 }
             })
@@ -1010,19 +1026,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             Request::Apply { change, args } => {
                 self.user_submit(Transition::ApplyChange { change, args }, peer, Source::User, "from the CLI".into())
             }
-            Request::Suppress { unit, until } => {
-                let s = Suppression {
-                    unit,
-                    until,
-                    reason: "from the CLI".into(),
-                    by: Actor::User { uid: peer.uid },
-                    stopped: false,
-                };
-                self.user_submit(Transition::Suppress(s), peer, Source::User, "from the CLI".into())
+            Request::SetOverride { unit, until, desired } => {
+                // `by` is overwritten from the caller's credentials by the executor (§11).
+                let s = Override::attested(unit, desired, until, "from the CLI".into(), Actor::user(peer.uid));
+                self.user_submit(Transition::SetOverride(s), peer, Source::User, "from the CLI".into())
             }
-            Request::Unsuppress { unit } => {
+            Request::LiftOverride { unit } => {
                 let r =
-                    self.user_submit(Transition::Unsuppress(unit.clone()), peer, Source::User, "from the CLI".into());
+                    self.user_submit(Transition::LiftOverride(unit.clone()), peer, Source::User, "from the CLI".into());
                 let now = self.b.clock().now();
                 if let Some(i) = self.incidents.human_acted(&unit, now) {
                     self.journal(Record::Incident(i));
@@ -1041,7 +1052,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         txn,
                         state,
                         message: format!(
-                            "{message}. Note: `stop` means stop and leave stopped until the next boot; `planarian unsuppress {unit}` lets it run again."
+                            "{message}. Note: `stop` means stop and leave stopped until the next boot; `planarian release {unit}` lets it run again."
                         ),
                     },
                     other => other,
@@ -1082,19 +1093,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     }
                 }
                 let (s, defs) = self.observe();
-                let r = self.ex.approve(&hash, &s, &defs);
+                let approver = self.authz(&peer);
+                let r = self.ex.approve(&hash, &approver, &s, &defs);
                 render::response(&r)
             }
             Request::Cancel { txn } => {
                 let Some(p) = self.ex.parked.get(&txn) else {
                     return Response::Error { message: "no such pending change".into() };
                 };
-                if !peer.admin && p.authz.caller != (Actor::User { uid: peer.uid }) {
+                if !peer.admin && p.authz.actor.uid() != Some(peer.uid) {
                     return Response::Error {
                         message: "only whoever asked for it, or an administrator, can withdraw it".into(),
                     };
                 }
-                let r = self.ex.cancel(txn, Actor::User { uid: peer.uid });
+                let r = self.ex.cancel(txn, Actor::user(peer.uid));
                 render::response(&r)
             }
             Request::Resolve { txn, resolution } => self.user_submit(
@@ -1155,7 +1167,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 if let Some(m) = may_change {
                     p.expected.may_change = m.into_iter().collect();
                 }
-                let authz = self.authz(peer);
+                let authz = self.authz(&peer);
                 let r = self.submit(p, authz, &s, &defs);
                 render::response(&r)
             }

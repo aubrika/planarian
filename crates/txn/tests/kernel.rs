@@ -295,7 +295,7 @@ fn crash_runtime_rollback_recovers_as_generation_op() {
     let first = d.prepare(good_change()).unwrap();
     d.run(first).unwrap();
     // Rollback to known_good (G1): restores the override recorded for G1.
-    let mut t = txn(Transition::Rollback, Actor::User { uid: ADMIN });
+    let mut t = txn(Transition::Rollback, Actor::user(ADMIN));
     t.base = G2;
     t.candidate = Some((G1, path(G1)));
     t.revert_to = G2;
@@ -318,7 +318,7 @@ fn crash_stop_and_suppress() {
     let mut d = rig.daemon();
     let t = txn(
         Transition::StopAndSuppress { unit: web(), until: Until::Explicit, reason: "user asked".into() },
-        Actor::User { uid: ADMIN },
+        Actor::user(ADMIN),
     );
     let id = d.prepare(t).unwrap();
     d.crash_at = Some(CrashPoint::OpBegun("stop"));
@@ -328,8 +328,8 @@ fn crash_stop_and_suppress() {
     let mut wd = rig.watchdog();
     assert_eq!(wd.recover(id, 1).unwrap(), TxnState::Committed);
     let l = wd.journal.ledger();
-    assert_eq!(l.suppressions.len(), 1);
-    assert_eq!(l.suppressions[0].by, Actor::User { uid: ADMIN });
+    assert_eq!(l.overrides.len(), 1);
+    assert_eq!(l.overrides[0].by, Actor::user(ADMIN));
     let w = rig.w();
     assert!(w.calls.iter().all(|c| !c.call.starts_with("activate_live") && !c.call.starts_with("restart")));
 }
@@ -340,13 +340,13 @@ fn stop_and_suppress_journals_suppression_before_stop() {
     let mut d = rig.daemon();
     let t = txn(
         Transition::StopAndSuppress { unit: web(), until: Until::Explicit, reason: String::new() },
-        Actor::User { uid: ADMIN },
+        Actor::user(ADMIN),
     );
     let id = d.prepare(t).unwrap();
     assert_eq!(d.run(id).unwrap(), TxnState::Committed);
     let entries = d.journal.segment().unwrap();
     let suppressed =
-        entries.iter().position(|e| matches!(e.record, planarian_txn::ledger::Record::Suppressed(_))).unwrap();
+        entries.iter().position(|e| matches!(e.record, planarian_txn::ledger::Record::OverrideSet(_))).unwrap();
     let stop = entries
         .iter()
         .position(|e| matches!(&e.record, planarian_txn::ledger::Record::OpBegin { call, .. } if call == "stop"))
@@ -362,7 +362,7 @@ fn drv_bind_fails_restores_previous() {
     let mut d = rig.daemon();
     let mut t = txn(
         Transition::BindDriver { device: snd(), driver: DriverRef { name: "vfio-pci".into(), module: None } },
-        Actor::User { uid: ADMIN },
+        Actor::user(ADMIN),
     );
     t.prior_driver = Some(hda());
     let id = d.prepare(t).unwrap();
@@ -390,8 +390,7 @@ fn revert_fails_sets_interlock_until_resolved() {
     ));
 
     rig.w().env_fault = false;
-    let resolve =
-        txn(Transition::Resolve { txn: id, resolution: Resolution::ManualRepaired }, Actor::User { uid: ADMIN });
+    let resolve = txn(Transition::Resolve { txn: id, resolution: Resolution::ManualRepaired }, Actor::user(ADMIN));
     let r = d.prepare(resolve).unwrap();
     assert_eq!(d.run(r).unwrap(), TxnState::Committed);
     assert!(!d.journal.ledger().interlocked());

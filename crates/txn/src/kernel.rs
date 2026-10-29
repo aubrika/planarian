@@ -11,8 +11,9 @@ use crate::ledger::{LedgerError, LiveTxn, Reconciliation, Record};
 use crate::machine::tag;
 use crate::store::Store;
 use planarian_schema::{
-    Actor, GenerationBackend, GenerationId, Hash, InventoryBackend, JobId, Lease, Millis, OpId, Outcome, OwnerId,
-    RecoveryStrategy, RejectReason, Suppression, Timestamp, Transaction, Transition, TxnId, TxnState, UnitId,
+    Actor, Attribution, GenerationBackend, GenerationId, Hash, InventoryBackend, JobId, Lease, Millis, OpId, Outcome,
+    Override, OverrideDesired, OwnerId, RecoveryStrategy, RejectReason, Timestamp, Transaction, Transition, TxnId,
+    TxnState, UnitId,
 };
 
 /// Job-drain wait during takeover (§16 operational limits).
@@ -148,7 +149,7 @@ pub trait Host {
     fn generations(&self) -> &Self::Gen;
     fn inventory(&self) -> &Self::Inv;
     /// Perform a `ReobserveOnly` transition's backend effect (restart, stop,
-    /// runtime option, GC). Suppression bookkeeping is the kernel's job, not this.
+    /// runtime option, GC). Override bookkeeping is the kernel's job, not this.
     fn execute_runtime(&self, t: &Transition, op: &OpId) -> Outcome;
     /// Settle, then observe and compare against the expectation; the outcome is
     /// recorded, never acted on (§12 step 7, UnitOp).
@@ -396,15 +397,30 @@ impl<S: Store, H: Host> Kernel<S, H> {
         // The suppression is journaled before the stop (§12, §14), and before
         // Activating: once the user's "stop" is recorded at all, the repair
         // loop leaves the unit alone, whatever happens to the rest.
-        if let Transition::StopAndSuppress { unit, until, reason } = &txn.transition {
-            let s = Suppression {
-                unit: unit.clone(),
-                until: until.clone(),
-                reason: reason.clone(),
-                by: caller.clone(),
-                stopped: true,
-            };
-            self.record(Record::Suppressed(s))?;
+        // An override the daemon or an agent sets would be gamed success (§15);
+        // a caller that is not a user never gets this far through policy.
+        match &txn.transition {
+            Transition::StopAndSuppress { unit, until, reason } => {
+                let s = Override::attested(
+                    unit.clone(),
+                    OverrideDesired::Stopped,
+                    until.clone(),
+                    reason.clone(),
+                    caller.clone(),
+                );
+                self.record(Record::OverrideSet(s))?;
+            }
+            Transition::SetOverride(s) => match s.desired {
+                OverrideDesired::LeaveAlone | OverrideDesired::Stopped => {
+                    let s = Override { by: caller.clone(), attribution: Attribution::Attested, ..s.clone() };
+                    self.record(Record::OverrideSet(s))?;
+                }
+                OverrideDesired::Absent | OverrideDesired::Detected => {
+                    return self
+                        .reject(txn.id, RejectReason::Other("Phase A overrides are LeaveAlone or Stopped".into()));
+                }
+            },
+            _ => {}
         }
         self.advance(txn, TxnState::Activating, "")?;
         let outcome = match &txn.transition {
@@ -412,13 +428,14 @@ impl<S: Store, H: Host> Kernel<S, H> {
                 let stop = Transition::StopUnit(unit.clone());
                 self.call(txn.id, "stop", |h, op| h.execute_runtime(&stop, op))?
             }
-            Transition::Suppress(s) => {
-                let s = Suppression { by: caller, stopped: false, ..s.clone() };
-                self.record(Record::Suppressed(s))?;
-                Outcome::Succeeded
+            // Journaled above; a Stopped override also stops the unit.
+            Transition::SetOverride(s) if s.desired == OverrideDesired::Stopped => {
+                let stop = Transition::StopUnit(s.unit.clone());
+                self.call(txn.id, "stop", |h, op| h.execute_runtime(&stop, op))?
             }
-            Transition::Unsuppress(u) => {
-                self.record(Record::Unsuppressed(u.clone()))?;
+            Transition::SetOverride(_) => Outcome::Succeeded,
+            Transition::LiftOverride(u) => {
+                self.record(Record::OverrideLifted(u.clone()))?;
                 Outcome::Succeeded
             }
             Transition::Resolve { txn: target, resolution } => {
@@ -476,9 +493,9 @@ impl<S: Store, H: Host> Kernel<S, H> {
         let units: Vec<UnitId> = self
             .journal
             .sync_ledger()?
-            .suppressions
+            .overrides
             .iter()
-            .filter(|s| s.stopped && s.holds_at(now))
+            .filter(|s| s.desired == OverrideDesired::Stopped && s.holds_at(now))
             .map(|s| s.unit.clone())
             .collect();
         for u in units {
