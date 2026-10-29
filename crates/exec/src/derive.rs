@@ -6,7 +6,7 @@ use planarian_policy::Tables;
 use planarian_schema::spec::dependents;
 use planarian_schema::*;
 use planarian_state::Canonical;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const CORE_UNITS: [&str; 2] = ["planariad", "planarian-recovery"];
 
@@ -184,11 +184,44 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             f.touches_canonical_probe = touches_canonical(&base_m, &cand_m, i.canonical);
             f.changes_desired = changes_desired(&base_m, &cand_m);
             f.touches_core = cand.core_units != i.base.core_units || f.sensitivity.contains(Sensitivity::Core);
+            // A catalog change may bring only what its override explains. The
+            // staged tree is the owner's as it is now, so it can carry edits the
+            // running generation does not have; those were never classified.
+            if let Transition::ApplyChange { change, args } = i.transition
+                && unexplained(i.base, cand, change, args)
+            {
+                f.sensitivity = f.sensitivity.union(&Sensitivities::of(&[Sensitivity::Security]));
+                f.touches_manifest = true;
+            }
             f.affected_units = unit_set(affected);
             f.config_diff = (!config.options.is_empty()).then_some(config);
         }
     }
     f
+}
+
+/// Whether the candidate differs from the running generation in ways a
+/// catalog change's override cannot explain: services declared or removed
+/// (other than the one a `service-enable` names), flake inputs, or a package
+/// with known vulnerabilities that the running generation does not have.
+pub fn unexplained(
+    base: &EvaluatedGeneration,
+    cand: &EvaluatedGeneration,
+    change: &ChangeId,
+    args: &BTreeMap<String, Value>,
+) -> bool {
+    let named = (change.0 == "service-enable").then(|| match args.get("service") {
+        Some(Value::Str(s)) => s.clone(),
+        _ => String::new(),
+    });
+    let services = |e: &EvaluatedGeneration| -> BTreeSet<String> {
+        e.declarations.keys().filter(|k| Some(*k) != named.as_ref()).cloned().collect()
+    };
+    // A generation that predates the export has no declarations to compare.
+    let declared = !base.declarations.is_empty() && services(base) != services(cand);
+    // Packages change with most changes (a service brings its own); a newly
+    // insecure one does not come from a catalog change.
+    declared || base.inputs != cand.inputs || !cand.insecure.is_subset(&base.insecure)
 }
 
 /// §11 session facts, from logind's sessions: which sessions the disruption

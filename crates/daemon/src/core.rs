@@ -674,10 +674,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             .map(|(svc, files)| {
                 let how = match &made {
                     Some(t) => format!(
-                        "by {} through {} (transaction {}), written to planarian/overrides.nix",
+                        "by {} through {} (transaction {}), written to planarian/overrides.nix; defined in {}",
                         who(&t.facts.caller),
                         render::transition(&t.transition),
-                        t.id.0
+                        t.id.0,
+                        if files.is_empty() { "an unknown file".to_string() } else { files.join(", ") }
                     ),
                     None => format!(
                         "by {} through {}, defined in {}; generation created at {}",

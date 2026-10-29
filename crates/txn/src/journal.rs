@@ -310,7 +310,13 @@ impl<S: Store> Journal<S> {
                 }
                 // A zeroed header is the end of the log only if no intact
                 // later record follows it; otherwise a record was erased (I18).
-                if truncate && let Some(seq) = self.later_record()? {
+                // (An erased header leaves the record's prev hash right after
+                // it; a fresh tail is zeros there, and needs no search.)
+                let after = self.store.read_at(self.offset + HEADER as u64, PREV)?;
+                if truncate
+                    && after.iter().any(|b| *b != 0)
+                    && let Some(seq) = self.later_record()?
+                {
                     return Err(JournalError::Integrity(format!(
                         "the record at byte {} was erased, but record {seq} follows it",
                         self.offset

@@ -973,7 +973,13 @@ impl Sim {
                 let path = get("path").to_string();
                 let tracked = s.get("tracked").and_then(T::as_bool).unwrap_or(true);
                 if tracked {
-                    self.fake.w().owner_files.insert(path, "edited".into());
+                    let mut w = self.fake.w();
+                    w.owner_files.insert(path, "edited".into());
+                    // An edit that enables a service, not yet rebuilt: the
+                    // owner's tree (what staging copies) now declares it.
+                    if let Some(svc) = s.get("enables").and_then(T::as_str) {
+                        w.base_options.insert(format!("services.{svc}.enable"), Value::Bool(true));
+                    }
                 } else {
                     self.fake.w().untracked.insert(path);
                 }

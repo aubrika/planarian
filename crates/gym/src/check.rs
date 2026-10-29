@@ -584,6 +584,8 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                             |x| matches!(x, Response::Done { message, .. } if message.contains("until the next boot")),
                         ),
                         "AwaitingApproval" => notices.contains("needs approval"),
+                        // The request itself was answered "approve first".
+                        "NeedsApproval" => e.responses.iter().any(|x| matches!(x, Response::NeedsApproval { .. })),
                         "ApprovalInvalidated" => ledger.terminal.values().any(|t| {
                             matches!(&t.state, TxnState::Rejected(RejectReason::Other(w)) if w == "approval invalidated")
                         }),
