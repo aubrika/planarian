@@ -574,14 +574,19 @@ fn sample() {
             let _ = writeln!(f, "{}", serde_json::to_string(&smp).expect("serializes"));
         }
         // The posture runs while planariad is down, so it is sampled apart.
-        let (classes, responses) = posture_snapshot();
-        if !classes.is_empty()
-            && let Ok(mut f) =
-                std::fs::OpenOptions::new().create(true).append(true).open(PathBuf::from(RUN).join("posture.jsonl"))
-        {
-            let _ = writeln!(f, "{}", serde_json::to_string(&(classes, responses)).expect("serializes"));
-        }
+        record_posture();
         std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// One posture sample, appended to the run's record when a class is raised.
+fn record_posture() {
+    let (classes, responses) = posture_snapshot();
+    if !classes.is_empty()
+        && let Ok(mut f) =
+            std::fs::OpenOptions::new().create(true).append(true).open(PathBuf::from(RUN).join("posture.jsonl"))
+    {
+        let _ = writeln!(f, "{}", serde_json::to_string(&(classes, responses)).expect("serializes"));
     }
 }
 
@@ -956,6 +961,9 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
         // `sudo planarian-ack` as the actor; a refusal (not an administrator,
         // or not a sudoer) is recorded for the judge.
         "ack_alarm" => {
+            // What the posture applied, seen now: an acknowledgement right
+            // after a reboot can come before the sampler's first sample.
+            record_posture();
             let user = user_for(actor);
             let ok = if user == "root" {
                 sh("planarian-ack")

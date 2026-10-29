@@ -90,7 +90,8 @@ pkgs.testers.runNixOSTest {
     with subtest("a fault restarting cannot fix is tried within budget, then handed to a person"):
         machine.wait_for_unit("gym-state.service")
         machine.succeed("echo corrupt > /var/lib/gym-state/state.json")
-        machine.succeed("systemctl kill --signal=SIGTERM gym-state.service")
+        # A crash (Q5: a SIGTERM would be a deliberate stop, taken as intended).
+        machine.succeed("systemctl kill --signal=SIGSEGV gym-state.service")
         # Backoff 10 s, 60 s, 300 s: three attempts, then a cooldown that says so.
         machine.wait_until_succeeds("planarian status | grep -q 'gym-state.*needs a person'", timeout=1200)
         print(machine.succeed("planarian status"))
