@@ -39,6 +39,17 @@ pub enum Effect {
     Package { name: String, version: String, insecure: bool },
 }
 
+/// An outcome injected into the next call of one name (the gym's
+/// `backend_result` and the assumptions conformance run): the effect lands
+/// but the call reports failure (Partial) or cannot say (Unknown), or the
+/// call is refused before any effect as if fenced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Injected {
+    Partial,
+    Unknown,
+    Fenced,
+}
+
 /// If option `option` evaluates to `value`, apply `effect`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
@@ -133,6 +144,8 @@ pub struct World {
     /// The base generation's packages (pname → version) and the insecure ones (§12e).
     pub base_packages: BTreeMap<String, String>,
     pub base_insecure: BTreeSet<String>,
+    /// Outcomes to inject, by call name (`restart`, `activate_live`, …), once each.
+    pub inject: BTreeMap<String, Injected>,
     /// Who the next out-of-band generation is created by (uid).
     pub rebuild_uid: u32,
     /// When the bad payload takes gym-web's port (set when a generation
@@ -529,6 +542,29 @@ impl Fake {
         w.calls.push(Call { at: w.now, op: *op, call, fenced });
         !fenced
     }
+
+    /// One mutating backend call: fenced on a stale epoch before any effect
+    /// (docs/assumptions.md), and subject to an injected outcome
+    /// (`World::inject`, keyed by the call's name before its parenthesis).
+    fn run(&self, op: &OpId, call: String, f: impl FnOnce(&mut World) -> Outcome) -> Outcome {
+        let mut w = self.w();
+        let name = call.split('(').next().unwrap_or("").to_string();
+        let injected = w.inject.remove(&name);
+        if injected == Some(Injected::Fenced) {
+            let at = w.now;
+            w.calls.push(Call { at, op: *op, call, fenced: true });
+            return Outcome::fenced();
+        }
+        if !self.admit(&mut w, op, call) {
+            return Outcome::fenced();
+        }
+        let out = f(&mut w);
+        match injected {
+            Some(Injected::Partial) => Outcome::Failed("partially applied (injected)".into()),
+            Some(Injected::Unknown) => Outcome::Unknown("no answer (injected)".into()),
+            _ => out,
+        }
+    }
 }
 
 impl UnitBackend for Fake {
@@ -550,22 +586,16 @@ impl UnitBackend for Fake {
     }
 
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome {
-        let mut w = self.w();
-        if !self.admit(&mut w, op, format!("restart({id})")) {
-            return Outcome::fenced();
-        }
-        w.start(id)
+        self.run(op, format!("restart({id})"), |w| w.start(id))
     }
 
     fn stop(&self, id: &UnitId, op: &OpId) -> Outcome {
-        let mut w = self.w();
-        if !self.admit(&mut w, op, format!("stop({id})")) {
-            return Outcome::fenced();
-        }
-        let now = w.now;
-        let sim = w.units.entry(World::key(id)).or_insert_with(|| UnitSim::active(now));
-        sim.observed = Observed::Bound;
-        Outcome::Succeeded
+        self.run(op, format!("stop({id})"), |w| {
+            let now = w.now;
+            let sim = w.units.entry(World::key(id)).or_insert_with(|| UnitSim::active(now));
+            sim.observed = Observed::Bound;
+            Outcome::Succeeded
+        })
     }
 }
 
@@ -713,61 +743,55 @@ impl GenerationBackend for Fake {
     }
 
     fn activate_live(&self, g: GenerationId, op: &OpId) -> Outcome {
-        let mut w = self.w();
-        if !self.admit(&mut w, op, format!("activate_live({})", g.0)) {
-            return Outcome::fenced();
-        }
-        if !w.gens.contains_key(&g) {
-            return Outcome::Failed(format!("no generation {}", g.0));
-        }
-        if w.fail_activate.contains(&g) {
-            return Outcome::Failed(format!("switch-to-configuration test failed for {}", g.0));
-        }
-        if g != w.booted && !w.block_on_activate.is_empty() {
-            let b = std::mem::take(&mut w.block_on_activate);
-            w.blocked.extend(b);
-        }
-        if let Some((delay, cancellable)) = w.slow_activation {
-            w.next_job += 1;
-            let id = JobId(format!("job-{}", w.next_job));
-            let done_at = w.now.plus(delay);
-            let job = Job { op: *op, done_at, cancellable, activates: g };
-            let now = w.now;
-            w.job_spans.insert(id.clone(), (job.clone(), now, None));
-            w.jobs.insert(id, job);
-            return Outcome::Unknown("activation job accepted; no reply".into());
-        }
-        w.apply_generation(g);
-        Outcome::Succeeded
+        self.run(op, format!("activate_live({})", g.0), |w| {
+            if !w.gens.contains_key(&g) {
+                return Outcome::Failed(format!("no generation {}", g.0));
+            }
+            if w.fail_activate.contains(&g) {
+                return Outcome::Failed(format!("switch-to-configuration test failed for {}", g.0));
+            }
+            if g != w.booted && !w.block_on_activate.is_empty() {
+                let b = std::mem::take(&mut w.block_on_activate);
+                w.blocked.extend(b);
+            }
+            if let Some((delay, cancellable)) = w.slow_activation {
+                w.next_job += 1;
+                let id = JobId(format!("job-{}", w.next_job));
+                let done_at = w.now.plus(delay);
+                let job = Job { op: *op, done_at, cancellable, activates: g };
+                let now = w.now;
+                w.job_spans.insert(id.clone(), (job.clone(), now, None));
+                w.jobs.insert(id, job);
+                return Outcome::Unknown("activation job accepted; no reply".into());
+            }
+            w.apply_generation(g);
+            Outcome::Succeeded
+        })
     }
 
     fn publish_boot(&self, g: GenerationId, op: &OpId) -> Outcome {
-        let mut w = self.w();
-        if !self.admit(&mut w, op, format!("publish_boot({})", g.0)) {
-            return Outcome::fenced();
-        }
-        // Only a generation whose files are not yet on /boot needs new space.
-        if w.fail_publish && !w.boot_entries.contains(&g) {
-            // /boot is full from here on, as on the gym VM.
-            if let Some((free, _)) = w.fs.get_mut("/boot") {
-                *free = 0;
+        self.run(op, format!("publish_boot({})", g.0), |w| {
+            // Only a generation whose files are not yet on /boot needs new space.
+            if w.fail_publish && !w.boot_entries.contains(&g) {
+                // /boot is full from here on, as on the gym VM.
+                if let Some((free, _)) = w.fs.get_mut("/boot") {
+                    *free = 0;
+                }
+                return Outcome::Failed("No space left on device (/boot)".into());
             }
-            return Outcome::Failed("No space left on device (/boot)".into());
-        }
-        w.boot_entries.insert(g);
-        w.boot_default = g;
-        Outcome::Succeeded
+            w.boot_entries.insert(g);
+            w.boot_default = g;
+            Outcome::Succeeded
+        })
     }
 
     fn publish_boot_once(&self, g: GenerationId, keep: GenerationId, op: &OpId) -> Outcome {
-        let mut w = self.w();
-        if !self.admit(&mut w, op, format!("publish_boot_once({})", g.0)) {
-            return Outcome::fenced();
-        }
-        w.boot_entries.insert(g);
-        w.boot_default = keep;
-        w.one_shot = Some(g);
-        Outcome::Succeeded
+        self.run(op, format!("publish_boot_once({})", g.0), |w| {
+            w.boot_entries.insert(g);
+            w.boot_default = keep;
+            w.one_shot = Some(g);
+            Outcome::Succeeded
+        })
     }
 
     fn one_shot_pending(&self) -> Result<Option<GenerationId>, Outcome> {
@@ -775,19 +799,11 @@ impl GenerationBackend for Fake {
     }
 
     fn protect(&self, g: GenerationId, op: &OpId) -> Outcome {
-        let mut w = self.w();
-        if !self.admit(&mut w, op, format!("protect({})", g.0)) {
-            return Outcome::fenced();
-        }
-        Outcome::Succeeded
+        self.run(op, format!("protect({})", g.0), |_| Outcome::Succeeded)
     }
 
     fn cancel(&self, job: &JobId, op: &OpId) -> Outcome {
-        let mut w = self.w();
-        if !self.admit(&mut w, op, format!("cancel({})", job.0)) {
-            return Outcome::fenced();
-        }
-        match w.jobs.get(job) {
+        self.run(op, format!("cancel({})", job.0), |w| match w.jobs.get(job) {
             Some(j) if j.cancellable => {
                 w.jobs.remove(job);
                 let now = w.now;
@@ -798,28 +814,26 @@ impl GenerationBackend for Fake {
             }
             Some(_) => Outcome::Failed("job cannot be cancelled".into()),
             None => Outcome::Succeeded,
-        }
+        })
     }
 
     fn swap_override(&self, from: &Hash, to: &Hash, op: &OpId) -> Outcome {
-        let mut w = self.w();
-        if !self.admit(&mut w, op, "swap_override".into()) {
-            return Outcome::fenced();
-        }
-        let cur = World::override_hash_of(&w.overrides);
-        if cur == *to {
-            return Outcome::Succeeded;
-        }
-        if cur != *from {
-            return Outcome::Failed("override file changed by a third party".into());
-        }
-        match w.override_store.get(to).cloned() {
-            Some(set) => {
-                w.overrides = set;
-                Outcome::Succeeded
+        self.run(op, "swap_override".into(), |w| {
+            let cur = World::override_hash_of(&w.overrides);
+            if cur == *to {
+                return Outcome::Succeeded;
             }
-            None => Outcome::Failed("override content unknown".into()),
-        }
+            if cur != *from {
+                return Outcome::Failed("override file changed by a third party".into());
+            }
+            match w.override_store.get(to).cloned() {
+                Some(set) => {
+                    w.overrides = set;
+                    Outcome::Succeeded
+                }
+                None => Outcome::Failed("override content unknown".into()),
+            }
+        })
     }
 
     fn path_of(&self, g: GenerationId) -> Result<StorePath, Outcome> {
@@ -860,18 +874,16 @@ impl GenerationBackend for Fake {
     }
 
     fn collect_garbage(&self, protect: &[GenerationId], emergency: bool, op: &OpId) -> Outcome {
-        let mut w = self.w();
-        if !self.admit(&mut w, op, "collect_garbage".into()) {
-            return Outcome::fenced();
-        }
-        let plan = w.gc_plan(protect, emergency);
-        let freed = plan.delete.len() as u64 * GEN_BYTES;
-        w.collected.extend(plan.delete.iter().copied());
-        for (free, size) in w.fs.values_mut() {
-            *free = (*free + freed).min(*size);
-        }
-        w.space_report = Some(gc::SpaceReport::of(&plan, w.now));
-        Outcome::Succeeded
+        self.run(op, "collect_garbage".into(), |w| {
+            let plan = w.gc_plan(protect, emergency);
+            let freed = plan.delete.len() as u64 * GEN_BYTES;
+            w.collected.extend(plan.delete.iter().copied());
+            for (free, size) in w.fs.values_mut() {
+                *free = (*free + freed).min(*size);
+            }
+            w.space_report = Some(gc::SpaceReport::of(&plan, w.now));
+            Outcome::Succeeded
+        })
     }
 
     fn gc_plan(&self, protect: &[GenerationId], emergency: bool) -> Result<gc::GcPlan, Outcome> {
@@ -919,21 +931,17 @@ impl InventoryBackend for Fake {
     }
 
     fn bind(&self, device: &UnitId, driver: &DriverRef, op: &OpId) -> Outcome {
-        let mut w = self.w();
-        if !self.admit(&mut w, op, format!("bind({device}, {})", driver.name)) {
-            return Outcome::fenced();
-        }
-        w.devices.insert(device.clone(), Some(driver.clone()));
-        Outcome::Succeeded
+        self.run(op, format!("bind({device}, {})", driver.name), |w| {
+            w.devices.insert(device.clone(), Some(driver.clone()));
+            Outcome::Succeeded
+        })
     }
 
     fn unbind(&self, device: &UnitId, op: &OpId) -> Outcome {
-        let mut w = self.w();
-        if !self.admit(&mut w, op, format!("unbind({device})")) {
-            return Outcome::fenced();
-        }
-        w.devices.insert(device.clone(), None);
-        Outcome::Succeeded
+        self.run(op, format!("unbind({device})"), |w| {
+            w.devices.insert(device.clone(), None);
+            Outcome::Succeeded
+        })
     }
 }
 
@@ -1046,12 +1054,10 @@ impl RuntimeOptionBackend for Fake {
     }
 
     fn set(&self, path: &str, value: &Value, op: &OpId) -> Outcome {
-        let mut w = self.w();
-        if !self.admit(&mut w, op, format!("set({path})")) {
-            return Outcome::fenced();
-        }
-        w.runtime.insert(path.into(), value.clone());
-        Outcome::Succeeded
+        self.run(op, format!("set({path})"), |w| {
+            w.runtime.insert(path.into(), value.clone());
+            Outcome::Succeeded
+        })
     }
 
     fn alternatives(&self, path: &str) -> Vec<Value> {

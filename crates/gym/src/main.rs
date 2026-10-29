@@ -9,6 +9,7 @@
 //! the flake's NixOS tests (`nix flake check`, `checks.vm-runtime`).
 
 mod check;
+mod conformance;
 mod evidence;
 mod live;
 mod metrics;
@@ -21,6 +22,9 @@ use sim::Sim;
 use toml::Value as T;
 
 const DEFAULT_CATALOG: &str = "crates/gym/catalog/phase-a.toml";
+
+/// The catalog being run, for entries that run others (the conformance matrix).
+static CATALOG: std::sync::OnceLock<Vec<T>> = std::sync::OnceLock::new();
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
 enum Result_ {
@@ -61,6 +65,12 @@ fn run_entry(entry: &T) -> Run {
     let fake = entry.get("harness").and_then(T::as_array).is_some_and(|h| h.iter().any(|x| x.as_str() == Some("fake")));
     if !fake {
         return Run { result: Result_::NotFake, notes: vec!["VM-only entry".into()], sim: None };
+    }
+    // A matrix entry (fake-assumptions-conformance) runs the conformance suite.
+    if entry.get("matrix").is_some() {
+        let catalog = CATALOG.get().cloned().unwrap_or_default();
+        let (ok, notes) = conformance::run(&catalog);
+        return Run { result: if ok { Result_::Pass } else { Result_::Fail }, notes, sim: None };
     }
     let mut sim = Sim::new();
     let setup = steps(entry, "setup");
@@ -160,6 +170,7 @@ fn main() {
         i += 1;
     }
     let entries = load(&catalog);
+    let _ = CATALOG.set(entries.clone());
     let cmd = args.first().map(String::as_str).unwrap_or("list");
     if harness == "vm" && cmd != "list" {
         eprintln!("The VM harness runs as NixOS tests: `nix build .#checks.x86_64-linux.vm-runtime` (needs KVM).");

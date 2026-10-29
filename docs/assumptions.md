@@ -37,3 +37,5 @@ Some lease holder eventually runs; a fenced worker eventually stops issuing call
 ## Fake harness (tests only, not proof sites)
 
 `txn::fake` models the backends in memory. Each kernel test's claim is only as good as the fake's fidelity to the contracts above: fencing refuses a stale epoch before any effect, `jobs_tagged` finds every job an op started (or answers `None`), and `swap_override` is a compare-and-swap. The VM harness exists to check the real backends against these same contracts.
+
+The catalog entry `fake-assumptions-conformance` (`crates/gym/src/conformance.rs`) runs both halves on every CI run. It holds one check per row above against the fake. It then injects Partial (the effect landed, the call failed), Unknown and Fenced into each mutating call (restart, stop, activate_live, publish_boot, publish_boot_once, swap_override, bind, collect_garbage) during a catalog entry that makes that call. Every transaction must end terminal (I12) and the journal must replay (I15). No fake-harness entry makes `cancel`, `unbind` or the runtime `set`. `GenerationBackend::protect` has no caller.
