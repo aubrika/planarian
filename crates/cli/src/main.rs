@@ -130,6 +130,10 @@ fn parse(args: &[String]) -> Result<(Request, bool), String> {
 fn send(req: &Request) -> Result<Response, String> {
     let path = std::env::var("PLANARIAN_SOCKET").unwrap_or_else(|_| SOCKET.into());
     let mut s = UnixStream::connect(&path).map_err(|e| format!("cannot reach planariad at {path}: {e}"))?;
+    // Long work runs off the core thread; the slowest answer is a diagnosis
+    // probe with a long timeout. Ten minutes without one means planariad is
+    // stuck: say so rather than hang.
+    s.set_read_timeout(Some(std::time::Duration::from_secs(600))).map_err(|e| e.to_string())?;
     s.write_all(req.encode().as_bytes()).map_err(|e| e.to_string())?;
     let mut line = String::new();
     BufReader::new(&s).read_line(&mut line).map_err(|e| e.to_string())?;

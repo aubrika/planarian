@@ -290,6 +290,8 @@ fn sh_out(cmd: &str) -> String {
 pub fn call(req: &Request) -> Result<Response, String> {
     let path = std::env::var("PLANARIAN_SOCKET").unwrap_or_else(|_| SOCKET.into());
     let mut c = UnixStream::connect(&path).map_err(|e| format!("{path}: {e}"))?;
+    // A daemon that stops answering is a finding, not a hung judge.
+    c.set_read_timeout(Some(std::time::Duration::from_secs(600))).map_err(|e| e.to_string())?;
     c.write_all(req.encode().as_bytes()).map_err(|e| e.to_string())?;
     let mut line = String::new();
     BufReader::new(c).read_line(&mut line).map_err(|e| e.to_string())?;
