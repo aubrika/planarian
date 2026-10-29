@@ -442,10 +442,13 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
             }
             "no_incident_on" => {
                 for u in val.as_array().into_iter().flatten().filter_map(T::as_str) {
-                    if unknown(u) {
+                    let id = unit(u);
+                    // A per-session unit (§9) has no instance while nobody is
+                    // logged in: then it trivially had no incident.
+                    let per_session = id.kind == UnitKind::Target && id.name == "graphical-session";
+                    if unknown(u) && !per_session {
                         fail(&mut v, format!("{u} is not a unit on this machine"));
                     }
-                    let id = unit(u);
                     if e.seen_incidents.values().any(|i| same_unit(&id, &i.target) && i.kind == IncidentKind::Repair) {
                         fail(&mut v, format!("an incident opened on {u}"));
                     }

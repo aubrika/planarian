@@ -391,6 +391,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
             let prev = self.manifest_gen;
             self.manifest_gen = current;
+            // A switch outside Planarian stops and starts units too: none of
+            // that is a person's stop (§11 residue).
+            self.generation_touched = true;
             self.note_declarations(Some(prev), current, true);
         }
         let ctx = self.context(&l, current);
@@ -568,6 +571,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let lenient = matches!(self.cfg.posture, Posture::Relaxed | Posture::Standard);
         let mut down: BTreeMap<UnitId, Ending> = BTreeMap::new();
         let mut current = BTreeMap::new();
+        // Units that crashed this tick (up before, failed now): units that
+        // require them and went down with them are part of that fault.
+        let crashed: BTreeSet<UnitId> = defs
+            .keys()
+            .filter(|u| {
+                matches!(self.prev_status.get(*u), Some(UnitStatus::Running | UnitStatus::Degraded(_)))
+                    && matches!(s.status(u, defs), UnitStatus::Failed(_))
+            })
+            .cloned()
+            .collect();
         for (u, def) in defs {
             let st = s.status(u, defs);
             // A Security unit killed by a termination signal that systemd
@@ -595,6 +608,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 || self.touched.contains(u)
                 || self.generation_touched
                 || !s.expected(u, defs)
+                || def.edges.iter().any(|e| e.from == *u && e.kind == EdgeKind::Requires && crashed.contains(&e.to))
             {
                 continue;
             }
