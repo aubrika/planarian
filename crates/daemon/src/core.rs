@@ -579,13 +579,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 && let Some(n) = self.b.units().auto_restarts(u)
             {
                 let before = self.prev_auto_restarts.insert(u.clone(), n);
-                if before.is_some_and(|b| n > b)
-                    && !self.touched.contains(u)
-                    && let Some(e) = self.b.units().ended_by(u).filter(Ending::is_termination)
-                {
+                // (Once systemd has restarted it, ExecMain* describe the new
+                // process, so how the old one ended is no longer visible.)
+                if before.is_some_and(|b| n > b) && !self.touched.contains(u) {
                     self.notice(format!(
-                        "ALARM: {u}, which is security-sensitive, was stopped outside Planarian ({}); systemd started it again",
-                        signal_name(e)
+                        "ALARM: {u}, which is security-sensitive, ended outside Planarian (killed, stopped or crashed); systemd started it again"
                     ));
                 }
             }

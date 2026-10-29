@@ -106,9 +106,9 @@ pkgs.testers.runNixOSTest {
         if busy:
             machine.succeed("systemd-run --unit=bench-crasher sh -c 'while true; do sleep 30; systemctl kill --signal=SIGSEGV bench-svc; done'")
         _, log = machine.execute(
-            f"MANGOHUD_CONFIG=no_display,autostart_log=1,log_duration=120,output_folder={out} "
-            f"timeout 200 xvfb-run -a -s '-screen 0 640x480x24' mangohud --dlsym {game} "
-            f"-nosound -benchmark {demo.removesuffix('.dem')} +vid_fullscreen 0 +vid_width 640 +vid_height 480 2>&1 | tail -n 5")
+            f"MANGOHUD_CONFIG=no_display,autostart_log=1,output_folder={out} "
+            f"timeout 600 xvfb-run -a -s '-screen 0 640x480x24' mangohud --dlsym {game} "
+            f"-nosound -benchmark {demo.removesuffix('.dem')} +vid_fullscreen 0 +vid_width 640 +vid_height 480 2>&1 | tail -n 40")
         if busy:
             machine.execute("systemctl stop bench-crasher")
         csv = machine.succeed(f"cat {out}/*.csv 2>/dev/null || true")
@@ -124,7 +124,17 @@ pkgs.testers.runNixOSTest {
                     pass
         times.sort()
         p99 = times[int(len(times) * 0.99) - 1] if len(times) >= 100 else None
-        return {"frames": len(times), "p99_ms": p99, "fps_line": next((l for l in log.splitlines() if "fps" in l), "")}
+        source = "mangohud"
+        # MangoHud writes its CSV when logging stops; without one, DarkPlaces'
+        # own benchmark summary: "N frames S seconds F fps, one-second fps
+        # min/avg/max: a b c". The slowest one-second window stands in for
+        # the p99 frame time (1000 / min fps).
+        engine = re.search(r"(\d+) frames ([\d.]+) seconds ([\d.]+) fps, one-second fps min/avg/max: ([\d.]+)", log)
+        if p99 is None and engine and float(engine.group(4)) > 0:
+            p99 = 1000.0 / float(engine.group(4))
+            source = "darkplaces one-second min"
+        return {"frames": len(times) or (int(engine.group(1)) if engine else 0), "p99_ms": p99, "source": source,
+                "engine": engine.group(0) if engine else None, "tail": log.splitlines()[-12:]}
 
     def mann_whitney_p(a, b):
         # Exact two-sided p of the U statistic, by enumerating every split.
