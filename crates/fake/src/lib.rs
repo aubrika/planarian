@@ -815,6 +815,13 @@ impl ProbeBackend for Fake {
                 if w.blocked.contains(unit) {
                     return ProbeResult::Fail("connection refused".into());
                 }
+                // A sound card is listed while snd-hda0 is driven.
+                if p.id.0 == "pipewire-has-a-card" {
+                    return match w.devices.get(&UnitId::device("snd-hda0")).cloned().flatten() {
+                        Some(d) if !w.bad_drivers.contains(&d.name) => ProbeResult::Pass,
+                        _ => ProbeResult::Fail("no sound card".into()),
+                    };
+                }
                 // A device's own check: driven by a driver that can drive it.
                 if unit.kind == UnitKind::Device && matches!(p.kind, ProbeKind::Exec { .. }) {
                     return match w.devices.get(unit).cloned().flatten() {

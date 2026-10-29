@@ -547,3 +547,36 @@ fn status_requests_do_not_run_the_probes() {
     }
     assert_eq!(r.fake.w().probe_batches, before);
 }
+
+#[test]
+fn a_repaired_root_cause_is_named_for_its_dependents() {
+    // drv-unbound-audio: alice's pipewire degrades because the sound card's
+    // driver is unbound; the card is rebound, and pipewire is told why.
+    let mut r = Rig::new();
+    let now = r.fake.w().now;
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1000".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: now,
+    });
+    for name in ["pipewire", "wireplumber"] {
+        r.fake.w().units.insert(
+            UnitId { kind: UnitKind::Service, name: name.into(), scope: Scope::User { uid: 1000, session: None } },
+            planarian_fake::UnitSim::active(now),
+        );
+    }
+    r.ticks(30);
+    r.fake.w().devices.insert(UnitId::device("snd-hda0"), None);
+    r.ticks(20);
+    assert!(
+        r.core
+            .notices
+            .iter()
+            .any(|n| n.starts_with("service@1000:pipewire:") && n.contains("(root cause: device:snd-hda0)")),
+        "{:#?}",
+        r.core.notices
+    );
+}

@@ -428,7 +428,7 @@ summary = "snd_hda_intel is unbound from the sound card; alice's pipewire degrad
 spec = ["§1 root-cause example", "§12 DeviceOp"]
 tags = []
 scoring = "repair"
-harness = ["vm"]
+harness = ["fake", "vm"]
 intent = { kind = "none" }
 setup = [{ raw = "greeter_login", uid = 1000 }]
 inject = { raw = "unbind_driver", device = "device:snd-hda0" }

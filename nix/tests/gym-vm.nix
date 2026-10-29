@@ -533,11 +533,14 @@ let
             print(machine.execute(
                 "ls -la /run/planarian-gym; cat /run/planarian-gym/hooks.json; echo;"
                 " journalctl -o short-monotonic --no-pager -u planariad -u planarian-recovery -u 'gym-watch-*' | tail -n 150;"
-                " ls -la /var/lib/planarian /var/lib/planarian/log; planarian log -n 10;"
-                " git -C /etc/nixos status --short; tail -n 3 /etc/nixos/configuration.nix;"
-                " echo 'status changes (sampler):'; jq -c '.status' /var/lib/gym-run/samples.jsonl 2>/dev/null | uniq | tail -n 12"
+                " ls -la /var/lib/planarian /var/lib/planarian/log 2>&1; timeout 10 planarian log -n 10 2>&1;"
+                " timeout 10 git -C /etc/nixos status --short 2>&1; tail -n 3 /etc/nixos/configuration.nix 2>&1"
             )[1])
             print(machine.succeed(f"{gym} judge --id {ID} 2>&1"))
+            # The sampler's status changes over the whole window (one line per change).
+            print(machine.execute(
+                "echo 'status changes (sampler):'; jq -c '.status' /var/lib/gym-run/samples.jsonl 2>&1 | uniq | tail -n 40"
+            )[1])
         machine.copy_from_machine("/var/lib/gym-run/verdict.json", "")
         if machine.execute("test -e /var/lib/gym-run/evidence.json")[0] == 0:
             machine.copy_from_machine("/var/lib/gym-run/evidence.json", "")

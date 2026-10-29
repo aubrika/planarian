@@ -431,8 +431,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                             .collect()
                     })
                     .unwrap_or_default();
+                // §1: name the deepest divergent unit below it, when it isn't itself.
+                let none = BTreeMap::new();
+                let inputs = diagnose::Inputs {
+                    state: &s,
+                    defs: &defs,
+                    failed_since: &self.asm.failed_since,
+                    known_drivers: &self.asm.known_drivers,
+                    current_planarian_built: false,
+                    alternatives: &none,
+                };
+                let root = diagnose::root_cause(&inc.target, &inputs);
+                let because = if root == inc.target { String::new() } else { format!(" (root cause: {root})") };
                 self.notice(format!(
-                    "{}: {:?}{}",
+                    "{}: {:?}{because}{}",
                     inc.target,
                     inc.divergence.1,
                     if failing.is_empty() { String::new() } else { format!(" ({})", failing.join("; ")) }
@@ -611,6 +623,18 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         // whenever it isn't the target itself.
         let root = diagnose::root_cause(&inc.target, &inputs);
         let because = if root == inc.target { String::new() } else { format!(" (root cause: {root})") };
+        // Every other unit in trouble now, with its root cause (named if this
+        // repair turns out to be theirs). Not just open incidents: a unit can
+        // diverge inside its startup grace, before it has one.
+        let others_rooted: Vec<(UnitId, UnitId, UnitStatus)> = defs
+            .keys()
+            .filter(|u| **u != inc.target && s.expected(u, defs))
+            .filter_map(|u| {
+                let st = s.status(u, defs);
+                matches!(st, UnitStatus::Degraded(_) | UnitStatus::Failed(_) | UnitStatus::Stopped)
+                    .then(|| (u.clone(), diagnose::root_cause(u, &inputs), st))
+            })
+            .collect();
         match diagnose::next(&inc, &inputs) {
             None => {
                 if let Some(i) = self.incidents.exhausted(inc.id, now) {
@@ -661,7 +685,29 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                             }
                             self.journal(Record::Incident(i));
                         }
-                        self.notice(format!("{}: {} → {:?}", inc.target, render::transition(&c.transition), state));
+                        self.notice(format!(
+                            "{}: {} → {:?}{because}",
+                            inc.target,
+                            render::transition(&c.transition),
+                            state
+                        ));
+                        // §1: other units in trouble because of the one just
+                        // repaired are told so (their incidents close once
+                        // they are well again).
+                        if state == TxnState::Committed {
+                            let dependents: Vec<(UnitId, UnitStatus)> = others_rooted
+                                .iter()
+                                .filter(|(t, root, _)| *root == c.target && *t != c.target)
+                                .map(|(t, _, st)| (t.clone(), st.clone()))
+                                .collect();
+                            for (d, st) in dependents {
+                                self.notice(format!(
+                                    "{d}: {st:?} (root cause: {}); repaired with {}",
+                                    c.target,
+                                    render::transition(&c.transition)
+                                ));
+                            }
+                        }
                     }
                     Submitted::Parked { txn, approve, facts } => {
                         self.incident_parked.insert(inc.id, txn);

@@ -211,6 +211,14 @@ pub fn gym_user_units() -> Vec<UnitDef> {
     let mut pw = unit("service:pipewire", &[Sensitivity::Routine], Disruption::Brief, vec![]);
     pw.id = user("pipewire");
     pw.synonyms = vec!["sound".into(), "audio".into()];
+    // As in the gym VM: pipewire degrades without a card to drive.
+    pw.probes.push(user_probe(
+        "pipewire-has-a-card",
+        ProbeKind::Exec {
+            argv: vec!["grep".into(), "-qv".into(), "no soundcards".into(), "/proc/asound/cards".into()],
+            sandbox: ProbeSandbox { uid: 0, caps: vec![], max_output: 4096, cpu_ms: 500, network: false },
+        },
+    ));
     pw.edges.push(Edge {
         from: pw.id.clone(),
         to: UnitId::device("snd-hda0"),

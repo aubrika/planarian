@@ -1065,7 +1065,10 @@ fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
         }
         let want: BTreeSet<UnitId> = of.iter().filter_map(T::as_str).map(unit).collect();
         for u in want.difference(&attributed) {
-            v.failures.push(format!("{label}: never named as the root cause of {u}"));
+            // Whether the dependent ever diverged says which side to look at.
+            let seen =
+                e.seen_status.get(u).map(|s| s.iter().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default();
+            v.failures.push(format!("{label}: never named as the root cause of {u} (it was seen {seen})"));
         }
         for u in attributed.difference(&want) {
             v.failures.push(format!("{label}: named as the root cause of {u}, which it isn't"));
