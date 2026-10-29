@@ -129,32 +129,6 @@ transition = "StopUnit"
 target = "service@1000:pipewire"
 tier = "AskFirst"
 
-# B-7 (Medium). Fake only: a VM cannot advance boot time by 24 h.
-[[fault]]
-id = "token-wall-clock-moved-back"
-family = "policy"
-summary = "An approval token is issued, then the wall clock is moved back 48 h. The token still expires 24 h after issue, timed on CLOCK_BOOTTIME (§12h)."
-spec = ["§12h", "I8", "B-7"]
-tags = ["acceptance", "bypass"]
-scoring = "must-pass"
-harness = ["fake"]
-intent = { kind = "none" }
-setup = [
-  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
-  { raw = "approve_pending", actor = "root", via = "tty", hold_token = true },
-  { raw = "set_wall_clock", by = "-48h" },
-  { raw = "advance_clock", by = "24h1m" },
-]
-inject = { raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }
-window = "1m"
-
-[fault.required_post]
-reports = ["TokenExpired"]
-
-[[fault.required_post.txn]]
-transition = "ApplyChange"
-never = ["Activating"]
-
 # B-11 (Medium). Fixture: gym-backup, a service with inferStops = false.
 [[fault]]
 id = "residue-infer-stops-false"

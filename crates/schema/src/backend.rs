@@ -271,7 +271,12 @@ pub trait ProcessBackend {
 }
 
 pub trait Clock {
+    /// Wall-clock time: for what people see and records compared across boots.
     fn now(&self) -> Timestamp;
+    /// Milliseconds on `CLOCK_BOOTTIME`: for everything that does not survive
+    /// a reboot (approval tokens, leases, cooldowns, windows; §12h). Moving
+    /// the wall clock never moves it.
+    fn boot_now(&self) -> Timestamp;
     fn sleep(&self, d: Millis);
 }
 

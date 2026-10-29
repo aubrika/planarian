@@ -368,6 +368,10 @@ impl Host for FakeHost {
         self.w().now
     }
 
+    fn boot_now(&self) -> Timestamp {
+        self.w().now
+    }
+
     fn sleep(&self, d: Millis) {
         let mut w = self.w();
         w.now = w.now.plus(d);

@@ -127,6 +127,23 @@ fn watchdog_leaves_a_live_renewing_daemon_alone() {
     assert!(wd.watchdog_should_take_over(&txn));
 }
 
+/// §12h: leases are on the boot clock, so after a reboot an owner from the
+/// earlier boot must read as gone even if its pid now belongs to a live
+/// process; otherwise its stale boot-clock deadline could look current.
+#[test]
+fn an_owner_from_an_earlier_boot_is_gone_whatever_holds_its_pid() {
+    let rig = Rig::new();
+    let mut d = rig.daemon();
+    let id = d.prepare(good_change()).unwrap();
+    d.crash_at = Some(CrashPoint::State("Checking"));
+    lost_or_crashed(d.run(id));
+    let mut wd = rig.watchdog();
+    let mut txn = wd.journal.sync_ledger().unwrap().live[&id].txn.clone();
+    assert!(!wd.watchdog_should_take_over(&txn), "same boot, live pid, within deadline");
+    txn.lease.owner = OwnerId::Daemon { pid: txn.lease.owner.pid(), boot_id: Hash::of(b"an earlier boot") };
+    assert!(wd.watchdog_should_take_over(&txn));
+}
+
 /// GA demo tail: the watchdog reverted while the daemon was down; the
 /// restarted daemon writes a reconciliation record that says so.
 #[test]

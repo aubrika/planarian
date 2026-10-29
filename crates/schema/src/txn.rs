@@ -195,6 +195,12 @@ impl OwnerId {
     pub fn is_watchdog(&self) -> bool {
         matches!(self, OwnerId::Watchdog { .. })
     }
+
+    pub fn boot_id(&self) -> Hash {
+        match self {
+            OwnerId::Daemon { boot_id, .. } | OwnerId::Watchdog { boot_id, .. } => *boot_id,
+        }
+    }
 }
 
 /// The manifest part of an evaluated generation.

@@ -2760,3 +2760,28 @@ security_floor = "candidate"
 [[fault.required_post.txn]]
 transition = "ApplyChange"
 terminal = "Committed"
+
+# B-7 (Medium). Fake only: a VM cannot advance CLOCK_BOOTTIME by 24 h
+# (deviations.md, owner decision 2026-10-29).
+[[fault]]
+id = "token-wall-clock-moved-back"
+family = "policy"
+summary = "An approval token is held, then the wall clock is moved back 48 h and 24 h pass. The token still expires 24 h after issue, timed on CLOCK_BOOTTIME (§12h): presenting it is refused and the parked change ends Rejected."
+spec = ["§12h", "I8", "B-7"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty", hold_token = true },
+  { raw = "set_wall_clock", by = "-48h" },
+]
+inject = { raw = "advance_clock", by = "24h1m" }
+after = [{ raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }]
+window = "1m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal_prefix = "Rejected"
+never = ["Activating"]

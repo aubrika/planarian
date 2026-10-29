@@ -201,6 +201,10 @@ impl<B: Backends> Host for ExecHost<B> {
         self.b.clock().now()
     }
 
+    fn boot_now(&self) -> Timestamp {
+        self.b.clock().boot_now()
+    }
+
     fn sleep(&self, d: Millis) {
         self.b.clock().sleep(d)
     }

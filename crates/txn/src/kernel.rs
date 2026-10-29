@@ -164,6 +164,8 @@ pub trait Host {
     /// Remove a GC root (I3). Returns false if it could not be removed.
     fn release_gc_root(&self, path: &str) -> bool;
     fn now(&self) -> Timestamp;
+    /// The boot clock (`CLOCK_BOOTTIME`): leases, deadlines and waits (§12h).
+    fn boot_now(&self) -> Timestamp;
     fn sleep(&self, d: Millis);
     /// SIGTERM then SIGKILL the process group via pidfd; true once confirmed dead.
     fn kill_worker(&self, pid: u32) -> bool;
@@ -317,14 +319,14 @@ impl<S: Store, H: Host> Kernel<S, H> {
 
     /// Wait up to `JOB_DRAIN` for `jobs` to leave the supervisor's queue.
     fn wait_gone(&mut self, jobs: &[JobId]) -> R<bool> {
-        let deadline = self.host.now().plus(JOB_DRAIN);
+        let deadline = self.host.boot_now().plus(JOB_DRAIN);
         loop {
             match self.host.generations().pending_jobs() {
                 Ok(pending) if !jobs.iter().any(|j| pending.contains(j)) => return Ok(true),
                 Ok(_) => {}
                 Err(_) => return Ok(false),
             }
-            if self.host.now() >= deadline {
+            if self.host.boot_now() >= deadline {
                 return Ok(false);
             }
             self.host.sleep(Millis::secs(1));
@@ -349,7 +351,14 @@ impl<S: Store, H: Host> Kernel<S, H> {
                 txn.id = id;
                 txn.state = TxnState::Prepared;
                 txn.recovery = txn.transition.recovery();
-                txn.lease = Lease { txn: id, owner: me, epoch: 1, worker_pid: worker, renewed: now, jobs: vec![] };
+                txn.lease = Lease {
+                    txn: id,
+                    owner: me,
+                    epoch: 1,
+                    worker_pid: worker,
+                    renewed: self.host.boot_now(),
+                    jobs: vec![],
+                };
                 j.store().set_fence(id, 1)?;
                 j.append(now, Record::Prepared(Box::new(txn))).map(|_| id)
             })?
@@ -743,8 +752,9 @@ impl<S: Store, H: Host> Kernel<S, H> {
         should_take_over(
             &txn.state,
             txn.lease.owner == self.me,
-            self.host.pid_alive(txn.lease.owner.pid()),
-            self.host.now(),
+            // An owner from an earlier boot is gone, whatever now holds its pid.
+            txn.lease.owner.boot_id() == self.me.boot_id() && self.host.pid_alive(txn.lease.owner.pid()),
+            self.host.boot_now(),
             txn.deadline,
             txn.lease.renewed,
         )
@@ -769,7 +779,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
             // takeover crashed between the two writes.
             let fence = j.store().fence(id).map_err(|e| KernelError::Journal(e.into()))?;
             let epoch = next_epoch(old.epoch, fence).ok_or(KernelError::LostLease(id))?;
-            let new = Lease { txn: id, owner: me, epoch, worker_pid: worker, renewed: now, jobs: vec![] };
+            let new =
+                Lease { txn: id, owner: me, epoch, worker_pid: worker, renewed: self.host.boot_now(), jobs: vec![] };
             // Fence first: from here on the old owner's calls are refused.
             j.store().set_fence(id, epoch).map_err(|e| KernelError::Journal(e.into()))?;
             j.append(now, Record::Takeover { txn: id, from_epoch: old.epoch, lease: new.clone() })?;

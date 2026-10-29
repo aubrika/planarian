@@ -139,6 +139,8 @@ pub struct Call {
 #[derive(Debug, Default)]
 pub struct World {
     pub now: Timestamp,
+    /// Wall clock minus boot clock, in ms (`set_wall_clock`, §12h).
+    pub wall_skew: i64,
     // ---- NixOS ----
     /// The owner's configuration as evaluated without any override.
     pub base_units: UnitDefs,
@@ -1112,7 +1114,14 @@ impl ProcessBackend for Fake {
 }
 
 impl Clock for Fake {
+    /// The world's `now` is elapsed time (boot time); the wall clock is it
+    /// plus `wall_skew`, which only `set_wall_clock` moves (§12h).
     fn now(&self) -> Timestamp {
+        let w = self.w();
+        Timestamp(w.now.0.saturating_add_signed(w.wall_skew))
+    }
+
+    fn boot_now(&self) -> Timestamp {
         self.w().now
     }
 

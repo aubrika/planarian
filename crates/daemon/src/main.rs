@@ -200,12 +200,18 @@ fn renewer(store_dir: PathBuf, txn_dir: PathBuf, capacity: u64, me: OwnerId) {
             let Ok(store) = FileStore::open(&store_dir, &txn_dir, capacity) else { continue };
             let Ok(mut j) = Journal::open(store) else { continue };
             let Ok(l) = j.sync_ledger().cloned() else { continue };
-            let now = planarian_backend_linux::process::Processes.now();
+            let clock = planarian_backend_linux::process::Processes;
+            let (now, boot_at) = (clock.now(), clock.boot_now());
             for t in l.live.values() {
                 if t.txn.lease.owner == me && !t.txn.state.is_pre_mutation() {
                     let _ = j.append(
                         now,
-                        Record::Renew { txn: t.txn.id, epoch: t.txn.lease.epoch, worker_pid: t.txn.lease.worker_pid },
+                        Record::Renew {
+                            txn: t.txn.id,
+                            epoch: t.txn.lease.epoch,
+                            worker_pid: t.txn.lease.worker_pid,
+                            boot_at,
+                        },
                     );
                 }
             }

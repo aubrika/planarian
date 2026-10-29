@@ -54,6 +54,10 @@ pub enum Record {
         txn: TxnId,
         epoch: u64,
         worker_pid: Option<u32>,
+        /// The renewal's time on the boot clock (§12h); 0 in records written
+        /// before v4.5, which then read as long ago.
+        #[serde(default)]
+        boot_at: Timestamp,
     },
     /// Written and fsynced before the backend call it names.
     OpBegin {
@@ -836,7 +840,7 @@ impl Ledger {
             Record::Prepared(t) => self.apply_prepared(*t),
             Record::Advance { txn, epoch, to, note } => self.apply_advance(txn, epoch, to, note),
             Record::Takeover { txn, from_epoch, lease } => self.apply_takeover(txn, from_epoch, lease),
-            Record::Renew { txn, epoch, worker_pid } => self.apply_renew(txn, epoch, at, worker_pid),
+            Record::Renew { txn, epoch, worker_pid, boot_at } => self.apply_renew(txn, epoch, boot_at, worker_pid),
             Record::OpBegin { op, call } => self.apply_op_begin(op, call),
             Record::OpAck { op, outcome } => self.apply_op_ack(op, outcome),
             Record::OverrideSet(s) => set_override(&mut self.overrides, s),

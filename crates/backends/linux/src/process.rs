@@ -34,9 +34,30 @@ impl ProcessBackend for Processes {
     }
 }
 
+fn boottime_ms() -> u64 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000
+}
+
+/// The wall clock and the boot clock, read once at the process's first use.
+static ANCHOR: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+
 impl Clock for Processes {
+    /// Wall-clock time, read once when the process first asks and advanced
+    /// from then on by `CLOCK_BOOTTIME` (§12h): every interval this process
+    /// measures (cooldowns, settle and activation windows, probe freshness)
+    /// is immune to the wall clock being moved, and the times it records
+    /// stay wall-clock times, comparable across boots.
     fn now(&self) -> Timestamp {
-        Timestamp(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0))
+        let (wall0, boot0) = *ANCHOR.get_or_init(|| {
+            let wall = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+            (wall, boottime_ms())
+        });
+        Timestamp(wall0.saturating_add(boottime_ms().saturating_sub(boot0)))
+    }
+
+    fn boot_now(&self) -> Timestamp {
+        Timestamp(boottime_ms())
     }
 
     fn sleep(&self, d: Millis) {

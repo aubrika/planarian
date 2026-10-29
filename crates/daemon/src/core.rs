@@ -1350,7 +1350,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 approve: p.bound_to,
                 what: render::transition(&p.proposal.transition),
                 facts: p.facts.clone(),
-                issued: p.issued,
+                // Shown to people: the boot-clock issue time on the wall clock.
+                issued: Timestamp(
+                    self.b.clock().now().0.saturating_sub(self.b.clock().boot_now().0.saturating_sub(p.issued.0)),
+                ),
             })
             .collect();
         StatusReport {

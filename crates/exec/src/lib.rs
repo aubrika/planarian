@@ -76,6 +76,8 @@ pub struct Parked {
     /// Who may approve it (the decision's class, §11).
     pub class: ApproverClass,
     pub bound_to: Hash,
+    /// When the token was issued, on the boot clock (§12h): moving the wall
+    /// clock cannot extend it, and it does not outlive the boot.
     pub issued: Timestamp,
     pub facts: DerivedFacts,
 }
@@ -184,7 +186,8 @@ fn build_candidate<G: GenerationBackend>(
     Ok(Candidate { staged, eval, built, merged })
 }
 
-/// An approval token issued at `issued` has expired by `now` (§12 step 4:
+/// An approval token issued at `issued` has expired by `now`, both on the
+/// boot clock (§12h; §12 step 4:
 /// 24 hours). Saturating: a token issued near the end of time never expires
 /// early, and no clock value makes this panic.
 pub fn token_expired(now: Timestamp, issued: Timestamp) -> bool {
@@ -446,6 +449,8 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
 
     fn transaction(&self, p: &Proposal, plan: &Plan, state: &SystemState, defs: &UnitDefs) -> Transaction {
         let now = self.b.clock().now();
+        // Leases and deadlines on the boot clock (§12h); `started` is shown.
+        let boot = self.b.clock().boot_now();
         let network = plan.facts.disruption == Disruption::ConnectivityLoss
             || plan.facts.affected_units.iter().any(|u| u.name == "NetworkManager");
         let prior_driver = match &plan.transition {
@@ -460,7 +465,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 owner: self.kernel.me.clone(),
                 epoch: 1,
                 worker_pid: None,
-                renewed: now,
+                renewed: boot,
                 jobs: vec![],
             },
             base_source: plan.staged.as_ref().map(|s| s.base_source),
@@ -478,7 +483,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             snapshot: None,
             expected: p.expected.clone(),
             started: now,
-            deadline: now.plus(if network { NETWORK_DEADLINE } else { GENERATION_DEADLINE }),
+            deadline: boot.plus(if network { NETWORK_DEADLINE } else { GENERATION_DEADLINE }),
             revert_to: state.generation,
             prior_driver,
             check: CheckContext {
@@ -588,7 +593,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         };
         if let Decision::Allow { tier: Tier::AskFirst, approver: class } = plan.decision {
             let bound_to = self.binding(&p, &plan, state);
-            let now = self.b.clock().now();
+            let now = self.b.clock().boot_now();
             self.parked.insert(
                 id,
                 Parked { txn: id, proposal: p, authz, class, bound_to, issued: now, facts: plan.facts.clone() },
@@ -746,7 +751,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             };
             return reject(RejectReason::Unauthorized, why);
         }
-        let now = self.b.clock().now();
+        let now = self.b.clock().boot_now();
         if token_expired(now, parked.issued) {
             return self.expire_one(parked.txn);
         }
@@ -813,7 +818,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
 
     /// Tokens expire after 24 h (§12 step 4); the parked transaction ends Rejected.
     pub fn expire(&mut self) -> Vec<TxnId> {
-        let now = self.b.clock().now();
+        let now = self.b.clock().boot_now();
         let old: Vec<TxnId> = self.parked.values().filter(|p| token_expired(now, p.issued)).map(|p| p.txn).collect();
         for t in &old {
             self.expire_one(*t);

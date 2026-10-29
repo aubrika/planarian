@@ -1014,6 +1014,17 @@ impl Sim {
                 let d = s.get("duration").and_then(dur).ok_or_else(|| Unsupported("suspend duration".into()))?;
                 self.fake.advance(d);
             }
+            // §12h: only the wall clock moves; the boot clock does not.
+            "set_wall_clock" => {
+                let by = get("by");
+                let (neg, rest) = match by.strip_prefix('-') {
+                    Some(r) => (true, r.to_string()),
+                    None => (false, by.trim_start_matches('+').to_string()),
+                };
+                let d = dur(&T::String(rest)).ok_or_else(|| Unsupported(format!("set_wall_clock {by}")))?;
+                let ms = d.0 as i64;
+                self.fake.w().wall_skew += if neg { -ms } else { ms };
+            }
             "advance_clock" => {
                 let d = s.get("by").and_then(dur).ok_or_else(|| Unsupported("advance_clock".into()))?;
                 self.fake.advance(d);
