@@ -7,23 +7,20 @@ tests only), and what it rests on. Status as of 2026-10-29 (GA baseline).
 The detailed proof notes are in `verification.md`; the trusted
 assumptions in `assumptions.md`; the counts in `verification-ratio.toml`.
 
-## 0. Naming: 0v and 0t
+## 0. Names
 
-In SPEC §17a, **0v** is what is verified and **0t** is what is trusted
-but unproven. Written next to numbers they read as zero times v ("0v:0t =
-28:43"), so they need new names. This document uses the recommended
-names below; the SPEC and the code keep the old ones until you choose.
+| Name | Meaning |
+| --- | --- |
+| **𝒱, the proven base** | The code that is verified: `schema`, `policy`, `txn`, and later crates as they enter the Verus subset. |
+| **𝒯, the trusted base** | What 𝒱 relies on but nobody has proved: backends, Nix, systemd, the kernel, firmware, vstd's specifications. Every trust is a line in `assumptions.md`. |
+| **d:a** | The verification ratio: proof obligations **d**ischarged to obligations **a**ssumed, per invariant and summed. |
+| **trust count, \|𝒯\|** | The number of `assumptions.md` entries plus every `external_body` and `assume` site in the verified crates. |
 
-| Proposal | Verified side | Trusted side | The ratio | "Size of 0t" | Notes |
-| --- | --- | --- | --- | --- | --- |
-| **A (recommended)** | **𝒱, the proven base** | **𝒯, the trusted base** | **d:a**, discharged to assumed | **trust count**, \|𝒯\| | The ratio counts proof obligations, not the sets, so it gets its own name. In plain text: V-base, T-base. |
-| B | proven core | trusted surface | proof ratio | trust surface | Words only, no symbols. "Surface" suggests area, which a count is not. |
-| C | Π (proofs) | Θ (trust) | Π:Θ | \|Θ\| | Compact, but Θ already means asymptotic bounds to most readers. |
-
-Proposal A also separates two things the old notation runs together: the
-*sets* (𝒱 is code, 𝒯 is everything that code relies on) and the *ratio*
-d:a (how many proof obligations each invariant has discharged against how
-many assumptions it cites). Today: **d:a = 28:43, trust count = 32.**
+Today: **d:a = 28:43, trust count = 32.** The ratio counts proof
+obligations, not the sets themselves, so it has its own name. In plain
+text, write V-base and T-base. (Until 2026-10-29 these were 0v, 0t,
+"0v:0t" and "the size of 0t"; the new names replace them everywhere,
+because "0v:0t" reads as zero times v.)
 
 ## 1. The trust boundary
 

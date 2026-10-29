@@ -1,8 +1,8 @@
-//! `planarian-gym verification`: the verification ratio 0v:0t and the size
-//! of 0t (SPEC §17a), from docs/verification-ratio.toml, checked against the
+//! `planarian-gym verification`: the verification ratio d:a (discharged to
+//! assumed obligations) and the trust count |𝒯| (SPEC §17a), from docs/verification-ratio.toml, checked against the
 //! source and docs/assumptions.md, and held to the recorded baseline.
 //!
-//! The size of 0t is the number of assumptions.md ids (V, P, G) plus every
+//! The trust count is the number of assumptions.md ids (V, P, G) plus every
 //! `external_body` and `assume` site in the verified crates. A discharged
 //! obligation is a Verus lemma or verified function, or a Kani harness,
 //! named in the file and present in the source.
@@ -77,7 +77,7 @@ pub fn run(write_baseline: bool) -> Report {
         .flat_map(|p| (1..=40).map(move |n| format!("{p}{n}")))
         .filter(|id| assumptions.contains(&format!("**{id}**")))
         .collect();
-    let size_0t = ids.len() + trust_sites();
+    let trust_count = ids.len() + trust_sites();
 
     let mut lines = vec![];
     let mut per: BTreeMap<String, (usize, usize)> = BTreeMap::new();
@@ -112,12 +112,12 @@ pub fn run(write_baseline: bool) -> Report {
     }
 
     // The ratchet: neither the global nor any per-invariant ratio falls, and
-    // 0t does not grow.
+    // the trust count does not grow.
     let base = doc.get("baseline");
     let b = |k: &str| base.and_then(|b| b.get(k)).and_then(T::as_integer).unwrap_or(0) as usize;
     if !write_baseline && base.is_some() {
-        if size_0t > b("size_0t") {
-            errors.push(format!("the size of 0t grew: {size_0t} > {}", b("size_0t")));
+        if trust_count > b("trust_count") {
+            errors.push(format!("the trust count grew: {trust_count} > {}", b("trust_count")));
         }
         let (bd, ba) = (b("discharged"), b("assumed"));
         if ba > 0 && a_sum > 0 && (d_sum as f64 / a_sum as f64) < (bd as f64 / ba as f64) - 1e-9 {
@@ -139,9 +139,9 @@ pub fn run(write_baseline: bool) -> Report {
     }
 
     let mut text = format!(
-        "verification ratio (SPEC §17a)\n  size of 0t: {size_0t} ({} assumptions.md entries + {} external_body/assume sites)\n  global 0v:0t: {d_sum}:{a_sum} ({:.2})\n",
+        "verification ratio (SPEC §17a)\n  trust count: {trust_count} ({} assumptions.md entries + {} external_body/assume sites)\n  global d:a: {d_sum}:{a_sum} ({:.2})\n",
         ids.len(),
-        size_0t - ids.len(),
+        trust_count - ids.len(),
         if a_sum == 0 { 0.0 } else { d_sum as f64 / a_sum as f64 }
     );
     text.push_str(&lines.join("\n"));
@@ -149,7 +149,7 @@ pub fn run(write_baseline: bool) -> Report {
     if write_baseline {
         let per_s: Vec<String> = per.iter().map(|(k, (d, a))| format!("{k} = [{d}, {a}]")).collect();
         text.push_str(&format!(
-            "\n[baseline]\nsize_0t = {size_0t}\ndischarged = {d_sum}\nassumed = {a_sum}\n\n[baseline.per_invariant]\n{}\n",
+            "\n[baseline]\ntrust_count = {trust_count}\ndischarged = {d_sum}\nassumed = {a_sum}\n\n[baseline.per_invariant]\n{}\n",
             per_s.join("\n")
         ));
     }

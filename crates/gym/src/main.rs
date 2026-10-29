@@ -3,7 +3,7 @@
 //!   planarian-gym list    [--catalog FILE]
 //!   planarian-gym run     [--catalog FILE] --harness fake [--id ID ...] [--all]
 //!   planarian-gym show-reconciliation --harness fake --id ID
-//!   planarian-gym verification [--write-baseline]   the 0v:0t report (§17a)
+//!   planarian-gym verification [--write-baseline]   the d:a report (§17a)
 //!
 //! The fake harness runs the real daemon core, executor, kernel and watchdog
 //! logic against the in-memory machine (`planarian-fake`). The VM harness is

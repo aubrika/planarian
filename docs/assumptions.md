@@ -35,7 +35,7 @@ See `verification.md` for what is proved.
 
 **G1** Some lease holder eventually runs. **G2** A fenced worker eventually stops issuing calls, or its calls are refused. **G3** Journal writes eventually succeed. **G4** Backend calls terminate.
 
-The ids (V, P, G) are what `docs/verification-ratio.toml` cites; the size of 0t counts them plus every `external_body` and `assume` site in the verified crates (`planarian-gym verification`).
+The ids (V, P, G) are what `docs/verification-ratio.toml` cites; the trust count is their number plus every `external_body` and `assume` site in the verified crates (`planarian-gym verification`).
 
 ## Fake harness (tests only, not proof sites)
 

@@ -32,7 +32,7 @@ jobs:
         run: crates/gym/demo.sh --harness fake
       - name: Dependency boundaries
         run: bash nix/tests/boundaries.sh .
-      - name: Verification ratio 0v:0t and the size of 0t (SPEC §17a; fails if either regresses)
+      - name: Verification ratio d:a and the trust count (SPEC §17a; fails if either regresses)
         run: cargo run -q -p planarian-gym -- verification
 
   nix:

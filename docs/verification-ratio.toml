@@ -1,4 +1,4 @@
-# The verification ratio 0v:0t and the size of 0t (SPEC §17a), per invariant.
+# The verification ratio d:a and the trust count (SPEC §17a), per invariant.
 #
 # `discharged`: proof obligations a tool closes on every CI run, as
 #   "crate::name": a Verus `proof fn` (or a function verified against its
@@ -8,12 +8,12 @@
 #
 # `planarian-gym verification` checks that every name exists in the source
 # and every id in assumptions.md, prints the report, and fails if a ratio
-# fell or 0t grew against [baseline] (the ratchet: every gate).
+# fell or the trust count grew against [baseline] (the ratchet: every gate).
 
 [baseline]
 # GA (2026-10-29), from `planarian-gym verification --write-baseline`.
 # Change these only when a change improves them.
-size_0t = 32
+trust_count = 32
 discharged = 28
 assumed = 43
 
