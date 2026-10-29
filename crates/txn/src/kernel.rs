@@ -46,6 +46,9 @@ pub enum RecoveryAction {
     CheckDevice,
     /// A driver revert was under way: run it again.
     RevertDevice,
+    /// A boot-only candidate waits for its boot (§12 step 7): leave it until
+    /// a reboot; then confirm it if it booted, else Reverted.
+    AwaitBoot,
     /// No recovery path: RecoveryFailed.
     Fail,
 }
@@ -119,6 +122,7 @@ pub fn recovery_action(state: &TxnState, strategy: RecoveryStrategy) -> Recovery
         (TxnState::Published, S::RevertGeneration) => A::RecheckPublished,
         (TxnState::Promoted, S::RevertGeneration) => A::WriteCommitted,
         (TxnState::Reverting, S::RevertGeneration) => A::RevertGeneration,
+        (TxnState::AwaitingBoot, S::RevertGeneration) => A::AwaitBoot,
         (TxnState::Activating, S::UnbindDevice) => A::DriverBound,
         (TxnState::Checking, S::UnbindDevice) => A::CheckDevice,
         (TxnState::Reverting, S::UnbindDevice) => A::RevertDevice,
@@ -540,6 +544,36 @@ impl<S: Store, H: Host> Kernel<S, H> {
         self.write_committed(txn)
     }
 
+    /// The crash table's AwaitingBoot row (§12): no reboot since the one-shot
+    /// entry was published, leave it; after a reboot, the candidate booted →
+    /// the boot-confirmation probes decide (pass: it becomes the default,
+    /// Promoted, Committed; fail: revert); it did not boot → Reverted.
+    pub fn await_boot(&mut self, txn: &Transaction) -> R<TxnState> {
+        let boot_of = |o: &OwnerId| match o {
+            OwnerId::Daemon { boot_id, .. } | OwnerId::Watchdog { boot_id, .. } => *boot_id,
+        };
+        if boot_of(&txn.lease.owner) == boot_of(&self.me) {
+            return Ok(TxnState::AwaitingBoot);
+        }
+        let Some(cand) = Self::candidate(txn) else {
+            return self.recovery_failed(txn, "AwaitingBoot without a candidate");
+        };
+        if self.host.generations().last_booted().ok() != Some(cand) {
+            self.advance(txn, TxnState::Reverted, "the boot-only candidate did not boot; the default entry did")?;
+            return Ok(TxnState::Reverted);
+        }
+        match self.host.check(txn, CheckPhase::Candidate) {
+            Verdict::Pass => {
+                let o = self.call(txn.id, "publish_boot", |h, op| h.generations().publish_boot(cand, op))?;
+                if !o.is_success() {
+                    return self.revert_generation(txn, &format!("publish_boot: {o:?}"));
+                }
+                self.promote_and_commit(txn)
+            }
+            Verdict::Fail(why) => self.revert_generation(txn, &why),
+        }
+    }
+
     fn write_committed(&mut self, txn: &Transaction) -> R<TxnState> {
         self.advance(txn, TxnState::Committed, "")?;
         if let Some(cand) = Self::candidate(txn) {
@@ -799,6 +833,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
             }
             A::CheckDevice => self.check_device(&txn),
             A::RevertDevice => self.revert_device(&txn, "recovery: re-run revert"),
+            A::AwaitBoot => self.await_boot(&txn),
             A::Fail => {
                 let why = format!("no recovery path for {} under {:?}", tag(&txn.state), txn.recovery);
                 self.recovery_failed(&txn, &why)

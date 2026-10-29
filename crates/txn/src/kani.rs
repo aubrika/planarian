@@ -18,7 +18,7 @@ use planarian_schema::{Actor, Hash, RecoveryStrategy, RejectReason, Timestamp, T
 
 fn any_state() -> TxnState {
     let i: u8 = kani::any();
-    match i % 13 {
+    match i % 14 {
         0 => TxnState::Prepared,
         1 => TxnState::Staged,
         2 => TxnState::Built,
@@ -31,6 +31,7 @@ fn any_state() -> TxnState {
         9 => TxnState::Reverted,
         10 => TxnState::RecoveryFailed,
         11 => TxnState::Rejected(RejectReason::Interrupted),
+        12 => TxnState::AwaitingBoot,
         _ => TxnState::Cancelled(Actor::Daemon),
     }
 }
@@ -69,6 +70,7 @@ fn idx(s: &TxnState) -> u8 {
         TxnState::RecoveryFailed => 10,
         TxnState::Rejected(_) => 11,
         TxnState::Cancelled(_) => 12,
+        TxnState::AwaitingBoot => 13,
     }
 }
 
@@ -140,6 +142,14 @@ fn action_ok(action: RecoveryAction, from: &TxnState, strategy: RecoveryStrategy
         }
         A::CheckDevice => {
             path_ok(from, strategy, &[Checking, Committed]);
+            reverts_ok(from, strategy);
+        }
+        A::AwaitBoot => {
+            // After a reboot (before one, the transaction is left as is):
+            // the candidate booted and passed, failed, or did not boot.
+            path_ok(from, strategy, &[AwaitingBoot, Promoted, Committed]);
+            path_ok(from, strategy, &[AwaitingBoot, RecoveryFailed]);
+            path_ok(from, strategy, &[AwaitingBoot, Reverted]);
             reverts_ok(from, strategy);
         }
         A::Fail => path_ok(from, strategy, &[from.clone(), RecoveryFailed]),
