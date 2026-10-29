@@ -851,6 +851,9 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
             if cg.is_empty() {
                 return Err(format!("oom: {name} has no cgroup"));
             }
+            // NixOS test VMs panic on any OOM (vm.panic_on_oom=2), a cgroup's
+            // included: this one is the fault, so only it is let through.
+            sh("sysctl -w vm.panic_on_oom=0");
             sh(&format!("echo 4096 > /sys/fs/cgroup{cg}/memory.max"));
             if !sh(&format!(
                 "for _ in $(seq 100); do [ \"$({ctl} show -p Result --value {name})\" = oom-kill ] && exit 0; sleep 0.1; done; exit 1"
