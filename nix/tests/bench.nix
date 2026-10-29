@@ -76,11 +76,16 @@ pkgs.testers.runNixOSTest {
         print(json.dumps(report["idle"]))
 
     # The demo: the benchmark demo Xonotic ships, else the first one found.
+    # nixpkgs' xonotic installs xonotic-sdl (and xonotic-glx in some builds);
+    # its data is a separate store path in the closure.
+    game = machine.succeed(
+        "for b in xonotic-glx xonotic-sdl xonotic; do command -v $b && break; done").strip().splitlines()[0]
     demos = machine.succeed(
-        "for f in $(dirname $(readlink -f $(command -v xonotic-glx)))/../share/xonotic/data/*.pk3; do"
+        "for p in $(nix-store -qR /run/current-system | grep -i xonotic); do"
+        " find $p -name '*.pk3' 2>/dev/null; done | sort -u | while read f; do"
         " unzip -Z1 $f 2>/dev/null | grep -i '^demos/.*\\.dem$'; done | sort -u || true").split()
     demo = next((d for d in demos if "keybench" in d), demos[0] if demos else None)
-    report["game"] = {"demo": demo, "renderer": machine.succeed(
+    report["game"] = {"binary": game, "demos_found": demos, "demo": demo, "renderer": machine.succeed(
         "xvfb-run -a glxinfo -B 2>/dev/null | grep -i 'renderer string' || true").strip()}
 
     def stopped(on):
@@ -102,7 +107,7 @@ pkgs.testers.runNixOSTest {
             machine.succeed("systemd-run --unit=bench-crasher sh -c 'while true; do sleep 30; systemctl kill --signal=SIGSEGV bench-svc; done'")
         _, log = machine.execute(
             f"MANGOHUD_CONFIG=no_display,autostart_log=1,log_duration=120,output_folder={out} "
-            f"timeout 200 xvfb-run -a -s '-screen 0 640x480x24' mangohud --dlsym xonotic-glx "
+            f"timeout 200 xvfb-run -a -s '-screen 0 640x480x24' mangohud --dlsym {game} "
             f"-nosound -benchmark {demo.removesuffix('.dem')} +vid_fullscreen 0 +vid_width 640 +vid_height 480 2>&1 | tail -n 5")
         if busy:
             machine.execute("systemctl stop bench-crasher")

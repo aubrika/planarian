@@ -14,6 +14,8 @@ evidence for each criterion and how to reproduce it. Updated 2026-10-29.
 | 2. Zero gamed successes | Guarded: see "Passes that prove something"; entries a harness cannot run faithfully are UNSUPPORTED there, never passed |
 | 2. Unnecessary interventions on the intent cases = 0 | 0 of 9 |
 | 3. `policy` proofs pass in CI | Yes: `ci.yml`'s `nix` job runs the Verus check |
+| 4. Baselines: the invisibility budget (§21) | Idle (VM, 5 min, run "Invisibility budget" #2): **0.063% of one core, 7.9 MB resident, 1.58 wakeups/s** (targets < 0.5%, < 50 MB). The game frame-time comparison has not completed yet: the first runs found no Xonotic demo (harness fix pending a run). |
+| 4. Baselines: the verification ratio (§17a) | **Size of 0t = 32; global 0v:0t = 28:43** (`planarian-gym verification`, a CI ratchet; per invariant in `docs/verification.md`) |
 
 ## 1. The demonstration
 
