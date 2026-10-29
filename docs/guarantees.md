@@ -16,7 +16,7 @@ assumptions in `assumptions.md`; the counts in `verification-ratio.toml`.
 | **d:a** | The verification ratio: proof obligations **d**ischarged to obligations **a**ssumed, per invariant and summed. |
 | **trust count, \|𝒯\|** | The number of `assumptions.md` entries plus every `external_body` and `assume` site in the verified crates. |
 
-Today: **d:a = 42:50, trust count = 32.** The ratio counts proof
+Today: **d:a = 47:50, trust count = 32.** The ratio counts proof
 obligations, not the sets themselves, so it has its own name. In plain
 text, write V-base and T-base. (Until 2026-10-29 these were 0v, 0t,
 "0v:0t" and "the size of 0t"; the new names replace them everywhere,
@@ -29,7 +29,7 @@ flowchart TB
   subgraph V["𝒱 · proven base (Verus)"]
     schema["schema<br/>types, TxnState predicates,<br/>recovery table, Sensitivities<br/>(17 obligations)"]
     policy["policy<br/>decide == decide_spec,<br/>may_approve, may_grant<br/>(52 obligations)"]
-    txn["txn: machine + ledger<br/>step_allowed == step_spec,<br/>validate, apply, well_formed<br/>(42 obligations)"]
+    txn["txn: machine, ledger, hash chain<br/>step_allowed == step_spec,<br/>validate, apply, well_formed,<br/>follows, verify (52 obligations)"]
   end
   subgraph K["model-checked (Kani)"]
     kern["txn::kernel decisions<br/>recovery_action, should_take_over,<br/>next_epoch / fence_admits, swap_step"]
@@ -38,7 +38,7 @@ flowchart TB
   subgraph T["tested, not proved"]
     exec["exec: kernel orchestration,<br/>derive (DerivedFacts)"]
     daemon["daemon: core loop, residue,<br/>boot report, hooks"]
-    journal["journal hash chain (I18)"]
+    journal["journal I/O: framing,<br/>torn-tail truncation"]
     backends["backends: systemd, nixos, runtime"]
   end
   subgraph A["𝒯 · trusted base"]
@@ -72,7 +72,7 @@ whether the backends do what they report (P1).
 **Status:** **Proved** = discharged by Verus or Kani under the listed
 assumptions. **Tested** = tests and gym entries only (its proof phase in
 brackets). d:a counts per invariant, so a lemma that serves two
-invariants counts for both (42 counts, 40 distinct obligations).
+invariants counts for both (47 counts, 45 distinct obligations).
 
 | Id | Guarantee, in plain words | Status | Discharged by | Rests on | d:a |
 | --- | --- | --- | --- | --- | --- |
@@ -93,7 +93,7 @@ invariants counts for both (42 counts, 40 distinct obligations).
 | **I15** | **One owner per transaction; a stale epoch is refused; only the lease holder advances the journal.** | **Proved** | `validate`, `takeover_fences_out_the_previous_owner` (Kani) | P4, P7 | 2:2 |
 | **I16** | **No automatic revert, rollback or boot fallback goes below the security floor; going below needs an administrator.** | **Proved** (decide; bootloader by test) | `i16_below_floor_needs_administrator`, `administrator_class_only_on_ask_first` | V1, V2, P3 | 2:3 |
 | I17 | There is always at least one administrator. | Tested | (`i17_root_is_always_an_administrator` is a unit test) | P8 | 0:1 |
-| I18 | Every journal record commits to its predecessor's hash; a broken chain is detected on read. | Tested | — | P5, P4 | 0:2 |
+| **I18** | **Every journal record commits to its predecessor's hash; a broken chain is detected on read.** | **Proved** (trusting SHA-256) | `follows`, `verify`, `next_link`, `appending_keeps_the_chain`, `an_edited_record_breaks_the_chain` | P5, P4 | 5:2 |
 | **I19** | **No principal approves its own proposal or grants itself a capability it lacks.** | **Proved** | `i19_no_self_approval`, `may_approve`, `may_grant` | V1 | 3:1 |
 | I20 | No agent starts while planarian-ready.target is not reached, in every failure posture. | Tested | — | P6, P8 | 0:2 |
 | **I21** | **Nothing irreversible, or that could lose a session, data or connectivity, runs without asking, unless only your own session is affected; another user's session needs an administrator.** | **Proved** | `global_floors`, `own_session_is_per_session` | V1, V2, P9 | 2:3 |
@@ -148,6 +148,11 @@ where a mapping is not obvious, the cell says why it holds (§7).
 | `well_formed` (verified fn) | The executable check equals the invariant: a checkpoint read from disk must pass it. | I6 |
 | `i6_one_generation_active` | From the invariant: at most one generation transaction active, and nothing else in flight beside it (except while it awaits a boot). | I6 |
 | `compatible_exec` (verified fn) | The executable compatibility check equals the I6 rule. | I6 |
+| `follows` (verified fn) | A record follows exactly when its seq is next and its `prev` is the current head; otherwise it says whether it is out of sequence (a torn tail) or unchained (an edit). Every read calls it. | I18 |
+| `verify` (verified fn) | A segment is accepted exactly when every record follows; otherwise the first break is reported. | I18 |
+| `next_link` (verified fn) | The writer gives each record the next seq and the current head. | I18 |
+| `appending_keeps_the_chain` | Appending keeps a chained journal chained: a break on read is damage or an edit, never the writer. | I18 |
+| `an_edited_record_breaks_the_chain` | Change one record's hash and the segment no longer verifies. | I18 |
 | `add_interlock` (verified fn) | The sentinel path (RecoveryFailed recorded outside the journal) sets the interlock and preserves the invariant. | I12: "RecoveryFailed always sets the interlock" when the journal cannot take the record. |
 
 ### Kani: the kernel's decisions and exec (bounded model checking, all inputs)
@@ -302,7 +307,7 @@ none is proved yet.
   the evaluated generation (P9). `exec` enters Verus in Phase C; today it
   has Kani on its pure decisions and property tests that crash the kernel
   at each of 15 points.
-- **Tested-only invariants:** I1–I4, I7, I13, I17, I18, I20.
+- **Tested-only invariants:** I1–I4, I7, I13, I17, I20 (I13 and I17 now have proof targets: SPEC §17a).
 - **`schema::digest`** is property-tested, not proved.
 - **Every proved obligation now counts.** Fourteen counted toward
   nothing at GA. Four were mapped to I6 and I12, and the other ten
@@ -325,3 +330,86 @@ none is proved yet.
 The ratchet: at every gate, d:a may not fall (globally or for any
 invariant) and \|𝒯\| may not grow. `planarian-gym verification` enforces
 it in CI.
+
+## 9. Where it is headed
+
+The end state the SPEC plans, with every scheduled proof target done
+(SPEC §4 phases and §17a). This is a plan, not a result: Phase A is in
+progress and B–E have not started. Green boxes are proved today; blue
+boxes are scheduled proof targets; each group's title, or the box
+itself, names the phase that proves it.
+
+```mermaid
+flowchart TB
+  subgraph V["𝒱 · proven base, end state"]
+    direction TB
+    subgraph VA["A · the monitor"]
+      schema2["schema"]:::done
+      policy2["policy: decide, floors, authority<br/>(I5 I10 I11 I14 I16 I19 I21 I22)"]:::done
+      txn2["txn: state machine, ledger,<br/>hash chain (I6 I12 I15 I18 I23)"]:::done
+      i17["I17: administrators never empty"]:::a
+      residue["residue classifier<br/>(Kani in A, Verus in C)"]:::a
+      digest["schema::digest"]:::a
+    end
+    subgraph VC["B, C · executor, planner"]
+      exec2["exec orchestration and derive<br/>(C: write-ahead order; retires P9)"]:::c
+      incident["incident planner (I13, C)"]:::c
+      broker["approval broker (I8, C)"]:::c
+      diag["diagnoser soundness<br/>and scorer (B)"]:::b
+    end
+    subgraph VD["D · system layer"]
+      switch["switch and rollback<br/>(I1, I3)"]:::d
+      super["Rust init and supervisor"]:::d
+      store["store integrity,<br/>content-addressed paths"]:::d
+    end
+    subgraph VE["E · kernel, core delivery"]
+      ostd["Asterinas OSTD<br/>(the kernel's privileged core)"]:::e
+      channel["model channel (I9)"]:::e
+      update["core update path (I2)"]:::e
+    end
+  end
+  subgraph S["tested, no proof planned"]
+    glue["daemon glue, CLI, console,<br/>intent matcher"]
+    sys["memory-safe Rust: Snix evaluator,<br/>CoW filesystem, drivers outside OSTD"]
+  end
+  subgraph T["𝒯 · what remains"]
+    hw["hardware and firmware"]
+    crypto["SHA-256 and signatures (P5)"]
+    input["input-addressed store paths<br/>(signature + NAR hash, not content)"]
+    tools["the proof tools: Verus, Z3, rustc"]
+    model["the model's judgement<br/>(contained by I9, not proved right)"]
+    people["the people who approve"]
+  end
+  S -->|"every change through"| V
+  V -.->|rests on| T
+  S -.->|rests on| T
+  classDef done fill:#d8f0d8,stroke:#2e7d32,color:#1b3d1b
+  classDef a fill:#e3eefc,stroke:#1565c0,color:#0d2a4d
+  classDef b fill:#e3eefc,stroke:#1565c0,color:#0d2a4d
+  classDef c fill:#e3eefc,stroke:#1565c0,color:#0d2a4d
+  classDef d fill:#e3eefc,stroke:#1565c0,color:#0d2a4d
+  classDef e fill:#e3eefc,stroke:#1565c0,color:#0d2a4d
+```
+
+What each phase moves from 𝒯 (or from "tested") into 𝒱:
+
+| Phase | Proved | Retires or shrinks |
+| --- | --- | --- |
+| A (now) | `schema`, `policy`, `txn` incl. the hash chain; then I17, the residue classifier (Kani), `schema::digest` | — (the proofs rest on V1–V6, P-ids) |
+| B | diagnoser soundness and scorer | how far the diagnosis is trusted |
+| C | `exec` (with the write-ahead order), the incident planner (I13), the approval broker (I8), the residue classifier under Verus | P9 (facts derived honestly), the kernel-ordering gap |
+| D | switch and rollback (I1, I3), the Rust supervisor, store integrity for content-addressed paths | P2, P3, P6 and C Nix and systemd themselves |
+| E | Asterinas OSTD, the model channel (I9), the core update path (I2) | P8 (the kernel), most of what remains of the platform |
+
+What never moves: hardware and firmware, the hash function, the people
+who approve, and the proof tools themselves. The last is worth saying
+plainly: Verus, Z3 and the Rust compiler are trusted today, but
+`assumptions.md` does not list them, so the trust count does not count
+them. Whether it should is an open question. The end state is the
+formula from §0 taken seriously: 𝒯 shrinks toward that floor while 𝒱
+grows, so |𝒯|/|𝒱| falls, and |𝒯| never reaches zero.
+
+Four invariants have no proof scheduled even in the end state: I4 and I20
+depend on what services and the init system report (I20 becomes provable
+once the supervisor is Planarian's own, in D, if the SPEC adds it), and
+I7's completeness is a property of `exec` that C could take on.

@@ -15,6 +15,7 @@
 // rather than `matches!` and let-chains.
 #![allow(clippy::ptr_arg, clippy::match_like_matches_macro, clippy::collapsible_if, clippy::single_match)]
 
+pub mod chain;
 pub mod fake;
 pub mod journal;
 pub mod kernel;

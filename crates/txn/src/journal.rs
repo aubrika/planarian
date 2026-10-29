@@ -27,6 +27,7 @@
 //! Several handles (the daemon and the watchdog) may share a store. Every
 //! append takes the store lock and first catches up on records others wrote.
 
+use crate::chain::{self, Follows, Link, Verdict};
 use crate::ledger::{Entry, InterlockEntry, Ledger, LedgerError, Record};
 use crate::store::Store;
 use planarian_schema::{GenerationId, Hash, Timestamp, Transition, TxnId};
@@ -335,13 +336,14 @@ impl<S: Store> Journal<S> {
                 continue;
             }
             skipping = false;
-            if seq != self.ledger.last_seq + 1 {
-                return self.stop_at_tail(truncate);
-            }
-            if f.prev != self.head {
-                return Err(JournalError::Integrity(format!(
-                    "record {seq} does not follow the hash chain (it may have been edited)"
-                )));
+            match chain::follows(self.ledger.last_seq, &self.head, seq, &f.prev) {
+                Follows::Yes => {}
+                Follows::OutOfSequence => return self.stop_at_tail(truncate),
+                Follows::Unchained => {
+                    return Err(JournalError::Integrity(format!(
+                        "record {seq} does not follow the hash chain (it may have been edited)"
+                    )));
+                }
             }
             let entry: Entry = match serde_json::from_slice(payload) {
                 Ok(e) => e,
@@ -404,12 +406,12 @@ impl<S: Store> Journal<S> {
     /// edited on disk after it was read. Read-only.
     pub fn verify_chain(&mut self) -> Result<(), JournalError> {
         let _g = self.store.lock()?;
-        let (mut head, ckpt) = match self.load_checkpoint()? {
+        let (start, ckpt) = match self.load_checkpoint()? {
             Some((seq, _, h)) => (h, seq),
             None => (Hash::ZERO, 0),
         };
         let mut off = 0u64;
-        let mut last = ckpt;
+        let mut links = Vec::new();
         while off < self.offset {
             let header = self.store.read_at(off, HEADER)?;
             let len = if header.len() == HEADER {
@@ -425,13 +427,19 @@ impl<S: Store> Journal<S> {
                 off += f.size as u64;
                 continue;
             }
-            if f.seq != last + 1 || f.prev != head {
-                return Err(JournalError::Integrity(format!("record {} does not follow the hash chain", f.seq)));
-            }
-            head = chain(&f.prev, f.seq, f.payload);
-            last = f.seq;
+            links.push(Link { seq: f.seq, prev: f.prev, next: chain(&f.prev, f.seq, f.payload) });
             off += f.size as u64;
         }
+        // Verified: accepts exactly a chained segment, else names its first break.
+        let head = match chain::verify(ckpt, start, &links) {
+            Verdict::Chained { head, .. } => head,
+            Verdict::Break { at, .. } => {
+                return Err(JournalError::Integrity(format!(
+                    "record {} does not follow the hash chain",
+                    links[at].seq
+                )));
+            }
+        };
         if ckpt == self.checkpoint_seq && head != self.head {
             return Err(JournalError::Integrity("the journal no longer matches what was read".into()));
         }
@@ -484,17 +492,20 @@ impl<S: Store> Journal<S> {
     }
 
     fn append_locked(&mut self, at: Timestamp, record: Record) -> Result<Entry, JournalError> {
-        let entry = Entry { seq: self.ledger.last_seq + 1, at, record };
+        // The next seq and the current head (verified: what is appended
+        // always follows the chain, `chain::appending_keeps_the_chain`).
+        let (seq, prev) = chain::next_link(self.ledger.last_seq, &self.head);
+        let entry = Entry { seq, at, record };
         self.ledger.validate(&entry)?;
         let payload = serde_json::to_vec(&entry).map_err(|e| JournalError::Corrupt(e.to_string()))?;
-        let bytes = frame(entry.seq, &self.head, &payload);
+        let bytes = frame(seq, &prev, &payload);
         if self.offset + bytes.len() as u64 > self.store.capacity() {
             return Err(JournalError::Full);
         }
         self.store.write_at(self.offset, &bytes)?;
         self.store.sync()?;
         self.ledger.apply(entry.clone())?;
-        self.head = chain(&self.head, entry.seq, &payload);
+        self.head = chain(&prev, seq, &payload);
         self.offset += bytes.len() as u64;
         Ok(entry)
     }

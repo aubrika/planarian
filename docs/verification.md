@@ -31,15 +31,16 @@ plus 13 `external_body` sites: 8 ledger helpers and 5 opaque types);
 proved obligations (`only_generations_publish` and
 `boot_only_never_activates` to I6, `step_allowed` and `add_interlock` to
 I12; arguments in `guarantees.md` §3), and to **42:50** when I21–I23 were
-added to SPEC §7 for ten proved obligations no invariant named. Invariants
-with a proof claim in Phase A: I5 4:3, I6 7:5, I11 2:2, I12 9:8, I21 2:3,
+added to SPEC §7 for ten proved obligations no invariant named, and to
+**47:50** with the proof of I18's hash chain. Invariants with a proof
+claim in Phase A: I5 4:3, I6 7:5, I11 2:2, I12 9:8, I18 5:2, I21 2:3,
 I22 5:3, I23 3:1, I14 1:2, I15 2:2, I16 2:3, I19 3:1.
-I1–I4, I7, I13, I17, I18 and I20 are tested, not proved (their proof
+I1–I4, I7, I13, I17 and I20 are tested, not proved (their proof
 phases are in SPEC §8).
 
 Before and after v4.4 (owner decision Q6): Verus verified 17 / 37 / 38
 obligations in `schema` / `policy` / `txn` before the v4.4 types, and
-17 / 52 / 42 after (52 with the G16 lemma). No proof was weakened. The policy lemmas extend to the
+17 / 52 / 42 after (52 with the G16 lemma; `txn` is 52 with the hash chain). No proof was weakened. The policy lemmas extend to the
 new types and add I16 and I19. The ledger adds v4.4's I6 and the boot-only
 path.
 
@@ -155,6 +156,21 @@ exclusivity check in `validate`; accepting a takeover with an equal epoch;
 not setting the interlock on RecoveryFailed; dropping I6 from the rule;
 dropping the "one active generation transaction" clause from the
 executable compatibility check.
+
+**Hash chain** (`chain.rs`, I18). The journal's chain decision, apart from
+its I/O: hashing stays outside (SHA-256 is P5), so a record enters as a
+`Link` with the head it claims to follow and the head after it.
+
+| Obligation | Property |
+| --- | --- |
+| `follows` | A record follows exactly when its seq is the next one and its `prev` is the current head; otherwise it says which (out of sequence: a torn tail; unchained: an edit or damage). `journal::scan` calls it for every record read. |
+| `verify` | A segment is accepted exactly when every record follows; otherwise the first record that does not is reported, and every record before it follows. `journal::verify_chain` calls it. |
+| `next_link` | The writer gives the next record the next seq and the current head. `journal::append` calls it. |
+| `appending_keeps_the_chain` | A chained segment with a record appended by `next_link` is still chained: every journal the writer produces is chained, so a break on read is damage or an edit. |
+| `an_edited_record_breaks_the_chain` | If a record's hash changes while the record after it is untouched, the segment no longer verifies. (That an edited payload changes the hash is P5.) |
+
+**Mutation check:** dropping the hash comparison from `follows` fails its
+postcondition.
 
 **Not proved here:** that the kernel journals OpBegin before the backend
 call it names (it does, in `kernel.rs`, which is not verified; §17a puts

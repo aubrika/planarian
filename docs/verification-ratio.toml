@@ -13,10 +13,11 @@
 [baseline]
 # GA (2026-10-29), from `planarian-gym verification --write-baseline`;
 # raised the same day when four proved obligations were mapped (I6, I12)
-# and again when I21-I23 were added to the SPEC for ten more.
+# and again when I21-I23 were added to the SPEC for ten more, and when
+# I18's hash chain was proved (txn::chain).
 # Change these only when a change improves them.
 trust_count = 32
-discharged = 42
+discharged = 47
 assumed = 50
 
 [baseline.per_invariant]
@@ -36,7 +37,7 @@ I14 = [1, 2]
 I15 = [2, 2]
 I16 = [2, 3]
 I17 = [0, 1]
-I18 = [0, 2]
+I18 = [5, 2]
 I19 = [3, 1]
 I20 = [0, 2]
 I21 = [2, 3]
@@ -170,9 +171,9 @@ assumes = ["P8"]
 [[invariant]]
 id = "I18"
 statement = "Every journal record commits to its predecessor's hash; a broken chain is detected on read."
-phase = "A"
+phase = "A (proof, trusting SHA-256)"
 tested = ["txn journal tests", "gym journal-record-edited", "gym posture-integrity-journal-chain"]
-discharged = []
+discharged = ["txn::follows", "txn::verify", "txn::next_link", "txn::appending_keeps_the_chain", "txn::an_edited_record_breaks_the_chain"]
 assumes = ["P5", "P4"]
 
 [[invariant]]
