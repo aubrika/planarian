@@ -110,14 +110,15 @@ pub fn plan(entry: &T) -> Plan {
     let all = steps(entry);
     let mut p = Plan { window_secs: crate::window(entry).0 / 1000, ..Default::default() };
     let mut changed_generation = false;
-    // The gym VM's journal filesystem is ext4 (nix/tests/gym-vm.nix).
+    // The gym VM's journal filesystem: ext4, or btrfs for an entry that asks
+    // for it (nix/tests/gym-vm.nix).
     let layouts: Vec<&str> = entry
         .get("layouts")
         .and_then(T::as_array)
         .map(|a| a.iter().filter_map(T::as_str).collect())
         .unwrap_or_default();
-    if !layouts.is_empty() && !layouts.contains(&"ext4") {
-        p.steps.push(format!("unsupported: a journal on {} (the gym VM's is ext4)", layouts.join(" or ")));
+    if !layouts.is_empty() && !layouts.iter().any(|l| matches!(*l, "ext4" | "btrfs")) {
+        p.steps.push(format!("unsupported: a journal on {} (the gym VM's is ext4 or btrfs)", layouts.join(" or ")));
         return p;
     }
     for (i, st) in all.iter().enumerate() {
@@ -201,7 +202,8 @@ pub fn plan(entry: &T) -> Plan {
                             .and_then(T::as_array)
                             .map(|a| a.iter().filter_map(T::as_str).collect())
                             .unwrap_or_default();
-                        argv.first() == Some(&"internal") && argv.get(1) != Some(&"wifi-connect")
+                        argv.first() == Some(&"internal")
+                            && !matches!(argv.get(1), Some(&"wifi-connect" | &"snapshot" | &"journal-churn"))
                     } =>
                 {
                     format!("unsupported: {raw} {:?} (no such command)", st.get("argv"))
@@ -237,7 +239,8 @@ pub fn plan(entry: &T) -> Plan {
                 | "ack_alarm"
                 | "corrupt_core_hash"
                 | "break_journal_chain"
-                | "plant_early_unit" => "vm".into(),
+                | "plant_early_unit"
+                | "oom" => "vm".into(),
                 "force_compaction" => "vm".into(),
                 "interrupt_write" => format!("unsupported: {raw} needs to interrupt the daemon's own write"),
                 other => format!("unsupported: {other}"),
@@ -838,6 +841,26 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
             let sig = st.get("signal").and_then(T::as_str).unwrap_or("SIGKILL");
             sh(&format!("{ctl} kill --signal={sig} {name}"));
         }
+        "oom" => {
+            // The kernel's OOM killer, in the unit's own cgroup: its limit set
+            // below what it uses (the VM has no swap), so systemd records
+            // Result=oom-kill. The limit goes with the cgroup when the unit
+            // dies; systemd's own MemoryMax is never touched.
+            let (ctl, name) = unit_cmd(&unit(&get("unit")));
+            let cg = sh_out(&format!("{ctl} show -p ControlGroup --value {name}")).trim().to_string();
+            if cg.is_empty() {
+                return Err(format!("oom: {name} has no cgroup"));
+            }
+            sh(&format!("echo 4096 > /sys/fs/cgroup{cg}/memory.max"));
+            if !sh(&format!(
+                "for _ in $(seq 100); do [ \"$({ctl} show -p Result --value {name})\" = oom-kill ] && exit 0; sleep 0.1; done; exit 1"
+            )) {
+                return Err(format!(
+                    "oom: {name} was not OOM-killed: {}",
+                    sh_out(&format!("{ctl} show -p Result,ActiveState {name}")).trim()
+                ));
+            }
+        }
         "stop_unit_out_of_band" => {
             let (ctl, name) = unit_cmd(&unit(&get("unit")));
             sh(&format!("{ctl} stop {name}"));
@@ -1071,6 +1094,35 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                     Request::Diagnose { unit: unit(u), probe: Some(ProbeId(p.to_string())) }
                 }
                 // The admin connects to a network outside Planarian.
+                // A snapshot of the journal's volume (btrfs): it shares every
+                // extent of the journal, so the next write to each needs space.
+                ["internal", "snapshot", "journal-volume"] => {
+                    if !sh("btrfs subvolume snapshot -r /var/lib/planarian /var/lib/planarian/.gym-snapshot") {
+                        return Err("could not snapshot the journal's volume".into());
+                    }
+                    return Ok(());
+                }
+                // Journal reuse: each wrap writes records over the start of
+                // the preallocation (an override set and lifted) and compacts
+                // (offset back to 0). A wrap here is one compaction cycle, not
+                // a pass over the whole 64 MiB (docs/deviations.md).
+                ["internal", "journal-churn", "--wraps", n] => {
+                    let n: u32 = n.parse().map_err(|_| format!("journal-churn: {n}"))?;
+                    let u = unit("service:gym-cache");
+                    for _ in 0..n {
+                        request_as(
+                            "root",
+                            &Request::SetOverride {
+                                unit: u.clone(),
+                                until: Until::Explicit,
+                                desired: planarian_schema::OverrideDesired::LeaveAlone,
+                            },
+                        )?;
+                        request_as("root", &Request::LiftOverride { unit: u.clone() })?;
+                        request_as("root", &Request::GymCompact)?;
+                    }
+                    return Ok(());
+                }
                 ["internal", "wifi-connect", ssid] => {
                     if !sh(&format!("nmcli connection up id {ssid}")) {
                         return Err(format!("nmcli could not connect to {ssid}"));

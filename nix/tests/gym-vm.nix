@@ -18,6 +18,10 @@ let
   lib = pkgs.lib;
   catalog = ../../crates/gym/catalog/phase-a.toml;
   gymPkg = pkgs.callPackage ../package.nix { gymHooks = true; };
+  # The journal's filesystem: btrfs for an entry whose layouts ask for it
+  # (and not ext4), else ext4.
+  layouts = (lib.findFirst (e: e.id == id) { } (builtins.fromTOML (builtins.readFile catalog)).fault).layouts or [ ];
+  journalFs = if layouts != [ ] && !(builtins.elem "ext4" layouts) && builtins.elem "btrfs" layouts then "btrfs" else "ext4";
   # A third-party flake input's source at two revisions (store paths).
   modulesOld = builtins.path { path = ./gym-modules-old; name = "gym-modules"; };
   modulesNew = builtins.path { path = ./gym-modules-new; name = "gym-modules"; };
@@ -297,7 +301,7 @@ let
         carol = { isNormalUser = true; uid = 1002; };
       };
 
-      environment.systemPackages = [ gymPkg pkgs.git pkgs.util-linux pkgs.iptables pkgs.curl pkgs.jq ];
+      environment.systemPackages = [ gymPkg pkgs.git pkgs.util-linux pkgs.iptables pkgs.curl pkgs.jq pkgs.btrfs-progs ];
       environment.variables.PLANARIAN_GYM_CATALOG = "${catalog}";
       programs.git.config.safe.directory = "*";
 
@@ -430,7 +434,7 @@ let
       # The journal on its own small filesystem (fill_fs fs-journal).
       # (virtualisation.fileSystems: in a test VM, plain fileSystems entries
       # are replaced by the VM's own, and were never mounted.)
-      virtualisation.fileSystems."/var/lib/planarian" = { device = "/dev/vdb"; fsType = "ext4"; autoFormat = true; };
+      virtualisation.fileSystems."/var/lib/planarian" = { device = "/dev/vdb"; fsType = journalFs; autoFormat = true; };
       # /boot on its own small filesystem, as on an installed machine
       # (fill_fs fs-boot; GRUB copies the kernels there since the store is
       # elsewhere). The test VM boots its kernel directly; this is what

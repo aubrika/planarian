@@ -1647,7 +1647,7 @@ summary = "The Nix store fills during build: Rejected(NoSpace), a storage incide
 spec = ["§12c ENOSPC by state"]
 tags = []
 scoring = "must-pass"
-harness = ["fake", "vm"]
+harness = ["fake"]
 intent = { kind = "none" }
 setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
 inject = { raw = "fill_fs", fs = "device:fs-nix", as_uid = 0, until = "full", when = { journal = "Staged" } }

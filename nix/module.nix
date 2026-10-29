@@ -513,6 +513,14 @@ in
       path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux ];
       environment.PLANARIAN_CONFIG = "/etc/planarian/config.json";
       serviceConfig = {
+        # On btrfs the journal is rewritten in place: mark its directory
+        # nodatacow before the journal is first created (§12c), so a write
+        # into the preallocation needs no new space (after a snapshot, once).
+        ExecStartPre = "-${pkgs.writeShellScript "planarian-journal-fs" ''
+          if [ "$(${pkgs.coreutils}/bin/stat -f -c %T /var/lib/planarian)" = btrfs ]; then
+            ${pkgs.e2fsprogs}/bin/chattr +C /var/lib/planarian
+          fi
+        ''}";
         ExecStart = "${cfg.package}/bin/planarian-recovery";
         Restart = "always";
         RestartSec = 2;

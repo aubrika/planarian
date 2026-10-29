@@ -239,8 +239,12 @@ fn vm_plan_refuses_what_the_gym_vm_cannot_be() {
     let entries = catalog();
     let get = |id: &str| entries.iter().find(|e| e.get("id").and_then(T::as_str) == Some(id)).expect("entry").clone();
     let unsupported = |id: &str| crate::live::plan(&get(id)).steps.iter().any(|s| s.starts_with("unsupported"));
-    // A btrfs journal: the gym VM's is ext4, so the entry would pass on the wrong filesystem.
-    assert!(unsupported("storage-journal-btrfs-reuse"));
+    // The gym VM's journal is ext4, or btrfs for an entry that asks for it;
+    // any other layout would pass on the wrong filesystem.
+    assert!(!unsupported("storage-journal-btrfs-reuse"));
+    let mut zfs = get("storage-journal-btrfs-reuse");
+    zfs.as_table_mut().unwrap().insert("layouts".into(), T::Array(vec![T::String("zfs".into())]));
+    assert!(crate::live::plan(&zfs).steps.iter().any(|s| s.starts_with("unsupported")));
     // ext4 is one of its layouts.
     assert!(!unsupported("storage-journal-fs-full"));
     // The VM's Nix store is the host's: it cannot really fill or be collected.
