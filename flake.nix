@@ -77,6 +77,8 @@
             ids = map (e: e.id) (builtins.filter (e: builtins.elem "vm" (e.harness or [ ])) entries);
           in
           nixpkgs.lib.genAttrs ids (id: import ./nix/tests/gym-vm.nix { inherit pkgs self id; });
+        # The invisibility budget (§21): run on demand (it downloads Xonotic).
+        bench.invisibility = import ./nix/tests/bench.nix { inherit pkgs self; };
       });
 
       templates.default = {

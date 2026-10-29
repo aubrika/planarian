@@ -1,0 +1,33 @@
+name: Invisibility budget
+
+# SPEC §21 (catalog quiet-reference-workload): the idle budget and the
+# reference game's frame times with Planarian stopped, idle and busy. On
+# demand and weekly: it downloads Xonotic (about 1 GB) and runs for a while.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+jobs:
+  invisibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      - run: nix build -L .#legacyPackages.x86_64-linux.bench.invisibility -o bench
+      - name: Report
+        if: always()
+        run: cat bench/report.json || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: invisibility-report
+          path: bench/report.json
+          if-no-files-found: ignore

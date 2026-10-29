@@ -2610,3 +2610,23 @@ window = "10m"
 [fault.required_post]
 invariants = ["I6", "I12", "I15"]
 reports = ["AssumptionHeld(<assumption>)"]
+
+# §21 (v4.4): the invisibility budget; owner decision Q7 (Xonotic timedemo, MangoHud).
+[[fault]]
+id = "quiet-reference-workload"
+family = "activation-scheduling"
+summary = "The invisibility-budget benchmark (§21): the reference game runs while a GC, a staged update and a non-urgent fault are queued. p99 frame time and input latency match the Planarian-stopped baseline; each deferred item runs in its window afterward; a PipeWire crash mid-run is repaired with one notice."
+spec = ["§12f", "§21 invisibility budget"]
+tags = ["acceptance", "benchmark"]
+scoring = "must-pass"
+# Run by legacyPackages.bench.invisibility (nix/tests/bench.nix; .github/workflows/bench.yml),
+# not by the gym runner: see deviations.md.
+harness = ["bench"]
+intent = { kind = "none" }
+setup = [{ raw = "session_login", uid = 1000, session = "s1", seat = "seat0" }]
+inject = { raw = "workload", name = "reference-game", queue = ["gc", "staged-update", "fault:gym-metrics"], mid_run = { raw = "kill_unit", unit = "service@1000:pipewire", signal = "SIGSEGV" } }
+window = "20m"
+
+[fault.required_post]
+metrics = { frame_time_p99 = "no significant difference vs baseline", deferred_items_ran = 3 }
+notices_count = { match = "pipewire", count = 1 }
