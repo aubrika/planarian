@@ -71,8 +71,13 @@ pkgs.testers.runNixOSTest {
         machine.succeed("ask 'start gym-web again'")
         machine.wait_until_succeeds("systemctl is-active gym-web.service", timeout=600)
 
-    with subtest("an unprivileged user cannot suppress sshd"):
-        out = machine.fail("su alice -c 'planarian suppress sshd' 2>&1")
+    with subtest("an unprivileged user's override of sshd is held for an administrator"):
+        _, out = machine.execute("su alice -c 'planarian override sshd --stopped' 2>&1")
+        assert "approv" in out, out
+        machine.sleep(10)
+        machine.succeed("systemctl is-active sshd.service")
+        # Nor can she stop a system unit that is not hers.
+        out = machine.fail("su alice -c 'planarian stop gym-state' 2>&1")
         assert "Unauthorized" in out, out
 
     with subtest("a service systemd restarts itself is left to systemd"):
