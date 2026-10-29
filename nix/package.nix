@@ -37,6 +37,9 @@ rustPlatform.buildRustPackage {
     ln -s planarian $out/bin/ask
   '';
 
+  # §12d, §15 (B-13): the module refuses a test build outside the gym.
+  passthru.testBuild = gymHooks;
+
   meta = {
     description = "A self-healing layer for declaratively configured computers";
     license = lib.licenses.mpl20;

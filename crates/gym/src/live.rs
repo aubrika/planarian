@@ -242,6 +242,7 @@ pub fn plan(entry: &T) -> Plan {
                 | "plant_early_unit"
                 | "agent_run"
                 | "request_then_exit"
+                | "plant_test_build"
                 | "oom" => "vm".into(),
                 "force_compaction" => "vm".into(),
                 "interrupt_write" => format!("unsupported: {raw} needs to interrupt the daemon's own write"),
@@ -1214,6 +1215,19 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
             ));
             if !ok {
                 return Err("request_then_exit: the client could not send".into());
+            }
+        }
+        // §15 (B-13): the test build, as if installed outside the gym: the
+        // same binaries, with the configuration's permission for a test
+        // build withdrawn (a runtime drop-in), and planariad started again.
+        "plant_test_build" => {
+            let ok = sh("mkdir -p /run/planarian-gym /run/systemd/system/planariad.service.d && \
+                 jq '.allowTestBuild = false' /etc/planarian/config.json > /run/planarian-gym/config.json && \
+                 printf '[Service]\\nEnvironment=PLANARIAN_CONFIG=/run/planarian-gym/config.json\\n' \
+                   > /run/systemd/system/planariad.service.d/test-build.conf && \
+                 systemctl daemon-reload && systemctl restart planariad; true");
+            if !ok {
+                return Err("plant_test_build".into());
             }
         }
         "agent_run" => {

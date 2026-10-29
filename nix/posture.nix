@@ -28,9 +28,6 @@ let
     ++ lib.optional (config.services.xserver.enable || config.services.displayManager.enable or false) "display-manager.service"
     ++ [ "user@.service" "getty@.service" "autovt@.service" ];
 
-  coreHash = pkgs.runCommand "planarian-core-hash" { } ''
-    sha256sum ${cfg.package}/bin/planariad | cut -d' ' -f1 > $out
-  '';
 
   alarmText = {
     absent = "Planarian, which protects this computer from unsafe changes, is not running. Assistants and system changes are turned off until it is fixed. An administrator has been notified.";
@@ -148,6 +145,26 @@ let
     systemctl is-active --quiet planarian-ready.target && exit 0
     systemctl start --no-block planarian-failed@absent.target
   '';
+
+  # I2 in A-D (§12d, B-12): every Planarian binary and script this
+  # generation installs, hashed at build. The watchdog checks each against
+  # the record; any mismatch is an Integrity failure. (Signatures in E.)
+  coreFiles = [
+    "${cfg.package}/bin/planariad"
+    "${cfg.package}/bin/planarian-recovery"
+    "${cfg.package}/bin/planarian"
+    "${respond}"
+    "${lift}"
+    "${ack}/bin/planarian-ack"
+    "${stopPost "planariad"}"
+    "${stopPost "planarian-recovery"}"
+    "${check}"
+  ];
+  coreHash = pkgs.runCommand "planarian-core-hash" { } ''
+    for f in ${lib.escapeShellArgs coreFiles}; do
+      printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"
+    done > $out
+  '';
 in
 {
   options.services.planarian = {
@@ -250,7 +267,6 @@ in
 
     systemd.services.planarian-recovery = {
       environment.PLANARIAN_CORE_HASH = "/etc/planarian/core.sha256";
-      environment.PLANARIAN_CORE_BINARY = "${cfg.package}/bin/planariad";
       serviceConfig = {
         SuccessExitStatus = [ 78 ];
         RestartPreventExitStatus = [ 78 ];

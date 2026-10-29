@@ -424,6 +424,18 @@ in
       description = "The manifest: units Planarian watches, keyed by name (e.g. `sshd`, `fs-root`).";
     };
 
+    testBuild = mkOption {
+      type = types.bool;
+      default = false;
+      internal = true;
+      description = ''
+        This configuration is the gym's VM test and may run the test build
+        (the gym-hooks package, which accepts fault injection over the
+        socket). Anywhere else the module refuses that package, and a test
+        build that runs anyway is an Integrity failure (§12d, §15).
+      '';
+    };
+
     optionSensitivity = mkOption {
       type = types.attrsOf (types.listOf (types.enum sensitivities));
       default = {
@@ -484,6 +496,13 @@ in
   };
 
   config = mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = !(cfg.package.testBuild or false) || cfg.testBuild;
+        message = "services.planarian.package is the gym's test build (planarian-gym-hooks), which accepts fault injection over its socket; it is for the gym's VM tests only (SPEC §15).";
+      }
+    ];
+
     services.planarian.units = {
       fs-root = mkDefault { kind = "device"; };
       fs-journal = mkDefault { kind = "device"; };
@@ -537,6 +556,7 @@ in
 
     environment.etc."planarian/config.json".text = builtins.toJSON {
       inherit (cfg) owner flakeAttr maxTier optionSensitivity;
+      allowTestBuild = cfg.testBuild;
       stateDir = "/var/lib/planarian";
       userControllableUnits = cfg.userControllable.units;
       userControllableChanges = cfg.userControllable.changes;

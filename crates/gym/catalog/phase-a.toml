@@ -2865,3 +2865,20 @@ overrides = [{ unit = "service:gym-web", by = "Unattributed", attribution = "Inf
 inferred_listed = []
 reports = ["InferredOverride"]
 no_txn_on = ["service:gym-web"]
+
+# B-13 (Low).
+[[fault]]
+id = "test-build-is-integrity"
+family = "failure-posture"
+summary = "The test build (gym-hooks, which accepts fault injection over its socket) starts with a configuration that does not allow it, as it would anywhere outside the gym's VM tests. planariad refuses to run: an Integrity failure, with exactly the Integrity responses and no agent started. (The module refuses such a configuration at evaluation; checks.module-eval covers that.)"
+spec = ["§12d", "§15 test builds", "B-13"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { raw = "plant_test_build" }
+window = "3m"
+
+[fault.required_post]
+posture = { class = "Integrity", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"], not = ["halt_to_recovery"] }
+not_started = ["service:gym-agent"]

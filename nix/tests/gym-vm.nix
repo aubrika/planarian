@@ -183,6 +183,7 @@ let
       services.planarian = {
         enable = true;
         package = gymPkg;
+        testBuild = true;
         owner = "/etc/nixos";
         flakeAttr = "nixosConfigurations.machine";
         startupGrace = 20;

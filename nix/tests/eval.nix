@@ -42,6 +42,11 @@ let
   securityNamed = [ "firewall" "nftables" "sshd" "fail2ban" "usbguard" "apparmor" "auditd" "wg-quick-wg0" "wireguard-wg0" "openvpn-office" "tailscaled" "strongswan" ];
   securityTrees = [ "security" "networking.firewall" "networking.nftables" "networking.wireguard" "networking.wg-quick" "services.openssh" "services.fail2ban" "services.usbguard" "services.openvpn" "services.tailscale" "services.strongswan" ];
   cfg = sys.config;
+  # §15 (B-13): the same configuration with the test build as its package.
+  testBuildSys = sys.extendModules {
+    modules = [ { services.planarian.package = pkgs.callPackage ../package.nix { gymHooks = true; }; } ];
+  };
+  refused = builtins.filter (a: !a.assertion) testBuildSys.config.assertions;
   export = cfg.services.planarian.export;
   unit = id: builtins.head (builtins.filter (u: u.id == id) export.units);
   app = unit "service:gym-app";
@@ -62,6 +67,8 @@ let
     (check (!cfg.systemd.services.planariad.restartIfChanged) "planariad survives activation")
     (check (!cfg.systemd.services.planarian-recovery.stopIfChanged) "the watchdog survives activation")
     (check (export.coreUnits."planariad.service" != "") "core unit hashes exported")
+    (check (builtins.any (a: pkgs.lib.hasInfix "test build" a.message) refused) "the module refuses the test build outside the gym (B-13)")
+    (check (builtins.all (a: !(pkgs.lib.hasInfix "test build" a.message)) (builtins.filter (a: !a.assertion) cfg.assertions)) "the shipped package is not refused")
   ];
 in
 assert builtins.all (x: x) checks;

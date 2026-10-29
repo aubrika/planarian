@@ -309,6 +309,13 @@ fn main() {
             std::process::exit(78);
         }
     };
+    // §12d, §15 (B-13): the test build outside the gym's VM tests.
+    if cfg!(feature = "gym-hooks") && !file.allow_test_build {
+        integrity_failure(
+            "planariad",
+            "a test build (gym-hooks, which accepts fault injection over the socket) is running outside the gym",
+        );
+    }
     let canonical = match load_canonical() {
         Ok(c) => c,
         Err(e) => {

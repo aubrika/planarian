@@ -83,18 +83,32 @@ fn pass(
     Ok(())
 }
 
-/// I2 in Phase A (§12d's independent check): the installed core binary's
-/// SHA-256 equals the hash recorded at build time. A mismatch is an Integrity
-/// failure: report it and stop with status 78; the posture units respond.
+/// I2 in Phase A-D (§12d's independent check, B-12): every Planarian
+/// binary and script the generation installs hashes to what was recorded at
+/// build (`<sha256> <path>` per line). A mismatch, a missing file or a
+/// record that is not in that form is an Integrity failure: report it and
+/// stop with status 78; the posture units respond.
 fn core_hash_check() {
-    let (Ok(record), Ok(binary)) = (std::env::var("PLANARIAN_CORE_HASH"), std::env::var("PLANARIAN_CORE_BINARY"))
-    else {
-        return;
-    };
-    let want = std::fs::read_to_string(&record).unwrap_or_default().trim().to_string();
-    let have = std::fs::read(&binary).map(|b| Hash::of(&b).to_hex()).unwrap_or_default();
-    if want.is_empty() || have != want {
-        let why = format!("core: {binary} hashes to {have:?}, but {record} records {want:?}");
+    let Ok(record) = std::env::var("PLANARIAN_CORE_HASH") else { return };
+    let text = std::fs::read_to_string(&record).unwrap_or_default();
+    let mut problems = vec![];
+    let mut checked = 0;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Some((want, path)) = line.split_once(' ') else {
+            problems.push(format!("{record}: malformed line {line:?}"));
+            continue;
+        };
+        let have = std::fs::read(path).map(|b| Hash::of(&b).to_hex()).unwrap_or_default();
+        if have != want {
+            problems.push(format!("{path} hashes to {have:?}, but {record} records {want:?}"));
+        }
+        checked += 1;
+    }
+    if checked == 0 && problems.is_empty() {
+        problems.push(format!("{record} records nothing"));
+    }
+    if !problems.is_empty() {
+        let why = format!("core: {}", problems.join("; "));
         eprintln!("planarian-recovery: INTEGRITY: {why}");
         let _ = std::fs::create_dir_all("/run/planarian");
         let _ = std::fs::write("/run/planarian/integrity", format!("{why}\n"));

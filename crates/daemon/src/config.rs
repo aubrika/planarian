@@ -56,6 +56,10 @@ pub struct FileConfig {
     /// Seconds between signed health reports (§10 hook); 0 turns them off.
     #[serde(default = "default_health_secs")]
     pub health_report_secs: u64,
+    /// This configuration is the gym's own VM test, which may run the test
+    /// build (§15, B-13). Anywhere else, a test build is an Integrity failure.
+    #[serde(default)]
+    pub allow_test_build: bool,
 }
 
 fn default_health_secs() -> u64 {
@@ -86,6 +90,7 @@ impl Default for FileConfig {
             session_compositors: vec![],
             external_source: None,
             health_report_secs: default_health_secs(),
+            allow_test_build: false,
         }
     }
 }

@@ -55,25 +55,6 @@ spec = "v4.5"
 # Group 1: the bypasses
 # ═══════════════════════════════════════════════════════════════════════════
 
-# B-13 (Low).
-[[fault]]
-id = "test-build-is-integrity"
-family = "failure-posture"
-summary = "The gym-hooks package's binaries are found in place of the real ones outside the gym. The boot report raises Integrity: exactly the Integrity responses, no agent starts. (The module assertion that refuses such a configuration is checked by evaluation, in `nix flake check`.)"
-spec = ["§12d", "§15 test builds", "B-13"]
-tags = ["acceptance", "bypass"]
-scoring = "must-pass"
-harness = ["vm"]
-intent = { kind = "none" }
-inject = { raw = "plant_test_build" }
-after = [{ raw = "reboot" }]
-window = "5m"
-
-[fault.required_post]
-posture = { class = "Integrity", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"] }
-not_started = ["service:gym-agent"]
-reports = ["BootReport(TestBuild)"]
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Group 2: one entry per proved invariant, from the English (§7)
 # ═══════════════════════════════════════════════════════════════════════════
