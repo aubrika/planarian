@@ -5,6 +5,13 @@ evidence for each criterion and how to reproduce it. Updated 2026-10-29.
 
 ## Summary
 
+**GA is blocked under SPEC v4.5** (installed 2026-10-29): no gate passes with
+an open High row in `docs/bypasses.md` (§17b), and two are open: B-1 (agents
+run under their user's uid) and B-2 (the floor ignores the closure outside
+`environment.systemPackages`). The results below stand; the gate waits on
+those two rows.
+
+
 | Criterion | Status |
 | --- | --- |
 | 1. The demonstration | **Passes**, on the fake harness and on VMs (CI, KVM, on every push) |
