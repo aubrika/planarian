@@ -764,6 +764,12 @@ fn external_desired_state_joins_with_provenance() {
     assert!(r.core.notices.iter().any(|n| n.contains("the generation's declaration stands")));
     assert!(r.core.asm.manifest().units.contains_key(&ext));
     assert!(r.core.asm.manifest().units[&web].synonyms.iter().all(|s| s != "from outside"));
+    // The document's unit is taken for its desired state only: no edges it
+    // drew, and Security-sensitive, so acting on it asks first.
+    let taken = &r.core.asm.manifest().units[&ext];
+    assert!(taken.edges.is_empty());
+    assert!(taken.sensitivity.contains(Sensitivity::Security));
+    assert!(!taken.probes.iter().any(|p| matches!(p.kind, ProbeKind::Exec { .. })));
     assert!(r.core.origin_of(&web).is_none());
     r.ticks(6);
     assert!(

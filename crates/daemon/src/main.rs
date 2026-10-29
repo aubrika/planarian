@@ -92,17 +92,38 @@ fn journal_failure(who: &str, e: &JournalError) -> ! {
 fn peer_of(s: &UnixStream, admin_group: &str) -> Option<Peer> {
     let cred = rustix::net::sockopt::socket_peercred(s).ok()?;
     let uid = cred.uid.as_raw();
-    let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", cred.pid.as_raw_nonzero())).unwrap_or_default();
-    Some(Peer { uid, admin: is_admin(uid, admin_group), session: session_of_cgroup(&cgroup) })
+    let pid = cred.pid.as_raw_nonzero();
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    // The pid could have been reused since the connect: a session read from
+    // a process of another uid counts as none.
+    let same_uid = std::fs::read_to_string(format!("/proc/{pid}/status")).ok().is_some_and(|st| {
+        st.lines()
+            .find_map(|l| l.strip_prefix("Uid:"))
+            .and_then(|r| r.split_whitespace().next())
+            .and_then(|u| u.parse::<u32>().ok())
+            == Some(uid)
+    });
+    let session = if same_uid { session_of_cgroup(&cgroup, uid) } else { None };
+    Some(Peer { uid, admin: is_admin(uid, admin_group), session })
 }
 
-/// `sd_pid_get_session`: the logind session is the `session-<id>.scope` in the
-/// process's cgroup path (§10). None for a process outside any session.
-fn session_of_cgroup(cgroup: &str) -> Option<String> {
-    cgroup.lines().filter_map(|l| l.rsplit_once(':')).find_map(|(_, path)| {
-        path.split('/')
-            .find_map(|c| c.strip_prefix("session-").and_then(|c| c.strip_suffix(".scope")).map(String::from))
-    })
+/// `sd_pid_get_session` (systemd's `cg_path_get_session`): the logind
+/// session is a `session-<id>.scope` reached through `.slice` components
+/// only, and here it must be under the caller's own `user-<uid>.slice`
+/// (§10). A cgroup a user created under their own manager (delegated, below
+/// `user@<uid>.service`) is no session, whatever it is named.
+fn session_of_cgroup(cgroup: &str, uid: u32) -> Option<String> {
+    let line = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let mut user_slice = false;
+    for c in line.split('/').filter(|c| !c.is_empty()) {
+        if c.ends_with(".slice") {
+            user_slice |= c == format!("user-{uid}.slice");
+            continue;
+        }
+        let id = c.strip_prefix("session-")?.strip_suffix(".scope")?;
+        return user_slice.then(|| id.to_string());
+    }
+    None
 }
 
 fn append_log(state: &Path, lines: &[String]) {
@@ -459,9 +480,13 @@ mod tests {
 
     #[test]
     fn session_from_cgroup() {
-        assert_eq!(session_of_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"), Some("3".into()));
-        assert_eq!(session_of_cgroup("0::/system.slice/cron.service\n"), None);
+        assert_eq!(session_of_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n", 1000), Some("3".into()));
+        assert_eq!(session_of_cgroup("0::/system.slice/cron.service\n", 1000), None);
+        // Another uid's session, and a user-made cgroup named like a session.
+        assert_eq!(session_of_cgroup("0::/user.slice/user-1001.slice/session-3.scope\n", 1000), None);
+        let forged = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/session-2.scope\n";
+        assert_eq!(session_of_cgroup(forged, 1000), None);
         let user_manager = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n";
-        assert_eq!(session_of_cgroup(user_manager), None);
+        assert_eq!(session_of_cgroup(user_manager, 1000), None);
     }
 }

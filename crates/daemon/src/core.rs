@@ -718,7 +718,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             if m.units.contains_key(id) {
                 shadowed.push(id.clone());
             } else {
-                m.units.insert(id.clone(), def.clone());
+                m.units.insert(id.clone(), crate::hooks::sanitized(def));
             }
         }
         (m, shadowed)

@@ -536,6 +536,19 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             };
         }
         self.last = None;
+        // §12c: while the recovery interlock is set, only administrators'
+        // operations and a user's own overrides run (the ledger refuses the
+        // autonomous callers itself).
+        if self.kernel.journal.ledger().interlocked()
+            && !authz.capabilities.contains(Capability::Administrator)
+            && !matches!(p.transition, Transition::SetOverride(_) | Transition::LiftOverride(_))
+        {
+            self.prebuilt = None;
+            return reject(
+                RejectReason::Other("interlocked".into()),
+                "the recovery interlock is set; only an administrator can change this machine until `planarian resolve`",
+            );
+        }
         let pre = self.prebuilt.take();
         let plan = match self.plan(&p, &authz, state, defs, pre) {
             Ok(plan) => plan,

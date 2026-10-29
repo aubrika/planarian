@@ -135,8 +135,13 @@ impl ExternalSource {
         if !self.cache.exists() {
             return Ok(());
         }
-        let (bytes, sig) = self.read(&self.cache).map_err(|e| format!("external source cache: {e}"))?;
-        match self.check(bytes, &sig) {
+        let raw = std::fs::read(&self.cache).map_err(|e| format!("external source cache: {e}"))?;
+        // One file: the signature's hex on the first line, then the document.
+        let Some(nl) = raw.iter().position(|b| *b == b'\n') else {
+            return Err("external source cache: no signature line".into());
+        };
+        let sig = String::from_utf8_lossy(&raw[..nl]).into_owned();
+        match self.check(raw[nl + 1..].to_vec(), &sig) {
             Ok(Ok(v)) => {
                 self.current = Some(v);
                 Ok(())
@@ -156,8 +161,20 @@ impl ExternalSource {
         if self.current.as_ref().is_some_and(|c| c.bytes == bytes && hex(&c.sig) == sig.trim()) {
             return Poll::Unchanged;
         }
-        let v = match self.check(bytes, &sig) {
-            Err(e) => return Poll::Integrity(format!("external desired-state source {}: {e}", self.path.display())),
+        let v = match self.check(bytes.clone(), &sig) {
+            Err(e) => {
+                // A producer replaces the document and its signature one
+                // after the other: a pair read in between is in flux, not
+                // tampered with. Only a pair that stays the same is.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                return match self.read(&self.path) {
+                    Ok((b2, s2)) if b2 == bytes && s2 == sig => {
+                        Poll::Integrity(format!("external desired-state source {}: {e}", self.path.display()))
+                    }
+                    Ok(_) => Poll::Stale("the document changed while it was read".into()),
+                    Err(e) => Poll::Stale(e),
+                };
+            }
             Ok(Err(e)) => return Poll::Refused(e),
             Ok(Ok(v)) => v,
         };
@@ -182,16 +199,36 @@ impl ExternalSource {
         Poll::Accepted(v)
     }
 
+    /// One file, written aside, synced and renamed: a crash leaves the old
+    /// cache or the new one, never a document with another's signature.
     fn store(&self, v: &Verified) -> std::io::Result<()> {
-        if let Some(d) = self.cache.parent() {
-            std::fs::create_dir_all(d)?;
-        }
+        use std::io::Write;
+        let dir = self.cache.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+        std::fs::create_dir_all(&dir)?;
         let tmp = self.cache.with_extension("tmp");
-        std::fs::write(sig_path(&tmp), hex(&v.sig))?;
-        std::fs::write(&tmp, &v.bytes)?;
-        std::fs::rename(sig_path(&tmp), sig_path(&self.cache))?;
-        std::fs::rename(&tmp, &self.cache)
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(hex(&v.sig).as_bytes())?;
+        f.write_all(b"\n")?;
+        f.write_all(&v.bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &self.cache)?;
+        std::fs::File::open(&dir)?.sync_all()
     }
+}
+
+/// What the core takes from an external document's unit (§9): its desired
+/// state and condition. Probes run by the core with privileges (Exec) come
+/// only from the administrator's manifest, and risk is not the document's to
+/// lower: an externally declared unit is Security-sensitive, so acting on it
+/// asks first, and the diagnoser follows no edge the document drew.
+pub fn sanitized(def: &planarian_schema::UnitDef) -> planarian_schema::UnitDef {
+    use planarian_schema::{ProbeKind, Sensitivities, Sensitivity};
+    let mut d = def.clone();
+    d.probes.retain(|p| !matches!(p.kind, ProbeKind::Exec { .. }));
+    d.sensitivity = Sensitivities::of(&[Sensitivity::Security]);
+    d.edges.clear();
+    d.runtime_repair = None;
+    d
 }
 
 /// Sign a desired-state document (for tests and the gym; Phase A has no producer).

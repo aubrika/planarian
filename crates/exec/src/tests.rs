@@ -574,3 +574,28 @@ fn rollback_below_the_floor_asks_an_administrator() {
     assert!(f.below_security_floor, "{sub:?}");
     assert_eq!(d, Decision::Allow { tier: Tier::AskFirst, approver: ApproverClass::Administrator });
 }
+
+/// §12c (review finding 3): while the recovery interlock is set, a
+/// non-administrator's mutation is refused; their own override and an
+/// administrator's operation are not.
+#[test]
+fn interlock_holds_off_non_administrators() {
+    let mut r = Rig::new();
+    r.ex.kernel.journal.write_sentinel(TxnId(99), "test").unwrap();
+    let s = r.propose(change("font-scale", &[("scale", Value::Str("1.25".into()))]), alice());
+    assert!(matches!(&s, Submitted::Rejected { detail, .. } if detail.contains("interlock")), "{s:?}");
+    let pw = UnitId::service("gym-web");
+    let s = r.propose(Transition::RestartUnit(pw.clone()), alice());
+    assert!(matches!(&s, Submitted::Rejected { detail, .. } if detail.contains("interlock")), "{s:?}");
+    let o = Override::attested(
+        pw.clone(),
+        OverrideDesired::LeaveAlone,
+        Until::NextBoot,
+        "test".into(),
+        Actor::local(ALICE, "2"),
+    );
+    let s = r.propose(Transition::SetOverride(o), alice());
+    assert!(!matches!(&s, Submitted::Rejected { detail, .. } if detail.contains("interlock")), "{s:?}");
+    let s = r.propose(Transition::RestartUnit(pw), admin());
+    assert!(!matches!(&s, Submitted::Rejected { detail, .. } if detail.contains("interlock")), "{s:?}");
+}
