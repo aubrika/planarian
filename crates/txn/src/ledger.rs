@@ -77,6 +77,13 @@ pub enum Record {
     /// The security floor (§12e): derived when a generation commits, or set by
     /// an administrator's `mark-security-floor`; never by a proposal.
     SecurityFloor(Option<GenerationId>),
+    /// The external desired-state document accepted (§9 hook, §12c, B-16):
+    /// its sequence number and the hash of its bytes. Replay protection
+    /// lives here, in the journal and its checkpoint, not in a cache file.
+    ExternalAccepted {
+        seq: u64,
+        digest: Hash,
+    },
     TokenUsed {
         nonce: [u8; 16],
         expires: Timestamp,
@@ -169,6 +176,9 @@ pub struct Ledger {
     pub accepted_baseline: Option<GenerationId>,
     #[serde(default)]
     pub security_floor: Option<GenerationId>,
+    /// The last accepted external document's (sequence, digest) (B-16).
+    #[serde(default)]
+    pub external: Option<(u64, Hash)>,
     pub interlock: IdMap<InterlockEntry>,
     pub last_reconciliation: Option<Reconciliation>,
 }
@@ -205,6 +215,11 @@ pub enum LedgerError {
     DuplicateOp(OpId),
     NotInterlocked(TxnId),
     BadPrepared(&'static str),
+    /// B-16: an external document no newer than the one in force.
+    ExternalReplay {
+        have: u64,
+        got: u64,
+    },
 }
 
 // ---------- Specifications ----------
@@ -328,7 +343,18 @@ pub open spec fn rules(l: Ledger, e: Entry) -> bool {
         Record::OpBegin { op, .. } => op_begin_rule(l, op),
         Record::OpAck { op, .. } => op_ack_rule(l, op),
         Record::Resolved { txn, .. } => has_id(l.interlock.entries@, txn),
+        Record::ExternalAccepted { seq, .. } => external_rule(l, seq),
         _ => true,
+    }
+}
+
+/// B-16: an external document is accepted only with a sequence number above
+/// the last one the journal accepted, so a replayed or rewound document
+/// cannot come back into force.
+pub open spec fn external_rule(l: Ledger, seq: u64) -> bool {
+    match l.external {
+        None => true,
+        Some(p) => seq > p.0,
     }
 }
 
@@ -654,6 +680,10 @@ impl Ledger {
                 }
                 Ok(())
             },
+            Record::ExternalAccepted { seq, .. } => match self.external {
+                Some((have, _)) if *seq <= have => Err(LedgerError::ExternalReplay { have, got: *seq }),
+                _ => Ok(()),
+            },
             _ => Ok(()),
         }
     }
@@ -850,6 +880,7 @@ impl Ledger {
             Record::LiveTested(g) => self.live_tested = g,
             Record::AcceptedBaseline(g) => self.accepted_baseline = g,
             Record::SecurityFloor(g) => self.security_floor = g,
+            Record::ExternalAccepted { seq, digest } => self.external = Some((seq, digest)),
             Record::TokenUsed { nonce, expires } => use_token(&mut self.tokens_used, at, nonce, expires),
             Record::Resolved { txn, .. } => {
                 if let Some(k) = find(&self.interlock, txn) {

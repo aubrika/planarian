@@ -96,6 +96,15 @@ fn journal_failure(who: &str, e: &JournalError) -> ! {
 const MAX_REQUEST: u64 = 64 * 1024;
 const PER_UID: usize = 16;
 const MAX_CONNS: usize = 64;
+/// Of MAX_CONNS, held back for administrators and for callers in a login
+/// session (§16, B-15): services with dynamic uids cannot fill them all.
+const RESERVED: usize = 16;
+
+/// Whether one more connection from this peer fits.
+fn admits(peer: &Peer, mine: usize, total: usize) -> bool {
+    let cap = if peer.admin || peer.session.is_some() { MAX_CONNS } else { MAX_CONNS - RESERVED };
+    mine < PER_UID && total < cap
+}
 
 /// One request line, bounded in size and in total time (10 s), not per read.
 fn read_request(conn: &UnixStream) -> Option<String> {
@@ -373,8 +382,17 @@ fn main() {
                 if let Err(e) = src.load_cache() {
                     integrity_failure("planariad", &e);
                 }
-                if let Some(v) = &src.current {
-                    core.set_external(Some(v.doc.clone()));
+                if let Some(v) = src.current.clone() {
+                    // A cache rewound to an older document, or swapped for
+                    // another with the same sequence, is not put in force
+                    // (B-16); the next newer document is.
+                    match ExternalSource::replayed(&v, core.ledger().external) {
+                        Some(why) => {
+                            core.notice(format!("cached external desired state not taken: {why}"));
+                            src.current = None;
+                        }
+                        None => core.accept_external(v.doc, Hash::of(&v.bytes)),
+                    }
                 }
                 Some(src)
             }
@@ -438,20 +456,19 @@ fn main() {
         // uid has at most PER_UID connections in flight, all at most MAX_CONNS.
         let in_flight: Arc<Mutex<std::collections::BTreeMap<u32, usize>>> = Arc::default();
         for conn in listener.incoming().flatten() {
-            let Some(uid) = rustix::net::sockopt::socket_peercred(&conn).ok().map(|c| c.uid.as_raw()) else {
-                continue;
-            };
+            // Who it is decides whether it may use a reserved slot (B-15).
+            let Some(peer) = peer_of(&conn, &group) else { continue };
+            let uid = peer.uid;
             {
                 let mut m = in_flight.lock().unwrap_or_else(|e| e.into_inner());
                 let total: usize = m.values().sum();
                 let mine = m.entry(uid).or_insert(0);
-                if *mine >= PER_UID || total >= MAX_CONNS {
+                if !admits(&peer, *mine, total) {
                     continue;
                 }
                 *mine += 1;
             }
             let tx = tx.clone();
-            let group = group.clone();
             let shared = shared.clone();
             let in_flight = in_flight.clone();
             std::thread::spawn(move || {
@@ -465,7 +482,6 @@ fn main() {
                     }
                 }
                 let _release = Release(in_flight, uid);
-                let Some(peer) = peer_of(&conn, &group) else { return };
                 let Some(line) = read_request(&conn) else { return };
                 let resp = match serde_json::from_str::<Request>(&line) {
                     Ok(req) if snapshot::read_only(&req) && shared.lock().is_ok_and(|b| b.is_some()) => {
@@ -587,9 +603,9 @@ fn hooks_tick(
     next_report: &mut Instant,
 ) {
     if let Some(src) = external.as_mut() {
-        match src.poll() {
+        match src.poll_against(core.ledger().external) {
             Poll::Unchanged => {}
-            Poll::Accepted(v) => core.set_external(Some(v.doc)),
+            Poll::Accepted(v) => core.accept_external(v.doc, Hash::of(&v.bytes)),
             Poll::Refused(why) => {
                 core.notice(format!("external desired state not taken: {why}; the one in force stays"))
             }
@@ -624,6 +640,19 @@ mod tests {
         let p = peer_process(&a).expect("readable");
         assert_eq!(p.uid, Some(rustix::process::getuid().as_raw()));
         assert_eq!(p.cgroup, std::fs::read_to_string("/proc/self/cgroup").unwrap());
+    }
+
+    #[test]
+    fn reserved_slots_are_for_administrators_and_sessions() {
+        let service = Peer::new(61184, false);
+        let admin = Peer::new(0, true);
+        let seated = Peer::new(1000, false).in_session("3");
+        let open = MAX_CONNS - RESERVED;
+        assert!(admits(&service, 0, open - 1));
+        assert!(!admits(&service, 0, open), "the reserved slots are not a service's");
+        assert!(admits(&admin, 0, open) && admits(&seated, 0, MAX_CONNS - 1));
+        assert!(!admits(&admin, 0, MAX_CONNS));
+        assert!(!admits(&seated, PER_UID, 0), "the per-uid limit holds for everyone");
     }
 
     #[test]

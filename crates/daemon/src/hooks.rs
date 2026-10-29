@@ -151,6 +151,26 @@ impl ExternalSource {
     }
 
     pub fn poll(&mut self) -> Poll {
+        self.poll_against(None)
+    }
+
+    /// Whether a verified document is older than, or a different one with
+    /// the same sequence number as, the last the journal accepted (B-16).
+    pub fn replayed(doc: &Verified, journal: Option<(u64, planarian_schema::Hash)>) -> Option<String> {
+        let (seq, digest) = journal?;
+        if doc.doc.seq < seq {
+            return Some(format!(
+                "sequence {} is older than the {seq} the journal accepted (a replayed document)",
+                doc.doc.seq
+            ));
+        }
+        (doc.doc.seq == seq && planarian_schema::Hash::of(&doc.bytes) != digest)
+            .then(|| format!("a different document with sequence {seq}, which the journal accepted"))
+    }
+
+    /// `poll`, held to the journal's record of the last accepted document
+    /// (B-16): the cache is root-writable, the journal is hash-chained.
+    pub fn poll_against(&mut self, journal: Option<(u64, planarian_schema::Hash)>) -> Poll {
         if !self.path.exists() {
             return Poll::Unchanged;
         }
@@ -178,6 +198,9 @@ impl ExternalSource {
             Ok(Err(e)) => return Poll::Refused(e),
             Ok(Ok(v)) => v,
         };
+        if let Some(why) = Self::replayed(&v, journal) {
+            return Poll::Refused(why);
+        }
         if let Some(c) = &self.current {
             if v.doc.seq < c.doc.seq {
                 return Poll::Refused(format!(
@@ -387,6 +410,34 @@ mod tests {
 
     fn doc(seq: u64) -> DesiredDoc {
         DesiredDoc { seq, issued: Timestamp(seq * 1000), issuer: "test".into(), units: Default::default() }
+    }
+
+    /// B-16: with the cache gone (deleted, or rewound by root), the
+    /// journal's record of the last accepted document still refuses an
+    /// older one, and a different one with the same sequence number.
+    #[test]
+    fn the_journal_not_the_cache_decides_what_is_a_replay() {
+        let d = dir("journal-floor");
+        let k = key(1);
+        let mut s = source(&d, &k);
+        put(&d.join("in/doc.json"), &k, &doc(3));
+        let Poll::Accepted(v3) = s.poll() else { panic!() };
+        let journal = Some((3, planarian_schema::Hash::of(&v3.bytes)));
+        // A fresh start with no cache: an older document is a replay.
+        std::fs::remove_dir_all(d.join("cache")).ok();
+        let mut fresh = source(&d, &k);
+        put(&d.join("in/doc.json"), &k, &doc(2));
+        assert!(matches!(fresh.poll_against(journal), Poll::Refused(m) if m.contains("journal")));
+        // As is another document with the journal's sequence number.
+        let mut other = doc(3);
+        other.issuer = "someone else".into();
+        put(&d.join("in/doc.json"), &k, &other);
+        assert!(matches!(fresh.poll_against(journal), Poll::Refused(m) if m.contains("journal")));
+        // The journal's own document is taken back; a newer one is accepted.
+        put(&d.join("in/doc.json"), &k, &doc(3));
+        assert!(matches!(fresh.poll_against(journal), Poll::Accepted(v) if v.doc.seq == 3));
+        put(&d.join("in/doc.json"), &k, &doc(4));
+        assert!(matches!(fresh.poll_against(journal), Poll::Accepted(v) if v.doc.seq == 4));
     }
 
     #[test]

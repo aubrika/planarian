@@ -822,6 +822,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
     /// A verified external document is now in force (or, with `None`, the
     /// configuration dropped the source).
+    /// A verified external document accepted: journaled (its sequence and
+    /// digest, B-16) when newer than the last one the journal accepted, then
+    /// put in force.
+    pub fn accept_external(&mut self, doc: crate::hooks::DesiredDoc, digest: Hash) {
+        if self.ledger().external.is_none_or(|(s, _)| doc.seq > s) {
+            self.journal(Record::ExternalAccepted { seq: doc.seq, digest });
+        }
+        self.set_external(Some(doc));
+    }
+
     pub fn set_external(&mut self, doc: Option<crate::hooks::DesiredDoc>) {
         let said = doc.as_ref().map(|d| {
             let names: Vec<String> = d.units.keys().map(|u| u.to_string()).collect();

@@ -75,6 +75,7 @@ pub fn record(r: &Record) -> String {
         Record::LiveTested(None) => "live-tested generation cleared".into(),
         Record::AcceptedBaseline(g) => format!("accepted baseline: {g:?}"),
         Record::SecurityFloor(g) => format!("security floor: {g:?}"),
+        Record::ExternalAccepted { seq, .. } => format!("external desired state {seq} accepted"),
         Record::TokenUsed { .. } => "approval token used".into(),
         Record::Resolved { txn, resolution, by } => format!("txn {} resolved as {resolution:?} by {by:?}", txn.0),
         Record::Reconciliation(r) => format!("reconciliation by {:?}: {}", r.by, r.actions.join("; ")),
