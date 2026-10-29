@@ -64,6 +64,9 @@ pub enum Request {
         txn: TxnId,
         resolution: Resolution,
     },
+    /// `planarian mark-security-floor`: the running generation becomes the
+    /// security floor (§12e). Administrator only.
+    MarkSecurityFloor,
     MarkGood {
         accept_unconfirmed: bool,
     },

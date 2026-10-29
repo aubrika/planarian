@@ -355,6 +355,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let policy = self.ex.policy_version();
         let caller = authz.actor.clone();
         let mut result = self.ex.submit(p.clone(), authz.clone(), s, defs);
+        if let Some((g, fixes)) = self.ex.floor_raised.take() {
+            self.notice(format!(
+                "security floor is now generation {} (it fixes {}); going back below it needs an administrator",
+                g.0,
+                fixes.join(", ")
+            ));
+        }
         if let (Transition::RestartUnit(u), Submitted::Finished { .. }) = (&p.transition, &result) {
             self.incidents.started(u, now);
         }
@@ -676,6 +683,21 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 self.notice(format!(
                     "{}: {:?}{because} and nothing I know how to do would fix it; it needs a person (I'll look again in an hour)",
                     inc.target, inc.divergence.1
+                ));
+            }
+            // §12e, I16: no automatic rollback below the security floor.
+            Some(c)
+                if c.transition == Transition::Rollback && s.security_floor.is_some_and(|f| s.known_good.0 < f.0) =>
+            {
+                if let Some(i) = self.incidents.escalate(inc.id, EscalationReason::RevertBlockedByFloor, now) {
+                    self.journal(Record::Incident(i));
+                }
+                self.notice(format!(
+                    "{}: {:?}{because}; rolling back would go below the security floor (generation {}), so it needs an administrator: the known-good generation {} lacks a security fix",
+                    inc.target,
+                    inc.divergence.1,
+                    s.security_floor.map(|f| f.0).unwrap_or_default(),
+                    s.known_good.0
                 ));
             }
             Some(c) if self.ex.parked.values().any(|p| p.proposal.transition == c.transition) => {
@@ -1134,6 +1156,36 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 Source::User,
                 "planarian resolve".into(),
             ),
+            Request::MarkSecurityFloor => {
+                if !peer.admin {
+                    return Response::Error { message: "mark-security-floor requires administrator authority".into() };
+                }
+                let (s, _) = self.observe();
+                let l = self.ledger();
+                let g = s.generation;
+                // §12e: the floor only moves forward, and never to a
+                // generation that has not at least committed live.
+                if l.known_good != Some(g) && l.live_tested != Some(g) {
+                    return Response::Error {
+                        message: format!("generation {} has not committed live or been boot-confirmed", g.0),
+                    };
+                }
+                if l.security_floor.is_some_and(|f| f.0 >= g.0) {
+                    return Response::Error {
+                        message: format!(
+                            "the security floor is already generation {}",
+                            l.security_floor.unwrap_or(g).0
+                        ),
+                    };
+                }
+                self.journal(Record::SecurityFloor(Some(g)));
+                Response::Ok {
+                    message: format!(
+                        "generation {} is now the security floor; going back below it needs an administrator",
+                        g.0
+                    ),
+                }
+            }
             Request::MarkGood { accept_unconfirmed } => {
                 if !peer.admin {
                     return Response::Error { message: "mark-good requires administrator authority".into() };

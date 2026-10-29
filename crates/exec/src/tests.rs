@@ -511,3 +511,65 @@ mod props {
         }
     }
 }
+
+fn session(id: &str, uid: u32) -> SessionInfo {
+    SessionInfo {
+        id: id.into(),
+        uid,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: Timestamp(0),
+        active: true,
+    }
+}
+
+/// authz-nonadmin-stops-network-other-session, at the executor: the session
+/// facts come from logind, and decide the floor.
+#[test]
+fn other_sessions_affected_is_derived_from_logind() {
+    let mut r = Rig::new();
+    r.ex.cfg.settings.user_controllable_units.push("gpu0".into());
+    let bob = user_authorization(Actor::local(1002, "s2"), false);
+    let stop =
+        Transition::StopAndSuppress { unit: UnitId::device("gpu0"), until: Until::NextBoot, reason: String::new() };
+    // Only bob is logged in: the session it drops is his own.
+    r.fake.w().sessions = vec![session("s2", 1002)];
+    let s = r.propose(stop.clone(), bob.clone());
+    let (f, d) = r.ex.last.clone().unwrap();
+    assert_eq!(f.affected_sessions, vec!["s2".to_string()]);
+    assert!(!f.other_sessions_affected);
+    assert_eq!(d, Decision::Allow { tier: Tier::Runtime, approver: ApproverClass::AnyApprover }, "{s:?}");
+    // alice is online too: AskFirst.
+    let mut r2 = Rig::new();
+    r2.ex.cfg.settings.user_controllable_units.push("gpu0".into());
+    r2.fake.w().sessions = vec![session("s1", 1000), session("s2", 1002)];
+    assert!(matches!(r2.propose(stop, bob), Submitted::Parked { .. }));
+    let (f, _) = r2.ex.last.clone().unwrap();
+    assert!(f.other_sessions_affected);
+    assert_eq!(f.affected_sessions, vec!["s1".to_string(), "s2".to_string()]);
+}
+
+/// floor-manual-rollback-needs-admin, at the executor: a Rollback to a
+/// known-good generation below the security floor asks an administrator.
+#[test]
+fn rollback_below_the_floor_asks_an_administrator() {
+    let mut r = Rig::new();
+    let good = change("font-scale", &[("scale", Value::Str("1.25".into()))]);
+    assert_eq!(finished(&r.propose(good, admin())), TxnState::Committed);
+    let cur = r.observe().0.generation;
+    r.ex.kernel.journal.append(Timestamp(1), planarian_txn::ledger::Record::SecurityFloor(Some(cur))).unwrap();
+    let (mut s, defs) = r.observe();
+    s.security_floor = Some(cur);
+    let p = Proposal {
+        observed: s.digest(),
+        expected: predict(&Transition::Rollback, &s, &defs),
+        transition: Transition::Rollback,
+        reason: "test".into(),
+        source: Source::User,
+    };
+    let sub = r.ex.submit(p, admin(), &s, &defs);
+    let (f, d) = r.ex.last.clone().unwrap();
+    assert!(f.below_security_floor, "{sub:?}");
+    assert_eq!(d, Decision::Allow { tier: Tier::AskFirst, approver: ApproverClass::Administrator });
+}

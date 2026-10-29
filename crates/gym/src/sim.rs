@@ -28,9 +28,15 @@ pub fn config() -> CoreConfig {
         exec: ExecConfig {
             settings: Settings::default(),
             tables: Tables {
-                catalog: ["service-enable", "font-scale", "listen-address", "repair:reenable-predicted"]
-                    .map(|s| ChangeId(s.into()))
-                    .into(),
+                catalog: [
+                    "service-enable",
+                    "font-scale",
+                    "listen-address",
+                    "repair:reenable-predicted",
+                    "gym:security-fix",
+                ]
+                .map(|s| ChangeId(s.into()))
+                .into(),
                 runtime_allowlist: ["font.scale", "wifi.network"].map(String::from).into(),
                 option_sensitivity: vec![("services.openssh".into(), Sensitivities::of(&[Sensitivity::Security]))],
                 model_catalog: Default::default(),
@@ -44,6 +50,15 @@ pub fn config() -> CoreConfig {
                     ListenAddress {
                         option: "services.gym-web.listenAddress".into(),
                         permitted: vec!["127.0.0.1".into(), "192.0.2.10".into()],
+                    },
+                )]
+                .into(),
+                gym_choices: [(
+                    "gym:security-fix".into(),
+                    planarian_changes::GymChoice {
+                        option: "gym.vulnlib".into(),
+                        arg: "version".into(),
+                        permitted: vec!["1.1".into()],
                     },
                 )]
                 .into(),

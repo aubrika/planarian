@@ -361,6 +361,24 @@ pub struct EvaluatedGeneration {
     /// Content hashes of the evaluated unit files for `planariad` and
     /// `planarian-recovery`; a difference from the running ones is `touches_core`.
     pub core_units: BTreeMap<String, Hash>,
+    /// The system's packages, pname → version (§12e).
+    #[serde(default)]
+    pub packages: BTreeMap<String, String>,
+    /// Those whose nixpkgs `meta.knownVulnerabilities` is not empty (§12e).
+    #[serde(default)]
+    pub insecure: BTreeSet<String>,
+}
+
+impl EvaluatedGeneration {
+    /// §12e: packages this generation fixes relative to `base`: insecure in
+    /// `base`, still present here, and no longer insecure.
+    pub fn security_fixes(&self, base: &EvaluatedGeneration) -> Vec<String> {
+        base.insecure
+            .iter()
+            .filter(|p| self.packages.contains_key(*p) && !self.insecure.contains(*p))
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

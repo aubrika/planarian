@@ -6,6 +6,7 @@ use planarian_policy::Tables;
 use planarian_schema::spec::dependents;
 use planarian_schema::*;
 use planarian_state::Canonical;
+use std::collections::BTreeSet;
 
 pub const CORE_UNITS: [&str; 2] = ["planariad", "planarian-recovery"];
 
@@ -188,4 +189,46 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         }
     }
     f
+}
+
+/// §11 session facts, from logind's sessions: which sessions the disruption
+/// lands on (sorted), and whether a system-scope session or connectivity loss
+/// reaches a session of another uid than the caller's. A user unit lands on
+/// its own session, or every session of its uid; a disruptive system unit on
+/// every session.
+pub fn session_facts(f: &mut DerivedFacts, sessions: &[SessionInfo]) {
+    let live: Vec<&SessionInfo> = sessions.iter().filter(|s| s.establishes()).collect();
+    let disruptive =
+        matches!(f.disruption, Disruption::SessionLoss | Disruption::ConnectivityLoss | Disruption::DataInterruption);
+    let mut hit: BTreeSet<String> = BTreeSet::new();
+    let mut system = false;
+    for u in &f.affected_units {
+        match &u.scope {
+            Scope::User { uid, session: Some(s) } if live.iter().any(|x| x.uid == *uid && &x.id == s) => {
+                hit.insert(s.clone());
+            }
+            Scope::User { uid, .. } => hit.extend(live.iter().filter(|x| x.uid == *uid).map(|x| x.id.clone())),
+            Scope::System => system = true,
+        }
+    }
+    if system && disruptive {
+        hit.extend(live.iter().map(|x| x.id.clone()));
+    }
+    let caller = f.caller.uid();
+    f.other_sessions_affected = system
+        && matches!(f.disruption, Disruption::SessionLoss | Disruption::ConnectivityLoss)
+        && live.iter().any(|x| Some(x.uid) != caller);
+    f.affected_sessions = hit.into_iter().collect();
+}
+
+/// §12e: whether the generation a transition goes to is below the security
+/// floor. Planarian's generation ids grow with time, so "below" is older.
+pub fn floor_fact(f: &mut DerivedFacts, t: &Transition, s: &SystemState) {
+    let Some(floor) = s.security_floor else { return };
+    let target = match t {
+        Transition::SwitchGeneration(g) | Transition::Revert { to: g } => Some(*g),
+        Transition::Rollback => Some(s.known_good),
+        _ => None,
+    };
+    f.below_security_floor = target.is_some_and(|g| g.0 < floor.0);
 }

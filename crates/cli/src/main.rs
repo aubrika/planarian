@@ -26,6 +26,7 @@ const USAGE: &str = "usage:
   planarian cancel <txn>
   planarian resolve <txn> --as-committed|--as-reverted|--manual-repaired
   planarian mark-good [--accept-unconfirmed]
+  planarian mark-security-floor       the running generation becomes the security floor
 
 Units are written like `sshd`, `service:sshd`, `device:snd-hda0` or `service@1000:pipewire`.";
 
@@ -118,6 +119,7 @@ fn parse(args: &[String]) -> Result<(Request, bool), String> {
                 _ => return Err("resolve needs --as-committed, --as-reverted or --manual-repaired".into()),
             },
         },
+        ["mark-security-floor"] => Request::MarkSecurityFloor,
         ["mark-good"] => Request::MarkGood { accept_unconfirmed: false },
         ["mark-good", "--accept-unconfirmed"] => Request::MarkGood { accept_unconfirmed: true },
         _ => return Err(USAGE.into()),

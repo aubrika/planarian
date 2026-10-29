@@ -57,6 +57,10 @@ pub struct Export {
     pub user_units: Vec<UnitDef>,
     pub core_units: BTreeMap<String, String>,
     pub devices: BTreeMap<String, String>,
+    /// pname → version of the system packages (§12e).
+    pub packages: BTreeMap<String, String>,
+    /// pnames whose `meta.knownVulnerabilities` is not empty.
+    pub insecure: Vec<String>,
 }
 
 impl Export {
@@ -73,6 +77,8 @@ impl Export {
                 .into_iter()
                 .map(|(k, v)| (k, Hash::from_hex(&v).unwrap_or(Hash::of(v.as_bytes()))))
                 .collect(),
+            packages: self.packages,
+            insecure: self.insecure.into_iter().collect(),
         }
     }
 }

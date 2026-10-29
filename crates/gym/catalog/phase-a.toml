@@ -2028,3 +2028,70 @@ gc_root_released = true
 [[fault.required_post.txn]]
 transition = "ApplyChange"
 terminal_prefix = "Rejected"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: security-floor (§12e, I16)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "floor-revert-blocked"
+family = "security-floor"
+summary = "A security update (gym-vulnlib 1.0 → 1.1, the old build carries knownVulnerabilities) commits and raises the floor. gym-web then crashes and fails every restart. The only rollback target, known_good, is below the floor: no Rollback runs, the incident escalates with RevertBlockedByFloor, and the boot default stays at the floor."
+spec = ["§12e", "I16", "§11 Rollback row", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "gym:security-fix", args = { version = "1.1" }, source = "user", actor = "user:1001" },
+  { raw = "set_persistent_knob", unit = "service:gym-web", knob = "fail_on_start", value = true },
+]
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }
+window = "30m"
+
+[fault.required_post]
+security_floor = "candidate"
+generation = "candidate"
+boot_default = "candidate"
+escalation = "RevertBlockedByFloor"
+invariants = ["I1", "I16"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+count = 0
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+escalation = "RevertBlockedByFloor"
+
+[[fault]]
+id = "floor-manual-rollback-needs-admin"
+family = "security-floor"
+summary = "After the security update, an administrator asks to roll back below the floor: AskFirst for an Administrator approver. The proposer cannot approve it (I19); root at a terminal can."
+spec = ["§12e", "§11 floors", "I16", "I19"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "gym:security-fix", args = { version = "1.1" }, source = "user", actor = "user:1001" }]
+inject = { transition = "Rollback", source = "user", actor = "user:1001" }
+after = [
+  { raw = "approve_pending", actor = "user:1001", via = "tty" },
+  { raw = "approve_pending", actor = "root", via = "tty" },
+]
+window = "10m"
+
+[fault.required_post]
+security_floor = "candidate"
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+decision = "Allow(AskFirst)"
+approver_class = "Administrator"
+terminal = "Committed"
+

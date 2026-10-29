@@ -194,6 +194,27 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     fail(&mut v, "a transaction is still in flight".into());
                 }
             }
+            // §12e: the floor names this generation ("none" if unset).
+            "security_floor" => {
+                let want = match val.as_str() {
+                    Some("none" | "unchanged") => None,
+                    Some(name) => gen_named(e, name),
+                    None => None,
+                };
+                if ledger.security_floor != want {
+                    fail(&mut v, format!("is {:?}, want {want:?}", ledger.security_floor));
+                }
+            }
+            // An incident escalated with this reason during the run.
+            "escalation" => {
+                let want = val.as_str().unwrap_or("");
+                let found = e.seen_incidents.values().any(
+                    |i| matches!(&i.state, IncidentState::Escalated { reason, .. } if format!("{reason:?}") == want),
+                );
+                if !found {
+                    fail(&mut v, format!("no incident escalated with {want}"));
+                }
+            }
             "interlock" => {
                 let set = ledger.interlocked();
                 if set != (val.as_str() == Some("set")) {
@@ -1030,6 +1051,14 @@ fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
         };
         if got != state {
             v.failures.push(format!("{label}: is {got}, want {state}"));
+        }
+    }
+    if let Some(want) = spec.get("escalation").and_then(T::as_str) {
+        let ok = found
+            .iter()
+            .any(|i| matches!(&i.state, IncidentState::Escalated { reason, .. } if format!("{reason:?}") == want));
+        if !ok {
+            v.failures.push(format!("{label}: not escalated with {want}"));
         }
     }
     if let Some(n) = spec.get("regressed_count").and_then(T::as_integer)

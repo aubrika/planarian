@@ -14,6 +14,7 @@
 { config, lib, pkgs, ... }:
 
 let
+  systemPkgs = lib.filter (p: p ? pname) config.environment.systemPackages;
   inherit (lib) mkOption mkEnableOption mkIf mkDefault types;
   cfg = config.services.planarian;
 
@@ -360,6 +361,11 @@ in
         "planarian-recovery.service" = unitHash "planarian-recovery.service";
       };
       devices = lib.mapAttrs (_: u: u.sysfs) (lib.filterAttrs (_: u: u.kind == "device" && u.sysfs != null) cfg.units);
+      # §12e: the security floor rises when a committed generation drops a
+      # package's nixpkgs knownVulnerabilities. Reading `meta` does not trip
+      # nixpkgs' insecure-package check.
+      packages = builtins.listToAttrs (map (p: { name = p.pname; value = p.version or ""; }) systemPkgs);
+      insecure = map (p: p.pname) (lib.filter (p: (p.meta.knownVulnerabilities or [ ]) != [ ]) systemPkgs);
     };
 
     environment.etc."planarian/export.json".text = builtins.toJSON cfg.export;

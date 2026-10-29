@@ -30,6 +30,9 @@ pub enum Effect {
     ReplaceProbe(UnitId, ProbeDef),
     /// Kernel/boot change: needs a reboot to be confirmed.
     NeedsReboot,
+    /// The package at this version, with or without nixpkgs'
+    /// `knownVulnerabilities` (§12e).
+    Package { name: String, version: String, insecure: bool },
 }
 
 /// If option `option` evaluates to `value`, apply `effect`.
@@ -114,6 +117,9 @@ pub struct World {
     pub base_units: UnitDefs,
     pub base_user_units: Vec<UnitDef>,
     pub base_options: BTreeMap<String, Value>,
+    /// The base generation's packages (pname → version) and the insecure ones (§12e).
+    pub base_packages: BTreeMap<String, String>,
+    pub base_insecure: BTreeSet<String>,
     pub rules: Vec<Rule>,
     /// Options the owner `mkForce`d.
     pub forced: BTreeSet<String>,
@@ -213,6 +219,8 @@ impl World {
         let mut core = self.core_units.clone();
         let mut broken = BTreeSet::new();
         let mut needs_reboot = false;
+        let mut packages = self.base_packages.clone();
+        let mut insecure = self.base_insecure.clone();
         for r in &self.rules {
             if options.get(&r.option) != Some(&r.value) {
                 continue;
@@ -234,6 +242,14 @@ impl World {
                     }
                 }
                 Effect::NeedsReboot => needs_reboot = true,
+                Effect::Package { name, version, insecure: bad } => {
+                    packages.insert(name.clone(), version.clone());
+                    if *bad {
+                        insecure.insert(name.clone());
+                    } else {
+                        insecure.remove(name);
+                    }
+                }
             }
         }
         let locked = overrides.assignments.keys().filter(|k| self.forced.contains(*k)).cloned().collect();
@@ -245,6 +261,8 @@ impl World {
             activation: ActivationPlan { needs_reboot_to_confirm: needs_reboot, ..Default::default() },
             locked,
             core_units: core,
+            packages,
+            insecure,
         };
         (eval, broken)
     }
@@ -994,9 +1012,18 @@ pub fn gym_world(store: MemStore) -> Fake {
         ("services.gym-web.listenAddress".to_string(), Value::Str("127.0.0.1".into())),
         ("services.openssh.enable".to_string(), Value::Bool(true)),
         ("planarian.reference.fontScale".to_string(), Value::Str("1".into())),
+        ("gym.vulnlib".to_string(), Value::Str("1.0".into())),
     ]
     .into();
+    // gym-vulnlib 1.0 carries knownVulnerabilities; 1.1 fixes them (§12e).
+    w.base_packages = [("gym-vulnlib".to_string(), "1.0".to_string())].into();
+    w.base_insecure = ["gym-vulnlib".to_string()].into();
     w.rules = vec![
+        Rule {
+            option: "gym.vulnlib".into(),
+            value: Value::Str("1.1".into()),
+            effect: Effect::Package { name: "gym-vulnlib".into(), version: "1.1".into(), insecure: false },
+        },
         Rule {
             option: "services.gym-web.listenAddress".into(),
             value: Value::Str("192.0.2.10".into()),

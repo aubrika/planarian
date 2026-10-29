@@ -110,6 +110,9 @@ pub struct Executor<B: Backends + Clone, S: Store> {
     /// next `submit` of the same transition uses it if the live override
     /// file is still the one it was built from.
     pub prebuilt: Option<Prebuilt>,
+    /// Set when the last commit raised the security floor (§12e): the
+    /// generation and the packages it fixed, for the daemon to report.
+    pub floor_raised: Option<(GenerationId, Vec<String>)>,
 }
 
 /// What stage, evaluate and build produced for a catalog change.
@@ -209,6 +212,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             last: None,
             excluded: vec![],
             prebuilt: None,
+            floor_raised: None,
         }
     }
 
@@ -268,6 +272,8 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 activation: ActivationPlan::default(),
                 locked: Default::default(),
                 core_units: BTreeMap::new(),
+                packages: BTreeMap::new(),
+                insecure: Default::default(),
             },
             Err(e) => {
                 return Err(reject(
@@ -360,6 +366,10 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             tables: &self.cfg.tables,
             canonical: &self.cfg.canonical,
         });
+        // §11: who else this reaches, and §12e: whether it goes below the floor.
+        let sessions = self.b.sessions().sessions().unwrap_or_default();
+        derive::session_facts(&mut plan.facts, &sessions);
+        derive::floor_fact(&mut plan.facts, &transition, state);
 
         // §12 step 3: `expected` must refine the spec's prediction.
         let predicted = predict(&transition, state, defs);
@@ -581,6 +591,18 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         }
         if let (Some((g, _)), Some(h)) = (&plan.candidate, plan.candidate_override) {
             let _ = self.b.generations().record_override(*g, &h);
+        }
+        // §12e: a committed generation that fixes a known vulnerability is the
+        // new security floor. Derived here, never set by a proposal; it only
+        // moves forward, and only to a generation that committed live.
+        if let (Some((g, _)), Some(cand)) = (&plan.candidate, &plan.cand_eval) {
+            let fixes = cand.security_fixes(&plan.base_eval);
+            let floor = self.kernel.journal.ledger().security_floor;
+            if !fixes.is_empty() && floor.is_none_or(|f| f.0 < g.0) {
+                let now = self.b.clock().now();
+                let _ = self.kernel.journal.append(now, Record::SecurityFloor(Some(*g)));
+                self.floor_raised = Some((*g, fixes));
+            }
         }
         self.session.applied.push(id);
         if let Some(d) = &plan.facts.config_diff {
