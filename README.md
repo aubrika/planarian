@@ -14,7 +14,7 @@ it, deterministically, through one executor that runs every change as a
 journaled, revertible transaction. If Planarian itself is killed mid-change, a
 separate watchdog finishes or reverts the change.
 
-- Specification: [`docs/SPEC.md`](docs/SPEC.md) (v4.3)
+- Specification: [`docs/SPEC.md`](docs/SPEC.md) (v4.4)
 - What differs from the spec, and why: [`docs/deviations.md`](docs/deviations.md)
 - Fault catalog: [`crates/gym/catalog/phase-a.toml`](crates/gym/catalog/phase-a.toml)
 

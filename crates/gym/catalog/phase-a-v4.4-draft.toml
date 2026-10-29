@@ -1,0 +1,782 @@
+# Planarian — Phase A fault catalog, v4.4 additions
+#
+# DRAFT FOR OWNER REVIEW (SPEC §18.0). Spec revision: v4.4.
+# Review notes, conflicts with the v4.3 entries, and questions:
+# docs/catalog-review.md §5–§8.
+#
+# Kept apart from phase-a.toml until sign-off so the gym and CI keep running
+# the signed-off catalog. On sign-off these entries move into phase-a.toml,
+# together with the mechanical v4.4 renames there (Suppress → SetOverride,
+# `suppressions` → `overrides`, CLI `suppress` → `override`), which land with
+# the schema change (handoff step 1) because the judge reads those keys.
+#
+# Format: as in phase-a.toml. Additions this file uses, all proposed:
+#
+#   required_post keys
+#     overrides           [{ unit, by, attribution, until }] that must hold at the end
+#     posture             { class, target_reached, responses = [...], not = [...] }
+#                         responses: alarm, alarm_dismissable, notify_admins,
+#                         disable_agents, restrict_remote, restrict_login,
+#                         restrict_network, halt_to_recovery
+#     not_started         units that must never have been active in the window (I20)
+#     notified_sessions   sessions that must receive a notice
+#     escalation          EscalationReason of the incident's escalation
+#     security_floor      symbolic generation the floor must name at the end
+#     boot_entries        { "<gen>" = { label, automatic_fallback, one_shot } }
+#     declaration_origin  fields the incident report must name for a unit's
+#                         declaration: who, when, path (see the malicious family)
+#     notices_count       { match = "...", count = N }
+#     [[...txn]] fields   approver_class, approved_by, waited_in (a state the
+#                         txn sat in, e.g. Built, with `until`)
+#     [[...incident]]     session (a session id symbol: s1, s2), escalation
+#
+#   raw actions
+#     mask_unit {unit} / unmask_unit {unit}
+#     corrupt_core_hash                    rewrite the recorded core hash
+#     break_journal_chain {record}         edit a retained record's bytes on disk
+#     plant_early_unit {unit}              add a unit outside the generation's
+#                                          closure that starts before planarian-ready
+#     ack_alarm {actor}                    the recovery exit, journaled with identity
+#     session_login {uid, session, seat?}  seat absent = remote (SSH)
+#     session_logout {session}
+#     foreground {session, on}             a GameMode client registers / leaves
+#     oom {unit}                           drive the unit past MemoryMax
+#     mark_security_floor {actor}          `planarian mark-security-floor`
+#     fail_boot {generation}               the next boot of that entry never
+#                                          reaches the 10-minute check (fake: the
+#                                          boot outcome; vm: a kernel param that
+#                                          panics the gym initrd)
+#
+#   inject actors: `user:1000@s1` names a uid and a session (§10).
+#
+#   new fixtures (gym VM; fake equivalents in crates/fake)
+#     service:gym-agent     stand-in principal-admitting agent unit, ordered
+#                           after planarian-ready.target (I20 is checked on it)
+#     service:gym-guard     long-running Security-sensitive unit (a raw kill
+#                           of the NixOS firewall, a oneshot, kills nothing)
+#     pkg:gym-vulnlib       package with two builds: 1.0 carries
+#                           meta.knownVulnerabilities, 1.1 does not
+#     catalog gym:security-fix  moves gym-web from gym-vulnlib 1.0 to 1.1
+#     service:gym-bad-payload   declared, disabled by default; when running it
+#                           takes gym-web's port (the observable "bad payload")
+#
+#   matrix   run the entry once per combination (fake harness only)
+
+schema_version = 1
+spec = "v4.4"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: failure-posture (§12d, I20) — Standard posture, one per class input
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "posture-absent-masked"
+family = "failure-posture"
+summary = "planariad is masked and the machine rebooted. planarian-ready.target times out; Standard's Absent responses apply; the agent stand-in never starts; unmasking and a clean ready lifts them."
+spec = ["§12d", "I20", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "mask_unit", unit = "service:planariad" }]
+inject = { raw = "reboot" }
+after = [
+  { raw = "wait", for = "90s" },
+  { raw = "unmask_unit", unit = "service:planariad", actor = "root" },
+  { raw = "restart_process", process = "planariad" },
+]
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Absent", target_reached = "planarian-failed@Absent.target", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"], not = ["restrict_login", "halt_to_recovery", "alarm_dismissable"] }
+not_started = ["service:gym-agent"]
+reports = ["PostureLifted"]
+invariants = ["I20"]
+
+[[fault]]
+id = "posture-crashed-budget"
+family = "failure-posture"
+summary = "planariad reaches ready, then is killed until its restart budget is spent. OnFailure= reaches planarian-failed@Crashed; responses as Absent; agents stop; an administrator's acknowledgement is journaled with identity."
+spec = ["§12d", "I20", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "release", process = "gym-agent" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGSEGV", repeat = "past-budget" }
+after = [
+  { raw = "wait", for = "30s" },
+  { raw = "ack_alarm", actor = "user:1001" },
+  { raw = "restart_process", process = "planariad" },
+]
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Crashed", target_reached = "planarian-failed@Crashed.target", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"], not = ["restrict_login"] }
+reports = ["AlarmAcknowledged(user:1001)"]
+invariants = ["I20"]
+
+# Agents that were running when the monitor failed are stopped, not merely not started.
+[fault.required_post.unit_after_failure]
+"service:gym-agent" = "Stopped"
+
+[[fault]]
+id = "posture-integrity-core-hash"
+family = "failure-posture"
+summary = "The recorded core hash no longer matches its signature (I2). planarian-recovery's independent check fails the boot as Integrity: tamper alarm, notify, no agents, remote access off; local login proceeds with the warning. Only an administrator clears it."
+spec = ["§12d", "I2", "I20", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "corrupt_core_hash" }]
+inject = { raw = "reboot" }
+after = [
+  { raw = "ack_alarm", actor = "user:1000" },
+  { raw = "ack_alarm", actor = "user:1001" },
+]
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Integrity", target_reached = "planarian-failed@Integrity.target", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"], not = ["halt_to_recovery"] }
+not_started = ["service:gym-agent"]
+# alice's acknowledgement is refused; the admin's clears it.
+reports = ["Unauthorized", "AlarmAcknowledged(user:1001)"]
+invariants = ["I2", "I20"]
+
+[[fault]]
+id = "posture-integrity-journal-chain"
+family = "failure-posture"
+summary = "A record in the hash-chained journal is altered while the machine is off. The boot report finds the broken chain (I18): Integrity responses, as above."
+spec = ["§12c", "§12d", "§10 boot report", "I18", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "RestartUnit", unit = "service:gym-web", source = "user", actor = "user:1001" }]
+inject = { raw = "break_journal_chain", record = "middle", when = "powered-off" }
+after = [{ raw = "reboot" }, { raw = "ack_alarm", actor = "user:1001" }]
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Integrity", target_reached = "planarian-failed@Integrity.target", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"] }
+reports = ["BootReport(JournalChainBroken)"]
+invariants = ["I18", "I20"]
+
+[[fault]]
+id = "posture-integrity-undeclared-early-unit"
+family = "failure-posture"
+summary = "A unit outside the generation's closure is planted to start before planarian-ready. The boot report lists it; Integrity responses apply; one incident opens for it. A user binary started after ready is not a finding."
+spec = ["§10 boot report", "§12d", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "plant_early_unit", unit = "service:gym-planted" }]
+inject = { raw = "reboot" }
+after = [{ raw = "cli", argv = ["status"], actor = "user:1000", run = "/home/alice/bin/late-tool" }]
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Integrity", target_reached = "planarian-failed@Integrity.target", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"] }
+reports = ["BootReport(UndeclaredEarly: service:gym-planted)"]
+no_incident_on = ["process:late-tool"]
+
+[[fault.required_post.incident]]
+target = "service:gym-planted"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: security-floor (§12e, I16)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "floor-revert-blocked"
+family = "security-floor"
+summary = "A security update (gym-vulnlib 1.0 → 1.1, the old build carries knownVulnerabilities) commits and raises the floor. gym-web is then broken so that restarts do not help. The only rollback target, known_good, is below the floor: no Rollback runs, and the incident escalates with RevertBlockedByFloor."
+spec = ["§12e", "I16", "§11 Rollback row", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "gym:security-fix", source = "user", actor = "user:1001" }]
+inject = { raw = "set_persistent_knob", unit = "service:gym-web", knob = "refuse", value = true }
+window = "10m"
+
+[fault.required_post]
+security_floor = "candidate"
+generation = "candidate"
+known_good = "unchanged"
+escalation = "RevertBlockedByFloor"
+boot_entries = { known_good = { label = "below security floor", automatic_fallback = false } }
+invariants = ["I1", "I16"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+count = 0
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+escalation = "RevertBlockedByFloor"
+
+[[fault]]
+id = "floor-update-fails-reverts"
+family = "security-floor"
+summary = "The security update itself fails its checks. The floor never advanced (it moves only on commit), so the ordinary revert to base runs."
+spec = ["§12e", "§12 step 7"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "set_persistent_knob", unit = "service:gym-web", knob = "refuse", value = true, when = { journal = "Activating" } }]
+inject = { transition = "ApplyChange", change = "gym:security-fix", source = "user", actor = "user:1001" }
+window = "10m"
+
+[fault.required_post]
+security_floor = "unchanged"
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Reverted"
+
+[[fault]]
+id = "floor-manual-rollback-needs-admin"
+family = "security-floor"
+summary = "An administrator marks the current generation as the floor. alice then asks to roll back below it: AskFirst with an Administrator approver; bob cannot approve, the admin can."
+spec = ["§12e", "§11 floors", "I16", "I19"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "mark_security_floor", actor = "user:1001" }]
+inject = { transition = "Rollback", source = "user", actor = "user:1000" }
+after = [
+  { raw = "approve_pending", actor = "user:1002", via = "tty" },
+  { raw = "approve_pending", actor = "user:1001", via = "tty" },
+]
+window = "10m"
+
+[fault.required_post]
+reports = ["Unauthorized"]
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+decision = "Allow(AskFirst)"
+approver_class = "Administrator"
+approved_by = "user:1001"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: boot-only-change (§12 step 7, §12f, AwaitingBoot)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "boot-only-kernel-confirmed"
+family = "boot-only-change"
+summary = "A kernel parameter change takes the boot-only path: published as a one-shot next-boot entry, AwaitingBoot, a non-urgent 'restart to finish' notice, known_good still the default. After the reboot and the 10-minute check it commits and becomes known_good."
+spec = ["§12 step 7", "§12f", "§10 boot confirmation", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:kernel-param", source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = { journal = "AwaitingBoot" } }, { raw = "reboot" }]
+window = "20m"
+
+[fault.required_post]
+generation = "candidate"
+known_good = "candidate"
+reports = ["RestartToFinish"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Built", "AwaitingBoot", "Committed"]
+never = "LiveTested"
+
+[[fault]]
+id = "boot-only-kernel-boot-fails"
+family = "boot-only-change"
+summary = "Same change, but the one-shot boot fails. The next boot falls back to known_good and the transaction is Reverted."
+spec = ["§12 step 7", "§12f", "I1", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "fail_boot", generation = "candidate" }]
+inject = { transition = "ApplyChange", change = "gym:kernel-param", source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = { journal = "AwaitingBoot" } }, { raw = "reboot" }]
+window = "20m"
+
+[fault.required_post]
+generation = "base"
+boot_default = "known_good"
+known_good = "unchanged"
+journal_agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["AwaitingBoot", "Reverted"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: authorization (§11)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Replaces phase-a.toml's authz-unprivileged-suppress-security (v4.3 rejected
+# it; v4.4 holds it for an administrator).
+[[fault]]
+id = "authz-unprivileged-override-security"
+family = "intentional-service-stop"
+summary = "alice tries to override sshd, a system Security unit. It is held as AskFirst for an administrator; sshd stays up meanwhile."
+spec = ["§11 authorization", "§15 v4-review"]
+tags = ["acceptance", "replaces:authz-unprivileged-suppress-security"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "cli", argv = ["override", "service:sshd", "--stop"], actor = "user:1000" }
+window = "1m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+overrides = []
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+decision = "Allow(AskFirst)"
+approver_class = "Administrator"
+terminal = "pending"
+
+[[fault]]
+id = "authz-user-overrides-firewall"
+family = "intentional-service-stop"
+summary = "From her session, alice overrides the firewall off. Held for an administrator; the firewall stays up. alice cannot approve her own proposal (I19) and bob is not an administrator; the admin approves and the override holds, attested, by alice."
+spec = ["§11 authorization", "§11 approval", "I19", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "session_login", uid = 1000, session = "s1", seat = "seat0" }]
+inject = { raw = "cli", argv = ["override", "service:firewall", "--stop"], actor = "user:1000@s1" }
+after = [
+  { raw = "approve_pending", actor = "user:1000", via = "tty" },
+  { raw = "approve_pending", actor = "user:1002", via = "tty" },
+  { raw = "wait", for = "30s" },
+  { raw = "approve_pending", actor = "user:1001", via = "tty" },
+]
+window = "3m"
+
+[fault.required_post]
+overrides = [{ unit = "service:firewall", by = "user:1000@s1", attribution = "Attested" }]
+reports = ["Unauthorized", "Unauthorized"]
+invariants = ["I19"]
+
+# Firewall up until the admin approved.
+[fault.required_post.unit_until_approval]
+"service:firewall" = "Running"
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+decision = "Allow(AskFirst)"
+approver_class = "Administrator"
+approved_by = "user:1001"
+
+[[fault]]
+id = "authz-unprivileged-stop-unauthorized"
+family = "intentional-service-stop"
+summary = "alice tries to stop gym-db, a system unit that is neither Security-sensitive nor user-controllable: Reject(Unauthorized), whatever max_tier says."
+spec = ["§11 authorization", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { raw = "cli", argv = ["stop", "service:gym-db"], actor = "user:1000" }
+window = "1m"
+
+[fault.required_post]
+units = { "service:gym-db" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+decision = "Reject(Unauthorized)"
+
+[[fault]]
+id = "authz-nonadmin-stops-network-other-session"
+family = "authorization"
+summary = "bob, at the seat, stops the network while alice has a session open. ConnectivityLoss with other_sessions_affected: AskFirst for a non-administrator, and alice's session is notified."
+spec = ["§11 floors", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+# See catalog-review §7 G11: stopping the network must be user-controllable
+# for bob, or authorization rejects it before the floor is reached.
+setup = [
+  { raw = "set_setting", key = "userControllable", value = ["device:net-gym0"] },
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "session_login", uid = 1002, session = "s2", seat = "seat0" },
+]
+inject = { raw = "cli", argv = ["stop", "device:net-gym0"], actor = "user:1002@s2" }
+window = "2m"
+
+[fault.required_post]
+units = { "device:net-gym0" = "Running" }
+notified_sessions = ["s1"]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+decision = "Allow(AskFirst)"
+
+[[fault]]
+id = "authz-ssh-not-local"
+family = "authorization"
+summary = "alice, over SSH (no seat), stops her own Wi-Fi: ConnectivityLoss from a session without a seat is AskFirst, even though the unit is user-controllable."
+spec = ["§10 actors", "§11 floors"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "session_login", uid = 1000, session = "r1" }]
+inject = { raw = "cli", argv = ["stop", "device:wlan-hwsim"], actor = "user:1000@r1" }
+window = "1m"
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+decision = "Allow(AskFirst)"
+
+[[fault]]
+id = "authz-last-admin-kept"
+family = "authorization"
+summary = "A proposal that would leave planarian-admin empty (and root excluded) is rejected (I17)."
+spec = ["I17"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:remove-admin", args = { user = "admin" }, source = "user", actor = "user:1001" }
+window = "1m"
+
+[fault.required_post]
+invariants = ["I17"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+decision = "Reject"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: sessions (§10)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "session-second-compositor-fails"
+family = "boot-to-desktop-failure"
+summary = "alice has two graphical sessions. The second session's compositor fails; an incident opens for that session only, and the first session is untouched."
+spec = ["§9 per-session compositor probe", "§10 conditions", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "session_login", uid = 1000, session = "s1", seat = "seat0" }]
+inject = { raw = "session_login", uid = 1000, session = "s2", seat = "seat0", compositor = "fails" }
+window = "5m"
+
+[fault.required_post]
+no_incident_on = ["target@1000/s1:graphical-session"]
+
+[[fault.required_post.incident]]
+target = "target@1000/s2:graphical-session"
+session = "s2"
+
+[[fault]]
+id = "session-logout-one-of-two"
+family = "login-screen-idle"
+summary = "alice logs out of one of her two sessions. Her user services (pipewire) keep running; no incident, no transaction."
+spec = ["§10 user-scoped units", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "the uid still has a session" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "session_login", uid = 1000, session = "s2", seat = "seat0" },
+]
+inject = { raw = "session_logout", session = "s2" }
+window = "3m"
+
+[fault.required_post]
+units = { "service@1000:pipewire" = "Running" }
+no_incident_on = ["service@1000:pipewire"]
+no_autonomous_txn = true
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: unattributed-residue (§11) — Standard posture
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "residue-kill9-service"
+family = "unattributed-residue"
+summary = "A raw kill -9 of gym-web (Restart=no, not Security-sensitive). Under Standard it is accepted until next boot as an inferred, unattributed override, with a notice and an undo. No restart."
+spec = ["§11 unattributed residue", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "an unattributed stop under Standard is inferred as intended" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", by = "Unattributed", attribution = "Inferred", until = "NextBoot" }]
+reports = ["InferredOverride", "Undo"]
+no_txn_on = ["service:gym-web"]
+
+[[fault]]
+id = "residue-kill9-undo"
+family = "unattributed-residue"
+summary = "Continuation: alice uses the offered undo. The inferred override is lifted by an authorized principal and gym-web is started."
+spec = ["§11 unattributed residue"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }, { raw = "wait", for = "30s" }]
+inject = { raw = "cli", argv = ["release", "service:gym-web"], actor = "user:1001" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+overrides = []
+
+[[fault.required_post.txn]]
+transition = "LiftOverride"
+actor = "user:1001"
+
+[[fault]]
+id = "residue-kill9-security"
+family = "unattributed-residue"
+summary = "A raw kill -9 of gym-guard (Security-sensitive) is a fault under every posture: restarted and alarmed, never inferred."
+spec = ["§11 unattributed residue", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "kill_unit", unit = "service:gym-guard", signal = "SIGKILL" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-guard" = "Running" }
+overrides = []
+reports = ["alarm"]
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-guard"
+terminal = "Committed"
+
+[[fault]]
+id = "residue-stop-firewall"
+family = "unattributed-residue"
+summary = "The NixOS firewall (a oneshot) is stopped out of band by root. Security-sensitive, so it is restarted and alarmed."
+spec = ["§11 unattributed residue", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "repair"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { raw = "stop_unit_out_of_band", unit = "service:firewall", actor = "root" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:firewall" = "Running" }
+reports = ["alarm"]
+
+[[fault]]
+id = "residue-oom-kill"
+family = "unattributed-residue"
+summary = "gym-web is driven past MemoryMax and the kernel kills it (Result=oom-kill). OOM kills are always faults: restarted, no inferred override."
+spec = ["§11 unattributed residue", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "oom", unit = "service:gym-web" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+overrides = []
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: journal-integrity (§12c, I18)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "journal-record-edited"
+family = "journal-integrity"
+summary = "A retained journal record is edited on disk while the daemon runs. The next read detects the broken chain as an Integrity failure; no transaction is taken from the edited record."
+spec = ["§12c", "I18", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "RestartUnit", unit = "service:gym-web", source = "user", actor = "user:1001" }]
+inject = { raw = "break_journal_chain", record = "retained" }
+after = [{ raw = "restart_process", process = "planariad" }]
+window = "3m"
+
+[fault.required_post]
+posture = { class = "Integrity", target_reached = "planarian-failed@Integrity.target" }
+reports = ["JournalChainBroken"]
+invariants = ["I18"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: activation-scheduling (§12f)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "quiet-staged-update-foreground"
+family = "activation-scheduling"
+summary = "A verified change that would restart a session unit (keyboard layout → compositor reload) is staged while a GameMode client holds Foreground. It waits in Built; once Foreground ends it activates in the window and commits."
+spec = ["§12f", "I6", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "foreground", session = "s1", on = true },
+]
+inject = { transition = "ApplyChange", change = "keyboard-layout", args = { layout = "de" }, source = "user", actor = "user:1000@s1" }
+after = [{ raw = "wait", for = "3m" }, { raw = "foreground", session = "s1", on = false }]
+window = "10m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+waited_in = { state = "Built", until = "foreground-ended" }
+terminal = "Committed"
+
+[[fault]]
+id = "quiet-repair-not-deferred"
+family = "activation-scheduling"
+summary = "While Foreground holds, PipeWire crashes. Repairs of units foreground work depends on are not deferred: repaired at once, exactly one notice."
+spec = ["§12f quiet mode"]
+tags = ["acceptance"]
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "foreground", session = "s1", on = true },
+]
+# SIGSEGV, not SIGKILL: see catalog-review §6 C1.
+inject = { raw = "kill_unit", unit = "service@1000:pipewire", signal = "SIGSEGV" }
+window = "2m"
+
+[fault.required_post]
+units = { "service@1000:pipewire" = "Running" }
+notices_count = { match = "pipewire", count = 1 }
+
+[[fault]]
+id = "quiet-reference-workload"
+family = "activation-scheduling"
+summary = "The invisibility-budget benchmark (§21): the reference game runs while a GC, a staged update and a non-urgent fault are queued. p99 frame time and input latency match the Planarian-stopped baseline; each deferred item runs in its window afterward; a PipeWire crash mid-run is repaired with one notice."
+spec = ["§12f", "§21 invisibility budget"]
+tags = ["acceptance", "benchmark", "owner-open:reference-game"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "session_login", uid = 1000, session = "s1", seat = "seat0" }]
+inject = { raw = "workload", name = "reference-game", queue = ["gc", "staged-update", "fault:gym-metrics"], mid_run = { raw = "kill_unit", unit = "service@1000:pipewire", signal = "SIGSEGV" } }
+window = "20m"
+
+[fault.required_post]
+metrics = { frame_time_p99 = "no significant difference vs baseline", deferred_items_ran = 3 }
+notices_count = { match = "pipewire", count = 1 }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: assumptions (§17a, AGENTS.md 12) — the fake backend as a second
+# implementation of every docs/assumptions.md entry
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "fake-assumptions-conformance"
+family = "assumptions"
+summary = "The transaction kernel against the fake backend, once per docs/assumptions.md entry and injected outcome. Each run must satisfy the entry's contract and reach a terminal state (I12)."
+spec = ["§17a", "§18.12", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+matrix = { assumption = "docs/assumptions.md#all", outcome = ["Partial", "Unknown", "Fenced"] }
+inject = { raw = "backend_result", call = "<assumption>", result = "<outcome>" }
+window = "10m"
+
+[fault.required_post]
+invariants = ["I6", "I12", "I15"]
+reports = ["AssumptionHeld(<assumption>)"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: malicious-declaration (§15)
+#
+# Planarian cannot tell a declared bad payload from a legitimate service: the
+# case passes iff the incident report names the declaration's origin. The
+# payload here takes gym-web's port, so the observable fault is gym-web.
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "malicious-decl-owner-rebuild"
+family = "malicious-declaration"
+summary = "The owner's flake gains gym-bad-payload and root runs nixos-rebuild switch outside Planarian. The incident on gym-web names gym-bad-payload's declaration: the owner source file, the out-of-band rebuild as the path, and when that generation appeared."
+spec = ["§15 malicious declaration", "§11 out-of-band rebuild"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "out_of_band_rebuild", edit = "enable gym-bad-payload", actor = "root" }
+window = "10m"
+
+[fault.required_post]
+declaration_origin = { unit = "service:gym-bad-payload", who = "root", path = "out-of-band nixos-rebuild", file = "owner:configuration.nix", when = "generation-created" }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+
+[[fault]]
+id = "malicious-decl-catalog-enable"
+family = "malicious-declaration"
+summary = "alice enables the declared-but-off gym-bad-payload through the service-enable catalog entry. The incident names alice, the transaction, and planarian/overrides.nix as the path."
+spec = ["§15 malicious declaration", "§9 catalog"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "service-enable", args = { service = "gym-bad-payload" }, source = "user", actor = "user:1000" }
+window = "10m"
+
+[fault.required_post]
+declaration_origin = { unit = "service:gym-bad-payload", who = "user:1000", path = "ApplyChange service-enable", file = "planarian/overrides.nix", when = "txn" }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+
+[[fault]]
+id = "malicious-decl-input-update"
+family = "malicious-declaration"
+summary = "A flake input update (the supply-chain path) brings in a module that declares gym-bad-payload. The incident names the input, its lock change (old and new revisions), and who applied the update."
+spec = ["§15 malicious declaration"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "out_of_band_rebuild", edit = "update input gym-modules to a rev declaring gym-bad-payload", actor = "root" }
+window = "10m"
+
+[fault.required_post]
+declaration_origin = { unit = "service:gym-bad-payload", who = "root", path = "flake input gym-modules", lock_change = true, when = "generation-created" }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
