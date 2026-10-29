@@ -248,7 +248,9 @@ let
             whenDevice = "device:gym-usb0";
             probes = [ { id = "gym-usb-reader-active"; type = "systemd-active"; establishes = "gym-usb-reader-active"; } ];
           };
-          wireplumber = { scope = "user"; };
+          # Upstream's unit carries BindsTo=pipewire.service, which the module
+          # cannot read from NixOS options for a user unit: declared here.
+          wireplumber = { scope = "user"; edges = [ { to = "service@0:pipewire"; kind = "Requires"; } ]; };
         };
       };
 
