@@ -55,33 +55,6 @@ spec = "v4.5"
 # Group 1: the bypasses
 # ═══════════════════════════════════════════════════════════════════════════
 
-# B-2 (High). Fixture: an overlay marking the base generation's openssh with
-# knownVulnerabilities = ["GYM-0001"]; the candidate's openssh lacks it.
-# openssh is a service package, not in environment.systemPackages.
-[[fault]]
-id = "floor-service-package-fix"
-family = "security-floor"
-summary = "A generation whose only security fix is in a service package (openssh, not in environment.systemPackages) commits. The floor moves to it, because the floor is derived from the whole closure. A later failure does not revert below it."
-spec = ["§12e", "I16", "B-2"]
-tags = ["acceptance", "bypass"]
-scoring = "must-pass"
-harness = ["fake", "vm"]
-intent = { kind = "none" }
-setup = [
-  { transition = "ApplyChange", change = "gym:openssh-fix", args = {}, source = "user", actor = "root" },
-  { raw = "set_persistent_knob", unit = "service:gym-web", knob = "fail_on_start", value = true },
-]
-inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }
-window = "10m"
-
-[fault.required_post]
-security_floor = "candidate"
-escalation = "RevertBlockedByFloor"
-
-[[fault.required_post.txn]]
-transition = "Rollback"
-never = ["Activating"]
-
 # B-3 (Medium).
 [[fault]]
 id = "approve-needs-real-terminal"

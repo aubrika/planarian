@@ -35,6 +35,7 @@ let
     sshd-on = { services.openssh.enable = true; };
     kparam = { gym.kernelParam = "virtio_gpu.modeset=0"; };
     payload = { services.gym-bad-payload.enable = true; };
+    vulnfix = { gym.vulnsvcVersion = "1.1"; };
   };
   # What Planarian evaluates besides the export (nix/backends apply_expr).
   optionPaths = [
@@ -44,7 +45,18 @@ let
     "services.gym-extra.enable"
     "gym.kernelParam"
     "services.gym-bad-payload.enable"
+    "gym.vulnsvcVersion"
   ];
+
+  # B-2 (§12e): a service package that is only a service's package (never in
+  # environment.systemPackages). 1.0 carries knownVulnerabilities; 1.1 does
+  # not. `meta` is set on the package value, so nixpkgs' insecure check,
+  # which runs when a derivation is made, is not involved.
+  vulnsvc = v:
+    let p = pkgs.runCommand "gym-vulnsvc-${v}" { pname = "gym-vulnsvc"; version = v; } ''
+      mkdir -p $out/bin; ln -s ${pkgs.coreutils}/bin/sleep $out/bin/gym-vulnsvc
+    ''; in
+    if v == "1.0" then p // { meta = (p.meta or { }) // { knownVulnerabilities = [ "GYM-0001: the gym's vulnerable service package" ]; }; } else p;
 
   fixture = pkgs.writeScript "gym-fixture" ''
     #!${pkgs.python3}/bin/python3
@@ -150,12 +162,22 @@ let
     options.gym.isBase = lib.mkOption { type = lib.types.bool; default = true; };
     # A boot-only change for gym:kernel-param (desktop-boot-fails-rollback).
     options.gym.kernelParam = lib.mkOption { type = lib.types.str; default = ""; };
+    options.gym.vulnsvcVersion = lib.mkOption { type = lib.types.str; default = "1.0"; };
+    options.services.gym-vulnsvc = {
+      enable = lib.mkEnableOption "gym-vulnsvc";
+      package = lib.mkOption { type = lib.types.package; };
+    };
 
     config = {
       # No desktop in this VM (the desktop entries need the COSMIC variant).
       services.desktopManager.cosmic.enable = lib.mkForce false;
       services.displayManager.cosmic-greeter.enable = lib.mkForce false;
       planarian.reference.verboseBoot = true;
+      services.gym-vulnsvc = { enable = true; package = vulnsvc config.gym.vulnsvcVersion; };
+      systemd.services.gym-vulnsvc = {
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig.ExecStart = "${config.services.gym-vulnsvc.package}/bin/gym-vulnsvc infinity";
+      };
       services.planarian.console.enable = lib.mkForce false;
 
       services.planarian = {
@@ -171,6 +193,7 @@ let
         };
         catalog.listenAddresses.gym-web = { option = "services.gym-web.listenAddress"; permitted = [ "127.0.0.1" "192.0.2.10" ]; };
         catalog.gymChoices."gym:kernel-param" = { option = "gym.kernelParam"; arg = "param"; permitted = [ "virtio_gpu.modeset=0" ]; };
+        catalog.gymChoices."gym:service-package-fix" = { option = "gym.vulnsvcVersion"; arg = "version"; permitted = [ "1.1" ]; };
         units = {
           gym-web = {
             synonyms = [ "web server" "web" ];

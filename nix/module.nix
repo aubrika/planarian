@@ -14,7 +14,50 @@
 { config, options, lib, pkgs, ... }:
 
 let
-  systemPkgs = lib.filter (p: p ? pname) config.environment.systemPackages;
+  # §12e: the security floor's inspected set. Every package value the
+  # evaluated configuration holds (environment.systemPackages,
+  # systemd.packages, every enabled services.* option that is a package or a
+  # list of them, every unit's `path`, the kernel and firmware), then their
+  # runtime inputs (buildInputs, propagatedBuildInputs), recursively. A
+  # package referenced only by a store-path string in a unit file has no
+  # `meta` to read at evaluation and is not seen (bypasses.md; the CVE feed
+  # matches the built closure from Phase B).
+  inspected =
+    let
+      ok = v: let r = builtins.tryEval v; in if r.success then r.value else null;
+      isDrv = v: ok (lib.isDerivation v) == true;
+      drvs = v:
+        let x = ok v; in
+        if x == null then [ ] else if isDrv x then [ x ] else if builtins.isList x then lib.filter isDrv x else [ ];
+      # Through `options`, never by walking config values: a renamed option's
+      # shim aborts when read, and abort is not catchable.
+      pkgType = t:
+        t.name == "package"
+        || (lib.elem t.name [ "listOf" "nullOr" ] && (t.nestedTypes.elemType.name or "") == "package");
+      isEnabled = n:
+        let os = options.services.${n}; in
+        n != "planarian" && os ? enable && lib.isOption os.enable && (os.enable.isDefined or false)
+        && ok config.services.${n}.enable == true;
+      fromServices = lib.concatMap
+        (n:
+          let os = options.services.${n}; in
+          lib.concatMap
+            (a: let o = os.${a}; in
+              if lib.isOption o && (o.visible or true) != false && pkgType o.type then drvs config.services.${n}.${a} else [ ])
+            (builtins.attrNames os))
+        (lib.filter isEnabled (builtins.attrNames options.services));
+      unitPaths = lib.concatMap (u: drvs (u.path or [ ])) (builtins.attrValues config.systemd.services);
+      roots = lib.concatMap drvs (config.environment.systemPackages ++ config.systemd.packages)
+        ++ fromServices ++ unitPaths
+        ++ drvs config.boot.kernelPackages.kernel ++ drvs config.hardware.firmware;
+      item = p: let k = ok p.outPath; in if k == null then [ ] else [ { key = k; pkg = p; } ];
+      inputs = p: lib.filter isDrv (lib.flatten (map (a: let v = ok (p.${a} or [ ]); in if v == null then [ ] else v) [ "buildInputs" "propagatedBuildInputs" ]));
+    in
+    map (i: i.pkg) (builtins.genericClosure {
+      startSet = lib.concatMap item roots;
+      operator = i: lib.concatMap item (inputs i.pkg);
+    });
+  insecureIn = p: (let r = builtins.tryEval (p.meta.knownVulnerabilities or [ ]); in if r.success then r.value else [ ]) != [ ];
   inherit (lib) mkOption mkEnableOption mkIf mkDefault types;
   cfg = config.services.planarian;
 
@@ -434,10 +477,10 @@ in
       };
       devices = lib.mapAttrs (_: u: u.sysfs) (lib.filterAttrs (_: u: u.kind == "device" && u.sysfs != null) cfg.units);
       # §12e: the security floor rises when a committed generation drops a
-      # package's nixpkgs knownVulnerabilities. Reading `meta` does not trip
-      # nixpkgs' insecure-package check.
-      packages = builtins.listToAttrs (map (p: { name = p.pname; value = p.version or ""; }) systemPkgs);
-      insecure = map (p: p.pname) (lib.filter (p: (p.meta.knownVulnerabilities or [ ]) != [ ]) systemPkgs);
+      # package's nixpkgs knownVulnerabilities, over the inspected set above.
+      # Reading `meta` does not trip nixpkgs' insecure-package check.
+      packages = builtins.listToAttrs (map (p: { name = lib.getName p; value = lib.getVersion p; }) inspected);
+      insecure = lib.unique (map lib.getName (lib.filter insecureIn inspected));
       # §15: every system service and the files that define it (NixOS's
       # definition locations), watched or not, so a declaration that turns
       # out to be malicious can be reported with its origin.

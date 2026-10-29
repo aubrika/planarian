@@ -2737,3 +2737,26 @@ caller = "agent:coder"
 [[fault.required_post.txn]]
 transition = "ApplyChange"
 never = ["Activating"]
+
+# B-2 (High). VM only: the fake has no closure, so it cannot tell a service
+# package from a system package. Not openssh: NixOS's openssh module adds its
+# package to environment.systemPackages itself, so a fix there moved the floor
+# before B-2 was fixed too and would not test it (deviations.md).
+[[fault]]
+id = "floor-service-package-fix"
+family = "security-floor"
+summary = "A change whose only security fix is in a service's package (gym-vulnsvc 1.0 -> 1.1; services.gym-vulnsvc.package, never in environment.systemPackages) commits. The security floor moves to it: the inspected set is the configuration's whole package set, not environment.systemPackages."
+spec = ["§12e", "I16", "B-2"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:service-package-fix", args = { version = "1.1" }, source = "user", actor = "root" }
+window = "10m"
+
+[fault.required_post]
+security_floor = "candidate"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
