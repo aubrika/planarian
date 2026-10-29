@@ -16,6 +16,28 @@ proof obligation fails: dropping the cumulative check from `decide` makes
 it fail. The crates also build with plain `cargo`, which erases the proof
 code: `vstd` is an ordinary dependency.
 
+## The ratio 0v:0t and the size of 0t (§17a)
+
+`docs/verification-ratio.toml` lists, for each invariant, the obligations
+a tool discharges on every run (Verus lemmas and verified functions, Kani
+harnesses) and the `assumptions.md` ids it rests on. Tests are listed but
+not counted. `planarian-gym verification` checks every name against the
+source and every id against `assumptions.md`, prints the report, and fails
+CI if the global or any per-invariant ratio falls or 0t grows.
+
+GA baseline (2026-10-29): **size of 0t = 32** (19 `assumptions.md` entries
+plus 13 `external_body` sites: 8 ledger helpers and 5 opaque types);
+**global 0v:0t = 28:43**. Invariants with a proof claim in Phase A:
+I5 4:3, I6 5:5, I11 2:2, I12 7:8, I14 1:2, I15 2:2, I16 2:3, I19 3:1.
+I1–I4, I7, I13, I17, I18 and I20 are tested, not proved (their proof
+phases are in SPEC §8).
+
+Before and after v4.4 (owner decision Q6): Verus verified 17 / 37 / 38
+obligations in `schema` / `policy` / `txn` before the v4.4 types, and
+17 / 51 / 42 after. No proof was weakened. The policy lemmas extend to the
+new types and add I16 and I19. The ledger adds v4.4's I6 and the boot-only
+path.
+
 ## `policy` (Phase A target: done)
 
 `decide` itself is verified: its postcondition is `r == decide_spec(*i)`,

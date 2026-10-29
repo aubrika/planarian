@@ -1,0 +1,186 @@
+# The verification ratio 0v:0t and the size of 0t (SPEC §17a), per invariant.
+#
+# `discharged`: proof obligations a tool closes on every CI run, as
+#   "crate::name": a Verus `proof fn` (or a function verified against its
+#   `ensures`) or a Kani harness. Tests do not discharge anything; they are
+#   listed under `tested` and not counted.
+# `assumes`: the docs/assumptions.md ids (V, P, G) the invariant rests on.
+#
+# `planarian-gym verification` checks that every name exists in the source
+# and every id in assumptions.md, prints the report, and fails if a ratio
+# fell or 0t grew against [baseline] (the ratchet: every gate).
+
+[baseline]
+# GA (2026-10-29), from `planarian-gym verification --write-baseline`.
+# Change these only when a change improves them.
+size_0t = 32
+discharged = 28
+assumed = 43
+
+[baseline.per_invariant]
+I1 = [0, 2]
+I2 = [0, 2]
+I3 = [0, 2]
+I4 = [0, 1]
+I5 = [4, 3]
+I6 = [5, 5]
+I7 = [0, 1]
+I8 = [1, 1]
+I10 = [1, 2]
+I11 = [2, 2]
+I12 = [7, 8]
+I13 = [0, 1]
+I14 = [1, 2]
+I15 = [2, 2]
+I16 = [2, 3]
+I17 = [0, 1]
+I18 = [0, 2]
+I19 = [3, 1]
+I20 = [0, 2]
+
+[[invariant]]
+id = "I1"
+statement = "A boot-confirmed known-good generation always exists and is in the boot menu."
+phase = "D (proof)"
+tested = ["exec::tests (vm-generations)"]
+discharged = []
+assumes = ["P3", "P8"]
+
+[[invariant]]
+id = "I2"
+statement = "The installed core package's hash equals the hash recorded in its signature."
+phase = "E"
+tested = ["gym posture-integrity-core-hash"]
+discharged = []
+assumes = ["P5", "P8"]
+
+[[invariant]]
+id = "I3"
+statement = "Garbage collection never removes known-good, the previous, the current generation, an in-flight candidate or the boot model."
+phase = "A (test), D (proof)"
+tested = ["schema::gc tests", "gym storage-budget-unsatisfiable"]
+discharged = []
+assumes = ["P1", "P8"]
+
+[[invariant]]
+id = "I4"
+statement = "Running means desired-Running, observed-active, and every applicable Readiness probe passed with fresh evidence."
+phase = "A"
+tested = ["state tests"]
+discharged = []
+assumes = ["P6"]
+
+[[invariant]]
+id = "I5"
+statement = "Forbidden actions are unrepresentable; Reject is never converted to a tier by any setting."
+phase = "A (proof)"
+discharged = ["policy::decide", "policy::i5_autonomy_never_touches_reject", "policy::unauthorized_is_refused_first", "policy::core_is_never_a_target"]
+assumes = ["V1", "V2", "V3"]
+
+[[invariant]]
+id = "I6"
+statement = "At most one generation-changing transaction is active; nothing executes during Activating, Published, Promoted or Reverting."
+phase = "A (proof)"
+discharged = ["txn::validate", "txn::apply", "txn::well_formed", "txn::i6_one_generation_active", "txn::compatible_exec"]
+assumes = ["V3", "V4", "V5", "V6", "P4"]
+
+[[invariant]]
+id = "I7"
+statement = "Every executed transition is logged with its proposal, facts, decision and outcome."
+phase = "A"
+tested = ["daemon core tests", "gym (every entry reads the executor log)"]
+discharged = []
+assumes = ["P4"]
+
+[[invariant]]
+id = "I8"
+statement = "A tier-3 transition executes only with an approval token bound to the concrete candidate, re-validated before execution."
+phase = "A, C (proof)"
+tested = ["exec tests", "gym policy-token-*"]
+discharged = ["exec::approval_tokens_expire_after_their_lifetime"]
+assumes = ["P5"]
+
+[[invariant]]
+id = "I10"
+statement = "No change that alters a canonical probe executes below AskFirst; canonical probes come from the installed core package."
+phase = "A"
+tested = ["state tests", "gym probe-tamper"]
+discharged = ["policy::i10_canonical_probe_changes_ask"]
+assumes = ["V1", "P9"]
+
+[[invariant]]
+id = "I11"
+statement = "A session's cumulative effect is classified at least as high as any single transition producing it."
+phase = "A (proof)"
+discharged = ["policy::i11_non_routine_session_asks", "policy::i11_session_only_raises"]
+assumes = ["V1", "V2"]
+
+[[invariant]]
+id = "I12"
+statement = "Under the progress assumptions, every transaction reaches a terminal state; RecoveryFailed alerts and sets the interlock."
+phase = "A (proof, conditional)"
+tested = ["exec crash-point property tests", "gym fake-assumptions-conformance"]
+discharged = ["txn::i12_steps_terminate", "txn::i12_terminal_always_reachable", "txn::terminal_is_final", "txn::refusal_only_before_mutation", "txn::apply", "txn::recovery_table_follows_the_state_machine", "txn::watchdog_takes_over_only_when_it_should"]
+assumes = ["G1", "G2", "G3", "G4", "P1", "P4", "P7", "V5"]
+
+[[invariant]]
+id = "I13"
+statement = "A unit under an override is never a repair target while the override holds."
+phase = "A"
+tested = ["incident tests", "gym intent-user-stops-service"]
+discharged = []
+assumes = ["P6"]
+
+[[invariant]]
+id = "I14"
+statement = "Policy facts are derived by the executor from the evaluated generation, never read from a proposal."
+phase = "A (proof)"
+discharged = ["policy::i14_facts_caller_is_not_authority"]
+assumes = ["P9", "V3"]
+
+[[invariant]]
+id = "I15"
+statement = "Exactly one owner per transaction; a stale epoch is refused; only the lease holder advances the journal."
+phase = "A (proof)"
+tested = ["gym fake-assumptions-conformance (Fenced)"]
+discharged = ["txn::validate", "txn::takeover_fences_out_the_previous_owner"]
+assumes = ["P4", "P7"]
+
+[[invariant]]
+id = "I16"
+statement = "No automatic revert, rollback or boot fallback goes below the security floor; going below needs an administrator."
+phase = "A (proof of decide and target selection; bootloader by test)"
+tested = ["gym floor-revert-blocked", "gym floor-manual-rollback-needs-admin"]
+discharged = ["policy::i16_below_floor_needs_administrator", "policy::administrator_class_only_on_ask_first"]
+assumes = ["V1", "V2", "P3"]
+
+[[invariant]]
+id = "I17"
+statement = "The set of principals holding administrator capability is never empty."
+phase = "A"
+tested = ["policy::i17_root_is_always_an_administrator"]
+discharged = []
+assumes = ["P8"]
+
+[[invariant]]
+id = "I18"
+statement = "Every journal record commits to its predecessor's hash; a broken chain is detected on read."
+phase = "A"
+tested = ["txn journal tests", "gym journal-record-edited", "gym posture-integrity-journal-chain"]
+discharged = []
+assumes = ["P5", "P4"]
+
+[[invariant]]
+id = "I19"
+statement = "No principal approves its own proposal or grants itself a capability it does not hold."
+phase = "A (proof), C"
+discharged = ["policy::i19_no_self_approval", "policy::may_approve", "policy::may_grant"]
+assumes = ["V1"]
+
+[[invariant]]
+id = "I20"
+statement = "No agent principal starts while planarian-ready.target is not reached, in every failure posture."
+phase = "A"
+tested = ["vm-posture", "gym posture-*"]
+discharged = []
+assumes = ["P6", "P8"]

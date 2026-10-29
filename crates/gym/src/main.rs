@@ -3,6 +3,7 @@
 //!   planarian-gym list    [--catalog FILE]
 //!   planarian-gym run     [--catalog FILE] --harness fake [--id ID ...] [--all]
 //!   planarian-gym show-reconciliation --harness fake --id ID
+//!   planarian-gym verification [--write-baseline]   the 0v:0t report (§17a)
 //!
 //! The fake harness runs the real daemon core, executor, kernel and watchdog
 //! logic against the in-memory machine (`planarian-fake`). The VM harness is
@@ -17,6 +18,7 @@ mod serve;
 mod sim;
 #[cfg(test)]
 mod tests;
+mod verification;
 
 use sim::Sim;
 use toml::Value as T;
@@ -125,6 +127,11 @@ fn load(path: &str) -> Vec<T> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("verification") {
+        let r = verification::run(args.iter().any(|a| a == "--write-baseline"));
+        print!("{}", r.text);
+        std::process::exit(if r.ok { 0 } else { 1 });
+    }
     if args.first().map(String::as_str) == Some("vm") {
         // The VM harness's in-VM half (live.rs).
         let catalog = args
