@@ -81,6 +81,10 @@ let
     # Ready again with a clean boot report: Absent and Crashed lift.
     # Integrity needs an administrator (planarian-ack).
     [ -e /run/planarian/failed-integrity ] && exit 0
+    # Wanted by the ready target and ordered after it, this also runs when
+    # the target's start failed (After= orders, it does not require).
+    systemctl is-active --quiet planarian-ready.target || exit 0
+    systemctl is-active --quiet planariad.service || exit 0
     if [ -e /run/planarian/alarm ]; then
       rm -f /run/planarian/alarm /run/issue.d/50-planarian.issue /run/planarian/failed-absent /run/planarian/failed-crashed
       rm -f /run/planarian/sshd/posture.conf
@@ -226,6 +230,9 @@ in
         # belongs to planarian-posture-check, which raises Absent and lifts it
         # again once ready is reached.
         TimeoutStartSec = "infinity";
+        # Restarts within the budget skip the failed state, so OnFailure=
+        # (Crashed) fires only once the budget is spent (systemd ≥ 254).
+        RestartMode = "direct";
         # 78: an integrity failure; not restarted, routed by ExecStopPost.
         SuccessExitStatus = [ 78 ];
         RestartPreventExitStatus = [ 78 ];
