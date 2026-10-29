@@ -548,7 +548,12 @@ impl GenerationBackend for Nixos {
     fn created_by(&self, g: GenerationId) -> Option<(u32, Timestamp)> {
         use std::os::unix::fs::MetadataExt;
         let dir = self.paths.profile.parent()?;
-        let name = format!("{}-{}-link", self.paths.profile.file_name()?.to_string_lossy(), g.0);
+        // Planarian's generation ids are not profile numbers: find the
+        // profile link that holds this generation's system path (the newest,
+        // if several do).
+        let path = self.path_of(g).ok()?;
+        let number = self.profile_generations().into_iter().filter(|(_, p)| *p == path.0).map(|(n, _)| n).max()?;
+        let name = format!("{}-{}-link", self.paths.profile.file_name()?.to_string_lossy(), number);
         let m = std::fs::symlink_metadata(dir.join(name)).ok()?;
         Some((m.uid(), Timestamp(u64::try_from(m.mtime()).ok()? * 1000)))
     }

@@ -770,6 +770,21 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
     }
 
+    /// The boot report (§10), once per boot: units from outside the
+    /// generation. `main` runs it before signalling ready, so nothing that
+    /// waits for planarian-ready.target starts before it is clean; the first
+    /// tick runs it otherwise (the gym). The finding, if any.
+    pub fn boot_report(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.boot_report_due) {
+            return None;
+        }
+        let foreign = self.b.units().foreign_units();
+        for u in &foreign {
+            self.notice(format!("INTEGRITY: boot report: {u} runs, but this generation does not declare it"));
+        }
+        (!foreign.is_empty()).then(|| format!("boot report: undeclared units: {}", foreign.join(", ")))
+    }
+
     pub fn tick(&mut self) {
         let (s, defs) = self.observe();
         let now = s.observed_at;
@@ -786,15 +801,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         // §10 boot report, on the first tick after boot: units from outside the
         // generation are an Integrity failure (§12d); the journal chain was
         // checked when it was opened, and the core hash by planarian-recovery.
-        if std::mem::take(&mut self.boot_report_due) {
-            let foreign = self.b.units().foreign_units();
-            for u in &foreign {
-                self.notice(format!("INTEGRITY: boot report: {u} runs, but this generation does not declare it"));
-            }
-            if !foreign.is_empty() {
-                self.integrity = Some(format!("boot report: undeclared units: {}", foreign.join(", ")));
-                return;
-            }
+        if let Some(why) = self.boot_report() {
+            self.integrity = Some(why);
+            return;
         }
 
         for t in std::mem::take(&mut self.reprepare) {
@@ -1669,6 +1678,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 let Some(def) = defs.get(&unit) else {
                     return Response::Error { message: format!("no unit {unit}") };
                 };
+                // Only units the caller may act on: their own user scope, the
+                // units users control, or any for an administrator (§11).
+                let mine = matches!(unit.scope, Scope::User { uid, .. } if uid == peer.uid);
+                let controllable = self.ex.cfg.settings.user_controllable_units.contains(&unit.name);
+                if !(peer.admin || mine || controllable) {
+                    return Response::Rejected {
+                        reason: "Unauthorized".into(),
+                        message: format!("you may not probe {unit}"),
+                    };
+                }
                 let probes: Vec<ProbeId> = match probe {
                     Some(p) => vec![p],
                     None => def.probes.iter().map(|p| p.id.clone()).collect(),
@@ -1678,7 +1697,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         .probes
                         .iter()
                         .any(|d| &d.id == p && matches!(d.side_effects, SideEffects::Audible | SideEffects::Visible));
-                    if audible && !self.asm.sessions.iter().any(|x| x.uid == peer.uid && x.establishes()) {
+                    // Sound or light only from the caller's own seated session.
+                    let seated = peer.session.as_ref().is_some_and(|id| {
+                        self.asm
+                            .sessions
+                            .iter()
+                            .any(|x| &x.id == id && x.uid == peer.uid && x.seat.is_some() && !x.remote)
+                    });
+                    if audible && !seated {
                         return Response::Error {
                             message: format!("{} makes sound or light; run it from your own session", p.0),
                         };

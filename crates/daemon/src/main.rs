@@ -14,7 +14,7 @@ use planarian_txn::journal::{Journal, JournalError};
 use planarian_txn::ledger::Record;
 use planarian_txn::store::FileStore;
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -32,10 +32,13 @@ fn boot_id() -> (Hash, String) {
 
 /// True the first time the daemon starts on this boot.
 fn fresh_boot(state: &Path, boot: &str) -> bool {
-    let p = state.join("boot_id");
-    let fresh = std::fs::read_to_string(&p).map(|s| s.trim() != boot).unwrap_or(true);
-    let _ = std::fs::write(&p, boot);
-    fresh
+    std::fs::read_to_string(state.join("boot_id")).map(|s| s.trim() != boot).unwrap_or(true)
+}
+
+/// This boot's start-up is done (the boot report was clean): a restart later
+/// in the boot is not a fresh boot. Until then every start is.
+fn mark_boot(state: &Path, boot: &str) {
+    let _ = std::fs::write(state.join("boot_id"), boot);
 }
 
 /// `sd_notify(3)`: one datagram to `$NOTIFY_SOCKET`, if systemd gave one.
@@ -87,6 +90,34 @@ fn journal_failure(who: &str, e: &JournalError) -> ! {
             std::process::exit(74);
         }
     }
+}
+
+/// The largest request line, and the connection limits (see `main`).
+const MAX_REQUEST: u64 = 64 * 1024;
+const PER_UID: usize = 16;
+const MAX_CONNS: usize = 64;
+
+/// One request line, bounded in size and in total time (10 s), not per read.
+fn read_request(conn: &UnixStream) -> Option<String> {
+    use std::io::Read;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut r = conn.take(MAX_REQUEST);
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        conn.set_read_timeout(Some(left.max(Duration::from_millis(1)))).ok()?;
+        let n = r.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(i) = buf.iter().position(|b| *b == b'\n') {
+            buf.truncate(i);
+            break;
+        }
+    }
+    String::from_utf8(buf).ok()
 }
 
 fn peer_of(s: &UnixStream, admin_group: &str) -> Option<Peer> {
@@ -240,6 +271,7 @@ fn main() {
     let me = OwnerId::Daemon { pid: std::process::id(), boot_id: boot_hash };
     let mut real = Real::new(paths.clone(), file.devices.clone());
     real.logind.compositors = file.session_compositors.clone();
+    real.runtime.wifi_permitted = file.catalog.wifi_networks.clone();
     real.nixos = real.nixos.with_budget(file.gc);
     let core_cfg = CoreConfig {
         exec: ExecConfig {
@@ -312,6 +344,12 @@ fn main() {
     // Ready (§12d): the journal is open and reconciled and the socket is up.
     // systemd then reaches planarian-ready.target, after which the units that
     // admit principals start.
+    // §10: the boot report before ready, so the units ordered after
+    // planarian-ready.target (logins, agents) never start before it is clean.
+    if let Some(why) = core.boot_report() {
+        integrity_failure("planariad", &why);
+    }
+    mark_boot(&paths.state, &boot);
     sd_notify("READY=1");
     let (tx, rx) = mpsc::channel::<Event>();
     let built_tx = tx.clone();
@@ -321,17 +359,40 @@ fn main() {
     let busy: Arc<Mutex<Option<(Busy, Snapshot)>>> = Arc::new(Mutex::new(None));
     let shared = busy.clone();
     std::thread::spawn(move || {
+        // Bounded per caller (any local user may connect): a request is one
+        // line of at most MAX_REQUEST bytes, read within 10 s in all, and a
+        // uid has at most PER_UID connections in flight, all at most MAX_CONNS.
+        let in_flight: Arc<Mutex<std::collections::BTreeMap<u32, usize>>> = Arc::default();
         for conn in listener.incoming().flatten() {
+            let Some(uid) = rustix::net::sockopt::socket_peercred(&conn).ok().map(|c| c.uid.as_raw()) else {
+                continue;
+            };
+            {
+                let mut m = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                let total: usize = m.values().sum();
+                let mine = m.entry(uid).or_insert(0);
+                if *mine >= PER_UID || total >= MAX_CONNS {
+                    continue;
+                }
+                *mine += 1;
+            }
             let tx = tx.clone();
             let group = group.clone();
             let shared = shared.clone();
+            let in_flight = in_flight.clone();
             std::thread::spawn(move || {
-                let Some(peer) = peer_of(&conn, &group) else { return };
-                let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
-                let mut line = String::new();
-                if BufReader::new(&conn).read_line(&mut line).is_err() {
-                    return;
+                struct Release(Arc<Mutex<std::collections::BTreeMap<u32, usize>>>, u32);
+                impl Drop for Release {
+                    fn drop(&mut self) {
+                        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(n) = m.get_mut(&self.1) {
+                            *n = n.saturating_sub(1);
+                        }
+                    }
                 }
+                let _release = Release(in_flight, uid);
+                let Some(peer) = peer_of(&conn, &group) else { return };
+                let Some(line) = read_request(&conn) else { return };
                 let resp = match serde_json::from_str::<Request>(&line) {
                     Ok(req) if snapshot::read_only(&req) && shared.lock().is_ok_and(|b| b.is_some()) => {
                         let b = shared.lock().unwrap_or_else(|e| e.into_inner());

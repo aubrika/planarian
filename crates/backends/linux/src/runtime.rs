@@ -12,11 +12,14 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub struct Runtime {
     txn_dir: PathBuf,
+    /// The Wi-Fi networks the catalog permits (`services.planarian.catalog.wifiNetworks`);
+    /// empty: any saved Wi-Fi connection.
+    pub wifi_permitted: Vec<String>,
 }
 
 impl Runtime {
     pub fn new(txn_dir: PathBuf) -> Runtime {
-        Runtime { txn_dir }
+        Runtime { txn_dir, wifi_permitted: vec![] }
     }
 }
 
@@ -46,6 +49,16 @@ impl RuntimeOptionBackend for Runtime {
         }
         match (path, value) {
             ("wifi.network", Value::Str(ssid)) => {
+                // Only a saved Wi-Fi connection the catalog permits: `nmcli
+                // connection up` as root would bring up any profile (a VPN, a
+                // bridge, another user's connection).
+                if !self.wifi_permitted.is_empty() && !self.wifi_permitted.contains(ssid) {
+                    return Outcome::Failed(format!("{ssid} is not a permitted Wi-Fi network"));
+                }
+                let saved = run(&["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"], Duration::from_secs(10));
+                if !wifi_connections(&saved.stdout).contains(ssid) {
+                    return Outcome::Failed(format!("{ssid} is not a saved Wi-Fi connection"));
+                }
                 let o = run(&["nmcli", "connection", "up", "id", ssid], Duration::from_secs(60));
                 if o.ok() { Outcome::Succeeded } else { Outcome::Failed(o.tail()) }
             }
