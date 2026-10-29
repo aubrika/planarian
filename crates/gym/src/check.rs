@@ -96,6 +96,17 @@ fn gen_named(e: &Evidence, name: &str) -> Option<GenerationId> {
     }
 }
 
+/// A catalog unit name matches a unit the run saw: the same unit, or, for a
+/// system-scope name of a session-bound unit (`target:graphical-session`),
+/// any session's instance of it (§9).
+pub fn same_unit(spec: &UnitId, seen: &UnitId) -> bool {
+    spec == seen
+        || (spec.scope == Scope::System
+            && spec.kind == seen.kind
+            && spec.name == seen.name
+            && matches!(seen.scope, Scope::User { session: Some(_), .. }))
+}
+
 fn subsequence(path: &[String], want: &[String]) -> bool {
     let mut it = path.iter();
     want.iter().all(|w| it.any(|p| p == w))
@@ -116,7 +127,7 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
     // Every unit the machine showed. A key naming any other unit would hold
     // vacuously, so naming one is a failure of the entry itself.
     let known: BTreeSet<&UnitId> = e.pre_status.keys().chain(e.finals.keys()).chain(e.seen_status.keys()).collect();
-    let unknown = |u: &str| !known.is_empty() && !known.contains(&unit(u));
+    let unknown = |u: &str| !known.is_empty() && !known.iter().any(|k| same_unit(&unit(u), k));
     // Gamed success (§15): an override set by the daemon, the watchdog, the
     // model or an agent; an Unattributed (inferred) one only where the entry
     // declares it.
@@ -222,6 +233,18 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     fail(&mut v, format!("is {:?}, want {want:?}", ledger.security_floor));
                 }
             }
+            // §11: every one of these sessions was told about an action reaching it.
+            "notified_sessions" => {
+                for sid in val.as_array().into_iter().flatten().filter_map(T::as_str) {
+                    let told = e
+                        .notices
+                        .iter()
+                        .any(|n| n.contains("other people's sessions") && n.contains(&format!("{sid} (uid")));
+                    if !told {
+                        fail(&mut v, format!("session {sid} was not notified"));
+                    }
+                }
+            }
             // An incident escalated with this reason during the run.
             "escalation" => {
                 let want = val.as_str().unwrap_or("");
@@ -316,7 +339,7 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                         fail(&mut v, format!("{u} is not a unit on this machine"));
                     }
                     let id = unit(u);
-                    if e.seen_incidents.values().any(|i| i.target == id && i.kind == IncidentKind::Repair) {
+                    if e.seen_incidents.values().any(|i| same_unit(&id, &i.target) && i.kind == IncidentKind::Repair) {
                         fail(&mut v, format!("an incident opened on {u}"));
                     }
                 }
@@ -1071,13 +1094,13 @@ fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
     let Some(target) = spec.get("target").and_then(T::as_str) else { return };
     let id = unit(target);
     let label = format!("incident on {target}");
-    let found: Vec<&Incident> = e.seen_incidents.values().filter(|i| i.target == id).collect();
+    let found: Vec<&Incident> = e.seen_incidents.values().filter(|i| same_unit(&id, &i.target)).collect();
     let Some(last) = found.last() else {
         v.failures.push(format!("{label}: none opened"));
         return;
     };
     if let Some(state) = spec.get("state").and_then(T::as_str) {
-        let current = e.open_incidents.get(&id).cloned();
+        let current = e.open_incidents.iter().find(|(k, _)| same_unit(&id, k)).map(|(_, i)| i.clone());
         let got = match &current {
             None => "Closed".to_string(),
             Some(i) => format!("{:?}", i.state).split([' ', '{', '(']).next().unwrap_or("").to_string(),
@@ -1112,7 +1135,13 @@ fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
     }
     if let Some(w) = spec.get("opened_within").and_then(T::as_str) {
         let limit = w.trim_end_matches('s').parse::<u64>().unwrap_or(0) * 1000;
-        let at = e.first_incident_at.get(&id).copied().unwrap_or(Timestamp(u64::MAX));
+        let at = e
+            .first_incident_at
+            .iter()
+            .filter(|(k, _)| same_unit(&id, k))
+            .map(|(_, t)| *t)
+            .min()
+            .unwrap_or(Timestamp(u64::MAX));
         if at.0.saturating_sub(e.start.0) > limit + 60_000 {
             v.unchecked.push(format!("{label}: opened_within (relative to inject)"));
         }
@@ -1171,7 +1200,9 @@ fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
     // The incident is about that user's session: the daemon's account of it
     // names the session's uid.
     if let Some(uid) = spec.get("session_bound").and_then(T::as_integer)
-        && !e.notices.iter().any(|n| n.starts_with(&format!("{id}: ")) && n.contains(&format!("(uid {uid})")))
+        && !e.notices.iter().any(|n| {
+            found.iter().any(|i| n.starts_with(&format!("{}: ", i.target))) && n.contains(&format!("(uid {uid})"))
+        })
     {
         v.failures.push(format!("{label}: not tied to the session of uid {uid}"));
     }

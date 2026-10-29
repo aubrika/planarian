@@ -195,6 +195,7 @@ fn main() {
     let (boot_hash, boot) = boot_id();
     let me = OwnerId::Daemon { pid: std::process::id(), boot_id: boot_hash };
     let mut real = Real::new(paths.clone(), file.devices.clone());
+    real.logind.compositors = file.session_compositors.clone();
     real.nixos = real.nixos.with_budget(file.gc);
     let core_cfg = CoreConfig {
         exec: ExecConfig {

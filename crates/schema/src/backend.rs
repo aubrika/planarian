@@ -205,6 +205,16 @@ pub enum PowerSource {
 pub trait SessionBackend {
     fn sessions(&self) -> Result<Vec<SessionInfo>, Outcome>;
     fn power(&self) -> Option<PowerSource>;
+    /// Whether a compositor runs in this session's own cgroup (§9); None if
+    /// the backend cannot see.
+    fn compositor_running(&self, _s: &SessionInfo) -> Option<bool> {
+        None
+    }
+    /// Sessions in which foreground work holds (§10: a GameMode client, a
+    /// gamescope session, …): `Condition::Foreground`.
+    fn foreground(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 /// The core-owned runtime-settable options (§12a).

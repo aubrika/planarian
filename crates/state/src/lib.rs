@@ -101,6 +101,27 @@ impl Assembler {
     pub fn defs(&self) -> UnitDefs {
         let mut defs = self.manifest.units.clone();
         let uids: BTreeSet<u32> = self.sessions.iter().filter(|s| s.establishes()).map(|s| s.uid).collect();
+        // §9: a session-bound unit (graphical-session) is one instance per
+        // established session, so a second session's failure is its own incident.
+        let bound: Vec<UnitDef> = defs.values().filter(|d| session_bound(d)).cloned().collect();
+        for t in bound {
+            defs.remove(&t.id);
+            for s in self.sessions.iter().filter(|s| s.establishes()) {
+                let id = UnitId {
+                    kind: t.id.kind,
+                    name: t.id.name.clone(),
+                    scope: Scope::User { uid: s.uid, session: Some(s.id.clone()) },
+                };
+                let mut d = t.clone();
+                d.id = id.clone();
+                d.desired.when =
+                    Condition::All(vec![t.desired.when.clone(), Condition::SessionEstablished { uid: Some(s.uid) }]);
+                for e in d.edges.iter_mut() {
+                    e.from = id.clone();
+                }
+                defs.insert(id, d);
+            }
+        }
         for t in &self.manifest.user_units {
             for uid in &uids {
                 let id = UnitId {
@@ -198,7 +219,10 @@ impl Assembler {
             ProbeKind::SessionTarget { target, within } => Some((target.clone(), *within)),
             _ => None,
         }) {
-            return self.observe_session_target(b, &target, within, now);
+            return match self.session_of(id) {
+                Some(s) => self.observe_session_target(b, &target, within, now, s),
+                None => Observed::Absent,
+            };
         }
         match b.units().observe(id) {
             Ok(o) => o,
@@ -206,48 +230,71 @@ impl Assembler {
         }
     }
 
-    /// §9 graphical-session: the target must be reached in each user session
-    /// within `within` of that session's creation. Pending sessions make the
-    /// unit Transitioning; a missed deadline makes it inactive, and its probe
-    /// (evaluated in `session_target_result`) fails.
-    fn observe_session_target<B: Backends>(&self, b: &B, target: &str, within: Millis, now: Timestamp) -> Observed {
-        let mut pending = false;
-        for s in self.sessions.iter().filter(|s| s.establishes()) {
-            let tid = UnitId {
-                kind: UnitKind::Target,
-                name: target.into(),
-                scope: Scope::User { uid: s.uid, session: Some(s.id.clone()) },
-            };
-            match b.units().observe(&tid) {
-                Ok(Observed::Active) => {}
-                _ if now.0 < s.created.0 + within.0 => pending = true,
-                _ => return Observed::Bound,
+    /// The logind session a session-bound unit instance belongs to.
+    fn session_of(&self, id: &UnitId) -> Option<&SessionInfo> {
+        match &id.scope {
+            Scope::User { uid, session: Some(sid) } => {
+                self.sessions.iter().find(|s| &s.id == sid && s.uid == *uid && s.establishes())
             }
+            _ => None,
         }
-        if pending { Observed::Transitioning { from: Box::new(Observed::Bound), since: now } } else { Observed::Active }
     }
 
-    fn session_target_result<B: Backends>(&self, b: &B, target: &str, within: Millis, now: Timestamp) -> ProbeResult {
-        for s in self.sessions.iter().filter(|s| s.establishes()) {
-            let tid = UnitId {
-                kind: UnitKind::Target,
-                name: target.into(),
-                scope: Scope::User { uid: s.uid, session: Some(s.id.clone()) },
-            };
-            match b.units().observe(&tid) {
-                Ok(Observed::Active) => {}
-                _ if now.0 < s.created.0 + within.0 => {}
-                _ => {
-                    return ProbeResult::Fail(format!(
-                        "{target} not reached within {}s of session {} (uid {})",
-                        within.0 / 1000,
-                        s.id,
-                        s.uid
-                    ));
-                }
-            }
+    /// Whether this session's desktop is up (§9): the compositor in the
+    /// session's own cgroup is running, when the backend can see that; else
+    /// the target in the user's manager, which is only corroboration (for a
+    /// second session of the same uid it was reached already).
+    fn session_up<B: Backends>(&self, b: &B, target: &str, s: &SessionInfo) -> bool {
+        if let Some(up) = b.sessions().compositor_running(s) {
+            return up;
         }
-        ProbeResult::Pass
+        let tid = UnitId {
+            kind: UnitKind::Target,
+            name: target.into(),
+            scope: Scope::User { uid: s.uid, session: Some(s.id.clone()) },
+        };
+        matches!(b.units().observe(&tid), Ok(Observed::Active))
+    }
+
+    /// §9 graphical-session, for one session: up within `within` of the
+    /// session's creation. Before the deadline it is Transitioning; a missed
+    /// deadline makes it inactive, and its probe fails.
+    fn observe_session_target<B: Backends>(
+        &self,
+        b: &B,
+        target: &str,
+        within: Millis,
+        now: Timestamp,
+        s: &SessionInfo,
+    ) -> Observed {
+        if self.session_up(b, target, s) {
+            Observed::Active
+        } else if now.0 < s.created.0 + within.0 {
+            Observed::Transitioning { from: Box::new(Observed::Bound), since: now }
+        } else {
+            Observed::Bound
+        }
+    }
+
+    fn session_target_result<B: Backends>(
+        &self,
+        b: &B,
+        id: &UnitId,
+        target: &str,
+        within: Millis,
+        now: Timestamp,
+    ) -> ProbeResult {
+        let Some(s) = self.session_of(id) else { return ProbeResult::Error("no such session".into()) };
+        if self.session_up(b, target, s) || now.0 < s.created.0 + within.0 {
+            ProbeResult::Pass
+        } else {
+            ProbeResult::Fail(format!(
+                "the desktop did not come up within {}s of session {} (uid {})",
+                within.0 / 1000,
+                s.id,
+                s.uid
+            ))
+        }
     }
 
     /// One tick: observe, probe, assemble.
@@ -272,6 +319,12 @@ impl Assembler {
         let mut conditions = BTreeSet::new();
         for s in self.sessions.iter().filter(|s| s.establishes()) {
             conditions.insert(Condition::SessionEstablished { uid: Some(s.uid) });
+        }
+        // §10 quiet mode: foreground work in a live session.
+        for sid in b.sessions().foreground() {
+            if self.sessions.iter().any(|s| s.id == sid && s.establishes()) {
+                conditions.insert(Condition::Foreground { session: sid });
+            }
         }
         match power {
             Some(PowerSource::Ac) => {
@@ -321,7 +374,7 @@ impl Assembler {
                         local.push((def.id.clone(), p.clone(), r));
                     }
                     ProbeKind::SessionTarget { target, within } => {
-                        let r = self.session_target_result(b, target, *within, now);
+                        let r = self.session_target_result(b, &def.id, target, *within, now);
                         local.push((def.id.clone(), p.clone(), r));
                     }
                     _ => batch.push((def.id.clone(), p.clone())),
@@ -380,3 +433,8 @@ pub fn backend_reason(msg: &str) -> Reason {
 
 #[cfg(test)]
 mod tests;
+
+/// A unit whose readiness is per logind session (§9 graphical-session).
+fn session_bound(d: &UnitDef) -> bool {
+    d.id.scope == Scope::System && d.probes.iter().any(|p| matches!(p.kind, ProbeKind::SessionTarget { .. }))
+}

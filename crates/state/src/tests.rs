@@ -65,7 +65,8 @@ fn user_units_follow_sessions_and_desktop_deadline() {
     let (s, defs) = tick(&fake, &mut a);
     let pw: UnitId = "service@1000:pipewire".parse().unwrap();
     assert!(defs.contains_key(&pw), "instantiated for alice's session");
-    let gs = UnitId::target("graphical-session");
+    let gs: UnitId = "target@1000/c1:graphical-session".parse().unwrap();
+    assert!(!defs.contains_key(&UnitId::target("graphical-session")), "one instance per session");
     assert_eq!(s.status(&gs, &defs), UnitStatus::Transitioning, "within 60 s");
     for _ in 0..13 {
         tick(&fake, &mut a);
@@ -133,6 +134,36 @@ fn unknown_session_creation_time_counts_from_first_sight() {
         created: Timestamp(0),
     });
     let (s, defs) = tick(&fake, &mut a);
-    let gs = UnitId::target("graphical-session");
+    let gs: UnitId = "target@1000/c9:graphical-session".parse().unwrap();
     assert_eq!(s.status(&gs, &defs), UnitStatus::Transitioning, "a fresh 60 s, not a deadline missed since 1970");
+}
+
+/// session-second-compositor-fails, at the state level: two graphical
+/// sessions of one uid; the compositor in the second never runs. Only the
+/// second session's instance diverges, though the user's target is reached.
+#[test]
+fn second_session_of_one_uid_is_judged_on_its_own() {
+    let (fake, mut a) = rig();
+    let created = fake.w().now;
+    for id in ["s1", "s2"] {
+        fake.w().sessions.push(SessionInfo {
+            id: id.into(),
+            uid: 1000,
+            class: "user".into(),
+            seat: Some("seat0".into()),
+            remote: false,
+            active: id == "s2",
+            created,
+        });
+    }
+    fake.w().compositors.insert("s1".into(), true);
+    fake.w().compositors.insert("s2".into(), false);
+    for _ in 0..14 {
+        tick(&fake, &mut a);
+    }
+    let (s, defs) = tick(&fake, &mut a);
+    let s1: UnitId = "target@1000/s1:graphical-session".parse().unwrap();
+    let s2: UnitId = "target@1000/s2:graphical-session".parse().unwrap();
+    assert_eq!(s.status(&s1, &defs), UnitStatus::Running);
+    assert_eq!(s.status(&s2, &defs), UnitStatus::Stopped);
 }

@@ -13,7 +13,7 @@ use planarian_txn::journal::Journal;
 use planarian_txn::kernel::{CrashPoint, Kernel};
 use planarian_txn::ledger::{Entry, Ledger, Record};
 use planarian_txn::machine::tag;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use toml::Value as T;
 
 pub const TICK: Millis = Millis::secs(5);
@@ -793,6 +793,53 @@ impl Sim {
                 let uid = s.get("uid").and_then(T::as_integer).unwrap_or(1000) as u32;
                 self.fake.w().sessions.retain(|x| x.uid != uid);
             }
+            // §10: a named logind session, at a seat or (no seat) remote; its
+            // compositor comes up unless `compositor = "fails"`.
+            "session_login" => {
+                let uid = s.get("uid").and_then(T::as_integer).unwrap_or(1000) as u32;
+                let id = get("session").to_string();
+                let seat = s.get("seat").and_then(T::as_str).map(String::from);
+                let now = self.now();
+                let mut w = self.fake.w();
+                w.sessions.push(SessionInfo {
+                    id: id.clone(),
+                    uid,
+                    class: "user".into(),
+                    remote: seat.is_none(),
+                    seat,
+                    active: true,
+                    created: now,
+                });
+                w.compositors.insert(id, get("compositor") != "fails");
+                let sim = planarian_fake::UnitSim::active(now);
+                for name in ["pipewire", "wireplumber"] {
+                    let u = UnitId {
+                        kind: UnitKind::Service,
+                        name: name.into(),
+                        scope: Scope::User { uid, session: None },
+                    };
+                    w.units.entry(u).or_insert_with(|| sim.clone());
+                }
+            }
+            "session_logout" => {
+                let id = get("session").to_string();
+                let mut w = self.fake.w();
+                w.sessions.retain(|x| x.id != id);
+                w.compositors.remove(&id);
+                // The user manager (and its services) ends with the uid's last session.
+                let uids: BTreeSet<u32> = w.sessions.iter().map(|x| x.uid).collect();
+                w.units.retain(|u, _| !matches!(u.scope, Scope::User { uid, .. } if !uids.contains(&uid)));
+            }
+            "foreground" => {
+                let id = get("session").to_string();
+                let on = s.get("on").and_then(T::as_bool).unwrap_or(true);
+                let mut w = self.fake.w();
+                if on {
+                    w.foreground.insert(id);
+                } else {
+                    w.foreground.remove(&id);
+                }
+            }
             "slow_backend" if get("call") == "activate_live" => {
                 let d = s.get("delay").and_then(dur).unwrap_or(Millis::secs(120));
                 let uncancellable = s.get("uncancellable").and_then(T::as_bool).unwrap_or(false);
@@ -888,6 +935,18 @@ impl Sim {
                     let pct =
                         s.get("value").and_then(T::as_float).ok_or_else(|| Unsupported("set_setting value".into()))?;
                     self.fake.w().gc_budget.generations_permille = (pct * 10.0).round() as u32;
+                }
+                "userControllable" => {
+                    let units: Vec<String> = s
+                        .get("value")
+                        .and_then(T::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(T::as_str)
+                        .map(|u| unit(u).name)
+                        .collect();
+                    let c = self.core.as_mut().ok_or_else(|| Unsupported("daemon down".into()))?;
+                    c.ex.cfg.settings.user_controllable_units.extend(units);
                 }
                 "posture" => {
                     self.posture = match s.get("value").and_then(T::as_str) {

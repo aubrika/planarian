@@ -366,8 +366,29 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let policy = self.ex.policy_version();
         let caller = authz.actor.clone();
         let mut result = self.ex.submit(p.clone(), authz.clone(), s, defs);
-        if let Some((facts, _)) = &self.ex.last {
+        if let Some((facts, _)) = self.ex.last.clone() {
             self.touched.extend(facts.affected_units.iter().cloned());
+            // §11: the affected sessions are notified either way.
+            if facts.other_sessions_affected {
+                let others: Vec<String> = self
+                    .asm
+                    .sessions
+                    .iter()
+                    .filter(|x| {
+                        x.establishes() && Some(x.uid) != caller.uid() && facts.affected_sessions.contains(&x.id)
+                    })
+                    .map(|x| format!("{} (uid {})", x.id, x.uid))
+                    .collect();
+                self.notice(format!(
+                    "{}: {} would also affect other people's sessions: {}",
+                    render::transition(&p.transition),
+                    match caller.uid() {
+                        Some(u) => format!("asked for by uid {u}"),
+                        None => "proposed by Planarian".to_string(),
+                    },
+                    others.join(", ")
+                ));
+            }
         }
         self.generation_touched |= p.transition.changes_generation();
         if let Some((g, fixes)) = self.ex.floor_raised.take() {
@@ -827,6 +848,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 // Planarian stopped it. Say how to make that stick.
                 if inc.attempts.is_empty()
                     && matches!(c.transition, Transition::RestartUnit(_))
+                    && c.target.kind == UnitKind::Service
                     && s.status(&c.target, defs) == UnitStatus::Stopped
                 {
                     self.notice(format!(

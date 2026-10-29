@@ -246,6 +246,24 @@ in
       description = "The flake output that is this machine.";
     };
 
+    sessionCompositors = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      example = [ "cosmic-comp" ];
+      description = ''
+        Process names (`comm`) of compositors. A graphical session is up when one
+        runs in that session's own cgroup (§9), which tells a second session of
+        the same user apart from the first. Empty: judge by the user's
+        graphical-session.target only.
+      '';
+    };
+
+    posture = mkOption {
+      type = types.enum [ "Relaxed" "Standard" "Guarded" "Sealed" ];
+      default = "Standard";
+      description = "The failure posture (SPEC §12d). Phase A ships Standard; the others are for testing.";
+    };
+
     startupGrace = mkOption {
       type = types.ints.unsigned;
       default = 90;
@@ -399,6 +417,8 @@ in
       };
       journalBytes = 64 * 1024 * 1024;
       startupGraceSecs = cfg.startupGrace;
+      sessionCompositors = cfg.sessionCompositors;
+      inherit (cfg) posture;
     };
 
     # With the console: its launcher entry and icons too.

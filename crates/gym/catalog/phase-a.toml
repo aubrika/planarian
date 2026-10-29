@@ -2203,3 +2203,121 @@ overrides = []
 transition = "RestartUnit"
 target = "service:gym-web"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: sessions and authorization (§10, §11, v4.4)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "session-second-compositor-fails"
+family = "boot-to-desktop-failure"
+summary = "alice has two graphical sessions. The compositor in the second never runs; an incident opens for that session only, though her user manager's graphical-session.target is already reached."
+spec = ["§9 per-session compositor probe", "§10 conditions", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "session_login", uid = 1000, session = "s1", seat = "seat0" }]
+inject = { raw = "session_login", uid = 1000, session = "s2", seat = "seat0", compositor = "fails" }
+window = "5m"
+
+[fault.required_post]
+no_incident_on = ["target@1000/s1:graphical-session"]
+
+[[fault.required_post.incident]]
+target = "target@1000/s2:graphical-session"
+
+[[fault]]
+id = "session-logout-one-of-two"
+family = "login-screen-idle"
+summary = "alice logs out of one of her two sessions. Her user services (pipewire) keep running; no incident, no transaction."
+spec = ["§10 user-scoped units", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake"]
+intent = { kind = "no-intervention", because = "the uid still has a session" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "session_login", uid = 1000, session = "s2", seat = "seat0" },
+  { raw = "wait", for = "2m" },
+]
+inject = { raw = "session_logout", session = "s2" }
+window = "3m"
+
+[fault.required_post]
+units = { "service@1000:pipewire" = "Running" }
+no_incident_on = ["service@1000:pipewire"]
+no_autonomous_txn = true
+
+[[fault]]
+id = "authz-nonadmin-stops-network-other-session"
+family = "authorization"
+summary = "bob, at the seat, stops the gym network interface (made user-controllable for this case, G11) while alice has a session open. The derived facts say it reaches another uid's session; it asks, and alice's session is notified."
+spec = ["§11 floors", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "set_setting", key = "userControllable", value = ["device:net-gym0"] },
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "session_login", uid = 1002, session = "s2", seat = "seat0" },
+]
+inject = { raw = "cli", argv = ["stop", "device:net-gym0"], actor = "user:1002@s2" }
+window = "2m"
+
+[fault.required_post]
+notified_sessions = ["s1"]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+decision = "Allow(AskFirst)"
+facts = { other_sessions_affected = true }
+terminal = "pending"
+
+[[fault]]
+id = "authz-unprivileged-stop-unauthorized"
+family = "intentional-service-stop"
+summary = "alice tries to stop gym-db, a system unit that is neither Security-sensitive nor user-controllable: Reject(Unauthorized), whatever max_tier says."
+spec = ["§11 authorization", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "cli", argv = ["stop", "service:gym-db"], actor = "user:1000" }
+window = "1m"
+
+[fault.required_post]
+units = { "service:gym-db" = "Running" }
+reports = ["Unauthorized"]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+decision = "Reject(Unauthorized)"
+
+[[fault]]
+id = "authz-user-overrides-firewall"
+family = "intentional-service-stop"
+summary = "From her session, alice overrides the firewall (sshd's stand-in in the fake: a Security unit) to stopped. Held for an administrator; it stays up. alice cannot approve her own request (I19); root at a terminal approves, and the override holds, attested and attributed to alice."
+spec = ["§11 authorization", "§11 approval", "I19", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "session_login", uid = 1000, session = "s1", seat = "seat0" }]
+inject = { raw = "cli", argv = ["override", "service:sshd", "--stop"], actor = "user:1000@s1" }
+after = [
+  { raw = "approve_pending", actor = "user:1000", via = "tty" },
+  { raw = "wait", for = "30s" },
+  { raw = "approve_pending", actor = "root", via = "tty" },
+]
+window = "3m"
+
+[fault.required_post]
+overrides = [{ unit = "service:sshd", until = "Explicit", by = "user:1000@s1", attribution = "Attested" }]
+invariants = ["I19"]
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+decision = "Allow(AskFirst)"
+approver_class = "Administrator"
+terminal = "Committed"

@@ -85,7 +85,7 @@ impl Real {
             nixos: nixos::Nixos::new(paths.clone()),
             sysfs: sysfs::Sysfs::new(devices, txn_dir.clone()),
             probes: probe::Probes,
-            logind: logind::Logind,
+            logind: logind::Logind::default(),
             runtime: runtime::Runtime::new(txn_dir),
             process: process::Processes,
         }

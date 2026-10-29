@@ -165,6 +165,11 @@ pub struct World {
     pub units: BTreeMap<UnitId, UnitSim>,
     pub devices: BTreeMap<UnitId, Option<DriverRef>>,
     pub sessions: Vec<SessionInfo>,
+    /// Whether the compositor runs in each session's cgroup (§9); a session
+    /// not listed falls back to the user's graphical-session target.
+    pub compositors: BTreeMap<String, bool>,
+    /// Sessions in which foreground work holds (§10 quiet mode).
+    pub foreground: BTreeSet<String>,
     pub power: Option<PowerSource>,
     /// Probes of these units fail regardless (e.g. a port blocked by nftables).
     pub blocked: BTreeSet<UnitId>,
@@ -937,6 +942,14 @@ impl ProbeBackend for Fake {
 impl SessionBackend for Fake {
     fn sessions(&self) -> Result<Vec<SessionInfo>, Outcome> {
         Ok(self.w().sessions.clone())
+    }
+
+    fn compositor_running(&self, s: &SessionInfo) -> Option<bool> {
+        self.w().compositors.get(&s.id).copied()
+    }
+
+    fn foreground(&self) -> Vec<String> {
+        self.w().foreground.iter().cloned().collect()
     }
 
     fn power(&self) -> Option<PowerSource> {
