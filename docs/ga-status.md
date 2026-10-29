@@ -121,6 +121,28 @@ What the runs since #11 found:
   is dropped, but SPEC §10 makes a timed-out probe Unknown, never Failed,
   so Planarian (rightly, by the spec) opens none. A question for the owner.
 
+### The whole VM catalog, third run (CI run "VM tests" #24, 2026-10-29)
+
+62 VM entries (`suspend-resume` moved to the fake; `net-upstream-down`
+added):
+
+| Verdict | Entries |
+| --- | --- |
+| PASS | 56 |
+| UNSUPPORTED | 4: `desktop-boot-fails-rollback`, `storage-nix-full-gc`, `storage-enospc-during-build`, `storage-journal-btrfs-reuse` |
+| FAIL | 2: `drv-unbound-audio`, `storage-boot-full-publish` (fixed since: a revert no longer fails on a disk it cannot free) |
+
+Real Planarian bugs this round, each with a test that fails without the
+fix: status requests ran the probes, which starved the repair loop (a
+killed service was restarted 100 s late); a failed publish left the boot
+default naming the candidate; a driver that binds but cannot drive the
+device passed the check; a revert failed on a full /boot it could not
+free. Owner decision: dropped traffic to an external dependency stays
+Unknown and is said (`net-gateway-down`); the refused case is
+`net-upstream-down`.
+
+The fake harness: 57 of 73 entries, all PASS (the rest are VM-only).
+
 ### Passes that prove something
 
 - The judge fails an entry if any key goes unchecked (PARTIAL fails CI), if a
