@@ -1,18 +1,18 @@
 # Phase A gate (GA) status
 
 Where Planarian stands against the Phase A exit gate (SPEC §4), with the
-evidence for each criterion and how to reproduce it. Updated 2026-10-28.
+evidence for each criterion and how to reproduce it. Updated 2026-10-29.
 
 ## Summary
 
 | Criterion | Status |
 | --- | --- |
-| 1. The demonstration | **Passes**, on the fake harness and on VMs (CI, KVM) |
-| 2. ≥ 60% of the catalog cleared deterministically | **54 of 71 (76%)** on the fake harness, every key checked |
-| 2. Every bad generation reverted | Yes on the fake harness; on VMs for the demonstration's bad change and the crash entries run so far |
-| 2. The manifest-weakening fault rejected | Yes (`manifest-weaken-via-proposal`) |
-| 2. Zero gamed successes | Guarded: see "Passes that prove something" |
-| 2. Unnecessary interventions on the intent cases = 0 | 0 of 4 |
+| 1. The demonstration | **Passes**, on the fake harness and on VMs (CI, KVM, on every push) |
+| 2. ≥ 60% of the catalog cleared deterministically | **70 of 72 (97%)**: 58 PASS on the fake harness, 58 PASS on VMs (48 entries run on both), every key checked |
+| 2. Every bad generation reverted | Yes, on both harnesses, including a full /boot at publish and a daemon killed mid-change |
+| 2. The manifest-weakening fault rejected | Yes (`manifest-weaken-via-proposal`; `manifest-weaken-out-of-band` on VMs) |
+| 2. Zero gamed successes | Guarded: see "Passes that prove something"; entries a harness cannot run faithfully are UNSUPPORTED there, never passed |
+| 2. Unnecessary interventions on the intent cases = 0 | 0 of 9 |
 | 3. `policy` proofs pass in CI | Yes: `ci.yml`'s `nix` job runs the Verus check |
 
 ## 1. The demonstration
@@ -34,26 +34,23 @@ runtime, generations and installer VM tests.)
 
 ## 2. The catalog
 
-Fake harness (`cargo run -p planarian-gym -- run`, also in CI):
+The final runs, 2026-10-29:
 
-| Result | Entries |
-| --- | --- |
-| PASS (every key in `required_post` checked) | 54 |
-| PARTIAL, FAIL, UNSUPPORTED | 0 |
-| VM-only (the fake cannot run them) | 17 |
+| Harness | PASS | UNSUPPORTED | FAIL / PARTIAL | Not run there |
+| --- | --- | --- | --- | --- |
+| Fake (`cargo run -p planarian-gym -- run`, in CI on every push) | 58 | 0 | 0 | 14 VM-only |
+| VMs (`vm.yml` by hand, run "VM tests" #28, all 62 VM entries on KVM) | 58 | 4 | 0 | 10 fake-only |
 
-The 60% is counted over the whole catalog (71 entries), with the 17 VM-only
-entries as not cleared.
+Cleared on at least one harness: 70 of 72. Not cleared anywhere:
+`desktop-boot-fails-rollback` (the test VM boots its kernel directly, never
+a published generation) and `storage-journal-btrfs-reuse` (the gym VM's
+journal is ext4). UNSUPPORTED on VMs but cleared on the fake:
+`storage-nix-full-gc` and `storage-enospc-during-build` (the test VM's Nix
+store is the host's). Fake-only by deviation: `suspend-resume` (QEMU never
+woke the VM; docs/deviations.md). The desktop entries run against a
+stand-in greeter and compositor (docs/AGENTS.md), not COSMIC.
 
-The 17 VM-only entries run on the VM harness (`nix run .#gym-vm`, or
-`vm.yml` by hand in CI). Of those, `svc-killed-defer-to-systemd` passes;
-`desktop-boot-fails-rollback` is UNSUPPORTED there, because the test VM boots
-its kernel directly and so never boots a published generation; the rest are
-scored below. Entries that run on both harnesses also pass on VMs
-where tried: the demonstration's four, `crash-activating-good`, and the Wi-Fi
-selection entry `policy-daemon-wifi-runtime` (simulated radios, hostapd,
-NetworkManager and wpa_supplicant). The desktop entries run against a stand-in greeter and
-compositor (docs/AGENTS.md), not COSMIC.
+The history of the VM runs follows; each found real bugs.
 
 ### The VM catalog (CI run "VM tests" #7, 2026-10-28)
 
@@ -141,7 +138,7 @@ free. Owner decision: dropped traffic to an external dependency stays
 Unknown and is said (`net-gateway-down`); the refused case is
 `net-upstream-down`.
 
-The fake harness: 57 of 73 entries, all PASS (the rest are VM-only).
+The fake harness: 57 of 72 entries, all PASS (the rest are VM-only).
 
 ### Passes that prove something
 
