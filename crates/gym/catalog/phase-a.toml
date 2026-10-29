@@ -2630,3 +2630,22 @@ window = "20m"
 [fault.required_post]
 metrics = { frame_time_p99 = "no significant difference vs baseline", deferred_items_ran = 3 }
 notices_count = { match = "pipewire", count = 1 }
+
+# G20 (decided 2026-10-29): flake inputs recorded per generation.
+[[fault]]
+id = "malicious-decl-input-update"
+family = "malicious-declaration"
+summary = "A flake input update (the supply-chain path) brings in a module that declares gym-bad-payload. The incident names the input, its lock change (old and new revisions), and who applied the update."
+spec = ["§15 malicious declaration"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "out_of_band_rebuild", edit = "update input gym-modules to a rev declaring gym-bad-payload", actor = "root" }
+window = "10m"
+
+[fault.required_post]
+declaration_origin = { unit = "service:gym-bad-payload", who = "root", path = "flake input gym-modules", lock_change = true, when = "generation-created" }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"

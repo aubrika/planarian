@@ -285,6 +285,22 @@ in
       '';
     };
 
+    flakeInputs = mkOption {
+      type = types.attrsOf (types.submodule {
+        options = {
+          rev = mkOption { type = types.str; default = ""; description = "The input's locked revision (or NAR hash)."; };
+          path = mkOption { type = types.str; default = ""; description = "The input's store path."; };
+        };
+      });
+      default = { };
+      example = lib.literalExpression ''builtins.mapAttrs (_: i: { rev = i.rev or i.narHash or ""; path = toString i.outPath; }) (removeAttrs inputs [ "self" ])'';
+      description = ''
+        The owner flake's inputs, recorded in each generation (SPEC §15): a
+        service declared by a file inside an input's source is reported with
+        that input and its lock change. The flake template sets it.
+      '';
+    };
+
     healthReport.interval = mkOption {
       type = types.ints.unsigned;
       default = 3600;
@@ -433,13 +449,16 @@ in
             else if (v._type or null) == "if" then (if v.condition then names v.content else [ ])
             else if (v._type or null) == "merge" then lib.concatMap names v.contents
             else if builtins.elem (v._type or null) [ "override" "order" ] then names v.content
-            else builtins.attrNames v;
+            # A service set to a false `mkIf` is not declared by this file.
+            else lib.filter (n: !(builtins.isAttrs v.${n} && (v.${n}._type or null) == "if" && !v.${n}.condition))
+              (builtins.attrNames v);
           perDef = d:
             let r = builtins.tryEval (names d.value);
             in lib.genAttrs (if r.success then r.value else [ ]) (_: [ (toString d.file) ]);
           all = lib.zipAttrsWith (_: lib.concatLists) (map perDef options.systemd.services.definitionsWithLocations);
         in
         lib.filterAttrs (n: _: config.systemd.services ? ${n}) all;
+      inputs = cfg.flakeInputs;
     };
 
     environment.etc."planarian/export.json".text = builtins.toJSON cfg.export;

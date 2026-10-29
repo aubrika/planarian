@@ -146,6 +146,8 @@ pub struct World {
     pub base_insecure: BTreeSet<String>,
     /// Outcomes to inject, by call name (`restart`, `activate_live`, …), once each.
     pub inject: BTreeMap<String, Injected>,
+    /// The owner flake's inputs, name → (rev, store path).
+    pub base_inputs: BTreeMap<String, (String, String)>,
     /// Who the next out-of-band generation is created by (uid).
     pub rebuild_uid: u32,
     /// When the bad payload takes gym-web's port (set when a generation
@@ -316,6 +318,7 @@ impl World {
             packages,
             insecure,
             declarations,
+            inputs: self.base_inputs.clone(),
         };
         (eval, broken)
     }
@@ -1151,12 +1154,23 @@ pub fn gym_world(store: MemStore) -> Fake {
         ("gym.vulnlib".to_string(), Value::Str("1.0".into())),
         ("gym.kernelParam".to_string(), Value::Str("".into())),
         ("services.gym-bad-payload.enable".to_string(), Value::Bool(false)),
+        ("gym.modules".to_string(), Value::Str("old".into())),
     ]
     .into();
     // gym-vulnlib 1.0 carries knownVulnerabilities; 1.1 fixes them (§12e).
     w.base_packages = [("gym-vulnlib".to_string(), "1.0".to_string())].into();
     w.base_insecure = ["gym-vulnlib".to_string()].into();
+    w.base_inputs = [("gym-modules".to_string(), ("old".to_string(), "/nix/store/aaa-gym-modules".to_string()))].into();
     w.rules = vec![
+        // A flake input update whose new module declares the payload.
+        Rule {
+            option: "gym.modules".into(),
+            value: Value::Str("new".into()),
+            effect: Effect::Declare {
+                service: "gym-bad-payload".into(),
+                file: "/nix/store/bbb-gym-modules/module.nix".into(),
+            },
+        },
         // The bad payload: a declared service, off by default, defined in the
         // gym's own module (§15 malicious declaration).
         Rule {

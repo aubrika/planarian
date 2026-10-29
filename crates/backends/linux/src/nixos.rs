@@ -64,6 +64,17 @@ pub struct Export {
     /// Every system service → the files defining it (§15 provenance).
     #[serde(default)]
     pub declarations: BTreeMap<String, Vec<String>>,
+    /// Flake inputs: name → { rev, path }.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, ExportInput>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportInput {
+    #[serde(default)]
+    pub rev: String,
+    #[serde(default)]
+    pub path: String,
 }
 
 impl Export {
@@ -83,6 +94,7 @@ impl Export {
             packages: self.packages,
             insecure: self.insecure.into_iter().collect(),
             declarations: self.declarations,
+            inputs: self.inputs.into_iter().map(|(k, v)| (k, (v.rev, v.path))).collect(),
         }
     }
 }

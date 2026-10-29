@@ -227,8 +227,9 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     Some("txn") => want.push("(transaction ".into()),
                     _ => {}
                 }
-                if val.get("lock_change").is_some() {
-                    v.unchecked.push("declaration_origin.lock_change".into());
+                // The input's lock change: its previous and new revision.
+                if val.get("lock_change").and_then(T::as_bool) == Some(true) && !report.contains(" → ") {
+                    fail(&mut v, format!("the report does not give the input's lock change: {report}"));
                 }
                 for w in want.iter().filter(|w| !report.contains(w.as_str())) {
                     fail(&mut v, format!("the report does not say {w:?}: {report}"));

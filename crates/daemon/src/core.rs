@@ -648,9 +648,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     fn note_declarations(&mut self, prev: Option<GenerationId>, cur: GenerationId, announce: bool) {
         let gens = self.b.generations();
         let prev = prev.or_else(|| gens.boot_entries().ok()?.into_iter().filter(|g| *g < cur).max());
-        let decls = |g: GenerationId| gens.path_of(g).and_then(|p| gens.evaluate_built(&p)).map(|e| e.declarations);
-        let (Some(prev), Ok(now_d)) = (prev, decls(cur)) else { return };
-        let Ok(before) = decls(prev) else { return };
+        let eval = |g: GenerationId| gens.path_of(g).and_then(|p| gens.evaluate_built(&p));
+        let (Some(prev), Ok(now_e)) = (prev, eval(cur)) else { return };
+        let Ok(before_e) = eval(prev) else { return };
+        let (now_d, before) = (&now_e.declarations, &before_e.declarations);
         let added: Vec<(&String, &Vec<String>)> = now_d.iter().filter(|(k, _)| !before.contains_key(*k)).collect();
         if added.is_empty() {
             self.new_declarations.clear();
@@ -679,8 +680,19 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         t.id.0
                     ),
                     None => format!(
-                        "by {} through an out-of-band nixos-rebuild, defined in {}; generation created at {}",
+                        "by {} through {}, defined in {}; generation created at {}",
                         created.map(|(uid, _)| who(&Actor::user(uid))).unwrap_or_else(|| "an unknown user".into()),
+                        // A file inside a flake input's source: that input,
+                        // and its lock change since the previous generation.
+                        match now_e.inputs.iter().find(|(_, (_, path))| {
+                            !path.is_empty() && files.iter().any(|f| f.starts_with(path.as_str()))
+                        }) {
+                            Some((name, (rev, _))) => format!(
+                                "flake input {name} ({} → {rev}) in an out-of-band nixos-rebuild",
+                                before_e.inputs.get(name).map(|(r, _)| r.as_str()).unwrap_or("not an input before")
+                            ),
+                            None => "an out-of-band nixos-rebuild".into(),
+                        },
                         if files.is_empty() { "an unknown file".to_string() } else { files.join(", ") },
                         created.map(|(_, at)| render::when(at)).unwrap_or_else(|| "an unknown time".into())
                     ),

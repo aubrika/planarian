@@ -372,6 +372,12 @@ pub struct EvaluatedGeneration {
     /// provenance a malicious declaration leaves (§15).
     #[serde(default)]
     pub declarations: BTreeMap<String, Vec<String>>,
+    /// The flake inputs the generation was built from, name → (revision,
+    /// store path), when the owner's flake passes them
+    /// (`services.planarian.flakeInputs`): a declaration from an input is
+    /// reported with the input's lock change (§15).
+    #[serde(default)]
+    pub inputs: BTreeMap<String, (String, String)>,
 }
 
 impl EvaluatedGeneration {

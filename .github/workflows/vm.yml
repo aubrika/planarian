@@ -78,7 +78,7 @@ jobs:
         id: [stale-owner-edit-during-build, drv-unbound-audio, storage-boot-full-publish,
              posture-absent-masked, posture-crashed-budget, posture-integrity-core-hash,
              posture-integrity-journal-chain, posture-integrity-undeclared-early-unit, journal-record-edited,
-             malicious-decl-owner-rebuild, malicious-decl-catalog-enable]
+             malicious-decl-owner-rebuild, malicious-decl-catalog-enable, malicious-decl-input-update]
     steps:
       - uses: actions/checkout@v4
       - name: Enable KVM

@@ -1099,6 +1099,17 @@ impl Sim {
                         sim.observed = Observed::Failed(Reason::ExitCode(1));
                         w.current = g;
                     }
+                } else if edit.starts_with("update input gym-modules") {
+                    // The supply-chain path: the input moves to a revision
+                    // whose module declares the payload; root switches.
+                    w.base_options.insert("gym.modules".into(), Value::Str("new".into()));
+                    w.base_inputs.insert("gym-modules".into(), ("new".into(), "/nix/store/bbb-gym-modules".into()));
+                    w.rebuild_uid = if actor == "root" { 0 } else { peer(&actor).uid };
+                    let g = w.add_generation(&OverrideSet::default());
+                    w.rebuild_uid = 0;
+                    w.boot_entries.insert(g);
+                    w.boot_default = g;
+                    w.apply_generation(g);
                 } else if edit == "enable gym-bad-payload" {
                     // The owner's configuration now enables it; root switches.
                     w.base_options.insert("services.gym-bad-payload.enable".into(), Value::Bool(true));

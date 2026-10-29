@@ -18,6 +18,9 @@ let
   lib = pkgs.lib;
   catalog = ../../crates/gym/catalog/phase-a.toml;
   gymPkg = pkgs.callPackage ../package.nix { gymHooks = true; };
+  # A third-party flake input's source at two revisions (store paths).
+  modulesOld = builtins.path { path = ./gym-modules-old; name = "gym-modules"; };
+  modulesNew = builtins.path { path = ./gym-modules-new; name = "gym-modules"; };
 
   # Every override set the catalog's changes produce (base: none).
   candidates = {
@@ -301,6 +304,9 @@ let
       # anything Planarian does. nodev still writes the boot menu for real.
       boot.loader.grub.devices = lib.mkForce [ "nodev" ];
 
+      # A third-party flake input at its old revision (malicious-decl-input-update).
+      services.planarian.flakeInputs.gym-modules = { rev = "old"; path = "${modulesOld}"; };
+
       # Failure-posture fixtures (§12d; catalog family failure-posture).
       # The stand-in agent principal, stopped by every failure class (I20).
       services.planarian.agentUnits = [ "gym-agent.service" ];
@@ -439,6 +445,11 @@ let
         ];
         # The owner enables the payload and rebuilds outside Planarian.
         bad-payload.services.gym-bad-payload.enable = true;
+        # A flake input update brings a module that declares the payload.
+        input-update = {
+          imports = [ "${modulesNew}/module.nix" ];
+          services.planarian.flakeInputs.gym-modules = lib.mkForce { rev = "new"; path = "${modulesNew}"; };
+        };
         throwaway0.environment.etc."gym-throwaway".text = "0";
         throwaway1.environment.etc."gym-throwaway".text = "1";
       });

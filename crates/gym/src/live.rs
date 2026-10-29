@@ -1131,11 +1131,14 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 "gym-web-false"
             } else if edit == "enable gym-bad-payload" {
                 "bad-payload"
+            } else if edit.starts_with("update input gym-modules") {
+                "input-update"
             } else {
                 return Err(format!("out_of_band_rebuild {edit}"));
             };
             // `nixos-rebuild switch`: the payload entry's owner switches to it.
-            let activate = st.get("activate").and_then(T::as_bool).unwrap_or(name == "bad-payload");
+            let activate =
+                st.get("activate").and_then(T::as_bool).unwrap_or(matches!(name, "bad-payload" | "input-update"));
             let n = if name == "throwaway" { 12 } else { 1 };
             for k in 0..n {
                 let spec = if name == "throwaway" { format!("throwaway{}", k % 2) } else { name.to_string() };
