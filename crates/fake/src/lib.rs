@@ -86,6 +86,8 @@ pub struct UnitSim {
     pub started_at: Timestamp,
     pub failed_at: Option<Timestamp>,
     pub restarts: u32,
+    /// Restarts systemd made on its own (`NRestarts`).
+    pub auto_restarts: u32,
 }
 
 impl UnitSim {
@@ -100,6 +102,7 @@ impl UnitSim {
             started_at: now,
             failed_at: None,
             restarts: 0,
+            auto_restarts: 0,
         }
     }
 }
@@ -411,6 +414,7 @@ impl World {
                 && now.0 >= at.0 + rs.0
             {
                 sim.restarts += 1;
+                sim.auto_restarts += 1;
                 if sim.fail_on_start || broken.contains(id) {
                     sim.failed_at = Some(now);
                 } else {
@@ -578,6 +582,10 @@ impl UnitBackend for Fake {
 
     fn ended_by(&self, id: &UnitId) -> Option<Ending> {
         self.w().units.get(&World::key(id)).and_then(|s| s.ended)
+    }
+
+    fn auto_restarts(&self, id: &UnitId) -> Option<u32> {
+        self.w().units.get(&World::key(id)).map(|s| s.auto_restarts)
     }
 
     fn foreign_units(&self) -> Vec<String> {

@@ -58,10 +58,16 @@ pub fn ending_from(props: &BTreeMap<String, String>) -> Option<Ending> {
 }
 
 /// A unit file that belongs to the generation: in the store (directly or
-/// through /etc's links into it), written by a systemd generator, or none at
-/// all (scopes, slices, devices, mounts systemd makes up).
+/// through /etc's links into it), written by a systemd generator, transient,
+/// or none at all (scopes, slices, devices, mounts systemd makes up).
 pub fn declared(fragment: &str) -> bool {
-    if fragment.is_empty() || fragment.starts_with("/nix/store/") || fragment.starts_with("/run/systemd/generator") {
+    // Transient units (`systemd-run`, Planarian's own operations) are made at
+    // run time by root over D-Bus and do not persist: not a planted file.
+    if fragment.is_empty()
+        || fragment.starts_with("/nix/store/")
+        || fragment.starts_with("/run/systemd/generator")
+        || fragment.starts_with("/run/systemd/transient/")
+    {
         return true;
     }
     std::fs::canonicalize(fragment).is_ok_and(|p| p.starts_with("/nix/store/"))
@@ -163,6 +169,11 @@ impl UnitBackend for Systemd {
         o.ok().then(|| ending_from(&parse_show(&o.stdout))).flatten()
     }
 
+    fn auto_restarts(&self, id: &UnitId) -> Option<u32> {
+        let o = self.ctl(&id.scope, &["show", "--property=NRestarts", "--value", &unit_name(id)], QUERY_TIMEOUT);
+        o.ok().then(|| o.stdout.trim().parse().ok()).flatten()
+    }
+
     fn list(&self) -> Result<Vec<UnitId>, Outcome> {
         let o = self.ctl(
             &Scope::System,
@@ -201,6 +212,7 @@ mod tests {
             declared("") && declared("/nix/store/abc-unit/x.service") && declared("/run/systemd/generator/a.mount")
         );
         assert!(!declared("/etc/systemd/system/planted-by-hand-0000.service"));
+        assert!(declared("/run/systemd/transient/run-u12.service"));
         let e = |t: &str| ending_from(&parse_show(t));
         assert_eq!(e("Result=signal\nExecMainCode=2\nExecMainStatus=9\n"), Some(Ending::Signal(9)));
         assert_eq!(e("Result=success\nExecMainCode=2\nExecMainStatus=15\n"), Some(Ending::Signal(15)));

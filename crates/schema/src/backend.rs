@@ -87,6 +87,11 @@ pub trait UnitBackend {
     fn ended_by(&self, _id: &UnitId) -> Option<Ending> {
         None
     }
+    /// How many times systemd itself restarted the unit (`NRestarts`); None
+    /// if the backend cannot say.
+    fn auto_restarts(&self, _id: &UnitId) -> Option<u32> {
+        None
+    }
     /// The boot report's unit check (§10): active units whose definition does
     /// not come from the running generation (a file outside the store that is
     /// not a generator's).

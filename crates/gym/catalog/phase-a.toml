@@ -2165,7 +2165,7 @@ actor = "user:1001"
 [[fault]]
 id = "residue-kill9-security"
 family = "unattributed-residue"
-summary = "A raw kill -9 of sshd (Security-sensitive) is a fault under every posture: alarmed, never inferred, and restored on its own (§11; catalog-review G16, decided 2026-10-29)."
+summary = "A raw kill -9 of sshd (Security-sensitive) is a fault under every posture: alarmed, never inferred, and back up: restored by Planarian on its own (§11; catalog-review G16, decided 2026-10-29), or by systemd where its Restart= does it first (NixOS's sshd), which is then alarmed from systemd's restart count."
 spec = ["§11 unattributed residue", "§15 v4.4"]
 tags = ["acceptance"]
 scoring = "must-pass"
@@ -2178,11 +2178,6 @@ window = "2m"
 units = { "service:sshd" = "Running" }
 overrides = []
 reports = ["alarm"]
-
-[[fault.required_post.txn]]
-transition = "RestartUnit"
-target = "service:sshd"
-decision = "Allow(Runtime)"
 
 [[fault]]
 id = "residue-oom-kill"

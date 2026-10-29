@@ -264,9 +264,10 @@ pub fn stop_fact(f: &mut DerivedFacts, t: &Transition, s: &SystemState, defs: &U
     // Inactive after a `systemctl stop` (an orderly exit or a termination
     // signal), or failed with Result=signal from a termination signal
     // (kill -9). A crash, a non-zero exit or the OOM killer is a fault.
+    // (Inactive, not failed, is a stop on request whatever the exit status:
+    // sshd, for one, exits 255 on SIGTERM.)
     let stopped = match (s.units.get(u).map(|(o, _)| o), ended) {
-        (Some(Observed::Bound), None) => true,
-        (Some(Observed::Bound), Some(e)) => e.is_termination() || e == Ending::Exited(0),
+        (Some(Observed::Bound), _) => true,
         (Some(Observed::Failed(_)), Some(e)) => e.is_termination(),
         _ => false,
     };

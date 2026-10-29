@@ -455,13 +455,16 @@ let
       });
 
       # /etc/nixos: the shim flake (written once; Planarian edits its overrides).
-      systemd.services.gym-owner = lib.mkIf config.gym.isBase {
+      # Declared in every specialisation too, so a candidate does not look like
+      # it removes a service (§15 provenance: an unexplained difference asks
+      # first); its condition makes it a no-op once /etc/nixos exists.
+      systemd.services.gym-owner = {
         wantedBy = [ "multi-user.target" ];
         before = [ "planariad.service" ];
         unitConfig.ConditionPathExists = "!/etc/nixos/flake.nix";
         serviceConfig.Type = "oneshot";
         path = [ pkgs.git pkgs.coreutils config.nix.package ];
-        script = ''
+        script = if !config.gym.isBase then "true" else ''
           mkdir -p /etc/nixos/planarian
           cd /etc/nixos
           install -m644 ${shim} flake.nix

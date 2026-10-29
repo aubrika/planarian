@@ -139,6 +139,9 @@ pub struct Core<B: Backends + Clone, S: Store> {
     pub integrity: Option<String>,
     /// Each unit's status at the previous tick, to see transitions (§11 residue).
     prev_status: BTreeMap<UnitId, UnitStatus>,
+    /// Security units' systemd restart counts at the previous tick (§11:
+    /// a kill systemd itself repaired is still alarmed).
+    prev_auto_restarts: BTreeMap<UnitId, u32>,
     /// The boot report runs on the first tick after boot (§10).
     boot_report_due: bool,
     /// Quiet mode (§12f) and the notices it holds back.
@@ -278,6 +281,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             chain_checked: None,
             integrity: None,
             prev_status: BTreeMap::new(),
+            prev_auto_restarts: BTreeMap::new(),
             boot_report_due: fresh,
             quiet: false,
             quiet_queue: vec![],
@@ -566,9 +570,28 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let mut current = BTreeMap::new();
         for (u, def) in defs {
             let st = s.status(u, defs);
+            // A Security unit killed by a termination signal that systemd
+            // restarted between two ticks: Planarian never saw it down, but
+            // it was still stopped outside Planarian (§11). Alarmed; systemd
+            // has already restored it.
+            if def.sensitivity.contains(Sensitivity::Security)
+                && def.id.kind == UnitKind::Service
+                && let Some(n) = self.b.units().auto_restarts(u)
+            {
+                let before = self.prev_auto_restarts.insert(u.clone(), n);
+                if before.is_some_and(|b| n > b)
+                    && !self.touched.contains(u)
+                    && let Some(e) = self.b.units().ended_by(u).filter(Ending::is_termination)
+                {
+                    self.notice(format!(
+                        "ALARM: {u}, which is security-sensitive, was stopped outside Planarian ({}); systemd started it again",
+                        signal_name(e)
+                    ));
+                }
+            }
             let was_up = matches!(self.prev_status.get(u), Some(UnitStatus::Running | UnitStatus::Degraded(_)));
             let now_down = matches!(st, UnitStatus::Failed(_) | UnitStatus::Stopped);
-            current.insert(u.clone(), st);
+            current.insert(u.clone(), st.clone());
             if !(was_up && now_down)
                 || def.id.kind != UnitKind::Service
                 || self.touched.contains(u)
@@ -577,7 +600,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             {
                 continue;
             }
-            let Some(e) = self.b.units().ended_by(u).filter(Ending::is_termination) else { continue };
+            // A unit inactive (not failed) after running was stopped on
+            // request (`systemctl stop`), whatever its exit status; a failed
+            // one counts only if a termination signal ended it (a crash, a
+            // non-zero exit or the OOM killer is a fault).
+            let ended = self.b.units().ended_by(u);
+            let e = match (&st, ended) {
+                (_, Some(e)) if e.is_termination() => e,
+                (UnitStatus::Stopped, _) => Ending::Signal(15),
+                _ => continue,
+            };
             if def.sensitivity.contains(Sensitivity::Security) {
                 self.notice(format!(
                     "ALARM: {u}, which is security-sensitive, was stopped outside Planarian ({}); starting it again",
