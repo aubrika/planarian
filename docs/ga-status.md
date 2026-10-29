@@ -15,7 +15,7 @@ evidence for each criterion and how to reproduce it. Updated 2026-10-29.
 | 2. Unnecessary interventions on the intent cases = 0 | 0 of 9 |
 | 3. `policy` proofs pass in CI | Yes: `ci.yml`'s `nix` job runs the Verus check |
 | 4. Baselines: the invisibility budget (§21) | Idle (VM, 5 min, run "Invisibility budget" #2): **0.063% of one core, 7.9 MB resident, 1.58 wakeups/s** (targets < 0.5%, < 50 MB). The game frame-time comparison has not completed yet: the first runs found no Xonotic demo (harness fix pending a run). |
-| 4. Baselines: the verification ratio (§17a) | **Trust count = 32; global d:a = 32:43 (28:43 at GA, before four proved obligations were mapped)** (`planarian-gym verification`, a CI ratchet; per invariant in `docs/verification.md`) |
+| 4. Baselines: the verification ratio (§17a) | **Trust count = 32; global d:a = 42:50 (28:43 at GA; then four proved obligations mapped to I6 and I12, and I21–I23 added for ten more)** (`planarian-gym verification`, a CI ratchet; per invariant in `docs/verification.md`) |
 
 ## 1. The demonstration
 

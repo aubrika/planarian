@@ -16,7 +16,7 @@ assumptions in `assumptions.md`; the counts in `verification-ratio.toml`.
 | **d:a** | The verification ratio: proof obligations **d**ischarged to obligations **a**ssumed, per invariant and summed. |
 | **trust count, \|𝒯\|** | The number of `assumptions.md` entries plus every `external_body` and `assume` site in the verified crates. |
 
-Today: **d:a = 32:43, trust count = 32.** The ratio counts proof
+Today: **d:a = 42:50, trust count = 32.** The ratio counts proof
 obligations, not the sets themselves, so it has its own name. In plain
 text, write V-base and T-base. (Until 2026-10-29 these were 0v, 0t,
 "0v:0t" and "the size of 0t"; the new names replace them everywhere,
@@ -67,12 +67,12 @@ through `step_allowed`. What is not proved is the code *between* the gates:
 whether the executor asks the gates honestly (P9, I14's other half) and
 whether the backends do what they report (P1).
 
-## 2. The invariants (SPEC §8)
+## 2. The invariants (SPEC §7)
 
 **Status:** **Proved** = discharged by Verus or Kani under the listed
 assumptions. **Tested** = tests and gym entries only (its proof phase in
 brackets). d:a counts per invariant, so a lemma that serves two
-invariants counts for both (32 counts, 30 distinct obligations).
+invariants counts for both (42 counts, 40 distinct obligations).
 
 | Id | Guarantee, in plain words | Status | Discharged by | Rests on | d:a |
 | --- | --- | --- | --- | --- | --- |
@@ -96,13 +96,15 @@ invariants counts for both (32 counts, 30 distinct obligations).
 | I18 | Every journal record commits to its predecessor's hash; a broken chain is detected on read. | Tested | — | P5, P4 | 0:2 |
 | **I19** | **No principal approves its own proposal or grants itself a capability it lacks.** | **Proved** | `i19_no_self_approval`, `may_approve`, `may_grant` | V1 | 3:1 |
 | I20 | No agent starts while planarian-ready.target is not reached, in every failure posture. | Tested | — | P6, P8 | 0:2 |
+| **I21** | **Nothing irreversible, or that could lose a session, data or connectivity, runs without asking, unless only your own session is affected; another user's session needs an administrator.** | **Proved** | `global_floors`, `own_session_is_per_session` | V1, V2, P9 | 2:3 |
+| **I22** | **Generation changes, garbage collection, driver binding, clearing the interlock and overriding a Security unit are administrator operations; a Security unit is changed without asking only to restore it; agents and the unattributed actor hold no authority (Phase A).** | **Proved** | `users_cannot_change_generations`, `only_administrators_resolve`, `security_override_held_for_administrator`, `security_restart_runs_alone_only_to_restore`, `agents_and_unattributed_are_refused` | V1, P8, P9 | 5:3 |
+| **I23** | **A generation commits only after its boot entry is written and promoted; runtime operations never publish, promote or revert; the override file is replaced only by compare-and-swap.** | **Proved** | `generations_commit_after_promotion`, `runtime_never_reverts`, `override_swap_never_overwrites_a_third_party` (Kani) | P3 | 3:1 |
 
 ## 3. Every formal obligation
 
 Every Verus lemma, verified function and Kani harness, with what it means
-in practice. **Counts toward** is the invariant row in the ratio file; a
-dash means the obligation is proved and runs in CI but no invariant
-claims it yet (see §7).
+in practice. **Counts toward** is the invariant row in the ratio file;
+where a mapping is not obvious, the cell says why it holds (§7).
 
 ### policy: the decision (Verus)
 
@@ -120,13 +122,13 @@ claims it yet (see §7).
 | `administrator_class_only_on_ask_first` | An Administrator approver class only ever comes with AskFirst. | I16 |
 | `i19_no_self_approval` | No self-approval; approving needs `Approve` (and `Administrator` for that class); no self-grant, nothing granted on one's own proposal, only capabilities the approver holds. | I19 |
 | `may_approve`, `may_grant` (verified fns) | The code that runs equals its specification. | I19 |
-| `global_floors` | Irreversible changes, session or data loss (unless it is the caller's own session), connectivity loss without a seat, or loss reaching another user's session (unless an administrator): AskFirst or Reject, for every transition kind. | — (proposed I21) |
-| `own_session_is_per_session` | "Your own session" means exactly that session: another session of the same user, or an unknown one, asks. | — (proposed I21) |
-| `security_override_held_for_administrator` | A non-administrator's override of a Security-sensitive unit never runs on its own. | — (proposed I22) |
-| `security_restart_runs_alone_only_to_restore` | A Security-sensitive unit's restart runs without asking only to restore an unattributed stop, and never for an External one (G16). | — (proposed I22) |
-| `agents_and_unattributed_are_refused` | Agents and the unattributed actor are always Unauthorized: an inferred override never passes through `decide`. | — (proposed I22) |
-| `only_administrators_resolve` | Only an administrator can clear the recovery interlock. | — (proposed I22) |
-| `users_cannot_change_generations` | A non-administrator cannot switch, revert, roll back, load models, restore snapshots, collect garbage, bind drivers or resolve. | — (proposed I22) |
+| `global_floors` | Irreversible changes, session or data loss (unless it is the caller's own session), connectivity loss without a seat, or loss reaching another user's session (unless an administrator): AskFirst or Reject, for every transition kind. | I21 |
+| `own_session_is_per_session` | "Your own session" means exactly that session: another session of the same user, or an unknown one, asks. | I21 |
+| `security_override_held_for_administrator` | A non-administrator's override of a Security-sensitive unit never runs on its own. | I22 |
+| `security_restart_runs_alone_only_to_restore` | A Security-sensitive unit's restart runs without asking only to restore an unattributed stop, and never for an External one (G16). | I22 |
+| `agents_and_unattributed_are_refused` | Agents and the unattributed actor are always Unauthorized: an inferred override never passes through `decide`. | I22 |
+| `only_administrators_resolve` | Only an administrator can clear the recovery interlock. | I22 |
+| `users_cannot_change_generations` | A non-administrator cannot switch, revert, roll back, load models, restore snapshots, collect garbage, bind drivers or resolve. | I22 |
 
 ### txn: the state machine and the ledger (Verus)
 
@@ -137,9 +139,9 @@ claims it yet (see §7).
 | `i12_terminal_always_reachable` | From every non-terminal state there is an allowed step to a terminal one. | I12 |
 | `terminal_is_final` | Terminal states have no way out. | I12 |
 | `refusal_only_before_mutation` | Rejected and Cancelled are reachable only before anything was changed. | I12 |
-| `runtime_never_reverts` | Runtime operations never revert, publish or promote. | — (proposed I23). Not I6: `only_generations_publish` already closes I6's gap. |
+| `runtime_never_reverts` | Runtime operations never revert, publish or promote. | I23. Not I6: `only_generations_publish` already closes I6's gap. |
 | `only_generations_publish` | Only generation operations write a boot entry or promote overrides. | I6: the ledger counts "generation-changing" by recovery strategy; this shows nothing outside that count can publish or promote, so the count is the right one. |
-| `generations_commit_after_promotion` | A generation commits only from Promoted. | — (proposed I23). Not I1: known-good is set by the boot check, which an owner's own rebuild can pass too. |
+| `generations_commit_after_promotion` | A generation commits only from Promoted. | I23. Not I1: known-good is set by the boot check, which an owner's own rebuild can pass too. |
 | `boot_only_never_activates` | A boot-only candidate is never live-activated: AwaitingBoot comes only from Built and leads only to Promoted or a revert. | I6: its exemption (repairs may run during AwaitingBoot) is safe only because a boot-only candidate never reaches Activating. |
 | `validate` (verified fn) | A record is written only if: its sequence number is next; it carries the current lease epoch; an Advance follows `step_spec`; it keeps every pair of live transactions compatible (I6); a takeover strictly raises the epoch; an OpAck answers a begun, unanswered OpBegin; autonomous mutation is refused while the interlock is set. | I6, I15 |
 | `apply` (verified fn) | Applying a record preserves the ledger invariant, never lowers an epoch, and RecoveryFailed always sets the interlock. | I6, I12 |
@@ -155,7 +157,7 @@ claims it yet (see §7).
 | `recovery_table_follows_the_state_machine` | After a crash, recovery refuses exactly the pre-mutation states, and every path it can journal takes only allowed steps and ends terminal. | I12 |
 | `watchdog_takes_over_only_when_it_should` | The watchdog takes over only in the mutation window, never from itself or a live owner within its deadline, always from a dead one; no overflow. | I12 |
 | `takeover_fences_out_the_previous_owner` | A takeover's epoch beats the lease and the store's fence; the old owner is refused from then on; at `u64::MAX` it backs off instead of overflowing. | I15 |
-| `override_swap_never_overwrites_a_third_party` | The override swap is a compare-and-swap: it never overwrites an override someone else set. | — (proposed I23) |
+| `override_swap_never_overwrites_a_third_party` | The override swap is a compare-and-swap: it never overwrites an override someone else set. | I23 |
 | `approval_tokens_expire_after_their_lifetime` | A token is never expired at issue, expires exactly after 24 h, stays expired; no overflow. This harness caught a real overflow panic. | I8 |
 
 **Mutation checks** (`verification.md`): for each of these, a deliberate
@@ -302,30 +304,12 @@ none is proved yet.
   at each of 15 points.
 - **Tested-only invariants:** I1–I4, I7, I13, I17, I18, I20.
 - **`schema::digest`** is property-tested, not proved.
-- **Proved, but no invariant claims them.** Of fourteen obligations
-  that counted toward nothing, four were mapped on 2026-10-29 (§3; d:a
-  rose from 28:43 to 32:43). The other ten guarantee something no
-  invariant states. They group into three proposed invariants:
-  - **I21, floors:** an irreversible transition, or one that may lose a
-    session, user data or connectivity, never runs below AskFirst, unless
-    the loss falls only on the caller's own session (and, for connectivity,
-    the caller has a seat); a loss reaching another user's session needs an
-    administrator. (`global_floors`, `own_session_is_per_session`)
-  - **I22, authority:** changing the generation, collecting garbage,
-    binding drivers, resolving the interlock and overriding a
-    Security-sensitive unit are administrator operations; a
-    Security-sensitive unit is changed without asking only to restore its
-    declared state; in Phase A agents and the unattributed actor hold no
-    authority. (`users_cannot_change_generations`,
-    `only_administrators_resolve`, `security_override_held_for_administrator`,
-    `security_restart_runs_alone_only_to_restore`,
-    `agents_and_unattributed_are_refused`)
-  - **I23, persistent configuration:** a generation transaction commits only
-    after its boot entry is written and promoted; a runtime transaction
-    never publishes, promotes or reverts; the override file is replaced
-    only by compare-and-swap, never over someone else's change.
-    (`generations_commit_after_promotion`, `runtime_never_reverts`,
-    `override_swap_never_overwrites_a_third_party`)
+- **Every proved obligation now counts.** Fourteen counted toward
+  nothing at GA. Four were mapped to I6 and I12, and the other ten
+  guaranteed things no invariant stated, so SPEC §7 gained I21 (floors),
+  I22 (authority) and I23 (persistent configuration) on 2026-10-29. d:a
+  went from 28:43 to 42:50. The assumptions grew with it: each new
+  invariant cites what it rests on.
 - **Kani is not a flake check** (not packaged in nixpkgs); it runs by hand
   from `cargo kani`.
 

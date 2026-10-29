@@ -217,6 +217,9 @@ Dependency rule, enforced in CI: `schema`, `policy`, `txn`, `exec`, `diagnose`, 
 | I18 | Every journal record commits to the hash of its predecessor; a broken chain is detected on read and treated as an integrity failure (§12c, §12d). | A |
 | I19 | No principal approves its own proposal, and no principal grants itself, or a principal it controls, a capability it does not hold. | A (proof), C |
 | I20 | No agent principal (on-device model or remote) starts while `planarian-ready.target` is not reached, in every failure posture (§12d). | A |
+| I21 | No transition that cannot be reversed, or that may lose a session, user data or connectivity, executes below AskFirst, unless the loss falls only on the caller's own session (and, for connectivity, the caller has a seat); a loss reaching another user's session requires administrator approval (§11 floors). | A (proof) |
+| I22 | Changing the generation, collecting garbage, binding drivers, resolving the recovery interlock and overriding a Security-sensitive unit are administrator operations; a Security-sensitive unit is changed without approval only to restore its declared state (§11); agent principals and the unattributed actor hold no authority beyond what §11 grants them (in Phase A, none). | A (proof) |
+| I23 | A generation transaction commits only after its boot entry is written and promoted; a runtime transaction never publishes, promotes or reverts; the override file is replaced only by compare-and-swap, never over a change another party made (§9 step 4). | A (proof) |
 
 ## 8. Schema (crate `schema`)
 

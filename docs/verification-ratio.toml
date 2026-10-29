@@ -12,11 +12,12 @@
 
 [baseline]
 # GA (2026-10-29), from `planarian-gym verification --write-baseline`;
-# raised the same day when four proved obligations were mapped (I6, I12).
+# raised the same day when four proved obligations were mapped (I6, I12)
+# and again when I21-I23 were added to the SPEC for ten more.
 # Change these only when a change improves them.
 trust_count = 32
-discharged = 32
-assumed = 43
+discharged = 42
+assumed = 50
 
 [baseline.per_invariant]
 I1 = [0, 2]
@@ -38,6 +39,9 @@ I17 = [0, 1]
 I18 = [0, 2]
 I19 = [3, 1]
 I20 = [0, 2]
+I21 = [2, 3]
+I22 = [5, 3]
+I23 = [3, 1]
 
 [[invariant]]
 id = "I1"
@@ -185,3 +189,26 @@ phase = "A"
 tested = ["vm-posture", "gym posture-*"]
 discharged = []
 assumes = ["P6", "P8"]
+
+[[invariant]]
+id = "I21"
+statement = "No irreversible transition, or one that may lose a session, user data or connectivity, runs below AskFirst unless the loss falls only on the caller's own session (with a seat, for connectivity); a loss reaching another user's session needs an administrator."
+phase = "A (proof)"
+discharged = ["policy::global_floors", "policy::own_session_is_per_session"]
+assumes = ["V1", "V2", "P9"]
+
+[[invariant]]
+id = "I22"
+statement = "Generation changes, garbage collection, driver binding, resolving the interlock and overriding a Security-sensitive unit are administrator operations; a Security-sensitive unit is changed without approval only to restore its declared state; agents and the unattributed actor hold no authority (Phase A)."
+phase = "A (proof)"
+tested = ["gym residue-kill9-security", "gym residue-stop-security-unit"]
+discharged = ["policy::users_cannot_change_generations", "policy::only_administrators_resolve", "policy::security_override_held_for_administrator", "policy::security_restart_runs_alone_only_to_restore", "policy::agents_and_unattributed_are_refused"]
+assumes = ["V1", "P8", "P9"]
+
+[[invariant]]
+id = "I23"
+statement = "A generation transaction commits only after its boot entry is written and promoted; a runtime transaction never publishes, promotes or reverts; the override file is replaced only by compare-and-swap."
+phase = "A (proof)"
+tested = ["gym stale-owner-edit-during-build"]
+discharged = ["txn::generations_commit_after_promotion", "txn::runtime_never_reverts", "txn::override_swap_never_overwrites_a_third_party"]
+assumes = ["P3"]
