@@ -354,3 +354,63 @@ fn format_one_journal_is_refused_not_truncated() {
     assert!(matches!(Journal::open(store.clone()), Err(JournalError::Legacy)));
     assert_eq!(store.read_at(0, f.len()).unwrap(), f, "left as found");
 }
+
+/// §12c: an interlock set through the sentinel (the journal was full on the
+/// recovery path) is cleared by `planarian resolve` and stays cleared across
+/// restarts, with or without a compaction in between; and the journal opens.
+#[test]
+fn sentinel_interlock_is_resolved_for_good() {
+    for compact in [false, true] {
+        let s = MemStore::new(1 << 16);
+        s.write_sentinel(b"RecoveryFailed txn=3 journal full").unwrap();
+        let mut j = Journal::open(s.clone()).unwrap();
+        assert!(j.ledger().interlocked());
+        if compact {
+            j.compact().unwrap();
+        }
+        j.append(
+            Timestamp(1),
+            Record::Resolved { txn: TxnId(3), resolution: Resolution::AsReverted, by: Actor::user(0) },
+        )
+        .unwrap();
+        assert!(!j.ledger().interlocked());
+        let again = Journal::open(s.clone()).unwrap_or_else(|e| panic!("compact={compact}: {e:?}"));
+        assert!(!again.ledger().interlocked(), "compact={compact}: the interlock came back");
+        // And after a later compaction too (the sentinel is cleared there).
+        let mut again = again;
+        again.compact().unwrap();
+        let third = Journal::open(s.clone()).unwrap();
+        assert!(!third.ledger().interlocked(), "compact={compact}: back after a compaction");
+    }
+}
+
+/// A sentinel whose Resolved is in the log but which was not yet cleared (a
+/// crash in between) replays in order: the journal opens, not interlocked.
+#[test]
+fn sentinel_resolved_before_clearing_replays_in_order() {
+    let s = MemStore::new(1 << 16);
+    s.write_sentinel(b"RecoveryFailed txn=3 journal full").unwrap();
+    let mut j = Journal::open(s.clone()).unwrap();
+    j.append(Timestamp(1), Record::Resolved { txn: TxnId(3), resolution: Resolution::AsReverted, by: Actor::user(0) })
+        .unwrap();
+    // The crash: the sentinel is back on disk.
+    s.write_sentinel(b"RecoveryFailed txn=3 journal full").unwrap();
+    let again = Journal::open(s.clone()).unwrap();
+    assert!(!again.ledger().interlocked());
+}
+
+/// I18: zeroing a middle record's header does not silently drop it and the
+/// records after it.
+#[test]
+fn erased_middle_header_is_an_integrity_failure() {
+    let s = MemStore::new(1 << 16);
+    let mut j = Journal::open(s.clone()).unwrap();
+    let mut offs = vec![];
+    for i in 0..5u64 {
+        offs.push(j.offset());
+        j.append(Timestamp(i), Record::KnownGood(GenerationId(i + 1))).unwrap();
+    }
+    drop(j);
+    s.write_at(offs[2], &[0u8; 16]).unwrap();
+    assert!(matches!(Journal::open(s), Err(JournalError::Integrity(_))));
+}

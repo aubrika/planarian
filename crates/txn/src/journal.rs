@@ -89,6 +89,10 @@ pub struct Journal<S: Store> {
     checkpoint_seq: u64,
     /// The hash chain's head after the last record this handle has read (I18).
     head: Hash,
+    /// During a reload: the sentinel's transaction and bytes, not yet applied
+    /// (§12c). Its interlock is applied just before a `Resolved` that names it,
+    /// or after the scan.
+    pending_sentinel: Option<(TxnId, Vec<u8>)>,
 }
 
 /// The chain head after a record (I18).
@@ -186,7 +190,14 @@ fn legacy_frame(bytes: &[u8]) -> bool {
 impl<S: Store> Journal<S> {
     /// Load the checkpoint, replay the log, truncate a torn tail.
     pub fn open(store: S) -> Result<Journal<S>, JournalError> {
-        let mut j = Journal { store, ledger: Ledger::default(), offset: 0, checkpoint_seq: 0, head: Hash::ZERO };
+        let mut j = Journal {
+            store,
+            ledger: Ledger::default(),
+            offset: 0,
+            checkpoint_seq: 0,
+            head: Hash::ZERO,
+            pending_sentinel: None,
+        };
         {
             let _g = j.store.lock()?;
             j.reload()?;
@@ -245,9 +256,28 @@ impl<S: Store> Journal<S> {
             }
         }
         self.offset = 0;
-        self.scan(true)?;
-        if let Some(bytes) = self.store.read_sentinel()? {
+        // The sentinel's interlock came after the records already in the log
+        // when it was written, and before any `Resolved` that names it.
+        self.pending_sentinel = self.store.read_sentinel()?.and_then(|b| sentinel_txn(&b).map(|t| (t, b)));
+        let scanned = self.scan(true);
+        let pending = self.pending_sentinel.take();
+        scanned?;
+        // Not resolved in the log (or no Resolved since the checkpoint).
+        if let Some((_, bytes)) = pending {
             self.apply_sentinel(&bytes);
+        }
+        Ok(())
+    }
+
+    /// At compaction: the checkpoint now carries the resolution, so the
+    /// sentinel of a resolved transaction is zeroed and a reload does not set
+    /// the interlock again. (A crash before the zeroing leaves it set: the
+    /// safe side; resolving again clears it.)
+    fn clear_resolved_sentinel(&mut self) -> Result<(), JournalError> {
+        if let Some(t) = self.store.read_sentinel()?.as_deref().and_then(sentinel_txn)
+            && !self.ledger.interlock.contains_key(&t)
+        {
+            self.store.write_sentinel(&[0; crate::store::SENTINEL_SIZE])?;
         }
         Ok(())
     }
@@ -278,6 +308,14 @@ impl<S: Store> Journal<S> {
                 if truncate && bytes.iter().take(HEADER).any(|b| *b != 0) {
                     return self.stop_at_tail(truncate);
                 }
+                // A zeroed header is the end of the log only if no intact
+                // later record follows it; otherwise a record was erased (I18).
+                if truncate && let Some(seq) = self.later_record()? {
+                    return Err(JournalError::Integrity(format!(
+                        "the record at byte {} was erased, but record {seq} follows it",
+                        self.offset
+                    )));
+                }
                 return Ok(());
             };
             let (seq, payload, size) = (f.seq, f.payload, f.size);
@@ -305,6 +343,12 @@ impl<S: Store> Journal<S> {
             };
             if entry.seq != seq {
                 return self.stop_at_tail(truncate);
+            }
+            if let Record::Resolved { txn, .. } = &entry.record
+                && self.pending_sentinel.as_ref().is_some_and(|(t, _)| t == txn)
+                && let Some((_, bytes)) = self.pending_sentinel.take()
+            {
+                self.apply_sentinel(&bytes);
             }
             self.ledger.apply(entry)?;
             self.head = chain(&f.prev, seq, payload);
@@ -500,7 +544,7 @@ impl<S: Store> Journal<S> {
         self.store.write_at(0, &[0; HEADER])?;
         self.store.sync()?;
         self.offset = 0;
-        Ok(())
+        self.clear_resolved_sentinel()
     }
 
     /// The fixed-size fallback when a recovery-path record cannot be written
@@ -514,13 +558,9 @@ impl<S: Store> Journal<S> {
     }
 
     fn apply_sentinel(&mut self, bytes: &[u8]) {
+        let Some(txn) = sentinel_txn(bytes) else { return };
         let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-        let Ok(text) = std::str::from_utf8(&bytes[..end]) else { return };
-        let Some(id) = text.strip_prefix("RecoveryFailed txn=").and_then(|s| s.split_whitespace().next()) else {
-            return;
-        };
-        let Ok(id) = id.parse::<u64>() else { return };
-        let txn = TxnId(id);
+        let text = String::from_utf8_lossy(&bytes[..end]).into_owned();
         if self.ledger.interlock.contains_key(&txn) {
             return;
         }
@@ -535,7 +575,15 @@ impl<S: Store> Journal<S> {
             base_override: None,
             candidate_override: None,
             revert_to,
-            note: text.into(),
+            note: text,
         });
     }
+}
+
+/// The transaction a sentinel names (`RecoveryFailed txn=<id> …`), if any.
+fn sentinel_txn(bytes: &[u8]) -> Option<TxnId> {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    let text = std::str::from_utf8(&bytes[..end]).ok()?;
+    let id = text.strip_prefix("RecoveryFailed txn=")?.split_whitespace().next()?;
+    id.parse::<u64>().ok().map(TxnId)
 }
