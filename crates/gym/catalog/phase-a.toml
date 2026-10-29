@@ -2551,3 +2551,43 @@ window = "5m"
 [fault.required_post]
 posture = { class = "Integrity", target_reached = "planarian-failed@Integrity.target", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"] }
 reports = ["BootReport(UndeclaredEarly: service:gym-planted)"]
+
+# §15 (v4.4): a malicious declaration is reported with its origin. The
+# payload (gym-bad-payload) behaves past the generation checks, then takes
+# gym-web's port; the incident on gym-web must name where it came from.
+[[fault]]
+id = "malicious-decl-owner-rebuild"
+family = "malicious-declaration"
+summary = "The owner's flake gains gym-bad-payload and root runs nixos-rebuild switch outside Planarian. The incident on gym-web names gym-bad-payload's declaration: the owner source file, the out-of-band rebuild as the path, and when that generation appeared."
+spec = ["§15 malicious declaration", "§11 out-of-band rebuild"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "out_of_band_rebuild", edit = "enable gym-bad-payload", actor = "root" }
+window = "10m"
+
+[fault.required_post]
+declaration_origin = { unit = "service:gym-bad-payload", who = "root", path = "out-of-band nixos-rebuild", file = "owner:configuration.nix", when = "generation-created" }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+
+[[fault]]
+id = "malicious-decl-catalog-enable"
+family = "malicious-declaration"
+summary = "alice enables the declared-but-off gym-bad-payload through the service-enable catalog entry (the owner made it user-controllable). The incident names alice, the transaction, and planarian/overrides.nix as the path."
+spec = ["§15 malicious declaration", "§9 catalog"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "set_setting", key = "userControllableChanges", value = ["service-enable"] }]
+inject = { transition = "ApplyChange", change = "service-enable", args = { service = "gym-bad-payload", enabled = true }, source = "user", actor = "user:1000" }
+window = "10m"
+
+[fault.required_post]
+declaration_origin = { unit = "service:gym-bad-payload", who = "user:1000", path = "ApplyChange service-enable", file = "planarian/overrides.nix", when = "txn" }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"

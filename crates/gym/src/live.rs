@@ -905,10 +905,18 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
         }
         // Past its restart budget (5 in 300 s): crash it until systemd gives up.
         "kill_process" if get("process") == "planariad" && get("repeat") == "past-budget" => {
+            // Kill it each time it is up again, until systemd gives up
+            // (Result=start-limit-hit); a kill while it waits to restart
+            // would hit nothing.
             let sig = if get("signal").is_empty() { "SIGSEGV".to_string() } else { get("signal") };
-            for _ in 0..8 {
-                sh(&format!("systemctl kill --signal={sig} planariad || true"));
-                std::thread::sleep(Duration::from_secs(3));
+            let until = Instant::now() + Duration::from_secs(300);
+            while Instant::now() < until
+                && sh_out("systemctl show -p Result --value planariad.service").trim() != "start-limit-hit"
+            {
+                if sh("systemctl is-active --quiet planariad.service") {
+                    sh(&format!("systemctl kill --signal={sig} planariad.service || true"));
+                }
+                std::thread::sleep(Duration::from_millis(500));
             }
         }
         "kill_process" => match get("process").as_str() {
@@ -1121,10 +1129,13 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 "weak-sshd-probe"
             } else if edit.contains("ExecStart=/bin/false") {
                 "gym-web-false"
+            } else if edit == "enable gym-bad-payload" {
+                "bad-payload"
             } else {
                 return Err(format!("out_of_band_rebuild {edit}"));
             };
-            let activate = st.get("activate").and_then(T::as_bool).unwrap_or(false);
+            // `nixos-rebuild switch`: the payload entry's owner switches to it.
+            let activate = st.get("activate").and_then(T::as_bool).unwrap_or(name == "bad-payload");
             let n = if name == "throwaway" { 12 } else { 1 };
             for k in 0..n {
                 let spec = if name == "throwaway" { format!("throwaway{}", k % 2) } else { name.to_string() };
@@ -1181,6 +1192,14 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                     (vec!["gc", "generationsPermille"], serde_json::json!((pct * 10.0).round() as u64))
                 }
                 "posture" => (vec!["posture"], serde_json::json!(get("value"))),
+                // `services.planarian.userControllable.changes` (added to).
+                "userControllableChanges" => {
+                    let add: Vec<&str> =
+                        st.get("value").and_then(T::as_array).into_iter().flatten().filter_map(T::as_str).collect();
+                    let mut have: Vec<String> = config().user_controllable_changes.into_iter().collect();
+                    have.extend(add.iter().map(|s| s.to_string()));
+                    (vec!["userControllableChanges"], serde_json::json!(have))
+                }
                 k => return Err(format!("set_setting {k}")),
             };
             let src = std::env::var("PLANARIAN_CONFIG").unwrap_or_else(|_| CONFIG.into());

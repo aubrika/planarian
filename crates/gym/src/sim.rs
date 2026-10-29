@@ -43,7 +43,12 @@ pub fn config() -> CoreConfig {
                 model_catalog: Default::default(),
             },
             catalog: CatalogConfig {
-                services: [("sshd".into(), "services.openssh.enable".into())].into(),
+                services: [
+                    ("sshd".into(), "services.openssh.enable".into()),
+                    // Declared, off by default (catalog family malicious-declaration).
+                    ("gym-bad-payload".into(), "services.gym-bad-payload.enable".into()),
+                ]
+                .into(),
                 font_scale_option: "planarian.reference.fontScale".into(),
                 font_scales: ["0.75", "1", "1.25", "1.5", "2"].map(String::from).into(),
                 listen_addresses: [(
@@ -1042,6 +1047,18 @@ impl Sim {
                     let c = self.core.as_mut().ok_or_else(|| Unsupported("daemon down".into()))?;
                     c.ex.cfg.settings.user_controllable_units.extend(units);
                 }
+                "userControllableChanges" => {
+                    let add: Vec<ChangeId> = s
+                        .get("value")
+                        .and_then(T::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(T::as_str)
+                        .map(|c| ChangeId(c.into()))
+                        .collect();
+                    let c = self.core.as_mut().ok_or_else(|| Unsupported("daemon down".into()))?;
+                    c.ex.cfg.settings.user_controllable_changes.extend(add);
+                }
                 "posture" => {
                     self.posture = match s.get("value").and_then(T::as_str) {
                         Some("Relaxed") => planarian_schema::Posture::Relaxed,
@@ -1082,6 +1099,15 @@ impl Sim {
                         sim.observed = Observed::Failed(Reason::ExitCode(1));
                         w.current = g;
                     }
+                } else if edit == "enable gym-bad-payload" {
+                    // The owner's configuration now enables it; root switches.
+                    w.base_options.insert("services.gym-bad-payload.enable".into(), Value::Bool(true));
+                    w.rebuild_uid = if actor == "root" { 0 } else { peer(&actor).uid };
+                    let g = w.add_generation(&OverrideSet::default());
+                    w.rebuild_uid = 0;
+                    w.boot_entries.insert(g);
+                    w.boot_default = g;
+                    w.apply_generation(g);
                 } else {
                     return Err(Unsupported(format!("out_of_band_rebuild {edit:?}")));
                 }

@@ -61,6 +61,9 @@ pub struct Export {
     pub packages: BTreeMap<String, String>,
     /// pnames whose `meta.knownVulnerabilities` is not empty.
     pub insecure: Vec<String>,
+    /// Every system service → the files defining it (§15 provenance).
+    #[serde(default)]
+    pub declarations: BTreeMap<String, Vec<String>>,
 }
 
 impl Export {
@@ -79,6 +82,7 @@ impl Export {
                 .collect(),
             packages: self.packages,
             insecure: self.insecure.into_iter().collect(),
+            declarations: self.declarations,
         }
     }
 }
@@ -524,6 +528,17 @@ impl GenerationBackend for Nixos {
 
     fn last_booted(&self) -> Result<GenerationId, Outcome> {
         self.id_of_link(Path::new("/run/booted-system"))
+    }
+
+    /// The profile link's owner and modification time (`nixos-rebuild` as
+    /// root, or Planarian, which also runs as root: the journal tells those
+    /// apart; this answers for rebuilds outside Planarian).
+    fn created_by(&self, g: GenerationId) -> Option<(u32, Timestamp)> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = self.paths.profile.parent()?;
+        let name = format!("{}-{}-link", self.paths.profile.file_name()?.to_string_lossy(), g.0);
+        let m = std::fs::symlink_metadata(dir.join(name)).ok()?;
+        Some((m.uid(), Timestamp(u64::try_from(m.mtime()).ok()? * 1000)))
     }
 
     fn stage(&self, owner: &PinnedSource, overrides: &OverrideSet) -> Result<StagedSource, Outcome> {

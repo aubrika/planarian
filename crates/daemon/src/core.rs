@@ -49,6 +49,9 @@ pub struct CoreConfig {
     pub posture: Posture,
 }
 
+/// How long a generation's new declarations are named in incident reports (§15).
+pub const NEW_DECLARATIONS_FOR: Millis = Millis::secs(24 * 3600);
+
 /// How often the running daemon re-reads its journal's hash chain (I18).
 pub const CHAIN_CHECK_EVERY: Millis = Millis::secs(3600);
 
@@ -118,6 +121,11 @@ pub struct Core<B: Backends + Clone, S: Store> {
     gen_manifest: planarian_schema::Manifest,
     /// The external desired-state document in force (§9 hook), verified by `main`.
     pub external: Option<crate::hooks::DesiredDoc>,
+    /// Services the running generation declares that the one before it did
+    /// not, with where each came from, and since when (§15: a malicious
+    /// declaration is reported with its origin).
+    pub new_declarations: Vec<(String, String)>,
+    new_declarations_since: Timestamp,
     interlock_noted: bool,
     /// Incidents whose opening was already announced.
     diag_noted: BTreeSet<IncidentId>,
@@ -262,6 +270,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             manifest_gen: current,
             gen_manifest: manifest,
             external: None,
+            new_declarations: vec![],
+            new_declarations_since: now,
             interlock_noted: false,
             diag_noted: BTreeSet::new(),
             unreachable: BTreeMap::new(),
@@ -292,6 +302,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
         core.reprepare = reprepare;
+        core.note_declarations(None, current, false);
         core
     }
 
@@ -374,7 +385,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 self.gen_manifest = manifest_of(&e);
                 self.asm.set_manifest(self.effective_manifest().0);
             }
+            let prev = self.manifest_gen;
             self.manifest_gen = current;
+            self.note_declarations(Some(prev), current, true);
         }
         let ctx = self.context(&l, current);
         let protect = self.protect(&l, current);
@@ -626,6 +639,62 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         true
     }
 
+    /// The services `cur` declares that `prev` (default: the boot entry
+    /// before it) did not, and where each came from: the transaction that
+    /// built `cur` (from the journal's Prepared record: its caller and
+    /// transition, written to planarian/overrides.nix), or else a rebuild
+    /// outside Planarian (the generation's creator and time, and the files
+    /// that define the service).
+    fn note_declarations(&mut self, prev: Option<GenerationId>, cur: GenerationId, announce: bool) {
+        let gens = self.b.generations();
+        let prev = prev.or_else(|| gens.boot_entries().ok()?.into_iter().filter(|g| *g < cur).max());
+        let decls = |g: GenerationId| gens.path_of(g).and_then(|p| gens.evaluate_built(&p)).map(|e| e.declarations);
+        let (Some(prev), Ok(now_d)) = (prev, decls(cur)) else { return };
+        let Ok(before) = decls(prev) else { return };
+        let added: Vec<(&String, &Vec<String>)> = now_d.iter().filter(|(k, _)| !before.contains_key(*k)).collect();
+        if added.is_empty() {
+            self.new_declarations.clear();
+            return;
+        }
+        let made = self.ex.kernel.journal.segment().ok().and_then(|seg| {
+            seg.into_iter().rev().find_map(|e| match e.record {
+                Record::Prepared(t) if t.candidate.as_ref().is_some_and(|(g, _)| *g == cur) => Some(t),
+                _ => None,
+            })
+        });
+        let who = |a: &Actor| match a {
+            Actor::User { uid: 0, .. } => "root".to_string(),
+            Actor::User { uid, .. } => format!("uid {uid}"),
+            a => format!("{a:?}"),
+        };
+        let created = gens.created_by(cur);
+        self.new_declarations = added
+            .into_iter()
+            .map(|(svc, files)| {
+                let how = match &made {
+                    Some(t) => format!(
+                        "by {} through {} (transaction {}), written to planarian/overrides.nix",
+                        who(&t.facts.caller),
+                        render::transition(&t.transition),
+                        t.id.0
+                    ),
+                    None => format!(
+                        "by {} through an out-of-band nixos-rebuild, defined in {}; generation created at {}",
+                        created.map(|(uid, _)| who(&Actor::user(uid))).unwrap_or_else(|| "an unknown user".into()),
+                        if files.is_empty() { "an unknown file".to_string() } else { files.join(", ") },
+                        created.map(|(_, at)| render::when(at)).unwrap_or_else(|| "an unknown time".into())
+                    ),
+                };
+                (svc.clone(), format!("service:{svc} is new in generation {}, {how}", cur.0))
+            })
+            .collect();
+        self.new_declarations_since = self.b.clock().now();
+        if announce {
+            let list: Vec<String> = self.new_declarations.iter().map(|(_, o)| o.clone()).collect();
+            self.notice(format!("generation {} declares new services: {}", cur.0, list.join("; ")));
+        }
+    }
+
     /// The generation's manifest with the external document's units joined
     /// (§9): a unit the generation declares stays the generation's. Returns
     /// the units the document declared that the generation overrode.
@@ -776,6 +845,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 let root = diagnose::root_cause(&inc.target, &inputs);
                 let because = if root == inc.target { String::new() } else { format!(" (root cause: {root})") };
                 let origin = self.origin_of(&inc.target).map(|o| format!("; declared by {o}")).unwrap_or_default();
+                // §15: what this generation added, with its origin, while recent.
+                let origin = if !self.new_declarations.is_empty()
+                    && now.0.saturating_sub(self.new_declarations_since.0) < NEW_DECLARATIONS_FOR.0
+                {
+                    let list: Vec<&str> = self.new_declarations.iter().take(3).map(|(_, o)| o.as_str()).collect();
+                    format!("{origin}; new since the previous generation: {}", list.join("; "))
+                } else {
+                    origin
+                };
                 self.notice(format!(
                     "{}: {:?}{because}{}{origin}",
                     inc.target,

@@ -207,6 +207,9 @@ fn main() {
                     for n in &sim.notices {
                         println!("             notice: {n}");
                     }
+                    for r in &sim.responses {
+                        println!("             response: {r:?}");
+                    }
                 }
             }
             println!("\n{tally:?}");

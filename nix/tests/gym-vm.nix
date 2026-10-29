@@ -27,6 +27,7 @@ let
     sshd-off = { services.openssh.enable = false; };
     sshd-on = { services.openssh.enable = true; };
     kparam = { gym.kernelParam = "virtio_gpu.modeset=0"; };
+    payload = { services.gym-bad-payload.enable = true; };
   };
   # What Planarian evaluates besides the export (nix/backends apply_expr).
   optionPaths = [
@@ -35,6 +36,7 @@ let
     "services.openssh.enable"
     "services.gym-extra.enable"
     "gym.kernelParam"
+    "services.gym-bad-payload.enable"
   ];
 
   fixture = pkgs.writeScript "gym-fixture" ''
@@ -133,7 +135,7 @@ let
         facts = facts (if n == "base" then config else config.specialisation.${n}.configuration);
       }) candidates));
     in {
-    imports = [ self.nixosModules.default self.nixosModules.reference ];
+    imports = [ self.nixosModules.default self.nixosModules.reference ./gym-payload.nix ];
 
     options.services.gym-web.listenAddress = lib.mkOption { type = lib.types.str; default = "127.0.0.1"; };
     options.services.gym-extra.enable = lib.mkEnableOption "gym-extra";
@@ -155,7 +157,11 @@ let
         owner = "/etc/nixos";
         flakeAttr = "nixosConfigurations.machine";
         startupGrace = 20;
-        catalog.services = { sshd = "services.openssh.enable"; gym-extra = "services.gym-extra.enable"; };
+        catalog.services = {
+          sshd = "services.openssh.enable";
+          gym-extra = "services.gym-extra.enable";
+          gym-bad-payload = "services.gym-bad-payload.enable";
+        };
         catalog.listenAddresses.gym-web = { option = "services.gym-web.listenAddress"; permitted = [ "127.0.0.1" "192.0.2.10" ]; };
         catalog.gymChoices."gym:kernel-param" = { option = "gym.kernelParam"; arg = "param"; permitted = [ "virtio_gpu.modeset=0" ]; };
         units = {
@@ -298,7 +304,8 @@ let
       # Failure-posture fixtures (§12d; catalog family failure-posture).
       # The stand-in agent principal, stopped by every failure class (I20).
       services.planarian.agentUnits = [ "gym-agent.service" ];
-      services.planarian.bootReadyTimeout = 30;
+      # The gym VM boots slowly (many fixtures); 30 s raised Absent at boot.
+      services.planarian.bootReadyTimeout = 120;
       systemd.services.gym-agent = {
         wantedBy = [ "multi-user.target" ];
         serviceConfig.ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
@@ -310,7 +317,7 @@ let
       # the early directory, which outranks every other).
       systemd.generators.gym-mask = pkgs.writeShellScript "gym-mask" ''
         [ -r /var/lib/gym-posture/masked ] || exit 0
-        while read -r u; do [ -n "$u" ] && ln -sf /dev/null "$2/$u"; done < /var/lib/gym-posture/masked
+        while read -r u; do [ -n "$u" ] && ${pkgs.coreutils}/bin/ln -sf /dev/null "$2/$u"; done < /var/lib/gym-posture/masked
       '';
       # The recovery check reads the core hash from a writable copy that the
       # harness can corrupt (corrupt_core_hash); the check itself is unchanged.
@@ -430,6 +437,8 @@ let
         weak-sshd-probe.services.planarian.units.sshd.probes = [
           { id = "sshd-tcp"; type = "tcp"; addr = "127.0.0.1:22"; timeout = 600; establishes = "weakened"; }
         ];
+        # The owner enables the payload and rebuilds outside Planarian.
+        bad-payload.services.gym-bad-payload.enable = true;
         throwaway0.environment.etc."gym-throwaway".text = "0";
         throwaway1.environment.etc."gym-throwaway".text = "1";
       });

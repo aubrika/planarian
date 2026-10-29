@@ -30,6 +30,10 @@ pub enum Effect {
     ReplaceProbe(UnitId, ProbeDef),
     /// Kernel/boot change: needs a reboot to be confirmed.
     NeedsReboot,
+    /// A system service the generation declares (watched or not), defined in
+    /// `file` (§15 provenance). `gym-bad-payload` is the catalog's payload:
+    /// it takes gym-web's port `PAYLOAD_DELAY` after it comes up.
+    Declare { service: String, file: String },
     /// The package at this version, with or without nixpkgs'
     /// `knownVulnerabilities` (§12e).
     Package { name: String, version: String, insecure: bool },
@@ -94,7 +98,13 @@ pub struct Gen {
     pub path: StorePath,
     pub eval: EvaluatedGeneration,
     pub broken: BTreeSet<UnitId>,
+    /// The profile link's owner and time (`created_by`).
+    pub created: (u32, Timestamp),
 }
+
+/// How long the gym's bad payload behaves before it takes gym-web's port:
+/// past any generation check (§15 malicious declaration).
+pub const PAYLOAD_DELAY: Millis = Millis::secs(240);
 
 #[derive(Clone, Debug)]
 pub struct Job {
@@ -123,6 +133,11 @@ pub struct World {
     /// The base generation's packages (pname → version) and the insecure ones (§12e).
     pub base_packages: BTreeMap<String, String>,
     pub base_insecure: BTreeSet<String>,
+    /// Who the next out-of-band generation is created by (uid).
+    pub rebuild_uid: u32,
+    /// When the bad payload takes gym-web's port (set when a generation
+    /// declaring it is applied).
+    pub payload_at: Option<Timestamp>,
     pub rules: Vec<Rule>,
     /// Options the owner `mkForce`d.
     pub forced: BTreeSet<String>,
@@ -235,6 +250,12 @@ impl World {
         let mut needs_reboot = false;
         let mut packages = self.base_packages.clone();
         let mut insecure = self.base_insecure.clone();
+        let mut declarations: BTreeMap<String, Vec<String>> = self
+            .base_units
+            .keys()
+            .filter(|u| u.kind == UnitKind::Service && u.scope == Scope::System)
+            .map(|u| (u.name.clone(), vec!["/etc/nixos/configuration.nix".to_string()]))
+            .collect();
         for r in &self.rules {
             if options.get(&r.option) != Some(&r.value) {
                 continue;
@@ -245,6 +266,10 @@ impl World {
                 }
                 Effect::Remove(u) => {
                     units.remove(u);
+                    declarations.remove(&u.name);
+                }
+                Effect::Declare { service, file } => {
+                    declarations.entry(service.clone()).or_default().push(file.clone());
                 }
                 Effect::TouchCore => {
                     core.insert("planariad.service".into(), Hash::of(b"changed"));
@@ -277,6 +302,7 @@ impl World {
             core_units: core,
             packages,
             insecure,
+            declarations,
         };
         (eval, broken)
     }
@@ -285,11 +311,12 @@ impl World {
         let (eval, broken) = self.evaluate(overrides);
         let id = GenerationId(self.gens.keys().map(|g| g.0).max().unwrap_or(0) + 1);
         let path = StorePath(format!("/nix/store/{:03}-nixos-system-fake", id.0));
-        self.gens.insert(id, Gen { path, eval, broken });
+        let created = (self.rebuild_uid, self.now);
+        self.gens.insert(id, Gen { path, eval, broken, created });
         id
     }
 
-    fn apply_generation(&mut self, g: GenerationId) {
+    pub fn apply_generation(&mut self, g: GenerationId) {
         let generation = self.gens[&g].clone();
         let now = self.now;
         for id in generation.eval.units.keys() {
@@ -306,6 +333,18 @@ impl World {
                 sim.started_at = now;
             }
         }
+        // The bad payload starts with the generation and bides its time.
+        self.payload_at = if generation.eval.declarations.contains_key("gym-bad-payload") {
+            self.payload_at.or(Some(now.plus(PAYLOAD_DELAY)))
+        } else {
+            // Gone with its generation: the port is free again.
+            if self.payload_at == Some(Timestamp(u64::MAX))
+                && let Some(web) = self.units.get_mut(&UnitId::service("gym-web"))
+            {
+                web.fail_on_start = false;
+            }
+            None
+        };
         // Units the generation no longer has are stopped and gone.
         let gone: Vec<UnitId> = self
             .units
@@ -324,6 +363,16 @@ impl World {
     /// Advance time-driven behaviour to `now`.
     pub fn advance_to(&mut self, now: Timestamp) {
         self.now = now;
+        // It takes gym-web's port: gym-web crashes and cannot start again.
+        if self.payload_at.is_some_and(|t| t <= now) {
+            self.payload_at = Some(Timestamp(u64::MAX));
+            if let Some(web) = self.units.get_mut(&UnitId::service("gym-web")) {
+                web.fail_on_start = true;
+                web.observed = Observed::Failed(Reason::ExitCode(1));
+                web.ended = Some(Ending::Signal(11));
+                web.failed_at = Some(now);
+            }
+        }
         let done: Vec<JobId> = self.jobs.iter().filter(|(_, j)| j.done_at <= now).map(|(k, _)| k.clone()).collect();
         for id in done {
             let job = self.jobs.remove(&id).expect("listed");
@@ -535,6 +584,10 @@ impl GenerationBackend for Fake {
 
     fn last_booted(&self) -> Result<GenerationId, Outcome> {
         Ok(self.w().booted)
+    }
+
+    fn created_by(&self, g: GenerationId) -> Option<(u32, Timestamp)> {
+        self.w().gens.get(&g).map(|x| x.created)
     }
 
     fn stage(&self, _owner: &PinnedSource, overrides: &OverrideSet) -> Result<StagedSource, Outcome> {
@@ -1091,12 +1144,20 @@ pub fn gym_world(store: MemStore) -> Fake {
         ("planarian.reference.fontScale".to_string(), Value::Str("1".into())),
         ("gym.vulnlib".to_string(), Value::Str("1.0".into())),
         ("gym.kernelParam".to_string(), Value::Str("".into())),
+        ("services.gym-bad-payload.enable".to_string(), Value::Bool(false)),
     ]
     .into();
     // gym-vulnlib 1.0 carries knownVulnerabilities; 1.1 fixes them (§12e).
     w.base_packages = [("gym-vulnlib".to_string(), "1.0".to_string())].into();
     w.base_insecure = ["gym-vulnlib".to_string()].into();
     w.rules = vec![
+        // The bad payload: a declared service, off by default, defined in the
+        // gym's own module (§15 malicious declaration).
+        Rule {
+            option: "services.gym-bad-payload.enable".into(),
+            value: Value::Bool(true),
+            effect: Effect::Declare { service: "gym-bad-payload".into(), file: "/etc/nixos/configuration.nix".into() },
+        },
         // A kernel parameter: takes effect only at boot (§12f).
         Rule {
             option: "gym.kernelParam".into(),

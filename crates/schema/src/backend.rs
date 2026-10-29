@@ -133,6 +133,11 @@ pub trait GenerationBackend {
     fn publish_boot_once(&self, _g: GenerationId, _keep: GenerationId, _op: &OpId) -> Outcome {
         Outcome::Failed("this boot loader cannot boot a generation once".into())
     }
+    /// Who created generation `g` and when (its profile link's owner and
+    /// time): the provenance of a rebuild made outside Planarian (§15).
+    fn created_by(&self, _g: GenerationId) -> Option<(u32, Timestamp)> {
+        None
+    }
     /// The generation a one-shot entry will boot next, if one is pending.
     fn one_shot_pending(&self) -> Result<Option<GenerationId>, Outcome> {
         Err(Outcome::Unknown("this boot loader has no one-shot entries".into()))

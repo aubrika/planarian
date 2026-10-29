@@ -367,6 +367,11 @@ pub struct EvaluatedGeneration {
     /// Those whose nixpkgs `meta.knownVulnerabilities` is not empty (§12e).
     #[serde(default)]
     pub insecure: BTreeSet<String>,
+    /// Every system service the generation declares, watched or not, with
+    /// the files that define it (NixOS's definition locations): the
+    /// provenance a malicious declaration leaves (§15).
+    #[serde(default)]
+    pub declarations: BTreeMap<String, Vec<String>>,
 }
 
 impl EvaluatedGeneration {

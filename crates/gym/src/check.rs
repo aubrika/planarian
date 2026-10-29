@@ -186,6 +186,54 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     fail(&mut v, "the journal does not replay".into());
                 }
             }
+            // §15: the incident report names where a declaration came from:
+            // who, through what, in which file, and when.
+            "declaration_origin" => {
+                let name = unit(val.get("unit").and_then(T::as_str).unwrap_or("")).name;
+                let target = post
+                    .get("incident")
+                    .and_then(T::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(|i| i.get("target"))
+                    .and_then(T::as_str)
+                    .unwrap_or("");
+                let decl = format!("service:{name} is new in generation");
+                let report = e.notices.iter().find(|n| n.starts_with(target) && n.contains(&decl));
+                let Some(report) = report else {
+                    fail(&mut v, format!("no incident report on {target} names service:{name}'s declaration"));
+                    continue;
+                };
+                let mut want: Vec<String> = vec![];
+                match val.get("who").and_then(T::as_str) {
+                    Some("root") => want.push("by root".into()),
+                    Some(u) => want.push(format!("by uid {}", u.trim_start_matches("user:"))),
+                    None => {}
+                }
+                match val.get("path").and_then(T::as_str) {
+                    Some(p) if p.starts_with("ApplyChange ") => {
+                        want.push(format!("through apply {}", p.trim_start_matches("ApplyChange ")))
+                    }
+                    Some(p) => want.push(p.to_string()),
+                    None => {}
+                }
+                match val.get("file").and_then(T::as_str) {
+                    // The owner's own file: whatever NixOS records as its definition.
+                    Some(f) if f.starts_with("owner:") => want.push("defined in /".into()),
+                    Some(f) => want.push(f.to_string()),
+                    None => {}
+                }
+                match val.get("when").and_then(T::as_str) {
+                    Some("generation-created") => want.push("generation created at".into()),
+                    Some("txn") => want.push("(transaction ".into()),
+                    _ => {}
+                }
+                if val.get("lock_change").is_some() {
+                    v.unchecked.push("declaration_origin.lock_change".into());
+                }
+                for w in want.iter().filter(|w| !report.contains(w.as_str())) {
+                    fail(&mut v, format!("the report does not say {w:?}: {report}"));
+                }
+            }
             // I20: these agents never ran while a failure class was raised
             // (the posture samples; VM only), and were stopped by it.
             "not_started" | "unit_after_failure" => match &e.posture.responses {

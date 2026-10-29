@@ -157,42 +157,6 @@ reports = ["AssumptionHeld(<assumption>)"]
 # ═══════════════════════════════════════════════════════════════════════════
 
 [[fault]]
-id = "malicious-decl-owner-rebuild"
-family = "malicious-declaration"
-summary = "The owner's flake gains gym-bad-payload and root runs nixos-rebuild switch outside Planarian. The incident on gym-web names gym-bad-payload's declaration: the owner source file, the out-of-band rebuild as the path, and when that generation appeared."
-spec = ["§15 malicious declaration", "§11 out-of-band rebuild"]
-tags = ["acceptance"]
-scoring = "must-pass"
-harness = ["fake", "vm"]
-intent = { kind = "none" }
-inject = { raw = "out_of_band_rebuild", edit = "enable gym-bad-payload", actor = "root" }
-window = "10m"
-
-[fault.required_post]
-declaration_origin = { unit = "service:gym-bad-payload", who = "root", path = "out-of-band nixos-rebuild", file = "owner:configuration.nix", when = "generation-created" }
-
-[[fault.required_post.incident]]
-target = "service:gym-web"
-
-[[fault]]
-id = "malicious-decl-catalog-enable"
-family = "malicious-declaration"
-summary = "alice enables the declared-but-off gym-bad-payload through the service-enable catalog entry. The incident names alice, the transaction, and planarian/overrides.nix as the path."
-spec = ["§15 malicious declaration", "§9 catalog"]
-tags = ["acceptance"]
-scoring = "must-pass"
-harness = ["fake", "vm"]
-intent = { kind = "none" }
-inject = { transition = "ApplyChange", change = "service-enable", args = { service = "gym-bad-payload" }, source = "user", actor = "user:1000" }
-window = "10m"
-
-[fault.required_post]
-declaration_origin = { unit = "service:gym-bad-payload", who = "user:1000", path = "ApplyChange service-enable", file = "planarian/overrides.nix", when = "txn" }
-
-[[fault.required_post.incident]]
-target = "service:gym-web"
-
-[[fault]]
 id = "malicious-decl-input-update"
 family = "malicious-declaration"
 summary = "A flake input update (the supply-chain path) brings in a module that declares gym-bad-payload. The incident names the input, its lock change (old and new revisions), and who applied the update."

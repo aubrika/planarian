@@ -277,6 +277,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 core_units: BTreeMap::new(),
                 packages: BTreeMap::new(),
                 insecure: Default::default(),
+                declarations: BTreeMap::new(),
             },
             Err(e) => {
                 return Err(reject(

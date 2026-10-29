@@ -77,7 +77,8 @@ jobs:
         # their responses are systemd's, so only the VM can judge them.
         id: [stale-owner-edit-during-build, drv-unbound-audio, storage-boot-full-publish,
              posture-absent-masked, posture-crashed-budget, posture-integrity-core-hash,
-             posture-integrity-journal-chain, posture-integrity-undeclared-early-unit, journal-record-edited]
+             posture-integrity-journal-chain, posture-integrity-undeclared-early-unit, journal-record-edited,
+             malicious-decl-owner-rebuild, malicious-decl-catalog-enable]
     steps:
       - uses: actions/checkout@v4
       - name: Enable KVM

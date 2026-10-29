@@ -11,7 +11,7 @@
 # Planarian never edits your own Nix. Your flake imports
 # ./planarian/overrides.nix (see the flake template), and Planarian changes
 # only that file, through transactions.
-{ config, lib, pkgs, ... }:
+{ config, options, lib, pkgs, ... }:
 
 let
   systemPkgs = lib.filter (p: p ? pname) config.environment.systemPackages;
@@ -422,6 +422,24 @@ in
       # nixpkgs' insecure-package check.
       packages = builtins.listToAttrs (map (p: { name = p.pname; value = p.version or ""; }) systemPkgs);
       insecure = map (p: p.pname) (lib.filter (p: (p.meta.knownVulnerabilities or [ ]) != [ ]) systemPkgs);
+      # §15: every system service and the files that define it (NixOS's
+      # definition locations), watched or not, so a declaration that turns
+      # out to be malicious can be reported with its origin.
+      declarations =
+        let
+          # The service names one definition sets, through mkIf/mkMerge.
+          names = v:
+            if !builtins.isAttrs v then [ ]
+            else if (v._type or null) == "if" then (if v.condition then names v.content else [ ])
+            else if (v._type or null) == "merge" then lib.concatMap names v.contents
+            else if builtins.elem (v._type or null) [ "override" "order" ] then names v.content
+            else builtins.attrNames v;
+          perDef = d:
+            let r = builtins.tryEval (names d.value);
+            in lib.genAttrs (if r.success then r.value else [ ]) (_: [ (toString d.file) ]);
+          all = lib.zipAttrsWith (_: lib.concatLists) (map perDef options.systemd.services.definitionsWithLocations);
+        in
+        lib.filterAttrs (n: _: config.systemd.services ? ${n}) all;
     };
 
     environment.etc."planarian/export.json".text = builtins.toJSON cfg.export;
