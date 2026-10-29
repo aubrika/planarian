@@ -105,10 +105,14 @@ fn parse(args: &[String]) -> Result<(Request, bool), String> {
         ["diagnose", u, p] => {
             Request::Diagnose { unit: unit(u)?, probe: Some(planarian_schema::ProbeId(p.to_string())) }
         }
-        ["approve", h] => Request::Approve {
-            hash: Hash::from_hex(h).ok_or("approve takes the 64-character hash shown by status")?,
-            tty: std::io::stdin().is_terminal(),
-        },
+        ["approve", h] => {
+            if !std::io::stdin().is_terminal() {
+                // The daemon decides (from the process, not from us); this
+                // only says why it will refuse.
+                eprintln!("note: approval needs an interactive terminal; this one has none");
+            }
+            Request::Approve { hash: Hash::from_hex(h).ok_or("approve takes the 64-character hash shown by status")? }
+        }
         ["cancel", t] => Request::Cancel { txn: TxnId(t.parse().map_err(|_| "cancel takes a transaction number")?) },
         ["resolve", t, how] => Request::Resolve {
             txn: TxnId(t.parse().map_err(|_| "resolve takes a transaction number")?),

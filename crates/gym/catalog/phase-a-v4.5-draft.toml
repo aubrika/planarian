@@ -55,29 +55,6 @@ spec = "v4.5"
 # Group 1: the bypasses
 # ═══════════════════════════════════════════════════════════════════════════
 
-# B-3 (Medium).
-[[fault]]
-id = "approve-needs-real-terminal"
-family = "policy"
-summary = "A root process with no controlling terminal (a systemd service) sends Approve for a pending AskFirst change. The daemon reads the peer's terminal from its pidfd, finds none, and refuses; the same change approved by root at a terminal then runs. The request carries no tty field to claim."
-spec = ["§11 approval", "§16 CLI", "B-3", "I14"]
-tags = ["acceptance", "bypass"]
-scoring = "must-pass"
-harness = ["fake", "vm"]
-intent = { kind = "none" }
-setup = [{ transition = "ApplyChange", change = "service-enable", args = { service = "gym-cache", enabled = false }, source = "user", actor = "user:1001" }]
-inject = { raw = "approve_pending", actor = "root", via = "no-tty" }
-after = [{ raw = "approve_pending", actor = "root", via = "tty" }]
-window = "5m"
-
-[fault.required_post]
-reports = ["ApprovalNeedsTerminal"]
-
-[[fault.required_post.txn]]
-transition = "ApplyChange"
-terminal = "Committed"
-approved_by = "root"
-
 # B-5 (Medium). Fixture: the gym VM declares fail2ban, AppArmor, USBGuard, a
 # WireGuard interface, the firewall and sshd through their option trees, and
 # gym-untagged with no sensitivity entry.
@@ -107,27 +84,6 @@ transition = "SetOverride"
 target = "service:fail2ban"
 approver_class = "Administrator"
 never = ["Activating"]
-
-# B-6 (Medium).
-[[fault]]
-id = "identity-peer-exited"
-family = "authority"
-summary = "A seated user's process sends a request that would be exempt only for its own session (stopping its own session's audio) and exits before the daemon resolves it. With no pidfd to resolve, the peer has no session: the request is decided as remote, never attributed to whichever process now holds that pid."
-spec = ["§10 actors and sessions", "I21", "B-6"]
-tags = ["acceptance", "bypass"]
-scoring = "must-pass"
-harness = ["vm"]
-intent = { kind = "none" }
-inject = { raw = "request_then_exit", actor = "user:1000", request = { transition = "StopUnit", target = "service@1000:pipewire" } }
-window = "2m"
-
-[fault.required_post]
-unattributed_never = true
-
-[[fault.required_post.txn]]
-transition = "StopUnit"
-target = "service@1000:pipewire"
-tier = "AskFirst"
 
 # B-11 (Medium). Fixture: gym-backup, a service with inferStops = false.
 [[fault]]

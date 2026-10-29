@@ -2785,3 +2785,45 @@ window = "1m"
 transition = "ApplyChange"
 terminal_prefix = "Rejected"
 never = ["Activating"]
+
+# B-3 (Medium).
+[[fault]]
+id = "approve-needs-real-terminal"
+family = "policy"
+summary = "Root approves a pending AskFirst change from a process with no controlling terminal (a new session, as a service would be). The daemon reads the terminal from the peer's pidfd, finds none, and refuses: the change is still waiting at the end. The request carries no terminal field to claim."
+spec = ["§11 approval", "§16 CLI", "B-3", "I14"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" }]
+inject = { raw = "approve_pending", actor = "root", via = "no-tty" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "pending"
+never = ["Activating"]
+
+# B-6 (Medium). Pid reuse itself cannot be arranged reproducibly (P10 in
+# assumptions.md, deviations.md); this checks the case the pidfd rule
+# decides: a peer gone before it is resolved has no session.
+[[fault]]
+id = "identity-peer-exited"
+family = "authority"
+summary = "alice, logged in at the seat, sends a stop of her own pipewire and exits before the daemon resolves her. With no process behind the connection, the daemon attributes the request to uid 1000 with no session: never to a session it cannot read from that process."
+spec = ["§10 actors and sessions", "I21", "B-6"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { raw = "request_then_exit", actor = "user:1000", request = { Stop = { unit = "service@1000:pipewire" } } }
+window = "2m"
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+caller = "user:1000@-"

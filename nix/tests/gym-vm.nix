@@ -324,7 +324,7 @@ let
         carol = { isNormalUser = true; uid = 1002; };
       };
 
-      environment.systemPackages = [ gymPkg pkgs.git pkgs.util-linux pkgs.iptables pkgs.curl pkgs.jq pkgs.btrfs-progs ];
+      environment.systemPackages = [ gymPkg pkgs.git pkgs.util-linux pkgs.iptables pkgs.curl pkgs.jq pkgs.btrfs-progs pkgs.python3 ];
       environment.variables.PLANARIAN_GYM_CATALOG = "${catalog}";
       programs.git.config.safe.directory = "*";
 

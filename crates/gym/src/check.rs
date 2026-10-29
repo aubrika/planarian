@@ -1019,6 +1019,15 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
     }
     // Judge the most recent match.
     let t = matching.last().expect("non-empty");
+    if let Some(c) = s("caller") {
+        let by = e.log.iter().any(|r| {
+            matches!(&r.result, Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if *txn == t.id)
+                && caller_is(&r.caller, c)
+        });
+        if !by {
+            v.failures.push(format!("{label}: not submitted by {c}"));
+        }
+    }
     if let Some(want) = s("terminal") {
         let got = state_name(&t.state);
         // "pending": still waiting for an approval at the end of the window.
@@ -1339,11 +1348,16 @@ fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
 }
 
 /// The executor log's caller is the catalog's principal: `root`,
-/// `user:<uid>` or `agent:<name>` (an agent's own principal, §11).
+/// `user:<uid>`, `user:<uid>@<session>` or `user:<uid>@-` (no session), or
+/// `agent:<name>` (an agent's own principal, §11).
 fn caller_is(a: &Actor, want: &str) -> bool {
     match (a, want.split_once(':')) {
         (Actor::User { uid, .. }, None) => want == "root" && *uid == 0,
-        (Actor::User { uid, .. }, Some(("user", n))) => n.parse() == Ok(*uid),
+        (Actor::User { uid, session, .. }, Some(("user", n))) => match n.split_once('@') {
+            Some((n, "-")) => n.parse() == Ok(*uid) && session.is_none(),
+            Some((n, s)) => n.parse() == Ok(*uid) && session.as_deref() == Some(s),
+            None => n.parse() == Ok(*uid),
+        },
         (Actor::Agent(p), Some(("agent", name))) => *p == planarian_daemon::core::agent_principal(name),
         _ => false,
     }

@@ -545,9 +545,13 @@ impl Sim {
     /// Send a request as `actor`; a crash point set by a later `kill_process`
     /// fires inside it.
     fn request(&mut self, actor: &str, req: Request) -> Result<(), Unsupported> {
+        self.request_peer(peer(actor), req)
+    }
+
+    fn request_peer(&mut self, p: Peer, req: Request) -> Result<(), Unsupported> {
         let Some(core) = self.core.as_mut() else { return Err(Unsupported("request while the daemon is down".into())) };
         core.ex.kernel.crash_at = self.crash.clone();
-        let r = core.handle(peer(actor), req);
+        let r = core.handle(p, req);
         let crashed = matches!(&r, Response::Error { message } if message.contains("Crashed"));
         if let Some(c) = self.core.as_mut() {
             c.ex.kernel.crash_at = None;
@@ -818,6 +822,18 @@ impl Sim {
                 None => {}
             },
             "ask" => self.request(&actor, Request::Ask { phrase: get("phrase").into(), choice: None })?,
+            // In the fake a peer's session comes only from the actor string,
+            // so a gone peer is one without a session.
+            "request_then_exit" => {
+                let req: Request = serde_json::from_value(
+                    serde_json::to_value(s.get("request").ok_or_else(|| Unsupported("request".into()))?)
+                        .map_err(|e| Unsupported(e.to_string()))?,
+                )
+                .map_err(|e| Unsupported(format!("request_then_exit: {e}")))?;
+                let actor = get("actor");
+                let who = actor.split('@').next().unwrap_or("user:1000").to_string();
+                self.request(&who, req)?;
+            }
             "agent_run" => {
                 let name = get("name");
                 let argv: Vec<String> = s
@@ -846,7 +862,7 @@ impl Sim {
                     && argv.get(1).map(String::as_str) == Some("present-token")
                 {
                     for h in self.held_tokens.clone() {
-                        self.request(&actor, Request::Approve { hash: h, tty: true })?;
+                        self.request_peer(peer(&actor).at_terminal(), Request::Approve { hash: h })?;
                     }
                     return Ok(());
                 }
@@ -864,7 +880,8 @@ impl Sim {
                 let actor = s.get("actor").and_then(T::as_str).unwrap_or("root").to_string();
                 let tty = s.get("via").and_then(T::as_str) != Some("no-tty");
                 for h in pending {
-                    self.request(&actor, Request::Approve { hash: h, tty })?;
+                    let p = if tty { peer(&actor).at_terminal() } else { peer(&actor) };
+                    self.request_peer(p, Request::Approve { hash: h })?;
                 }
             }
             "greeter_login" => {

@@ -52,10 +52,11 @@ pub enum Request {
     },
     Gc,
     Undo,
-    /// Root and an interactive TTY (checked by the client; root re-checked here).
+    /// Approve a pending change. Phase A: root at an interactive terminal,
+    /// the terminal established by the daemon from the peer's pidfd (§11,
+    /// B-3); the request carries nothing about it.
     Approve {
         hash: Hash,
-        tty: bool,
     },
     Cancel {
         txn: TxnId,

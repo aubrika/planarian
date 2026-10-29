@@ -27,6 +27,7 @@ planarian-exec.workspace = true
 planarian-ipc.workspace = true
 planarian-backend-linux.workspace = true
 rustix = { version = "1", features = ["net"] }
+nix = { version = "0.31", default-features = false, features = ["socket"] }
 serde.workspace = true
 ed25519-dalek.workspace = true
 rand_core.workspace = true

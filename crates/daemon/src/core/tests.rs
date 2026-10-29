@@ -209,9 +209,9 @@ fn unprivileged_override_of_a_security_unit_is_held_for_an_administrator() {
     r.ticks(2);
     assert_eq!(r.status("service:sshd"), UnitStatus::Running, "stays up while held");
     // I19: never the proposer; Phase A approval is root at a terminal.
-    let resp = r.core.handle(ALICE, Request::Approve { hash: approve, tty: true });
+    let resp = r.core.handle(ALICE.at_terminal(), Request::Approve { hash: approve });
     assert!(matches!(resp, Response::Error { .. }), "{resp:?}");
-    let resp = r.core.handle(ADMIN, Request::Approve { hash: approve, tty: true });
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
     assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
     r.ticks(2);
     assert_eq!(r.status("service:sshd"), UnitStatus::Overridden(OverrideDesired::Stopped));
@@ -249,7 +249,7 @@ fn an_agent_is_its_own_principal_and_holds_nothing() {
     // A change an administrator proposed cannot be approved by the agent.
     let req = Request::SetOverride { unit: sshd.clone(), until: Until::Explicit, desired: OverrideDesired::Stopped };
     let Response::NeedsApproval { approve, .. } = r.core.handle(ALICE, req) else { panic!() };
-    let resp = r.core.handle(coder, Request::Approve { hash: approve, tty: true });
+    let resp = r.core.handle(coder.at_terminal(), Request::Approve { hash: approve });
     assert!(!matches!(resp, Response::Done { .. }), "{resp:?}");
     r.ticks(2);
     assert_eq!(r.status("service:sshd"), UnitStatus::Running);

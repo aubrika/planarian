@@ -120,27 +120,71 @@ fn read_request(conn: &UnixStream) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
+/// The peer's pidfd (`SO_PEERPIDFD`, Linux 6.5+), or None (an older
+/// kernel, or a peer already gone).
+fn peer_pidfd(s: &UnixStream) -> Option<std::os::fd::OwnedFd> {
+    nix::sys::socket::getsockopt(s, nix::sys::socket::sockopt::PeerPidfd).ok()
+}
+
+/// The pid a pidfd names now (`Pid:` in its fdinfo); None once the process
+/// has exited, after which the pid may be reused.
+fn pidfd_pid(fd: &std::os::fd::OwnedFd) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).ok()?;
+    let pid: i64 = info.lines().find_map(|l| l.strip_prefix("Pid:"))?.trim().parse().ok()?;
+    (pid > 0).then_some(pid as u32)
+}
+
+/// What the daemon reads about the calling process (§10, §11): its cgroup,
+/// its real uid and whether it has a controlling terminal. Read through
+/// its pidfd, never a bare pid: the pid is taken from the pidfd before and
+/// after the reads, and if the process exited in between (so the pid could
+/// now be another process's) nothing read is used (B-6).
+struct PeerProcess {
+    cgroup: String,
+    uid: Option<u32>,
+    tty: bool,
+}
+
+fn peer_process(s: &UnixStream) -> Option<PeerProcess> {
+    let fd = peer_pidfd(s)?;
+    let pid = pidfd_pid(&fd)?;
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    if pidfd_pid(&fd) != Some(pid) {
+        return None;
+    }
+    let uid = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|u| u.parse::<u32>().ok());
+    // stat: "pid (comm) state ppid pgrp session tty_nr ..."; comm may hold
+    // spaces or parentheses, so count fields after the last ')'.
+    let tty = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(4))
+        .and_then(|t| t.parse::<i64>().ok())
+        .is_some_and(|t| t != 0);
+    Some(PeerProcess { cgroup, uid, tty })
+}
+
 fn peer_of(s: &UnixStream, admin_group: &str) -> Option<Peer> {
     let cred = rustix::net::sockopt::socket_peercred(s).ok()?;
     let uid = cred.uid.as_raw();
-    let pid = cred.pid.as_raw_nonzero();
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
-    // The pid could have been reused since the connect: a session read from
-    // a process of another uid counts as none.
-    let same_uid = std::fs::read_to_string(format!("/proc/{pid}/status")).ok().is_some_and(|st| {
-        st.lines()
-            .find_map(|l| l.strip_prefix("Uid:"))
-            .and_then(|r| r.split_whitespace().next())
-            .and_then(|u| u.parse::<u32>().ok())
-            == Some(uid)
-    });
+    // No pidfd, or the peer gone or changed: no session, no terminal, not an
+    // agent (fail closed; §10). Its uid alone is what it is.
+    let Some(p) = peer_process(s).filter(|p| p.uid == Some(uid)) else {
+        return Some(Peer::new(uid, is_admin(uid, admin_group)));
+    };
     // A process in an agent's unit is that agent, whatever uid it runs as
     // (§11): never an administrator, never in a session.
-    if let Some(name) = agent_of_cgroup(&cgroup) {
+    if let Some(name) = agent_of_cgroup(&p.cgroup) {
         return Some(Peer::agent(uid, &name));
     }
-    let session = if same_uid { session_of_cgroup(&cgroup, uid) } else { None };
-    Some(Peer { uid, admin: is_admin(uid, admin_group), session, agent: None })
+    let session = session_of_cgroup(&p.cgroup, uid);
+    Some(Peer { uid, admin: is_admin(uid, admin_group), session, agent: None, tty: p.tty })
 }
 
 /// The agent whose unit (`/system.slice/planarian-agent-<name>.service`,
@@ -561,6 +605,18 @@ fn hooks_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_is_read_through_its_pidfd() {
+        // A socket pair's peer is this process: its pidfd names our pid, and
+        // what is read through it is ours.
+        let (a, _b) = UnixStream::pair().unwrap();
+        let fd = peer_pidfd(&a).expect("SO_PEERPIDFD (Linux 6.5+)");
+        assert_eq!(pidfd_pid(&fd), Some(std::process::id()));
+        let p = peer_process(&a).expect("readable");
+        assert_eq!(p.uid, Some(rustix::process::getuid().as_raw()));
+        assert_eq!(p.cgroup, std::fs::read_to_string("/proc/self/cgroup").unwrap());
+    }
 
     #[test]
     fn agent_from_cgroup() {

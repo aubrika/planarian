@@ -67,15 +67,23 @@ pub struct Peer {
     /// `planarian-agent-<name>` (§11). An agent is its own principal, never
     /// the uid it runs under, and is never an administrator or in a session.
     pub agent: Option<String>,
+    /// The calling process has a controlling terminal, read by the daemon
+    /// from its pidfd (§11, B-3). Never taken from the request.
+    pub tty: bool,
 }
 
 impl Peer {
     pub const fn new(uid: u32, admin: bool) -> Peer {
-        Peer { uid, admin, session: None, agent: None }
+        Peer { uid, admin, session: None, agent: None, tty: false }
     }
 
     pub fn agent(uid: u32, name: &str) -> Peer {
-        Peer { uid, admin: false, session: None, agent: Some(name.into()) }
+        Peer { uid, admin: false, session: None, agent: Some(name.into()), tty: false }
+    }
+
+    pub const fn at_terminal(mut self) -> Peer {
+        self.tty = true;
+        self
     }
 
     pub fn in_session(mut self, session: &str) -> Peer {
@@ -1632,8 +1640,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     None => Response::Error { message: "there is no earlier generation to go back to".into() },
                 }
             }
-            Request::Approve { hash, tty } => {
-                if peer.uid != 0 || !tty {
+            Request::Approve { hash } => {
+                if peer.uid != 0 || !peer.tty {
                     return Response::Error {
                         message: "approve requires root at an interactive terminal (Phase A)".into(),
                     };
@@ -1641,7 +1649,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 if self.defer && self.deferred.is_none() {
                     let t = self.ex.parked.values().find(|p| p.bound_to == hash).map(|p| p.proposal.transition.clone());
                     if let Some(job) = t.and_then(|t| self.ex.prebuild_job(&t)) {
-                        let req = Request::Approve { hash, tty };
+                        let req = Request::Approve { hash };
                         self.deferred = Some((job, Resume { peer, kind: ResumeKind::Request(req) }));
                         return Response::Ok { message: "deferred".into() };
                     }

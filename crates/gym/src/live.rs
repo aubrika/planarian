@@ -241,6 +241,7 @@ pub fn plan(entry: &T) -> Plan {
                 | "break_journal_chain"
                 | "plant_early_unit"
                 | "agent_run"
+                | "request_then_exit"
                 | "oom" => "vm".into(),
                 "force_compaction" => "vm".into(),
                 "interrupt_write" => format!("unsupported: {raw} needs to interrupt the daemon's own write"),
@@ -675,6 +676,30 @@ fn posture_seen(cfg: &FileConfig, since_unix: u64) -> crate::evidence::PostureSe
         Ok(Err(planarian_txn::journal::JournalError::Integrity(_)))
     );
     p
+}
+
+/// Send a request as `actor` from a process that has a controlling terminal
+/// (`script` allocates one) or that has none (`setsid`, a new session): the
+/// daemon reads which from the process (§11, B-3).
+fn request_at(actor: &str, req: &Request, tty: bool) -> Result<(), String> {
+    let exe = std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "planarian-gym".into());
+    let json = serde_json::to_string(req).expect("serializes");
+    let script = PathBuf::from(RUN).join("request.sh");
+    let user = user_for(actor);
+    let q = json.replace('\'', "'\\''");
+    let inner = if user == "root" {
+        format!("{exe} vm request --json '{q}'")
+    } else {
+        format!("runuser -u {user} -- {exe} vm request --json '{q}'")
+    };
+    std::fs::write(&script, format!("#!/bin/sh\nexec {inner}\n")).map_err(|e| e.to_string())?;
+    sh(&format!("chmod +x {}", script.display()));
+    let cmd = if tty {
+        format!("script -qec {} /dev/null", script.display())
+    } else {
+        format!("setsid -w {} < /dev/null", script.display())
+    };
+    if sh(&cmd) { Ok(()) } else { Err(format!("request as {user} failed")) }
 }
 
 /// Send a request as the step's actor and record the answer.
@@ -1166,7 +1191,25 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
             let r = console().ok_or("daemon down")?;
             for p in r.status.pending {
                 // A refused approval is the step's outcome, not the harness's error.
-                let _ = request_as(actor, &Request::Approve { hash: p.approve, tty });
+                let _ = request_at(actor, &Request::Approve { hash: p.approve }, tty);
+            }
+        }
+        // §10 (B-6): a peer that has exited before the daemon resolves it.
+        // The daemon is held still while the client connects, sends and
+        // exits, so by the time it accepts, the process is gone.
+        "request_then_exit" => {
+            let req: Request = serde_json::from_value(serde_json::to_value(st.get("request").ok_or("request")?).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("request_then_exit: {e}"))?;
+            let line = serde_json::to_string(&req).expect("serializes").replace('\'', "'\\''");
+            let user = user_for(&get("actor"));
+            let ok = sh(&format!(
+                "pid=$(systemctl show -p MainPID --value planariad); kill -STOP $pid; \
+                 runuser -u {user} -- python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.argv[2].encode()+b\"\\n\")' {sock} '{line}'; \
+                 r=$?; kill -CONT $pid; exit $r",
+                sock = planarian_ipc::SOCKET
+            ));
+            if !ok {
+                return Err("request_then_exit: the client could not send".into());
             }
         }
         "agent_run" => {
