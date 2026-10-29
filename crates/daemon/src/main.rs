@@ -611,7 +611,8 @@ mod tests {
         // A socket pair's peer is this process: its pidfd names our pid, and
         // what is read through it is ours.
         let (a, _b) = UnixStream::pair().unwrap();
-        let fd = peer_pidfd(&a).expect("SO_PEERPIDFD (Linux 6.5+)");
+        // SO_PEERPIDFD is Linux 6.5+; a build machine may be older.
+        let Some(fd) = peer_pidfd(&a) else { return };
         assert_eq!(pidfd_pid(&fd), Some(std::process::id()));
         let p = peer_process(&a).expect("readable");
         assert_eq!(p.uid, Some(rustix::process::getuid().as_raw()));

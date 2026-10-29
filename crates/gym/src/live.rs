@@ -1198,8 +1198,10 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
         // The daemon is held still while the client connects, sends and
         // exits, so by the time it accepts, the process is gone.
         "request_then_exit" => {
-            let req: Request = serde_json::from_value(serde_json::to_value(st.get("request").ok_or("request")?).map_err(|e| e.to_string())?)
-                .map_err(|e| format!("request_then_exit: {e}"))?;
+            let req: Request = serde_json::from_value(
+                serde_json::to_value(st.get("request").ok_or("request")?).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| format!("request_then_exit: {e}"))?;
             let line = serde_json::to_string(&req).expect("serializes").replace('\'', "'\\''");
             let user = user_for(&get("actor"));
             let ok = sh(&format!(

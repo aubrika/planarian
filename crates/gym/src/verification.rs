@@ -229,10 +229,13 @@ mod tests {
 
     #[test]
     fn the_register_parses_and_its_checks_bite() {
-        let shipped = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/bypasses.md")).unwrap();
-        let (open, errors) = parse_bypasses(&shipped);
-        assert!(errors.is_empty(), "{errors:?}");
-        assert!(open.values().flatten().count() > 0);
+        // The shipped register, where the source tree has it (the Nix
+        // package build copies only the crates; CI's cargo test has docs/).
+        if let Ok(shipped) = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/bypasses.md")) {
+            let (open, errors) = parse_bypasses(&shipped);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(open.values().flatten().count() > 0);
+        }
         let row = |id: &str, sev: &str, status: &str| format!("| {id} | r | b | {sev} | {status} | m | A |\n");
         let bad = [
             row("B-1", "High", "Open") + &row("B-1", "Low", "Open"),
