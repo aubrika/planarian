@@ -1,17 +1,34 @@
 # Phase A gate (GA) status
 
 Where Planarian stands against the Phase A exit gate (SPEC §4), with the
-evidence for each criterion and how to reproduce it. Updated 2026-10-29.
+evidence for each criterion and how to reproduce it. Updated 2026-10-30.
 
 ## Summary
 
-**No open High row under SPEC v4.5** (installed 2026-10-29). §17b holds every
-gate while a High row in `docs/bypasses.md` is open. Both were closed on
-2026-10-30 after their VM entries passed: B-1 (agents are their own
-principals, `agent-run-own-principal`) and B-2 (the floor reads the whole
-configuration's package set, `floor-service-package-fix`). The remaining rows
-are Medium and Low. The criteria below are re-confirmed by the next full VM
-catalog run on head.
+**The gate is not called.** SPEC v4.6 (installed 2026-10-30) holds Phase A
+open until §28's required changes have landed, each with its acceptance
+case, and the whole VM catalog has passed on one commit; a gate claim then
+cites that commit and that run, never a union of runs (§18 rule 19(f)).
+Where that stands, in rule 19's order:
+
+| Step | State |
+| --- | --- |
+| (a) Reconcile the close-out review | Done: `docs/review-reconciliation.md` (R01–R16, S01–S07 at `b219d81`) |
+| (b) B-20 (I24) | Closed: agent authority bound to the instance a start journaled (`8231a07`); `agent-name-collision` on both harnesses |
+| (c) Documentation sweep | Done (`8dc27fa` and this summary) |
+| (d) §28's required changes | In progress |
+| (e) §15 harness contract, §17a accounting checks | Partly: VM catalog jobs green only on PASS or a named waiver (`b219d81`); the rest open |
+| (f) One whole VM catalog run, this file from it | After (d) and (e) |
+
+The bypass register has no open High row: B-1 and B-2 closed on
+2026-10-30, and B-20, found in the review, is closed. Agents act with the
+permissions of the user who started them, attributed per instance
+(owner decision, 2026-10-30; §11, I24, X-11). Six Medium rows stay open,
+none for Phase A.
+
+The criteria below are the last results recorded before v4.6, on the
+v4.4 catalog (101 entries; it has 128 at v4.6). They are history, not the
+gate's evidence.
 
 
 | Criterion | Status |
