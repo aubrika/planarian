@@ -188,6 +188,10 @@ in
   };
 
   config = mkIf cfg.enable (lib.mkMerge [ {
+    # §12h: authenticated time is recommended; unauthenticated NTP is a
+    # notice, not an error (nothing Planarian times depends on it, B-7).
+    warnings = lib.optional (!(config.services.chrony.enable && config.services.chrony.enableNTS))
+      "planarian: the clock is set by unauthenticated NTP; authenticated time (NTS) is recommended: services.chrony.enable = true; services.chrony.enableNTS = true; (SPEC §12h).";
     environment.systemPackages = [ ack ];
     environment.etc."planarian/core.sha256".source = coreHash;
 
