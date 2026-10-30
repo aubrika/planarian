@@ -1059,9 +1059,23 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
             }
         }
         // The hash planarian-recovery checks the binary against (I2).
-        "corrupt_core_hash" => {
-            sh("mkdir -p /var/lib/gym-posture && printf '%064d\\n' 0 > /var/lib/gym-posture/core.sha256");
-        }
+        // With `file`: only that file's line in the record no longer matches
+        // (as if that one binary or script had been replaced, B-12).
+        "corrupt_core_hash" => match st.get("file").and_then(T::as_str) {
+            Some(f) => {
+                let ok = sh(&format!(
+                    "mkdir -p /var/lib/gym-posture && grep -q '/{f}$' /etc/planarian/core.sha256 && \
+                     sed -E 's|^[0-9a-f]{{64}} (.*/{f})$|{zero} \\1|' /etc/planarian/core.sha256 > /var/lib/gym-posture/core.sha256",
+                    zero = "0".repeat(64)
+                ));
+                if !ok {
+                    return Err(format!("corrupt_core_hash: no {f} in the record"));
+                }
+            }
+            None => {
+                sh("mkdir -p /var/lib/gym-posture && printf '%064d\\n' 0 > /var/lib/gym-posture/core.sha256");
+            }
+        },
         // I18: a retained record's bytes edited in place (CRC recomputed).
         "break_journal_chain" => {
             let off = get("when") == "powered-off";

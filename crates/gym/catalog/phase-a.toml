@@ -2512,6 +2512,23 @@ reports = ["Unauthorized", "AlarmAcknowledged(user:1001)"]
 invariants = ["I2", "I20"]
 
 [[fault]]
+id = "posture-integrity-core-script"
+family = "failure-posture"
+summary = "One posture script (planarian-ack), not planariad, no longer matches its line in the core-hash record. planarian-recovery checks every Planarian binary and script, so the boot fails as Integrity all the same (B-12)."
+spec = ["§12d", "I2", "B-12"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "corrupt_core_hash", file = "planarian-ack" }]
+inject = { raw = "reboot" }
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Integrity", target_reached = "planarian-failed@Integrity.target" }
+invariants = ["I2"]
+
+[[fault]]
 id = "posture-integrity-journal-chain"
 family = "failure-posture"
 summary = "A record in the hash-chained journal is altered while the machine is off. The boot report finds the broken chain (I18): Integrity responses, as above."
