@@ -5,11 +5,13 @@ evidence for each criterion and how to reproduce it. Updated 2026-10-29.
 
 ## Summary
 
-**GA is blocked under SPEC v4.5** (installed 2026-10-29): no gate passes with
-an open High row in `docs/bypasses.md` (§17b), and two are open: B-1 (agents
-run under their user's uid) and B-2 (the floor ignores the closure outside
-`environment.systemPackages`). The results below stand; the gate waits on
-those two rows.
+**No open High row under SPEC v4.5** (installed 2026-10-29). §17b holds every
+gate while a High row in `docs/bypasses.md` is open. Both were closed on
+2026-10-30 after their VM entries passed: B-1 (agents are their own
+principals, `agent-run-own-principal`) and B-2 (the floor reads the whole
+configuration's package set, `floor-service-package-fix`). The remaining rows
+are Medium and Low. The criteria below are re-confirmed by the next full VM
+catalog run on head.
 
 
 | Criterion | Status |

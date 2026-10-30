@@ -129,6 +129,17 @@ Services get a startup grace: a health check that fails in a unit's first
 `services.planarian.startupGrace`, or `units.<name>.startupGrace` per unit,
 for slow machines or slow-starting services.
 
+### Running an AI agent
+
+Start an agent that should be able to ask Planarian for things with
+`planarian agent run <name> -- <command> [args...]`. It runs as its own
+transient service (`planarian-agent-<name>`) under a fresh dynamic uid, and
+Planarian treats it as its own principal: never you, never an
+administrator, never in your login session, so by default it can read status
+but change nothing. An agent you start yourself from a shell, outside
+`agent run`, is simply you, with everything you can do; that is not
+supported (`docs/bypasses.md`, X-10).
+
 ### If something goes wrong
 
 - `planarian status` shows incidents, pending approvals, any recovery failure
