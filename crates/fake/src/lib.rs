@@ -215,6 +215,8 @@ pub struct World {
     /// The running instance of each agent's unit (I24), as the agent's
     /// processes would show it in their cgroup.
     pub agent_instances: BTreeMap<String, InstanceId>,
+    /// The next build's dry activation fails this way (R10).
+    pub dry_activate_fails: Option<String>,
     pub next_instance: u64,
     pub third_party_override: Option<Hash>,
     /// Units planted outside the generation (the boot report finds them).
@@ -717,6 +719,11 @@ impl GenerationBackend for Fake {
         w.builds += 1;
         if std::mem::take(&mut w.nospace_on_build) {
             return Err(Outcome::Failed("error: writing to file: No space left on device".into()));
+        }
+        // R10: the dry activation failed, timed out or was cut short; the
+        // real backend refuses the plan, so this one does too.
+        if let Some(why) = w.dry_activate_fails.take() {
+            return Err(Outcome::Failed(why));
         }
         let staged = w
             .staged

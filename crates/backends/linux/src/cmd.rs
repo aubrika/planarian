@@ -10,6 +10,9 @@ pub struct Output {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// More output than `max_output` came and was dropped: what is here is
+    /// incomplete, and never a basis for a plan (rule 21).
+    pub truncated: bool,
 }
 
 impl Output {
@@ -34,7 +37,8 @@ pub fn run(argv: &[&str], timeout: Duration) -> Output {
 }
 
 pub fn run_limited(argv: &[&str], timeout: Duration, max_output: usize) -> Output {
-    let fail = |e: String| Output { status: None, stdout: String::new(), stderr: e, timed_out: false };
+    let fail =
+        |e: String| Output { status: None, stdout: String::new(), stderr: e, timed_out: false, truncated: false };
     let Some((prog, args)) = argv.split_first() else { return fail("empty command".into()) };
     let mut cmd = Command::new(prog);
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -48,14 +52,14 @@ pub fn run_limited(argv: &[&str], timeout: Duration, max_output: usize) -> Outpu
     let out_t = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = (&mut out).take(max_output as u64).read_to_end(&mut buf);
-        let _ = std::io::copy(&mut out, &mut std::io::sink());
-        buf
+        let dropped = std::io::copy(&mut out, &mut std::io::sink()).unwrap_or(0);
+        (buf, dropped > 0)
     });
     let err_t = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = (&mut err).take(max_output as u64).read_to_end(&mut buf);
-        let _ = std::io::copy(&mut err, &mut std::io::sink());
-        buf
+        let dropped = std::io::copy(&mut err, &mut std::io::sink()).unwrap_or(0);
+        (buf, dropped > 0)
     });
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
@@ -74,9 +78,11 @@ pub fn run_limited(argv: &[&str], timeout: Duration, max_output: usize) -> Outpu
             Err(e) => return fail(e.to_string()),
         }
     };
-    let stdout = String::from_utf8_lossy(&out_t.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&err_t.join().unwrap_or_default()).into_owned();
-    Output { status, stdout, stderr, timed_out }
+    let (out, out_cut) = out_t.join().unwrap_or_default();
+    let (err, err_cut) = err_t.join().unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    let stderr = String::from_utf8_lossy(&err).into_owned();
+    Output { status, stdout, stderr, timed_out, truncated: out_cut || err_cut }
 }
 
 #[cfg(test)]

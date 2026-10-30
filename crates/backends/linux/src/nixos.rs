@@ -103,6 +103,19 @@ impl Export {
     }
 }
 
+/// Why a dry activation gives no usable plan, if it does not (R10).
+pub fn dry_activate_failure(o: &Output) -> Option<String> {
+    if o.timed_out {
+        Some("dry activation timed out: its plan is unknown".into())
+    } else if o.truncated {
+        Some("dry activation output was cut short: its plan is incomplete".into())
+    } else if !o.ok() {
+        Some(format!("dry activation failed ({:?}): {}", o.status, o.tail()))
+    } else {
+        None
+    }
+}
+
 /// Parse `switch-to-configuration dry-activate` output.
 pub fn parse_dry_activate(text: &str) -> ActivationPlan {
     let mut plan = ActivationPlan::default();
@@ -670,6 +683,13 @@ impl GenerationBackend for Nixos {
         let path = std::fs::canonicalize(&printed).map(|p| p.to_string_lossy().into_owned()).unwrap_or(printed);
         let generation = self.with_registry(|r| r.id_for(&path))?;
         let dry = run(&[&format!("{path}/bin/switch-to-configuration"), "dry-activate"], Duration::from_secs(120));
+        // The plan is the risk evidence (§9 step 3): a dry activation that
+        // failed, timed out or was cut short yields none, never a smaller one
+        // (rule 21, R10). The candidate is not usable.
+        if let Some(why) = dry_activate_failure(&dry) {
+            let _ = std::fs::remove_file(&root);
+            return Err(Outcome::Failed(why));
+        }
         let mut activation = parse_dry_activate(&format!("{}\n{}", dry.stdout, dry.stderr));
         let differs = |f: &str| {
             std::fs::read_link(format!("{path}/{f}")).ok()
@@ -1034,6 +1054,22 @@ mod tests {
         assert_eq!(closure_bytes_of(object), Some(123));
         assert_eq!(closure_bytes_of(array), Some(123));
         assert_eq!(closure_bytes_of("nonsense"), None);
+    }
+
+    /// R10: nonzero exit, timeout and truncated output each refuse the plan.
+    #[test]
+    fn a_failed_dry_activation_is_no_plan() {
+        let o = |status, timed_out, truncated| Output {
+            status,
+            stdout: "would start the following units: a.service\n".into(),
+            stderr: String::new(),
+            timed_out,
+            truncated,
+        };
+        assert!(dry_activate_failure(&o(Some(0), false, false)).is_none());
+        assert!(dry_activate_failure(&o(Some(1), false, false)).is_some());
+        assert!(dry_activate_failure(&o(None, true, false)).is_some());
+        assert!(dry_activate_failure(&o(Some(0), false, true)).is_some());
     }
 
     #[test]

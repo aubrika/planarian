@@ -1085,6 +1085,9 @@ impl Sim {
                         effect: planarian_fake::Effect::TouchCore,
                     });
                 }
+                ("dry_activate", r @ ("exit-nonzero" | "timeout" | "truncated")) => {
+                    self.fake.w().dry_activate_fails = Some(format!("dry activation: {r}"));
+                }
                 ("activate_live", "Failed") => {
                     let base = self.base;
                     self.fake.w().fail_activate.insert(base);

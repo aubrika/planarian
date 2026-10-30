@@ -2765,6 +2765,72 @@ caller = "agent:coder"
 # B-20 (High), I24.
 # R08 (§13): rejection must not grant an indirect control capability.
 [[fault]]
+id = "dry-activate-exit-nonzero"
+family = "bad-generation"
+summary = "The dry activation of a display-scale change exits nonzero. Its plan is unknown, never smaller: the build fails, nothing is activated, and the running generation stays (rule 21, R10)."
+spec = ["§9 step 3", "§18 rule 21", "R10"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the VM's dry activation is the real switch-to-configuration,
+# with no hook to make it fail; the backend's own test covers the three cases.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "dry_activate", result = "exit-nonzero" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "3m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = 'Other("build")'
+
+[[fault]]
+id = "dry-activate-timeout"
+family = "bad-generation"
+summary = "The dry activation of a display-scale change times out. Its plan is unknown, never smaller: the build fails, nothing is activated, and the running generation stays (rule 21, R10)."
+spec = ["§9 step 3", "§18 rule 21", "R10"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the VM's dry activation is the real switch-to-configuration,
+# with no hook to make it fail; the backend's own test covers the three cases.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "dry_activate", result = "timeout" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "3m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = 'Other("build")'
+
+[[fault]]
+id = "dry-activate-truncated"
+family = "bad-generation"
+summary = "The dry activation of a display-scale change emits more output than is read (truncated). Its plan is unknown, never smaller: the build fails, nothing is activated, and the running generation stays (rule 21, R10)."
+spec = ["§9 step 3", "§18 rule 21", "R10"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the VM's dry activation is the real switch-to-configuration,
+# with no hook to make it fail; the backend's own test covers the three cases.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "dry_activate", result = "truncated" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "3m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = 'Other("build")'
+
+[[fault]]
 id = "release-refused-leaves-incident"
 family = "authority"
 summary = "gym-web keeps failing until its incident has spent its repair budget and escalated. alice, who may not act on gym-web, asks to release it: refused Unauthorized, and the incident record is unchanged (no budget restored, no attempt brought forward, not reopened)."
