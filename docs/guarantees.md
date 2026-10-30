@@ -16,7 +16,7 @@ assumptions in `assumptions.md`; the counts in `verification-ratio.toml`.
 | **d:a** | The verification ratio: proof obligations **d**ischarged to obligations **a**ssumed, per invariant and summed. |
 | **trust count, \|𝒯\|** | The number of `assumptions.md` entries plus every `external_body` and `assume` site in the verified crates. |
 
-Today: **d:a = 47:50, trust count = 32.** The ratio counts proof
+Today (SPEC v4.6, re-accounted once for v4.5 as §17a allows): **d:a = 47:56, trust count = 37, internal-unproven count = 5.** The ratio counts proof
 obligations, not the sets themselves, so it has its own name. In plain
 text, write V-base and T-base. (Until 2026-10-29 these were 0v, 0t,
 "0v:0t" and "the size of 0t"; the new names replace them everywhere,
@@ -43,7 +43,7 @@ flowchart TB
   end
   subgraph A["𝒯 · trusted base"]
     vstd["V1–V6: vstd specs, serde,<br/>opaque types, ledger helpers"]
-    plat["P1–P9: backends honest, fsync durable,<br/>SHA-256, systemd and kernel correct,<br/>fencing effective, facts derived honestly"]
+    plat["P1–P8, P10: backends honest, fsync durable,<br/>SHA-256, systemd and kernel correct,<br/>fencing effective, pidfd semantics"]
     prog["G1–G4: progress (a lease holder runs,<br/>writes succeed, calls terminate)"]
   end
   exec -->|"calls (pure, Kani-checked)"| kern
@@ -65,7 +65,7 @@ Read the arrows as "everything that changes the machine passes through a
 proven gate": every journal record goes through `Ledger::validate` and
 `Ledger::apply`, every transition through `decide`, and every state step
 through `step_allowed`. What is not proved is the code *between* the gates:
-whether the executor asks the gates honestly (P9, I14's other half) and
+whether the executor asks the gates honestly (U1, I14's other half: unproven internal code, counted apart) and
 whether the backends do what they report (P1).
 
 ## 2. The invariants (SPEC §7)
@@ -86,19 +86,19 @@ invariants counts for both (47 counts, 45 distinct obligations).
 | I7 | Every executed transition is logged with its proposal, facts, decision and outcome. | Tested | — | P4 | 0:1 |
 | **I8** | **An AskFirst transition runs only with an approval token bound to that exact candidate, re-checked before it runs.** | **Partly proved** (expiry) | `approval_tokens_expire_after_their_lifetime` (Kani) | P5 | 1:1 |
 | I9 | The model process can only submit proposals. | Phase E (no model yet) | — | — | — |
-| **I10** | **A change that alters a canonical probe never runs below AskFirst.** | **Proved** (decide half) | `i10_canonical_probe_changes_ask` | V1, P9 | 1:2 |
+| **I10** | **A change that alters a canonical probe never runs below AskFirst.** | **Proved** (decide half) | `i10_canonical_probe_changes_ask` | V1, U1 | 1:2 |
 | **I11** | **A session's combined effect is judged at least as strictly as any single step of it.** | **Proved** | `i11_non_routine_session_asks`, `i11_session_only_raises` | V1, V2 | 2:2 |
 | **I12** | **Every transaction reaches a terminal state; RecoveryFailed alerts and sets the interlock.** | **Proved, conditional** on G1–G4 | `i12_steps_terminate`, `i12_terminal_always_reachable`, `terminal_is_final`, `refusal_only_before_mutation`, `apply`, `recovery_table_follows_the_state_machine` (Kani), `watchdog_takes_over_only_when_it_should` (Kani), `step_allowed`, `add_interlock` | G1–G4, P1, P4, P7, V5 | 9:8 |
 | I13 | A unit under an override is never a repair target while the override holds. | Tested | — | P6 | 0:1 |
-| **I14** | **Policy facts come from the evaluated generation, never from the proposal.** | **Proved** (decide half) | `i14_facts_caller_is_not_authority`; `decide` takes no `Proposal` at all | P9, V3 | 1:2 |
+| **I14** | **Policy facts come from the evaluated generation, never from the proposal.** | **Proved** (decide half) | `i14_facts_caller_is_not_authority`; `decide` takes no `Proposal` at all | U1, V3 | 1:2 |
 | **I15** | **One owner per transaction; a stale epoch is refused; only the lease holder advances the journal.** | **Proved** | `validate`, `takeover_fences_out_the_previous_owner` (Kani) | P4, P7 | 2:2 |
 | **I16** | **No automatic revert, rollback or boot fallback goes below the security floor; going below needs an administrator.** | **Proved** (decide; bootloader by test) | `i16_below_floor_needs_administrator`, `administrator_class_only_on_ask_first` | V1, V2, P3 | 2:3 |
 | I17 | There is always at least one administrator. | Tested | (`i17_root_is_always_an_administrator` is a unit test) | P8 | 0:1 |
 | **I18** | **Every journal record commits to its predecessor's hash; a broken chain is detected on read.** | **Proved** (trusting SHA-256) | `follows`, `verify`, `next_link`, `appending_keeps_the_chain`, `an_edited_record_breaks_the_chain` | P5, P4 | 5:2 |
 | **I19** | **No principal approves its own proposal or grants itself a capability it lacks.** | **Proved** | `i19_no_self_approval`, `may_approve`, `may_grant` | V1 | 3:1 |
 | I20 | No agent starts while planarian-ready.target is not reached, in every failure posture. | Tested | — | P6, P8 | 0:2 |
-| **I21** | **Nothing irreversible, or that could lose a session, data or connectivity, runs without asking, unless only your own session is affected; another user's session needs an administrator.** | **Proved** | `global_floors`, `own_session_is_per_session` | V1, V2, P9 | 2:3 |
-| **I22** | **Generation changes, garbage collection, driver binding, clearing the interlock and overriding a Security unit are administrator operations; a Security unit is changed without asking only to restore it; the unattributed actor holds no authority, and an agent exactly its user's (§11).** | **Proved** | `users_cannot_change_generations`, `only_administrators_resolve`, `security_override_held_for_administrator`, `security_restart_runs_alone_only_to_restore`, `agents_and_unattributed_are_refused` | V1, P8, P9 | 5:3 |
+| **I21** | **Nothing irreversible, or that could lose a session, data or connectivity, runs without asking, unless only your own session is affected; another user's session needs an administrator.** | **Proved** | `global_floors`, `own_session_is_per_session` | V1, V2, U1 | 2:3 |
+| **I22** | **Generation changes, garbage collection, driver binding, clearing the interlock and overriding a Security unit are administrator operations; a Security unit is changed without asking only to restore it; the unattributed actor holds no authority, and an agent exactly its user's (§11).** | **Proved** | `users_cannot_change_generations`, `only_administrators_resolve`, `security_override_held_for_administrator`, `security_restart_runs_alone_only_to_restore`, `agents_and_unattributed_are_refused` | V1, P8, U1 | 5:3 |
 | **I23** | **A generation commits only after its boot entry is written and promoted; runtime operations never publish, promote or revert; the override file is replaced only by compare-and-swap.** | **Proved** | `generations_commit_after_promotion`, `runtime_never_reverts`, `override_swap_never_overwrites_a_third_party` (Kani) | P3 | 3:1 |
 
 ## 3. Every formal obligation
@@ -305,7 +305,7 @@ none is proved yet.
 
 - **Between the gates.** That the kernel journals an OpBegin *before* the
   backend call it names, and that the executor derives `DerivedFacts` from
-  the evaluated generation (P9). `exec` enters Verus in Phase C; today it
+  the evaluated generation (U1). `exec` enters Verus in Phase C; today it
   has Kani on its pure decisions and property tests that crash the kernel
   at each of 15 points.
 - **Tested-only invariants:** I1–I4, I7, I13, I17, I20 (I13 and I17 now have proof targets: SPEC §17a).
@@ -319,14 +319,15 @@ none is proved yet.
 - **Kani is not a flake check** (not packaged in nixpkgs): CI runs it as
   its own job (`ci.yml`, `kani`), pinned to 0.68.0.
 
-## 8. The trust count, itemised (\|𝒯\| = 32)
+## 8. The trust count, itemised (\|𝒯\| = 37)
 
 | Kind | Count | Items |
 | --- | --- | --- |
-| Verified-code trust (V) | 6 | vstd specs of `Vec` and strings; `Value` opaque; serde unverified; four opaque external types; ledger bookkeeping helpers; vstd `Vec`/`Box` specs |
-| Platform (P) | 9 | backend outcomes honest; live activation restores; boot publish idempotent; fsync durable; SHA-256; systemd truthful; fencing effective; kernel and systemd correct; facts derived honestly |
+| Verified-code and proof-validity trust (V) | 11 | vstd specs of `Vec` and strings; `Value` opaque; serde unverified; four opaque external types; ledger bookkeeping helpers; vstd `Vec`/`Box` specs; the specifications themselves (V7); Verus, Z3, rustc and Kani/CBMC sound (V8–V11) |
+| Platform (P) | 9 | backend outcomes honest; live activation restores; boot publish idempotent; fsync durable; SHA-256; systemd truthful; fencing effective; kernel and systemd correct; pidfd semantics (P10) |
 | Progress (G) | 4 | a lease holder runs; a fenced worker stops; journal writes succeed; backend calls terminate |
 | `external_body` sites | 13 | 8 ledger helpers, 5 opaque types |
+| *Internal-unproven (U), reported apart* | *5* | *`exec::derive` (formerly P9), authorization and the administrator lookup, the residue classifier, journal I/O around the chain, identity resolution* |
 
 The ratchet: at every gate, d:a may not fall (globally or for any
 invariant) and \|𝒯\| may not grow. `planarian-gym verification` enforces
@@ -353,7 +354,7 @@ flowchart TB
       digest["schema::digest"]:::a
     end
     subgraph VC["B, C · executor, planner"]
-      exec2["exec orchestration and derive<br/>(C: write-ahead order; retires P9)"]:::c
+      exec2["exec orchestration and derive<br/>(C: write-ahead order; retires U1)"]:::c
       incident["incident planner (I13, C)"]:::c
       broker["approval broker (I8, C)"]:::c
       diag["diagnoser soundness<br/>and scorer (B)"]:::b
@@ -398,7 +399,7 @@ What each phase moves from 𝒯 (or from "tested") into 𝒱:
 | --- | --- | --- |
 | A (now) | `schema`, `policy`, `txn` incl. the hash chain; then I17, the residue classifier (Kani), `schema::digest` | — (the proofs rest on V1–V6, P-ids) |
 | B | diagnoser soundness and scorer | how far the diagnosis is trusted |
-| C | `exec` (with the write-ahead order), the incident planner (I13), the approval broker (I8), the residue classifier under Verus | P9 (facts derived honestly), the kernel-ordering gap |
+| C | `exec` (with the write-ahead order), the incident planner (I13), the approval broker (I8), the residue classifier under Verus | U1 (facts derived honestly, an internal-unproven entry), the kernel-ordering gap |
 | D | switch and rollback (I1, I3), the Rust supervisor, store integrity for content-addressed paths | P2, P3, P6 and C Nix and systemd themselves |
 | E | Asterinas OSTD, the model channel (I9), the core update path (I2) | P8 (the kernel), most of what remains of the platform |
 

@@ -1,8 +1,8 @@
 # Planarian — Phase A fault catalog
 #
-# First deliverable per SPEC §18.0. Status: DRAFT FOR OWNER REVIEW.
-# Spec revision: v4.4 (v4.4 renames applied; v4.4 cases join as they are
-# implemented, from phase-a-v4.4-draft.toml). Review notes, coverage matrix and open questions:
+# First deliverable per SPEC §18.0; the owner signed off the defaults on
+# 2026-10-26. Spec revision: v4.6 (128 entries; v4.4, v4.5 and the v4.6
+# cases so far are in). Review notes, coverage and counts:
 # docs/catalog-review.md.
 #
 # ───────────────────────────────────────────────────────────────────────────

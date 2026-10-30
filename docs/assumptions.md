@@ -30,7 +30,7 @@ See `verification.md` for what is proved.
 | **P2** `activate_live(revert_to)` restores the activation state of `revert_to` | — |
 | **P3** `publish_boot` and the override promotion rename are idempotent | — |
 | **P4** Journal fsync is durable and the preallocation is writable | — |
-| **P5** SHA-256 is collision-resistant (the journal's hash chain, I18) | `txn::journal::chain` |
+| **P5** SHA-256 is collision-resistant (the journal's hash chain, I18) | `txn::chain` (the chain decision, proved), `txn::journal` (its I/O) |
 | **P6** systemd reports unit state truthfully over D-Bus and honors `X-RestartIfChanged` / `X-StopIfChanged` | — |
 | **P7** Fencing is effective: a stale-epoch call is refused before it mutates | — |
 | **P8** The kernel and systemd are correct | — |

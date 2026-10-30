@@ -32,11 +32,18 @@ proved obligations (`only_generations_publish` and
 `boot_only_never_activates` to I6, `step_allowed` and `add_interlock` to
 I12; arguments in `guarantees.md` §3), and to **42:50** when I21–I23 were
 added to SPEC §7 for ten proved obligations no invariant named, and to
-**47:50** with the proof of I18's hash chain. Invariants with a proof
-claim in Phase A: I5 4:3, I6 7:5, I11 2:2, I12 9:8, I18 5:2, I21 2:3,
-I22 5:3, I23 3:1, I14 1:2, I15 2:2, I16 2:3, I19 3:1.
-I1–I4, I7, I13, I17 and I20 are tested, not proved (their proof
-phases are in SPEC §8).
+**47:50** with the proof of I18's hash chain. Re-accounted once for
+SPEC v4.5 (2026-10-29, as §17a allows): **trust count = 37** (24 platform
+and proof-validity entries, V1–V11 and P1–P10 among them, plus the same 13
+sites), **internal-unproven count = 5** (U1–U5, reported apart), and
+**global d:a = 47:56**, because I17–I19, I21 and I22 now cite the unproven
+code they rest on. Per invariant with a proof claim in Phase A (from
+`planarian-gym verification` at v4.6): I5 4:3, I6 7:5, I8 1:1, I10 1:2,
+I11 2:2, I12 9:8, I14 1:2, I15 2:2, I16 2:3, I18 5:3, I19 3:3, I21 2:4,
+I22 5:4, I23 3:1. I1–I4, I7, I13, I17 and I20 are tested, not proved
+(their proof phases are in SPEC §7); I24 and I25 (v4.6) are tested.
+Every invariant with a proof claim has a catalog entry written from its
+English (tag `english`), which `planarian-gym verification` requires.
 
 Before and after v4.4 (owner decision Q6): Verus verified 17 / 37 / 38
 obligations in `schema` / `policy` / `txn` before the v4.4 types, and

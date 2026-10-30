@@ -2,9 +2,10 @@
 # gym's fault catalog on real VMs (one NixOS test per entry). Linux runners
 # have KVM once /dev/kvm is opened to the runner user.
 #
-# A push runs 7 VM jobs (about 70 runner minutes; a newer push cancels
-# them); the whole catalog is 62 jobs (several hundred minutes), so it runs
-# only by hand (Actions → VM tests → Run workflow → catalog).
+# A push runs the VM checks, the GA demonstration and the gym smoke entries
+# (a newer push cancels them); the whole catalog is one job per VM entry (94
+# at v4.6, several hundred runner minutes), so it runs only by hand (Actions →
+# VM tests → Run workflow → catalog).
 name: VM tests
 
 on:
