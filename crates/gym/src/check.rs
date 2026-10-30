@@ -461,6 +461,48 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                 (Some("third-party"), None) => fail(&mut v, "no third-party edit happened".into()),
                 _ => v.unchecked.push(key.clone()),
             },
+            // §13 (R08): a refused request leaves the incident's control state
+            // alone: no budget restored and no cooldown cut when it is refused.
+            "incident_unchanged_by_refusal" => match &e.entries {
+                None => v.unchecked.push(key.clone()),
+                Some(en) => {
+                    let u = unit(val.as_str().unwrap_or(""));
+                    let refusals: Vec<Timestamp> = e
+                        .log
+                        .iter()
+                        .filter(|r| target_of(&r.proposal.transition).as_ref() == Some(&u))
+                        .filter(|r| matches!(r.result, Submitted::Rejected { .. }))
+                        .map(|r| r.at)
+                        .collect();
+                    if refusals.is_empty() {
+                        fail(&mut v, format!("no refused request on {u}"));
+                    }
+                    // What a human's action restores: budget, and an earlier
+                    // next attempt. Neither may follow a refusal.
+                    for at in refusals {
+                        let mut prev: Option<&Incident> = None;
+                        for x in en {
+                            let Record::Incident(i) = &x.record else { continue };
+                            if i.target != u {
+                                continue;
+                            }
+                            if x.at == at
+                                && let Some(p) = prev
+                                && p.id == i.id
+                                && (i.budget_left > p.budget_left
+                                    || i.next_attempt < p.next_attempt
+                                    || (i.state != p.state && i.state == IncidentState::Open))
+                            {
+                                fail(
+                                    &mut v,
+                                    format!("the incident on {u} was replenished when a request on it was refused"),
+                                );
+                            }
+                            prev = Some(i);
+                        }
+                    }
+                }
+            },
             // §12b, retainAllGenerations: no generation was collected.
             "collected_none" if val.as_bool() == Some(true) => {
                 if !e.collected.is_empty() {

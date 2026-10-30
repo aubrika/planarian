@@ -2763,6 +2763,32 @@ terminal = "Committed"
 caller = "agent:coder"
 
 # B-20 (High), I24.
+# R08 (§13): rejection must not grant an indirect control capability.
+[[fault]]
+id = "release-refused-leaves-incident"
+family = "authority"
+summary = "gym-web keeps failing until its incident has spent its repair budget and escalated. alice, who may not act on gym-web, asks to release it: refused Unauthorized, and the incident record is unchanged (no budget restored, no attempt brought forward, not reopened)."
+spec = ["§13", "§11 authorization", "R08"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "set_persistent_knob", unit = "service:gym-web", knob = "fail_on_start", value = true },
+  { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" },
+  { raw = "wait", for = "5m" },
+]
+inject = { raw = "cli", argv = ["release", "service:gym-web"], actor = "user:1000" }
+window = "2m"
+
+[fault.required_post]
+incident_unchanged_by_refusal = "service:gym-web"
+
+[[fault.required_post.txn]]
+transition = "LiftOverride"
+target = "service:gym-web"
+refused_with = "Unauthorized"
+
 [[fault]]
 id = "agent-name-collision"
 family = "authority"

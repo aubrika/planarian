@@ -1617,6 +1617,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     Source::User,
                     "from the CLI".into(),
                 );
+                // Incident control state changes only on an authorized,
+                // successful human action (§13, R08): a refused or failed
+                // release leaves the record, its budget and cooldown alone.
+                let released = matches!(&r, Response::Done { state: TxnState::Committed, .. });
+                if !released {
+                    return r;
+                }
                 // Releasing an inferred stop also releases what went down with it.
                 let with = format!("stopped together with {unit}");
                 let linked: Vec<UnitId> = self
