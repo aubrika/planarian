@@ -550,6 +550,11 @@ in
         in
         lib.filterAttrs (n: _: config.systemd.services ? ${n}) all;
       inputs = cfg.flakeInputs;
+      # §11 sensitivity completeness: every system service NixOS defines
+      # that the manifest does not declare has the shipped tables' entry,
+      # so only a unit in neither fails closed.
+      services = lib.mapAttrs (n: _: defaultSensitivity n)
+        (lib.filterAttrs (n: _: !(cfg.units ? ${n})) config.systemd.services);
     };
 
     environment.etc."planarian/export.json".text = builtins.toJSON cfg.export;

@@ -67,6 +67,9 @@ pub struct Export {
     /// Flake inputs: name → { rev, path }.
     #[serde(default)]
     pub inputs: BTreeMap<String, ExportInput>,
+    /// Every undeclared system service → its shipped-table sensitivity (§11).
+    #[serde(default)]
+    pub services: BTreeMap<String, Sensitivities>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +98,7 @@ impl Export {
             insecure: self.insecure.into_iter().collect(),
             declarations: self.declarations,
             inputs: self.inputs.into_iter().map(|(k, v)| (k, (v.rev, v.path))).collect(),
+            services: self.services,
         }
     }
 }

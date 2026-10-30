@@ -324,6 +324,7 @@ impl World {
             insecure,
             declarations,
             inputs: self.base_inputs.clone(),
+            services: BTreeMap::new(),
         };
         (eval, broken)
     }

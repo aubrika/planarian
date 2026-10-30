@@ -27,7 +27,11 @@ pub fn manifest_of(e: &EvaluatedGeneration) -> Manifest {
     Manifest { units: e.units.clone(), user_units: e.user_units.clone() }
 }
 
-fn unit_facts<'a>(units: impl IntoIterator<Item = &'a UnitId>, defs: &UnitDefs) -> (Sensitivities, Disruption) {
+fn unit_facts<'a>(
+    units: impl IntoIterator<Item = &'a UnitId>,
+    defs: &UnitDefs,
+    services: &BTreeMap<String, Sensitivities>,
+) -> (Sensitivities, Disruption) {
     let mut sens = Sensitivities::default();
     let mut disruption = Disruption::None;
     for u in units {
@@ -35,20 +39,21 @@ fn unit_facts<'a>(units: impl IntoIterator<Item = &'a UnitId>, defs: &UnitDefs) 
         // sensitivity entry, or none in the manifest at all, is not taken
         // as Routine. External: nothing is known about what it touches.
         let unknown = Sensitivities::of(&[Sensitivity::External]);
+        let empty = |s: &Sensitivities| !(s.routine || s.security || s.user_data || s.external || s.core);
         match defs.get(u) {
             Some(d) => {
-                let empty = !(d.sensitivity.routine
-                    || d.sensitivity.security
-                    || d.sensitivity.user_data
-                    || d.sensitivity.external
-                    || d.sensitivity.core);
-                sens = sens.union(if empty { &unknown } else { &d.sensitivity });
+                sens = sens.union(if empty(&d.sensitivity) { &unknown } else { &d.sensitivity });
                 disruption = disruption.max(d.restart_disruption);
             }
             // A user-scope unit runs with that user's rights only; an
             // undeclared one stays Routine (deviations.md).
             None if matches!(u.scope, Scope::User { .. }) => {}
-            None => sens = sens.union(&unknown),
+            // A system service NixOS defines but the manifest does not
+            // declare has the shipped tables' entry (the export's `services`).
+            None => match services.get(&u.name) {
+                Some(t) if !empty(t) => sens = sens.union(t),
+                _ => sens = sens.union(&unknown),
+            },
         }
         if CORE_UNITS.contains(&u.name.as_str()) {
             sens.insert(Sensitivity::Core);
@@ -144,7 +149,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
     };
     let unit_op = |f: &mut DerivedFacts, u: &UnitId, recovery: Recovery| {
         f.affected_units = unit_set(one(u));
-        let (s, d) = unit_facts(&f.affected_units, i.defs);
+        let (s, d) = unit_facts(&f.affected_units, i.defs, &i.base.services);
         f.sensitivity = s;
         f.disruption = d;
         f.recovery = recovery;
@@ -193,7 +198,9 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             for (k, v) in &cand.units {
                 all_defs.entry(k.clone()).or_insert_with(|| v.clone());
             }
-            let (s, d) = unit_facts(&affected, &all_defs);
+            let mut services = i.base.services.clone();
+            services.extend(cand.services.iter().map(|(k, v)| (k.clone(), *v)));
+            let (s, d) = unit_facts(&affected, &all_defs, &services);
             f.sensitivity = s.union(&i.tables.diff_sensitivity(&config));
             f.disruption = d;
             f.touches_manifest = touches_manifest(&base_m, &cand_m, &config);
@@ -317,14 +324,24 @@ mod sensitivity_completeness {
         empty.id = UnitId::service("gym-untagged");
         empty.sensitivity = Sensitivities::default();
         defs.insert(empty.id.clone(), empty.clone());
-        let (s, _) = unit_facts([&empty.id], &defs);
+        let none = BTreeMap::new();
+        let (s, _) = unit_facts([&empty.id], &defs, &none);
         assert!(s.external && !s.routine, "an empty sensitivity is External: {s:?}");
         let ghost = UnitId::service("not-in-the-manifest");
-        let (s, _) = unit_facts([&ghost], &defs);
+        let (s, _) = unit_facts([&ghost], &defs, &none);
         assert!(s.external && !s.routine, "an undeclared system unit is External: {s:?}");
+        // One NixOS defines has the shipped tables' entry instead.
+        let tables = BTreeMap::from([
+            ("dbus-broker".to_string(), Sensitivities::of(&[Sensitivity::Routine])),
+            ("blank".to_string(), Sensitivities::default()),
+        ]);
+        let (s, _) = unit_facts([&UnitId::service("dbus-broker")], &defs, &tables);
+        assert!(s.routine && !s.external, "a defined service takes its table entry: {s:?}");
+        let (s, _) = unit_facts([&UnitId::service("blank")], &defs, &tables);
+        assert!(s.external, "an empty table entry still fails closed: {s:?}");
         let own =
             UnitId { kind: UnitKind::Service, name: "notes".into(), scope: Scope::User { uid: 1000, session: None } };
-        let (s, _) = unit_facts([&own], &defs);
+        let (s, _) = unit_facts([&own], &defs, &none);
         assert!(!s.external, "an undeclared user unit stays as it was: {s:?}");
     }
 }

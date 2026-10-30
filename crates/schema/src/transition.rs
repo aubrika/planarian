@@ -383,6 +383,11 @@ pub struct EvaluatedGeneration {
     /// reported with the input's lock change (§15).
     #[serde(default)]
     pub inputs: BTreeMap<String, (String, String)>,
+    /// The shipped tables' sensitivity for every system service NixOS
+    /// defines that the manifest does not declare (§11 sensitivity
+    /// completeness): a unit in neither has no entry, and fails closed.
+    #[serde(default)]
+    pub services: BTreeMap<String, Sensitivities>,
 }
 
 impl EvaluatedGeneration {

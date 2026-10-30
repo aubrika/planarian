@@ -64,6 +64,7 @@ let
     (check ((unit "service:sshd").sensitivity == [ "Security" ]) "sshd is Security")
     (check (builtins.all (n: (unit "service:${n}").sensitivity == [ "Security" ]) securityNamed) "every named security unit is Security without a tag (B-5)")
     (check (builtins.all (t: (cfg.services.planarian.optionSensitivity.${t} or [ ]) == [ "Security" ]) securityTrees) "every named option tree is Security (B-5)")
+    (check (export.services.dbus-broker or null == [ "Routine" ] && export.services.systemd-logind or null == [ "Security" ] && !(export.services ? sshd)) "every undeclared system service has its shipped-table entry (B-5)")
     (check (!cfg.systemd.services.planariad.restartIfChanged) "planariad survives activation")
     (check (!cfg.systemd.services.planarian-recovery.stopIfChanged) "the watchdog survives activation")
     (check (export.coreUnits."planariad.service" != "") "core unit hashes exported")
