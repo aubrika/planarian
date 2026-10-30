@@ -67,6 +67,9 @@ pub struct Peer {
     /// `planarian-agent-<name>` (§11). An agent is its own principal, never
     /// the uid it runs under, and is never an administrator or in a session.
     pub agent: Option<String>,
+    /// The agent unit's instance the process runs in (its InvocationID,
+    /// from the cgroup), which authority is bound to (I24).
+    pub instance: Option<planarian_schema::InstanceId>,
     /// The calling process has a controlling terminal, read by the daemon
     /// from its pidfd (§11, B-3). Never taken from the request.
     pub tty: bool,
@@ -74,11 +77,12 @@ pub struct Peer {
 
 impl Peer {
     pub const fn new(uid: u32, admin: bool) -> Peer {
-        Peer { uid, admin, session: None, agent: None, tty: false }
+        Peer { uid, admin, session: None, agent: None, instance: None, tty: false }
     }
 
-    pub fn agent(uid: u32, name: &str) -> Peer {
-        Peer { uid, admin: false, session: None, agent: Some(name.into()), tty: false }
+    /// A process in agent `name`'s unit, in the given instance of it.
+    pub fn agent(uid: u32, name: &str, instance: Option<planarian_schema::InstanceId>) -> Peer {
+        Peer { uid, admin: false, session: None, agent: Some(name.into()), instance, tty: false }
     }
 
     pub const fn at_terminal(mut self) -> Peer {
@@ -1320,7 +1324,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             // of the user who started it, judged as that user with no login
             // session and no terminal. One the journal has no start for is
             // granted nothing.
-            let Some(by) = self.ledger().agent_for(name) else {
+            // Bound to the instance the peer runs in, never the name (I24).
+            let instance = peer.instance.map(|i| i.0).unwrap_or_default();
+            let Some(by) = self.ledger().agent_for(name, instance) else {
                 let actor = Actor::Agent(agent_principal(name));
                 return Authorization { principal: actor.principal(), actor, capabilities: Capabilities::default() };
             };
@@ -1697,10 +1703,23 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         message: "agent run <name> -- <command>: the name is 1-32 of a-z, 0-9 and -".into(),
                     };
                 }
-                // Who it acts for is journaled before it starts (§11).
-                self.journal(Record::AgentStarted { name: name.clone(), by: peer.uid });
+                // A name in use is refused, so a second start never rebinds
+                // what a running agent may do (I24, B-20).
+                if self.b.units().agent_running(&name) {
+                    let owner = self.ledger().agent_owner(&name);
+                    return Response::Rejected {
+                        reason: "Unauthorized".into(),
+                        message: match owner {
+                            Some(u) => format!("agent {name} is already running, started by uid {u}; stop it first"),
+                            None => format!("agent {name} is already running; stop it first"),
+                        },
+                    };
+                }
                 match self.b.units().start_agent(&name, &argv) {
-                    Outcome::Succeeded => {
+                    Ok(instance) => {
+                        // Journaled once it has started, with the instance it
+                        // started as: a failed start binds nothing (I24).
+                        self.journal(Record::AgentStarted { name: name.clone(), instance: instance.0, by: peer.uid });
                         self.notice(format!(
                             "agent {name} started by uid {} ({}); it acts with that user's permissions",
                             peer.uid,
@@ -1708,7 +1727,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         ));
                         Response::Ok { message: format!("agent {name} is running with your permissions") }
                     }
-                    other => Response::Error { message: format!("could not start agent {name}: {other:?}") },
+                    Err(other) => Response::Error { message: format!("could not start agent {name}: {other:?}") },
                 }
             }
             Request::Undo => {

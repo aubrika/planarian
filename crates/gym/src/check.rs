@@ -642,6 +642,12 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                             |x| matches!(x, Response::Done { message, .. } if message.contains("until the next boot")),
                         ),
                         "AwaitingApproval" => notices.contains("needs approval"),
+                        // I24: a second `agent run` under a running agent's
+                        // name is refused, naming who started it.
+                        "AgentNameInUse" => e.responses.iter().any(|x| {
+                            matches!(x, Response::Rejected { message, .. }
+                                if message.contains("is already running, started by uid"))
+                        }),
                         // The request itself was answered "approve first".
                         "NeedsApproval" => e.responses.iter().any(|x| matches!(x, Response::NeedsApproval { .. })),
                         "ApprovalInvalidated" => ledger.terminal.values().any(|t| {

@@ -88,12 +88,15 @@ pub enum Record {
         nonce: [u8; 16],
         expires: Timestamp,
     },
-    /// `planarian agent run <name>` by this uid (§11): the agent acts with
-    /// that user's permissions, attributed to the agent. Journaled before the
-    /// agent's unit starts, so who it acts for survives restarts and is
-    /// covered by the chain.
+    /// `planarian agent run <name>` by this uid (§11, I24): the started
+    /// unit's instance (its InvocationID) acts with that user's permissions,
+    /// attributed to the agent. Journaled once the unit has started, so a
+    /// failed or refused start binds nothing; covered by the chain.
     AgentStarted {
         name: String,
+        /// Zero in records written before v4.6, which then match no peer.
+        #[serde(default)]
+        instance: [u8; 16],
         by: u32,
     },
     Resolved {
@@ -189,10 +192,10 @@ pub struct Ledger {
     pub external: Option<(u64, Hash)>,
     pub interlock: IdMap<InterlockEntry>,
     pub last_reconciliation: Option<Reconciliation>,
-    /// Every agent started, in order: (name, the uid that started it). The
-    /// last entry for a name is the one in force.
+    /// Every agent started, in order: (name, instance, the uid that started
+    /// it). A peer is matched by its instance, never its name (I24).
     #[serde(default)]
-    pub agents: Vec<(String, u32)>,
+    pub agents: Vec<(String, [u8; 16], u32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -900,7 +903,7 @@ impl Ledger {
                 }
             },
             Record::Reconciliation(r) => self.last_reconciliation = Some(r),
-            Record::AgentStarted { name, by } => self.agents.push((name, by)),
+            Record::AgentStarted { name, instance, by } => self.agents.push((name, instance, by)),
         }
     }
 
@@ -1316,9 +1319,19 @@ impl Ledger {
         !self.interlock.is_empty()
     }
 
-    /// The uid the agent `name` acts for: whoever started it last (§11).
-    pub fn agent_for(&self, name: &str) -> Option<u32> {
-        self.agents.iter().rev().find(|(n, _)| n == name).map(|(_, by)| *by)
+    /// The uid the agent `name`'s running `instance` acts for (§11, I24):
+    /// the start that journaled that very instance under that name. A zero
+    /// instance matches nothing.
+    pub fn agent_for(&self, name: &str, instance: [u8; 16]) -> Option<u32> {
+        if instance == [0; 16] {
+            return None;
+        }
+        self.agents.iter().rev().find(|(n, i, _)| *i == instance && n == name).map(|(_, _, by)| *by)
+    }
+
+    /// Who started the last instance under `name`, for a refusal's message.
+    pub fn agent_owner(&self, name: &str) -> Option<u32> {
+        self.agents.iter().rev().find(|(n, _, _)| n == name).map(|(_, _, by)| *by)
     }
 }
 

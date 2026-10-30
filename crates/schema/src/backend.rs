@@ -99,10 +99,16 @@ pub trait UnitBackend {
         vec![]
     }
     fn list(&self) -> Result<Vec<UnitId>, Outcome>;
-    /// Start an agent as its own principal (§11, §16): the transient unit
-    /// `planarian-agent-<name>`, under a dynamic uid of its own.
-    fn start_agent(&self, _name: &str, _argv: &[String]) -> Outcome {
-        Outcome::Failed("this backend cannot start agents".into())
+    /// Start an agent (§11, §16): the transient unit `planarian-agent-<name>`,
+    /// under a dynamic uid of its own. Returns the started unit's instance
+    /// (its InvocationID), read back once it has started (I24).
+    fn start_agent(&self, _name: &str, _argv: &[String]) -> Result<InstanceId, Outcome> {
+        Err(Outcome::Failed("this backend cannot start agents".into()))
+    }
+    /// Whether an agent's unit under this name is loaded and running (I24:
+    /// `agent run` refuses a name in use).
+    fn agent_running(&self, _name: &str) -> bool {
+        false
     }
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome;
     fn stop(&self, id: &UnitId, op: &OpId) -> Outcome;
@@ -309,6 +315,31 @@ pub fn valid_agent_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
         && !name.starts_with('-')
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// One start of an agent's unit: its systemd InvocationID (I24). The name
+/// alone never identifies an agent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct InstanceId(pub [u8; 16]);
+
+impl InstanceId {
+    /// From systemd's form (32 hex digits, as `InvocationID` and the
+    /// cgroup's `trusted.invocation_id` carry it) or the 16 raw bytes.
+    pub fn parse(b: &[u8]) -> Option<InstanceId> {
+        let b = b.strip_suffix(b"\n").unwrap_or(b);
+        if b.len() == 16 {
+            return Some(InstanceId(b.try_into().ok()?));
+        }
+        let s = std::str::from_utf8(b).ok()?.trim();
+        if s.len() != 32 {
+            return None;
+        }
+        let mut out = [0u8; 16];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+        }
+        (out != [0; 16]).then_some(InstanceId(out))
+    }
 }
 
 /// The unit an agent runs in (§11, §16).

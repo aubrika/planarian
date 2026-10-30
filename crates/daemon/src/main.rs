@@ -190,10 +190,10 @@ fn peer_of(s: &UnixStream, admin_group: &str) -> Option<Peer> {
     // A process in an agent's unit is that agent, whatever uid it runs as
     // (§11): never an administrator, never in a session.
     if let Some(name) = agent_of_cgroup(&p.cgroup) {
-        return Some(Peer::agent(uid, &name));
+        return Some(Peer::agent(uid, &name, instance_of_cgroup(&p.cgroup)));
     }
     let session = session_of_cgroup(&p.cgroup, uid);
-    Some(Peer { uid, admin: is_admin(uid, admin_group), session, agent: None, tty: p.tty })
+    Some(Peer { uid, admin: is_admin(uid, admin_group), session, agent: None, instance: None, tty: p.tty })
 }
 
 /// The agent whose unit (`/system.slice/planarian-agent-<name>.service`,
@@ -206,6 +206,19 @@ fn agent_of_cgroup(cgroup: &str) -> Option<String> {
     }
     let name = parts.next()?.strip_prefix("planarian-agent-")?.strip_suffix(".service")?;
     planarian_schema::backend::valid_agent_name(name).then(|| name.to_string())
+}
+
+/// The InvocationID of the agent unit holding this cgroup (I24): systemd
+/// writes it to the unit's cgroup as the `trusted.invocation_id` xattr,
+/// which only root can set, so a process in the unit cannot change it.
+fn instance_of_cgroup(cgroup: &str) -> Option<planarian_schema::InstanceId> {
+    let line = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let mut parts = line.split('/').filter(|c| !c.is_empty());
+    let (slice, unit) = (parts.next()?, parts.next()?);
+    let dir = format!("/sys/fs/cgroup/{slice}/{unit}");
+    let mut buf = [0u8; 64];
+    let n = rustix::fs::getxattr(dir.as_str(), "trusted.invocation_id", &mut buf).ok()?;
+    planarian_schema::InstanceId::parse(&buf[..n])
 }
 
 /// `sd_pid_get_session` (systemd's `cg_path_get_session`): the logind

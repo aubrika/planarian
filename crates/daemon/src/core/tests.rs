@@ -220,25 +220,40 @@ fn unprivileged_override_of_a_security_unit_is_held_for_an_administrator() {
 }
 
 /// §11 (owner decision, 2026-10-30): an agent has the permissions of the
-/// user who started it, as journaled when it started, and is attributed to
-/// itself in the log. One the journal has no start for holds nothing.
+/// user who started it, bound to the instance that start journaled (I24),
+/// and is attributed to itself in the log. One with no journaled start, or
+/// in an instance no start names, holds nothing.
 #[test]
 fn an_agent_has_its_users_permissions() {
     let mut r = Rig::new();
     r.ticks(2);
     let stop_web = || Request::Stop { unit: UnitId::service("gym-web") };
+    let instance = |r: &Rig, name: &str| r.fake.w().agent_instances.get(name).copied();
     // Never started through `agent run`: nothing.
-    let stray = Peer::agent(61185, "stray");
+    let stray = Peer::agent(61185, "stray", None);
     let resp = r.core.handle(stray, stop_web());
     assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
     // Started by alice: alice's permissions, which do not reach gym-web.
     let resp = r.core.handle(ALICE, Request::AgentRun { name: "helper".into(), argv: vec!["true".into()] });
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
-    let helper = Peer::agent(61186, "helper");
+    let helper = Peer::agent(61186, "helper", instance(&r, "helper"));
     let resp = r.core.handle(helper.clone(), stop_web());
     assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
     // An agent cannot start agents.
-    let resp = r.core.handle(helper, Request::AgentRun { name: "more".into(), argv: vec!["true".into()] });
+    let resp = r.core.handle(helper.clone(), Request::AgentRun { name: "more".into(), argv: vec!["true".into()] });
+    assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
+    // B-20: an administrator re-running `agent run helper` is refused while
+    // alice's agent runs, naming its owner, and her agent gains nothing.
+    let resp = r.core.handle(ADMIN, Request::AgentRun { name: "helper".into(), argv: vec!["true".into()] });
+    assert!(
+        matches!(&resp, Response::Rejected { message, .. } if message.contains("uid 1000")),
+        "a name in use is refused: {resp:?}"
+    );
+    let resp = r.core.handle(helper, stop_web());
+    assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
+    // A process claiming the name in another instance holds nothing.
+    let forged = Peer::agent(61186, "helper", Some(planarian_schema::InstanceId([7; 16])));
+    let resp = r.core.handle(forged, stop_web());
     assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
     // Started by an administrator: an administrator's permissions.
     let resp = r.core.handle(ADMIN, Request::AgentRun { name: "coder".into(), argv: vec!["true".into()] });
@@ -246,7 +261,7 @@ fn an_agent_has_its_users_permissions() {
     r.ticks(1);
     // Planarian does not manage the agent's unit: it is not in the manifest.
     assert_eq!(r.status("service:planarian-agent-coder"), UnitStatus::NotExpected);
-    let coder = Peer::agent(61184, "coder");
+    let coder = Peer::agent(61184, "coder", instance(&r, "coder"));
     let resp = r.core.handle(coder, stop_web());
     assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
     // A finished transaction's record is logged at the next observation.
@@ -255,9 +270,11 @@ fn an_agent_has_its_users_permissions() {
     let rec = rec.expect("logged");
     assert_eq!(rec.agent.as_deref(), Some("coder"), "attributed to the agent");
     assert_eq!(rec.caller.uid(), Some(0), "acting for the administrator who started it");
-    // Who it acts for is in the journal, so it survives a restart.
-    assert_eq!(r.core.ledger().agent_for("coder"), Some(0));
-    assert_eq!(r.core.ledger().agent_for("helper"), Some(1000));
+    // Who it acts for is in the journal, by instance, so it survives a restart.
+    let l = r.core.ledger();
+    assert_eq!(l.agent_for("coder", instance(&r, "coder").unwrap().0), Some(0));
+    assert_eq!(l.agent_for("helper", instance(&r, "helper").unwrap().0), Some(1000));
+    assert_eq!(l.agent_for("helper", [7; 16]), None);
 }
 
 #[test]

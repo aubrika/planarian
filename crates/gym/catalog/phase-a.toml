@@ -2762,6 +2762,33 @@ target = "service:gym-web"
 terminal = "Committed"
 caller = "agent:coder"
 
+# B-20 (High), I24.
+[[fault]]
+id = "agent-name-collision"
+family = "authority"
+summary = "alice (uid 1000) starts an agent named helper. An administrator then runs `planarian agent run helper` too: refused, naming alice as its owner. alice's agent stays alice's: its stop of gym-web, a system unit she may not stop, is refused. Authority is bound to the instance a start journaled, never the name (I24)."
+spec = ["§11 principals", "§16 agent run", "I24", "B-20"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "agent_run", name = "helper", as = "user:1000", argv = ["/run/current-system/sw/bin/sleep", "infinity"] },
+  { raw = "agent_run", name = "helper", as = "user:1001", argv = ["/run/current-system/sw/bin/sleep", "infinity"] },
+]
+inject = { raw = "cli", argv = ["stop", "service:gym-web"], actor = "agent:helper" }
+window = "3m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+reports = ["AgentNameInUse"]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+target = "service:gym-web"
+refused_with = "Unauthorized"
+caller = "agent:helper"
+
 [[fault]]
 id = "agent-has-its-users-permissions"
 family = "authority"

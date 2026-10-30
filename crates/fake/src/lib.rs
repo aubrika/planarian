@@ -212,6 +212,10 @@ pub struct World {
     /// I23: a third party rewrites the override file once the next boot
     /// entry is published; the hash of what it wrote.
     pub third_party_on_publish: bool,
+    /// The running instance of each agent's unit (I24), as the agent's
+    /// processes would show it in their cgroup.
+    pub agent_instances: BTreeMap<String, InstanceId>,
+    pub next_instance: u64,
     pub third_party_override: Option<Hash>,
     /// Units planted outside the generation (the boot report finds them).
     pub foreign_units: Vec<String>,
@@ -610,12 +614,25 @@ impl UnitBackend for Fake {
         Ok(self.w().units.keys().cloned().collect())
     }
 
-    fn start_agent(&self, name: &str, _argv: &[String]) -> Outcome {
+    fn start_agent(&self, name: &str, _argv: &[String]) -> Result<InstanceId, Outcome> {
         let mut w = self.w();
         let now = w.now;
         let id = UnitId::service(&format!("planarian-agent-{name}"));
         w.units.insert(World::key(&id), UnitSim::active(now));
-        Outcome::Succeeded
+        // A fresh InvocationID per start, as systemd gives one.
+        w.next_instance += 1;
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&w.next_instance.to_be_bytes());
+        b[8] = 0xa9;
+        let inst = InstanceId(b);
+        w.agent_instances.insert(name.to_string(), inst);
+        Ok(inst)
+    }
+
+    fn agent_running(&self, name: &str) -> bool {
+        let w = self.w();
+        let id = UnitId::service(&format!("planarian-agent-{name}"));
+        w.units.get(&World::key(&id)).is_some_and(|u| matches!(u.observed, Observed::Active))
     }
 
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome {

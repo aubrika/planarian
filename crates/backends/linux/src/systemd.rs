@@ -191,9 +191,9 @@ impl UnitBackend for Systemd {
             .collect())
     }
 
-    fn start_agent(&self, name: &str, argv: &[String]) -> Outcome {
+    fn start_agent(&self, name: &str, argv: &[String]) -> Result<planarian_schema::backend::InstanceId, Outcome> {
         if !planarian_schema::backend::valid_agent_name(name) {
-            return Outcome::Failed(format!("bad agent name {name:?}"));
+            return Err(Outcome::Failed(format!("bad agent name {name:?}")));
         }
         // A uid of its own (DynamicUser), so it is never the person who
         // started it (§11); no privilege it could gain by exec.
@@ -209,7 +209,20 @@ impl UnitBackend for Systemd {
         ];
         a.extend(argv.iter().map(String::as_str));
         let o = run(&a, JOB_TIMEOUT);
-        if o.ok() { Outcome::Succeeded } else { Outcome::Failed(o.tail()) }
+        if !o.ok() {
+            return Err(Outcome::Failed(o.tail()));
+        }
+        // The instance that started, read back from systemd (I24).
+        let unit = format!("{}.service", planarian_schema::backend::agent_unit(name));
+        let id = run(&["systemctl", "show", "-p", "InvocationID", "--value", &unit], QUERY_TIMEOUT);
+        planarian_schema::backend::InstanceId::parse(id.stdout.trim().as_bytes())
+            .ok_or_else(|| Outcome::Unknown(format!("{unit} started, but it has no InvocationID")))
+    }
+
+    fn agent_running(&self, name: &str) -> bool {
+        let unit = format!("{}.service", planarian_schema::backend::agent_unit(name));
+        let o = run(&["systemctl", "show", "-p", "ActiveState", "--value", &unit], QUERY_TIMEOUT);
+        matches!(o.stdout.trim(), "active" | "activating" | "reloading" | "deactivating")
     }
 
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome {
