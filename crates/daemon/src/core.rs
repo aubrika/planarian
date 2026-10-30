@@ -75,6 +75,9 @@ pub struct Peer {
     /// looked up from the journal; its dynamic uid conveys no authority and
     /// it inherits no login session, seat, or terminal.
     pub agent: Option<String>,
+    /// The agent unit's instance the process runs in (its InvocationID,
+    /// from the cgroup), which authority is bound to (I24).
+    pub instance: Option<planarian_schema::InstanceId>,
     /// The calling process has a controlling terminal, read by the daemon
     /// from its pidfd (§11, B-3). Never taken from the request.
     pub tty: bool,
@@ -82,11 +85,12 @@ pub struct Peer {
 
 impl Peer {
     pub const fn new(uid: u32, admin: bool) -> Peer {
-        Peer { uid, admin, session: None, agent: None, tty: false }
+        Peer { uid, admin, session: None, agent: None, instance: None, tty: false }
     }
 
-    pub fn agent(uid: u32, name: &str) -> Peer {
-        Peer { uid, admin: false, session: None, agent: Some(name.into()), tty: false }
+    /// A process in agent `name`'s unit, in the given instance of it.
+    pub fn agent(uid: u32, name: &str, instance: Option<planarian_schema::InstanceId>) -> Peer {
+        Peer { uid, admin: false, session: None, agent: Some(name.into()), instance, tty: false }
     }
 
     pub const fn at_terminal(mut self) -> Peer {
@@ -244,9 +248,13 @@ enum ResumeKind {
 impl Resume {
     /// Authenticated principal for expensive-work admission. Launched
     /// agents share the principal and limits of their launching user.
-    pub fn principal(&self) -> PrincipalId { self.principal }
+    pub fn principal(&self) -> PrincipalId {
+        self.principal
+    }
 
-    pub fn administrator(&self) -> bool { self.administrator }
+    pub fn administrator(&self) -> bool {
+        self.administrator
+    }
 
     /// A few words for "busy with …".
     pub fn describe(&self) -> String {
@@ -284,7 +292,8 @@ fn expectation_after(record: &LogRecord, state: &SystemState, defs: &UnitDefs) -
     }
     if expected.others_unchanged {
         for (unit, before) in &record.pre_status {
-            if *before == UnitStatus::Running && !expected.may_change.contains(unit)
+            if *before == UnitStatus::Running
+                && !expected.may_change.contains(unit)
                 && state.status(unit, defs) != UnitStatus::Running
             {
                 missed.push(format!("{unit}: previously Running, observed {:?}", state.status(unit, defs)));
@@ -550,7 +559,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         if let Response::Done { txn, state, message, evidence } = &mut response {
             let operation = self.ex.kernel.journal.ledger().operation_outcome(*txn);
             *evidence = Some(planarian_ipc::ExecutionEvidence {
-                format: 1, operation: operation.clone(), expectation: None, post_status: None,
+                format: 1,
+                operation: operation.clone(),
+                expectation: None,
+                post_status: None,
             });
             if *state != TxnState::Committed {
                 return response;
@@ -1437,7 +1449,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             // of the user who started it, judged as that user with no login
             // session and no terminal. One the journal has no start for is
             // granted nothing.
-            let Some(by) = self.ledger().agent_for(name) else {
+            // Bound to the instance the peer runs in, never the name (I24).
+            let instance = peer.instance.map(|i| i.0).unwrap_or_default();
+            let Some(by) = self.ledger().agent_for(name, instance) else {
                 let actor = Actor::Agent(agent_principal(name));
                 return Authorization { principal: actor.principal(), actor, capabilities: Capabilities::default() };
             };
@@ -1739,9 +1753,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     Source::User,
                     "from the CLI".into(),
                 );
-                // Denial or a parked request has no incident-control effect.
-                // LiftOverride has no backend operation: Committed witnesses
-                // the authorized, durable OverrideLifted record.
+                // Only successful authorized release changes incident control
+                // state; LiftOverride's durable commit witnesses that action.
                 if !matches!(&r, Response::Done { state: TxnState::Committed, .. }) {
                     return r;
                 }
@@ -1836,50 +1849,48 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         message: "agent run <name> -- <command>: the name is 1-32 of a-z, 0-9 and -".into(),
                     };
                 }
-                // A failed same-name launch must never reattribute an existing
-                // agent to a different user. Names retain their established
-                // owner (the last recorded owner in a historical ledger).
+                // Read authority/registration state before bounded launch work.
+                // A live name cannot be rebound, even by an administrator (I24).
                 let ledger = match self.ex.kernel.journal.sync_ledger() {
-                    Ok(l) => l,
+                    Ok(l) => l.clone(),
                     Err(e) => return Response::Error { message: format!("cannot establish agent owner: {e:?}") },
                 };
-                if ledger.agent_for(&name).is_some_and(|by| by != peer.uid) {
+                if self.b.units().agent_running(&name) {
                     return Response::Rejected {
                         reason: "Unauthorized".into(),
-                        message: "this agent name belongs to another user".into(),
+                        message: match ledger.agent_owner(&name) {
+                            Some(by) => format!("agent {name} is already running, started by uid {by}; stop it first"),
+                            None => format!("agent {name} is already running; stop it first"),
+                        },
                     };
                 }
-                if ledger.agent_for(&name).is_none() {
-                    // Historical ledgers may contain repeated starts of a
-                    // name. Count current distinct ownership, not events.
-                    let owners: BTreeMap<&str, u32> =
-                        ledger.agents.iter().map(|(name, by)| (name.as_str(), *by)).collect();
+                // Reuse of a stopped name cannot confer authority on its old
+                // instance, and a transfer counts against the new caller's cap.
+                let owners: BTreeMap<&str, u32> =
+                    ledger.agents.iter().map(|(name, _, by)| (name.as_str(), *by)).collect();
+                if ledger.agent_owner(&name) != Some(peer.uid) {
                     let owned = owners.values().filter(|by| **by == peer.uid).count();
-                    let (per_caller, total) = if peer.uid == 0 {
-                        (AGENT_NAMES_ROOT, AGENT_NAMES_MAX)
-                    } else {
-                        (AGENT_NAMES_PER_CALLER, AGENT_NAMES_MAX - AGENT_NAMES_ROOT_RESERVE)
-                    };
-                    if owned >= per_caller || owners.len() >= total {
+                    let per_caller = if peer.uid == 0 { AGENT_NAMES_ROOT } else { AGENT_NAMES_PER_CALLER };
+                    let total = if peer.uid == 0 { AGENT_NAMES_MAX } else { AGENT_NAMES_MAX - AGENT_NAMES_ROOT_RESERVE };
+                    if owned >= per_caller || (!owners.contains_key(name.as_str()) && owners.len() >= total) {
                         return Response::Error {
                             message: "registered agent-name capacity reached; reuse an agent name you already own".into(),
                         };
                     }
                 }
-                // Never attach authority to an already-running, possibly
-                // unregistered unit by recording a launch that cannot occur.
-                let agent_unit = UnitId::service(&planarian_schema::backend::agent_unit(&name));
-                if !matches!(self.b.units().observe(&agent_unit), Ok(Observed::Absent | Observed::Bound)) {
-                    return Response::Error { message: "agent name is already active or cannot be inspected".into() };
-                }
-                // No launch without a durable start: an ignored journal error
-                // cannot confer the launching user's authority.
-                let at = self.b.clock().now();
-                if let Err(e) = self.ex.kernel.journal.append(at, Record::AgentStarted { name: name.clone(), by: peer.uid }) {
-                    return Response::Error { message: format!("cannot journal agent start: {e:?}") };
-                }
                 match self.b.units().start_agent(&name, &argv, peer.uid) {
-                    Outcome::Succeeded => {
+                    Ok(instance) => {
+                        // I24: only the actual successfully started instance
+                        // acquires its user's authority, after a durable append.
+                        // A failed append leaves the unit unprivileged.
+                        let at = self.b.clock().now();
+                        if let Err(e) = self.ex.kernel.journal.append(at, Record::AgentStarted {
+                            name: name.clone(), instance: instance.0, by: peer.uid,
+                        }) {
+                            return Response::Error {
+                                message: format!("agent started without authority because its instance could not be journaled: {e:?}; stop its unit before retrying"),
+                            };
+                        }
                         self.notice(format!(
                             "agent {name} started by uid {} ({}); it acts with that user's permissions",
                             peer.uid,
@@ -1887,7 +1898,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         ));
                         Response::Ok { message: format!("agent {name} is running with your permissions") }
                     }
-                    other => Response::Error { message: format!("could not start agent {name}: {other:?}") },
+                    Err(other) => Response::Error { message: format!("could not start agent {name}: {other:?}") },
                 }
             }
             Request::Undo => {

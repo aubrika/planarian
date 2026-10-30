@@ -510,7 +510,6 @@ fn journal_full_mid_transaction_writes_the_sentinel() {
     assert!(seen > 0, "no capacity filled the journal mid-transaction");
 }
 
-
 /// Publication must be durably recoverable before any boot selection effect,
 /// including an accepted call whose acknowledgment and reply were lost.
 #[test]
@@ -536,7 +535,8 @@ fn boot_publication_crash_boundaries_remain_tracked_for_both_owners() {
                 assert!(owner.watchdog_should_take_over(&before));
             }
             let end = owner.recover(id, before.lease.epoch).unwrap();
-            let published = matches!(point, CrashPoint::OpCalled(_) | CrashPoint::OpAcked(_) | CrashPoint::State("AwaitingBoot"));
+            let published =
+                matches!(point, CrashPoint::OpCalled(_) | CrashPoint::OpAcked(_) | CrashPoint::State("AwaitingBoot"));
             if published {
                 assert_eq!(end, TxnState::AwaitingBoot, "{point:?}, watchdog={watchdog}");
                 let live = &owner.journal.ledger().live[&id].txn;
@@ -672,9 +672,11 @@ fn withdrawal_effects_with_failed_partial_or_lost_replies_remain_interlocked() {
             assert_eq!(w.one_shot, None);
             assert!(!w.gc_roots.is_empty());
             assert!(owner.journal.ledger().interlocked());
-            assert!(owner.journal.ledger().operations(id).unwrap().iter().any(|operation| {
-                operation.call == "withdraw_boot_once" && operation.ack.as_ref() == Some(&reply)
-            }));
+            assert!(
+                owner.journal.ledger().operations(id).unwrap().iter().any(|operation| {
+                    operation.call == "withdraw_boot_once" && operation.ack.as_ref() == Some(&reply)
+                })
+            );
         }
     }
 }
@@ -803,7 +805,10 @@ fn legacy_built_publication_is_taken_over_as_a_mutation_obligation() {
     let id = daemon.prepare(good_change()).unwrap();
     daemon.wait_built(id, "old format").unwrap();
     let op = OpId { txn: id, epoch: 1, seq: 1 };
-    daemon.journal.append(Timestamp(2), planarian_txn::ledger::Record::OpBegin { op, call: "publish_boot_once".into() }).unwrap();
+    daemon
+        .journal
+        .append(Timestamp(2), planarian_txn::ledger::Record::OpBegin { op, call: "publish_boot_once".into() })
+        .unwrap();
     assert!(rig.host().publish_boot_once(G2, G1, &op).is_success());
     rig.kill(DAEMON);
     let mut watchdog = rig.watchdog();
@@ -911,7 +916,10 @@ fn intentional_boot_parking_has_no_forced_reboot_or_untracked_cancellation() {
     let parked = daemon.journal.ledger().live[&id].txn.clone();
     assert!(!rig.watchdog().watchdog_should_take_over(&parked), "parking waits for an operator-selected reboot");
     assert_eq!(daemon.run(id).unwrap(), TxnState::AwaitingBoot);
-    assert!(daemon.cancel(id, Actor::user(ADMIN)).is_err(), "generic pre-mutation cancellation cannot withdraw a published candidate");
+    assert!(
+        daemon.cancel(id, Actor::user(ADMIN)).is_err(),
+        "generic pre-mutation cancellation cannot withdraw a published candidate"
+    );
     assert_eq!(state_of(&mut daemon, id), TxnState::AwaitingBoot);
     assert_eq!(rig.w().one_shot, Some(G2));
     assert!(rig.w().calls.iter().all(|c| !c.call.starts_with("activate_live")));

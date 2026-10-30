@@ -36,6 +36,53 @@ pkgs.testers.runNixOSTest (
       }
     '';
     gymPkg = pkgs.callPackage ../package.nix { gymHooks = true; };
+    # The daemon establishes approval's controlling terminal from the peer.
+    # Allocate a new session/pty explicitly instead of inheriting driver stdin.
+    onTerminal = pkgs.writeScriptBin "boot-test-terminal" ''
+      #!${pkgs.python3}/bin/python3
+      import errno, os, pty, select, signal, sys, time
+
+      pid, fd = pty.fork()
+      if pid == 0:
+          os.execvp(sys.argv[1], sys.argv[1:])
+      deadline = time.monotonic() + 110
+      status = None
+      output = bytearray()
+      try:
+          while True:
+              remaining = deadline - time.monotonic()
+              if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                  raise TimeoutError("terminal request exceeded 110 seconds")
+              try:
+                  chunk = os.read(fd, 4096)
+              except OSError as error:
+                  if error.errno != errno.EIO:
+                      raise
+                  break
+              if not chunk:
+                  break
+              output.extend(chunk)
+              if len(output) > 512 * 1024:
+                  raise RuntimeError("terminal request output exceeded 512 KiB")
+          while status is None:
+              waited, result = os.waitpid(pid, os.WNOHANG)
+              if waited == pid:
+                  status = result
+              elif time.monotonic() >= deadline:
+                  raise TimeoutError("terminal request did not exit")
+              else:
+                  time.sleep(0.01)
+          sys.stdout.buffer.write(output)
+          sys.exit(os.waitstatus_to_exitcode(status))
+      finally:
+          os.close(fd)
+          if status is None:
+              try:
+                  os.killpg(pid, signal.SIGKILL)
+              except ProcessLookupError:
+                  pass
+              os.waitpid(pid, 0)
+    '';
   in {
     name = "planarian-installed-entries-${recoverer}-${if confirm then "confirmation" else if crashPoint == null then "fallback" else builtins.replaceStrings [ ":" ] [ "-" ] crashPoint}";
     skipTypeCheck = true;
@@ -51,6 +98,9 @@ pkgs.testers.runNixOSTest (
           efi.keepVariables = true;
           diskSize = 24576;
           memorySize = 3072;
+          # With useBootLoader the test has a private store. A path mentioned
+          # only by the host-side testScript is not copied into that store.
+          additionalPaths = [ exports shim ../template/planarian/overrides.nix ];
         };
         boot.loader.grub.enable = lib.mkForce false;
         boot.loader.systemd-boot.enable = true;
@@ -79,12 +129,16 @@ pkgs.testers.runNixOSTest (
         specialisation.candidate.configuration.gym.bootSlot = "g3";
         # Synthetic metadata models a vulnerable G1 and fixed G2/G3 using the
         # normal evaluated package-value inspection; no real CVE is invented.
-        environment.systemPackages = [ pkgs.python3 pkgs.util-linux pkgs.jq (
-          pkgs.runCommand "planarian-boot-fixture-${if config.gym.bootSlot == "g1" then "1" else "2"}" {
-            pname = "planarian-boot-fixture";
+        environment.systemPackages = [ pkgs.python3 pkgs.util-linux pkgs.jq onTerminal (
+          let
             version = if config.gym.bootSlot == "g1" then "1" else "2";
-            meta.knownVulnerabilities = lib.optional (config.gym.bootSlot == "g1") "Synthetic acceptance-only vulnerability";
-          } ''mkdir -p $out/share; touch $out/share/fixture''
+            fixture = pkgs.runCommand "planarian-boot-fixture-${version}" {
+              pname = "planarian-boot-fixture";
+              inherit version;
+            } ''mkdir -p $out/share; touch $out/share/fixture'';
+          in fixture // { meta = (fixture.meta or { }) // {
+            knownVulnerabilities = lib.optional (config.gym.bootSlot == "g1") "Synthetic acceptance-only vulnerability";
+          }; }
         ) ];
       };
     };
@@ -116,7 +170,7 @@ pkgs.testers.runNixOSTest (
           return int(match.group(1))
 
       def variable(name):
-          code = "from pathlib import Path; p=Path('/sys/firmware/efi/efivars/" + name + "-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f'); print(p.read_bytes()[4:].decode('utf-16-le').rstrip('\\0') if p.exists() else '')"
+          code = "from pathlib import Path; p=Path('/sys/firmware/efi/efivars/" + name + "-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f'); print(p.read_bytes()[4:].decode('utf-16-le').rstrip('\\0') if p.exists() else str())"
           return machine.succeed("python3 -c " + shlex.quote(code)).strip()
 
       def profile_entry(path):
@@ -141,7 +195,7 @@ pkgs.testers.runNixOSTest (
           response = json.loads(machine.succeed("runuser -u proposer -- planarian --json apply gym:boot-slot slot=g" + str(slot)))
           if response["kind"] == "needs-approval":
               command = "planarian --json approve " + response["approve"]
-              code, output = machine.execute("timeout -k 5 120 script -qec " + shlex.quote(command) + " /dev/null </dev/null")
+              code, output = machine.execute("timeout -k 5 120 boot-test-terminal " + command + " </dev/null")
               print("approval exit/output", code, output)
               if not (slot == 3 and crash is not None):
                   assert code == 0, output
@@ -154,7 +208,7 @@ pkgs.testers.runNixOSTest (
       machine.succeed("grep -q planarian-boot-slot=g1 /proc/cmdline")
       machine.succeed("test \"$(readlink -f /run/booted-system)\" = ${g1}")
       machine.succeed("mkdir -p /etc/nixos/planarian", "install -m644 ${shim} /etc/nixos/flake.nix", "install -m644 ${exports} /etc/nixos/exports.json", "install -m644 ${../template/planarian/overrides.nix} /etc/nixos/planarian/overrides.nix", "ln -s ${g1} /etc/nixos/g1", "ln -s ${g2} /etc/nixos/g2", "ln -s ${g3} /etc/nixos/g3")
-      machine.succeed("script -qec 'planarian mark-good' /dev/null </dev/null")
+      machine.succeed("timeout -k 5 120 boot-test-terminal planarian mark-good </dev/null")
       g1_id = status()["generation"]
       assert status()["known_good"] == g1_id
 
@@ -192,6 +246,10 @@ pkgs.testers.runNixOSTest (
               assert floor() == g2_id
           with subtest("publication crash boundaries remain tracked or prove withdrawal"):
               machine.succeed("systemctl stop planarian-recovery", "mkdir -p /run/systemd/system/planariad.service.d", "printf '[Service]\\nRestart=no\\n' > /run/systemd/system/planariad.service.d/boot-test.conf", "systemctl daemon-reload")
+              if recoverer == "daemon":
+                  # planariad Wants recovery; merely stopping it lets it race
+                  # the intended daemon recovery when planariad starts again.
+                  machine.succeed("systemctl mask --runtime planarian-recovery.service")
               if crash is not None:
                   machine.succeed("mkdir -p /run/planarian-gym", "printf '%s' " + shlex.quote(crash) + " > /run/planarian-gym/crash")
               else:
@@ -235,6 +293,10 @@ pkgs.testers.runNixOSTest (
                   machine.shutdown()
                   machine.start()
                   machine.wait_for_unit("multi-user.target")
+                  if recoverer == "daemon":
+                      # Runtime masks do not survive reboot. Both monitors are
+                      # still held by the failure marker until it is removed.
+                      machine.succeed("systemctl mask --runtime planarian-recovery.service")
                   machine.succeed("grep -q planarian-boot-slot=g2 /proc/cmdline", "test \"$(readlink -f /run/booted-system)\" = ${g2}", "rm /var/lib/boot-test-no-monitor")
                   if recoverer == "watchdog":
                       machine.succeed("systemctl start planarian-recovery")

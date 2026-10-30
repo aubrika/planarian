@@ -212,6 +212,12 @@ pub struct World {
     /// I23: a third party rewrites the override file once the next boot
     /// entry is published; the hash of what it wrote.
     pub third_party_on_publish: bool,
+    /// The running instance of each agent's unit (I24), as the agent's
+    /// processes would show it in their cgroup.
+    pub agent_instances: BTreeMap<String, InstanceId>,
+    /// The next build's dry activation fails this way (R10).
+    pub dry_activate_fails: Option<String>,
+    pub next_instance: u64,
     pub third_party_override: Option<Hash>,
     /// Units planted outside the generation (the boot report finds them).
     pub foreign_units: Vec<String>,
@@ -647,12 +653,28 @@ impl UnitBackend for Fake {
         Ok(self.w().units.keys().cloned().collect())
     }
 
-    fn start_agent(&self, name: &str, _argv: &[String], _by: u32) -> Outcome {
+    fn start_agent(&self, name: &str, _argv: &[String], _by: u32) -> Result<InstanceId, Outcome> {
         let mut w = self.w();
         let now = w.now;
         let id = UnitId::service(&format!("planarian-agent-{name}"));
+        if w.units.get(&World::key(&id)).is_some_and(|u| matches!(u.observed, Observed::Active)) {
+            return Err(Outcome::Failed("agent unit is already running".into()));
+        }
         w.units.insert(World::key(&id), UnitSim::active(now));
-        Outcome::Succeeded
+        // A fresh InvocationID per start, as systemd gives one.
+        w.next_instance += 1;
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&w.next_instance.to_be_bytes());
+        b[8] = 0xa9;
+        let inst = InstanceId(b);
+        w.agent_instances.insert(name.to_string(), inst);
+        Ok(inst)
+    }
+
+    fn agent_running(&self, name: &str) -> bool {
+        let w = self.w();
+        let id = UnitId::service(&format!("planarian-agent-{name}"));
+        w.units.get(&World::key(&id)).is_some_and(|u| matches!(u.observed, Observed::Active))
     }
 
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome {
@@ -737,6 +759,11 @@ impl GenerationBackend for Fake {
         w.builds += 1;
         if std::mem::take(&mut w.nospace_on_build) {
             return Err(Outcome::Failed("error: writing to file: No space left on device".into()));
+        }
+        // R10: the dry activation failed, timed out or was cut short; the
+        // real backend refuses the plan, so this one does too.
+        if let Some(why) = w.dry_activate_fails.take() {
+            return Err(Outcome::Failed(why));
         }
         let staged = w
             .staged
@@ -921,7 +948,10 @@ impl GenerationBackend for Fake {
     }
 
     fn read_override(&self, hash: &Hash) -> Result<OverrideSet, Outcome> {
-        self.w().override_store.get(hash).cloned()
+        self.w()
+            .override_store
+            .get(hash)
+            .cloned()
             .ok_or_else(|| Outcome::Unknown("override content is unavailable".into()))
     }
 
@@ -1333,3 +1363,20 @@ pub fn gym_world(store: MemStore) -> Fake {
 }
 
 pub mod fixtures;
+
+#[cfg(test)]
+mod agent_instance_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_same_name_start_cannot_replace_a_live_instance() {
+        let fake = gym_world(MemStore::new(1 << 20));
+        let first = fake.start_agent("helper", &["sleep".into()], 1000).unwrap();
+        assert!(fake.start_agent("helper", &["sleep".into()], 0).is_err());
+        assert_eq!(fake.w().agent_instances.get("helper"), Some(&first));
+        let unit = UnitId::service("planarian-agent-helper");
+        fake.w().units.get_mut(&World::key(&unit)).unwrap().observed = Observed::Bound;
+        let next = fake.start_agent("helper", &["sleep".into()], 0).unwrap();
+        assert_ne!(next, first);
+    }
+}

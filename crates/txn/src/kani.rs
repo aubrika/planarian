@@ -50,8 +50,12 @@ fn any_strategy() -> RecoveryStrategy {
 fn in_window(s: &TxnState) -> bool {
     matches!(
         s,
-        TxnState::Activating | TxnState::Checking | TxnState::PublishingBoot | TxnState::Published
-            | TxnState::Promoted | TxnState::Reverting
+        TxnState::Activating
+            | TxnState::Checking
+            | TxnState::PublishingBoot
+            | TxnState::Published
+            | TxnState::Promoted
+            | TxnState::Reverting
     )
 }
 

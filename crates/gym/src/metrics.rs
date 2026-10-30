@@ -129,7 +129,11 @@ impl fmt::Display for Metrics {
             100.0 * self.passed as f64 / self.runnable.max(1) as f64,
             self.partial
         )?;
-        writeln!(f, "  repair rate: {}/{} repair entries with verified required postconditions", self.repaired, self.repair_entries)?;
+        writeln!(
+            f,
+            "  repair rate: {}/{} repair entries with verified required postconditions",
+            self.repaired, self.repair_entries
+        )?;
         writeln!(f, "  operation outcomes (independent of lifecycle/health): {:?}", self.operation_outcomes)?;
         writeln!(
             f,
@@ -142,9 +146,18 @@ impl fmt::Display for Metrics {
         let mut t = self.time_to_repair.clone();
         t.sort();
         if !t.is_empty() {
-            writeln!(f, "  time to sampled health satisfaction: median {} s, max {} s (simulated time)", t[t.len() / 2], t[t.len() - 1])?;
+            writeln!(
+                f,
+                "  time to sampled health satisfaction: median {} s, max {} s (simulated time)",
+                t[t.len() / 2],
+                t[t.len() - 1]
+            )?;
         }
-        writeln!(f, "  repair latency unmeasured: {} passing repair entries without required-unit timeline evidence", self.repair_time_unmeasured)?;
+        writeln!(
+            f,
+            "  repair latency unmeasured: {} passing repair entries without required-unit timeline evidence",
+            self.repair_time_unmeasured
+        )?;
         let max = self.restarts.iter().max_by_key(|(_, n)| **n);
         if let Some((u, n)) = max {
             writeln!(
@@ -167,7 +180,6 @@ impl fmt::Display for Metrics {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,11 +199,14 @@ mod tests {
     fn repair_time_comes_from_health_samples_and_rejects_missing_or_failed_samples() {
         let entry: T = "[required_post.units]\n'service:gym-web' = 'Running'".parse().unwrap();
         let unit = UnitId::service("gym-web");
-        let mut timeline = BTreeMap::from([(unit.clone(), vec![
-            (Timestamp(0), "Running".into()),
-            (Timestamp(1000), "Failed".into()),
-            (Timestamp(19_000), "Running".into()),
-        ])]);
+        let mut timeline = BTreeMap::from([(
+            unit.clone(),
+            vec![
+                (Timestamp(0), "Running".into()),
+                (Timestamp(1000), "Failed".into()),
+                (Timestamp(19_000), "Running".into()),
+            ],
+        )]);
         assert_eq!(health_satisfied_at(&entry, &timeline), Some(Timestamp(19_000)));
         timeline.get_mut(&unit).unwrap().push((Timestamp(20_000), "Unknown".into()));
         assert_eq!(health_satisfied_at(&entry, &timeline), None);

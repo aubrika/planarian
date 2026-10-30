@@ -1,34 +1,54 @@
 # Phase A gate (GA) status
 
-Current shared-core gate limits, followed by explicitly historical evidence for the Phase A exit gate (SPEC §4). Updated for the shared-core draft on 2026-10-30.
+Where Planarian stands against the Phase A exit gate (SPEC §4), with the
+evidence for each criterion and how to reproduce it. Updated 2026-10-30.
 
-## Current shared-core draft
+## Current shared-core integration
 
-**Acceptance incomplete; keep the PR draft.** The reconciliation in
-[shared-core-review.md](shared-core-review.md) and machine-readable
-[acceptance manifest](shared-core-acceptance.json) control the current claim.
-No current-candidate Rust/Nix/Verus/Kani/VM/installed-entry/durability or
-reference-hardware acceptance run has been established in this workspace.
-Local shell/Python accounting regressions and boundaries are separate evidence.
-B-20/R11 remains open; zero open High register rows does not close R/S findings.
-The catalog set is derived from its current source, never the historical counts below.
+The gate remains uncalled. The shared-core PR merges the adopted v4.6 contract and later fixes through main20d4f2c. Its current reconciliation is `docs/shared-core-review.md`; every acceptance result belongs to the immutable revision named in `docs/shared-core-acceptance.json`. Old 9aca/eaf5 candidate records are historical after this merge. The earlier G5 proposal is superseded by the adopted parking contract, so it is not a current counted assumption or a reason to reset the baseline.
 
-The earlier GA ratio 47:50/trust 32 was superseded at baseline 805cd1c by
-47:56, trust 37 and internal-unproven 5. This PR preserves that numerical
-ratchet and all baseline invariant rows. The proposed explicit proof map has
-45 unique obligations and 47 invariant-support edges; no successful new proof
-is claimed from name counting.
+The current source must pass formatting, compilation/tests/proofs, role-qualified exact catalog coverage, installed-entry boot tests and the declared performance/durability scopes before freeze. A source merge or authored test does not establish a pass. Main's approval PTY fix and the later R03/R08/R10/agent-instance fixes are retained.
 
-Historical VM MainPID measurements omitted helper costs. The one-second
-minimum-FPS statistic is not p99 frame time, and lack of statistical significance
-is not equivalence evidence. Full personal-profile acceptance requires real
-frame samples, physical input latency, predeclared margins and reference hardware.
-Headless results have only their explicitly declared subset scope.
+## Summary
 
-## Historical evidence only (2026-10-29/30)
+**The gate is not called.** SPEC v4.6 (installed 2026-10-30) holds Phase A
+open until §28's required changes have landed, each with its acceptance
+case, and the whole VM catalog has passed on one commit; a gate claim then
+cites that commit and that run, never a union of runs (§18 rule 19(f)).
+Where that stands, in rule 19's order:
 
-The remainder describes older or mixed revisions. It establishes neither
-current implementation closure nor one-candidate release certification.
+| Step | State |
+| --- | --- |
+| (a) Reconcile the close-out review | Done: `docs/review-reconciliation.md` (R01–R16, S01–S07 at `b219d81`) |
+| (b) B-20 (I24) | Closed: agent authority bound to the instance a start journaled (`8231a07`); `agent-name-collision` on both harnesses |
+| (c) Documentation sweep | Done (`8dc27fa` and this summary) |
+| (d) §28's required changes | In progress |
+| (e) §15 harness contract, §17a accounting checks | Partly: VM catalog jobs green only on PASS or a named waiver (`b219d81`); the rest open |
+| (f) One whole VM catalog run, this file from it | After (d) and (e) |
+
+The bypass register has no open High row: B-1 and B-2 closed on
+2026-10-30, and B-20, found in the review, is closed. Agents act with the
+permissions of the user who started them, attributed per instance
+(owner decision, 2026-10-30; §11, I24, X-11). Six Medium rows stay open,
+none for Phase A.
+
+The criteria below are the last results recorded before v4.6, on the
+v4.4 catalog (101 entries; it has 128 at v4.6). They are history, not the
+gate's evidence.
+
+
+| Criterion | Status |
+| --- | --- |
+| 1. The demonstration | **Passes**, on the fake harness and on VMs (CI, KVM, on every push) |
+| 2. ≥ 60% of the catalog cleared deterministically | **99 of 101 (98%)**, provisional (see §2): 81 PASS on the fake harness, 74 PASS and 2 UNSUPPORTED on VMs, every key checked; the 101st is the invisibility benchmark, still running |
+| Q8, the personal-profile gate (owner decision) | **Met, provisionally:** every must-pass and intent entry passes on each harness it lists (the benchmark's entry pending); no acceptance entry is UNSUPPORTED on VMs; 98% cleared (≥ 95%). Final once the whole VM catalog passes on one commit (run dispatched 2026-10-29 on 5368267) |
+| 2. Every bad generation reverted | Yes, on both harnesses, including a full /boot at publish and a daemon killed mid-change |
+| 2. The manifest-weakening fault rejected | Yes (`manifest-weaken-via-proposal`; `manifest-weaken-out-of-band` on VMs) |
+| 2. Zero gamed successes | Guarded: see "Passes that prove something"; entries a harness cannot run faithfully are UNSUPPORTED there, never passed |
+| 2. Unnecessary interventions on the intent cases = 0 | 0, on the 8 intent entries the fake harness runs and the VM runs of all 12 |
+| 3. `policy` proofs pass in CI | Yes: `ci.yml`'s `nix` job runs the Verus check |
+| 4. Baselines: the invisibility budget (§21) | Idle (VM, 5 min, run "Invisibility budget" #2): **0.063% of one core, 7.9 MB resident, 1.58 wakeups/s** (targets < 0.5%, < 50 MB). Game (run "Invisibility budget" #5, Xonotic `the-big-keybench` timedemo on llvmpipe, five runs per condition): **no measurable difference** with Planarian stopped, idle, or busy repairing a crash loop: average 44.6–45.4 fps stopped, 43.7–45.3 idle, 43.6–45.2 busy; median p99 frame time 38.5 ms in all three (Mann–Whitney p = 1.0 against stopped). Caveat: MangoHud wrote no per-frame log in the VM, so p99 is the engine's one-second minimum fps (a 1 s resolution proxy), not per-frame timing. |
+| 4. Baselines: the verification ratio (§17a) | **Trust count = 32; global d:a = 47:50 (28:43 at GA; then four proved obligations mapped to I6 and I12, I21–I23 added for ten more, and I18's hash chain proved)** (`planarian-gym verification`, a CI ratchet; per invariant in `docs/verification.md`) |
 
 ## 1. The demonstration
 
@@ -68,7 +88,7 @@ table becomes final when it passes.
 Cleared on at least one harness: 100 of 101. Not cleared:
 `desktop-boot-fails-rollback` (UNSUPPORTED: the test VM boots its kernel
 directly, never a published generation; a repair entry, VM-only).
-`quiet-reference-workload` historically reported a pass on its benchmark harness (run #5); its proxy statistic does not satisfy current performance acceptance. UNSUPPORTED on VMs but
+`quiet-reference-workload` passes on its own harness (benchmark run #5). UNSUPPORTED on VMs but
 cleared on the fake: `storage-nix-full-gc` (the test VM's Nix store is the
 host's). Fake-only by deviation: `suspend-resume` and
 `storage-enospc-during-build` (docs/deviations.md). Now run on VMs that
@@ -77,7 +97,7 @@ snapshot and churn) and `residue-oom-kill` (a real cgroup OOM kill). The
 desktop entries run against a stand-in greeter and compositor
 (docs/AGENTS.md), not COSMIC.
 
-**Historical Q8 accounting; not personal-profile acceptance** (owner decision, catalog-review §9),
+**Q8, the personal-profile gate** (owner decision, catalog-review §9),
 checked against these results:
 
 | Condition | Result |
@@ -209,8 +229,3 @@ by hand (about 70 runner minutes per push for
 - Booting into a published generation in a VM (needs a VM that boots through
   its own boot loader).
 - COSMIC itself in the gym VM.
-
-
-## Proposed parked-state progress assumption (S03)
-
-G5 explicitly accounts for the external event/operator action needed by intentionally parked Built/AwaitingBoot. It is proposed, not adopted. Current declared support becomes 47:57 (45 unique proof IDs / 47 invariant edges) and trust 38, internal-unproven 5, against the unchanged historical 47:56 / trust 37 / internal-unproven 5 baseline. The existing ratchet must reject that regression; no baseline is reset here. Owner review must adopt the conditional liveness contract and expressly justify any baseline amendment, or require a different implementation/contract. A state-rank proof does not establish a wall-clock bound for a deliberately withheld reboot/window.

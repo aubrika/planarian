@@ -92,6 +92,18 @@ fn historical_interlock_does_not_invent_candidate_root_evidence() {
 }
 
 #[test]
+fn historical_agent_records_keep_their_shape_without_instance_authority() {
+    let old = r#"{"AgentStarted":{"name":"legacy","by":1000}}"#;
+    let record: Record = serde_json::from_str(old).unwrap();
+    assert_eq!(serde_json::to_string(&record).unwrap(), old);
+    let mut journal = Journal::open(MemStore::new(1 << 20)).unwrap();
+    journal.append(Timestamp(1), record).unwrap();
+    assert_eq!(journal.ledger().agent_owner("legacy"), Some(1000));
+    assert_eq!(journal.ledger().agent_for("legacy", [0; 16]), None);
+    assert_eq!(journal.ledger().agent_for("legacy", [1; 16]), None);
+}
+
+#[test]
 fn repeated_agent_launches_keep_one_registration_through_replay_and_compaction() {
     let store = MemStore::new(1 << 20);
     let mut journal = Journal::open(store.clone()).unwrap();
@@ -99,13 +111,15 @@ fn repeated_agent_launches_keep_one_registration_through_replay_and_compaction()
     for n in 0..300u64 {
         let name = format!("agent-{}", n % 3);
         let by = if n % 2 == 0 { ALICE } else { ADMIN };
-        journal.append(Timestamp(n), Record::AgentStarted { name: name.clone(), by }).unwrap();
-        owners.insert(name, by);
+        let mut instance = [0; 16];
+        instance[..8].copy_from_slice(&(n + 1).to_be_bytes());
+        journal.append(Timestamp(n), Record::AgentStarted { name: name.clone(), instance, by }).unwrap();
+        owners.insert(name, (instance, by));
         assert_eq!(journal.ledger().agents.len(), owners.len());
     }
     assert_eq!(journal.segment().unwrap().len(), 300, "every accepted launch retains its own journal record");
     assert_eq!(journal.ledger().last_seq, 300);
-    assert_eq!(journal.ledger().agents.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(), owners);
+    assert_eq!(journal.ledger().agents.iter().map(|(name, instance, by)| (name.clone(), (*instance, *by))).collect::<std::collections::BTreeMap<_, _>>(), owners);
     let ledger = journal.ledger().clone();
     let head = journal.head();
     drop(journal);
@@ -115,8 +129,9 @@ fn repeated_agent_launches_keep_one_registration_through_replay_and_compaction()
     let compacted = Journal::open(store).unwrap();
     assert_eq!(compacted.ledger(), &ledger);
     assert_eq!(compacted.head(), head);
-    for (name, by) in owners {
-        assert_eq!(compacted.ledger().agent_for(&name), Some(by));
+    for (name, (instance, by)) in owners {
+        assert_eq!(compacted.ledger().agent_for(&name, instance), Some(by));
+        assert_eq!(compacted.ledger().agent_for(&name, [0; 16]), None);
     }
 }
 
@@ -539,7 +554,6 @@ fn erased_middle_header_is_an_integrity_failure() {
     s.write_at(offs[2], &[0u8; 16]).unwrap();
     assert!(matches!(Journal::open(s), Err(JournalError::Integrity(_))));
 }
-
 
 /// D03: checkpoint compaction must preserve actual acknowledgments. An old
 /// archive with no such evidence stays unknown, regardless of Committed.

@@ -259,9 +259,11 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             return Err(reject(RejectReason::NotInCatalog, "not in the active catalog"));
         }
         let admitted = match &authz.actor {
-            Actor::User { .. } => authz.capabilities.administrator
-                || (authz.capabilities.user_controllable
-                    && self.cfg.settings.user_controllable_changes.contains(change)),
+            Actor::User { .. } => {
+                authz.capabilities.administrator
+                    || (authz.capabilities.user_controllable
+                        && self.cfg.settings.user_controllable_changes.contains(change))
+            }
             Actor::Agent(_) | Actor::Unattributed => false,
             _ => true,
         };
@@ -596,11 +598,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     /// The slow part of planning `t`, to run elsewhere: `Some` for a catalog
     /// change, whose staging, evaluation and build can take minutes. Hand
     /// its result to `prebuilt` before submitting `t`.
-    pub fn prebuild_job(
-        &self,
-        t: &Transition,
-        authz: &Authorization,
-    ) -> Result<Option<PrebuildJob<B::Gens>>, Submitted>
+    pub fn prebuild_job(&self, t: &Transition, authz: &Authorization) -> Result<Option<PrebuildJob<B::Gens>>, Submitted>
     where
         B::Gens: Clone,
     {
@@ -608,7 +606,10 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             return Ok(None);
         }
         self.admit_catalog(t, authz)?;
-        let (live, live_hash) = self.b.generations().read_overrides()
+        let (live, live_hash) = self
+            .b
+            .generations()
+            .read_overrides()
             .map_err(|o| reject(RejectReason::Other("overrides".into()), outcome_msg(o)))?;
         Ok(Some(PrebuildJob {
             gens: self.b.generations().clone(),
@@ -632,9 +633,13 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         }
         self.last = None;
         if matches!(p.transition, Transition::CollectGarbage { .. })
-            && self.kernel.journal.ledger().interlock.values().any(|pending| {
-                pending.transition.changes_generation() && pending.evidence_version != 1
-            })
+            && self
+                .kernel
+                .journal
+                .ledger()
+                .interlock
+                .values()
+                .any(|pending| pending.transition.changes_generation() && pending.evidence_version != 1)
         {
             self.prebuilt = None;
             return reject(
@@ -783,19 +788,27 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             Ok(g) if Some(g) == base => match gens.preflight_existing(built.generation, &built.path) {
                 Ok(now) => {
                     let same = now.generation == built.generation
-                        && now.path == built.path && now.activation == built.activation;
-                    if now.root != built.root { gens.release_root(&now.root); }
+                        && now.path == built.path
+                        && now.activation == built.activation;
+                    if now.root != built.root {
+                        gens.release_root(&now.root);
+                    }
                     same
                 }
                 Err(_) => false,
             },
             _ => false,
         };
-        if valid { return None; }
+        if valid {
+            return None;
+        }
         match self.kernel.reject(id, RejectReason::Stale) {
             Ok(_) => {
                 self.release(plan);
-                Some(reject(RejectReason::Stale, "activation preflight changed or became unavailable; resubmit the change"))
+                Some(reject(
+                    RejectReason::Stale,
+                    "activation preflight changed or became unavailable; resubmit the change",
+                ))
             }
             Err(e) => Some(Self::kernel_error(e)),
         }
@@ -935,15 +948,13 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         if self.kernel.journal.ledger().tokens_used.iter().any(|(n, _)| *n == nonce) {
             return reject(RejectReason::Other("approval".into()), "this approval was already used");
         }
-        if let Err(e) = self.kernel.journal.append(
-            now,
-            Record::TokenUsed { nonce, expires: parked.issued.plus(TOKEN_LIFETIME) },
-        ) {
+        if let Err(e) =
+            self.kernel.journal.append(now, Record::TokenUsed { nonce, expires: parked.issued.plus(TOKEN_LIFETIME) })
+        {
             // The original candidate is still parked. A deterministic
             // rebuild may reuse its exact root; keep that durable obligation
             // rooted while discarding only a distinct temporary preflight.
-            let held = self.kernel.journal.ledger().live.get(&parked.txn)
-                .and_then(|t| t.txn.gc_root.as_ref());
+            let held = self.kernel.journal.ledger().live.get(&parked.txn).and_then(|t| t.txn.gc_root.as_ref());
             if plan.built.as_ref().is_some_and(|b| Some(&b.root) != held) {
                 self.release(&plan);
             }

@@ -100,7 +100,7 @@ jobs:
              malicious-decl-owner-rebuild, malicious-decl-catalog-enable, malicious-decl-input-update,
              residue-stop-security-unit, residue-kill9-security,
              gc-during-approval, agent-run-own-principal, agent-has-its-users-permissions,
-             probe-http-503-degraded, floor-service-package-fix]
+             probe-http-503-degraded, floor-service-package-fix, approve-at-terminal-runs, agent-name-collision]
     steps:
       - uses: actions/checkout@v4
       - name: Enable KVM
@@ -169,6 +169,7 @@ jobs:
         run: |
           cat verdict/verdict.json
           python3 nix/gym/acceptance.py check --harness vm --id "${{ matrix.id }}" --waivers docs/acceptance-waivers.toml verdict/verdict.json
+          jq -r '"\(.id): \(.result)"' verdict/verdict.json >> "$GITHUB_STEP_SUMMARY"
       # Best effort: the verdict is in the log above too, and a private
       # repository's artifact storage is small (the evidence is not uploaded).
       - uses: actions/upload-artifact@v4

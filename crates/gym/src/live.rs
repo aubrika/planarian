@@ -684,9 +684,8 @@ fn posture_seen(cfg: &FileConfig, since_unix: u64) -> crate::evidence::PostureSe
     p
 }
 
-/// Send a request as `actor` from a process that has a controlling terminal
-/// (`script` allocates one) or that has none (`setsid`, a new session): the
-/// daemon reads which from the process (§11, B-3).
+/// Send a request as `actor` from a fresh controlling PTY/session or a
+/// session without a terminal. The daemon derives terminal identity (§11).
 fn request_at(actor: &str, req: &Request, tty: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "planarian-gym".into());
     let json = serde_json::to_string(req).expect("serializes");
@@ -699,14 +698,19 @@ fn request_at(actor: &str, req: &Request, tty: bool) -> Result<(), String> {
         format!("runuser -u {user} -- {exe} vm request --json '{q}'")
     };
     std::fs::write(&script, format!("#!/bin/sh\nexec {inner}\n")).map_err(|e| e.to_string())?;
-    sh(&format!("chmod +x {}", script.display()));
-    // Never give the terminal allocator the test driver's control input.
-    // Bound the whole child tree as well as the socket's 600-second read:
-    // an approval transport failure must become evidence, not a silently
-    // ignored 900-second driver timeout with a still-Prepared candidate.
+    if !sh(&format!("chmod +x {}", script.display())) {
+        return Err("cannot make terminal request executable".into());
+    }
+    let helper = PathBuf::from(RUN).join("on-a-terminal.py");
+    if tty {
+        std::fs::write(&helper, ON_A_TERMINAL).map_err(|e| e.to_string())?;
+    }
+    // The subprocess runner supplies null stdin and bounds the complete
+    // process group, output and socket wait, independently of driver stdin.
     let path = script.to_string_lossy().into_owned();
+    let helper_path = helper.to_string_lossy().into_owned();
     let argv = if tty {
-        vec!["script", "-qec", path.as_str(), "/dev/null"]
+        vec!["python3", helper_path.as_str(), path.as_str()]
     } else {
         vec!["setsid", "-w", path.as_str()]
     };
@@ -716,10 +720,36 @@ fn request_at(actor: &str, req: &Request, tty: bool) -> Result<(), String> {
     if output.ok() {
         Ok(())
     } else {
-        Err(format!("terminal request as {user} failed (status {:?}, timed_out {}): {}",
-            output.status, output.timed_out, output.tail()))
+        Err(format!(
+            "terminal request as {user} failed (status {:?}, timed_out {}): {}",
+            output.status,
+            output.timed_out,
+            output.tail()
+        ))
     }
 }
+
+/// A session-leading child gets the PTY as its controlling terminal. Stream
+/// output to the bounded outer runner instead of accumulating it in memory.
+const ON_A_TERMINAL: &str = r#"import errno, os, pty, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], [sys.argv[1]])
+while True:
+    try:
+        b = os.read(fd, 4096)
+    except OSError as error:
+        if error.errno == errno.EIO:
+            break
+        raise
+    if not b:
+        break
+    sys.stdout.buffer.write(b)
+    sys.stdout.buffer.flush()
+os.close(fd)
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+"#;
 
 /// Send a request as the step's actor and record the answer.
 fn request_as(actor: &str, req: &Request) -> Result<(), String> {

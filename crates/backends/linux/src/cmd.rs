@@ -10,11 +10,14 @@ pub struct Output {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// More output than the retained budget arrived, or a stream was unreadable.
+    /// Incomplete evidence cannot establish a successful helper result (rule 21).
+    pub truncated: bool,
 }
 
 impl Output {
     pub fn ok(&self) -> bool {
-        self.status == Some(0) && !self.timed_out
+        self.status == Some(0) && !self.timed_out && !self.truncated
     }
 
     /// The last few lines of stderr (or stdout), for an error message.
@@ -37,7 +40,8 @@ pub fn run(argv: &[&str], timeout: Duration) -> Output {
 pub fn run_limited(argv: &[&str], timeout: Duration, max_output: usize) -> Output {
     let deadline = Instant::now() + timeout;
     let max_output = max_output.min(MAX_OUTPUT);
-    let fail = |e: String| Output { status: None, stdout: String::new(), stderr: e, timed_out: false };
+    let fail =
+        |e: String| Output { status: None, stdout: String::new(), stderr: e, timed_out: false, truncated: false };
     let Some((prog, args)) = argv.split_first() else { return fail("empty command".into()) };
     let mut cmd = Command::new(prog);
     cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -61,9 +65,10 @@ pub fn run_limited(argv: &[&str], timeout: Duration, max_output: usize) -> Outpu
     let (mut out_done, mut err_done) = (false, false);
     let mut exited = None;
     let mut timed_out = false;
+    let mut truncated = false;
     loop {
-        out_done |= drain(&mut out, &mut stdout, max_output);
-        err_done |= drain(&mut err, &mut stderr, max_output);
+        out_done |= drain(&mut out, &mut stdout, max_output, &mut truncated);
+        err_done |= drain(&mut err, &mut stderr, max_output, &mut truncated);
         if exited.is_none() {
             match child.try_wait() {
                 Ok(Some(s)) => exited = Some(s.code()),
@@ -87,7 +92,7 @@ pub fn run_limited(argv: &[&str], timeout: Duration, max_output: usize) -> Outpu
     let status = exited.unwrap_or_else(|| child.wait().ok().and_then(|s| s.code()));
     let stdout = String::from_utf8_lossy(&stdout).into_owned();
     let stderr = String::from_utf8_lossy(&stderr).into_owned();
-    Output { status, stdout, stderr, timed_out }
+    Output { status, stdout, stderr, timed_out, truncated }
 }
 
 fn kill_group(child: &mut std::process::Child) {
@@ -100,7 +105,7 @@ fn kill_group(child: &mut std::process::Child) {
 
 /// Drain a bounded amount per iteration so a continuously writing process
 /// cannot postpone checking the deadline. Retain at most `max_output` bytes.
-fn drain<R: Read>(pipe: &mut R, kept: &mut Vec<u8>, max_output: usize) -> bool {
+fn drain<R: Read>(pipe: &mut R, kept: &mut Vec<u8>, max_output: usize, truncated: &mut bool) -> bool {
     let mut chunk = [0u8; 8192];
     for _ in 0..16 {
         match pipe.read(&mut chunk) {
@@ -108,10 +113,14 @@ fn drain<R: Read>(pipe: &mut R, kept: &mut Vec<u8>, max_output: usize) -> bool {
             Ok(n) => {
                 let take = n.min(max_output.saturating_sub(kept.len()));
                 kept.extend_from_slice(&chunk[..take]);
+                *truncated |= take < n;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return true,
+            Err(_) => {
+                *truncated = true;
+                return true;
+            }
         }
     }
     false
@@ -131,6 +140,9 @@ mod tests {
         assert!(o.timed_out && !o.ok());
         let o = run_limited(&["sh", "-c", "yes | head -c 100000"], Duration::from_secs(5), 10);
         assert_eq!(o.stdout.len(), 10);
+        assert!(o.truncated && !o.ok());
+        let exact = run_limited(&["sh", "-c", "printf 1234567890"], Duration::from_secs(1), 10);
+        assert!(!exact.truncated && exact.ok());
         assert!(!run(&["/nonexistent"], Duration::from_secs(1)).ok());
     }
     #[test]
@@ -142,5 +154,4 @@ mod tests {
         assert!(o.timed_out);
         assert!(start.elapsed() < Duration::from_secs(1));
     }
-
 }

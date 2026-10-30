@@ -170,7 +170,9 @@ pub fn peer(actor: &str) -> Peer {
     };
     if let Some(name) = who.strip_prefix("agent:") {
         // A dynamic uid, as systemd would give it.
-        return Peer::agent(61184, name);
+        // Its instance is filled in when it sends (`request_peer`): the
+        // running unit's, as its cgroup would show it.
+        return Peer::agent(61184, name, None);
     }
     let p = match who {
         "root" => Peer::new(0, true),
@@ -595,7 +597,10 @@ impl Sim {
         self.request_peer(peer(actor), req)
     }
 
-    fn request_peer(&mut self, p: Peer, req: Request) -> Result<(), Unsupported> {
+    fn request_peer(&mut self, mut p: Peer, req: Request) -> Result<(), Unsupported> {
+        if let (Some(name), None) = (&p.agent, p.instance) {
+            p.instance = self.fake.w().agent_instances.get(name).copied();
+        }
         let Some(core) = self.core.as_mut() else { return Err(Unsupported("request while the daemon is down".into())) };
         core.ex.kernel.crash_at = self.crash.clone();
         let r = core.handle(p, req);
@@ -1086,6 +1091,9 @@ impl Sim {
                         value: Value::Str("1.25".into()),
                         effect: planarian_fake::Effect::TouchCore,
                     });
+                }
+                ("dry_activate", r @ ("exit-nonzero" | "timeout" | "truncated")) => {
+                    self.fake.w().dry_activate_fails = Some(format!("dry activation: {r}"));
                 }
                 ("activate_live", "Failed") => {
                     let base = self.base;

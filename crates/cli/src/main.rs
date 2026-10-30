@@ -248,9 +248,17 @@ fn print_status(r: &StatusReport) {
 fn response_code(resp: &Response) -> i32 {
     match resp {
         Response::Done { state: TxnState::Committed, evidence: Some(evidence), .. }
-            if evidence.format == 1 && evidence.operation.is_success() => 0,
-        Response::Done { state: TxnState::Committed | TxnState::Reverted | TxnState::RecoveryFailed | TxnState::Rejected(_), .. }
-        | Response::Rejected { .. } | Response::Unmatched { .. } | Response::Error { .. } => 1,
+            if evidence.format == 1 && evidence.operation.is_success() =>
+        {
+            0
+        }
+        Response::Done {
+            state: TxnState::Committed | TxnState::Reverted | TxnState::RecoveryFailed | TxnState::Rejected(_),
+            ..
+        }
+        | Response::Rejected { .. }
+        | Response::Unmatched { .. }
+        | Response::Error { .. } => 1,
         _ => 0,
     }
 }
@@ -403,23 +411,39 @@ mod tests {
     fn committed_failure_and_unknown_evidence_are_nonzero_in_text_and_json() {
         use planarian_ipc::ExecutionEvidence;
         use planarian_schema::Outcome;
-        for operation in [Outcome::Failed("refused".into()), Outcome::Partial("some effect".into()), Outcome::Unknown("reply lost".into())] {
+        for operation in [
+            Outcome::Failed("refused".into()),
+            Outcome::Partial("some effect".into()),
+            Outcome::Unknown("reply lost".into()),
+        ] {
             let response = Response::Done {
-                txn: TxnId(1), state: TxnState::Committed, message: "lifecycle committed".into(),
+                txn: TxnId(1),
+                state: TxnState::Committed,
+                message: "lifecycle committed".into(),
                 evidence: Some(ExecutionEvidence { format: 1, operation, expectation: None, post_status: None }),
             };
             assert_ne!(print(&response, false), 0);
             assert_ne!(print(&response, true), 0);
         }
         let mut response = Response::Done {
-            txn: TxnId(1), state: TxnState::Committed, message: "operation succeeded".into(),
-            evidence: Some(ExecutionEvidence { format: 1, operation: Outcome::Succeeded, expectation: None, post_status: None }),
+            txn: TxnId(1),
+            state: TxnState::Committed,
+            message: "operation succeeded".into(),
+            evidence: Some(ExecutionEvidence {
+                format: 1,
+                operation: Outcome::Succeeded,
+                expectation: None,
+                post_status: None,
+            }),
         };
         assert_eq!(response_code(&response), 0);
-        if let Response::Done { evidence: Some(evidence), .. } = &mut response { evidence.format = 99; }
+        if let Response::Done { evidence: Some(evidence), .. } = &mut response {
+            evidence.format = 99;
+        }
         assert_ne!(response_code(&response), 0, "unknown format provides no success evidence");
-        if let Response::Done { evidence, .. } = &mut response { *evidence = None; }
+        if let Response::Done { evidence, .. } = &mut response {
+            *evidence = None;
+        }
         assert_ne!(response_code(&response), 0, "historical lifecycle alone provides no success evidence");
     }
-
 }

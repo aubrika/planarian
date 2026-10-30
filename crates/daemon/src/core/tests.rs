@@ -242,25 +242,40 @@ fn unprivileged_override_of_a_security_unit_is_held_for_an_administrator() {
 }
 
 /// §11 (owner decision, 2026-10-30): an agent has the permissions of the
-/// user who started it, as journaled when it started, and is attributed to
-/// itself in the log. One the journal has no start for holds nothing.
+/// user who started it, bound to the instance that start journaled (I24),
+/// and is attributed to itself in the log. One with no journaled start, or
+/// in an instance no start names, holds nothing.
 #[test]
 fn an_agent_has_its_users_permissions() {
     let mut r = Rig::new();
     r.ticks(2);
     let stop_web = || Request::Stop { unit: UnitId::service("gym-web") };
+    let instance = |r: &Rig, name: &str| r.fake.w().agent_instances.get(name).copied();
     // Never started through `agent run`: nothing.
-    let stray = Peer::agent(61185, "stray");
+    let stray = Peer::agent(61185, "stray", None);
     let resp = r.core.handle(stray, stop_web());
     assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
     // Started by alice: alice's permissions, which do not reach gym-web.
     let resp = r.core.handle(ALICE, Request::AgentRun { name: "helper".into(), argv: vec!["true".into()] });
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
-    let helper = Peer::agent(61186, "helper");
+    let helper = Peer::agent(61186, "helper", instance(&r, "helper"));
     let resp = r.core.handle(helper.clone(), stop_web());
     assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
     // An agent cannot start agents.
-    let resp = r.core.handle(helper, Request::AgentRun { name: "more".into(), argv: vec!["true".into()] });
+    let resp = r.core.handle(helper.clone(), Request::AgentRun { name: "more".into(), argv: vec!["true".into()] });
+    assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
+    // B-20: an administrator re-running `agent run helper` is refused while
+    // alice's agent runs, naming its owner, and her agent gains nothing.
+    let resp = r.core.handle(ADMIN, Request::AgentRun { name: "helper".into(), argv: vec!["true".into()] });
+    assert!(
+        matches!(&resp, Response::Rejected { message, .. } if message.contains("uid 1000")),
+        "a name in use is refused: {resp:?}"
+    );
+    let resp = r.core.handle(helper, stop_web());
+    assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
+    // A process claiming the name in another instance holds nothing.
+    let forged = Peer::agent(61186, "helper", Some(planarian_schema::InstanceId([7; 16])));
+    let resp = r.core.handle(forged, stop_web());
     assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
     // Started by an administrator: an administrator's permissions.
     let resp = r.core.handle(ADMIN, Request::AgentRun { name: "coder".into(), argv: vec!["true".into()] });
@@ -268,7 +283,7 @@ fn an_agent_has_its_users_permissions() {
     r.ticks(1);
     // Planarian does not manage the agent's unit: it is not in the manifest.
     assert_eq!(r.status("service:planarian-agent-coder"), UnitStatus::NotExpected);
-    let coder = Peer::agent(61184, "coder");
+    let coder = Peer::agent(61184, "coder", instance(&r, "coder"));
     let resp = r.core.handle(coder, stop_web());
     assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
     // A finished transaction's record is logged at the next observation.
@@ -277,9 +292,11 @@ fn an_agent_has_its_users_permissions() {
     let rec = rec.expect("logged");
     assert_eq!(rec.agent.as_deref(), Some("coder"), "attributed to the agent");
     assert_eq!(rec.caller.uid(), Some(0), "acting for the administrator who started it");
-    // Who it acts for is in the journal, so it survives a restart.
-    assert_eq!(r.core.ledger().agent_for("coder"), Some(0));
-    assert_eq!(r.core.ledger().agent_for("helper"), Some(1000));
+    // Who it acts for is in the journal, by instance, so it survives a restart.
+    let l = r.core.ledger();
+    assert_eq!(l.agent_for("coder", instance(&r, "coder").unwrap().0), Some(0));
+    assert_eq!(l.agent_for("helper", instance(&r, "helper").unwrap().0), Some(1000));
+    assert_eq!(l.agent_for("helper", [7; 16]), None);
 }
 
 #[test]
@@ -849,7 +866,6 @@ fn external_desired_state_joins_with_provenance() {
     assert!(!r.core.asm.manifest().units.contains_key(&ext));
 }
 
-
 /// A failed same-name request cannot transfer a running agent's authority.
 #[test]
 fn agent_name_cannot_be_reattributed_by_another_launcher() {
@@ -858,9 +874,48 @@ fn agent_name_cannot_be_reattributed_by_another_launcher() {
     let launch = || Request::AgentRun { name: "owned-helper".into(), argv: vec!["true".into()] };
     assert!(matches!(r.core.handle(ALICE, launch()), Response::Ok { .. }));
     assert!(matches!(r.core.handle(ADMIN, launch()), Response::Rejected { .. }));
-    assert_eq!(r.core.ledger().agent_for("owned-helper"), Some(1000));
-    let resp = r.core.handle(Peer::agent(61186, "owned-helper"), Request::Stop { unit: UnitId::service("gym-web") });
+    assert_eq!(r.core.ledger().agent_owner("owned-helper"), Some(1000));
+    let instance = r.fake.w().agent_instances.get("owned-helper").copied();
+    let resp = r.core.handle(Peer::agent(61186, "owned-helper", instance), Request::Stop { unit: UnitId::service("gym-web") });
     assert!(matches!(resp, Response::Rejected { .. }), "{resp:?}");
+}
+
+/// Reusing a stopped unit name grants only the fresh instance authority.
+#[test]
+fn stopped_agent_name_reuse_cannot_rebind_the_old_instance() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let launch = || Request::AgentRun { name: "reused".into(), argv: vec!["true".into()] };
+    assert!(matches!(r.core.handle(ALICE, launch()), Response::Ok { .. }));
+    let old = r.fake.w().agent_instances["reused"];
+    r.fake.w().units.remove(&UnitId::service("planarian-agent-reused"));
+    assert!(matches!(r.core.handle(ADMIN, launch()), Response::Ok { .. }));
+    let new = r.fake.w().agent_instances["reused"];
+    assert_ne!(old, new);
+    assert_eq!(r.core.ledger().agent_for("reused", old.0), None);
+    assert_eq!(r.core.ledger().agent_for("reused", new.0), Some(ADMIN.uid));
+    let stop = || Request::Stop { unit: UnitId::service("gym-web") };
+    let refused = r.core.handle(Peer::agent(61186, "reused", Some(old)), stop());
+    assert!(matches!(refused, Response::Rejected { .. }), "{refused:?}");
+    let allowed = r.core.handle(Peer::agent(61187, "reused", Some(new)), stop());
+    assert!(matches!(allowed, Response::Done { state: TxnState::Committed, .. }), "{allowed:?}");
+}
+
+#[test]
+fn failed_agent_instance_append_grants_no_authority() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    r.fake.store.tear_write_containing("AgentStarted");
+    let response = r.core.handle(ADMIN, Request::AgentRun { name: "unrecorded".into(), argv: vec!["true".into()] });
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert!(r.fake.store.torn());
+    let instance = r.fake.w().agent_instances["unrecorded"];
+    assert_eq!(r.core.ledger().agent_for("unrecorded", instance.0), None);
+    let response = r.core.handle(
+        Peer::agent(61185, "unrecorded", Some(instance)),
+        Request::Stop { unit: UnitId::service("gym-web") },
+    );
+    assert!(matches!(response, Response::Rejected { .. }), "{response:?}");
 }
 
 #[test]
@@ -868,7 +923,7 @@ fn oversized_agent_commands_do_not_get_authority() {
     let mut r = Rig::new();
     let resp = r.core.handle(ALICE, Request::AgentRun { name: "too-big".into(), argv: vec!["x".repeat(16385)] });
     assert!(matches!(resp, Response::Error { .. }));
-    assert_eq!(r.core.ledger().agent_for("too-big"), None);
+    assert_eq!(r.core.ledger().agent_owner("too-big"), None);
 }
 
 /// R05: completed/failed unit lifetimes cannot evade durable name admission.
@@ -898,7 +953,7 @@ fn short_lived_agent_names_are_bounded_and_preserve_root_reserve() {
     let response = r.core.handle(Peer::new(2000, false), launch("ordinary-global-overflow".into()));
     assert!(matches!(response, Response::Error { .. }), "{response:?}");
     assert_eq!(r.core.ledger().last_seq, seq);
-    assert_eq!(r.core.ledger().agent_for("ordinary-global-overflow"), None);
+    assert_eq!(r.core.ledger().agent_owner("ordinary-global-overflow"), None);
 
     // A full caller/global budget must still permit an owned name's reuse.
     // Repeated launch events must not grow the checkpoint's owner registry.
@@ -906,7 +961,7 @@ fn short_lived_agent_names_are_bounded_and_preserve_root_reserve() {
         let seq = r.core.ledger().last_seq;
         let response = r.core.handle(ALICE, launch("finished-0-0".into()));
         assert!(matches!(response, Response::Ok { .. }), "{response:?}");
-        assert!(r.core.ledger().last_seq > seq, "journal the new start before launching");
+        assert!(r.core.ledger().last_seq > seq, "journal every successful new instance before granting authority");
         r.fake.w().units.remove(&UnitId::service("planarian-agent-finished-0-0"));
         assert_eq!(r.core.ledger().agents.len(), 224, "reuse does not accumulate owner rows");
     }
@@ -923,7 +978,7 @@ fn short_lived_agent_names_are_bounded_and_preserve_root_reserve() {
     r.core.ex.kernel.journal.compact().unwrap();
     let replay = Journal::open(r.fake.store.clone()).unwrap();
     assert_eq!(replay.ledger().agents.len(), 256);
-    assert_eq!(replay.ledger().agent_for("finished-0-0"), Some(ALICE.uid));
+    assert_eq!(replay.ledger().agent_owner("finished-0-0"), Some(ALICE.uid));
     let mut cfg = config();
     cfg.fresh_boot = false;
     let mut restarted = Core::start(replay, r.fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, cfg);
@@ -938,21 +993,25 @@ fn short_lived_agent_names_are_bounded_and_preserve_root_reserve() {
 fn failed_agent_start_history_cannot_bypass_name_limits() {
     let mut r = Rig::new();
     for slot in 0..32 {
-        r.core.journal(Record::AgentStarted { name: format!("failed-{slot}"), by: ALICE.uid });
+        r.core.journal(Record::AgentStarted { name: format!("failed-{slot}"), instance: [0; 16], by: ALICE.uid });
     }
     let seq = r.core.ledger().last_seq;
-    let response = r.core.handle(ALICE, Request::AgentRun {
-        name: "failed-history-overflow".into(), argv: vec!["true".into()],
-    });
+    let response =
+        r.core.handle(ALICE, Request::AgentRun { name: "failed-history-overflow".into(), argv: vec!["true".into()] });
     assert!(matches!(response, Response::Error { .. }), "{response:?}");
     assert_eq!(r.core.ledger().last_seq, seq);
-    assert_eq!(r.core.ledger().agent_for("failed-history-overflow"), None);
-    assert!(matches!(r.core.handle(ADMIN, Request::AgentRun {
-        name: "recovery-after-failed-starts".into(), argv: vec!["true".into()],
-    }), Response::Ok { .. }));
-    assert!(matches!(r.core.handle(ALICE, Request::AgentRun {
-        name: "failed-0".into(), argv: vec!["true".into()],
-    }), Response::Ok { .. }));
+    assert_eq!(r.core.ledger().agent_owner("failed-history-overflow"), None);
+    assert!(matches!(
+        r.core.handle(
+            ADMIN,
+            Request::AgentRun { name: "recovery-after-failed-starts".into(), argv: vec!["true".into()] }
+        ),
+        Response::Ok { .. }
+    ));
+    assert!(matches!(
+        r.core.handle(ALICE, Request::AgentRun { name: "failed-0".into(), argv: vec!["true".into()] }),
+        Response::Ok { .. }
+    ));
     assert_eq!(r.core.ledger().agents.len(), 33);
 }
 
@@ -960,17 +1019,17 @@ fn failed_agent_start_history_cannot_bypass_name_limits() {
 fn root_agent_name_limit_still_allows_owned_name_reuse() {
     let mut r = Rig::new();
     for slot in 0..64 {
-        r.core.journal(Record::AgentStarted { name: format!("root-history-{slot}"), by: 0 });
+        r.core.journal(Record::AgentStarted { name: format!("root-history-{slot}"), instance: [0; 16], by: 0 });
     }
     let seq = r.core.ledger().last_seq;
-    let response = r.core.handle(ADMIN, Request::AgentRun {
-        name: "root-caller-overflow".into(), argv: vec!["true".into()],
-    });
+    let response =
+        r.core.handle(ADMIN, Request::AgentRun { name: "root-caller-overflow".into(), argv: vec!["true".into()] });
     assert!(matches!(response, Response::Error { .. }), "{response:?}");
     assert_eq!(r.core.ledger().last_seq, seq);
-    assert!(matches!(r.core.handle(ADMIN, Request::AgentRun {
-        name: "root-history-0".into(), argv: vec!["true".into()],
-    }), Response::Ok { .. }));
+    assert!(matches!(
+        r.core.handle(ADMIN, Request::AgentRun { name: "root-history-0".into(), argv: vec!["true".into()] }),
+        Response::Ok { .. }
+    ));
     assert_eq!(r.core.ledger().agents.len(), 64);
 }
 
@@ -982,18 +1041,25 @@ fn denied_release_preserves_incident_and_linked_overrides() {
     let target = UnitId::service("gym-db");
     let linked = UnitId::service("gym-app");
     let now = r.fake.clock().now();
-    for (unit, reason) in [(target.clone(), "outside stop".to_string()),
-                           (linked, format!("stopped together with {target}"))] {
+    for (unit, reason) in
+        [(target.clone(), "outside stop".to_string()), (linked, format!("stopped together with {target}"))]
+    {
         let mut o = Override::attested(unit, OverrideDesired::Stopped, Until::NextBoot, reason, Actor::Unattributed);
         o.attribution = Attribution::Inferred;
         r.core.journal(Record::OverrideSet(o));
     }
     let incident = Incident {
-        id: IncidentId(91), kind: IncidentKind::Repair, target: target.clone(),
-        divergence: (DesiredStatus::Running, UnitStatus::Stopped), opened: now,
-        attempts: vec![], budget_left: 0,
+        id: IncidentId(91),
+        kind: IncidentKind::Repair,
+        target: target.clone(),
+        divergence: (DesiredStatus::Running, UnitStatus::Stopped),
+        opened: now,
+        attempts: vec![],
+        budget_left: 0,
         state: IncidentState::Cooldown { until: now.plus(Millis::secs(3600)) },
-        backoff: Millis::secs(300), next_attempt: now.plus(Millis::secs(300)), regressions: 2,
+        backoff: Millis::secs(300),
+        next_attempt: now.plus(Millis::secs(300)),
+        regressions: 2,
     };
     r.core.incidents.incidents.insert(incident.id, incident.clone());
     let before = r.core.ledger().overrides;
@@ -1035,13 +1101,13 @@ fn deferred_agent_work_keeps_launching_principal_limits_and_attribution() {
     let mut r = Rig::new();
     r.ticks(2);
     r.core.log.clear();
-    r.core.journal(Record::AgentStarted { name: "coder".into(), by: ALICE.uid });
+    r.core.journal(Record::AgentStarted { name: "coder".into(), instance: [1; 16], by: ALICE.uid });
     r.core.defer = true;
     let request = Request::Apply {
         change: ChangeId("font-scale".into()),
         args: [("scale".into(), Value::Str("1.25".into()))].into(),
     };
-    let placeholder = r.core.handle(Peer::agent(61184, "coder"), request);
+    let placeholder = r.core.handle(Peer::agent(61184, "coder", Some(InstanceId([1; 16]))), request);
     assert!(matches!(placeholder, Response::Ok { .. }));
     let (job, resume) = r.core.take_deferred().unwrap();
     assert_eq!(resume.principal(), Actor::user(ALICE.uid).principal());
@@ -1065,16 +1131,21 @@ fn committed_runtime_failure_is_not_a_repaired_incident() {
     r.fake.w().signal(&unit, 11);
     r.ticks(4);
     r.core.observe();
-    let incident = r.core.incidents.active_for(&unit).expect("still failed");
+    let incident = r.core.incidents.active_for(&unit).expect("still failed").clone();
     assert!(!incident.attempts.is_empty());
     for (txn, outcome) in &incident.attempts {
         assert_eq!(r.core.ledger().state(*txn), Some(TxnState::Committed), "runtime lifecycle completes");
         assert!(matches!(outcome, Outcome::Failed(_)), "backend failure is not success: {outcome:?}");
     }
-    let record = r.core.log.iter().find(|record| {
-        matches!(&record.proposal.source, Source::Diagnoser { .. })
-            && record.proposal.transition == Transition::RestartUnit(unit.clone())
-    }).expect("attempt log");
+    let record = r
+        .core
+        .log
+        .iter()
+        .find(|record| {
+            matches!(&record.proposal.source, Source::Diagnoser { .. })
+                && record.proposal.transition == Transition::RestartUnit(unit.clone())
+        })
+        .expect("attempt log");
     assert_eq!(record.format, 2);
     assert!(matches!(record.operation, Some(Outcome::Failed(_))));
     assert!(matches!(record.expectation, Some(Outcome::Partial(_))));
@@ -1111,7 +1182,7 @@ fn operation_expectation_and_health_are_independent_results() {
 
 #[test]
 fn recovery_interlock_keeps_its_candidate_and_fallback_protected() {
-    let r = Rig::new();
+    let mut r = Rig::new();
     let mut ledger = r.core.ledger();
     ledger.add_interlock(planarian_txn::ledger::InterlockEntry {
         txn: TxnId(20),

@@ -16,8 +16,8 @@
 
 use crate::machine::{step_allowed, tag};
 use planarian_schema::{
-    Actor, GenerationId, Hash, Incident, IncidentId, Lease, OpId, Outcome, Override, OwnerId, Resolution, Timestamp,
-    StorePath, Transaction, Transition, TxnId, TxnState, UnitId,
+    Actor, GenerationId, Hash, Incident, IncidentId, Lease, OpId, Outcome, Override, OwnerId, Resolution, StorePath,
+    Timestamp, Transaction, Transition, TxnId, TxnState, UnitId,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -88,12 +88,15 @@ pub enum Record {
         nonce: [u8; 16],
         expires: Timestamp,
     },
-    /// `planarian agent run <name>` by this uid (§11): the agent acts with
-    /// that user's permissions, attributed to the agent. Journaled before the
-    /// agent's unit starts, so who it acts for survives restarts and is
-    /// covered by the chain.
+    /// `planarian agent run <name>` by this uid (§11, I24): the started
+    /// unit's instance (its InvocationID) acts with that user's permissions,
+    /// attributed to the agent. Journaled once the unit has started, so a
+    /// failed or refused start binds nothing; covered by the chain.
     AgentStarted {
         name: String,
+        /// Zero in records written before v4.6, which then match no peer.
+        #[serde(default, skip_serializing_if = "agent_instance_unknown")]
+        instance: [u8; 16],
         by: u32,
     },
     Resolved {
@@ -203,11 +206,10 @@ pub struct Ledger {
     pub external: Option<(u64, Hash)>,
     pub interlock: IdMap<InterlockEntry>,
     pub last_reconciliation: Option<Reconciliation>,
-    /// Current registration per agent name: (name, the uid that started it).
-    /// Every launch is still journaled; replay replaces an existing row.
-    /// Historical duplicate checkpoint rows normalize to their last owner.
-    #[serde(default)]
-    pub agents: Vec<(String, u32)>,
+    /// Current registration per name, bound to its started instance (I24).
+    /// Every launch remains journaled; replacement revokes earlier instances.
+    #[serde(default, serialize_with = "serialize_agent_registry", deserialize_with = "deserialize_agent_registry")]
+    pub agents: Vec<(String, [u8; 16], u32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -436,7 +438,7 @@ fn agent_name_eq(a: &str, b: &str) -> (r: bool)
 /// Reduce old checkpoint registrations after the original checkpoint bytes
 /// have passed integrity and ledger validation. Keep the last occurrence,
 /// exactly preserving the historical lookup's last-recorded owner semantics.
-pub fn normalize_agent_registry(agents: &mut Vec<(String, u32)>) {
+pub fn normalize_agent_registry(agents: &mut Vec<(String, [u8; 16], u32)>) {
     let mut i: usize = 0;
     while i < agents.len()
         invariant
@@ -467,7 +469,7 @@ pub fn normalize_agent_registry(agents: &mut Vec<(String, u32)>) {
 
 /// Applying a launch retains one current row, while the original AgentStarted
 /// record and its attribution remain in the durable journal prefix.
-fn record_agent(agents: &mut Vec<(String, u32)>, name: String, by: u32) {
+fn record_agent(agents: &mut Vec<(String, [u8; 16], u32)>, name: String, instance: [u8; 16], by: u32) {
     let mut i: usize = 0;
     while i < agents.len()
         invariant
@@ -480,7 +482,7 @@ fn record_agent(agents: &mut Vec<(String, u32)>, name: String, by: u32) {
             i += 1;
         }
     }
-    agents.push((name, by));
+    agents.push((name, instance, by));
 }
 
 fn flying_exec(s: &TxnState) -> (r: bool)
@@ -993,7 +995,7 @@ impl Ledger {
                 }
             },
             Record::Reconciliation(r) => self.last_reconciliation = Some(r),
-            Record::AgentStarted { name, by } => record_agent(&mut self.agents, name, by),
+            Record::AgentStarted { name, instance, by } => record_agent(&mut self.agents, name, instance, by),
         }
     }
 
@@ -1403,6 +1405,43 @@ fn interlock_evidence_legacy(version: &u32) -> bool {
     *version == 0
 }
 
+fn agent_instance_unknown(instance: &[u8; 16]) -> bool {
+    *instance == [0; 16]
+}
+
+/// Preserve historical checkpoint JSON until its original checksum is checked.
+/// Legacy rows carry no instance authority; zero never matches a peer.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum AgentRegistration {
+    Legacy((String, u32)),
+    Bound((String, [u8; 16], u32)),
+}
+
+fn serialize_agent_registry<S: Serializer>(
+    agents: &[(String, [u8; 16], u32)],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let rows: Vec<AgentRegistration> = agents.iter().map(|(name, instance, by)| {
+        if *instance == [0; 16] {
+            AgentRegistration::Legacy((name.clone(), *by))
+        } else {
+            AgentRegistration::Bound((name.clone(), *instance, *by))
+        }
+    }).collect();
+    rows.serialize(serializer)
+}
+
+fn deserialize_agent_registry<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<(String, [u8; 16], u32)>, D::Error> {
+    let rows = Vec::<AgentRegistration>::deserialize(deserializer)?;
+    Ok(rows.into_iter().map(|row| match row {
+        AgentRegistration::Legacy((name, by)) => (name, [0; 16], by),
+        AgentRegistration::Bound(row) => row,
+    }).collect())
+}
+
 impl Ledger {
     /// Backend acknowledgments are evidence distinct from lifecycle. An old
     /// terminal checkpoint did not retain them, so its Committed state cannot
@@ -1420,15 +1459,22 @@ impl Ledger {
         };
         if ops.is_empty() {
             let bookkeeping = self.terminal.get(&txn).is_some_and(|t| {
-                t.state == TxnState::Committed && matches!(
-                    &t.transition,
-                    Transition::LiftOverride(_) | Transition::Resolve { .. }
-                        | Transition::SetOverride(planarian_schema::Override {
-                            desired: planarian_schema::OverrideDesired::LeaveAlone, ..
-                        })
-                )
+                t.state == TxnState::Committed
+                    && matches!(
+                        &t.transition,
+                        Transition::LiftOverride(_)
+                            | Transition::Resolve { .. }
+                            | Transition::SetOverride(planarian_schema::Override {
+                                desired: planarian_schema::OverrideDesired::LeaveAlone,
+                                ..
+                            })
+                    )
             });
-            return if bookkeeping { Outcome::Succeeded } else { Outcome::Unknown("no backend operation acknowledged".into()) };
+            return if bookkeeping {
+                Outcome::Succeeded
+            } else {
+                Outcome::Unknown("no backend operation acknowledged".into())
+            };
         }
         if let Some(op) = ops.iter().find(|o| matches!(&o.ack, Some(Outcome::Failed(_)))) {
             return op.ack.clone().expect("matched acknowledgment");
@@ -1458,9 +1504,19 @@ impl Ledger {
         !self.interlock.is_empty()
     }
 
-    /// The uid the agent `name` acts for: whoever started it last (§11).
-    pub fn agent_for(&self, name: &str) -> Option<u32> {
-        self.agents.iter().rev().find(|(n, _)| n == name).map(|(_, by)| *by)
+    /// The uid the agent `name`'s running `instance` acts for (§11, I24):
+    /// the start that journaled that very instance under that name. A zero
+    /// instance matches nothing.
+    pub fn agent_for(&self, name: &str, instance: [u8; 16]) -> Option<u32> {
+        if instance == [0; 16] {
+            return None;
+        }
+        self.agents.iter().rev().find(|(n, i, _)| *i == instance && n == name).map(|(_, _, by)| *by)
+    }
+
+    /// Who started the last instance under `name`, for a refusal's message.
+    pub fn agent_owner(&self, name: &str) -> Option<u32> {
+        self.agents.iter().rev().find(|(n, _, _)| n == name).map(|(_, _, by)| *by)
     }
 }
 

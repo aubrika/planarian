@@ -30,7 +30,7 @@ See `verification.md` for what is proved.
 | **P2** `activate_live(revert_to)` restores the activation state of `revert_to` | — |
 | **P3** `publish_boot` and the override promotion rename are idempotent | — |
 | **P4** Journal fsync is durable and the preallocation is writable | — |
-| **P5** SHA-256 is collision-resistant (the journal's hash chain, I18) | `txn::journal::chain` |
+| **P5** SHA-256 is collision-resistant (the journal's hash chain, I18) | `txn::chain` (the chain decision, proved), `txn::journal` (its I/O) |
 | **P6** systemd reports unit state truthfully over D-Bus and honors `X-RestartIfChanged` / `X-StopIfChanged` | — |
 | **P7** Fencing is effective: a stale-epoch call is refused before it mutates | — |
 | **P8** The kernel and systemd are correct | — |
@@ -52,15 +52,13 @@ Planarian's own code that the proven gates take input from (SPEC §17a). Counted
 
 ## Progress assumptions for I12
 
-**G1** Some lease holder eventually runs. **G2** A fenced worker eventually stops issuing calls, or its calls are refused. **G3** Journal writes eventually succeed. **G4** Backend calls terminate.
-
-**G5** **Proposed, not adopted (S03):** intentionally parked Built/AwaitingBoot eventually receives an allowed activation window, an operator-selected reboot with trustworthy boot evidence, or an authorized operator disposition. No wall-clock bound is inferred while the external condition is intentionally withheld. This is a separate progress assumption, not an uncounted addition to G1. The historical trust-37 / 47:56 baseline remains unchanged: declaring G5 raises current trust to 38 and I12 assumed support from 8 to 9 (global 47:57), so the existing ratchet is expected to reject it pending explicit owner review/adoption of the contract and any justified baseline amendment. No reset is applied by this PR.
+**G1** Some lease holder eventually runs. **G2** A fenced worker eventually stops issuing calls, or its calls are refused. **G3** Journal writes eventually succeed. **G4** Backend calls terminate. Intentionally parked states follow the separately adopted SPEC v4.6 I12/§12f contract: Built expires at24 hours; AwaitingBoot is reported as waiting for reboot. The former draft G5 proposal is superseded and is not a current extra assumption.
 
 The ids (V, P, G, U) are what `docs/verification-ratio.toml` cites. The trust count is the number of V, P and G ids plus every `external_body` and `assume` site in the verified crates; the internal-unproven count is the number of U ids (`planarian-gym verification`). Per invariant, `assumes` lists what that invariant specifically rests on; proof-validity trust (V7–V11) underlies every proof alike and is counted once, in the trust count, not repeated on each row.
 
 ## Fake harness (tests only, not proof sites)
 
-`txn::fake` models the backends in memory. Each kernel test's claim is only as good as the fake's fidelity to the contracts above: fencing refuses a stale epoch before any effect, `jobs_tagged` finds every job an op started (or answers `None`), and `swap_override` is a compare-and-swap. The VM harness must check real backends against these contracts; its presence is not evidence of a pass. Shared-core R11/B-20 demonstrates that the current real override replacement does not provide the fake's atomic CAS against arbitrary editors. That unresolved mismatch is not silently added as a trusted assumption or discharged by the SwapStep proof.
+`txn::fake` models the backends in memory. Each kernel test's claim is only as good as the fake's fidelity to the contracts above: fencing refuses a stale epoch before any effect, `jobs_tagged` finds every job an op started (or answers `None`), and `swap_override` is a compare-and-swap. The VM harness must check real backends against these contracts; its presence is not evidence of a pass. Under adopted SPEC v4.6 I23, real replacement additionally requires the exclusive directory lock for cooperating writers; writers outside that boundary are X-12. An atomic SwapStep model is not arbitrary-editor CAS. Missing cooperative enforcement remains R11/B-21 until its implementation and regression are complete.
 
 The new withdrawal contract also injects accepted Partial/Unknown and Fenced outcomes against the shared fake adapter; dedicated kernel regressions retain roots after lost withdrawal replies. These authored additions remain UNRUN in this draft.
 

@@ -152,7 +152,10 @@ fn weak_external_diagnostic_dependency_blocks_local_repair_on_http_503() {
     w.s.generation = GenerationId(2);
     let mut ours = w.inputs();
     ours.current_planarian_built = true;
-    assert!(candidates(&incident(&cl), &ours).is_empty(), "neither client restart nor local rollback repairs an outage");
+    assert!(
+        candidates(&incident(&cl), &ours).is_empty(),
+        "neither client restart nor local rollback repairs an outage"
+    );
     observe(&mut w.s, &w.defs, &ext, Observed::Active, ProbeResult::Pass);
     let c = candidates(&incident(&cl), &w.inputs());
     assert_eq!(c[0].transition, Transition::RestartUnit(cl), "local repair can resume after the prerequisite passes");
@@ -174,7 +177,11 @@ fn timed_out_external_dependency_stays_unknown_and_does_not_trigger_local_repair
     observe(&mut w.s, &w.defs, &cl, Observed::Active, ProbeResult::Fail("upstream HTTP 503".into()));
     assert_eq!(w.s.status(&ext, &w.defs), UnitStatus::Unknown);
     assert!(candidates(&incident(&cl), &w.inputs()).is_empty());
-    assert_eq!(w.s.status(&ext, &w.defs), UnitStatus::Unknown, "safety withholding does not manufacture Failed evidence");
+    assert_eq!(
+        w.s.status(&ext, &w.defs),
+        UnitStatus::Unknown,
+        "safety withholding does not manufacture Failed evidence"
+    );
 }
 
 #[test]

@@ -620,7 +620,6 @@ fn interlock_holds_off_non_administrators() {
     assert!(!matches!(&s, Submitted::Rejected { detail, .. } if detail.contains("interlock")), "{s:?}");
 }
 
-
 /// S07: outstanding approval authority belongs to one executor lifetime,
 /// including when a checkpoint retains its Prepared transaction.
 #[test]
@@ -688,7 +687,8 @@ fn stopped_override_has_the_same_effects_and_floor_as_a_stop() {
         for kind in 0..3 {
             let mut r = Rig::new();
             r.fake.w().sessions = vec![session("1", 1001), session("2", 1002)];
-            let edge = Edge { from: gs.clone(), kind: EdgeKind::Requires, to: dm.clone(), origin: EdgeOrigin::Manifest };
+            let edge =
+                Edge { from: gs.clone(), kind: EdgeKind::Requires, to: dm.clone(), origin: EdgeOrigin::Manifest };
             let mut manifest = r.asm.manifest().clone();
             manifest.units.get_mut(&gs).unwrap().edges.push(edge);
             r.asm.set_manifest(manifest);
@@ -696,7 +696,11 @@ fn stopped_override_has_the_same_effects_and_floor_as_a_stop() {
                 0 => Transition::StopUnit(dm.clone()),
                 1 => Transition::StopAndSuppress { unit: dm.clone(), until: Until::Explicit, reason: "test".into() },
                 _ => Transition::SetOverride(Override::attested(
-                    dm.clone(), OverrideDesired::Stopped, Until::Explicit, "test".into(), caller.actor.clone(),
+                    dm.clone(),
+                    OverrideDesired::Stopped,
+                    Until::Explicit,
+                    "test".into(),
+                    caller.actor.clone(),
                 )),
             };
             let result = r.propose(t, caller.clone());
@@ -706,12 +710,20 @@ fn stopped_override_has_the_same_effects_and_floor_as_a_stop() {
             assert!(facts.affected_units.contains(&gs));
             assert!(facts.other_sessions_affected);
             let effect = (facts.affected_units, facts.sensitivity, facts.disruption, facts.recovery, decision);
-            if let Some(ref wanted) = expected { assert_eq!(&effect, wanted); } else { expected = Some(effect); }
+            if let Some(ref wanted) = expected {
+                assert_eq!(&effect, wanted);
+            } else {
+                expected = Some(effect);
+            }
         }
     }
     let mut r = Rig::new();
     let leave = Transition::SetOverride(Override::attested(
-        dm, OverrideDesired::LeaveAlone, Until::Explicit, "test".into(), admin().actor,
+        dm,
+        OverrideDesired::LeaveAlone,
+        Until::Explicit,
+        "test".into(),
+        admin().actor,
     ));
     let _ = r.propose(leave, admin());
     assert_eq!(r.ex.last.as_ref().unwrap().0.disruption, Disruption::None);
@@ -722,10 +734,13 @@ fn stopped_override_has_the_same_effects_and_floor_as_a_stop() {
 /// fresh generations use the same content-sensitive activation discovery.
 #[test]
 fn existing_generation_derives_activation_and_override_configuration() {
-    for (service, disruption) in [("display-manager", Disruption::SessionLoss),
-                                  ("NetworkManager", Disruption::ConnectivityLoss)] {
+    for (service, disruption) in
+        [("display-manager", Disruption::SessionLoss), ("NetworkManager", Disruption::ConnectivityLoss)]
+    {
         let mut r = Rig::new();
-        let set = OverrideSet { assignments: [(format!("services.{service}.settings"), Value::Str("changed".into()))].into() };
+        let set = OverrideSet {
+            assignments: [(format!("services.{service}.settings"), Value::Str("changed".into()))].into(),
+        };
         let target = r.fake.w().add_generation(&set);
         let path = r.fake.generations().path_of(target).unwrap();
         let preflight = r.fake.generations().preflight_existing(target, &path).unwrap();
@@ -734,13 +749,20 @@ fn existing_generation_derives_activation_and_override_configuration() {
         let (mut state, defs) = r.observe();
         state.known_good = target;
         for t in [Transition::SwitchGeneration(target), Transition::Revert { to: target }, Transition::Rollback] {
-            let p = Proposal { observed: state.digest(), expected: predict(&t, &state, &defs), transition: t,
-                               source: Source::User, reason: "test".into() };
+            let p = Proposal {
+                observed: state.digest(),
+                expected: predict(&t, &state, &defs),
+                transition: t,
+                source: Source::User,
+                reason: "test".into(),
+            };
             let plan = r.ex.plan(&p, &user_authorization(Actor::user(1001), true), &state, &defs, None).unwrap();
             assert_eq!(plan.base_eval.units, plan.cand_eval.as_ref().unwrap().units);
             assert_eq!(plan.facts.disruption, disruption);
             assert!(plan.facts.affected_units.contains(&UnitId::service(service)));
-            assert!(plan.facts.config_diff.as_ref().unwrap().options.contains_key(&format!("services.{service}.settings")));
+            assert!(
+                plan.facts.config_diff.as_ref().unwrap().options.contains_key(&format!("services.{service}.settings"))
+            );
             assert_eq!(plan.decision, Decision::Allow { tier: Tier::AskFirst, approver: ApproverClass::AnyApprover });
             r.ex.release(&plan);
         }
@@ -784,8 +806,13 @@ fn changed_activation_preflight_is_rejected_before_execution() {
     let target = r.fake.w().add_generation(&OverrideSet::default());
     let (state, defs) = r.observe();
     let t = Transition::SwitchGeneration(target);
-    let p = Proposal { observed: state.digest(), expected: predict(&t, &state, &defs), transition: t,
-                       source: Source::User, reason: "test".into() };
+    let p = Proposal {
+        observed: state.digest(),
+        expected: predict(&t, &state, &defs),
+        transition: t,
+        source: Source::User,
+        reason: "test".into(),
+    };
     let plan = r.ex.plan(&p, &admin(), &state, &defs, None).unwrap();
     let transaction = r.ex.transaction(&p, &plan, &state, &defs);
     let id = r.ex.kernel.prepare(transaction).unwrap();
@@ -804,7 +831,10 @@ fn historical_unknown_recovery_candidate_blocks_even_administrator_gc() {
     for emergency in [false, true] {
         let before = r.fake.w().calls.len();
         let result = r.propose(Transition::CollectGarbage { emergency }, admin());
-        assert!(matches!(&result, Submitted::Rejected { detail, .. } if detail.contains("protected candidate")), "{result:?}");
+        assert!(
+            matches!(&result, Submitted::Rejected { detail, .. } if detail.contains("protected candidate")),
+            "{result:?}"
+        );
         assert_eq!(r.fake.w().calls.len(), before, "no collection before protected identities are reconciled");
     }
 }
@@ -814,7 +844,10 @@ fn unacknowledged_runtime_setting_does_not_create_a_persistence_followup() {
     for injected in [planarian_fake::Injected::Partial, planarian_fake::Injected::Unknown] {
         let mut r = Rig::new();
         r.fake.w().inject.insert("set".into(), injected);
-        let result = r.propose(Transition::SetRuntimeOption { path: "font.scale".into(), value: Value::Str("1.25".into()) }, alice());
+        let result = r.propose(
+            Transition::SetRuntimeOption { path: "font.scale".into(), value: Value::Str("1.25".into()) },
+            alice(),
+        );
         assert!(matches!(result, Submitted::Finished { state: TxnState::Committed, followup: None, .. }), "{result:?}");
     }
 }

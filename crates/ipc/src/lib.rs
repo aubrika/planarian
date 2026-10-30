@@ -350,19 +350,34 @@ mod tests {
         let legacy = r#"{"kind":"done","txn":1,"state":"Committed","message":"done"}"#;
         let response: Response = serde_json::from_str(legacy).unwrap();
         assert!(matches!(&response, Response::Done { evidence: None, .. }));
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&response.encode()).unwrap(), serde_json::from_str::<serde_json::Value>(legacy).unwrap());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.encode()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(legacy).unwrap()
+        );
         let mut new: serde_json::Value = serde_json::from_str(legacy).unwrap();
         new["evidence"] = serde_json::json!({
             "format": 1, "operation": {"Failed": "backend refused"},
             "expectation": null, "post_status": null,
         });
         let response: Response = serde_json::from_value(new.clone()).unwrap();
-        assert!(matches!(response, Response::Done { evidence: Some(ExecutionEvidence { format: 1, operation: Outcome::Failed(_), expectation: None, post_status: None }), .. }));
+        assert!(matches!(
+            response,
+            Response::Done {
+                evidence: Some(ExecutionEvidence {
+                    format: 1,
+                    operation: Outcome::Failed(_),
+                    expectation: None,
+                    post_status: None
+                }),
+                ..
+            }
+        ));
         #[derive(Deserialize)]
         #[serde(tag = "kind", rename_all = "kebab-case")]
-        enum LegacyResponse { Done { state: TxnState } }
+        enum LegacyResponse {
+            Done { state: TxnState },
+        }
         let LegacyResponse::Done { state } = serde_json::from_value::<LegacyResponse>(new).unwrap();
         assert_eq!(state, TxnState::Committed, "old consumers can only read lifecycle");
     }
-
 }

@@ -69,8 +69,12 @@ pub fn should_take_over(
 ) -> bool {
     let in_window = matches!(
         state,
-        TxnState::Activating | TxnState::Checking | TxnState::PublishingBoot | TxnState::Published
-            | TxnState::Promoted | TxnState::Reverting
+        TxnState::Activating
+            | TxnState::Checking
+            | TxnState::PublishingBoot
+            | TxnState::Published
+            | TxnState::Promoted
+            | TxnState::Reverting
     );
     if !in_window || mine {
         return false;
@@ -452,7 +456,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
         // Prepared. Enter the recoverable/exclusive state BEFORE OpBegin and
         // BEFORE any boot mutation. A failed/lost reply proves no absence of effect.
         self.advance(&txn, TxnState::PublishingBoot, "boot publication intent")?;
-        let (op, o) = self.call_op(id, "publish_boot_once", |h, op| h.generations().publish_boot_once(cand, keep, op))?;
+        let (op, o) =
+            self.call_op(id, "publish_boot_once", |h, op| h.generations().publish_boot_once(cand, keep, op))?;
         if !o.is_success() {
             if let Err(why) = self.drain_op(id, &op)? {
                 return self.recovery_failed(&txn, &why);
@@ -532,7 +537,10 @@ impl<S: Store, H: Host> Kernel<S, H> {
                 Outcome::Succeeded
             }
             Transition::Resolve { txn: target, resolution } => {
-                self.record_owned(Some(txn.id), Record::Resolved { txn: *target, resolution: *resolution, by: caller })?;
+                self.record_owned(
+                    Some(txn.id),
+                    Record::Resolved { txn: *target, resolution: *resolution, by: caller },
+                )?;
                 Outcome::Succeeded
             }
             t => {
@@ -655,7 +663,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
         match gens.last_booted() {
             Ok(booted) if booted == cand => {}
             Ok(_) => {
-                return self.withdraw_boot_publication(txn, "the boot-only candidate did not boot; selection reconciled");
+                return self
+                    .withdraw_boot_publication(txn, "the boot-only candidate did not boot; selection reconciled");
             }
             Err(o) => return self.recovery_failed(txn, &format!("cannot establish booted generation: {o:?}")),
         }
@@ -775,7 +784,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
         if !self.automatic_target_eligible(txn.revert_to)? {
             return self.recovery_failed(txn, "automatic boot fallback is below the security floor");
         }
-        let o = self.call(txn.id, "withdraw_boot_once", |h, op| h.generations().withdraw_boot_once(txn.revert_to, op))?;
+        let o =
+            self.call(txn.id, "withdraw_boot_once", |h, op| h.generations().withdraw_boot_once(txn.revert_to, op))?;
         if !o.is_success() {
             return self.recovery_failed(txn, &format!("cannot prove boot publication withdrawn: {o:?}"));
         }
@@ -882,7 +892,12 @@ impl<S: Store, H: Host> Kernel<S, H> {
     /// Whether the watchdog should take this transaction over (§12 recovery watchdog).
     pub fn watchdog_should_take_over(&self, txn: &Transaction) -> bool {
         let historical_publication = txn.state == TxnState::Built
-            && self.journal.ledger().live.get(&txn.id).is_some_and(|l| l.ops.iter().any(|o| o.call == "publish_boot_once"));
+            && self
+                .journal
+                .ledger()
+                .live
+                .get(&txn.id)
+                .is_some_and(|l| l.ops.iter().any(|o| o.call == "publish_boot_once"));
         // AwaitingBoot is intentionally parked during the publishing boot,
         // regardless of its deadline. After a reboot it has a recovery
         // obligation even when the daemon never starts; the independent
@@ -1098,8 +1113,8 @@ mod completion_tests {
     use crate::fake::{FakeHost, World};
     use crate::store::MemStore;
     use planarian_schema::{
-        ChangeId, CheckContext, DerivedFacts, Disruption, Expectation, PolicyVersion, Recovery,
-        Sensitivities, Settle, StorePath,
+        ChangeId, CheckContext, DerivedFacts, Disruption, Expectation, PolicyVersion, Recovery, Sensitivities, Settle,
+        StorePath,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex};
@@ -1114,7 +1129,12 @@ mod completion_tests {
             id: TxnId(0),
             state: TxnState::Prepared,
             lease: Lease {
-                txn: TxnId(0), owner: daemon, epoch: 1, worker_pid: None, renewed: Timestamp(0), jobs: vec![],
+                txn: TxnId(0),
+                owner: daemon,
+                epoch: 1,
+                worker_pid: None,
+                renewed: Timestamp(0),
+                jobs: vec![],
             },
             base_source: None,
             staged_source: None,
@@ -1124,11 +1144,20 @@ mod completion_tests {
             recovery: RecoveryStrategy::RevertGeneration,
             transition: Transition::ApplyChange { change: ChangeId("security-fix".into()), args: BTreeMap::new() },
             facts: DerivedFacts {
-                affected_units: Vec::new(), sensitivity: Sensitivities::default(), disruption: Disruption::Brief,
-                recovery: Recovery::Revertible, touches_manifest: false, touches_canonical_probe: false,
-                changes_desired: false, below_security_floor: false, restores_unattributed_stop: false,
-                other_sessions_affected: false, affected_sessions: Vec::new(), touches_core: false,
-                caller: Actor::user(1000), config_diff: None,
+                affected_units: Vec::new(),
+                sensitivity: Sensitivities::default(),
+                disruption: Disruption::Brief,
+                recovery: Recovery::Revertible,
+                touches_manifest: false,
+                touches_canonical_probe: false,
+                changes_desired: false,
+                below_security_floor: false,
+                restores_unattributed_stop: false,
+                other_sessions_affected: false,
+                affected_sessions: Vec::new(),
+                touches_core: false,
+                caller: Actor::user(1000),
+                config_diff: None,
             },
             base: GenerationId(1),
             candidate: Some((GenerationId(2), StorePath("/nix/store/security-fix".into()))),
@@ -1136,7 +1165,10 @@ mod completion_tests {
             approval: None,
             snapshot: None,
             expected: Expectation {
-                units: BTreeMap::new(), generation: None, may_change: BTreeSet::new(), others_unchanged: true,
+                units: BTreeMap::new(),
+                generation: None,
+                may_change: BTreeSet::new(),
+                others_unchanged: true,
                 settle: Settle::Duration(Millis(0)),
             },
             started: Timestamp(0),
@@ -1144,7 +1176,9 @@ mod completion_tests {
             revert_to: GenerationId(1),
             prior_driver: None,
             check: CheckContext {
-                required_floor: Some(GenerationId(2)), floor_fixes: vec!["inspected-fix".into()], ..Default::default()
+                required_floor: Some(GenerationId(2)),
+                floor_fixes: vec!["inspected-fix".into()],
+                ..Default::default()
             },
         };
         let id = kernel.prepare(transaction).unwrap();

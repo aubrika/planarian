@@ -694,7 +694,7 @@ mod agent_registry_checkpoint_tests {
         let store = MemStore::new(1 << 20);
         let ledger = Ledger {
             last_seq: 3,
-            agents: vec![("coder".into(), 1000), ("tester".into(), 1001), ("coder".into(), 0)],
+            agents: vec![("coder".into(), [0; 16], 1000), ("tester".into(), [0; 16], 1001), ("coder".into(), [0; 16], 0)],
             ..Default::default()
         };
         let head = Hash::of(b"historical journal prefix");
@@ -707,8 +707,9 @@ mod agent_registry_checkpoint_tests {
     fn old_duplicate_registrations_normalize_after_original_checkpoint_verification() {
         let (store, bytes, head) = historical_checkpoint();
         let mut journal = Journal::open(store.clone()).unwrap();
-        assert_eq!(journal.ledger().agents, vec![("tester".into(), 1001), ("coder".into(), 0)]);
-        assert_eq!(journal.ledger().agent_for("coder"), Some(0), "historical last-recorded owner is preserved");
+        assert_eq!(journal.ledger().agents, vec![("tester".into(), [0; 16], 1001), ("coder".into(), [0; 16], 0)]);
+        assert_eq!(journal.ledger().agent_owner("coder"), Some(0), "historical last-recorded owner is preserved");
+        assert_eq!(journal.ledger().agent_for("coder", [0; 16]), None, "legacy rows supply no instance authority");
         let (ledger, prefix) = journal.verified_snapshot().unwrap();
         assert_eq!(prefix.checkpoint, Some(Hash::of(&bytes)), "prefix identifies the original stored bytes");
         assert_eq!(prefix.head, head);
@@ -726,6 +727,10 @@ mod agent_registry_checkpoint_tests {
         bytes[HEADER + PREV] ^= 1;
         store.write_checkpoint(&bytes).unwrap();
         assert!(matches!(Journal::open(store.clone()), Err(JournalError::Corrupt(_))));
-        assert_eq!(store.read_checkpoint().unwrap(), Some(bytes), "invalid evidence is retained without normalization writes");
+        assert_eq!(
+            store.read_checkpoint().unwrap(),
+            Some(bytes),
+            "invalid evidence is retained without normalization writes"
+        );
     }
 }

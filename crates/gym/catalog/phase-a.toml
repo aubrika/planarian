@@ -1,8 +1,8 @@
 # Planarian — Phase A fault catalog
 #
-# First deliverable per SPEC §18.0. Status: DRAFT FOR OWNER REVIEW.
-# Spec revision: v4.4 (v4.4 renames applied; v4.4 cases join as they are
-# implemented, from phase-a-v4.4-draft.toml). Review notes, coverage matrix and open questions:
+# First deliverable per SPEC §18.0; the owner signed off the defaults on
+# 2026-10-26. Spec revision: v4.6 (128 entries; v4.4, v4.5 and the v4.6
+# cases so far are in). Review notes, coverage and counts:
 # docs/catalog-review.md.
 #
 # ───────────────────────────────────────────────────────────────────────────
@@ -2762,6 +2762,155 @@ target = "service:gym-web"
 terminal = "Committed"
 caller = "agent:coder"
 
+# B-20 (High), I24.
+# R08 (§13): rejection must not grant an indirect control capability.
+[[fault]]
+id = "dry-activate-exit-nonzero"
+family = "bad-generation"
+summary = "The dry activation of a display-scale change exits nonzero. Its plan is unknown, never smaller: the build fails, nothing is activated, and the running generation stays (rule 21, R10)."
+spec = ["§9 step 3", "§18 rule 21", "R10"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the VM's dry activation is the real switch-to-configuration,
+# with no hook to make it fail; the backend's own test covers the three cases.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "dry_activate", result = "exit-nonzero" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "3m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = 'Other("build")'
+
+[[fault]]
+id = "dry-activate-timeout"
+family = "bad-generation"
+summary = "The dry activation of a display-scale change times out. Its plan is unknown, never smaller: the build fails, nothing is activated, and the running generation stays (rule 21, R10)."
+spec = ["§9 step 3", "§18 rule 21", "R10"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the VM's dry activation is the real switch-to-configuration,
+# with no hook to make it fail; the backend's own test covers the three cases.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "dry_activate", result = "timeout" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "3m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = 'Other("build")'
+
+[[fault]]
+id = "dry-activate-truncated"
+family = "bad-generation"
+summary = "The dry activation of a display-scale change emits more output than is read (truncated). Its plan is unknown, never smaller: the build fails, nothing is activated, and the running generation stays (rule 21, R10)."
+spec = ["§9 step 3", "§18 rule 21", "R10"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the VM's dry activation is the real switch-to-configuration,
+# with no hook to make it fail; the backend's own test covers the three cases.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "dry_activate", result = "truncated" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "3m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = 'Other("build")'
+
+# R03 (§11, rule 20): equivalent effects, equivalent facts.
+[[fault]]
+id = "override-stopped-equals-stop"
+family = "authority"
+summary = "An administrator with no session here (over SSH) asks, in turn, for an override that stops the display manager and for a plain stop of it. Both end the seated user's session: both derive SessionLoss over the same units and both are held at AskFirst, since it is not the caller's own session."
+spec = ["§11 global floors", "§18 rule 20", "I21", "R03"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { raw = "cli", argv = ["override", "service:display-manager", "--stopped"], actor = "user:1001" }
+after = [{ raw = "cli", argv = ["stop", "service:display-manager"], actor = "user:1001" }]
+window = "3m"
+
+[fault.required_post]
+units = { "service:display-manager" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+tier = "AskFirst"
+facts = { disruption = "SessionLoss" }
+affected_includes = ["service:display-manager"]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+tier = "AskFirst"
+facts = { disruption = "SessionLoss" }
+affected_includes = ["service:display-manager"]
+
+[[fault]]
+id = "release-refused-leaves-incident"
+family = "authority"
+summary = "gym-web keeps failing until its incident has spent its repair budget and escalated. alice, who may not act on gym-web, asks to release it: refused Unauthorized, and the incident record is unchanged (no budget restored, no attempt brought forward, not reopened)."
+spec = ["§13", "§11 authorization", "R08"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "set_persistent_knob", unit = "service:gym-web", knob = "fail_on_start", value = true },
+  { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" },
+  { raw = "wait", for = "5m" },
+]
+inject = { raw = "cli", argv = ["release", "service:gym-web"], actor = "user:1000" }
+window = "2m"
+
+[fault.required_post]
+incident_unchanged_by_refusal = "service:gym-web"
+
+[[fault.required_post.txn]]
+transition = "LiftOverride"
+target = "service:gym-web"
+refused_with = "Unauthorized"
+
+[[fault]]
+id = "agent-name-collision"
+family = "authority"
+summary = "alice (uid 1000) starts an agent named helper. An administrator then runs `planarian agent run helper` too: refused, naming alice as its owner. alice's agent stays alice's: its stop of gym-web, a system unit she may not stop, is refused. Authority is bound to the instance a start journaled, never the name (I24)."
+spec = ["§11 principals", "§16 agent run", "I24", "B-20"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "agent_run", name = "helper", as = "user:1000", argv = ["/run/current-system/sw/bin/sleep", "infinity"] },
+  { raw = "agent_run", name = "helper", as = "user:1001", argv = ["/run/current-system/sw/bin/sleep", "infinity"] },
+]
+inject = { raw = "cli", argv = ["stop", "service:gym-web"], actor = "agent:helper" }
+window = "3m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+reports = ["AgentNameInUse"]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+target = "service:gym-web"
+refused_with = "Unauthorized"
+caller = "agent:helper"
+
 [[fault]]
 id = "agent-has-its-users-permissions"
 family = "authority"
@@ -2863,6 +3012,26 @@ units = { "service:sshd" = "Running" }
 transition = "ApplyChange"
 terminal = "pending"
 never = ["Activating"]
+
+# The other half of approve-needs-real-terminal: at a terminal the daemon
+# finds on the peer, the same approval is taken and the change runs.
+[[fault]]
+id = "approve-at-terminal-runs"
+family = "authority"
+summary = "An administrator who is not root asks to disable sshd (Security: AskFirst). Root approves it from a real terminal, which the daemon reads from the peer's pidfd: the approval is taken and the change commits."
+spec = ["§11 approval", "§16 approve", "B-3"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" }]
+inject = { raw = "approve_pending", actor = "root", via = "tty" }
+window = "10m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+decision = "Allow(AskFirst)"
+terminal = "Committed"
 
 # B-6 (Medium). Pid reuse itself cannot be arranged reproducibly (P10 in
 # assumptions.md, deviations.md); this checks the case the pidfd rule
@@ -3012,9 +3181,11 @@ setup = [
 inject = { raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }
 window = "5m"
 
+# The token was presented and refused, not merely never presented.
 [[fault.required_post.txn]]
 transition = "ApplyChange"
 never = ["Activating"]
+terminal = "Rejected(Stale)"
 
 # I10: "No change that removes or alters a canonical probe executes below AskFirst."
 [[fault]]

@@ -9,8 +9,8 @@ use crate::admitted;
 use crate::cmd::run;
 use planarian_schema::{Ending, Observed, OpId, Outcome, Reason, Scope, Timestamp, UnitBackend, UnitId, UnitKind};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -131,8 +131,11 @@ fn agent_admission(text: &str, by: u32) -> Result<(), &'static str> {
             continue;
         }
         total += 1;
-        let owner = p.get("Description").and_then(|s| s.strip_prefix("Planarian agent uid="))
-            .and_then(|s| s.parse::<u32>().ok()).ok_or("unknown owner of live agent; administrator must stop it")?;
+        let owner = p
+            .get("Description")
+            .and_then(|s| s.strip_prefix("Planarian agent uid="))
+            .and_then(|s| s.parse::<u32>().ok())
+            .ok_or("unknown owner of live agent; administrator must stop it")?;
         if owner == by {
             own += 1;
         }
@@ -247,18 +250,23 @@ impl UnitBackend for Systemd {
             .collect())
     }
 
-    fn start_agent(&self, name: &str, argv: &[String], by: u32) -> Outcome {
+    fn start_agent(
+        &self,
+        name: &str,
+        argv: &[String],
+        by: u32,
+    ) -> Result<planarian_schema::backend::InstanceId, Outcome> {
         if !planarian_schema::backend::valid_agent_name(name)
             || argv.is_empty()
             || argv.len() > 64
             || argv.iter().map(String::len).sum::<usize>() > 16384
         {
-            return Outcome::Failed("invalid or oversized agent command".into());
+            return Err(Outcome::Failed("invalid or oversized agent command".into()));
         }
-        // Serialize admission across backend instances/processes. Failure to
-        // acquire the lock is backpressure, never an unbounded wait queue.
+        // The same cross-process lock covers admission, start and identity
+        // readback; no unbounded launcher wait queue is created.
         if let Err(e) = std::fs::create_dir_all(&self.txn_dir) {
-            return Outcome::Failed(format!("agent admission directory: {e}"));
+            return Err(Outcome::Failed(format!("agent admission directory: {e}")));
         }
         let lock = match std::fs::OpenOptions::new()
             .create(true)
@@ -268,16 +276,14 @@ impl UnitBackend for Systemd {
             .open(self.txn_dir.join("agent-launch.lock"))
         {
             Ok(f) => f,
-            Err(e) => return Outcome::Failed(format!("agent admission lock: {e}")),
+            Err(e) => return Err(Outcome::Failed(format!("agent admission lock: {e}"))),
         };
         if lock.try_lock().is_err() {
-            return Outcome::Failed("agent admission busy; retry later".into());
+            return Err(Outcome::Failed("agent admission busy; retry later".into()));
         }
-        // These checks improve the error; systemd enforces the same lifecycle
-        // independently below, including the check/start race and daemon death.
         let ready = self.ctl(&Scope::System, &["is-active", "--quiet", "planarian-ready.target"], QUERY_TIMEOUT);
         if !ready.ok() {
-            return Outcome::Failed("Planarian is not ready for agents".into());
+            return Err(Outcome::Failed("Planarian is not ready for agents".into()));
         }
         let live = self.ctl(
             &Scope::System,
@@ -285,21 +291,33 @@ impl UnitBackend for Systemd {
             QUERY_TIMEOUT,
         );
         if !live.ok() {
-            return Outcome::Failed(format!("cannot establish agent admission: {}", live.tail()));
+            return Err(Outcome::Failed(format!("cannot establish agent admission: {}", live.tail())));
         }
         if let Err(reason) = agent_admission(&live.stdout, by) {
-            return Outcome::Failed(reason.into());
+            return Err(Outcome::Failed(reason.into()));
         }
         let a = agent_argv(name, argv, by);
         let refs: Vec<&str> = a.iter().map(String::as_str).collect();
         let o = run(&refs, QUERY_TIMEOUT);
         if o.timed_out {
-            Outcome::Unknown("agent start was accepted or lost; inspect its systemd unit".into())
-        } else if o.ok() {
-            Outcome::Succeeded
-        } else {
-            Outcome::Failed(o.tail())
+            return Err(Outcome::Unknown("agent start was accepted or lost; inspect its systemd unit".into()));
         }
+        if !o.ok() {
+            return Err(Outcome::Failed(o.tail()));
+        }
+        let unit = format!("{}.service", planarian_schema::backend::agent_unit(name));
+        let id = self.ctl(&Scope::System, &["show", "-p", "InvocationID", "--value", &unit], QUERY_TIMEOUT);
+        if !id.ok() {
+            return Err(Outcome::Unknown(format!("{unit} started, but its instance query failed")));
+        }
+        planarian_schema::backend::InstanceId::parse(id.stdout.trim().as_bytes())
+            .ok_or_else(|| Outcome::Unknown(format!("{unit} started, but it has no InvocationID")))
+    }
+
+    fn agent_running(&self, name: &str) -> bool {
+        let unit = format!("{}.service", planarian_schema::backend::agent_unit(name));
+        let o = self.ctl(&Scope::System, &["show", "-p", "ActiveState", "--value", &unit], QUERY_TIMEOUT);
+        o.ok() && matches!(o.stdout.trim(), "active" | "activating" | "reloading" | "deactivating")
     }
 
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome {
@@ -324,7 +342,10 @@ mod tests {
             "Requisite=planarian-ready.target",
             "ConditionPathExistsGlob=!/run/planarian/failed-*",
             "Slice=planarian-agents.slice",
-            "TasksMax=64", "MemoryMax=256M", "CPUQuota=50%", "KillMode=control-group",
+            "TasksMax=64",
+            "MemoryMax=256M",
+            "CPUQuota=50%",
+            "KillMode=control-group",
         ] {
             assert!(a.contains(&format!("--property={property}")), "{property}");
         }
@@ -334,8 +355,12 @@ mod tests {
 
     #[test]
     fn admission_counts_starts_and_preserves_root_capacity() {
-        let block = |uid, state| format!("Id=planarian-agent-helper.service\nDescription=Planarian agent uid={uid}\nActiveState={state}\n");
-        let four = [block(1000, "active"), block(1000, "activating"), block(1000, "deactivating"), block(1000, "active")].join("\n");
+        let block = |uid, state| {
+            format!("Id=planarian-agent-helper.service\nDescription=Planarian agent uid={uid}\nActiveState={state}\n")
+        };
+        let four =
+            [block(1000, "active"), block(1000, "activating"), block(1000, "deactivating"), block(1000, "active")]
+                .join("\n");
         assert!(agent_admission(&four, 1000).is_err());
         assert!(agent_admission(&four, 1001).is_ok());
         let full = (1000..1028).map(|uid| block(uid, "active")).collect::<Vec<_>>().join("\n");

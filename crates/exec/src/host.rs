@@ -241,7 +241,6 @@ pub fn changed_units(a: &Manifest, b: &Manifest) -> BTreeSet<UnitId> {
     out
 }
 
-
 /// Capture the independently passing applicable probes before policy-approved
 /// activation. This evidence is stored in Prepared, so recovery has the same
 /// obligation even if the daemon and its volatile state are gone.
@@ -288,13 +287,18 @@ fn preservation_violations(
             out.push(format!("{unit}: previously passing Readiness probe {} changed or disappeared", before.id.0));
             continue;
         }
-        let latest = state.units.get(unit).and_then(|(_, ev)| {
-            ev.iter().filter(|e| e.probe == before.id).max_by_key(|e| e.at)
-        });
+        let latest =
+            state.units.get(unit).and_then(|(_, ev)| ev.iter().filter(|e| e.probe == before.id).max_by_key(|e| e.at));
         if !latest.is_some_and(|e| {
-            e.at >= started && e.at <= state.observed_at && e.fresh_at(state.observed_at) && e.result == ProbeResult::Pass
+            e.at >= started
+                && e.at <= state.observed_at
+                && e.fresh_at(state.observed_at)
+                && e.result == ProbeResult::Pass
         }) {
-            out.push(format!("{unit}: previously passing Readiness probe {} has no fresh post-change pass", before.id.0));
+            out.push(format!(
+                "{unit}: previously passing Readiness probe {} has no fresh post-change pass",
+                before.id.0
+            ));
         }
     }
     out

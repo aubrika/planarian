@@ -107,8 +107,7 @@ const RESERVED_BUILDS: usize = 2;
 const BUILDS_PER_PRINCIPAL: usize = 2;
 
 fn admits_build(admin: bool, mine: usize, total: usize) -> bool {
-    mine < BUILDS_PER_PRINCIPAL
-        && total < if admin { MAX_BUILDS } else { MAX_BUILDS - RESERVED_BUILDS }
+    mine < BUILDS_PER_PRINCIPAL && total < if admin { MAX_BUILDS } else { MAX_BUILDS - RESERVED_BUILDS }
 }
 
 /// Whether one more connection from this peer fits.
@@ -201,22 +200,47 @@ fn peer_of(s: &UnixStream, admin_group: &str) -> Option<Peer> {
     // A process in an agent's unit is that agent, whatever uid it runs as
     // (§11): never an administrator, never in a session.
     if let Some(name) = agent_of_cgroup(&p.cgroup) {
-        return Some(Peer::agent(uid, &name));
+        return Some(Peer::agent(uid, &name, instance_of_cgroup(&p.cgroup)));
     }
     let session = session_of_cgroup(&p.cgroup, uid);
-    Some(Peer { uid, admin: is_admin(uid, admin_group), session, agent: None, tty: p.tty })
+    Some(Peer { uid, admin: is_admin(uid, admin_group), session, agent: None, instance: None, tty: p.tty })
 }
 
-/// The agent whose unit (`/system.slice/planarian-agent-<name>.service`,
-/// or below it) holds this cgroup, if any.
-fn agent_of_cgroup(cgroup: &str) -> Option<String> {
+/// Resolve only supervisor-owned launcher locations, never a unit-looking
+/// name inside a user/delegated cgroup. Descendants inherit the enclosing
+/// agent's identity and instance, not a unit name they create themselves.
+fn agent_unit_cgroup(cgroup: &str) -> Option<(String, String)> {
     let line = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
-    let mut parts = line.split('/').filter(|c| !c.is_empty());
-    if parts.next()? != "system.slice" {
+    let parts: Vec<&str> = line.strip_prefix('/')?.split('/').collect();
+    if parts.iter().any(|c| c.is_empty() || *c == "." || *c == "..") {
         return None;
     }
-    let name = parts.next()?.strip_prefix("planarian-agent-")?.strip_suffix(".service")?;
-    planarian_schema::backend::valid_agent_name(name).then(|| name.to_string())
+    let unit_index = if parts.first() == Some(&"system.slice") {
+        1
+    } else if parts.starts_with(&["planarian.slice", "planarian-agents.slice"]) {
+        2
+    } else {
+        return None;
+    };
+    let name = parts.get(unit_index)?.strip_prefix("planarian-agent-")?.strip_suffix(".service")?;
+    if !planarian_schema::backend::valid_agent_name(name) {
+        return None;
+    }
+    Some((name.to_string(), parts[..=unit_index].join("/")))
+}
+
+fn agent_of_cgroup(cgroup: &str) -> Option<String> {
+    agent_unit_cgroup(cgroup).map(|(name, _)| name)
+}
+
+/// Read the actual launcher unit root, even for a delegated descendant or
+/// the nested supervised slice. Only root may set this trusted xattr (I24).
+fn instance_of_cgroup(cgroup: &str) -> Option<planarian_schema::InstanceId> {
+    let (_, unit) = agent_unit_cgroup(cgroup)?;
+    let dir = format!("/sys/fs/cgroup/{unit}");
+    let mut buf = [0u8; 64];
+    let n = rustix::fs::getxattr(dir.as_str(), "trusted.invocation_id", &mut buf).ok()?;
+    planarian_schema::InstanceId::parse(&buf[..n])
 }
 
 /// `sd_pid_get_session` (systemd's `cg_path_get_session`): the logind
@@ -717,6 +741,24 @@ mod tests {
         // an agent unit is not one, and neither is a bad name.
         assert_eq!(agent_of_cgroup("0::/user.slice/user-1000.slice/planarian-agent-coder.service\n"), None);
         assert_eq!(agent_of_cgroup("0::/system.slice/planarian-agent-Coder.service\n"), None);
+        let supervised = "0::/planarian.slice/planarian-agents.slice/planarian-agent-coder.service/sub\n";
+        assert_eq!(agent_of_cgroup(supervised), Some("coder".into()));
+        assert_eq!(
+            agent_unit_cgroup(supervised),
+            Some(("coder".into(), "planarian.slice/planarian-agents.slice/planarian-agent-coder.service".into()))
+        );
+        assert_eq!(
+            agent_unit_cgroup("0::/system.slice/planarian-agent-coder.service/sub\n"),
+            Some(("coder".into(), "system.slice/planarian-agent-coder.service".into()))
+        );
+        for spoof in [
+            "0::/user.slice/user-1000.slice/user@1000.service/planarian.slice/planarian-agents.slice/planarian-agent-coder.service",
+            "0::/system.slice/other.service/planarian-agent-coder.service",
+            "0::/planarian.slice/planarian-agents.slice/other.service/planarian-agent-coder.service",
+            "0::/planarian.slice/planarian-agents.slice/../planarian-agent-coder.service",
+        ] {
+            assert_eq!(agent_unit_cgroup(spoof), None, "{spoof}");
+        }
     }
 
     #[test]

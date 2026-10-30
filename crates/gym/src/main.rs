@@ -149,7 +149,9 @@ fn validate_catalog(entries: &[T]) -> Result<(), String> {
         let harnesses = entry.get("harness").and_then(T::as_array).ok_or_else(|| format!("{id}: no harness"))?;
         let mut seen = std::collections::BTreeSet::new();
         if harnesses.is_empty()
-            || harnesses.iter().any(|h| !matches!(h.as_str(), Some("fake" | "vm" | "bench")) || !seen.insert(h.as_str()))
+            || harnesses
+                .iter()
+                .any(|h| !matches!(h.as_str(), Some("fake" | "vm" | "bench")) || !seen.insert(h.as_str()))
         {
             return Err(format!("{id}: invalid harness applicability"));
         }
@@ -289,7 +291,9 @@ fn main() {
                     }
                 }
                 let r = run_entry(e);
-                if r.result != Result_::NotFake && let Some(dir) = &verdict_dir {
+                if r.result != Result_::NotFake
+                    && let Some(dir) = &verdict_dir
+                {
                     let verdict = serde_json::json!({
                         "id": id,
                         "result": format!("{:?}", r.result).to_uppercase(),
@@ -331,7 +335,13 @@ fn main() {
             // Exit 3 is exclusively unsupported coverage; the wrapper may
             // accept it only after validating reviewed scoped waivers. A
             // failing execution keeps exit 1 even if another case is waived.
-            std::process::exit(if failed { 1 } else if worst == Result_::Unsupported { 3 } else { 0 });
+            std::process::exit(if failed {
+                1
+            } else if worst == Result_::Unsupported {
+                3
+            } else {
+                0
+            });
         }
         "serve" => {
             let socket = args.iter().position(|a| a == "--socket").and_then(|i| args.get(i + 1)).cloned();

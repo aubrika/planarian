@@ -258,9 +258,7 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
     // unique obligation. Its runner rejects missing, failed, stale or edited
     // artifacts; source-name and count checks alone cannot discharge a claim.
     let artifacts = std::env::var("PLANARIAN_PROOF_ARTIFACTS").unwrap_or_else(|_| "proof-results".into());
-    match std::process::Command::new("python3")
-        .args(["nix/gym/proofs.py", "check", "--artifacts", &artifacts])
-        .output()
+    match std::process::Command::new("python3").args(["nix/gym/proofs.py", "check", "--artifacts", &artifacts]).output()
     {
         Ok(output) => {
             text.push_str(&String::from_utf8_lossy(&output.stdout));

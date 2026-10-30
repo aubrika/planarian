@@ -72,7 +72,9 @@ fn external_dependency_obstructs(target: &UnitId, i: &Inputs<'_>) -> bool {
             {
                 let has_readiness =
                     i.defs.get(&edge.to).is_some_and(|d| d.probes.iter().any(|p| p.role == ProbeRole::Readiness));
-                if !has_readiness || !matches!(i.state.status(&edge.to, i.defs), UnitStatus::Running | UnitStatus::Bound) {
+                if !has_readiness
+                    || !matches!(i.state.status(&edge.to, i.defs), UnitStatus::Running | UnitStatus::Bound)
+                {
                     return true;
                 }
             }

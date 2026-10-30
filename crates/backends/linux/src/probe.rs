@@ -47,11 +47,7 @@ fn resolve_with(program: &str, host: &str, deadline: Instant) -> Result<Vec<IpAd
             break;
         }
     }
-    if addresses.is_empty() {
-        Err(ProbeResult::Error(format!("{host}: no usable address")))
-    } else {
-        Ok(addresses)
-    }
+    if addresses.is_empty() { Err(ProbeResult::Error(format!("{host}: no usable address"))) } else { Ok(addresses) }
 }
 
 fn remaining(deadline: Instant) -> Result<Duration, ProbeResult> {
@@ -214,6 +210,8 @@ pub fn exec(argv: &[String], sb: &ProbeSandbox, timeout: Duration) -> ProbeResul
     let o = run_limited(&refs, timeout + Duration::from_secs(2), sb.max_output as usize);
     if o.timed_out {
         ProbeResult::Timeout
+    } else if o.truncated {
+        ProbeResult::Error("probe output is incomplete".into())
     } else if o.ok() {
         ProbeResult::Pass
     } else if o.status.is_none() {
@@ -234,6 +232,8 @@ pub fn dbus(service: &str, path: &str, method: &str, timeout: Duration) -> Probe
     let o = run_limited(&argv, timeout + Duration::from_secs(2), 4096);
     if o.timed_out {
         ProbeResult::Timeout
+    } else if o.truncated {
+        ProbeResult::Error("probe output is incomplete".into())
     } else if o.ok() {
         ProbeResult::Pass
     } else if o.status.is_none() {
@@ -298,7 +298,8 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 struct Permit;
 impl Permit {
     fn acquire() -> Option<Self> {
-        ACTIVE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_CONCURRENT).then_some(n + 1))
+        ACTIVE
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_CONCURRENT).then_some(n + 1))
             .ok()
             .map(|_| Self)
     }
@@ -320,10 +321,12 @@ impl ProbeBackend for Probes {
                     .map(|(_, p)| {
                         // A caller cannot create unbounded workers while another
                         // batch is still running. There is no wait for a permit.
-                        Permit::acquire().map(|permit| s.spawn(move || {
-                            let _permit = permit;
-                            run_one(p, enqueued)
-                        }))
+                        Permit::acquire().map(|permit| {
+                            s.spawn(move || {
+                                let _permit = permit;
+                                run_one(p, enqueued)
+                            })
+                        })
                     })
                     .collect();
                 handles
@@ -442,5 +445,4 @@ mod tests {
             assert!(start.elapsed() < Duration::from_millis(500));
         }
     }
-
 }

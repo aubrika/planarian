@@ -99,12 +99,16 @@ pub trait UnitBackend {
         vec![]
     }
     fn list(&self) -> Result<Vec<UnitId>, Outcome>;
-    /// Start an agent as its own principal (§11, §16): the transient unit
-    /// `planarian-agent-<name>`, under a dynamic uid of its own. `by` is the
-    /// authenticated launching uid, used only for resource admission and
-    /// attribution; authority is still derived from the durable start record.
-    fn start_agent(&self, _name: &str, _argv: &[String], _by: u32) -> Outcome {
-        Outcome::Failed("this backend cannot start agents".into())
+    /// Start an agent in a transient dynamic-uid unit (§11, §16). `by` is
+    /// authenticated launcher metadata for admission/resource attribution.
+    /// Authority is bound only after successful start to the returned unit
+    /// instance, read back from the supervisor (I24).
+    fn start_agent(&self, _name: &str, _argv: &[String], _by: u32) -> Result<InstanceId, Outcome> {
+        Err(Outcome::Failed("this backend cannot start agents".into()))
+    }
+    /// Whether the named agent is still running; a name in use is refused.
+    fn agent_running(&self, _name: &str) -> bool {
+        false
     }
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome;
     fn stop(&self, id: &UnitId, op: &OpId) -> Outcome;
@@ -343,7 +347,51 @@ pub fn valid_agent_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// One start of an agent's unit: its systemd InvocationID (I24). The name
+/// alone never identifies an agent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct InstanceId(pub [u8; 16]);
+
+impl InstanceId {
+    /// From systemd's form (32 hex digits, as `InvocationID` and the
+    /// cgroup's `trusted.invocation_id` carry it) or the 16 raw bytes.
+    pub fn parse(b: &[u8]) -> Option<InstanceId> {
+        if b.len() == 16 {
+            let raw: [u8; 16] = b.try_into().ok()?;
+            return (raw != [0; 16]).then_some(InstanceId(raw));
+        }
+        let b = b.strip_suffix(b"\n").unwrap_or(b);
+        let s = std::str::from_utf8(b).ok()?.trim();
+        if s.len() != 32 {
+            return None;
+        }
+        let mut out = [0u8; 16];
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+        }
+        (out != [0; 16]).then_some(InstanceId(out))
+    }
+}
+
 /// The unit an agent runs in (§11, §16).
 pub fn agent_unit(name: &str) -> String {
     format!("planarian-agent-{name}")
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::InstanceId;
+
+    #[test]
+    fn instance_evidence_rejects_zero_and_preserves_raw_newline_bytes() {
+        assert_eq!(InstanceId::parse(&[0; 16]), None);
+        assert_eq!(InstanceId::parse(b"00000000000000000000000000000000"), None);
+        let mut raw = [1; 16];
+        raw[15] = b'\n';
+        assert_eq!(InstanceId::parse(&raw), Some(InstanceId(raw)));
+        assert_eq!(
+            InstanceId::parse(b"0101010101010101010101010101010a\n"),
+            Some(InstanceId(raw))
+        );
+    }
 }

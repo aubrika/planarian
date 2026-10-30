@@ -2,7 +2,7 @@
 
 Covers `crates/gym/catalog/phase-a.toml` (SPEC §18.0) and, from §5 on, the v4.4 draft `crates/gym/catalog/phase-a-v4.4-draft.toml`. Per §18.0, work stops here until the owner signs off.
 
-The catalog has 71 entries: 46 `must-pass`, 16 `repair`, 9 `intent`. 54 run on the fake-backend harness and 61 on the NixOS VM; most run on both.
+At sign-off (2026-10-26) the catalog had 71 entries: 46 `must-pass`, 16 `repair`, 9 `intent`; 54 ran on the fake-backend harness and 61 on the NixOS VM. Sections 5–11 cover what v4.4, v4.5 and v4.6 added; the current counts are in §11.
 
 ## 1. Coverage
 
@@ -210,3 +210,13 @@ The kill cases above switch to `SIGSEGV` (as `quiet-repair-not-deferred` already
 - A Security unit whose systemd restart count (`NRestarts`) rose without Planarian is alarmed on that alone. After systemd restarts a unit, its `ExecMain*` fields describe the new process, so the kill is no longer visible.
 - Not residue: (a) anything during a generation switch Planarian did not make, since the switch stops and starts units itself (`owner-rebuild-breaks-service`); (b) a unit that `Requires` (or `BindsTo`) a unit that crashed in the same tick, since it went down with that fault (`svc-killed-user-scope`, where wireplumber follows pipewire). Systemd's dependencies on user units are not in NixOS options, so the gym VM declares wireplumber → pipewire in its manifest.
 - `no_incident_on` for `target:graphical-session` passes when no session exists: a per-session unit with no instance had no incident (`login-greeter-idle`).
+
+# v4.5 and v4.6 additions (2026-10-29 to 2026-10-30)
+
+## 11. The catalog at v4.6
+
+128 entries: 95 `must-pass`, 20 `repair`, 13 `intent`. 104 run on the fake harness, 94 on the NixOS VM, and one (`quiet-reference-workload`) on the benchmark. Tags: 59 `acceptance`, 12 `bypass` (a `docs/bypasses.md` row's case), 14 `english` (one per proved invariant, written from §7's English before implementation; `planarian-gym verification` requires them).
+
+v4.5 added the bypass cases (B-1 … B-16) and the fourteen English-derived entries (`en-i5` … `en-i23`); where the draft named behaviour Phase A does not have, the entry tests the English's consequence instead (`docs/deviations.md`, 2026-10-30). v4.6 adds, so far: `agent-name-collision`, `agent-run-own-principal`, `agent-has-its-users-permissions`, `approve-at-terminal-runs`, `gc-retain-all-generations`, `posture-integrity-core-script`. The rest of §15's v4.6 acceptance cases land with the §28 changes they close (rule 19(d)), each in the same commit as its change.
+
+Harness changes that affect what a verdict means: a `[[required_post.txn]]` key the judge does not implement is reported unchecked (PARTIAL), never taken as holding; a VM catalog job is green only on PASS, or on UNSUPPORTED for the two entries the test VM cannot run by design (`storage-nix-full-gc`, `desktop-boot-fails-rollback`). §15's v4.6 harness contract extends this to every runner (rule 19(e)).

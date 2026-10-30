@@ -135,7 +135,7 @@ statement = "Under the progress assumptions, every transaction reaches a termina
 phase = "A (proof, conditional)"
 tested = ["exec crash-point property tests", "gym fake-assumptions-conformance"]
 discharged = ["txn::i12_steps_terminate", "txn::i12_terminal_always_reachable", "txn::terminal_is_final", "txn::refusal_only_before_mutation", "txn::apply", "txn::recovery_table_follows_the_state_machine", "txn::watchdog_takes_over_only_when_it_should", "txn::step_allowed", "txn::add_interlock"]
-assumes = ["G1", "G2", "G3", "G4", "G5", "P1", "P4", "P7", "V5"]
+assumes = ["G1", "G2", "G3", "G4", "P1", "P4", "P7", "V5"]
 
 [[invariant]]
 id = "I13"
