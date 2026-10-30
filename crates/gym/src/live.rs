@@ -700,12 +700,25 @@ fn request_at(actor: &str, req: &Request, tty: bool) -> Result<(), String> {
     };
     std::fs::write(&script, format!("#!/bin/sh\nexec {inner}\n")).map_err(|e| e.to_string())?;
     sh(&format!("chmod +x {}", script.display()));
-    let cmd = if tty {
-        format!("script -qec {} /dev/null", script.display())
+    // Never give the terminal allocator the test driver's control input.
+    // Bound the whole child tree as well as the socket's 600-second read:
+    // an approval transport failure must become evidence, not a silently
+    // ignored 900-second driver timeout with a still-Prepared candidate.
+    let path = script.to_string_lossy().into_owned();
+    let argv = if tty {
+        vec!["script", "-qec", path.as_str(), "/dev/null"]
     } else {
-        format!("setsid -w {} < /dev/null", script.display())
+        vec!["setsid", "-w", path.as_str()]
     };
-    if sh(&cmd) { Ok(()) } else { Err(format!("request as {user} failed")) }
+    let output = planarian_backend_linux::cmd::run(&argv, Duration::from_secs(660));
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+    if output.ok() {
+        Ok(())
+    } else {
+        Err(format!("terminal request as {user} failed (status {:?}, timed_out {}): {}",
+            output.status, output.timed_out, output.tail()))
+    }
 }
 
 /// Send a request as the step's actor and record the answer.
@@ -720,9 +733,11 @@ fn request_as(actor: &str, req: &Request) -> Result<(), String> {
         let unit = planarian_schema::backend::agent_unit(name);
         let cmd = format!(
             "uid=$(systemctl show -p UID --value {unit}); gid=$(systemctl show -p GID --value {unit}); \
+             cg=$(systemctl show -p ControlGroup --value {unit}); \
              [ -n \"$uid\" ] && [ \"$uid\" != \"[not set]\" ] || exit 1; \
-             sh -c 'echo $$ > /sys/fs/cgroup/system.slice/{unit}.service/cgroup.procs && \
-             exec setpriv --reuid=$0 --regid=$1 --clear-groups {exe} vm request --json \"$2\"' \"$uid\" \"$gid\" '{q}'"
+             case \"$cg\" in /*) ;; *) exit 1 ;; esac; [ \"$cg\" != / ] || exit 1; \
+             sh -c 'echo $$ > \"/sys/fs/cgroup$3/cgroup.procs\" && \
+             exec setpriv --reuid=$0 --regid=$1 --clear-groups {exe} vm request --json \"$2\"' \"$uid\" \"$gid\" '{q}' \"$cg\""
         );
         return if sh(&cmd) { Ok(()) } else { Err(format!("request as {actor} failed")) };
     }
@@ -1231,9 +1246,13 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 std::fs::write(Path::new(RUN).join("held-tokens"), held).map_err(|e| e.to_string())?;
                 return Ok(());
             }
+            if r.status.pending.is_empty() {
+                return Err("approve_pending found no pending approval; refusing to silently skip the acceptance step".into());
+            }
             for p in r.status.pending {
-                // A refused approval is the step's outcome, not the harness's error.
-                let _ = request_at(actor, &Request::Approve { hash: p.approve }, tty);
+                // A policy refusal is captured as a response by `vm request`;
+                // a failed transport is a harness error and must propagate.
+                request_at(actor, &Request::Approve { hash: p.approve }, tty)?;
             }
         }
         // I14: a request line carrying fields it must not set, sent to the
@@ -1319,7 +1338,7 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
             let user = user_for(&format!("user:{uid}"));
             let tty = 2 + (uid - 1000).clamp(0, 5);
             sh(&format!(
-                "systemd-run --unit=gym-session-{uid} -p PAMName=login -p User={user} -p TTYPath=/dev/tty{tty} \
+                "systemd-run --unit=gym-session-{uid} -p PAMName=login -p User={user} -p Environment=XDG_SESSION_TYPE=wayland -p TTYPath=/dev/tty{tty} \
                  -p StandardInput=tty -p StandardOutput=tty sleep infinity; sleep 5"
             ));
         }

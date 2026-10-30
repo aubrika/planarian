@@ -128,6 +128,68 @@ fn external_dependency_gets_no_local_repair() {
     observe(&mut w.s, &w.defs, &cl, Observed::Active, ProbeResult::Fail("upstream 502".into()));
     assert_eq!(root_cause(&cl, &w.inputs()), ext);
     assert!(candidates(&incident(&cl), &w.inputs()).is_empty(), "exhausted → report, never a local restart");
+    w.s.generation = GenerationId(2);
+    let mut current_planarian = w.inputs();
+    current_planarian.current_planarian_built = true;
+    assert!(candidates(&incident(&cl), &current_planarian).is_empty(), "no local rollback for an external outage");
+}
+
+#[test]
+fn weak_external_diagnostic_dependency_blocks_local_repair_on_http_503() {
+    let ext: UnitId = "service:external:gym-upstream".parse().unwrap();
+    let mut client = service("gym-upstream-client");
+    edge(&mut client, "service:external:gym-upstream", EdgeKind::Diagnostic { confidence: Confidence(500) });
+    client.probes[0].kind = ProbeKind::Http { url: "http://upstream/health".into(), status: 200 };
+    client.probes[0].establishes = "service:external:gym-upstream returns HTTP 200".into();
+    let mut upstream = service("service:external:gym-upstream");
+    upstream.probes[0].kind = ProbeKind::Http { url: "http://upstream/health".into(), status: 200 };
+    let mut w = World::new(defs([upstream, client]));
+    let cl = UnitId::service("gym-upstream-client");
+    observe(&mut w.s, &w.defs, &ext, Observed::Active, ProbeResult::Fail("HTTP 503".into()));
+    observe(&mut w.s, &w.defs, &cl, Observed::Active, ProbeResult::Fail("HTTP 503".into()));
+    assert!(matches!(w.s.status(&ext, &w.defs), UnitStatus::Degraded(_)));
+    assert_eq!(root_cause(&cl, &w.inputs()), cl, "weak evidence does not acquire root-cause confidence");
+    w.s.generation = GenerationId(2);
+    let mut ours = w.inputs();
+    ours.current_planarian_built = true;
+    assert!(candidates(&incident(&cl), &ours).is_empty(), "neither client restart nor local rollback repairs an outage");
+    observe(&mut w.s, &w.defs, &ext, Observed::Active, ProbeResult::Pass);
+    let c = candidates(&incident(&cl), &w.inputs());
+    assert_eq!(c[0].transition, Transition::RestartUnit(cl), "local repair can resume after the prerequisite passes");
+    w.defs.get_mut(&ext).unwrap().probes.clear();
+    assert!(
+        candidates(&incident(&UnitId::service("gym-upstream-client")), &w.inputs()).is_empty(),
+        "an external placeholder with no readiness evidence cannot prove the prerequisite healthy"
+    );
+}
+
+#[test]
+fn timed_out_external_dependency_stays_unknown_and_does_not_trigger_local_repair() {
+    let ext: UnitId = "service:external:gym-upstream".parse().unwrap();
+    let mut client = service("gym-upstream-client");
+    edge(&mut client, "service:external:gym-upstream", EdgeKind::Diagnostic { confidence: Confidence(500) });
+    let mut w = World::new(defs([service("service:external:gym-upstream"), client]));
+    let cl = UnitId::service("gym-upstream-client");
+    observe(&mut w.s, &w.defs, &ext, Observed::Active, ProbeResult::Timeout);
+    observe(&mut w.s, &w.defs, &cl, Observed::Active, ProbeResult::Fail("upstream HTTP 503".into()));
+    assert_eq!(w.s.status(&ext, &w.defs), UnitStatus::Unknown);
+    assert!(candidates(&incident(&cl), &w.inputs()).is_empty());
+    assert_eq!(w.s.status(&ext, &w.defs), UnitStatus::Unknown, "safety withholding does not manufacture Failed evidence");
+}
+
+#[test]
+fn external_wants_and_ordering_do_not_become_functional_prerequisites() {
+    for kind in [EdgeKind::Wants, EdgeKind::Ordering] {
+        let ext: UnitId = "service:external:gym-upstream".parse().unwrap();
+        let mut client = service("gym-upstream-client");
+        edge(&mut client, "service:external:gym-upstream", kind);
+        let mut w = World::new(defs([service("service:external:gym-upstream"), client]));
+        let cl = UnitId::service("gym-upstream-client");
+        observe(&mut w.s, &w.defs, &ext, Observed::Active, ProbeResult::Fail("HTTP 503".into()));
+        observe(&mut w.s, &w.defs, &cl, Observed::Active, ProbeResult::Fail("local failure".into()));
+        let c = candidates(&incident(&cl), &w.inputs());
+        assert_eq!(c[0].transition, Transition::RestartUnit(cl));
+    }
 }
 
 #[test]

@@ -71,6 +71,35 @@ pub fn contracts() -> Vec<(&'static str, Result<(), String>)> {
         }
     }));
 
+    // A withdrawal can have effects without a successful acknowledgment.
+    // Exercise the real fake adapter, including fencing before any mutation.
+    out.push(("Boot withdrawal preserves Partial/Unknown and fencing", (|| {
+        for injected in OUTCOMES {
+            let f = fresh();
+            fenced_at(&f, 1, 1);
+            let keep = f.w().current;
+            {
+                let mut w = f.w();
+                w.one_shot = Some(GenerationId(99));
+                w.boot_default = GenerationId(99);
+                w.inject.insert("withdraw_boot_once".into(), *injected);
+            }
+            let result = f.generations().withdraw_boot_once(keep, &op(1, 1));
+            let w = f.w();
+            let correct = match (injected, &result) {
+                (Injected::Fenced, _) => result.is_fenced() && w.one_shot == Some(GenerationId(99)),
+                (Injected::Partial, Outcome::Partial(_)) | (Injected::Unknown, Outcome::Unknown(_)) => {
+                    w.one_shot.is_none() && w.boot_default == keep
+                }
+                _ => false,
+            };
+            if !correct {
+                return Err(format!("withdrawal {injected:?}: {result:?}, selection {:?}", w.one_shot));
+            }
+        }
+        Ok(())
+    })()));
+
     // activate_live(revert_to) restores revert_to's activation state.
     out.push(("activate_live(revert_to) restores revert_to", {
         let f = fresh();

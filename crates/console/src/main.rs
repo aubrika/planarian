@@ -468,7 +468,7 @@ fn incidents<'a>(r: &'a ConsoleReport) -> Element<'a, Message> {
 
 fn describe(r: &Response) -> String {
     match r {
-        Response::Done { txn, state, message } => format!("transaction {}: {state:?}. {message}", txn.0),
+        Response::Done { txn, state, message, .. } => format!("transaction {}: {state:?}. {message}", txn.0),
         Response::NeedsApproval { what, approve, .. } => {
             format!("{what} needs approval (as root: planarian approve {approve})")
         }

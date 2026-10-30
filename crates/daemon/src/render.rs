@@ -152,7 +152,7 @@ pub fn response(s: &Submitted) -> Response {
                 TxnState::Cancelled(_) => "withdrawn".to_string(),
                 s => tag(s).to_string(),
             };
-            Response::Done { txn: *txn, state: state.clone(), message }
+            Response::Done { txn: *txn, state: state.clone(), message, evidence: None }
         }
         Submitted::Parked { txn, approve, facts } => Response::NeedsApproval {
             txn: *txn,

@@ -100,6 +100,17 @@ const MAX_CONNS: usize = 64;
 /// session (§16, B-15): services with dynamic uids cannot fill them all.
 const RESERVED: usize = 16;
 
+/// Includes the running build. Leave room for administrator work even when
+/// user-controlled catalog requests fill their allowance.
+const MAX_BUILDS: usize = 8;
+const RESERVED_BUILDS: usize = 2;
+const BUILDS_PER_PRINCIPAL: usize = 2;
+
+fn admits_build(admin: bool, mine: usize, total: usize) -> bool {
+    mine < BUILDS_PER_PRINCIPAL
+        && total < if admin { MAX_BUILDS } else { MAX_BUILDS - RESERVED_BUILDS }
+}
+
 /// Whether one more connection from this peer fits.
 fn admits(peer: &Peer, mine: usize, total: usize) -> bool {
     let cap = if peer.admin || peer.session.is_some() { MAX_CONNS } else { MAX_CONNS - RESERVED };
@@ -289,6 +300,8 @@ fn gym_arm(core: &mut Core<Real, FileStore>) {
         "State" => Some(CrashPoint::State(name)),
         "OpBegun" => Some(CrashPoint::OpBegun(name)),
         "OpCalled" => Some(CrashPoint::OpCalled(name)),
+        "OpAcked" => Some(CrashPoint::OpAcked(name)),
+        "FloorEstablished" => Some(CrashPoint::FloorEstablished),
         _ => None,
     };
 }
@@ -514,6 +527,7 @@ fn main() {
     let mut next_tick = Instant::now();
     // One build at a time; later ones wait their turn.
     let mut building = false;
+    let mut building_principal = None;
     let mut queued: VecDeque<(PrebuildJob<<Real as Backends>::Gens>, Resume, Reply)> = VecDeque::new();
     let start = |job: PrebuildJob<_>, resume: Resume, reply: Reply, core: &mut Core<Real, FileStore>| {
         let what = resume.describe();
@@ -553,10 +567,23 @@ fn main() {
                     *busy.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
                 match core.take_deferred() {
-                    Some((job, resume)) if building => queued.push_back((job, resume, reply)),
                     Some((job, resume)) => {
-                        building = true;
-                        start(job, resume, reply, &mut core);
+                        let principal = resume.principal();
+                        let mine = usize::from(building_principal == Some(principal))
+                            + queued.iter().filter(|(_, r, _)| r.principal() == principal).count();
+                        let total = usize::from(building) + queued.len();
+                        if !admits_build(resume.administrator(), mine, total) {
+                            let _ = reply.send(Response::Rejected {
+                                reason: "Busy".into(),
+                                message: "catalog work limit reached; try again after the pending work finishes".into(),
+                            });
+                        } else if building {
+                            queued.push_back((job, resume, reply));
+                        } else {
+                            building = true;
+                            building_principal = Some(principal);
+                            start(job, resume, reply, &mut core);
+                        }
                     }
                     None => {
                         let _ = reply.send(resp);
@@ -565,6 +592,7 @@ fn main() {
             }
             Ok(Event::Built(resume, pre, reply)) => {
                 core.building = None;
+                building_principal = None;
                 if let Some(snap) = Snapshot::take(&mut core) {
                     let b = Busy { with: resume.describe(), since: Instant::now() };
                     *busy.lock().unwrap_or_else(|e| e.into_inner()) = Some((b, snap));
@@ -576,8 +604,14 @@ fn main() {
                 gym_crash(&resp);
                 *busy.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 let _ = reply.send(resp);
-                match queued.pop_front() {
-                    Some((job, resume, reply)) => start(job, resume, reply, &mut core),
+                // Administrator and recovery work uses reserved capacity
+                // and is selected before another user's queued build.
+                let next = queued.iter().position(|(_, r, _)| r.administrator()).unwrap_or(0);
+                match queued.remove(next) {
+                    Some((job, resume, reply)) => {
+                        building_principal = Some(resume.principal());
+                        start(job, resume, reply, &mut core);
+                    }
                     None => building = false,
                 }
             }
@@ -622,8 +656,13 @@ fn hooks_tick(
         && Instant::now() >= *next_report
     {
         *next_report = Instant::now() + *every;
-        if let Err(e) = hooks::emit(state, key, &core.health_report()) {
-            eprintln!("planariad: health report: {e}");
+        match core.health_report() {
+            Some(report) => {
+                if let Err(e) = hooks::emit(state, key, &report) {
+                    eprintln!("planariad: health report: {e}");
+                }
+            }
+            None => eprintln!("planariad: health report unavailable before the first state collection"),
         }
     }
 }
@@ -656,6 +695,17 @@ mod tests {
         assert!(admits(&admin, 0, open) && admits(&seated, 0, MAX_CONNS - 1));
         assert!(!admits(&admin, 0, MAX_CONNS));
         assert!(!admits(&seated, PER_UID, 0), "the per-uid limit holds for everyone");
+    }
+
+    #[test]
+    fn expensive_work_is_bounded_per_principal_with_admin_reserve() {
+        assert!(admits_build(false, 0, MAX_BUILDS - RESERVED_BUILDS - 1));
+        assert!(!admits_build(false, 0, MAX_BUILDS - RESERVED_BUILDS));
+        assert!(admits_build(true, 0, MAX_BUILDS - 1));
+        assert!(!admits_build(true, 0, MAX_BUILDS));
+        for admin in [false, true] {
+            assert!(!admits_build(admin, BUILDS_PER_PRINCIPAL, 0));
+        }
     }
 
     #[test]
