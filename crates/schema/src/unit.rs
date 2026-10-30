@@ -50,7 +50,8 @@ pub enum Actor {
     /// sessions, which are never local.
     User { uid: u32, session: Option<String>, seat: Option<String>, active: bool },
     Model(crate::ids::ModelId),
-    /// Reserved: remote principals via a relay. Not constructed in Phase A.
+    /// Reserved: remote principals via a relay; in Phase A, only a local agent
+    /// the journal has no start for (it holds nothing; §11).
     Agent(crate::ids::PrincipalId),
     /// The actor of an `Inferred` override (§11): never a caller, never authorized.
     Unattributed,

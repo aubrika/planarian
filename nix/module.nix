@@ -410,6 +410,11 @@ in
         default = 20;
         description = "Generations may use at most this share of the Nix store's filesystem. Older generations are collected first until both bounds hold.";
       };
+      retainAllGenerations = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Never collect a system generation, even when the store is nearly full: keep the full history (for export, or to go back to any of them). Other store garbage is still collected. The two bounds above are then reported, not enforced; deleting generations is otherwise a Runtime change (§12b).";
+      };
     };
 
     userControllable = {
@@ -586,6 +591,7 @@ in
         keepGenerations = cfg.gc.keepGenerations;
         generationsPermille = builtins.floor (cfg.gc.generationsPercent * 10);
         keepEmergency = 3;
+        retainAll = cfg.gc.retainAllGenerations;
       };
       journalBytes = 64 * 1024 * 1024;
       startupGraceSecs = cfg.startupGrace;

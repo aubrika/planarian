@@ -940,15 +940,18 @@ impl World {
         let on_disk: Vec<GenerationId> = self.gens.keys().copied().filter(|g| !self.collected.contains(g)).collect();
         let mut keep: Vec<GenerationId> = protect.to_vec();
         keep.extend([self.current, self.boot_default]);
-        // Built candidates still rooted under gcroots/planarian/builds survive.
+        // Built candidates still rooted under gcroots/planarian/builds survive
+        // until they are in the profile (published), whose link roots them
+        // from then on; a collection drops the build root of such a one.
         keep.extend(on_disk.iter().copied().filter(|g| {
             let generation = &self.gens[g];
-            self.gc_roots.iter().any(|r| r.ends_with(&generation.eval.source.to_hex()))
+            !self.boot_entries.contains(g)
+                && self.gc_roots.iter().any(|r| r.ends_with(&generation.eval.source.to_hex()))
         }));
         let fs_size = self.fs.get("/nix").map(|(_, size)| *size).unwrap_or(u64::MAX);
         let b = self.gc_budget;
         let count = if emergency { b.keep_emergency } else { b.keep_generations };
-        gc::plan(&on_disk, &keep, count, b.max_bytes(fs_size), |gs| gs.len() as u64 * GEN_BYTES)
+        gc::plan(&on_disk, &b.protected(&on_disk, &keep), count, b.max_bytes(fs_size), |gs| gs.len() as u64 * GEN_BYTES)
     }
 }
 

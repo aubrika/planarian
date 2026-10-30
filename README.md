@@ -134,11 +134,22 @@ for slow machines or slow-starting services.
 Start an agent that should be able to ask Planarian for things with
 `planarian agent run <name> -- <command> [args...]`. It runs as its own
 transient service (`planarian-agent-<name>`) under a fresh dynamic uid, and
-Planarian treats it as its own principal: never you, never an
-administrator, never in your login session, so by default it can read status
-but change nothing. An agent you start yourself from a shell, outside
-`agent run`, is simply you, with everything you can do; that is not
-supported (`docs/bypasses.md`, X-10).
+Planarian lets it do exactly what you could do (an administrator's agent is
+an administrator), as you would over SSH: with no login session and no
+terminal, so it cannot approve changes itself. Everything it asks for is
+logged as that agent, acting for you. An agent you start yourself from a
+shell, outside `agent run`, is simply you, unattributed (`docs/bypasses.md`,
+X-10, X-11).
+
+### Keeping every generation
+
+Planarian collects old system generations within the bounds of
+`services.planarian.gc` (by default the last 10, within 20% of the store's
+filesystem; the ones it must keep are never collected). To keep the full
+history instead, for export or to be able to go back to any of them, set
+`services.planarian.gc.retainAllGenerations = true;`. Other store garbage is
+still collected, and `planarian status` reports when the generations are over
+the bounds.
 
 ### If something goes wrong
 

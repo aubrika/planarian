@@ -219,42 +219,45 @@ fn unprivileged_override_of_a_security_unit_is_held_for_an_administrator() {
     assert_eq!(l.overrides[0].by.uid(), Some(1000), "attributed to alice, not the approver");
 }
 
-/// B-1 (§11): an agent is its own principal, granted nothing, even when an
-/// administrator started it.
+/// §11 (owner decision, 2026-10-30): an agent has the permissions of the
+/// user who started it, as journaled when it started, and is attributed to
+/// itself in the log. One the journal has no start for holds nothing.
 #[test]
-fn an_agent_is_its_own_principal_and_holds_nothing() {
+fn an_agent_has_its_users_permissions() {
     let mut r = Rig::new();
     r.ticks(2);
+    let stop_web = || Request::Stop { unit: UnitId::service("gym-web") };
+    // Never started through `agent run`: nothing.
+    let stray = Peer::agent(61185, "stray");
+    let resp = r.core.handle(stray, stop_web());
+    assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
+    // Started by alice: alice's permissions, which do not reach gym-web.
+    let resp = r.core.handle(ALICE, Request::AgentRun { name: "helper".into(), argv: vec!["true".into()] });
+    assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
+    let helper = Peer::agent(61186, "helper");
+    let resp = r.core.handle(helper.clone(), stop_web());
+    assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
+    // An agent cannot start agents.
+    let resp = r.core.handle(helper, Request::AgentRun { name: "more".into(), argv: vec!["true".into()] });
+    assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized"), "{resp:?}");
+    // Started by an administrator: an administrator's permissions.
     let resp = r.core.handle(ADMIN, Request::AgentRun { name: "coder".into(), argv: vec!["true".into()] });
     assert!(matches!(resp, Response::Ok { .. }), "{resp:?}");
     r.ticks(1);
     // Planarian does not manage the agent's unit: it is not in the manifest.
     assert_eq!(r.status("service:planarian-agent-coder"), UnitStatus::NotExpected);
     let coder = Peer::agent(61184, "coder");
-    let sshd = UnitId::service("sshd");
-    for req in [
-        Request::SetOverride { unit: sshd.clone(), until: Until::Explicit, desired: OverrideDesired::Stopped },
-        Request::Stop { unit: UnitId::service("gym-web") },
-        Request::Restart { unit: UnitId::service("planarian-agent-coder") },
-        Request::Gc,
-        Request::AgentRun { name: "helper".into(), argv: vec!["true".into()] },
-    ] {
-        let resp = r.core.handle(coder.clone(), req.clone());
-        assert!(
-            matches!(&resp, Response::Rejected { reason, .. } if reason == "Unauthorized")
-                || matches!(&resp, Response::Error { .. }),
-            "{req:?} -> {resp:?}"
-        );
-    }
-    // A change an administrator proposed cannot be approved by the agent.
-    let req = Request::SetOverride { unit: sshd.clone(), until: Until::Explicit, desired: OverrideDesired::Stopped };
-    let Response::NeedsApproval { approve, .. } = r.core.handle(ALICE, req) else { panic!() };
-    let resp = r.core.handle(coder.at_terminal(), Request::Approve { hash: approve });
-    assert!(!matches!(resp, Response::Done { .. }), "{resp:?}");
-    r.ticks(2);
-    assert_eq!(r.status("service:sshd"), UnitStatus::Running);
-    assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
-    assert!(r.core.ledger().overrides.is_empty());
+    let resp = r.core.handle(coder, stop_web());
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    // A finished transaction's record is logged at the next observation.
+    r.ticks(1);
+    let rec = r.core.log.iter().rev().find(|l| matches!(l.proposal.transition, Transition::StopAndSuppress { .. }));
+    let rec = rec.expect("logged");
+    assert_eq!(rec.agent.as_deref(), Some("coder"), "attributed to the agent");
+    assert_eq!(rec.caller.uid(), Some(0), "acting for the administrator who started it");
+    // Who it acts for is in the journal, so it survives a restart.
+    assert_eq!(r.core.ledger().agent_for("coder"), Some(0));
+    assert_eq!(r.core.ledger().agent_for("helper"), Some(1000));
 }
 
 #[test]

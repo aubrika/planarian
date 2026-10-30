@@ -461,6 +461,12 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                 (Some("third-party"), None) => fail(&mut v, "no third-party edit happened".into()),
                 _ => v.unchecked.push(key.clone()),
             },
+            // §12b, retainAllGenerations: no generation was collected.
+            "collected_none" if val.as_bool() == Some(true) => {
+                if !e.collected.is_empty() {
+                    fail(&mut v, format!("collected {:?}", e.collected));
+                }
+            }
             // I12: no transaction is left open at the end of the window.
             "nothing_left_open" if val.as_bool() == Some(true) => {
                 for t in e.ledger.live.values() {
@@ -1114,7 +1120,8 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
     if let Some(why) = s("refused_with") {
         let refused = e.log.iter().any(|r| {
             s("transition").is_none_or(|t| transition_name(&r.proposal.transition) == t)
-                && s("caller").is_none_or(|c| caller_is(&r.caller, c))
+                && s("target").is_none_or(|u| target_of(&r.proposal.transition) == Some(unit(u)))
+                && s("caller").is_none_or(|c| caller_is(r, c))
                 && (matches!(&r.result, Submitted::Rejected { reason, .. } if format!("{reason:?}") == why)
                     || matches!(&r.decision, Some(Decision::Reject(reason)) if format!("{reason:?}") == why))
         });
@@ -1157,7 +1164,7 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             .unwrap_or_default();
         let refused = e.log.iter().any(|r| {
             s("transition").is_none_or(|t| transition_name(&r.proposal.transition) == t)
-                && s("caller").is_none_or(|c| caller_is(&r.caller, c))
+                && s("caller").is_none_or(|c| caller_is(r, c))
                 && match &r.result {
                     Submitted::Rejected { reason, .. } => wanted.iter().any(|w| *w == format!("Rejected({reason:?})")),
                     _ => false,
@@ -1173,7 +1180,7 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
     if let Some(c) = s("caller") {
         let by = e.log.iter().any(|r| {
             matches!(&r.result, Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if *txn == t.id)
-                && caller_is(&r.caller, c)
+                && caller_is(r, c)
         });
         if !by {
             v.failures.push(format!("{label}: not submitted by {c}"));
@@ -1626,7 +1633,19 @@ fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
 /// The executor log's caller is the catalog's principal: `root`,
 /// `user:<uid>`, `user:<uid>@<session>` or `user:<uid>@-` (no session), or
 /// `agent:<name>` (an agent's own principal, §11).
-fn caller_is(a: &Actor, want: &str) -> bool {
+/// Whether a log record was sent by `want`: `agent:<name>` is the agent's
+/// request (it acts for its user, §11); anything else is the actor's own,
+/// sent by no agent.
+fn caller_is(r: &planarian_daemon::LogRecord, want: &str) -> bool {
+    match (want.strip_prefix("agent:"), &r.agent) {
+        (Some(name), Some(a)) => a == name,
+        (Some(name), None) => actor_is(&r.caller, &format!("agent:{name}")),
+        (None, Some(_)) => false,
+        (None, None) => actor_is(&r.caller, want),
+    }
+}
+
+fn actor_is(a: &Actor, want: &str) -> bool {
     match (a, want.split_once(':')) {
         (Actor::User { uid, .. }, None) => want == "root" && *uid == 0,
         (Actor::User { uid, session, .. }, Some(("user", n))) => match n.split_once('@') {

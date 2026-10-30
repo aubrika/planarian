@@ -23,11 +23,16 @@ pub struct GcBudget {
     /// Generations to keep at most in an emergency (the store or journal
     /// filesystem is nearly full).
     pub keep_emergency: usize,
+    /// `services.planarian.gc.retainAllGenerations`: never collect a
+    /// generation, even in an emergency (a full history, or generations kept
+    /// for export). Other store garbage is still collected; a space bound the
+    /// generations exceed is reported, never enforced.
+    pub retain_all: bool,
 }
 
 impl Default for GcBudget {
     fn default() -> Self {
-        GcBudget { keep_generations: 10, generations_permille: 200, keep_emergency: 3 }
+        GcBudget { keep_generations: 10, generations_permille: 200, keep_emergency: 3, retain_all: false }
     }
 }
 
@@ -35,6 +40,12 @@ impl GcBudget {
     /// The space bound for a filesystem of `fs_bytes`.
     pub fn max_bytes(&self, fs_bytes: u64) -> u64 {
         (fs_bytes as u128 * self.generations_permille as u128 / 1000) as u64
+    }
+
+    /// The generations `plan` may not collect: the I3 set, and with
+    /// `retain_all` every generation on disk.
+    pub fn protected(&self, on_disk: &[GenerationId], protect: &[GenerationId]) -> Vec<GenerationId> {
+        if self.retain_all { on_disk.to_vec() } else { protect.to_vec() }
     }
 }
 
@@ -113,6 +124,16 @@ mod tests {
     /// Each generation's closure is 2 GB with nothing shared.
     fn size(gs: &[GenerationId]) -> u64 {
         gs.len() as u64 * 2 * GB
+    }
+
+    #[test]
+    fn retain_all_collects_no_generation_and_reports_the_overrun() {
+        let gens: Vec<_> = (1..=13).map(g).collect();
+        let b = GcBudget { retain_all: true, ..GcBudget::default() };
+        let p = plan(&gens, &b.protected(&gens, &[g(13)]), b.keep_emergency, 7 * GB, size);
+        assert!(p.delete.is_empty());
+        assert_eq!(p.kept.len(), 13);
+        assert_eq!(p.shortfall, Some(26 * GB - 7 * GB));
     }
 
     #[test]

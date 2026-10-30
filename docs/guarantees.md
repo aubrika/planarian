@@ -98,7 +98,7 @@ invariants counts for both (47 counts, 45 distinct obligations).
 | **I19** | **No principal approves its own proposal or grants itself a capability it lacks.** | **Proved** | `i19_no_self_approval`, `may_approve`, `may_grant` | V1 | 3:1 |
 | I20 | No agent starts while planarian-ready.target is not reached, in every failure posture. | Tested | — | P6, P8 | 0:2 |
 | **I21** | **Nothing irreversible, or that could lose a session, data or connectivity, runs without asking, unless only your own session is affected; another user's session needs an administrator.** | **Proved** | `global_floors`, `own_session_is_per_session` | V1, V2, P9 | 2:3 |
-| **I22** | **Generation changes, garbage collection, driver binding, clearing the interlock and overriding a Security unit are administrator operations; a Security unit is changed without asking only to restore it; agents and the unattributed actor hold no authority (Phase A).** | **Proved** | `users_cannot_change_generations`, `only_administrators_resolve`, `security_override_held_for_administrator`, `security_restart_runs_alone_only_to_restore`, `agents_and_unattributed_are_refused` | V1, P8, P9 | 5:3 |
+| **I22** | **Generation changes, garbage collection, driver binding, clearing the interlock and overriding a Security unit are administrator operations; a Security unit is changed without asking only to restore it; the unattributed actor holds no authority, and an agent exactly its user's (§11).** | **Proved** | `users_cannot_change_generations`, `only_administrators_resolve`, `security_override_held_for_administrator`, `security_restart_runs_alone_only_to_restore`, `agents_and_unattributed_are_refused` | V1, P8, P9 | 5:3 |
 | **I23** | **A generation commits only after its boot entry is written and promoted; runtime operations never publish, promote or revert; the override file is replaced only by compare-and-swap.** | **Proved** | `generations_commit_after_promotion`, `runtime_never_reverts`, `override_swap_never_overwrites_a_third_party` (Kani) | P3 | 3:1 |
 
 ## 3. Every formal obligation
@@ -127,7 +127,7 @@ where a mapping is not obvious, the cell says why it holds (§7).
 | `own_session_is_per_session` | "Your own session" means exactly that session: another session of the same user, or an unknown one, asks. | I21 |
 | `security_override_held_for_administrator` | A non-administrator's override of a Security-sensitive unit never runs on its own. | I22 |
 | `security_restart_runs_alone_only_to_restore` | A Security-sensitive unit's restart runs without asking only to restore an unattributed stop, and never for an External one (G16). | I22 |
-| `agents_and_unattributed_are_refused` | Agents and the unattributed actor are always Unauthorized: an inferred override never passes through `decide`. | I22 |
+| `agents_and_unattributed_are_refused` | The reserved `Actor::Agent` (a remote principal, or a local agent with no journaled start) and the unattributed actor are always Unauthorized: an inferred override never passes through `decide`. A local agent started by `agent run` is judged as its user (§11). | I22 |
 | `only_administrators_resolve` | Only an administrator can clear the recovery interlock. | I22 |
 | `users_cannot_change_generations` | A non-administrator cannot switch, revert, roll back, load models, restore snapshots, collect garbage, bind drivers or resolve. | I22 |
 

@@ -185,6 +185,11 @@ pub fn peer(actor: &str) -> Peer {
 
 /// The authorization the daemon would compute for `actor` on the gym's seat:
 /// a local, active session (`gym` unless the actor names one).
+/// The gym's administrators: root and uid 1001 (in `planarian-admin`).
+fn gym_admins() -> std::sync::Arc<dyn Fn(u32) -> bool + Send + Sync> {
+    std::sync::Arc::new(|uid| uid == 0 || uid == 1001)
+}
+
 fn gym_authz(actor: &str) -> planarian_schema::Authorization {
     let pe = peer(actor);
     let session = pe.session.clone().unwrap_or_else(|| "gym".into());
@@ -242,7 +247,8 @@ impl Sim {
         let mut j = Journal::open(store).expect("journal");
         let now = fake.w().now;
         j.append(now, Record::KnownGood(GenerationId(1))).expect("enroll");
-        let core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: DAEMON_PID, boot_id: Hash::ZERO }, config());
+        let mut core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: DAEMON_PID, boot_id: Hash::ZERO }, config());
+        core.admin_of = gym_admins();
         Sim {
             fake,
             core: Some(core),
@@ -572,7 +578,9 @@ impl Sim {
         cfg.fresh_boot = std::mem::take(&mut self.fresh_boot);
         cfg.posture = self.posture;
         let boot_id = self.boot_id();
-        self.core = Some(Core::start(j, self.fake.clone(), OwnerId::Daemon { pid, boot_id }, cfg));
+        let mut core = Core::start(j, self.fake.clone(), OwnerId::Daemon { pid, boot_id }, cfg);
+        core.admin_of = gym_admins();
+        self.core = Some(core);
         self.harvest();
     }
 
@@ -1156,6 +1164,9 @@ impl Sim {
                 }
             }
             "set_setting" => match get("key") {
+                "gc.retain_all" => {
+                    self.fake.w().gc_budget.retain_all = s.get("value").and_then(T::as_bool).unwrap_or(true);
+                }
                 "gc.generation_budget_percent" => {
                     let pct =
                         s.get("value").and_then(T::as_float).ok_or_else(|| Unsupported("set_setting value".into()))?;
@@ -1362,6 +1373,7 @@ impl Sim {
                     post_digest: None,
                     path: vec![],
                     why: String::new(),
+                    agent: None,
                 });
                 return Ok(());
             }
@@ -1428,6 +1440,7 @@ impl Sim {
             post_digest: None,
             path: vec![],
             why: String::new(),
+            agent: None,
         });
         if crashed {
             self.kill_daemon();

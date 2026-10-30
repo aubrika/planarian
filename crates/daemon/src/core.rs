@@ -121,9 +121,17 @@ pub struct LogRecord {
     pub path: Vec<String>,
     #[serde(default)]
     pub why: String,
+    /// The agent that sent the request, acting for `caller` (§11).
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 pub struct Core<B: Backends + Clone, S: Store> {
+    /// Whether a uid is an administrator (root or `planarian-admin`), for
+    /// the user an agent acts for; set by the daemon from the group file.
+    pub admin_of: std::sync::Arc<dyn Fn(u32) -> bool + Send + Sync>,
+    /// The agent behind the request being handled, for its log records.
+    acting_agent: Option<String>,
     pub ex: Executor<B, S>,
     pub b: B,
     pub asm: Assembler,
@@ -303,6 +311,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             unreachable: BTreeMap::new(),
             chain_checked: None,
             integrity: None,
+            admin_of: std::sync::Arc::new(|uid| uid == 0),
+            acting_agent: None,
             prev_status: BTreeMap::new(),
             prev_auto_restarts: BTreeMap::new(),
             boot_report_due: fresh,
@@ -537,6 +547,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             post_digest: None,
             path,
             why,
+            agent: self.acting_agent.clone(),
         };
         // A finished transaction's record waits for the next observation for
         // its post-state (observing here would run the probes again).
@@ -1303,11 +1314,18 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
     /// §10: `Actor::User { uid, session, seat, active }` from the caller's
     /// logind session; a remote session has no seat and is never local.
-    fn authz(&self, peer: &Peer) -> Authorization {
+    fn authz(&mut self, peer: &Peer) -> Authorization {
         if let Some(name) = &peer.agent {
-            // Granted nothing (§11; `agents_and_unattributed_are_refused`).
-            let actor = Actor::Agent(agent_principal(name));
-            return Authorization { principal: actor.principal(), actor, capabilities: Capabilities::default() };
+            // §11 (owner decision, 2026-10-30): an agent has the permissions
+            // of the user who started it, judged as that user with no login
+            // session and no terminal. One the journal has no start for is
+            // granted nothing.
+            let Some(by) = self.ledger().agent_for(name) else {
+                let actor = Actor::Agent(agent_principal(name));
+                return Authorization { principal: actor.principal(), actor, capabilities: Capabilities::default() };
+            };
+            let actor = Actor::User { uid: by, session: None, seat: None, active: false };
+            return user_authorization(actor, (self.admin_of)(by));
         }
         let info =
             peer.session.as_ref().and_then(|id| self.asm.sessions.iter().find(|x| &x.id == id && x.uid == peer.uid));
@@ -1526,6 +1544,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     pub fn handle(&mut self, peer: Peer, req: Request) -> Response {
+        self.acting_agent = peer.agent.clone();
+        let r = self.handle_as(peer, req);
+        self.acting_agent = None;
+        r
+    }
+
+    fn handle_as(&mut self, peer: Peer, req: Request) -> Response {
         match req {
             Request::Status => Response::Status(Box::new(self.status())),
             Request::Incidents => {
@@ -1672,14 +1697,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         message: "agent run <name> -- <command>: the name is 1-32 of a-z, 0-9 and -".into(),
                     };
                 }
+                // Who it acts for is journaled before it starts (§11).
+                self.journal(Record::AgentStarted { name: name.clone(), by: peer.uid });
                 match self.b.units().start_agent(&name, &argv) {
                     Outcome::Succeeded => {
                         self.notice(format!(
-                            "agent {name} started by uid {} as its own principal ({}), granted nothing",
+                            "agent {name} started by uid {} ({}); it acts with that user's permissions",
                             peer.uid,
                             planarian_schema::backend::agent_unit(&name)
                         ));
-                        Response::Ok { message: format!("agent {name} is running as its own principal") }
+                        Response::Ok { message: format!("agent {name} is running with your permissions") }
                     }
                     other => Response::Error { message: format!("could not start agent {name}: {other:?}") },
                 }

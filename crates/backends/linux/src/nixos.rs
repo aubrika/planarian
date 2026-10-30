@@ -333,6 +333,29 @@ impl Nixos {
         gens
     }
 
+    /// Roots that no longer hold anything Planarian needs, removed before a
+    /// collection so it can free what the profile no longer keeps (§9 step 5,
+    /// §12b): a build root whose candidate is a profile generation (the
+    /// profile link roots it from commit on, and a collected one must go),
+    /// and a `gen-<n>` root for a generation no longer protected.
+    fn prune_roots(&self, profile: &[(u64, String)], protect: &[GenerationId]) {
+        let in_profile: BTreeSet<&str> = profile.iter().map(|(_, p)| p.as_str()).collect();
+        let entries = |d: &Path| std::fs::read_dir(d).map(|rd| rd.flatten().collect::<Vec<_>>()).unwrap_or_default();
+        for e in entries(&self.paths.gcroots.join("builds")) {
+            let target = std::fs::read_link(e.path()).ok().map(|t| t.to_string_lossy().into_owned());
+            if target.is_some_and(|t| in_profile.contains(t.as_str())) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        for e in entries(&self.paths.gcroots) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(n) = name.strip_prefix("gen-").and_then(|n| n.parse::<u64>().ok()) else { continue };
+            if !protect.contains(&GenerationId(n)) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+
     /// Plan over profile numbers. Protected generations are the profile
     /// entries whose store path is a protected generation's.
     fn plan_profile(
@@ -352,6 +375,7 @@ impl Nixos {
         };
         let count = if emergency { self.budget.keep_emergency } else { self.budget.keep_generations };
         let mut failure = None;
+        let keep = self.budget.protected(&ids, &keep);
         let plan = gc::plan(&ids, &keep, count, self.budget.max_bytes(fs_bytes), |set| {
             let paths: Vec<&str> =
                 gens.iter().filter(|(n, _)| set.contains(&GenerationId(*n))).map(|(_, p)| p.as_str()).collect();
@@ -930,7 +954,7 @@ impl GenerationBackend for Nixos {
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
         }
-        let (plan, _) = match self.plan_profile(protect, emergency) {
+        let (plan, gens) = match self.plan_profile(protect, emergency) {
             Ok(p) => p,
             Err(o) => return o,
         };
@@ -963,6 +987,7 @@ impl GenerationBackend for Nixos {
                 }
             }
         }
+        self.prune_roots(&gens, protect);
         let o = run(&["nix-store", "--gc"], NIX);
         if !o.ok() {
             return err(&o);
@@ -980,6 +1005,27 @@ impl GenerationBackend for Nixos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §12b: a committed candidate's build root and a no-longer-protected
+    /// generation's root go before a collection; a pending candidate's and a
+    /// protected generation's stay.
+    #[test]
+    fn stale_roots_are_pruned_before_a_collection() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths { gcroots: d.path().join("gcroots"), ..Default::default() };
+        let builds = paths.gcroots.join("builds");
+        std::fs::create_dir_all(&builds).unwrap();
+        std::os::unix::fs::symlink("/nix/store/aaa-committed", builds.join("a")).unwrap();
+        std::os::unix::fs::symlink("/nix/store/bbb-pending", builds.join("b")).unwrap();
+        std::os::unix::fs::symlink("/nix/store/aaa-committed", paths.gcroots.join("gen-5")).unwrap();
+        std::os::unix::fs::symlink("/nix/store/ccc", paths.gcroots.join("gen-6")).unwrap();
+        let n = Nixos::new(paths.clone());
+        n.prune_roots(&[(1, "/nix/store/aaa-committed".into())], &[GenerationId(6)]);
+        assert!(std::fs::symlink_metadata(builds.join("a")).is_err(), "committed: the profile roots it");
+        assert!(std::fs::symlink_metadata(builds.join("b")).is_ok(), "pending: still the build's");
+        assert!(std::fs::symlink_metadata(paths.gcroots.join("gen-5")).is_err(), "no longer protected");
+        assert!(std::fs::symlink_metadata(paths.gcroots.join("gen-6")).is_ok(), "protected");
+    }
 
     #[test]
     fn closure_sizes_from_both_json_shapes() {

@@ -88,6 +88,14 @@ pub enum Record {
         nonce: [u8; 16],
         expires: Timestamp,
     },
+    /// `planarian agent run <name>` by this uid (§11): the agent acts with
+    /// that user's permissions, attributed to the agent. Journaled before the
+    /// agent's unit starts, so who it acts for survives restarts and is
+    /// covered by the chain.
+    AgentStarted {
+        name: String,
+        by: u32,
+    },
     Resolved {
         txn: TxnId,
         resolution: Resolution,
@@ -181,6 +189,10 @@ pub struct Ledger {
     pub external: Option<(u64, Hash)>,
     pub interlock: IdMap<InterlockEntry>,
     pub last_reconciliation: Option<Reconciliation>,
+    /// Every agent started, in order: (name, the uid that started it). The
+    /// last entry for a name is the one in force.
+    #[serde(default)]
+    pub agents: Vec<(String, u32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -888,6 +900,7 @@ impl Ledger {
                 }
             },
             Record::Reconciliation(r) => self.last_reconciliation = Some(r),
+            Record::AgentStarted { name, by } => self.agents.push((name, by)),
         }
     }
 
@@ -1301,6 +1314,11 @@ impl Ledger {
 
     pub fn interlocked(&self) -> bool {
         !self.interlock.is_empty()
+    }
+
+    /// The uid the agent `name` acts for: whoever started it last (§11).
+    pub fn agent_for(&self, name: &str) -> Option<u32> {
+        self.agents.iter().rev().find(|(n, _)| n == name).map(|(_, by)| *by)
     }
 }
 

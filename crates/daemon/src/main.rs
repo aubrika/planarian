@@ -373,6 +373,9 @@ fn main() {
         posture: file.posture,
     };
     let mut core = Core::start(journal, real, me.clone(), core_cfg);
+    // The user an agent acts for is an administrator as that user is now (§11).
+    let admins = file.admin_group.clone();
+    core.admin_of = std::sync::Arc::new(move |uid| is_admin(uid, &admins));
     // §9 hook: the external desired-state source, from its verified cache
     // first; an altered cache is an integrity finding like any other.
     let mut external = match &file.external_source {

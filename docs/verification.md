@@ -75,7 +75,7 @@ lemmas about `decide_spec` in `crates/policy/src/proofs.rs`:
 | `administrator_class_only_on_ask_first` | An Administrator approver class only ever comes with AskFirst. |
 | `security_override_held_for_administrator` | A non-administrator's override (`SetOverride`, `LiftOverride`, `StopAndSuppress`) of a Security-sensitive unit is never `Unauthorized` and never runs on its own: AskFirst for an administrator, or another refusal. |
 | `security_restart_runs_alone_only_to_restore` | A restart of a Security-sensitive unit runs below AskFirst only when it restores an unattributed stop (`restores_unattributed_stop`) of a unit that is not also External (§11, G16). |
-| `agents_and_unattributed_are_refused` | An agent (reserved) and the unattributed actor are always `Unauthorized`: an inferred override never passes through `decide`. |
+| `agents_and_unattributed_are_refused` | The reserved `Actor::Agent` (a remote principal, or a local agent with no journaled start) and the unattributed actor are always `Unauthorized`: an inferred override never passes through `decide`. A local agent started by `agent run` is judged as its user (§11). |
 | `i19_no_self_approval` | `may_approve` never lets a principal approve its own proposal, requires `Approve`, and requires `Administrator` for that class; `may_grant` never grants to the approver itself, never on its own proposal, and only a capability the approver holds (I19). |
 | `i10_canonical_probe_changes_ask` | A change to a canonical probe's definition (probe tampering) is AskFirst or Reject. |
 | `unauthorized_is_refused_first` | An unauthorized caller gets `Reject(Unauthorized)`, whatever else holds. |
