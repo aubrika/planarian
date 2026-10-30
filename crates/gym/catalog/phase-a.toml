@@ -2864,6 +2864,26 @@ transition = "ApplyChange"
 terminal = "pending"
 never = ["Activating"]
 
+# The other half of approve-needs-real-terminal: at a terminal the daemon
+# finds on the peer, the same approval is taken and the change runs.
+[[fault]]
+id = "approve-at-terminal-runs"
+family = "authority"
+summary = "An administrator who is not root asks to disable sshd (Security: AskFirst). Root approves it from a real terminal, which the daemon reads from the peer's pidfd: the approval is taken and the change commits."
+spec = ["§11 approval", "§16 approve", "B-3"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" }]
+inject = { raw = "approve_pending", actor = "root", via = "tty" }
+window = "10m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+decision = "Allow(AskFirst)"
+terminal = "Committed"
+
 # B-6 (Medium). Pid reuse itself cannot be arranged reproducibly (P10 in
 # assumptions.md, deviations.md); this checks the case the pidfd rule
 # decides: a peer gone before it is resolved has no session.
@@ -3012,9 +3032,11 @@ setup = [
 inject = { raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }
 window = "5m"
 
+# The token was presented and refused, not merely never presented.
 [[fault.required_post.txn]]
 transition = "ApplyChange"
 never = ["Activating"]
+terminal = "Rejected(Stale)"
 
 # I10: "No change that removes or alters a canonical probe executes below AskFirst."
 [[fault]]

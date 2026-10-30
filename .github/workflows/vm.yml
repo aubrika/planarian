@@ -147,7 +147,10 @@ jobs:
       - name: Verdict
         run: |
           cat verdict/verdict.json
-          jq -e '.result == "PASS" or .result == "UNSUPPORTED"' verdict/verdict.json
+          # UNSUPPORTED only where the test VM cannot run the entry by design
+          # (docs/ga-status.md); anywhere else it is a harness regression.
+          jq -e --arg id '${{ matrix.id }}' '.result == "PASS" or (.result == "UNSUPPORTED" and ($id == "storage-nix-full-gc" or $id == "desktop-boot-fails-rollback"))' verdict/verdict.json
+          jq -r '"\(.id): \(.result)"' verdict/verdict.json >> "$GITHUB_STEP_SUMMARY"
       # Best effort: the verdict is in the log above too, and a private
       # repository's artifact storage is small (the evidence is not uploaded).
       - uses: actions/upload-artifact@v4

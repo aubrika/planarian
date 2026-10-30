@@ -701,12 +701,37 @@ fn request_at(actor: &str, req: &Request, tty: bool) -> Result<(), String> {
     std::fs::write(&script, format!("#!/bin/sh\nexec {inner}\n")).map_err(|e| e.to_string())?;
     sh(&format!("chmod +x {}", script.display()));
     let cmd = if tty {
-        format!("script -qec {} /dev/null", script.display())
+        // A new session whose controlling terminal is a fresh pty, whatever
+        // the step's own stdin is (the daemon reads the terminal from the
+        // peer's /proc, §11, B-3); the request's answer is copied out.
+        let helper = PathBuf::from(RUN).join("on-a-terminal.py");
+        std::fs::write(&helper, ON_A_TERMINAL).map_err(|e| e.to_string())?;
+        format!("python3 {} {} < /dev/null", helper.display(), script.display())
     } else {
         format!("setsid -w {} < /dev/null", script.display())
     };
     if sh(&cmd) { Ok(()) } else { Err(format!("request as {user} failed")) }
 }
+
+/// Run argv[1] as the leader of a new session on a new pty, print what it
+/// writes, and exit with its status.
+const ON_A_TERMINAL: &str = r#"import os, pty, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], [sys.argv[1]])
+out = b""
+while True:
+    try:
+        b = os.read(fd, 4096)
+    except OSError:
+        break
+    if not b:
+        break
+    out += b
+sys.stdout.write(out.decode(errors="replace"))
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+"#;
 
 /// Send a request as the step's actor and record the answer.
 fn request_as(actor: &str, req: &Request) -> Result<(), String> {
@@ -1232,8 +1257,12 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 return Ok(());
             }
             for p in r.status.pending {
-                // A refused approval is the step's outcome, not the harness's error.
-                let _ = request_at(actor, &Request::Approve { hash: p.approve }, tty);
+                // A refused approval is the step's outcome, not the harness's
+                // error; the answer is in responses.jsonl and printed by
+                // `vm request`, and a harness failure is said here.
+                if let Err(e) = request_at(actor, &Request::Approve { hash: p.approve }, tty) {
+                    eprintln!("approve_pending: {e}");
+                }
             }
         }
         // I14: a request line carrying fields it must not set, sent to the
