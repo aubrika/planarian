@@ -24,7 +24,7 @@ catalog run on head.
 | 2. Zero gamed successes | Guarded: see "Passes that prove something"; entries a harness cannot run faithfully are UNSUPPORTED there, never passed |
 | 2. Unnecessary interventions on the intent cases = 0 | 0, on the 8 intent entries the fake harness runs and the VM runs of all 12 |
 | 3. `policy` proofs pass in CI | Yes: `ci.yml`'s `nix` job runs the Verus check |
-| 4. Baselines: the invisibility budget (§21) | Idle (VM, 5 min, run "Invisibility budget" #2): **0.063% of one core, 7.9 MB resident, 1.58 wakeups/s** (targets < 0.5%, < 50 MB). The game frame-time comparison has not completed yet: the first runs found no Xonotic demo (harness fix pending a run). |
+| 4. Baselines: the invisibility budget (§21) | Idle (VM, 5 min, run "Invisibility budget" #2): **0.063% of one core, 7.9 MB resident, 1.58 wakeups/s** (targets < 0.5%, < 50 MB). Game (run "Invisibility budget" #5, Xonotic `the-big-keybench` timedemo on llvmpipe, five runs per condition): **no measurable difference** with Planarian stopped, idle, or busy repairing a crash loop: average 44.6–45.4 fps stopped, 43.7–45.3 idle, 43.6–45.2 busy; median p99 frame time 38.5 ms in all three (Mann–Whitney p = 1.0 against stopped). Caveat: MangoHud wrote no per-frame log in the VM, so p99 is the engine's one-second minimum fps (a 1 s resolution proxy), not per-frame timing. |
 | 4. Baselines: the verification ratio (§17a) | **Trust count = 32; global d:a = 47:50 (28:43 at GA; then four proved obligations mapped to I6 and I12, I21–I23 added for ten more, and I18's hash chain proved)** (`planarian-gym verification`, a CI ratchet; per invariant in `docs/verification.md`) |
 
 ## 1. The demonstration
@@ -52,7 +52,7 @@ The latest results, 2026-10-29 (v4.4 catalog: 101 entries):
 | --- | --- | --- | --- | --- |
 | Fake (`cargo run -p planarian-gym -- run`, in CI on every push) | 81 | 0 | 0 | 19 VM-only, 1 benchmark |
 | VMs (`vm.yml`, all 76 VM entries on KVM) | 74 | 2 | 0 | 24 fake-only, 1 benchmark |
-| Benchmark (`bench.yml`) | — | — | — | `quiet-reference-workload`: run #5 in progress |
+| Benchmark (`bench.yml`) | 1 | — | — | `quiet-reference-workload`: run #5 (proxy p99; see criterion 4) |
 
 **Provisional:** the VM verdicts come from the full run on 8f3f296 (71
 PASS) plus re-runs of the entries fixed afterwards on 06560cb and 6e72eff
@@ -62,10 +62,10 @@ froze). Later commits changed the journal (I18's proof moved the chain
 check into `txn::chain`), so a full run on the head is dispatched; this
 table becomes final when it passes.
 
-Cleared on at least one harness: 99 of 101. Not cleared: 
+Cleared on at least one harness: 100 of 101. Not cleared:
 `desktop-boot-fails-rollback` (UNSUPPORTED: the test VM boots its kernel
-directly, never a published generation; a repair entry, VM-only) and
-`quiet-reference-workload` (pending the benchmark). UNSUPPORTED on VMs but
+directly, never a published generation; a repair entry, VM-only).
+`quiet-reference-workload` passes on its own harness (benchmark run #5). UNSUPPORTED on VMs but
 cleared on the fake: `storage-nix-full-gc` (the test VM's Nix store is the
 host's). Fake-only by deviation: `suspend-resume` and
 `storage-enospc-during-build` (docs/deviations.md). Now run on VMs that
@@ -79,9 +79,9 @@ checked against these results:
 
 | Condition | Result |
 | --- | --- |
-| Every must-pass and intent entry (81) passes on each harness it lists | Yes on the fake and on VMs; `quiet-reference-workload` (must-pass, benchmark) pending |
+| Every must-pass and intent entry (81) passes on each harness it lists | Yes on the fake and on VMs; `quiet-reference-workload` (must-pass) passes on the benchmark, with the proxy caveat |
 | No acceptance entry (47) UNSUPPORTED on VMs without a deviation | Yes: the two UNSUPPORTED entries are repair entries, neither tagged acceptance |
-| At least 95% of entries cleared on at least one harness | 99 of 101 (98%); 100 of 101 if the benchmark passes |
+| At least 95% of entries cleared on at least one harness | 100 of 101 (99%) |
 
 The history of the VM runs follows; each found real bugs.
 
