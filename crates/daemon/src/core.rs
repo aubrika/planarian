@@ -1366,7 +1366,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     fn user_submit(&mut self, t: Transition, peer: Peer, source: Source, reason: String) -> Response {
-        if self.defer
+        // Admission before work (R09): a caller refused anyway queues no
+        // staging or build; `submit` then refuses it, logged.
+        let who = self.authz(&peer);
+        let admitted = self.ex.admit(&t, &who).is_ok();
+        if admitted
+            && self.defer
             && self.deferred.is_none()
             && let Some(job) = self.ex.prebuild_job(&t)
         {

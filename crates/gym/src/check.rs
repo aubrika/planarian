@@ -503,6 +503,15 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     }
                 }
             },
+            // §12 (R09): nothing staged, evaluated or built during the run.
+            "no_build_work" if val.as_bool() == Some(true) => match e.work {
+                None => v.unchecked.push(key.clone()),
+                Some((stages, builds)) => {
+                    if stages + builds > 0 {
+                        fail(&mut v, format!("{stages} source(s) staged and {builds} build(s) for a refused caller"));
+                    }
+                }
+            },
             // §12b, retainAllGenerations: no generation was collected.
             "collected_none" if val.as_bool() == Some(true) => {
                 if !e.collected.is_empty() {

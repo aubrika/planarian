@@ -190,6 +190,8 @@ pub struct World {
     pub nospace_on_build: bool,
     /// How many times `build` ran.
     pub builds: usize,
+    /// Sources staged (§9 step 1), for admission-before-work checks (R09).
+    pub stages: usize,
     pub block_on_activate: BTreeSet<UnitId>,
     pub fail_activate: BTreeSet<GenerationId>,
     pub slow_activation: Option<(Millis, bool)>,
@@ -674,6 +676,7 @@ impl GenerationBackend for Fake {
 
     fn stage(&self, _owner: &PinnedSource, overrides: &OverrideSet) -> Result<StagedSource, Outcome> {
         let mut w = self.w();
+        w.stages += 1;
         let dir = format!("/var/lib/planarian/stage/{}", w.staged.len() + 1);
         let files = w.owner_files.clone();
         let base = w.overrides.clone();

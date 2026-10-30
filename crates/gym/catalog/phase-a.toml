@@ -2860,6 +2860,28 @@ tier = "AskFirst"
 facts = { disruption = "SessionLoss" }
 affected_includes = ["service:display-manager"]
 
+# R09 (§12): admission before work.
+[[fault]]
+id = "unauthorized-change-does-no-work"
+family = "authority"
+summary = "alice, who may not change the configuration beyond her own settings, asks to disable sshd: refused Unauthorized before any source is staged, evaluated or built."
+spec = ["§12 admission", "§11 authorization", "R09"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the fake counts its stages and builds; the VM has no such counter.
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1000" }
+window = "2m"
+
+[fault.required_post]
+no_build_work = true
+units = { "service:sshd" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = "Unauthorized"
+
 [[fault]]
 id = "release-refused-leaves-incident"
 family = "authority"

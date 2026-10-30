@@ -1618,6 +1618,7 @@ fn evidence() -> Evidence {
         candidate,
         boot_entries,
         collected,
+        work: None,
         overrides_empty: g.read_overrides().map(|(o, _)| o.assignments.is_empty()).unwrap_or(true),
         override_hash: g.read_overrides().ok().map(|(_, h)| h),
         third_party_override: None,

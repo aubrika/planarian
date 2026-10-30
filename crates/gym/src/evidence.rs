@@ -21,6 +21,9 @@ pub struct Evidence {
     /// Generations in the boot menu, and those garbage-collected during the run.
     pub boot_entries: Vec<GenerationId>,
     pub collected: Vec<GenerationId>,
+    /// Sources staged and candidates built during the run (fake harness).
+    #[serde(default)]
+    pub work: Option<(usize, usize)>,
     /// The live override file assigns nothing (it is the base's).
     pub overrides_empty: bool,
     /// The live override file's hash at the end, and the hash of what a

@@ -157,6 +157,8 @@ pub struct Sim {
     held_tokens: Vec<Hash>,
     timeline: BTreeMap<UnitId, Vec<(Timestamp, String)>>,
     start_probe_defs: String,
+    /// Stages and builds when the entry's steps began.
+    start_work: (usize, usize),
     start_roots: std::collections::BTreeSet<String>,
     /// planariad's side of the failure posture (§12d); see `PostureSeen`.
     pub posture_seen: crate::evidence::PostureSeen,
@@ -277,6 +279,7 @@ impl Sim {
             held_tokens: vec![],
             timeline: BTreeMap::new(),
             start_probe_defs: String::new(),
+            start_work: (0, 0),
             start_roots: Default::default(),
             posture_seen: Default::default(),
         }
@@ -287,6 +290,9 @@ impl Sim {
         self.start = self.now();
         self.pre_status = self.statuses();
         self.start_probe_defs = self.probe_defs();
+        let w = self.fake.w();
+        self.start_work = (w.stages, w.builds);
+        drop(w);
         self.start_roots = self.build_roots();
     }
 
@@ -405,6 +411,7 @@ impl Sim {
             w.overrides.assignments.is_empty(),
         );
         let override_hash = Some(planarian_fake::World::override_hash_of(&w.overrides));
+        let work = Some((w.stages - self.start_work.0, w.builds - self.start_work.1));
         let third_party_override = w.third_party_override;
         drop(w);
         crate::evidence::Evidence {
@@ -414,6 +421,7 @@ impl Sim {
             candidate: self.candidate,
             boot_entries,
             collected,
+            work,
             overrides_empty,
             override_hash,
             third_party_override,

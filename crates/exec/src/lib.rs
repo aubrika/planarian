@@ -537,6 +537,35 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         })
     }
 
+    /// Admission before work (§12, R09): the checks that need no staged
+    /// source, run before anything is staged, evaluated or built. Each is a
+    /// necessary condition of `decide`'s authorization, so admission refuses
+    /// only what policy would refuse after the build.
+    pub fn admit(&self, t: &Transition, authz: &Authorization) -> Result<(), (RejectReason, &'static str)> {
+        let Transition::ApplyChange { change, .. } = t else { return Ok(()) };
+        if !matches!(authz.actor, Actor::User { .. } | Actor::Daemon | Actor::Watchdog) {
+            return Err((RejectReason::Unauthorized, "this caller cannot change the configuration"));
+        }
+        if !self.cfg.tables.catalog.contains(change) {
+            return Err((RejectReason::NotInCatalog, "that change is not in the catalog"));
+        }
+        let admin = authz.capabilities.contains(Capability::Administrator);
+        if self.kernel.journal.ledger().interlocked() && !admin {
+            return Err((
+                RejectReason::Other("interlocked".into()),
+                "the recovery interlock is set; only an administrator can change this machine until `planarian resolve`",
+            ));
+        }
+        if matches!(authz.actor, Actor::User { .. })
+            && !admin
+            && !(authz.capabilities.contains(Capability::UserControllable)
+                && self.cfg.settings.user_controllable_changes.contains(change))
+        {
+            return Err((RejectReason::Unauthorized, "that change needs an administrator"));
+        }
+        Ok(())
+    }
+
     /// Submit a proposal. `state` and `defs` are the current observation.
     pub fn submit(&mut self, p: Proposal, authz: Authorization, state: &SystemState, defs: &UnitDefs) -> Submitted {
         let digest = state.digest();
@@ -560,6 +589,10 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 RejectReason::Other("interlocked".into()),
                 "the recovery interlock is set; only an administrator can change this machine until `planarian resolve`",
             );
+        }
+        if let Err((reason, why)) = self.admit(&p.transition, &authz) {
+            self.prebuilt = None;
+            return reject(reason, why);
         }
         let pre = self.prebuilt.take();
         let plan = match self.plan(&p, &authz, state, defs, pre) {
