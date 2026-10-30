@@ -26,14 +26,18 @@ jobs:
       - name: clippy with the gym's fault-injection hooks
         run: cargo clippy -p planarian-daemon -p planarian-backend-linux --features planarian-daemon/gym-hooks -- -D warnings
       - run: cargo test --workspace
-      - name: Fault catalog, fake harness (fails on FAIL or PARTIAL)
-        run: cargo run -p planarian-gym -- run
+      - name: Acceptance-tool negative regressions
+        run: |
+          python3 nix/gym/test_acceptance.py
+          python3 nix/gym/test_proofs.py
+          python3 nix/gym/test_manifest.py
+          python3 nix/gym/test_performance.py
+      - name: Fault catalog, fake harness (complete applicable set and scoped waivers)
+        run: bash nix/gym/run-fake.sh
       - name: GA demonstration, fake harness
         run: crates/gym/demo.sh --harness fake
       - name: Dependency boundaries
         run: bash nix/tests/boundaries.sh .
-      - name: Verification ratio d:a and the trust count (SPEC §17a; fails if either regresses)
-        run: cargo run -q -p planarian-gym -- verification
 
   nix:
     runs-on: ubuntu-24.04
@@ -47,6 +51,15 @@ jobs:
           .#checks.x86_64-linux.module-eval
           .#checks.x86_64-linux.boundaries
           .#checks.x86_64-linux.verus
+      - name: Export successful source-bound Verus artifacts
+        run: nix build .#checks.x86_64-linux.verus -o proof-result
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proof-verus
+          path: |
+            proof-result/verus.json
+            proof-result/verus.log
+          if-no-files-found: error
 
   kani:
     runs-on: ubuntu-24.04
@@ -63,5 +76,25 @@ jobs:
         run: |
           command -v cargo-kani || cargo install --locked kani-verifier --version 0.68.0
           cargo kani setup
-      - run: cargo kani -p planarian-txn
-      - run: cargo kani -p planarian-exec
+      - name: Kani with source-bound success artifacts
+        run: python3 nix/gym/proofs.py run --engine kani --output proof-results/kani.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proof-kani
+          path: proof-results/kani.*
+          if-no-files-found: error
+
+  verification:
+    needs: [rust, nix, kani]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: proof-*
+          merge-multiple: true
+          path: proof-results
+      - name: Complete invariant map, successful proofs, ratios and bypass gate
+        run: cargo run -q -p planarian-gym -- verification --gate

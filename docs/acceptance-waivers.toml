@@ -1,0 +1,5 @@
+# No waivers are adopted for this candidate. Required evidence stays open.
+# Each future waiver needs: id, harness, role, result = "UNSUPPORTED", reason,
+# reviewed_by, review_url (a GitHub review permalink), expires (ISO date).
+# A waiver never converts FAIL, PARTIAL, ERROR, or missing evidence to a pass.
+format_version = 1

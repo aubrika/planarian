@@ -65,7 +65,11 @@
             program = "${pkgs.writeShellApplication {
               name = "planarian-gym-vm";
               runtimeInputs = [ pkgs.jq pkgs.python3 ];
-              text = builtins.readFile ./nix/gym/run-vm.sh;
+              text = ''
+                export GYM_ACCEPTANCE=${./nix/gym/acceptance.py}
+                export GYM_CATALOG=${./crates/gym/catalog/phase-a.toml}
+                export GYM_WAIVERS=${./docs/acceptance-waivers.toml}
+              '' + builtins.readFile ./nix/gym/run-vm.sh;
             }}/bin/planarian-gym-vm";
             meta.description = "Run the fault catalog on NixOS VMs";
           };
@@ -79,6 +83,22 @@
             ids = map (e: e.id) (builtins.filter (e: builtins.elem "vm" (e.harness or [ ])) entries);
           in
           nixpkgs.lib.genAttrs ids (id: import ./nix/tests/gym-vm.nix { inherit pkgs self id; });
+        # Each test really boots its installed ESP entries, unlike gym-vm.
+        boot-entry-tests = pkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") (
+          let
+            points = [
+              { name = "built"; point = "State:Built"; }
+              { name = "publication-intent"; point = "State:PublishingBoot"; }
+              { name = "operation-intent"; point = "OpBegun:publish_boot_once"; }
+              { name = "mutation"; point = "OpCalled:publish_boot_once"; }
+              { name = "acknowledgment"; point = "OpAcked:publish_boot_once"; }
+              { name = "awaiting-boot"; point = "State:AwaitingBoot"; }
+            ];
+          in pkgs.lib.listToAttrs (pkgs.lib.concatMap (p: map (recoverer: {
+            name = "${p.name}-${recoverer}";
+            value = import ./nix/tests/boot-entries.nix { inherit pkgs self recoverer; crashPoint = p.point; };
+          }) [ "daemon" "watchdog" ]) points)
+        );
         # The invisibility budget (§21): run on demand (it downloads Xonotic).
         bench.invisibility = import ./nix/tests/bench.nix { inherit pkgs self; };
       });
@@ -102,6 +122,9 @@
           ${pkgs.bash}/bin/bash ${./nix/tests/boundaries.sh} ${./.} > $out
         '';
       } // pkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") {
+        vm-installed-boot = import ./nix/tests/boot-entries.nix { inherit pkgs self; };
+        vm-installed-boot-watchdog = import ./nix/tests/boot-entries.nix { inherit pkgs self; recoverer = "watchdog"; };
+        vm-boot-confirmation = import ./nix/tests/boot-entries.nix { inherit pkgs self; confirm = true; };
         # Verus publishes binaries for x86_64-linux only.
         verus = import ./nix/tests/verus.nix { inherit pkgs; };
       });

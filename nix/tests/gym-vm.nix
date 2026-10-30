@@ -570,7 +570,7 @@ let
         plan = json.loads(machine.succeed(f"{gym} plan --id {ID}"))
         print(plan)
         if any(s.startswith("unsupported") for s in plan["steps"]):
-            machine.succeed(f"mkdir -p /var/lib/gym-run && {gym} judge --id {ID} || true")
+            machine.succeed(f"mkdir -p /var/lib/gym-run && {gym} judge --id {ID}")
         else:
             print(machine.succeed(f"{gym} begin --id {ID} 2>&1"))
             import tomllib
@@ -579,10 +579,13 @@ let
             for k in ("setup", "inject", "after"):
                 v = entry.get(k, [])
                 steps += [v] if isinstance(v, dict) else v
+            assert len(plan["steps"]) == len(steps), f"{ID}: incomplete step plan"
             for i, (kind, st) in enumerate(zip(plan["steps"], steps)):
                 raw = st.get("raw")
                 if kind == "vm":
-                    print(machine.execute(f"{gym} step --id {ID} --index {i} 2>&1")[1])
+                    status, output = machine.execute(f"{gym} step --id {ID} --index {i} 2>&1")
+                    print(output)
+                    assert status == 0, f"{ID}: step {i} failed with exit {status}: {output}"
                 elif kind == "host":
                     if raw == "reboot":
                         machine.shutdown(); machine.start(); machine.wait_for_unit("multi-user.target")

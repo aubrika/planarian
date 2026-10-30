@@ -16,25 +16,29 @@ pkgs.stdenv.mkDerivation {
       ../../Cargo.lock
       ../../crates
       ../../share
+      ../../assets/identity/animations/keyframes.json
+      ../../assets/identity/marks/planarian-mark-micro-currentcolor.svg
+      ../../rust-toolchain.toml
+      ../../docs/assumptions.md
+      ../../docs/verification-ratio.toml
+      ../../docs/proof-obligations.toml
+      ../gym/proofs.py
       ../template/planarian/overrides.nix
     ];
   };
 
   cargoDeps = pkgs.rustPlatform.importCargoLock { lockFile = ../../Cargo.lock; };
-  nativeBuildInputs = [ verus verus.toolchain pkgs.rustPlatform.cargoSetupHook ];
+  nativeBuildInputs = [ verus verus.toolchain pkgs.python3 pkgs.rustPlatform.cargoSetupHook ];
 
   buildPhase = ''
     runHook preBuild
     export HOME=$TMPDIR
-    cargo-verus verify -p planarian-policy -p planarian-txn --offline 2>&1 | tee verus.log
-    status=''${PIPESTATUS[0]}
-    if [ "$status" -ne 0 ] || grep -q "verification results:: .* [1-9][0-9]* errors" verus.log; then
-      echo "Verus failed (exit $status)"; exit 1
-    fi
+    python3 nix/gym/proofs.py run --engine verus --output proof-results/verus.json
     runHook postBuild
   '';
 
   installPhase = ''
-    grep "verification results" verus.log > $out
+    mkdir -p $out
+    cp proof-results/verus.json proof-results/verus.log $out/
   '';
 }
