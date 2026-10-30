@@ -2821,7 +2821,7 @@ scoring = "must-pass"
 harness = ["vm"]
 intent = { kind = "none" }
 setup = [{ raw = "greeter_login", uid = 1000 }]
-inject = { raw = "request_then_exit", actor = "user:1000", request = { Stop = { unit = "service@1000:pipewire" } } }
+inject = { raw = "request_then_exit", actor = "user:1000", request = { op = "stop", unit = "service@1000:pipewire" } }
 window = "2m"
 
 [[fault.required_post.txn]]
