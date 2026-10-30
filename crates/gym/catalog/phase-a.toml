@@ -2830,6 +2830,36 @@ generation = "base"
 transition = "ApplyChange"
 refused_with = 'Other("build")'
 
+# R03 (§11, rule 20): equivalent effects, equivalent facts.
+[[fault]]
+id = "override-stopped-equals-stop"
+family = "authority"
+summary = "An administrator with no session here (over SSH) asks, in turn, for an override that stops the display manager and for a plain stop of it. Both end the seated user's session: both derive SessionLoss over the same units and both are held at AskFirst, since it is not the caller's own session."
+spec = ["§11 global floors", "§18 rule 20", "I21", "R03"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { raw = "cli", argv = ["override", "service:display-manager", "--stopped"], actor = "user:1001" }
+after = [{ raw = "cli", argv = ["stop", "service:display-manager"], actor = "user:1001" }]
+window = "3m"
+
+[fault.required_post]
+units = { "service:display-manager" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+tier = "AskFirst"
+facts = { disruption = "SessionLoss" }
+affected_includes = ["service:display-manager"]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+tier = "AskFirst"
+facts = { disruption = "SessionLoss" }
+affected_includes = ["service:display-manager"]
+
 [[fault]]
 id = "release-refused-leaves-incident"
 family = "authority"

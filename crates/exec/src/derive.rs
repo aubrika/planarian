@@ -160,11 +160,20 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         Transition::StopUnit(u) | Transition::StopAndSuppress { unit: u, .. } => {
             unit_op(&mut f, u, Recovery::Revertible)
         }
-        Transition::SetOverride(s) => {
-            unit_op(&mut f, &s.unit, Recovery::Idempotent);
-            f.affected_units = vec![s.unit.clone()];
-            f.disruption = Disruption::None;
-        }
+        // Equivalent effects, equivalent facts (§11, rule 20, R03): an
+        // override that stops, removes or detaches a unit does what a stop
+        // does to it and its dependents, so it carries the same facts as
+        // StopAndSuppress. Only LeaveAlone changes nothing on the machine.
+        Transition::SetOverride(s) => match s.desired {
+            OverrideDesired::LeaveAlone => {
+                unit_op(&mut f, &s.unit, Recovery::Idempotent);
+                f.affected_units = vec![s.unit.clone()];
+                f.disruption = Disruption::None;
+            }
+            OverrideDesired::Stopped | OverrideDesired::Absent | OverrideDesired::Detected => {
+                unit_op(&mut f, &s.unit, Recovery::Revertible)
+            }
+        },
         Transition::LiftOverride(u) => {
             unit_op(&mut f, u, Recovery::Idempotent);
             f.affected_units = vec![u.clone()];

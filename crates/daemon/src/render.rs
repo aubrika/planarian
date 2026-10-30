@@ -40,7 +40,12 @@ pub fn transition(t: &Transition) -> String {
         Transition::CollectGarbage { emergency: true } => "emergency garbage collection".into(),
         Transition::CollectGarbage { .. } => "garbage collection".into(),
         Transition::SetRuntimeOption { path, value: v } => format!("set {path} to {}", value(v)),
-        Transition::SetOverride(s) => format!("leave {} alone {}", s.unit, until(&s.until)),
+        Transition::SetOverride(s) => match s.desired {
+            OverrideDesired::LeaveAlone => format!("leave {} alone {}", s.unit, until(&s.until)),
+            OverrideDesired::Stopped => format!("stop {} and keep it stopped {}", s.unit, until(&s.until)),
+            OverrideDesired::Absent => format!("disable {} and keep it off {}", s.unit, until(&s.until)),
+            OverrideDesired::Detected => format!("detach {} and keep it detached {}", s.unit, until(&s.until)),
+        },
         Transition::LiftOverride(u) => format!("stop leaving {u} alone"),
         Transition::StopAndSuppress { unit, until: u, .. } => format!("stop {unit} and leave it stopped {}", until(u)),
         Transition::Resolve { txn, resolution } => format!("resolve transaction {} as {resolution:?}", txn.0),
