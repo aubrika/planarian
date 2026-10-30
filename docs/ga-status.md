@@ -5,7 +5,7 @@ evidence for each criterion and how to reproduce it. Updated 2026-10-30.
 
 ## Current shared-core integration
 
-The gate remains uncalled. The shared-core PR merges the adopted v4.6 contract and later fixes through main20d4f2c. Its current reconciliation is `docs/shared-core-review.md`; every acceptance result belongs to the immutable revision named in `docs/shared-core-acceptance.json`. Old 9aca/eaf5 candidate records are historical after this merge. The earlier G5 proposal is superseded by the adopted parking contract, so it is not a current counted assumption or a reason to reset the baseline.
+The gate remains uncalled. The shared-core PR merges the adopted v4.6 contract and later fixes through main `20d4f2c`. Its current reconciliation is `docs/shared-core-review.md`; every acceptance result belongs to the immutable revision named in `docs/shared-core-acceptance.json`. Old 9aca/eaf5 candidate records are historical after this merge. The earlier G5 proposal is superseded by the adopted parking contract, so it is not a current counted assumption or a reason to reset the baseline.
 
 The current source must pass formatting, compilation/tests/proofs, role-qualified exact catalog coverage, installed-entry boot tests and the declared performance/durability scopes before freeze. A source merge or authored test does not establish a pass. Main's approval PTY fix and the later R03/R08/R10/agent-instance fixes are retained.
 
@@ -29,8 +29,7 @@ Where that stands, in rule 19's order:
 The bypass register has no open High row: B-1 and B-2 closed on
 2026-10-30, and B-20, found in the review, is closed. Agents act with the
 permissions of the user who started them, attributed per instance
-(owner decision, 2026-10-30; §11, I24, X-11). Six Medium rows stay open,
-none for Phase A.
+(owner decision, 2026-10-30; §11, I24, X-11). Six pre-existing Medium rows remain open; shared-core B-21 additionally tracks the pending Phase A cooperative-lock acceptance. A zero High count closes no R/S requirement.
 
 The criteria below are the last results recorded before v4.6, on the
 v4.4 catalog (101 entries; it has 128 at v4.6). They are history, not the

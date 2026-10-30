@@ -1871,10 +1871,18 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 if ledger.agent_owner(&name) != Some(peer.uid) {
                     let owned = owners.values().filter(|by| **by == peer.uid).count();
                     let per_caller = if peer.uid == 0 { AGENT_NAMES_ROOT } else { AGENT_NAMES_PER_CALLER };
-                    let total = if peer.uid == 0 { AGENT_NAMES_MAX } else { AGENT_NAMES_MAX - AGENT_NAMES_ROOT_RESERVE };
-                    if owned >= per_caller || (!owners.contains_key(name.as_str()) && owners.len() >= total) {
+                    let total =
+                        if peer.uid == 0 { AGENT_NAMES_MAX } else { AGENT_NAMES_MAX - AGENT_NAMES_ROOT_RESERVE };
+                    let takes_root_reserve = peer.uid != 0
+                        && ledger.agent_owner(&name) == Some(0)
+                        && owners.len() >= AGENT_NAMES_MAX - AGENT_NAMES_ROOT_RESERVE;
+                    if owned >= per_caller
+                        || (!owners.contains_key(name.as_str()) && owners.len() >= total)
+                        || takes_root_reserve
+                    {
                         return Response::Error {
-                            message: "registered agent-name capacity reached; reuse an agent name you already own".into(),
+                            message: "registered agent-name capacity reached; reuse an agent name you already own"
+                                .into(),
                         };
                     }
                 }
@@ -1884,11 +1892,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         // acquires its user's authority, after a durable append.
                         // A failed append leaves the unit unprivileged.
                         let at = self.b.clock().now();
-                        if let Err(e) = self.ex.kernel.journal.append(at, Record::AgentStarted {
-                            name: name.clone(), instance: instance.0, by: peer.uid,
-                        }) {
+                        if let Err(e) = self
+                            .ex
+                            .kernel
+                            .journal
+                            .append(at, Record::AgentStarted { name: name.clone(), instance: instance.0, by: peer.uid })
+                        {
                             return Response::Error {
-                                message: format!("agent started without authority because its instance could not be journaled: {e:?}; stop its unit before retrying"),
+                                message: format!(
+                                    "agent started without authority because its instance could not be journaled: {e:?}; stop its unit before retrying"
+                                ),
                             };
                         }
                         self.notice(format!(

@@ -708,11 +708,10 @@ impl Nixos {
         // All supported writers lock this same directory inode. Keep the guard
         // through comparison, rename and directory fsync; non-cooperating root
         // editors remain the explicitly accepted X-12 bypass.
-        let _writer_lock = match std::fs::File::open(live.parent().expect("override has a parent"))
-            .and_then(|lock| {
-                rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
-                Ok(lock)
-            }) {
+        let _writer_lock = match std::fs::File::open(live.parent().expect("override has a parent")).and_then(|lock| {
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+            Ok(lock)
+        }) {
             Ok(lock) => lock,
             Err(e) => return Outcome::Unknown(format!("override writer lock unavailable: {e}")),
         };

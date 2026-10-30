@@ -405,15 +405,14 @@ What each phase moves from 𝒯 (or from "tested") into 𝒱:
 | D | switch and rollback (I1, I3), the Rust supervisor, store integrity for content-addressed paths | P2, P3, P6 and C Nix and systemd themselves |
 | E | Asterinas OSTD, the model channel (I9), the core update path (I2) | P8 (the kernel), most of what remains of the platform |
 
-What never moves: hardware and firmware, the hash function, the people
-who approve, and the proof tools themselves. The last is worth saying
-plainly: Verus, Z3 and the Rust compiler are trusted today, but
-`assumptions.md` does not list them, so the trust count does not count
-them. Whether it should is an open question. The end state is the
-formula from §0 taken seriously: 𝒯 shrinks toward that floor while 𝒱
-grows, so |𝒯|/|𝒱| falls, and |𝒯| never reaches zero.
+What remains trusted includes hardware and firmware, the hash function,
+the people who approve, and the proof tools. Proof-validity trust is
+explicitly listed as V7–V11 in `assumptions.md`, including Verus, Z3,
+rustc and Kani/CBMC, and counted by the existing trust ratchet. The end
+state still has a nonzero trusted floor; verification does not prove its
+own tools sound.
 
-Four invariants have no proof scheduled even in the end state: I4 and I20
+Several listed invariants lack a complete proof schedule even in the end state: I4 and I20
 depend on what services and the init system report (I20 becomes provable
 once the supervisor is Planarian's own, in D, if the SPEC adds it), and
 I7's completeness is a property of `exec` that C could take on.

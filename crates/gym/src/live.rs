@@ -709,11 +709,8 @@ fn request_at(actor: &str, req: &Request, tty: bool) -> Result<(), String> {
     // process group, output and socket wait, independently of driver stdin.
     let path = script.to_string_lossy().into_owned();
     let helper_path = helper.to_string_lossy().into_owned();
-    let argv = if tty {
-        vec!["python3", helper_path.as_str(), path.as_str()]
-    } else {
-        vec!["setsid", "-w", path.as_str()]
-    };
+    let argv =
+        if tty { vec!["python3", helper_path.as_str(), path.as_str()] } else { vec!["setsid", "-w", path.as_str()] };
     let output = planarian_backend_linux::cmd::run(&argv, Duration::from_secs(660));
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
@@ -1277,7 +1274,9 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 return Ok(());
             }
             if r.status.pending.is_empty() {
-                return Err("approve_pending found no pending approval; refusing to silently skip the acceptance step".into());
+                return Err(
+                    "approve_pending found no pending approval; refusing to silently skip the acceptance step".into()
+                );
             }
             for p in r.status.pending {
                 // A policy refusal is captured as a response by `vm request`;

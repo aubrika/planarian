@@ -1422,13 +1422,16 @@ fn serialize_agent_registry<S: Serializer>(
     agents: &[(String, [u8; 16], u32)],
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    let rows: Vec<AgentRegistration> = agents.iter().map(|(name, instance, by)| {
-        if *instance == [0; 16] {
-            AgentRegistration::Legacy((name.clone(), *by))
-        } else {
-            AgentRegistration::Bound((name.clone(), *instance, *by))
-        }
-    }).collect();
+    let rows: Vec<AgentRegistration> = agents
+        .iter()
+        .map(|(name, instance, by)| {
+            if *instance == [0; 16] {
+                AgentRegistration::Legacy((name.clone(), *by))
+            } else {
+                AgentRegistration::Bound((name.clone(), *instance, *by))
+            }
+        })
+        .collect();
     rows.serialize(serializer)
 }
 
@@ -1436,10 +1439,13 @@ fn deserialize_agent_registry<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<(String, [u8; 16], u32)>, D::Error> {
     let rows = Vec::<AgentRegistration>::deserialize(deserializer)?;
-    Ok(rows.into_iter().map(|row| match row {
-        AgentRegistration::Legacy((name, by)) => (name, [0; 16], by),
-        AgentRegistration::Bound(row) => row,
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| match row {
+            AgentRegistration::Legacy((name, by)) => (name, [0; 16], by),
+            AgentRegistration::Bound(row) => row,
+        })
+        .collect())
 }
 
 impl Ledger {

@@ -694,7 +694,11 @@ mod agent_registry_checkpoint_tests {
         let store = MemStore::new(1 << 20);
         let ledger = Ledger {
             last_seq: 3,
-            agents: vec![("coder".into(), [0; 16], 1000), ("tester".into(), [0; 16], 1001), ("coder".into(), [0; 16], 0)],
+            agents: vec![
+                ("coder".into(), [0; 16], 1000),
+                ("tester".into(), [0; 16], 1001),
+                ("coder".into(), [0; 16], 0),
+            ],
             ..Default::default()
         };
         let head = Hash::of(b"historical journal prefix");

@@ -876,7 +876,8 @@ fn agent_name_cannot_be_reattributed_by_another_launcher() {
     assert!(matches!(r.core.handle(ADMIN, launch()), Response::Rejected { .. }));
     assert_eq!(r.core.ledger().agent_owner("owned-helper"), Some(1000));
     let instance = r.fake.w().agent_instances.get("owned-helper").copied();
-    let resp = r.core.handle(Peer::agent(61186, "owned-helper", instance), Request::Stop { unit: UnitId::service("gym-web") });
+    let resp =
+        r.core.handle(Peer::agent(61186, "owned-helper", instance), Request::Stop { unit: UnitId::service("gym-web") });
     assert!(matches!(resp, Response::Rejected { .. }), "{resp:?}");
 }
 
@@ -911,10 +912,9 @@ fn failed_agent_instance_append_grants_no_authority() {
     assert!(r.fake.store.torn());
     let instance = r.fake.w().agent_instances["unrecorded"];
     assert_eq!(r.core.ledger().agent_for("unrecorded", instance.0), None);
-    let response = r.core.handle(
-        Peer::agent(61185, "unrecorded", Some(instance)),
-        Request::Stop { unit: UnitId::service("gym-web") },
-    );
+    let response = r
+        .core
+        .handle(Peer::agent(61185, "unrecorded", Some(instance)), Request::Stop { unit: UnitId::service("gym-web") });
     assert!(matches!(response, Response::Rejected { .. }), "{response:?}");
 }
 
@@ -975,6 +975,10 @@ fn short_lived_agent_names_are_bounded_and_preserve_root_reserve() {
     let response = r.core.handle(ADMIN, launch("root-total-overflow".into()));
     assert!(matches!(response, Response::Error { .. }), "{response:?}");
     assert_eq!(r.core.ledger().last_seq, seq);
+    // Reassignment of a stopped root name must not consume root's reserve.
+    let response = r.core.handle(Peer::new(2000, false), launch("root-reserve-0".into()));
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert_eq!(r.core.ledger().agent_owner("root-reserve-0"), Some(0));
     r.core.ex.kernel.journal.compact().unwrap();
     let replay = Journal::open(r.fake.store.clone()).unwrap();
     assert_eq!(replay.ledger().agents.len(), 256);

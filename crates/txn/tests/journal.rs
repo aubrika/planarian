@@ -119,7 +119,15 @@ fn repeated_agent_launches_keep_one_registration_through_replay_and_compaction()
     }
     assert_eq!(journal.segment().unwrap().len(), 300, "every accepted launch retains its own journal record");
     assert_eq!(journal.ledger().last_seq, 300);
-    assert_eq!(journal.ledger().agents.iter().map(|(name, instance, by)| (name.clone(), (*instance, *by))).collect::<std::collections::BTreeMap<_, _>>(), owners);
+    assert_eq!(
+        journal
+            .ledger()
+            .agents
+            .iter()
+            .map(|(name, instance, by)| (name.clone(), (*instance, *by)))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        owners
+    );
     let ledger = journal.ledger().clone();
     let head = journal.head();
     drop(journal);

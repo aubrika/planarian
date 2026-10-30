@@ -389,9 +389,6 @@ mod instance_tests {
         let mut raw = [1; 16];
         raw[15] = b'\n';
         assert_eq!(InstanceId::parse(&raw), Some(InstanceId(raw)));
-        assert_eq!(
-            InstanceId::parse(b"0101010101010101010101010101010a\n"),
-            Some(InstanceId(raw))
-        );
+        assert_eq!(InstanceId::parse(b"0101010101010101010101010101010a\n"), Some(InstanceId(raw)));
     }
 }

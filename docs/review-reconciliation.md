@@ -60,4 +60,4 @@ implementation it requires is listed as open or closed separately).
 
 ## Shared-core integration note
 
-The tables above are deliberately the b219d81 review snapshot. Later main fixes (including8231a07,4d27bce,c6347cb and20d4f2c) and the shared-core implementation are reconciled in `docs/shared-core-review.md`. Adopted v4.6 contracts govern; historical open rows and superseded PR proposals do not override them or certify the merged candidate.
+The tables above are deliberately the b219d81 review snapshot. Later main fixes (including `8231a07`, `4d27bce`, `c6347cb` and `20d4f2c`) and the shared-core implementation are reconciled in `docs/shared-core-review.md`. Adopted v4.6 contracts govern; historical open rows and superseded PR proposals do not override them or certify the merged candidate.
