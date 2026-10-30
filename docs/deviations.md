@@ -2,6 +2,8 @@
 
 Where the implementation departs from `docs/SPEC.md`: SHOULD-level choices made differently (§5 preamble) and places where NixOS and the spec disagree on mechanism (§18.7). One entry per deviation.
 
+Current-candidate evidence is in `shared-core-review.md`; the dated rows below describe their revisions and are not current certification. Shared-core proposed normative changes are authoritative only in SPEC and remain subject to owner review. R11 is an unmet invariant (B-20), not an accepted deviation.
+
 | Date | Spec § | Deviation | Reason |
 | --- | --- | --- | --- |
 | 2026-10-26 | §15 | A catalog case whose VM fixture can't be made reliable (S3 suspend, mac80211_hwsim, greeter automation, withheld D-Bus replies) may run on `harness = ["fake"]` only. Each such move gets its own row here. | Owner decision Q4, catalog review |
@@ -69,3 +71,12 @@ Where the implementation departs from `docs/SPEC.md`: SHOULD-level choices made 
 | 2026-10-30 | §11, §12b | **I21 and garbage collection.** en-i21 tests I21 with a snapshot restore, not a collection: §12b makes `CollectGarbage` Runtime, though deleting unprotected generations cannot be undone, because it never removes the protected set (I3). Read literally, I21 would put every collection at AskFirst; the spec's own table says Runtime, and the code follows the table. Decided 2026-10-30: §12b holds, I21 now says so, and `services.planarian.gc.retainAllGenerations` keeps every generation for an owner who wants the full history. | Owner decision |
 | 2026-10-30 | §15 | **The judge reads every txn key it is given.** A key in a `[[required_post.txn]]` table that the judge does not implement is reported unchecked (PARTIAL), never taken as holding. This found `residue-kill9-undo` judging its undo's caller through an unread `actor` key (now `caller`). | My call |
 | 2026-10-30 | §11, I22 | **An agent acts with its user's permissions** (owner decision, replacing v4.5's "agents are their own principals, granted nothing"). `planarian agent run` journals `AgentStarted { name, by }` before the agent's unit starts; a request from a process in that unit is authorized as `Actor::User { uid: by }` with no session, seat or terminal, and with that user's administrator status as it is now (`planarian-admin` membership read at each request). The executor log carries the agent's name on each record it sent. Consequences: an administrator's agent is an administrator (B-1's original route is now the design, X-10); an agent's AskFirst proposal is its user's, so that user cannot approve it (I19) and another administrator or root must; approval still needs a terminal the daemon finds on the peer, which an agent's unit lacks unless it allocates its own pty (the same known weakness as any root process, §16). `Actor::Agent` stays reserved for remote principals, and `agents_and_unattributed_are_refused` still holds of it; an agent with no journaled start is given that actor and holds nothing. | Owner decision |
+
+
+## Shared-core draft reconciliation
+
+- Approval restart summaries are aligned to volatile unused approvals; durable consumed-token replay protection and authorized recovery obligations survive checkpoints. Historical token-rebinding wording supplies no authority.
+- Boot-only checked commitment precedes delayed ten-minute boot confirmation; admission readiness is independent. PublishingBoot records the pre-mutation obligation. S01/S02 installed-entry enforcement/evidence remain open until their dedicated target passes.
+- Linux target discovery rejects unsupported/unmodeled activation categories instead of treating them as harmless; historical/unmanaged target metadata may require administrator recovery.
+- Launcher slice/admission limits and graphical-session lifecycle eligibility are proposed refinements in SPEC. They preserve launching-user permissions.
+- Supported installer durability claims are ext4 and prepared nodatacow btrfs only, pending current-candidate runs. ZFS/XFS and the Phase B candidate-bound sandbox have no acceptance claim here.

@@ -21,9 +21,38 @@ code: `vstd` is an ordinary dependency.
 `docs/verification-ratio.toml` lists, for each invariant, the obligations
 a tool discharges on every run (Verus lemmas and verified functions, Kani
 harnesses) and the `assumptions.md` ids it rests on. Tests are listed but
-not counted. `planarian-gym verification` checks every name against the
-source and every id against `assumptions.md`, prints the report, and fails
-CI if the global or any per-invariant ratio falls or the trust count grows.
+not counted. `docs/proof-obligations.toml` gives each unique obligation an
+explicit source, verifier, and invariant mapping. The proposed map contains
+45 unique obligations and 47 invariant-support edges: `txn::apply` and
+`txn::validate` each support two invariants. The historical 47:56 ratchet
+continues to count those support edges; it has not been reset to count
+unique obligations instead.
+
+`planarian-gym verification` rejects duplicate invariant/obligation ids,
+missing baseline invariants, unverified source names, and missing, failed,
+edited or stale verifier artifacts. It checks the assumptions and ratio
+ratchets as before. A name found in a source file does not establish a
+discharged obligation. The proposed map still needs owner review; the
+gate requires successful current-source Verus and Kani artifacts regardless.
+
+To generate and check the artifacts:
+
+```sh
+nix build .#checks.x86_64-linux.verus -o proof-result
+mkdir -p proof-results
+cp proof-result/verus.json proof-result/verus.log proof-results/
+python3 nix/gym/proofs.py run --engine kani --output proof-results/kani.json
+cargo run -p planarian-gym -- verification --gate
+```
+
+The fixed-command runner records tool versions and hashes the complete
+proof source snapshot, manifests and assumptions before and after execution.
+Successful logs and covered obligation ids accompany each receipt. CI
+checks both engines' artifacts together against its checkout before the
+ratio gate. These are local reproducibility artifacts, not signatures or
+proofs of resistance to a forged local toolchain. To inspect the source
+mapping without claiming a verification result, run
+`python3 nix/gym/proofs.py check --source-only`.
 
 GA baseline (2026-10-29): **trust count = 32** (19 `assumptions.md` entries
 plus 13 `external_body` sites: 8 ledger helpers and 5 opaque types);
@@ -233,3 +262,8 @@ computing the takeover epoch without the store's fence.
 Extracting the decisions changed no behaviour, with one exception: a
 takeover at epoch `u64::MAX` now backs off with `LostLease` instead of
 overflowing.
+
+
+## Proposed parked-state progress assumption (S03)
+
+G5 explicitly accounts for the external event/operator action needed by intentionally parked Built/AwaitingBoot. It is proposed, not adopted. Current declared support becomes 47:57 (45 unique proof IDs / 47 invariant edges) and trust 38, internal-unproven 5, against the unchanged historical 47:56 / trust 37 / internal-unproven 5 baseline. The existing ratchet must reject that regression; no baseline is reset here. Owner review must adopt the conditional liveness contract and expressly justify any baseline amendment, or require a different implementation/contract. A state-rank proof does not establish a wall-clock bound for a deliberately withheld reboot/window.

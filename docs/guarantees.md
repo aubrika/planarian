@@ -1,5 +1,13 @@
 # What Planarian guarantees, and how we know
 
+> Shared-core draft: the tables below map historical proof/test claims, not
+> successful verification of this candidate. Current scope and open requirements
+> are in [shared-core-review.md](shared-core-review.md). R11/B-20 remains unmet:
+> the atomic SwapStep model does not prove real arbitrary-editor CAS. Installed
+> boot-chain fallback, current filesystem/VM runs and full personal-profile
+> performance remain acceptance requirements. New source/regression presence is
+> not a proof result or VM pass.
+
 A map of Planarian's core from four angles: the trust boundary, the
 transaction state machine, the policy decision, and the ledger. It lists
 every guarantee, what establishes it (a Verus proof, a Kani harness, or
@@ -16,7 +24,7 @@ assumptions in `assumptions.md`; the counts in `verification-ratio.toml`.
 | **d:a** | The verification ratio: proof obligations **d**ischarged to obligations **a**ssumed, per invariant and summed. |
 | **trust count, \|𝒯\|** | The number of `assumptions.md` entries plus every `external_body` and `assume` site in the verified crates. |
 
-Today: **d:a = 47:50, trust count = 32.** The ratio counts proof
+Instruction-baseline ratchet: **d:a = 47:56, trust count = 37, internal-unproven = 5.** Current-candidate successful verifier artifacts are still required. The ratio counts proof
 obligations, not the sets themselves, so it has its own name. In plain
 text, write V-base and T-base. (Until 2026-10-29 these were 0v, 0t,
 "0v:0t" and "the size of 0t"; the new names replace them everywhere,
@@ -82,7 +90,7 @@ invariants counts for both (47 counts, 45 distinct obligations).
 | I3 | Garbage collection never removes known-good, previous, current, an in-flight candidate or the boot model. | Tested [D] | — | P1, P8 | 0:2 |
 | I4 | "Running" means desired Running, observed active, and every readiness probe passed on fresh evidence. | Tested | — | P6 | 0:1 |
 | **I5** | **Forbidden actions are unrepresentable; no setting turns a Reject into anything else.** | **Proved** | `decide`, `i5_autonomy_never_touches_reject`, `unauthorized_is_refused_first`, `core_is_never_a_target` | V1, V2, V3 | 4:3 |
-| **I6** | **At most one generation-changing transaction is active; nothing else runs during Activating, Published, Promoted or Reverting.** | **Proved** | `validate`, `apply`, `well_formed`, `i6_one_generation_active`, `compatible_exec`, `only_generations_publish`, `boot_only_never_activates` | V3–V6, P4 | 7:5 |
+| **I6** | **At most one generation-changing transaction is active; nothing else runs during Activating, Checking, PublishingBoot, Published, Promoted or Reverting.** | **Proved** | `validate`, `apply`, `well_formed`, `i6_one_generation_active`, `compatible_exec`, `only_generations_publish`, `boot_only_never_activates` | V3–V6, P4 | 7:5 |
 | I7 | Every executed transition is logged with its proposal, facts, decision and outcome. | Tested | — | P4 | 0:1 |
 | **I8** | **An AskFirst transition runs only with an approval token bound to that exact candidate, re-checked before it runs.** | **Partly proved** (expiry) | `approval_tokens_expire_after_their_lifetime` (Kani) | P5 | 1:1 |
 | I9 | The model process can only submit proposals. | Phase E (no model yet) | — | — | — |
@@ -99,7 +107,7 @@ invariants counts for both (47 counts, 45 distinct obligations).
 | I20 | No agent starts while planarian-ready.target is not reached, in every failure posture. | Tested | — | P6, P8 | 0:2 |
 | **I21** | **Nothing irreversible, or that could lose a session, data or connectivity, runs without asking, unless only your own session is affected; another user's session needs an administrator.** | **Proved** | `global_floors`, `own_session_is_per_session` | V1, V2, P9 | 2:3 |
 | **I22** | **Generation changes, garbage collection, driver binding, clearing the interlock and overriding a Security unit are administrator operations; a Security unit is changed without asking only to restore it; the unattributed actor holds no authority, and an agent exactly its user's (§11).** | **Proved** | `users_cannot_change_generations`, `only_administrators_resolve`, `security_override_held_for_administrator`, `security_restart_runs_alone_only_to_restore`, `agents_and_unattributed_are_refused` | V1, P8, P9 | 5:3 |
-| **I23** | **A generation commits only after its boot entry is written and promoted; runtime operations never publish, promote or revert; the override file is replaced only by compare-and-swap.** | **Proved** | `generations_commit_after_promotion`, `runtime_never_reverts`, `override_swap_never_overwrites_a_third_party` (Kani) | P3 | 3:1 |
+| **I23** | **A generation commits only after its boot entry is written and promoted; runtime operations never publish, promote or revert; the required override CAS guarantee is still open in the real backend (R11/B-20).** | **Model only; real replacement unclosed** | `generations_commit_after_promotion`, `runtime_never_reverts`, `override_swap_never_overwrites_a_third_party` (Kani) | P3 | 3:1 |
 
 ## 3. Every formal obligation
 
@@ -414,3 +422,8 @@ Four invariants have no proof scheduled even in the end state: I4 and I20
 depend on what services and the init system report (I20 becomes provable
 once the supervisor is Planarian's own, in D, if the SPEC adds it), and
 I7's completeness is a property of `exec` that C could take on.
+
+
+## Proposed parked-state progress assumption (S03)
+
+G5 explicitly accounts for the external event/operator action needed by intentionally parked Built/AwaitingBoot. It is proposed, not adopted. Current declared support becomes 47:57 (45 unique proof IDs / 47 invariant edges) and trust 38, internal-unproven 5, against the unchanged historical 47:56 / trust 37 / internal-unproven 5 baseline. The existing ratchet must reject that regression; no baseline is reset here. Owner review must adopt the conditional liveness contract and expressly justify any baseline amendment, or require a different implementation/contract. A state-rank proof does not establish a wall-clock bound for a deliberately withheld reboot/window.

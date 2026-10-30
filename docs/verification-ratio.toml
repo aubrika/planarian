@@ -6,8 +6,9 @@
 #   listed under `tested` and not counted.
 # `assumes`: the docs/assumptions.md ids (V, P, G, U) the invariant rests on.
 #
-# `planarian-gym verification` checks that every name exists in the source
-# and every id in assumptions.md, prints the report, and fails if a ratio
+# `planarian-gym verification` requires the unique reviewed proof map and
+# successful matching current-source verifier artifacts, preserves the baseline
+# invariant set, and checks every assumption id. It fails if a ratio
 # fell or the trust count grew against [baseline] (the ratchet: every gate).
 
 
@@ -92,7 +93,7 @@ assumes = ["V1", "V2", "V3"]
 
 [[invariant]]
 id = "I6"
-statement = "At most one generation-changing transaction is active; nothing executes during Activating, Published, Promoted or Reverting."
+statement = "At most one generation-changing transaction is active; nothing executes during Activating, Checking, PublishingBoot, Published, Promoted or Reverting."
 phase = "A (proof)"
 discharged = ["txn::validate", "txn::apply", "txn::well_formed", "txn::i6_one_generation_active", "txn::compatible_exec", "txn::only_generations_publish", "txn::boot_only_never_activates"]
 assumes = ["V3", "V4", "V5", "V6", "P4"]
@@ -134,7 +135,7 @@ statement = "Under the progress assumptions, every transaction reaches a termina
 phase = "A (proof, conditional)"
 tested = ["exec crash-point property tests", "gym fake-assumptions-conformance"]
 discharged = ["txn::i12_steps_terminate", "txn::i12_terminal_always_reachable", "txn::terminal_is_final", "txn::refusal_only_before_mutation", "txn::apply", "txn::recovery_table_follows_the_state_machine", "txn::watchdog_takes_over_only_when_it_should", "txn::step_allowed", "txn::add_interlock"]
-assumes = ["G1", "G2", "G3", "G4", "P1", "P4", "P7", "V5"]
+assumes = ["G1", "G2", "G3", "G4", "G5", "P1", "P4", "P7", "V5"]
 
 [[invariant]]
 id = "I13"
@@ -207,7 +208,7 @@ assumes = ["V1", "V2", "U1", "U5"]
 
 [[invariant]]
 id = "I22"
-statement = "Generation changes, garbage collection, driver binding, resolving the interlock and overriding a Security-sensitive unit are administrator operations; a Security-sensitive unit is changed without approval only to restore its declared state; agents and the unattributed actor hold no authority (Phase A)."
+statement = "Generation changes, garbage collection, driver binding, resolving the interlock and overriding a Security-sensitive unit are administrator operations; a Security-sensitive unit is changed without approval only to restore its declared state; an unjournaled agent and the unattributed actor hold no authority; launched agents act as their launching user without a session/terminal (Phase A)."
 phase = "A (proof)"
 tested = ["gym residue-kill9-security", "gym residue-stop-security-unit"]
 discharged = ["policy::users_cannot_change_generations", "policy::only_administrators_resolve", "policy::security_override_held_for_administrator", "policy::security_restart_runs_alone_only_to_restore", "policy::agents_and_unattributed_are_refused"]

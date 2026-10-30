@@ -32,6 +32,8 @@ Seeded from the spec vulnerability review of 2026-10-29 against commit `1bc09b2`
 | B-18 | The model service escapes its sandbox before I9 is proved, and becomes a process with its uid's capabilities (it parses untrusted text and drives a GPU) | Tamperproof (I9) | Medium | Open (v4.5 §20, I9) | Normative sandbox: dynamic uid, no capabilities, strict read-only filesystem, Unix sockets only, syscall allowlist, render node only, proposal socket as the only write path; gym case attempting every other write path | B sandbox and case; E proof |
 | B-19 | A package referenced only by a store-path string (an `ExecStart=` naming `/nix/store/…` directly, a script's interpolated path) has no `meta` to read at evaluation, so a fix to it does not move the security floor | Correct (I16) | Medium | Open | Residue of B-2: the evaluated inspected set covers every package *value*; the CVE feed matching the built closure covers strings | B |
 
+| B-20 | An arbitrary editor writes through a pre-opened descriptor or renames overrides.nix after Linux compares its hash but before replacement; the promotion/restoration overwrites that edit | Correct (I23 replacement) | Medium | Open (shared-core R11) | The model checks an atomic SwapStep decision; Linux check-then-rename/advisory locks do not enforce arbitrary-editor CAS. Added an unrun real-backend race characterization for both editor forms and promotion/restoration. Owner must adopt an enforceable writer boundary or explicitly approve a justified contract change; no narrower model is adopted here | A shared-core gate |
+
 ## Accepted
 
 | Id | Route | Breaks | Narrowed by | Phase |
