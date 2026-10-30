@@ -177,7 +177,7 @@ pub fn plan(entry: &T) -> Plan {
                         None => "unsupported: a timed kill with no request before it".into(),
                     }
                 }
-                "edit_owner_source" | "block_network" | "fill_fs" => {
+                "edit_owner_source" | "block_network" | "fill_fs" | "kill_unit" => {
                     p.watched.insert(i, state.to_string());
                     "armed".into()
                 }
@@ -203,7 +203,10 @@ pub fn plan(entry: &T) -> Plan {
                             .map(|a| a.iter().filter_map(T::as_str).collect())
                             .unwrap_or_default();
                         argv.first() == Some(&"internal")
-                            && !matches!(argv.get(1), Some(&"wifi-connect" | &"snapshot" | &"journal-churn"))
+                            && !matches!(
+                                argv.get(1),
+                                Some(&"wifi-connect" | &"snapshot" | &"journal-churn" | &"present-token")
+                            )
                     } =>
                 {
                     format!("unsupported: {raw} {:?} (no such command)", st.get("argv"))
@@ -243,6 +246,8 @@ pub fn plan(entry: &T) -> Plan {
                 | "agent_run"
                 | "request_then_exit"
                 | "plant_test_build"
+                | "forge_proposal_fields"
+                | "delete_journal_record"
                 | "oom" => "vm".into(),
                 "force_compaction" => "vm".into(),
                 "interrupt_write" => format!("unsupported: {raw} needs to interrupt the daemon's own write"),
@@ -1135,8 +1140,14 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 ["ack"] => Request::Acknowledge { unit: None },
                 ["ack", u] => Request::Acknowledge { unit: Some(unit(u)) },
                 ["release", u] => Request::LiftOverride { unit: unit(u) },
-                ["resolve", _, how] => {
-                    let txn = *ledger(cfg).0.interlock.keys().next().ok_or("resolve: nothing interlocked")?;
+                ["resolve", t, how] => {
+                    // `resolve any` with nothing interlocked: a transaction that
+                    // does not exist (authorization is decided first).
+                    let txn = match (ledger(cfg).0.interlock.keys().next(), *t) {
+                        (Some(x), _) => *x,
+                        (None, "any") => TxnId(u64::MAX),
+                        (None, _) => return Err("resolve: nothing interlocked".into()),
+                    };
                     let resolution = match *how {
                         "--as-committed" => Resolution::AsCommitted,
                         "--as-reverted" => Resolution::AsReverted,
@@ -1146,6 +1157,15 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 }
                 ["diagnose", u, "--probe", p] => {
                     Request::Diagnose { unit: unit(u), probe: Some(ProbeId(p.to_string())) }
+                }
+                // Present the approvals held earlier (`approve_pending`
+                // with `hold_token`), as the actor at a terminal.
+                ["internal", "present-token", _] => {
+                    let held = std::fs::read_to_string(Path::new(RUN).join("held-tokens")).unwrap_or_default();
+                    for h in held.lines().filter_map(|l| Hash::from_hex(l.trim())) {
+                        let _ = request_at(&get("actor"), &Request::Approve { hash: h }, true);
+                    }
+                    return Ok(());
                 }
                 // The admin connects to a network outside Planarian.
                 // A snapshot of the journal's volume (btrfs): it shares every
@@ -1192,9 +1212,50 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
             let actor = st.get("actor").and_then(T::as_str).unwrap_or("root");
             let tty = st.get("via").and_then(T::as_str) != Some("no-tty");
             let r = console().ok_or("daemon down")?;
+            if st.get("hold_token").and_then(T::as_bool) == Some(true) {
+                let held: String = r.status.pending.iter().map(|p| format!("{}\n", p.approve.to_hex())).collect();
+                std::fs::write(Path::new(RUN).join("held-tokens"), held).map_err(|e| e.to_string())?;
+                return Ok(());
+            }
             for p in r.status.pending {
                 // A refused approval is the step's outcome, not the harness's error.
                 let _ = request_at(actor, &Request::Approve { hash: p.approve }, tty);
+            }
+        }
+        // I14: a request line carrying fields it must not set, sent to the
+        // socket as is, so the daemon's own parser is what meets them.
+        "forge_proposal_fields" => {
+            let r = st.get("request").and_then(T::as_table).ok_or("request")?;
+            let args: BTreeMap<String, Value> = r
+                .get("args")
+                .and_then(T::as_table)
+                .map(|a| a.iter().map(|(k, v)| (k.clone(), value(v))).collect())
+                .unwrap_or_default();
+            let change = ChangeId(r.get("change").and_then(T::as_str).unwrap_or("").into());
+            let mut line = serde_json::to_value(Request::Apply { change, args }).expect("serializes");
+            let forged = serde_json::to_value(st.get("fields").cloned().unwrap_or(T::Table(Default::default())))
+                .map_err(|e| e.to_string())?;
+            if let (Some(o), Some(f)) = (line.as_object_mut(), forged.as_object()) {
+                o.extend(f.clone());
+            }
+            let line = line.to_string().replace('\'', "'\\''");
+            let user = user_for(&get("actor"));
+            sh(&format!(
+                "runuser -u {user} -- python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.argv[2].encode()+b\"\\n\"); s.recv(65536)' {sock} '{line}'",
+                sock = planarian_ipc::SOCKET
+            ));
+        }
+        // I18: a retained record deleted (not edited), the rest re-framed so
+        // every frame is intact. The daemon is stopped first, since it holds
+        // the journal's write offset.
+        "delete_journal_record" => {
+            sh("systemctl stop planariad");
+            let paths = Paths { state: cfg.state_dir.clone(), ..Default::default() };
+            let store = FileStore::open(&paths.journal_dir(), &paths.txn_dir(), cfg.journal_bytes)
+                .map_err(|e| format!("journal: {e}"))?;
+            let n = st.get("record").and_then(T::as_integer).unwrap_or(1) as usize;
+            if !matches!(planarian_txn::journal::delete(&store, n), Ok(true)) {
+                return Err(format!("delete_journal_record: no record {n}"));
             }
         }
         // §10 (B-6): a peer that has exited before the daemon resolves it.
@@ -1515,6 +1576,8 @@ fn evidence() -> Evidence {
         boot_entries,
         collected,
         overrides_empty: g.read_overrides().map(|(o, _)| o.assignments.is_empty()).unwrap_or(true),
+        override_hash: g.read_overrides().ok().map(|(_, h)| h),
+        third_party_override: None,
         ledger,
         journal_replays,
         log,

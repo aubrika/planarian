@@ -296,6 +296,19 @@ fn edited_record_breaks_the_chain_on_read() {
 }
 
 #[test]
+fn deleted_record_breaks_the_chain_on_read() {
+    let (store, j) = filled(10);
+    drop(j);
+    // Record 5 gone, records 6..10 renumbered 5..9 with valid frames.
+    assert!(planarian_txn::journal::delete(&store, 4).unwrap());
+    match Journal::open(store.clone()) {
+        Err(JournalError::Integrity(why)) => assert!(why.contains("record 5"), "{why}"),
+        other => panic!("{:?}", other.map(|j| j.ledger().last_seq)),
+    }
+    assert!(!planarian_txn::journal::delete(&store, 40).unwrap(), "no such record");
+}
+
+#[test]
 fn damaged_middle_record_is_not_a_torn_tail() {
     let (store, j) = filled(10);
     // A byte a quarter of the way in: inside an early record, with later ones after it.

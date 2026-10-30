@@ -2160,7 +2160,7 @@ overrides = []
 
 [[fault.required_post.txn]]
 transition = "LiftOverride"
-actor = "user:1001"
+caller = "user:1001"
 
 [[fault]]
 id = "residue-kill9-security"
@@ -2882,3 +2882,364 @@ window = "3m"
 [fault.required_post]
 posture = { class = "Integrity", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"], not = ["halt_to_recovery"] }
 not_started = ["service:gym-agent"]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v4.5: one entry per proved invariant, written from the SPEC's English (§7,
+# §17a), not from the formal specification.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# I5: "Decision::Reject is never converted to any tier by any setting."
+[[fault]]
+id = "en-i5-reject-survives-every-setting"
+family = "english"
+summary = "With autonomy at its maximum, a change touching Planarian's own unit is refused, not raised to a tier; with the setting changed and the change asked again, it is refused again. No setting turns the refusal into an approval to ask for."
+spec = ["I5"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "set_setting", key = "max_tier", value = "Tested" }]
+inject = { transition = "ApplyChange", change = "gym:touch-core", args = { value = "on" }, source = "user", actor = "root" }
+after = [
+  { raw = "set_setting", key = "max_tier", value = "Observe" },
+  { transition = "ApplyChange", change = "gym:touch-core", args = { value = "on" }, source = "user", actor = "root" },
+]
+window = "2m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = "CoreTarget"
+
+# I6: "No transition executes during Activating, Published, Promoted or Reverting."
+[[fault]]
+id = "en-i6-repair-waits-for-activation"
+family = "english"
+summary = "While a slow generation change sits in Activating, gym-web crashes. Its restart is not executed until the activation leaves the exclusive states; then it runs."
+spec = ["I6"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "slow_backend", call = "activate_live", delay = "90s" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+]
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV", when = { journal = "Activating" } }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+terminal = "Committed"
+started_after = { transition = "ApplyChange", left = "Activating" }
+
+# I8: "...an approval token bound to the concrete candidate, re-validated immediately before execution."
+[[fault]]
+id = "en-i8-token-bound-to-candidate"
+family = "english"
+summary = "An AskFirst change is approved; before it runs, the owner edits the configuration so the candidate it would build differs. The token, bound to the old candidate, does not authorise the new one."
+spec = ["I8"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty", hold_token = true },
+  { raw = "edit_owner_source", path = "configuration.nix", tracked = true },
+]
+inject = { raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }
+window = "5m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+
+# I10: "No change that removes or alters a canonical probe executes below AskFirst."
+[[fault]]
+id = "en-i10-a-canonical-probe-cannot-be-removed"
+family = "english"
+summary = "A configuration change drops sshd's canonical probe from the manifest (removes it, not weakens it). Below AskFirst it may run, but the probe does not go: the probe definitions the daemon evaluates are the same afterwards, because the core ships the canonical probe and puts it back."
+spec = ["I10"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:drop-probe", args = { probe = "sshd-tcp" }, source = "user", actor = "root" }
+window = "2m"
+
+# Either way the English holds: asked first (and not approved here), or run
+# and the canonical probe still in force.
+[fault.required_post]
+probe_definitions_unchanged = true
+
+# I11: "A session's cumulative effect is classified at least as high as any single transition producing it."
+[[fault]]
+id = "en-i11-session-carries-its-sensitivity"
+family = "english"
+summary = "In one session, an administrator changes the firewall (Security: approved by root at a terminal, committed), then asks for a display-scale change, Routine on its own. The session's cumulative effect includes the firewall change, so the second is classified at least as high: AskFirst, not as itself."
+spec = ["I11"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "gym:firewall-step", args = { step = "1" }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty" },
+  { raw = "wait", for = "2m" },
+]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1001" }
+window = "3m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+change = "gym:firewall-step"
+terminal = "Committed"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+change = "font-scale"
+tier = "AskFirst"
+
+# I12: "every transaction in the journal reaches a terminal state; RecoveryFailed always alerts and sets the recovery interlock."
+[[fault]]
+id = "en-i12-nothing-left-open"
+family = "english"
+summary = "A generation change breaks gym-web, and the revert to the base fails too. The daemon is killed while it is reverting and comes back to finish the revert, which fails again. At the end no journaled transaction is left open, the change is RecoveryFailed with its alert, the interlock holds, and gym-web's next crash gets no autonomous restart."
+spec = ["I12"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "backend_result", call = "activate_live", result = "Failed" },
+  { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" },
+  { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Reverting" } },
+  { raw = "restart_process", process = "planariad" },
+  { raw = "wait", for = "5m" },
+]
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }
+window = "10m"
+
+[fault.required_post]
+nothing_left_open = true
+interlock = "set"
+reports = ["RecoveryFailed"]
+no_txn_on = ["service:gym-web"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "RecoveryFailed"
+
+# I14: "Policy facts ... are derived by the executor ..., never read from a proposal" (v4.5: or any request field).
+[[fault]]
+id = "en-i14-forged-fields-ignored"
+family = "english"
+summary = "An administrator who is not root submits a change to sshd whose request also claims caller root, sensitivity Routine and no affected units. The claims are ignored: the change is decided on derived facts (Security, sshd affected), held at AskFirst for approval, and not run."
+spec = ["I14", "principle 6"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "forge_proposal_fields", fields = { caller = "root", sensitivity = ["Routine"], affected_units = [], facts = { sensitivity = ["Routine"] } }, request = { change = "service-enable", args = { service = "sshd", enabled = false } }, actor = "user:1001" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+caller = "user:1001"
+tier = "AskFirst"
+never = ["Activating"]
+facts = { affected_units = ["service:sshd"] }
+
+# I15: "a mutating call with a stale epoch is refused; only the lease holder advances the journal."
+[[fault]]
+id = "en-i15-old-worker-cannot-finish"
+family = "english"
+summary = "The daemon is killed mid-activation and stays down; the watchdog takes the generation change over while the old activation worker is still running. From the takeover on, only the watchdog's lease advances the transaction or journals a call, the old worker's activation never overlaps the watchdog's revert, and each epoch has one owner."
+spec = ["I15"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "slow_backend", call = "activate_live", delay = "120s" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+after = [{ raw = "hold_down" }]
+window = "10m"
+
+[fault.required_post]
+journal_owner_after_takeover = "watchdog"
+owners_per_epoch_max = 1
+no_overlap = ["activate_live(candidate)", "activate_live(revert_to)"]
+
+# I16: "No automatic revert, rollback, or boot fallback selects a generation below the security floor."
+[[fault]]
+id = "en-i16-boot-fallback-respects-floor"
+family = "english"
+summary = "After a security update raises the floor, the machine restarts and the boot fails. The automatic fallback does not select a generation below the floor: the boot default and the generation that boots are the floor."
+spec = ["I16"]
+tags = ["english"]
+scoring = "must-pass"
+# The test VM boots its kernel directly (no boot loader), so the fallback is
+# the fake's, as for the other floor entries.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "gym:security-fix", args = { version = "1.1" }, source = "user", actor = "user:1001" },
+  { raw = "fail_boot" },
+]
+inject = { raw = "reboot" }
+window = "15m"
+
+# The fake's boot loader falls back from a failed boot to the default entry;
+# the floor holds if that default, and so what boots, is at the floor.
+[fault.required_post]
+security_floor = "candidate"
+boot_default = "candidate"
+generation = "candidate"
+
+# I18: "Every journal record commits to the hash of its predecessor; a broken chain is detected on read."
+[[fault]]
+id = "en-i18-deleted-record-detected"
+family = "english"
+summary = "A retained journal record is deleted (not edited) and the rest re-framed so every frame is intact. The next read detects the break as an Integrity failure."
+spec = ["I18"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" },
+  { raw = "wait", for = "30s" },
+]
+inject = { raw = "delete_journal_record", record = 1 }
+after = [{ raw = "restart_process", process = "planariad" }]
+window = "3m"
+
+[fault.required_post]
+reports = ["JournalChainBroken"]
+posture = { class = "Integrity" }
+
+# I19: "No principal approves its own proposal, and no principal grants itself ... a capability it does not hold."
+[[fault]]
+id = "en-i19-no-self-approval"
+family = "english"
+summary = "Root proposes an AskFirst change and then, at a terminal, tries to approve it: refused, and the change never runs. (A principal granting itself a capability has no request to make in Phase A: capabilities come from group membership only.)"
+spec = ["I19"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "root" }]
+inject = { raw = "approve_pending", actor = "root", via = "tty" }
+window = "3m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+terminal = "pending"
+
+# I21: "No transition that cannot be reversed ... executes below AskFirst, unless the loss falls only on the caller's own session."
+[[fault]]
+id = "en-i21-irreversible-asks-even-for-root"
+family = "english"
+summary = "Root, at maximum autonomy, asks to restore a snapshot over user data: it cannot be reversed. It is held at AskFirst, whoever asks and whatever the setting."
+spec = ["I21"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+# Not garbage collection: §12b makes CollectGarbage Runtime, since it never
+# removes the protected set (I3); see docs/deviations.md.
+setup = [{ raw = "set_setting", key = "max_tier", value = "Tested" }]
+inject = { transition = "RestoreSnapshot", snapshot = "gym-snap-1", source = "user", actor = "root" }
+window = "2m"
+
+[[fault.required_post.txn]]
+transition = "RestoreSnapshot"
+tier = "AskFirst"
+never = ["Activating"]
+
+# I22: "Changing the generation, collecting garbage, binding drivers, resolving the recovery interlock ... are administrator operations."
+[[fault]]
+id = "en-i22-user-cannot-do-admin-things"
+family = "english"
+summary = "A seated, unprivileged user tries, in turn, to roll back, collect garbage, bind a driver and resolve the interlock. Each is refused Unauthorized; nothing executes."
+spec = ["I22"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { transition = "Rollback", source = "user", actor = "user:1000" }
+after = [
+  { transition = "CollectGarbage", source = "user", actor = "user:1000" },
+  { transition = "BindDriver", device = "device:snd-hda0", driver = "snd_hda_intel", source = "user", actor = "user:1000" },
+  { raw = "cli", argv = ["resolve", "any", "--as-reverted"], actor = "user:1000" },
+]
+window = "3m"
+
+[fault.required_post]
+no_txn_executed = true
+reports = ["Unauthorized"]
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+refused_with = "Unauthorized"
+
+[[fault.required_post.txn]]
+transition = "CollectGarbage"
+refused_with = "Unauthorized"
+
+[[fault.required_post.txn]]
+transition = "BindDriver"
+refused_with = "Unauthorized"
+
+[[fault.required_post.txn]]
+transition = "Resolve"
+refused_with = "Unauthorized"
+
+# I23: "a runtime transaction never publishes, promotes or reverts; the override file is replaced only by compare-and-swap."
+[[fault]]
+id = "en-i23-third-party-override-kept"
+family = "english"
+summary = "Between a change's boot entry being published and its override promotion, a third party rewrites the override file. Planarian does not overwrite it: the third party's file stands, and the change does not commit (it stops at RecoveryFailed for a person to resolve). Before it, a runtime restart of gym-web wrote no boot entry."
+spec = ["I23"]
+tags = ["english"]
+scoring = "must-pass"
+# Fake only: on the VM the gap between Published and promotion is too short
+# for the harness's watcher to land an edit in it.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" },
+  { raw = "wait", for = "1m" },
+  { raw = "edit_override_file", when = { journal = "Published" } },
+]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "10m"
+
+[fault.required_post]
+override_file = "third-party"
+units = { "service:gym-web" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Promoted", "Committed"]
+terminal = "RecoveryFailed"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+terminal = "Committed"
+boot_entries_unchanged = true

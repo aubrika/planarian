@@ -19,6 +19,7 @@ use toml::Value as T;
 const RATIO: &str = "docs/verification-ratio.toml";
 const ASSUMPTIONS: &str = "docs/assumptions.md";
 const BYPASSES: &str = "docs/bypasses.md";
+const CATALOG: &str = "crates/gym/catalog/phase-a.toml";
 const VERIFIED: &[&str] = &["crates/policy/src", "crates/schema/src", "crates/txn/src"];
 
 fn rust_files(dir: &Path, out: &mut Vec<String>) {
@@ -159,6 +160,29 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
             "  {id:<4} rests on {d} discharged and {a} assumed ({}){}",
             if a == 0 { "-".into() } else { format!("{:.2}", d as f64 / a as f64) },
             if d == 0 { format!("; {phase}: tested, not proved") } else { String::new() }
+        ));
+    }
+
+    // §17a: every proved invariant has a catalog entry written from its
+    // English (tag `english`), so a wrong specification shows up as a failure.
+    let english: Vec<String> = std::fs::read_to_string(CATALOG)
+        .ok()
+        .and_then(|t| toml::from_str::<T>(&t).ok())
+        .and_then(|d| d.get("fault").and_then(T::as_array).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| {
+            e.get("tags").and_then(T::as_array).is_some_and(|t| t.iter().any(|x| x.as_str() == Some("english")))
+        })
+        .flat_map(|e| e.get("spec").and_then(T::as_array).cloned().unwrap_or_default())
+        .filter_map(|x| x.as_str().map(String::from))
+        .collect();
+    let unwritten: Vec<&String> =
+        per.iter().filter(|(id, (d, _))| *d > 0 && !english.contains(id)).map(|(id, _)| id).collect();
+    if !unwritten.is_empty() {
+        errors.push(format!(
+            "proved without an entry written from the English (§17a): {}",
+            unwritten.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
         ));
     }
 

@@ -433,6 +433,40 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     }
                 }
             }
+            // Nothing the entry asked for ran: no transaction committed, and
+            // no backend mutation went through.
+            "no_txn_executed" if val.as_bool() == Some(true) => {
+                for t in &all {
+                    if state_name(&t.state) == "Committed" {
+                        fail(&mut v, format!("txn {} ({}) committed", t.id.0, transition_name(&t.transition)));
+                    }
+                }
+                match &e.effects {
+                    None => v.unchecked.push(format!("{key} (backend effects)")),
+                    Some(fx) => {
+                        for f in fx {
+                            fail(&mut v, format!("{} went through", describe(f)));
+                        }
+                    }
+                }
+            }
+            // I23: the override file at the end is the third party's, as it
+            // wrote it (never replaced by Planarian), or Planarian's own.
+            "override_file" => match (val.as_str(), &e.third_party_override) {
+                (Some("third-party"), Some(h)) => {
+                    if e.override_hash != Some(*h) {
+                        fail(&mut v, "the third party's override file was replaced".into());
+                    }
+                }
+                (Some("third-party"), None) => fail(&mut v, "no third-party edit happened".into()),
+                _ => v.unchecked.push(key.clone()),
+            },
+            // I12: no transaction is left open at the end of the window.
+            "nothing_left_open" if val.as_bool() == Some(true) => {
+                for t in e.ledger.live.values() {
+                    fail(&mut v, format!("txn {} left in {}", t.txn.id.0, state_name(&t.txn.state)));
+                }
+            }
             "no_txn_on" => {
                 for u in val.as_array().into_iter().flatten().filter_map(T::as_str) {
                     if unknown(u) {
@@ -863,6 +897,51 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     }
                 }
             },
+            // I15: once a transaction is taken over, only the new lease
+            // holder advances it, and the takeover is the named owner's.
+            "journal_owner_after_takeover" => match &e.entries {
+                None => v.unchecked.push(key.clone()),
+                Some(en) => {
+                    let want = val.as_str().unwrap_or("");
+                    let mut held: BTreeMap<TxnId, u64> = BTreeMap::new();
+                    let mut took = false;
+                    for x in en {
+                        match &x.record {
+                            Record::Takeover { txn, lease, .. } => {
+                                took = true;
+                                if (want == "watchdog") != lease.owner.is_watchdog() {
+                                    fail(&mut v, format!("txn {} taken over by {:?}", txn.0, lease.owner));
+                                }
+                                held.insert(*txn, lease.epoch);
+                            }
+                            Record::Advance { txn, epoch, to, .. } => {
+                                if let Some(&ep) = held.get(txn)
+                                    && *epoch != ep
+                                {
+                                    fail(
+                                        &mut v,
+                                        format!(
+                                            "txn {} advanced to {to:?} at epoch {epoch} after takeover {ep}",
+                                            txn.0
+                                        ),
+                                    );
+                                }
+                            }
+                            Record::OpBegin { op, call } => {
+                                if let Some(&ep) = held.get(&op.txn)
+                                    && op.epoch != ep
+                                {
+                                    fail(&mut v, format!("{call} journaled at epoch {} after takeover {ep}", op.epoch));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !took {
+                        fail(&mut v, "no takeover in the journal".into());
+                    }
+                }
+            },
             "journal_order" => match &e.entries {
                 None => v.unchecked.push(key.clone()),
                 Some(en) => {
@@ -992,6 +1071,25 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             .map(|t| t.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "))
             .unwrap_or_default()
     );
+    // A refusal for this reason (I5: never converted to a tier), from the
+    // executor log; and no matching transaction ran.
+    if let Some(why) = s("refused_with") {
+        let refused = e.log.iter().any(|r| {
+            s("transition").is_none_or(|t| transition_name(&r.proposal.transition) == t)
+                && s("caller").is_none_or(|c| caller_is(&r.caller, c))
+                && (matches!(&r.result, Submitted::Rejected { reason, .. } if format!("{reason:?}") == why)
+                    || matches!(&r.decision, Some(Decision::Reject(reason)) if format!("{reason:?}") == why))
+        });
+        if !refused {
+            v.failures.push(format!("{label}: not refused with {why}"));
+        }
+        for t in &matching {
+            if t.path.iter().any(|p| p == "Activating") {
+                v.failures.push(format!("{label}: txn {} ran", t.id.0));
+            }
+        }
+        return;
+    }
     let count = spec.get("count").and_then(T::as_integer);
     if count == Some(0) {
         if spec.get("before_unit_running").is_some()
@@ -1156,12 +1254,117 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             v.failures.push(format!("{label}: never waited for approval"));
         }
     }
+    // The tier it was decided at: AskFirst is the one that waits for an
+    // approval; the others are read from the logged decision.
+    if let Some(want) = s("tier") {
+        let rec = e.log.iter().find(
+            |r| matches!(&r.result, Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if *txn == t.id),
+        );
+        let got = match rec {
+            Some(r) if matches!(r.result, Submitted::Parked { .. }) => Some("AskFirst".to_string()),
+            Some(r) => match &r.decision {
+                Some(Decision::Allow { tier, .. }) => Some(format!("{tier:?}")),
+                _ => None,
+            },
+            None => None,
+        };
+        if got.as_deref() != Some(want) {
+            v.failures.push(format!("{label}: decided at {got:?}"));
+        }
+    }
+    if let Some(after) = spec.get("started_after").and_then(T::as_table) {
+        match &e.entries {
+            None => v.unchecked.push(format!("{label}: started_after (journal history)")),
+            Some(en) => {
+                let other = after.get("transition").and_then(T::as_str).unwrap_or("");
+                let left = after.get("left").and_then(T::as_str).unwrap_or("");
+                let others: BTreeSet<TxnId> =
+                    all.iter().filter(|x| transition_name(&x.transition) == other).map(|x| x.id).collect();
+                // Where the other transaction first advanced out of `left`.
+                let mut inside = BTreeSet::new();
+                let mut out = None;
+                for (i, x) in en.iter().enumerate() {
+                    if let Record::Advance { txn, to, .. } = &x.record
+                        && others.contains(txn)
+                    {
+                        if state_name(to) == left {
+                            inside.insert(*txn);
+                        } else if inside.contains(txn) && out.is_none() {
+                            out = Some(i);
+                        }
+                    }
+                }
+                let began = en.iter().position(|x| matches!(&x.record, Record::Prepared(p) if p.id == t.id));
+                match (out, began) {
+                    (None, _) => v.failures.push(format!("{label}: no {other} left {left}")),
+                    (_, None) => v.failures.push(format!("{label}: not in the journal")),
+                    (Some(o), Some(b)) if b < o => {
+                        v.failures.push(format!("{label}: prepared while {other} was still in {left}"))
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // A runtime transaction writes no boot entry (I23).
+    if spec.get("boot_entries_unchanged").and_then(T::as_bool) == Some(true) {
+        match &e.entries {
+            None => v.unchecked.push(format!("{label}: boot_entries_unchanged (journal history)")),
+            Some(en) => {
+                if en.iter().any(|x| {
+                    matches!(&x.record, Record::OpBegin { op, call } if op.txn == t.id && call.starts_with("publish_boot"))
+                }) {
+                    v.failures.push(format!("{label}: wrote a boot entry"));
+                }
+            }
+        }
+    }
     for k in ["returns_current_digest", "reject_detail", "decision_in", "decision_not_below"] {
         if spec.get(k).is_some() {
             v.unchecked.push(format!("{label}: {k}"));
         }
     }
+    // A key nobody reads is never taken as holding.
+    for k in spec.as_table().into_iter().flat_map(|t| t.keys()) {
+        if !TXN_KEYS.contains(&k.as_str()) {
+            v.unchecked.push(format!("{label}: {k}"));
+        }
+    }
 }
+
+const TXN_KEYS: &[&str] = &[
+    "transition",
+    "target",
+    "change",
+    "path_option",
+    "args",
+    "emergency",
+    "count",
+    "before_unit_running",
+    "while_interlock",
+    "while_incident",
+    "terminal",
+    "decision",
+    "decision_in",
+    "caller",
+    "approver_class",
+    "terminal_prefix",
+    "path",
+    "never",
+    "lease_epoch_min",
+    "source",
+    "owner",
+    "recovery",
+    "facts",
+    "not_activated_before",
+    "returns_current_digest",
+    "reject_detail",
+    "decision_not_below",
+    "refused_with",
+    "tier",
+    "started_after",
+    "boot_entries_unchanged",
+];
 
 /// `count = 0` under a condition: no proposal matching the spec went
 /// through (finished or parked) while the condition held.

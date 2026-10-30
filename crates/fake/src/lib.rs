@@ -28,6 +28,8 @@ pub enum Effect {
     TouchCore,
     /// The probe definition on a unit changes (a manifest edit).
     ReplaceProbe(UnitId, ProbeDef),
+    /// The probe with this id is gone from the unit (removed, not weakened).
+    DropProbe(UnitId, String),
     /// Kernel/boot change: needs a reboot to be confirmed.
     NeedsReboot,
     /// A system service the generation declares (watched or not), defined in
@@ -207,6 +209,10 @@ pub struct World {
     /// fails (the gym's `fail_boot`).
     pub one_shot: Option<GenerationId>,
     pub fail_one_shot: bool,
+    /// I23: a third party rewrites the override file once the next boot
+    /// entry is published; the hash of what it wrote.
+    pub third_party_on_publish: bool,
+    pub third_party_override: Option<Hash>,
     /// Units planted outside the generation (the boot report finds them).
     pub foreign_units: Vec<String>,
     /// Sessions in which foreground work holds (§10 quiet mode).
@@ -246,7 +252,7 @@ impl World {
         k
     }
 
-    fn override_hash_of(set: &OverrideSet) -> Hash {
+    pub fn override_hash_of(set: &OverrideSet) -> Hash {
         Hash::of(render(set).as_bytes())
     }
 
@@ -298,6 +304,11 @@ impl World {
                     if let Some(d) = units.get_mut(u) {
                         d.probes.retain(|x| x.id != p.id);
                         d.probes.push(p.clone());
+                    }
+                }
+                Effect::DropProbe(u, id) => {
+                    if let Some(d) = units.get_mut(u) {
+                        d.probes.retain(|x| x.id.0 != *id);
                     }
                 }
                 Effect::NeedsReboot => needs_reboot = true,
@@ -803,6 +814,10 @@ impl GenerationBackend for Fake {
             }
             w.boot_entries.insert(g);
             w.boot_default = g;
+            if std::mem::take(&mut w.third_party_on_publish) {
+                w.overrides.assignments.insert("gym.thirdParty".into(), Value::Str("edited".into()));
+                w.third_party_override = Some(World::override_hash_of(&w.overrides));
+            }
             Outcome::Succeeded
         })
     }
@@ -1209,6 +1224,14 @@ pub fn gym_world(store: MemStore) -> Fake {
             option: "gym.kernelParam".into(),
             value: Value::Str("virtio_gpu.modeset=0".into()),
             effect: Effect::NeedsReboot,
+        },
+        // The catalog's English entries (§17a): a change to Planarian's own
+        // unit, and one that removes sshd's canonical probe.
+        Rule { option: "gym.touchCore".into(), value: Value::Str("on".into()), effect: Effect::TouchCore },
+        Rule {
+            option: "gym.dropProbe".into(),
+            value: Value::Str("sshd-tcp".into()),
+            effect: Effect::DropProbe(UnitId::service("sshd"), "sshd-tcp".into()),
         },
         Rule {
             option: "gym.vulnlib".into(),

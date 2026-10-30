@@ -35,11 +35,17 @@ pub fn config() -> CoreConfig {
                     "repair:reenable-predicted",
                     "gym:security-fix",
                     "gym:kernel-param",
+                    "gym:touch-core",
+                    "gym:drop-probe",
+                    "gym:firewall-step",
                 ]
                 .map(|s| ChangeId(s.into()))
                 .into(),
                 runtime_allowlist: ["font.scale", "wifi.network"].map(String::from).into(),
-                option_sensitivity: vec![("services.openssh".into(), Sensitivities::of(&[Sensitivity::Security]))],
+                option_sensitivity: vec![
+                    ("services.openssh".into(), Sensitivities::of(&[Sensitivity::Security])),
+                    ("networking.firewall".into(), Sensitivities::of(&[Sensitivity::Security])),
+                ],
                 model_catalog: Default::default(),
             },
             catalog: CatalogConfig {
@@ -66,6 +72,30 @@ pub fn config() -> CoreConfig {
                             option: "gym.vulnlib".into(),
                             arg: "version".into(),
                             permitted: vec!["1.1".into()],
+                        },
+                    ),
+                    (
+                        "gym:touch-core".into(),
+                        planarian_changes::GymChoice {
+                            option: "gym.touchCore".into(),
+                            arg: "value".into(),
+                            permitted: vec!["on".into()],
+                        },
+                    ),
+                    (
+                        "gym:drop-probe".into(),
+                        planarian_changes::GymChoice {
+                            option: "gym.dropProbe".into(),
+                            arg: "probe".into(),
+                            permitted: vec!["sshd-tcp".into()],
+                        },
+                    ),
+                    (
+                        "gym:firewall-step".into(),
+                        planarian_changes::GymChoice {
+                            option: "networking.firewall.gymStep".into(),
+                            arg: "step".into(),
+                            permitted: vec!["1".into()],
                         },
                     ),
                     (
@@ -366,6 +396,8 @@ impl Sim {
             w.collected.to_vec(),
             w.overrides.assignments.is_empty(),
         );
+        let override_hash = Some(planarian_fake::World::override_hash_of(&w.overrides));
+        let third_party_override = w.third_party_override;
         drop(w);
         crate::evidence::Evidence {
             current,
@@ -375,6 +407,8 @@ impl Sim {
             boot_entries,
             collected,
             overrides_empty,
+            override_hash,
+            third_party_override,
             ledger: self.ledger(),
             journal_replays,
             log: self.log.clone(),
@@ -665,6 +699,10 @@ impl Sim {
                     }
                     consumed.insert(i);
                 }
+                "edit_override_file" if state == "Published" => {
+                    self.fake.w().third_party_on_publish = true;
+                    consumed.insert(i);
+                }
                 "fill_fs" if get("fs") == "device:fs-boot" => {
                     self.fake.w().fail_publish = true;
                     consumed.insert(i);
@@ -785,6 +823,16 @@ impl Sim {
                     return Err(Unsupported(format!("break_journal_chain: {edited:?}")));
                 }
             }
+            // I18: delete a retained record (not edit it), the rest re-framed
+            // so every frame is intact; only the chain can tell.
+            "delete_journal_record" => {
+                let n = s.get("record").and_then(T::as_integer).unwrap_or(1) as usize;
+                let gone = planarian_txn::journal::delete(&self.fake.store, n)
+                    .map_err(|e| Unsupported(format!("delete_journal_record: {e}")))?;
+                if !gone {
+                    return Err(Unsupported(format!("delete_journal_record: no record {n}")));
+                }
+            }
             // `sudo planarian-ack` (nix/posture.nix): an administrator's clears
             // the alarm, journaled with identity; anyone else's is refused.
             "ack_alarm" => {
@@ -833,6 +881,26 @@ impl Sim {
                 let actor = get("actor");
                 let who = actor.split('@').next().unwrap_or("user:1000").to_string();
                 self.request(&who, req)?;
+            }
+            // I14: a request carrying fields it must not set (a caller, a
+            // sensitivity, affected units), parsed as the daemon parses it.
+            "forge_proposal_fields" => {
+                let r = s.get("request").and_then(T::as_table).ok_or_else(|| Unsupported("request".into()))?;
+                let args: BTreeMap<String, Value> = r
+                    .get("args")
+                    .and_then(T::as_table)
+                    .map(|a| a.iter().map(|(k, v)| (k.clone(), value(v))).collect())
+                    .unwrap_or_default();
+                let change = ChangeId(r.get("change").and_then(T::as_str).unwrap_or("").into());
+                let mut line = serde_json::to_value(Request::Apply { change, args }).expect("serializes");
+                let forged = serde_json::to_value(s.get("fields").cloned().unwrap_or(T::Table(Default::default())))
+                    .map_err(|e| Unsupported(e.to_string()))?;
+                if let (Some(o), Some(f)) = (line.as_object_mut(), forged.as_object()) {
+                    o.extend(f.clone());
+                }
+                let req: Request =
+                    serde_json::from_value(line).map_err(|e| Unsupported(format!("forge_proposal_fields: {e}")))?;
+                self.request(&actor, req)?;
             }
             "agent_run" => {
                 let name = get("name");
@@ -1117,6 +1185,16 @@ impl Sim {
                     let c = self.core.as_mut().ok_or_else(|| Unsupported("daemon down".into()))?;
                     c.ex.cfg.settings.user_controllable_changes.extend(add);
                 }
+                "max_tier" => {
+                    let tier = match s.get("value").and_then(T::as_str) {
+                        Some("Observe") => Tier::Observe,
+                        Some("Runtime") => Tier::Runtime,
+                        Some("Tested") => Tier::Tested,
+                        v => return Err(Unsupported(format!("set_setting max_tier {v:?}"))),
+                    };
+                    let c = self.core.as_mut().ok_or_else(|| Unsupported("daemon down".into()))?;
+                    c.ex.cfg.settings.max_tier = tier;
+                }
                 "posture" => {
                     self.posture = match s.get("value").and_then(T::as_str) {
                         Some("Relaxed") => planarian_schema::Posture::Relaxed,
@@ -1223,10 +1301,16 @@ impl Sim {
             ["ack"] => Request::Acknowledge { unit: None },
             ["ack", u] => Request::Acknowledge { unit: Some(unit(u)) },
             ["release", u] => Request::LiftOverride { unit: unit(u) },
-            ["resolve", _, how] => {
+            ["resolve", _t, how] => {
                 let l = self.ledger();
-                let txn =
-                    *l.interlock.keys().next().ok_or_else(|| Unsupported("resolve: nothing interlocked".into()))?;
+                // `resolve any`: the interlocked transaction, or with none
+                // interlocked, one that does not exist (authorization is
+                // decided before the transaction is looked up).
+                let txn = match (l.interlock.keys().next(), *_t) {
+                    (Some(t), _) => *t,
+                    (None, "any") => TxnId(u64::MAX),
+                    (None, _) => return Err(Unsupported("resolve: nothing interlocked".into())),
+                };
                 let resolution = match *how {
                     "--as-committed" => Resolution::AsCommitted,
                     "--as-reverted" => Resolution::AsReverted,
@@ -1284,6 +1368,11 @@ impl Sim {
             "RestartUnit" => Request::Restart { unit: unit(&get("unit")) },
             "CollectGarbage" => Request::Gc,
             "Rollback" => return self.direct(actor, Transition::Rollback),
+            // Restoring a snapshot overwrites user data (NonReversible).
+            "RestoreSnapshot" => {
+                let id = SnapshotId(get("snapshot"));
+                return self.direct(actor, Transition::RestoreSnapshot(id));
+            }
             "SwitchGeneration" => {
                 let g = self.fake.w().gens.keys().copied().max().unwrap_or(GenerationId(1));
                 self.candidate = Some(g);

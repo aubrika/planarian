@@ -178,6 +178,43 @@ pub fn tamper<S: Store>(store: &S, nth: usize, edit: impl FnOnce(&mut Vec<u8>)) 
     Ok(false)
 }
 
+/// Fault injection (tests and the gym): remove the `nth` record and re-frame
+/// every record after it one seq lower, each with its own `prev` and a valid
+/// CRC, so every frame is intact and the seqs run on; zero what is left at
+/// the end. The chain then breaks at the record after the deleted one (I18).
+/// False if there is no such record.
+pub fn delete<S: Store>(store: &S, nth: usize) -> io::Result<bool> {
+    let mut off = 0u64;
+    let mut at = None;
+    let mut rest: Vec<(u64, Hash, Vec<u8>)> = vec![];
+    for i in 0.. {
+        let header = store.read_at(off, HEADER)?;
+        if header.len() < HEADER {
+            break;
+        }
+        let len = u32::from_le_bytes(header[0..4].try_into().expect("4 bytes")) as usize;
+        let bytes = store.read_at(off, HEADER + len)?;
+        let Some(f) = unframe(&bytes) else { break };
+        if i == nth {
+            at = Some(off);
+        } else if at.is_some() {
+            rest.push((f.seq - 1, f.prev, f.payload.to_vec()));
+        }
+        off += f.size as u64;
+    }
+    let Some(start) = at else { return Ok(false) };
+    let mut out = vec![];
+    for (seq, prev, payload) in &rest {
+        out.extend_from_slice(&frame(*seq, prev, payload));
+    }
+    let end = start + out.len() as u64;
+    out.resize((off - start) as usize, 0);
+    store.write_at(start, &out)?;
+    debug_assert!(end <= off);
+    store.sync()?;
+    Ok(true)
+}
+
 /// Whether `bytes` start with an intact frame of format 1 (no chain, plain CRC).
 fn legacy_frame(bytes: &[u8]) -> bool {
     if bytes.len() < HEADER {
