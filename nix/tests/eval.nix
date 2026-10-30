@@ -68,6 +68,12 @@ let
     (check (builtins.any (w: pkgs.lib.hasInfix "NTS" w) cfg.warnings) "unauthenticated NTP is reported as a notice (§12h)")
     (check (!cfg.systemd.services.planariad.restartIfChanged) "planariad survives activation")
     (check (!cfg.systemd.services.planarian-recovery.stopIfChanged) "the watchdog survives activation")
+    (check (cfg.systemd.services.planariad.serviceConfig.Slice == "planarian-monitor.slice"
+      && cfg.systemd.services.planarian-recovery.serviceConfig.Slice == "planarian-monitor.slice")
+      "daemon and independent watchdog share persistent owned-work accounting")
+    (check (cfg.systemd.slices.planarian-monitor.sliceConfig.CPUAccounting
+      && cfg.systemd.slices.planarian-monitor.sliceConfig.MemoryAccounting)
+      "owned monitor helper CPU and memory remain accounted after exit")
     (check (export.coreUnits."planariad.service" != "") "core unit hashes exported")
     (check (builtins.any (a: pkgs.lib.hasInfix "test build" a.message) refused) "the module refuses the test build outside the gym (B-13)")
     (check (builtins.all (a: !(pkgs.lib.hasInfix "test build" a.message)) (builtins.filter (a: !a.assertion) cfg.assertions)) "the shipped package is not refused")

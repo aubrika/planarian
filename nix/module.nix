@@ -604,6 +604,16 @@ in
     environment.systemPackages = [ cfg.package ] ++ lib.optional (cfg.console.enable || cfg.tray.enable) cfg.console.package;
     users.groups.planarian-admin = { };
 
+    # Stable accounting parent for owned monitor work, including short-lived
+    # systemd-run probe/activation services. Sibling agent workloads and the
+    # shared Nix/systemd daemons are outside this explicitly measured scope.
+    systemd.slices.planarian-monitor = {
+      description = "Planarian monitor and owned helpers";
+      wantedBy = [ "multi-user.target" ];
+      unitConfig.StopWhenUnneeded = false;
+      sliceConfig = { CPUAccounting = true; MemoryAccounting = true; };
+    };
+
     # The healer is not the patient (Principle 1): no activation restarts or
     # stops these two (NixOS honours X-RestartIfChanged/X-StopIfChanged), and a
     # candidate whose unit files for them differ is refused as touching the core.
@@ -613,7 +623,7 @@ in
       before = [ "planariad.service" ];
       restartIfChanged = false;
       stopIfChanged = false;
-      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux ];
+      path = [ config.nix.package pkgs.git pkgs.glibc.bin config.systemd.package pkgs.util-linux ];
       environment.PLANARIAN_CONFIG = "/etc/planarian/config.json";
       serviceConfig = {
         # On btrfs the journal is rewritten in place: mark its directory
@@ -625,6 +635,7 @@ in
           fi
         ''}";
         ExecStart = "${cfg.package}/bin/planarian-recovery";
+        Slice = "planarian-monitor.slice";
         Restart = "always";
         RestartSec = 2;
         StateDirectory = "planarian";
@@ -662,11 +673,12 @@ in
       after = [ "planarian-recovery.service" ];
       restartIfChanged = false;
       stopIfChanged = false;
-      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux pkgs.kmod ]
+      path = [ config.nix.package pkgs.git pkgs.glibc.bin config.systemd.package pkgs.util-linux pkgs.kmod ]
         ++ lib.optional config.networking.networkmanager.enable config.networking.networkmanager.package;
       environment.PLANARIAN_CONFIG = "/etc/planarian/config.json";
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/planariad";
+        Slice = "planarian-monitor.slice";
         Restart = "always";
         RestartSec = 2;
         StateDirectory = "planarian";
