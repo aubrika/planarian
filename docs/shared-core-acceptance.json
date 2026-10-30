@@ -1,0 +1,3769 @@
+{
+  "format_version": 1,
+  "source": {
+    "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+    "checkout_head": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+    "revision_available": true,
+    "revision_verified": true,
+    "fingerprint": "e46fb5cc7dc28959abcb7a45859c88a7f42b16d13c05243c28582551b2782b00",
+    "files": {
+      ".github/workflows/bench.yml": {
+        "sha256": "f9cb79d5248c20d294f27eeb673590570b3d8cc118b5a7406f13e009c5693606",
+        "mode": "100644"
+      },
+      ".github/workflows/ci.yml": {
+        "sha256": "292eda823a7d996b22d73aa905f5993c66c81fa3c9a56dee5700ed9ab836ccfc",
+        "mode": "100644"
+      },
+      ".github/workflows/vm.yml": {
+        "sha256": "72d810cbf8b875908b4a098243eac6b1f3a540ac994a7310842e9d2a1c5ba840",
+        "mode": "100644"
+      },
+      ".gitignore": {
+        "sha256": "5f90881a4b351273a5ffa6023dda7429b9d7924b0fb4d01843ae13df3ad5b594",
+        "mode": "100644"
+      },
+      "Cargo.lock": {
+        "sha256": "c504c57dea935a9cd67529f0184d56138d365e06a457fd60c41111ea196a1cbc",
+        "mode": "100644"
+      },
+      "Cargo.toml": {
+        "sha256": "3ab66d691df64f18a5bac14c6324ad95e392c1751aa2613b5e493330165324f4",
+        "mode": "100644"
+      },
+      "assets/boot/bios-splash.png": {
+        "sha256": "87e1ff2de3a1261767eded3ee22eb0ea589b58120979bfb4eaa08f0bf48d2daf",
+        "mode": "100644"
+      },
+      "assets/boot/efi-splash.png": {
+        "sha256": "88ec5bc21c58ae36354783621668a59b5aade964379abcc0cb9d2fb1c9718ed3",
+        "mode": "100644"
+      },
+      "assets/identity/README.md": {
+        "sha256": "4ecbf384d3b186d1ad7382e8f87af687c705218aa42ca74f50146eb2ed4fc51c",
+        "mode": "100644"
+      },
+      "assets/identity/animations/README.md": {
+        "sha256": "9429eb1a10755b6d44002e41245f02111818914d160f344d09a4b74b2b7bc5d2",
+        "mode": "100644"
+      },
+      "assets/identity/animations/keyframes.json": {
+        "sha256": "3620fe7f6d066c652a564a162ca6acdcf2c3c7ee7300d81c8e0c6cd22d7b5c41",
+        "mode": "100644"
+      },
+      "assets/identity/animations/loading-black.svg": {
+        "sha256": "6d242662758cd4b643d5f677d898235ccd9867a2c1a2282c20592aafc7648288",
+        "mode": "100644"
+      },
+      "assets/identity/animations/loading-white.svg": {
+        "sha256": "379a9ea74c1dcb63de08682170b80fff78887e8925675a116adb18e89705e30e",
+        "mode": "100644"
+      },
+      "assets/identity/animations/planarian-motion.js": {
+        "sha256": "c8e1c122263f04a756d5335c707c68b8e5cda0ccb876eac3ccf586b81dcfc31b",
+        "mode": "100644"
+      },
+      "assets/identity/animations/poster.png": {
+        "sha256": "153b1e4116c7a8fa5f3e1e750d13a89f9690ddb6051e7bad515082b47a0a490c",
+        "mode": "100644"
+      },
+      "assets/identity/animations/prototype.html": {
+        "sha256": "199339d9b5a99cf94c3d9013ef074a4668d4873da138cf431db3815e528f628c",
+        "mode": "100644"
+      },
+      "assets/identity/animations/working-black.svg": {
+        "sha256": "bd6407faca6c8985588ebcf67706dff18337349b0a0c5806db10c7735b5ded34",
+        "mode": "100644"
+      },
+      "assets/identity/animations/working-white.svg": {
+        "sha256": "0646dc9733478986f6d217820f05b6af5ba951b76740fde19c7ad9f3c88924d0",
+        "mode": "100644"
+      },
+      "assets/identity/asset-index.json": {
+        "sha256": "d8eeb03a01df93d316095e664030910c29b38c42547ce6c36b64f2d26fc85c93",
+        "mode": "100644"
+      },
+      "assets/identity/docs/guide.html": {
+        "sha256": "839c2774c25255aa4c2fb2656a0336683f342074748e8a2de4800aa3d9027f2c",
+        "mode": "100644"
+      },
+      "assets/identity/icons/dark/planarian-1024.png": {
+        "sha256": "2335253c98daab741beaf3bc351f428613a1054620654b793148f4354793055e",
+        "mode": "100644"
+      },
+      "assets/identity/icons/dark/planarian-128.png": {
+        "sha256": "8f624c063f2685f1b2f61f66c526f74f96af9a9b9d859a8b19577461631cb265",
+        "mode": "100644"
+      },
+      "assets/identity/icons/dark/planarian-16.png": {
+        "sha256": "7301c6f5334bde81632baa304b6184b8adc625fba7183187e20b2700e6544fd9",
+        "mode": "100644"
+      },
+      "assets/identity/icons/dark/planarian-192.png": {
+        "sha256": "a774b54c1693145bb805f25b8f0a4275d3ce62365cb4d5534d44447a679dfbdb",
+        "mode": "100644"
+      },
+      "assets/identity/icons/dark/planarian-20.png": {
+        "sha256": "29c195f12c22cc14f4c82b838ec61dcb705a6a7be75970b2b1b841babd23bd0a",
+        "mode": "100644"
+      },
+      "assets/identity/icons/dark/planarian-24.png": {
+        "sha256": "b0df89dccdca25f2b99ee6336f610fcfa1b8d273abf148704dd7f6d4765eb4af",
+        "mode": "100644"
+      },
+      "assets/identity/icons/dark/planarian-256.png": {
+        "sha256": "e0e4a54c832df30d2e1cedc60a9e7452d052ab7711f07fa4d07bfadb17d2836d",
+        "mode": "100644"
+      },
+      "assets/identity/icons/dark/planarian-32.png": {
+        "sha256": "ef8e5636403ae4c7731c7d59114da38cc2f9a5ab7d956557de17f88c2bc49312",
+        "mode": "100644"
+      },
+      "assets/identity/icons/dark/planarian-48.png": {
+        "sha256": "ad070f469e745c57e17d5f84935201935d3dd01b9e38503d62e3d8a3585d8b89",
+        "mode": "100644"
+      },
+      "assets/identity/icons/dark/planarian-512.png": {
+        "sha256": "2620ccc1a6c2f2072dcea5f698af22c6195d4ab3d9cb120f8724abbdfa923b60",
+        "mode": "100644"
+      },
+      "assets/identity/icons/dark/planarian-64.png": {
+        "sha256": "4faa490d8d511f8df9937a6f233a7f0f5b14a2255671199f7d2df3a96f654025",
+        "mode": "100644"
+      },
+      "assets/identity/icons/dark/planarian-96.png": {
+        "sha256": "7e3254f2859a971aab0e256911e92db9934c306fb7b784742bef635671972242",
+        "mode": "100644"
+      },
+      "assets/identity/icons/light/planarian-1024.png": {
+        "sha256": "bae52c3384a8384d8aeeedf270aeaf484cd1420cb198b7ec0ec544b950aa74f5",
+        "mode": "100644"
+      },
+      "assets/identity/icons/light/planarian-128.png": {
+        "sha256": "92e682081c8a4e9fcd1c5cfa47df85c7efe143da17499d4acf703e8969032376",
+        "mode": "100644"
+      },
+      "assets/identity/icons/light/planarian-16.png": {
+        "sha256": "e940a3af2078e8f7fe53e1fc0b87cc04768728de51d17603221bff1b4ec82a18",
+        "mode": "100644"
+      },
+      "assets/identity/icons/light/planarian-192.png": {
+        "sha256": "c00605ccf87a076be5e67f75701eba2ef9111ab4bc8b5d2190ceb6eb5fa9f3e4",
+        "mode": "100644"
+      },
+      "assets/identity/icons/light/planarian-20.png": {
+        "sha256": "44e48dc7e83e535ed085cd242a49b00f66486fac00c731d5329bcf4834ea2330",
+        "mode": "100644"
+      },
+      "assets/identity/icons/light/planarian-24.png": {
+        "sha256": "bb00ad58e4e98095d68d4d509e6a0c2be2e64a40d6ae00a9d7287fbc99911d52",
+        "mode": "100644"
+      },
+      "assets/identity/icons/light/planarian-256.png": {
+        "sha256": "5e30a8954ddfd87c4c08e1fa4e32f3e3b28779b43d6415706678a03cd699714d",
+        "mode": "100644"
+      },
+      "assets/identity/icons/light/planarian-32.png": {
+        "sha256": "09ffaba60ff43d4c91cf7c806fbc47f326fec6c4c8dff14ccd280b3ce9fe61f1",
+        "mode": "100644"
+      },
+      "assets/identity/icons/light/planarian-48.png": {
+        "sha256": "e76a3144bc2b7c874cd5da83f77b76e4cbf7d846a67b89199ec53427221beead",
+        "mode": "100644"
+      },
+      "assets/identity/icons/light/planarian-512.png": {
+        "sha256": "c4b5927ba085ab05c59ffd83654624b7e947a762f13160c17dc992d872c9bd8a",
+        "mode": "100644"
+      },
+      "assets/identity/icons/light/planarian-64.png": {
+        "sha256": "d2689f583fa9e37601d01d03346357ce231e49fbb63cfe9e55b5be81ad417971",
+        "mode": "100644"
+      },
+      "assets/identity/icons/light/planarian-96.png": {
+        "sha256": "cd1086329818211814a532dd93b570ed861bcf66e94eb7907363255eea60b04b",
+        "mode": "100644"
+      },
+      "assets/identity/icons/planarian-app-dark-micro.svg": {
+        "sha256": "4175e805def2bc91c33ffee8aba58d6360fef0aaa673f47df9be487fdfbe0c72",
+        "mode": "100644"
+      },
+      "assets/identity/icons/planarian-app-dark.svg": {
+        "sha256": "f613767d6a13e1eab768a564c408aeb81e8d6cdceb900f19a5a7a22b9fce11e0",
+        "mode": "100644"
+      },
+      "assets/identity/icons/planarian-app-light-micro.svg": {
+        "sha256": "96bc1781ef1ebe7275a82a1e6342da2542461700c7bb86470824f816a8a2ae6d",
+        "mode": "100644"
+      },
+      "assets/identity/icons/planarian-app-light.svg": {
+        "sha256": "81d061496b035b992cbc4f8d462c6011e369105f485178be30f77dc78c868d2d",
+        "mode": "100644"
+      },
+      "assets/identity/icons/symbolic/planarian-symbolic.svg": {
+        "sha256": "f6202afa0f72a78ba48c232eacf7af555a7b01ee43dc5ef35f5be342d9528235",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/1024x1024/apps/planarian.png": {
+        "sha256": "2335253c98daab741beaf3bc351f428613a1054620654b793148f4354793055e",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/128x128/apps/planarian.png": {
+        "sha256": "8f624c063f2685f1b2f61f66c526f74f96af9a9b9d859a8b19577461631cb265",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/16x16/apps/planarian.png": {
+        "sha256": "7301c6f5334bde81632baa304b6184b8adc625fba7183187e20b2700e6544fd9",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/192x192/apps/planarian.png": {
+        "sha256": "a774b54c1693145bb805f25b8f0a4275d3ce62365cb4d5534d44447a679dfbdb",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/20x20/apps/planarian.png": {
+        "sha256": "29c195f12c22cc14f4c82b838ec61dcb705a6a7be75970b2b1b841babd23bd0a",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/24x24/apps/planarian.png": {
+        "sha256": "b0df89dccdca25f2b99ee6336f610fcfa1b8d273abf148704dd7f6d4765eb4af",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/256x256/apps/planarian.png": {
+        "sha256": "e0e4a54c832df30d2e1cedc60a9e7452d052ab7711f07fa4d07bfadb17d2836d",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/32x32/apps/planarian.png": {
+        "sha256": "ef8e5636403ae4c7731c7d59114da38cc2f9a5ab7d956557de17f88c2bc49312",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/48x48/apps/planarian.png": {
+        "sha256": "ad070f469e745c57e17d5f84935201935d3dd01b9e38503d62e3d8a3585d8b89",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/512x512/apps/planarian.png": {
+        "sha256": "2620ccc1a6c2f2072dcea5f698af22c6195d4ab3d9cb120f8724abbdfa923b60",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/64x64/apps/planarian.png": {
+        "sha256": "4faa490d8d511f8df9937a6f233a7f0f5b14a2255671199f7d2df3a96f654025",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/96x96/apps/planarian.png": {
+        "sha256": "7e3254f2859a971aab0e256911e92db9934c306fb7b784742bef635671972242",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/scalable/apps/planarian.svg": {
+        "sha256": "f613767d6a13e1eab768a564c408aeb81e8d6cdceb900f19a5a7a22b9fce11e0",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/hicolor/symbolic/apps/planarian-symbolic.svg": {
+        "sha256": "f6202afa0f72a78ba48c232eacf7af555a7b01ee43dc5ef35f5be342d9528235",
+        "mode": "100644"
+      },
+      "assets/identity/integration/linux/planarian.desktop": {
+        "sha256": "3a4b08c2260b80f251363d597d18c71e93bc4d3132475887b1c2d79ddfaa69b8",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-black-1024.png": {
+        "sha256": "944e3ef17ac22c7b0773686e19d1b7b68925eaf5adabf1823e5b10c9148829dd",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-black-128.png": {
+        "sha256": "a74cd9f51edb27071c2c9ea88512727e2435f6fbc01738c5fcc771ed1254b41e",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-black-256.png": {
+        "sha256": "3cc0d242ccd0537505c7e5bffe4829d098c5c3d1858fcd891894bbd9feafe98d",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-black-512.png": {
+        "sha256": "fbf10bb7827b0d26cc1ebf60cf83130447a9fdc6bd7f0ab2f937e1940813317c",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-black.svg": {
+        "sha256": "772b28a1e315c1da791b7dff7eaab16b94d5e4094f3b568861ca64719e965673",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-currentcolor.svg": {
+        "sha256": "807fedb0741f4ee9f72415e52d938e64fafc6363996714e7c278271735f2b172",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-micro-black.svg": {
+        "sha256": "6266ef89356c8589c3a1913274ffb22b3e268ed08043849cb69c4ceba847bc47",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-micro-currentcolor.svg": {
+        "sha256": "f6202afa0f72a78ba48c232eacf7af555a7b01ee43dc5ef35f5be342d9528235",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-micro-white.svg": {
+        "sha256": "f71d014f2c3c65e7c8deaa5b8aa421d712f1b6ee09f7e4b167b28587c7e3cc58",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-white-1024.png": {
+        "sha256": "57073640d4f667617c066cfc1548e808e76fafaea447c0574fe2533f2f42e3b4",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-white-128.png": {
+        "sha256": "71887079e8f5f07780dd0812bc807d15f930efbacce64d2448b0f6a28651b14e",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-white-256.png": {
+        "sha256": "da61e3c5708c4b5d505432241349d19612ca11c4e0abb9d6a12cc2dca4277d30",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-white-512.png": {
+        "sha256": "bae101ab9fe22f19cc1a0b1ed69ee2b8aa29de629c5fcc8fcad905fb1ef0608d",
+        "mode": "100644"
+      },
+      "assets/identity/marks/planarian-mark-white.svg": {
+        "sha256": "bda4f419b628e299cd727cfc2085f1c300b98d0e577c548d65c8b500562cb5d4",
+        "mode": "100644"
+      },
+      "assets/identity/previews/boot-dark.svg": {
+        "sha256": "7bf2d7496fee1b8fb9b4060a17ef1fe87943096a45dcb85c4a091d72e3a290cd",
+        "mode": "100644"
+      },
+      "assets/identity/previews/boot-light.svg": {
+        "sha256": "d7db9985d1519f9caf210670178ef1afe401d09cf824c90431d89a5fa919de91",
+        "mode": "100644"
+      },
+      "assets/identity/previews/identity-board.png": {
+        "sha256": "8235e30c7735001ae7bec56aa4ab8e615b9122244f5a81dec052cd6c50b5b7b3",
+        "mode": "100644"
+      },
+      "assets/identity/previews/identity-board.svg": {
+        "sha256": "958dccf6e092dbdd801f92777676e9735c96bc57ddf12a575bc2b53c75539451",
+        "mode": "100644"
+      },
+      "assets/identity/previews/software-applications.svg": {
+        "sha256": "40268de766121749d786c89bd2d5e533f8c5abbda3522c7ef3cd40717534b2f0",
+        "mode": "100644"
+      },
+      "assets/identity/social/planarian-avatar-dark.png": {
+        "sha256": "5810e7b2f961b147732c53b415d13c6913c66e8923364a5e7b481b4ba80f538f",
+        "mode": "100644"
+      },
+      "assets/identity/social/planarian-avatar-dark.svg": {
+        "sha256": "a9b8100ff3c1f66eb9fd5918a4ef15ac5745a42c93fff59c3bfe9a645662f662",
+        "mode": "100644"
+      },
+      "assets/identity/social/planarian-avatar-light.png": {
+        "sha256": "3203c61a41fa626b8dc408377db9f86fd66d84ca69038a177198d94a3b128c28",
+        "mode": "100644"
+      },
+      "assets/identity/social/planarian-avatar-light.svg": {
+        "sha256": "ec8a1a3fc3ed4ec801ed9f8a215ef745d41933f80765b7e3ea1f0d31fae2cec9",
+        "mode": "100644"
+      },
+      "assets/identity/social/planarian-card-dark.png": {
+        "sha256": "16dd07cf513ad5a551cb848c8b3015d6bda9e9a2200ef19b677d74d1bd43eef0",
+        "mode": "100644"
+      },
+      "assets/identity/social/planarian-card-dark.svg": {
+        "sha256": "59bf29b333bed810489a01797ae7346e2a2feafd6ae4fe73ad8ba4f9814f5f1d",
+        "mode": "100644"
+      },
+      "assets/identity/social/planarian-card-light.png": {
+        "sha256": "51f2b30508055de0837355b4fd2a8a73760ed9be64735c272797e56545cf4f97",
+        "mode": "100644"
+      },
+      "assets/identity/social/planarian-card-light.svg": {
+        "sha256": "e53ad3e5aaf75ca1fd2b6e199cd108780d2eab1853c077e5b2227d368aa425b5",
+        "mode": "100644"
+      },
+      "assets/identity/source/build_kit.py": {
+        "sha256": "b859f27df0975899bb59ca8e083b94499c0fac1cb99c73592100ac76c1995011",
+        "mode": "100644"
+      },
+      "assets/identity/source/build_motion.cjs": {
+        "sha256": "7d1fa205e9371b73ffa293f45a5b7d875b2c6a919cdcfda44496f27aefd4d978",
+        "mode": "100644"
+      },
+      "assets/identity/source/export_kit.cjs": {
+        "sha256": "0c05538cdef265dee4c566d38d45f2bb7fcadce1dd92807a00a8bf33db2b6977",
+        "mode": "100644"
+      },
+      "assets/identity/source/make_guide.py": {
+        "sha256": "a0051493c6ce74a7f397f23614761cf8a968f60a18352163b789be86314e590f",
+        "mode": "100644"
+      },
+      "assets/identity/source/manifest.json": {
+        "sha256": "36b1bcfc9e08d686ab94aa6ca42fbd5ed5ac3ad98c800ce241ae44b5473412b3",
+        "mode": "100644"
+      },
+      "assets/identity/source/mark-raster.png": {
+        "sha256": "1ebbf95decec61738214389dff92a3011419d514959bc27571b2220ae51be9e1",
+        "mode": "100644"
+      },
+      "assets/identity/source/package.json": {
+        "sha256": "34bc65bd7ebab75fb78a7b9f2a0b5b613061945e9a5bbe94fbe93992eebef32d",
+        "mode": "100644"
+      },
+      "assets/identity/source/prompts.md": {
+        "sha256": "c89eedaa13b7ad1f9b006aad09e15e09c5f6ba7f98659083e1910d60fe2d0a04",
+        "mode": "100644"
+      },
+      "assets/identity/source/trace-data.json": {
+        "sha256": "3327ac63470329b1742aa70cfb5e6f99b76d14b6452ba70951e950804e0dbc01",
+        "mode": "100644"
+      },
+      "assets/identity/web/apple-touch-icon.png": {
+        "sha256": "e0fcc7f9a9af18bde775df108b8f01eee142975b42bd904290dba75376d95f3f",
+        "mode": "100644"
+      },
+      "assets/identity/web/favicon-16.png": {
+        "sha256": "7301c6f5334bde81632baa304b6184b8adc625fba7183187e20b2700e6544fd9",
+        "mode": "100644"
+      },
+      "assets/identity/web/favicon-24.png": {
+        "sha256": "b0df89dccdca25f2b99ee6336f610fcfa1b8d273abf148704dd7f6d4765eb4af",
+        "mode": "100644"
+      },
+      "assets/identity/web/favicon-32.png": {
+        "sha256": "ef8e5636403ae4c7731c7d59114da38cc2f9a5ab7d956557de17f88c2bc49312",
+        "mode": "100644"
+      },
+      "assets/identity/web/favicon-48.png": {
+        "sha256": "ad070f469e745c57e17d5f84935201935d3dd01b9e38503d62e3d8a3585d8b89",
+        "mode": "100644"
+      },
+      "assets/identity/web/favicon-64.png": {
+        "sha256": "4faa490d8d511f8df9937a6f233a7f0f5b14a2255671199f7d2df3a96f654025",
+        "mode": "100644"
+      },
+      "assets/identity/web/favicon.ico": {
+        "sha256": "7150bcd3e5dc0e347096ba43aba2f2b4fe39ea7c01c7a123a6ab4340c8c3e598",
+        "mode": "100644"
+      },
+      "assets/identity/web/favicon.svg": {
+        "sha256": "6bf893206ea71a67e66772a32ac5b013e93e52c95e166077f2f980188d340cba",
+        "mode": "100644"
+      },
+      "assets/identity/web/head-snippet.html": {
+        "sha256": "cc9c6757691b9146c092aaad5e980ce4ecf39a4b9b755e7c6d15a24dfc22212c",
+        "mode": "100644"
+      },
+      "assets/identity/web/planarian-mask.svg": {
+        "sha256": "772b28a1e315c1da791b7dff7eaab16b94d5e4094f3b568861ca64719e965673",
+        "mode": "100644"
+      },
+      "assets/identity/web/planarian-maskable-dark-192.png": {
+        "sha256": "56286cfc59f464225751d78d351d28350669a11acafd4ea05f6efe73a05bca47",
+        "mode": "100644"
+      },
+      "assets/identity/web/planarian-maskable-dark-512.png": {
+        "sha256": "d8ee7abb61d7dc8c9a4bd57ef702c2c079ce1a5feb179e867121c778f97a237d",
+        "mode": "100644"
+      },
+      "assets/identity/web/planarian-maskable-dark.svg": {
+        "sha256": "f550baff5a3c06b8d7a0e59b9151494a8b301d2e6c8d8b90b33cb4350dc6d9c1",
+        "mode": "100644"
+      },
+      "assets/identity/web/planarian-maskable-light-192.png": {
+        "sha256": "bec34a5d6774a18a51ab39483eab34fbaebea257000a6a0cf30a5462c3a9436f",
+        "mode": "100644"
+      },
+      "assets/identity/web/planarian-maskable-light-512.png": {
+        "sha256": "6758707c48a444ab406ee233c44713a9034aab9eea7d01360446df6b376b4d7f",
+        "mode": "100644"
+      },
+      "assets/identity/web/planarian-maskable-light.svg": {
+        "sha256": "2278b795b98d5e9cd1b18c6dee1aa3030941d9f7215d79b43ce8570e2ce8af45",
+        "mode": "100644"
+      },
+      "assets/identity/web/planarian-symbols.svg": {
+        "sha256": "fac80b1e5deef38236ae3d24ff095c6941fbf417c9f9acf1ea5bf94085dd650a",
+        "mode": "100644"
+      },
+      "assets/identity/web/planarian.css": {
+        "sha256": "27a5def2e44459758e31a187dd45c994b993d68c4cbb6a0f4555f7de2217343a",
+        "mode": "100644"
+      },
+      "assets/identity/web/site.webmanifest": {
+        "sha256": "6962dc90b77009a1ae271c52ec5577521aadd7f0ec8c35fc470c755d45dc005e",
+        "mode": "100644"
+      },
+      "assets/identity/wordmarks/planarian-horizontal-dark.png": {
+        "sha256": "846ec13a842515860c88efbdc053461eeffe24d37b777394186b4287f8a04f31",
+        "mode": "100644"
+      },
+      "assets/identity/wordmarks/planarian-horizontal-dark.svg": {
+        "sha256": "c0d796407d506d7e90dac945c42c25bd95db821408fb0c1a384912af50f1106c",
+        "mode": "100644"
+      },
+      "assets/identity/wordmarks/planarian-horizontal-light.png": {
+        "sha256": "8a9f1a330cd88c741b31e953425d5bc2161e2c0f6319fdf4a988d3a1187c3d34",
+        "mode": "100644"
+      },
+      "assets/identity/wordmarks/planarian-horizontal-light.svg": {
+        "sha256": "faf8863e4471dcf05cde2e82c2ef2b0b6d980afe29053aa7bb06f70d6397e9a2",
+        "mode": "100644"
+      },
+      "assets/identity/wordmarks/planarian-stacked-dark.png": {
+        "sha256": "23fcf9a4be2d23c4805f4c4ae9dc59931354f1b311cef87a5272f0bbb49c4c58",
+        "mode": "100644"
+      },
+      "assets/identity/wordmarks/planarian-stacked-dark.svg": {
+        "sha256": "04bb001f8e607cd3c2ee96f5c025755c9b1cea55a2f297c594070dfa2bdf1f45",
+        "mode": "100644"
+      },
+      "assets/identity/wordmarks/planarian-stacked-light.png": {
+        "sha256": "f9e68d058888a1aa4381a200a0f02b046c7e5f135d55b84d23182b4c122fb125",
+        "mode": "100644"
+      },
+      "assets/identity/wordmarks/planarian-stacked-light.svg": {
+        "sha256": "0bb93349356145d75b4470f1b4c99634dd415f0d89128b032cce41ccedc27954",
+        "mode": "100644"
+      },
+      "crates/backends/linux/Cargo.toml": {
+        "sha256": "50872a35d954dd07b2614b87020a15f365ce0353b68a52d07efd3e217e97319b",
+        "mode": "100644"
+      },
+      "crates/backends/linux/src/cmd.rs": {
+        "sha256": "5fdb5df6b96afa28b19bbdb40636cec106488eda2d94bce406f49be8bc2bab6e",
+        "mode": "100644"
+      },
+      "crates/backends/linux/src/gym.rs": {
+        "sha256": "4e0776e085d7568873cdd08c726a14714dc9e257a9f2310eaed1cdc817f2b490",
+        "mode": "100644"
+      },
+      "crates/backends/linux/src/lib.rs": {
+        "sha256": "7207afe64c428b91802bde955a1bea9bfa0f6a8a6342cf32ddea97a562803aad",
+        "mode": "100644"
+      },
+      "crates/backends/linux/src/logind.rs": {
+        "sha256": "a8146f60aaada4986ffd1e970da811b24ec38057c0ab596c68f264a1167fd3fb",
+        "mode": "100644"
+      },
+      "crates/backends/linux/src/nixos.rs": {
+        "sha256": "0fa30aa984008ca73a71024dfd684e4b45954f989be29b7e555b5e0b9553df38",
+        "mode": "100644"
+      },
+      "crates/backends/linux/src/probe.rs": {
+        "sha256": "acd3419f040b05c9faf10e92cfee857cf37b2c8050853cb8509ce89b7a16f1af",
+        "mode": "100644"
+      },
+      "crates/backends/linux/src/process.rs": {
+        "sha256": "0ee40fc6818cdabdb1d5e154b945c3fd1036bde9f9e6f04880c3e16494f1c6ac",
+        "mode": "100644"
+      },
+      "crates/backends/linux/src/runtime.rs": {
+        "sha256": "0e3fd9e2f9f9585642eeba71f5d6ba287862870d2373ffefa52142705bc0fa70",
+        "mode": "100644"
+      },
+      "crates/backends/linux/src/sysfs.rs": {
+        "sha256": "81e8b115941ac77845279c7384dc4318ba1a49cfba59fa6c6da8c0f3b6a125e8",
+        "mode": "100644"
+      },
+      "crates/backends/linux/src/systemd.rs": {
+        "sha256": "cdd432935e74413ba85aa5724d6dee5dd9e3016d326237ec5cd79e934c0a43cb",
+        "mode": "100644"
+      },
+      "crates/backends/linux/tests/export-sample.json": {
+        "sha256": "6c42f5e1ab4ca47a90215a2c9977f14c9bb1d250ddbb873d819d5c3e74895799",
+        "mode": "100644"
+      },
+      "crates/backends/linux/tests/export.rs": {
+        "sha256": "c6ea8630471c332808e40ae1a98343d49f269a523212b074b086f7c67245221c",
+        "mode": "100644"
+      },
+      "crates/changes/Cargo.toml": {
+        "sha256": "6bdd0a991dda5f87d6cac5a1cf850a79410ce61af7354ca3fd4e5b9d91322394",
+        "mode": "100644"
+      },
+      "crates/changes/src/lib.rs": {
+        "sha256": "d8cf0d70cdb0786bb9c5b5f6ec3f2d28ebcd740d224f547ebdac26db24a569f7",
+        "mode": "100644"
+      },
+      "crates/cli/Cargo.toml": {
+        "sha256": "dfafba7c3fe61e9a4a3c969fca744ebc6411c91c84328fc0ce2c763b77e40e36",
+        "mode": "100644"
+      },
+      "crates/cli/src/main.rs": {
+        "sha256": "d2a30e5d9fc7105fa657fa2ad0021c7121f6302d456d80269504ab81b9a24d2f",
+        "mode": "100644"
+      },
+      "crates/console/Cargo.toml": {
+        "sha256": "dbe49993345db8446f02290cfe7cb209df6fbc6bd1b811e7593e437946a55a6f",
+        "mode": "100644"
+      },
+      "crates/console/src/graph.rs": {
+        "sha256": "fb5863b6ca2603ce066694ce0e00de90c2d16308d49b5ebcda344b4489bcb568",
+        "mode": "100644"
+      },
+      "crates/console/src/icon-64.rgba": {
+        "sha256": "54349ea5d8c28e4c0a7895b24dc456514869e943dd887181929228503f7f0fa1",
+        "mode": "100644"
+      },
+      "crates/console/src/main.rs": {
+        "sha256": "9453da388719095fe9d8aa563c6f89de95a75cfccaa4347d5658613f2e7d76c4",
+        "mode": "100644"
+      },
+      "crates/console/src/mark.rs": {
+        "sha256": "6c32250612a403c61b60c1b8d830f05a0f0470d0a5cfd78a08ccadebc24fb05f",
+        "mode": "100644"
+      },
+      "crates/daemon/Cargo.toml": {
+        "sha256": "cedd22f0bb628406eb2bc392689fec1a40ccd04c078b94814f27ba56862fe8bf",
+        "mode": "100644"
+      },
+      "crates/daemon/src/config.rs": {
+        "sha256": "78aee4d3fe33841f7359300c3a43be2290f02cc48005ca8c397aefa552a1a19a",
+        "mode": "100644"
+      },
+      "crates/daemon/src/core/tests.rs": {
+        "sha256": "ccd656a61923d31a3bd77c5ea36d1946a526377f65fd1824ba1aa48ca959eeeb",
+        "mode": "100644"
+      },
+      "crates/daemon/src/core.rs": {
+        "sha256": "92c276479d975c908ea33550dc26a59bfb5b2f5170a643317974075ecfa2b7f2",
+        "mode": "100644"
+      },
+      "crates/daemon/src/hooks.rs": {
+        "sha256": "0d9ab58b10c6e3c46501b92681c0548f27ecd679244d97af896cce495279085a",
+        "mode": "100644"
+      },
+      "crates/daemon/src/lib.rs": {
+        "sha256": "51f351d86beae5864f7c859abab6237871395b68558bcdc5cb1df42983da0726",
+        "mode": "100644"
+      },
+      "crates/daemon/src/main.rs": {
+        "sha256": "4fc8c35de590ab3e0f2a7f654bd4ae0e3eb0f872cbb01cfa6815ffc1dda758a1",
+        "mode": "100644"
+      },
+      "crates/daemon/src/render.rs": {
+        "sha256": "0102b29305ee934ee3f5fdc1b9642b28e227e4bb0fe0e93c13ad1a4c630727ef",
+        "mode": "100644"
+      },
+      "crates/daemon/src/render.rs.test": {
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "mode": "100644"
+      },
+      "crates/daemon/src/snapshot.rs": {
+        "sha256": "cb531ad9d559c4c38e00c7a76b940d7e5dde42a24b46def2e12653ec3e146245",
+        "mode": "100644"
+      },
+      "crates/diagnose/Cargo.toml": {
+        "sha256": "b9966f9eecd7e5d8381bf5da0e0a288e1bc536bc33fbe5dc7b9903a31ea8ae44",
+        "mode": "100644"
+      },
+      "crates/diagnose/src/lib.rs": {
+        "sha256": "7a8c92490814cb837adbf44379363b501f3827af13e3b7c83be72dfb8a3d6875",
+        "mode": "100644"
+      },
+      "crates/diagnose/src/tests.rs": {
+        "sha256": "ac37ad5313f937b34e2ff662bc87535b91b058603423d21092a3702a5bea4aaa",
+        "mode": "100644"
+      },
+      "crates/exec/Cargo.toml": {
+        "sha256": "e9316d2b3107b9780093ed4b3b46ba0b8870a260d1c9a45ebe89dc1188521b98",
+        "mode": "100644"
+      },
+      "crates/exec/src/derive.rs": {
+        "sha256": "195e77c59e597b647e01474c605e6c570bc095c402e283fd3b8898384bb76646",
+        "mode": "100644"
+      },
+      "crates/exec/src/host.rs": {
+        "sha256": "ae2c2fe5c68fff65e08e5a78fa35d15c6db846b6dd0c1dc630405a266d924339",
+        "mode": "100644"
+      },
+      "crates/exec/src/kani.rs": {
+        "sha256": "f80d531d4a09931da13f8c2cd6509cfae5ccbfb0d237a979416083156a837657",
+        "mode": "100644"
+      },
+      "crates/exec/src/lib.rs": {
+        "sha256": "3f37d188fcb4cd717b7bbd6f58373e589da51a8a85926992eda18bff39dec67c",
+        "mode": "100644"
+      },
+      "crates/exec/src/tests.rs": {
+        "sha256": "d9ceb89a598aabbada2b319cccb0a4569364fd8c4fe81a11f8aa58dd9cc0c69d",
+        "mode": "100644"
+      },
+      "crates/fake/Cargo.toml": {
+        "sha256": "94b802b7cbcbf81d3c2d0a5355b3a91a0985d174475b3aa2b000f1a483d0ac80",
+        "mode": "100644"
+      },
+      "crates/fake/src/fixtures.rs": {
+        "sha256": "b3e77fc873aa947a312805ddb0a057e55e9d02db4522d0377c0c658e16ccde3a",
+        "mode": "100644"
+      },
+      "crates/fake/src/lib.rs": {
+        "sha256": "0f0a9819313463a5a52a214890aead56a7f6318dded806ab4baab453cf411332",
+        "mode": "100644"
+      },
+      "crates/gym/Cargo.toml": {
+        "sha256": "d0f3cefe5518a8978f492ab712c1f493908be0950ddbd01d0c09b157cc58a25f",
+        "mode": "100644"
+      },
+      "crates/gym/catalog/phase-a-v4.4-draft.toml": {
+        "sha256": "fe5d07cbf4ca8ace9d988ad35b7eaf9426bb7f24d08f6c62a002a871c9b95d4b",
+        "mode": "100644"
+      },
+      "crates/gym/catalog/phase-a.toml": {
+        "sha256": "ae9df9ccbc9e06a4b0ea551a0ef54b3a91e0dafd1818489142a817208ccecab3",
+        "mode": "100644"
+      },
+      "crates/gym/demo.sh": {
+        "sha256": "0b76a6770aa4f58ae35577e005bc128b6973bf603bb5d4ac1e494b890220edf0",
+        "mode": "100755"
+      },
+      "crates/gym/src/check.rs": {
+        "sha256": "5f64c60351d47af3bbc8428b9c857b6e55df313757b30bb6bb04d8f5261b3143",
+        "mode": "100644"
+      },
+      "crates/gym/src/conformance.rs": {
+        "sha256": "0ec27f428b6f92f3d439e4b2c3d74a92d2ce07c7a7542883fb1269445b9467b7",
+        "mode": "100644"
+      },
+      "crates/gym/src/evidence.rs": {
+        "sha256": "d8bab6e3e4ce5aff474b687a2b934664dfc432d4c4967eab1bd07d0e8033c73e",
+        "mode": "100644"
+      },
+      "crates/gym/src/live.rs": {
+        "sha256": "f7b0b3cd146abf3b75f6f9ceb1cd2994906f0d3d37634905e0a2aae813afa077",
+        "mode": "100644"
+      },
+      "crates/gym/src/main.rs": {
+        "sha256": "5313384ffb97c4b11bb13a62346e03a78b82999bedb6d45b13363e329e97d9f0",
+        "mode": "100644"
+      },
+      "crates/gym/src/metrics.rs": {
+        "sha256": "ade7f7981183fb9e607c2e8ce951038e8af42b4522dc09826de37d5a69427c0a",
+        "mode": "100644"
+      },
+      "crates/gym/src/serve.rs": {
+        "sha256": "480222b2ceeafaad956bda331a18dc330c03807e1b16bb5171b1f762f330ee6d",
+        "mode": "100644"
+      },
+      "crates/gym/src/sim.rs": {
+        "sha256": "60106dd519b48a2d5b1b46a2a89b321221e0b261db843339e5bd8d416f3108e6",
+        "mode": "100644"
+      },
+      "crates/gym/src/tests.rs": {
+        "sha256": "37c8b207f43e7e04dde3a6eca4b6e3afd3f9fcfa9eeee6c59df451ee49840639",
+        "mode": "100644"
+      },
+      "crates/gym/src/verification.rs": {
+        "sha256": "b07e960e5736d588345c582288ade3b392cc6f4d88dfeba182bbd0bd53dd015d",
+        "mode": "100644"
+      },
+      "crates/incident/Cargo.toml": {
+        "sha256": "8f002c91eeaaabb60b528f7478db8521d2b038cdc3bbef0ceeaa70bd61209866",
+        "mode": "100644"
+      },
+      "crates/incident/src/lib.rs": {
+        "sha256": "225b0d3880132c05294408914622449f9847c2a56a97501856597a3ae7d891c8",
+        "mode": "100644"
+      },
+      "crates/incident/src/tests.rs": {
+        "sha256": "243f8d302d7f8ae38e1af150bf025aac0f1dd10f7a0fd70dc3869dc6f593d83e",
+        "mode": "100644"
+      },
+      "crates/intent/Cargo.toml": {
+        "sha256": "d59ebb3d7ab4361c191854ecf050f8bcea4c28fa2248009927fbfd7f33b416db",
+        "mode": "100644"
+      },
+      "crates/intent/src/lib.rs": {
+        "sha256": "2ffd7e8b17fd7c6c41c6184d98012892c1744b362ccc34ebe0fd5d101ae2b182",
+        "mode": "100644"
+      },
+      "crates/intent/src/tests.rs": {
+        "sha256": "fab96c489852db1edb51d9827882725963205b07cea8953980281261aa211003",
+        "mode": "100644"
+      },
+      "crates/ipc/Cargo.toml": {
+        "sha256": "f1e192915a4b0612c52961a3a196fe6cd0d1851e5ba5a1cf0cee5bddbc40a1f7",
+        "mode": "100644"
+      },
+      "crates/ipc/src/lib.rs": {
+        "sha256": "3894a6e259d8b9afcc0f9556adf8367f65c6707a6cbf0ee5b4a830afb26cdc1d",
+        "mode": "100644"
+      },
+      "crates/policy/Cargo.toml": {
+        "sha256": "6bf59fb54aeb56a5a3d89e7473086c30ba5360899288359ad5f3cbaca1eba0e7",
+        "mode": "100644"
+      },
+      "crates/policy/src/lib.rs": {
+        "sha256": "1bc36bd2164089a889421715e98ec16f050922d1bbe5ac12e8ae55792e71980c",
+        "mode": "100644"
+      },
+      "crates/policy/src/proofs.rs": {
+        "sha256": "41a9d7a49765f0ef18f2105e2641b0b7e31012025163c620a5b9ac39888af051",
+        "mode": "100644"
+      },
+      "crates/policy/src/tests.rs": {
+        "sha256": "32784c69f1b1edb2413e142e16a4caefb4bfa57a4749481c08834147b640f4a6",
+        "mode": "100644"
+      },
+      "crates/schema/Cargo.toml": {
+        "sha256": "dc7d8943495a5aa0c1fbc9f50c1bdfd1c16d713b7ce16de2e328cbfb4841c555",
+        "mode": "100644"
+      },
+      "crates/schema/src/authz.rs": {
+        "sha256": "aac9c054a706d81ce6c65a0005c740e45d1667bb1bf3db174d30fa4e6264bf11",
+        "mode": "100644"
+      },
+      "crates/schema/src/backend.rs": {
+        "sha256": "2693a4ebaefbb4c8adb32b4798f90e90041b3c01629df67cf198382480de62a4",
+        "mode": "100644"
+      },
+      "crates/schema/src/fixtures.rs": {
+        "sha256": "f6d9d714ddf933dbfbb096856c96a00da5682ffc30e3102a7ff1f793089433a5",
+        "mode": "100644"
+      },
+      "crates/schema/src/gc.rs": {
+        "sha256": "69794552d50de34122a281003e2e78eb85076621090f6667ac14b93f2c2a46b2",
+        "mode": "100644"
+      },
+      "crates/schema/src/ids.rs": {
+        "sha256": "d7136d022fcb89ea947df023bfd704b05c89f8c85c0c1c0302980499b2c66d1d",
+        "mode": "100644"
+      },
+      "crates/schema/src/lib.rs": {
+        "sha256": "6119b55d820572b47e640090d7318aca7154a5f2c6875bca18949ee56c8c0b54",
+        "mode": "100644"
+      },
+      "crates/schema/src/pathmap.rs": {
+        "sha256": "fcda350f4c23a5695e5eb57bc9fc3a62de642c428c21a0047ad4a3bcfafb87d0",
+        "mode": "100644"
+      },
+      "crates/schema/src/spec.rs": {
+        "sha256": "2ac02a8176b3da7ade7a796ba91e113170d6b4ece000971fdae63dc9cc4ef584",
+        "mode": "100644"
+      },
+      "crates/schema/src/state.rs": {
+        "sha256": "14e443d5353b4a1e16cc7fec01f1ed53222a437ee89985c823ead8093388cd30",
+        "mode": "100644"
+      },
+      "crates/schema/src/transition.rs": {
+        "sha256": "bacbcf6708c671aa44648fdf4e1773a7554ba955dae01baacfd32813f4517256",
+        "mode": "100644"
+      },
+      "crates/schema/src/txn.rs": {
+        "sha256": "41920eaeaa08b2f36d98492da1cd1a82147fd4a37020fe0412552a152741e5c2",
+        "mode": "100644"
+      },
+      "crates/schema/src/unit.rs": {
+        "sha256": "0259ced87bb0a674f81364bb618bc878143111f9e863ff4ce955c10b0414a8ab",
+        "mode": "100644"
+      },
+      "crates/state/Cargo.toml": {
+        "sha256": "5c29ac2e43d9cf8b9d0b77f36f101a8317868a9e539656700929215a5253be57",
+        "mode": "100644"
+      },
+      "crates/state/src/lib.rs": {
+        "sha256": "3f702a21981deca237e18ecfa8c76f16e83ab115ed9f7f2b4474fc541f0d2d3b",
+        "mode": "100644"
+      },
+      "crates/state/src/tests.rs": {
+        "sha256": "a4c53b74d8bdec9392c03d08c4ad129a860003790fc4d3913dca076bc009d1e6",
+        "mode": "100644"
+      },
+      "crates/tray/Cargo.toml": {
+        "sha256": "f9faac20230a847a355d30dd3669c777da27afee3761e7d125ac8108095786f4",
+        "mode": "100644"
+      },
+      "crates/tray/src/icon.rs": {
+        "sha256": "a0a563fb5b0066862d22f4829d3341c20617c40b6d36e24e8736cb1123d4d1bf",
+        "mode": "100644"
+      },
+      "crates/tray/src/main.rs": {
+        "sha256": "a39d9496cfe1175230d01c942d406d509f3eee7eb65df86bd8241bee90b913cc",
+        "mode": "100644"
+      },
+      "crates/tray/src/state.rs": {
+        "sha256": "cd9afe10952f241e77610d19a9bff99cde3f9e64e1861bfb46f32408ba409eb9",
+        "mode": "100644"
+      },
+      "crates/txn/Cargo.toml": {
+        "sha256": "1fc47460fc19c380c93e6bb52071f8ff33f8e11a9f85a6454605dead1705b50d",
+        "mode": "100644"
+      },
+      "crates/txn/src/chain.rs": {
+        "sha256": "a1fcf4887a4468d18a107d1b7a029dba2f476642444b02bcc2df9a1a30adc6d6",
+        "mode": "100644"
+      },
+      "crates/txn/src/fake.rs": {
+        "sha256": "0ff36f5bc57d5e5bc47746884eab3634837f9bf7182dc304cda41d7e2dfa1a20",
+        "mode": "100644"
+      },
+      "crates/txn/src/journal.rs": {
+        "sha256": "7b97c3eec595e7df8bad78ecd5e3994d65aa3452ac6d9a80aeb04306023aa869",
+        "mode": "100644"
+      },
+      "crates/txn/src/kani.rs": {
+        "sha256": "72798726d770fbe7b20e0034c7f6410b6e1dcda7da413ef48c211b76f090dc7e",
+        "mode": "100644"
+      },
+      "crates/txn/src/kernel.rs": {
+        "sha256": "f728b18c9ddd9ee36842fe3a928605496943dcf413cab626776a7ad7718e3099",
+        "mode": "100644"
+      },
+      "crates/txn/src/ledger.rs": {
+        "sha256": "a08796800b619c510c188599ae360d17396d09d5e114ce1127c7925e0404406b",
+        "mode": "100644"
+      },
+      "crates/txn/src/lib.rs": {
+        "sha256": "4b16ca19c125b5ee90541ea35f2b8cca2eb26d0a711992a93e82f678d40bf697",
+        "mode": "100644"
+      },
+      "crates/txn/src/machine.rs": {
+        "sha256": "174d06028aba4bc600f8d917870107be526f99e85e6e46eb3c4c4999ee44a2a1",
+        "mode": "100644"
+      },
+      "crates/txn/src/store.rs": {
+        "sha256": "c4fe404309c385e5548b8f2545bf8bd280c753486712d975e1089c7825c355a7",
+        "mode": "100644"
+      },
+      "crates/txn/tests/common/mod.rs": {
+        "sha256": "3b51da039467130d3d372b903d455e517cbbc4a98fa3999e0d4f8ee0927ff3da",
+        "mode": "100644"
+      },
+      "crates/txn/tests/journal.rs": {
+        "sha256": "bca0b19120854ae9ecd09f07b6dcd94dad8d17704d47deb63faf6ba176b9fae5",
+        "mode": "100644"
+      },
+      "crates/txn/tests/kernel.rs": {
+        "sha256": "931887d07760609612af951764fddea2b56c0100651bf8853f5194ab005947a2",
+        "mode": "100644"
+      },
+      "crates/watchdog/Cargo.toml": {
+        "sha256": "b74664b751bf0c1d85924376d30701b0a9baa19cb2cde403771477af2abaf7ba",
+        "mode": "100644"
+      },
+      "crates/watchdog/src/main.rs": {
+        "sha256": "e071a512460ef77eebb2a1db78fe54ea160b1aa028f03e9cfff576e6f1d39262",
+        "mode": "100644"
+      },
+      "docs/AGENTS.md": {
+        "sha256": "6e32661426720f216a42274aa07417596c524e129ccfefb4ed87feccd91aab5a",
+        "mode": "100644"
+      },
+      "docs/SPEC.md": {
+        "sha256": "6852536a6609504af603af491d8422274aa41afc1a509506ead564348169cf7f",
+        "mode": "100644"
+      },
+      "docs/acceptance-waivers.toml": {
+        "sha256": "d7fe9b8ed041b5b892b032990d400c633ee6ecae219049045a200cd6038d5c21",
+        "mode": "100644"
+      },
+      "docs/assumptions.md": {
+        "sha256": "0a72d903f37b1c99cdda759da6ad2255bea290c805366d3aa1dbcaa51ff9a034",
+        "mode": "100644"
+      },
+      "docs/bypasses.md": {
+        "sha256": "fb19d5a9ef923e166322bbc8b2296f969747b26765184d7637a621effc6a8cf4",
+        "mode": "100644"
+      },
+      "docs/catalog-review.md": {
+        "sha256": "e1bb80feed4e0d6499fe475a0e6c09394689acace86f26dfa157ba58ee798947",
+        "mode": "100644"
+      },
+      "docs/deviations.md": {
+        "sha256": "9213ff7a2dca4011c2bc856baa106c4537f95ac4f097037a110f75b38c155948",
+        "mode": "100644"
+      },
+      "docs/future-work.md": {
+        "sha256": "9d7adeb4e9292332d740ef0d380d6204601683ee2dffb17c5da433040c72e19d",
+        "mode": "100644"
+      },
+      "docs/ga-status.md": {
+        "sha256": "e48f033374c9ef948d33ccf1180c336984234dcb0d25bacd881c942fb4a1402d",
+        "mode": "100644"
+      },
+      "docs/guarantees.md": {
+        "sha256": "5032ff620a4c97d85d50103eb195a3f2fc61b1ba06df7ffeba0ebbf98a22ff0a",
+        "mode": "100644"
+      },
+      "docs/pins.md": {
+        "sha256": "78334f5d904e414f630cf946ceb8302b3ebcc5e6bee38aa201aa25ca175acb9a",
+        "mode": "100644"
+      },
+      "docs/planarian-os.md": {
+        "sha256": "32a38b1df04443ef028027efafb2855fc07b3b82b7fccab791b989432df8c4ae",
+        "mode": "100644"
+      },
+      "docs/proof-obligations.toml": {
+        "sha256": "6a53346629ddb3b3e5cf5055450a97813334a16382288f03a4800744c5fd590d",
+        "mode": "100644"
+      },
+      "docs/shared-core-acceptance-tooling.md": {
+        "sha256": "1396e26fce3da0c412f36313c80b0b3a668ec026ee7c56ce12da3df7edee79e5",
+        "mode": "100644"
+      },
+      "docs/shared-core-performance-plan.md": {
+        "sha256": "3733f777c7d6feea40eb1cc653bf8ce436f0886b54bac0b2f6d0c4a7762e6a14",
+        "mode": "100644"
+      },
+      "docs/verification-ratio.toml": {
+        "sha256": "90d8c153f21c1bc3be17efa3f3430f657f356ee7dd5c03a21dbc34c11c4f3898",
+        "mode": "100644"
+      },
+      "docs/verification.md": {
+        "sha256": "60cf3139a9f94fd6df1dedbfe630ef02aeb3cdb524802906eb18ec83ccbbeb6c",
+        "mode": "100644"
+      },
+      "flake.lock": {
+        "sha256": "fd60c7c407e71e8b92d0667c780294c9cc2ac3bc3596a0a89a67b272724b57fd",
+        "mode": "100644"
+      },
+      "flake.nix": {
+        "sha256": "2756c1e6c5988c28e117388909be77f3b2ca89e97fd470c52c39ed9fc0793c73",
+        "mode": "100644"
+      },
+      "nix/console.nix": {
+        "sha256": "deaef7fed18543012a5f086101080ab7da17e1fea0ff811d82f94ada76ae39fa",
+        "mode": "100644"
+      },
+      "nix/demo/common.nix": {
+        "sha256": "2f7d265a9ef1bba6d72545fd93defe9e8b250cf3c015276657a54a54f323398a",
+        "mode": "100644"
+      },
+      "nix/firecracker.nix": {
+        "sha256": "a275ff61f997649a16e778e1c8473839efab70c6197e6e0c0963c7e30717ad89",
+        "mode": "100644"
+      },
+      "nix/gym/acceptance.py": {
+        "sha256": "c930a80ec31acf5f840e5459ebc74118f9b68a930dbfde9f0839ec2dcd328d34",
+        "mode": "100644"
+      },
+      "nix/gym/manifest.py": {
+        "sha256": "4ca6afb7bd15dd980f13c32065a0c3184dab168489c87cac9fef6466c3e94bc8",
+        "mode": "100644"
+      },
+      "nix/gym/performance.py": {
+        "sha256": "35c3bd91caa065bee5e4b2a7da94f3a0b5da65f664e836ba52a4d877d3b6c935",
+        "mode": "100644"
+      },
+      "nix/gym/proofs.py": {
+        "sha256": "096bddfbd28d279d57591d4affa63698da48732c13033f59cd38dbb11695683d",
+        "mode": "100644"
+      },
+      "nix/gym/run-fake.sh": {
+        "sha256": "1727f4d3a529a2348ee7f0fa21e4aa5a307ca010dd9f3c351ee146be807eefc8",
+        "mode": "100644"
+      },
+      "nix/gym/run-vm.sh": {
+        "sha256": "705a22e9a6b346e7c6e0364acb25b94729e9461d1d845ea2703b287f66c2605f",
+        "mode": "100755"
+      },
+      "nix/gym/test_acceptance.py": {
+        "sha256": "797c3eaf153d3df843196daa476d22ed76b5d724aa7589ae63c79e16c06eb304",
+        "mode": "100644"
+      },
+      "nix/gym/test_manifest.py": {
+        "sha256": "01e2659fe87346983c5b9f5b97c30cdfc00b0c0532d66af9f70eb62121921bf5",
+        "mode": "100644"
+      },
+      "nix/gym/test_performance.py": {
+        "sha256": "cf561721e0ffabf8fd326ffc321565689c1f5b16c6c4c04ccefb3adafd81b878",
+        "mode": "100644"
+      },
+      "nix/gym/test_proofs.py": {
+        "sha256": "868b53e24b72664c2d569a5f5d1dc46ed3888c82465b100f0e7ce6403ad8fd2a",
+        "mode": "100644"
+      },
+      "nix/installer/default.nix": {
+        "sha256": "f6b270c23d8dfb2b04d3be15db7318ae538c16bc7caa87f0b53d7afcaff8986e",
+        "mode": "100644"
+      },
+      "nix/installer/planarian-install.sh": {
+        "sha256": "80e9df9f252abfc44476420c2f35ec06619616cae1138698986edd2dafe9a770",
+        "mode": "100644"
+      },
+      "nix/live/iso.nix": {
+        "sha256": "6cee47d624d4036c33fb08af8c846ca8289e235acaff56ce4de95e8ff1161a2e",
+        "mode": "100644"
+      },
+      "nix/module.nix": {
+        "sha256": "75a5b2ffe81cbde4e03b9843fbcdfc05e1d93dc5d89b35ccb9cd8eafdd9b9ac8",
+        "mode": "100644"
+      },
+      "nix/package.nix": {
+        "sha256": "42de4731e7bfd7785f1fbba02b150c24543c981d76984bcc69acc9678dbde4b9",
+        "mode": "100644"
+      },
+      "nix/posture.nix": {
+        "sha256": "cfa539b77cf483d29b9053ce617270823aab98e40426ca4cfdc7bff23c24154a",
+        "mode": "100644"
+      },
+      "nix/reference.nix": {
+        "sha256": "18da141e3a32e9cc9fb99167570810390fa3a349139a05bc4cdc277a72d85634",
+        "mode": "100644"
+      },
+      "nix/template/README.md": {
+        "sha256": "2a71bfcc8eb050adb29d9fedbf9b0169dbb8be9dc63a3b691fa8513f7d7a64f5",
+        "mode": "100644"
+      },
+      "nix/template/configuration.nix": {
+        "sha256": "57febc198ac1ffb92b480ff9059303f988f33392c5927f5e11b7fc657d05659e",
+        "mode": "100644"
+      },
+      "nix/template/flake.nix": {
+        "sha256": "5d0d565e7ed9b0e6bd1a9459ce2cb630b364293fa9ab228a9709a8c5c470a50e",
+        "mode": "100644"
+      },
+      "nix/template/planarian/overrides.nix": {
+        "sha256": "b326506a0d9c90a00f10277418466b9a592d3ea108ce833904bb623929aad621",
+        "mode": "100644"
+      },
+      "nix/tests/bench.nix": {
+        "sha256": "3682473afb5a3149c16d305deb36c09c01ee1b43d592311e9bc0af123bfff3ac",
+        "mode": "100644"
+      },
+      "nix/tests/boot-entries.nix": {
+        "sha256": "ba0e6848dc01d95fc399a849b97c73b7ecb72fe03a16a29a1ad17312258fe89b",
+        "mode": "100644"
+      },
+      "nix/tests/boundaries.sh": {
+        "sha256": "91aa621bc04121c7fc6cd27e9261b0ad562f61296095d38f9a265c4d6e9e38fc",
+        "mode": "100755"
+      },
+      "nix/tests/eval.nix": {
+        "sha256": "53bb6c460625bb85c93621713f6b18686224833b944c5d4ec1f2facc4b835df8",
+        "mode": "100644"
+      },
+      "nix/tests/gym-modules-new/module.nix": {
+        "sha256": "fdef469cd6d268eef737a6626b4ad3f65feca42bb17436e2df33703d4563dc1a",
+        "mode": "100644"
+      },
+      "nix/tests/gym-modules-new/service.nix": {
+        "sha256": "9169dfefa14551fae4efd754d39f62ede7b09bf1204064669c5d30b644946dfc",
+        "mode": "100644"
+      },
+      "nix/tests/gym-modules-old/module.nix": {
+        "sha256": "7d6eabaf69e41120831c5958bc09ecb1d667e195598c896d950955304fd94758",
+        "mode": "100644"
+      },
+      "nix/tests/gym-payload.nix": {
+        "sha256": "f98efc9116ed98600d98e90e251e61fbfed04382c884ad4d1f505dba4ced39e7",
+        "mode": "100644"
+      },
+      "nix/tests/gym-vm.nix": {
+        "sha256": "b6c617ba7927dd73c516e365291056efe58906f63e07ff564de0bf2f0addd1d6",
+        "mode": "100644"
+      },
+      "nix/tests/installer.nix": {
+        "sha256": "57a5fb396089536b8a585ed3ea18ef20fe0a361b2c2e849f7db72e0476fd6bd5",
+        "mode": "100644"
+      },
+      "nix/tests/posture.nix": {
+        "sha256": "03c1f6ef7f2f330b1f7d3fab1c5b68685198ef05f5a1d8b0d1c1cae9ef3352ca",
+        "mode": "100644"
+      },
+      "nix/tests/verus.nix": {
+        "sha256": "2faadfabe005d2fadebdd15c1caf1a84ff01dd4f65f9bbc1ebe422efed75b5e4",
+        "mode": "100644"
+      },
+      "nix/tests/vm-generations.nix": {
+        "sha256": "3fd96fa024ea9c93ffb28be94529b77d4cfb9b0a2bf6f76b9aa6f5a9a2451179",
+        "mode": "100644"
+      },
+      "nix/tests/vm.nix": {
+        "sha256": "8cf6941681b94d838a5d8143157e1847b7a99ae381e419a00bb03b702645299a",
+        "mode": "100644"
+      },
+      "nix/verus.nix": {
+        "sha256": "0edd645f0e3295ed30b42ea6c281ba1b9f4b8bb0c0b1c67e025ea3a2af7bdcd0",
+        "mode": "100644"
+      },
+      "nix/vm/machine.nix": {
+        "sha256": "b0d9a6f7b72318f48163c1490f669187696f828063c07041dcc95576322f585f",
+        "mode": "100644"
+      },
+      "rust-toolchain.toml": {
+        "sha256": "12dc5d64dbd96c1b07be2943241d52d9f6127a79ba47a820455ba7b873fc896a",
+        "mode": "100644"
+      },
+      "share/canonical.json": {
+        "sha256": "08033b32d10771ac926a15b5a83f65dbc6ba05bfc1a25340059b76964001221e",
+        "mode": "100644"
+      }
+    },
+    "scope": "implementation, fixtures, assets, build/CI inputs and governing docs; explicitly named evidence docs excluded"
+  },
+  "catalog_sha256": "ae9df9ccbc9e06a4b0ea551a0ef54b3a91e0dafd1818489142a817208ccecab3",
+  "waivers_sha256": "d7fe9b8ed041b5b892b032990d400c633ee6ecae219049045a200cd6038d5c21",
+  "catalog_id_count": 126,
+  "roles": {
+    "repair": 20,
+    "intent": 13,
+    "must-pass": 93
+  },
+  "harness_acceptance_complete": {
+    "bench": false,
+    "fake": false,
+    "vm": false
+  },
+  "catalog_acceptance_complete": false,
+  "acceptance_complete": false,
+  "findings": [
+    {
+      "id": "R01",
+      "status": "fixed by this PR",
+      "requirement": "\u00a712/I6/I15",
+      "code": "crates/txn/src/kernel.rs:run_boot_only/reconcile_boot_publication; schema txn; watchdog",
+      "regression": "boot_publication_crash_boundaries_remain_tracked_for_both_owners; partial_unknown_and_failed_boot_publication_reconcile_actual_effects; boot_publication_interlock_preserves_candidate_roots_on_disk; withdrawal_effects_with_failed_partial_or_lost_replies_remain_interlocked; fake withdrawal Partial/Unknown/Fenced conformance",
+      "before": "Built publication could mutate before tracked state",
+      "after": "PublishingBoot precedes intent/call; unknown boot/selection interlocks with candidate/root/fallback; old publication intent reconciles",
+      "evidence_type": "Source + authored UNRUN regressions",
+      "remaining": "Installed-entry VM crash matrix, actual ext4/btrfs execution and powered failure evidence still required",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "R02",
+      "status": "fixed by this PR",
+      "requirement": "\u00a712e/I16",
+      "code": "crates/txn/src/kernel.rs:write_committed; exec/lib.rs; watchdog",
+      "regression": "every_generation_completion_establishes_the_same_floor; completion_crashes_and_torn_floor_or_commit_writes_preserve_the_obligation; a_fenced_completion_cannot_write_global_floor_or_baseline_records",
+      "before": "Daemon best-effort floor followed Committed; watchdog/boot-only omitted it",
+      "after": "Versioned durable intent; fenced serialized floor/LiveTested precede Committed, interrupted completion remains obligated",
+      "evidence_type": "Source + authored UNRUN regressions",
+      "remaining": "Actual proofs/daemon/watchdog/restart/boot-only fault runs; historical terminal facts require administrator migration, not inference",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "R03",
+      "status": "fixed by this PR",
+      "requirement": "\u00a711/I21",
+      "code": "crates/exec/src/derive.rs",
+      "regression": "stopped_override_has_the_same_effects_and_floor_as_a_stop",
+      "before": "Stopped override erased disruption/dependents",
+      "after": "Equivalent stop effects share floors; LeaveAlone remains nonactuating",
+      "evidence_type": "Source + authored UNRUN regression",
+      "remaining": "Run local/SSH/multiuser cases and actual display/network consequences",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "R04",
+      "status": "fixed by this PR",
+      "requirement": "\u00a79/\u00a711/I14",
+      "code": "crates/exec/src/lib.rs:plan_existing/revalidate_activation; backend-linux/nixos.rs",
+      "regression": "existing_generation_derives_activation_and_override_configuration; changed_activation_preflight_is_rejected_before_execution",
+      "before": "Existing targets used manifests without actual activation/config differences",
+      "after": "Target-bound preflight/override identity; execution revalidates base and activation evidence; Unknown rejects",
+      "evidence_type": "Source + authored UNRUN regressions",
+      "remaining": "Run equal-UnitDefs changed-content NixOS VM cases; unmodeled discovery/historical target evidence fails closed",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "R05",
+      "status": "fixed by this PR",
+      "requirement": "\u00a712d/I20/owner agent decision",
+      "code": "crates/backends/linux/src/systemd.rs; nix/posture.nix; daemon AgentRun",
+      "regression": "launcher_units_are_externally_supervised_and_bounded; admission_counts_starts_and_preserves_root_capacity; nix/tests/posture.nix public launches; sequential failed/short-lived launch quota and registry replay/compaction/historical-integrity cases",
+      "before": "Transient agents escaped static agentUnits posture list",
+      "after": "Readiness-bound bounded slice; failure marker before slice stop; per-user/global counts and root launch slots; failed start cannot reattribute; durable distinct names32/nonroot64/root256total32rootreserve, same-owner reuse deduplicates registry while journaling every launch; historical last-owner semantics retained after checksum verification",
+      "evidence_type": "Source + authored UNRUN unit/VM regressions",
+      "remaining": "Run actual systemd Absent/Crashed/Integrity/recovery/resource limits; proposed numerical/name-lifecycle refinements await owner review",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "R06",
+      "status": "fixed by this PR",
+      "requirement": "\u00a710 bounded total probe lifetime",
+      "code": "crates/backends/linux/src/probe.rs; cmd.rs",
+      "regression": "trickling_http_has_one_total_deadline; resolver_process_is_cancelled_inside_the_total_deadline; inherited_output_pipe_is_inside_the_deadline",
+      "before": "DNS escaped timeout; per-read HTTP deadlines reset; inherited pipes could stall cleanup",
+      "after": "Cancellable resolver/process groups, one network deadline, bounded batches/workers/output, no detached resolver thread",
+      "evidence_type": "Source + authored UNRUN regressions; getent CLI syntax only",
+      "remaining": "Run blocked DNS/connect/write/trickle/resource accounting with measured scheduling margin; responsive local filesystem/kernel remains platform assumption",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "R07",
+      "status": "fixed by this PR",
+      "requirement": "\u00a712 checking/I10",
+      "code": "crates/exec/src/host.rs; schema CheckContext; watchdog",
+      "regression": "mixed_baselines_preserve_each_passing_probe_through_replay; missing_stale_timeout_error_and_old_pass_are_not_preservation_evidence; authorized_removal_changes_applicability_but_probe_removal_does_not",
+      "before": "Aggregate Degraded/Unknown omitted individual passing evidence",
+      "after": "Versioned durable applicable passing probe definitions independently preserved, requiring fresh new Pass",
+      "evidence_type": "Source + authored UNRUN regressions",
+      "remaining": "Run replay/watchdog cases and real canonical checks; authorized applicability changes distinct from weakening",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "R08",
+      "status": "fixed by this PR",
+      "requirement": "\u00a713 authorized incident control",
+      "code": "crates/daemon/src/core.rs release handlers",
+      "regression": "denied_release_preserves_incident_and_linked_overrides",
+      "before": "Denied release still replenished incident/released linked overrides",
+      "after": "Effects follow successful durable authorized LiftOverride only",
+      "evidence_type": "Source + authored UNRUN regression",
+      "remaining": "Run full incident budget/cooldown/state comparison and successful release control",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "R09",
+      "status": "fixed by this PR",
+      "requirement": "\u00a711 authenticated admission",
+      "code": "crates/exec/src/lib.rs admission/prebuild_job; daemon/core.rs/main.rs queue",
+      "regression": "unauthorized_catalog_change_does_no_expensive_work; deferred_catalog_work_authenticates_before_staging; expensive_work_is_bounded_per_principal_with_admin_reserve",
+      "before": "Valid unauthorized catalog requests staged/built before authorization",
+      "after": "Cheap authenticated capability/argument admission; bounded attributed queue, admin reserve, full post-build policy retained",
+      "evidence_type": "Source + authored UNRUN regressions",
+      "remaining": "Run actual stage/evaluate/build call counts/load; AskFirst remains admitted for authorized proposals",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "R10",
+      "status": "fixed by this PR",
+      "requirement": "\u00a79 trustworthy risk evidence",
+      "code": "crates/backends/linux/src/nixos.rs:checked_dry_activate",
+      "regression": "discovery_checks_real_command_exit_timeout_and_protocol",
+      "before": "Discovery ignored actual failure/timeout/incomplete output",
+      "after": "Reject nonzero/timeouts/capped/malformed/incomplete/unmodeled discovery before optimistic activation",
+      "evidence_type": "Source + authored UNRUN actual-command regression",
+      "remaining": "Run actual pinned NixOS backend/VM; NixOS own child-script honesty remains explicit trust boundary",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "R11",
+      "status": "blocked",
+      "requirement": "\u00a79/I23",
+      "code": "crates/backends/linux/src/nixos.rs:swap_override_after_comparison",
+      "regression": "demonstrates_unclosed_arbitrary_editor_override_replacement_bypass",
+      "before": "Check-then-rename is not arbitrary-editor CAS",
+      "after": "No false closure: race characterization covers FD/rename editors and promotion/restoration; B-20 remains open",
+      "evidence_type": "Source + authored UNRUN negative characterization",
+      "remaining": "Requires enforceable exclusive writer profile or explicit owner adoption of a justified narrower contract; advisory locking/mode bits alone do not suffice",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": null,
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "R12",
+      "status": "fixed by this PR",
+      "requirement": "\u00a715 verdict integrity",
+      "code": "nix/gym/run-vm.sh; acceptance.py; nix/tests/gym-vm.nix",
+      "regression": "test_acceptance.py actual runner failing-build/status/coverage cases",
+      "before": "Nix eval success + all builds fail returned zero; missing/duplicate/bad verdict ignored",
+      "after": "Build/step/judge errors propagate; exact derived expected IDs/roles; stale results cleared",
+      "evidence_type": "Executed local shell/Python regression + pre-fix counterfactual",
+      "remaining": "Current complete Nix VM catalog still unrun; baseline script failed all seven injected negative assertions, fixed runner rejects them",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false,
+      "local_accounting_evidence": "docs/evidence/shared-core-local/receipt.json"
+    },
+    {
+      "id": "R13",
+      "status": "open",
+      "requirement": "\u00a721 resource/performance acceptance",
+      "code": "nix/tests/bench.nix; nix/gym/performance.py",
+      "regression": "test_performance.py; installed metric helper CPU-load subtest",
+      "before": "MainPID counters missed helpers; one-second min FPS falsely used as frame p99",
+      "after": "Whole-cgroup CPU/memory and actual frame-only metrics prepared; physical input interface/plan; no desktop measurement invented; persistent monitor-owned-work slice includes transient probe/Nix/posture helpers; shared service/frontend exclusions explicit",
+      "evidence_type": "Source + local Python metric regressions (see report)",
+      "remaining": "Reference hardware, measured input latency, full personal-profile repetitions and proposed practical margin adoption remain outstanding",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": null,
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false,
+      "local_accounting_evidence": "docs/evidence/shared-core-local/receipt.json"
+    },
+    {
+      "id": "R14",
+      "status": "fixed by this PR",
+      "requirement": "\u00a717a proof integrity/ratchet",
+      "code": "nix/gym/proofs.py; gym/verification.rs; docs/proof-obligations.toml",
+      "regression": "test_proofs.py duplicate/deleted/conditional/unverified names and stale/failed receipts",
+      "before": "Name/count presence could discharge removed or unverified properties",
+      "after": "Unique source/engine mapping + complete successful current-source receipts; preserve baseline invariant set and 47:56 denominator",
+      "evidence_type": "Executed local Python accounting controls; source map only",
+      "remaining": "Actual Verus/Kani runs unrun; proposed proof map requires review; synthetic verifier logs are accounting controls, not proofs",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false,
+      "local_accounting_evidence": "docs/evidence/shared-core-local/receipt.json"
+    },
+    {
+      "id": "R15",
+      "status": "fixed by this PR",
+      "requirement": "\u00a715 role-qualified coverage",
+      "code": "nix/gym/acceptance.py/run-fake.sh; gym/main.rs; workflows",
+      "regression": "test_acceptance.py required Unsupported/omission/waiver/exit negatives",
+      "before": "Applicable required coverage silently disappeared as Unsupported",
+      "after": "Exact current id/harness/role and explicit reviewed expiring waivers; no blanket Unsupported acceptance",
+      "evidence_type": "Executed local Python/shell controls",
+      "remaining": "No waivers adopted; full current fake/VM/bench catalog and required critical PR checks must pass",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false,
+      "local_accounting_evidence": "docs/evidence/shared-core-local/receipt.json"
+    },
+    {
+      "id": "R16",
+      "status": "fixed by this PR",
+      "requirement": "\u00a718 documentation/evidence",
+      "code": "docs/SPEC.md; AGENTS.md; deviations/guarantees/ga-status/bypasses/verification",
+      "regression": "nix/gym/manifest.py; test_manifest.py; reconciliation and source fingerprint",
+      "before": "Historical/mixed results and narrower proofs overstated current closure",
+      "after": "One authoritative proposed contract; historical evidence labeled; current acceptance manifest leaves unrun gates open",
+      "evidence_type": "Source + executed local manifest-accounting controls",
+      "remaining": "Normative amendments remain proposed; final candidate tests/proofs/VM evidence and R11/GC/S01-S02 closure required",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false,
+      "local_accounting_evidence": "docs/evidence/shared-core-local/receipt.json"
+    },
+    {
+      "id": "S01",
+      "status": "open",
+      "requirement": "\u00a712e/I1/I16",
+      "code": "txn automatic_target_eligible; Linux boot publication/default; installed-entry target",
+      "regression": "failed_boot_only_generation_uses_floor_eligible_fallback_not_old_known_good; no_floor_eligible_automatic_boot_target_refuses_before_publication; nix/tests/boot-entries.nix installed UEFI/systemd-boot boundary/confirmation/failure-interval matrix (UNRUN)",
+      "before": "Live/watchdog/boot selection eligibility not unified",
+      "after": "Proposed single eligibility rule: recoverable trusted target >= current floor; manual below-floor known_good remains menu-only; no target -> admin recovery",
+      "evidence_type": "Source + authored UNRUN regressions",
+      "remaining": "Complete initrd/bootloader enforcement and installed-entry failure evidence remain open; preserve manual fallback distinction",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": null,
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "S02",
+      "status": "open",
+      "requirement": "\u00a710/\u00a712d readiness milestones",
+      "code": "daemon READY path; Core boot_confirmation; txn await_boot; installed-entry target",
+      "regression": "healthy early-ready/later-confirmation and failed-candidate installed-entry cases; nix/tests/boot-entries.nix installed UEFI/systemd-boot boundary/confirmation/failure-interval matrix (UNRUN)",
+      "before": "Boot confirmation and early ready were inconsistently summarized",
+      "after": "Existing early READY retained; checked commit/live_tested separated from later ten-minute known_good; proposed normative alignment",
+      "evidence_type": "Source; existing behavior reconciled",
+      "remaining": "Owner adoption and real installed-entry failure-between-milestones evidence required",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": null,
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "S03",
+      "status": "blocked",
+      "requirement": "\u00a712f/G1 conditional liveness",
+      "code": "txn Built/AwaitingBoot recovery; SPEC parking contract",
+      "regression": "intentional_boot_parking_has_no_forced_reboot_or_untracked_cancellation; interrupted_withdrawal_never_claims_the_boot_candidate_untracked",
+      "before": "No stated progress assumptions for intentional parked work",
+      "after": "Proposed explicit external-window/operator-reboot assumptions; no forced progress/cancellation of published obligation",
+      "evidence_type": "Source + authored UNRUN regressions",
+      "remaining": "Proposed G5 adds one counted progress assumption: current support47:57/trust38 vs unchanged baseline47:56/trust37; ratchet must reject until explicit owner contract/baseline decision. Long foreground/deferred reboot/restart/withdrawal regressions remain UNRUN.",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": null,
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "S04",
+      "status": "already fixed with evidence",
+      "requirement": "\u00a711/I19 root-only independent approval",
+      "code": "policy::may_approve; daemon approve terminal check; exec workflow",
+      "regression": "root_proposals_require_resubmission_by_an_independent_administrator; existing no-self-approval/terminal cases",
+      "before": "Root-only proposer cannot self-approve; another admin cannot approve original root request",
+      "after": "Preserve authority; document nonroot authorized admin fresh proposal/root approval; agent shares user principal",
+      "evidence_type": "Source at 805cd1c + authored UNRUN workflow regression",
+      "remaining": "Root-only install limitation/manual physical recovery remains explicit; no account creation or approval broadening",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "S05",
+      "status": "fixed by this PR",
+      "requirement": "\u00a710 session applicability",
+      "code": "state::Assembler::defs; SessionInfo; Linux logind",
+      "regression": "ssh_and_tty_logins_do_not_create_compositor_expectations; locked_and_inactive_graphical_sessions_keep_their_own_readiness; desktop_eligibility_requires_graphical_type_and_live_lifecycle",
+      "before": "SSH/TTY authentication created desktop deadlines",
+      "after": "Separate authenticated user services from local graphical x11/wayland active/online sessions; missing type defaults false",
+      "evidence_type": "Source + authored UNRUN regressions",
+      "remaining": "Run greeter/locked/closing/two-session VM evidence; fixture stand-in is not COSMIC performance",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "S06",
+      "status": "fixed by this PR",
+      "requirement": "\u00a710/\u00a713 external-outage guarantee",
+      "code": "diagnose external dependency safety guard",
+      "regression": "weak_external_diagnostic_dependency_blocks_local_repair_on_http_503; timed_out_external_dependency_stays_unknown_and_does_not_trigger_local_repair; external_wants_and_ordering_do_not_become_functional_prerequisites",
+      "before": "Weak external Diagnostic edge could allow local restart/rollback during outage",
+      "after": "Explicit external Diagnostic/Requires readiness veto separate from explanation confidence; Wants/Ordering unchanged",
+      "evidence_type": "Source + authored UNRUN regressions",
+      "remaining": "Honest dependency metadata required; run actual HTTP503/Timeout VM cases and adopt proposed contract",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "S07",
+      "status": "already fixed with evidence",
+      "requirement": "\u00a711/\u00a712c approval restart",
+      "code": "Executor::new/parked maps; checkpoint Ledger; approve TokenUsed; SPEC",
+      "regression": "unused_approval_does_not_survive_restart_or_compaction; consumed_approval_replay_protection_survives_restart_and_compaction; approval_consumption_write_failure_keeps_execution_parked",
+      "before": "Implementation already discarded unused approvals; docs claimed persisted/rebound authority",
+      "after": "Align volatile unused approvals; preserve consumed-token protection and authorized recovery; fix TokenUsed write failure; include Checking/PublishingBoot",
+      "evidence_type": "Source at 805cd1c plus source fix and authored UNRUN regressions",
+      "remaining": "Run expiry/restart/replay/live recovery/historical fixtures; proposed contract adoption remains pending",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "P09",
+      "status": "fixed by this PR",
+      "requirement": "\u00a710/\u00a712c signed prefix",
+      "code": "txn::Journal::verified_snapshot; daemon hooks/Core cache",
+      "regression": "the_signature_covers_the_head_sequence_and_checkpoint; exported_prefix_and_ledger_survive_other_writers_replay_and_compaction; health_reporting_only_reads_the_cached_state_and_journal_cut",
+      "before": "Format1 lacked head and reporting ran observe/probes",
+      "after": "Format2 signed sequence/head/checkpoint identity from consistent ledger cut; cached physical observation context; explicit unavailable/invalid and legacy support",
+      "evidence_type": "Source + authored UNRUN regressions",
+      "remaining": "Run signing/tamper/restart/compaction/Minimal integration; verify added retained-chain cost on reference workload; no remote witness claim",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false
+    },
+    {
+      "id": "GC",
+      "status": "open",
+      "requirement": "\u00a712b/I3 protected candidate survival",
+      "code": "gym gc-during-approval; live terminal transport; VM step/judge",
+      "regression": "approval_candidate_survives_collection_and_commits_in_both_retention_modes; gc-during-approval; gc-retain-all-generations",
+      "before": "Historical VM stays generation1/Prepared after 900s approval stall following successful GC",
+      "after": "Historical log rules out inferring candidate deletion from verdict; fix swallowed step/transport failures, preserve candidate survival/verification/commit oracle",
+      "evidence_type": "Historical VM job at 805cd1c; source + authored UNRUN regression",
+      "remaining": "Exact historical hang cause and real normal/retain-all VM reproduction remain required; no longer window/Unsupported/oracle weakening",
+      "affected_revision": "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+      "candidate_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "fixing_revision": null,
+      "implementation_evidence": {
+        "type": "source_analysis_and_authored_regressions",
+        "revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+        "rust_regression_execution": "NOT_RUN"
+      },
+      "acceptance_complete": false,
+      "historical_evidence": "https://github.com/aubrika/planarian/actions/runs/41016876492/job/123953787557"
+    }
+  ],
+  "proof_accounting": {
+    "current_successful_verification": "NOT_RUN",
+    "artifacts": [],
+    "declared_unique_obligation_ids": 45,
+    "declared_invariant_support_edges": 47,
+    "invariant_ids": [
+      "I1",
+      "I2",
+      "I3",
+      "I4",
+      "I5",
+      "I6",
+      "I7",
+      "I8",
+      "I10",
+      "I11",
+      "I12",
+      "I13",
+      "I14",
+      "I15",
+      "I16",
+      "I17",
+      "I18",
+      "I19",
+      "I20",
+      "I21",
+      "I22",
+      "I23"
+    ],
+    "historical_baseline_only": {
+      "trust_count": 37,
+      "internal_unproven": 5,
+      "discharged": 47,
+      "assumed": 56,
+      "per_invariant": {
+        "I1": [
+          0,
+          2
+        ],
+        "I10": [
+          1,
+          2
+        ],
+        "I11": [
+          2,
+          2
+        ],
+        "I12": [
+          9,
+          8
+        ],
+        "I13": [
+          0,
+          1
+        ],
+        "I14": [
+          1,
+          2
+        ],
+        "I15": [
+          2,
+          2
+        ],
+        "I16": [
+          2,
+          3
+        ],
+        "I17": [
+          0,
+          2
+        ],
+        "I18": [
+          5,
+          3
+        ],
+        "I19": [
+          3,
+          3
+        ],
+        "I2": [
+          0,
+          2
+        ],
+        "I20": [
+          0,
+          2
+        ],
+        "I21": [
+          2,
+          4
+        ],
+        "I22": [
+          5,
+          4
+        ],
+        "I23": [
+          3,
+          1
+        ],
+        "I3": [
+          0,
+          2
+        ],
+        "I4": [
+          0,
+          1
+        ],
+        "I5": [
+          4,
+          3
+        ],
+        "I6": [
+          7,
+          5
+        ],
+        "I7": [
+          0,
+          1
+        ],
+        "I8": [
+          1,
+          1
+        ]
+      }
+    },
+    "note": "Declared mappings and historical ratios do not establish current successful proofs.",
+    "current_declared_support": {
+      "discharged_edges": 47,
+      "assumed_edges": 57,
+      "trust_count": 38,
+      "internal_unproven": 5,
+      "explicit_trust_sites": 13
+    },
+    "proposed_baseline_change": {
+      "status": "NOT_ADOPTED",
+      "reason": "S03 requires explicit G5 external progress assumption for intentionally parked states",
+      "historical_baseline_unchanged": true,
+      "existing_ratchet_expected": "REJECT declared47:57/trust38 vs baseline47:56/trust37; actual verification command NOT_RUN"
+    }
+  },
+  "required_non_catalog_evidence": [
+    {
+      "command_or_scope": "cargo fmt --check",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "cargo clippy --workspace --all-targets -- -D warnings",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "cargo clippy -p planarian-daemon -p planarian-backend-linux --features planarian-daemon/gym-hooks -- -D warnings",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "cargo test --workspace",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "bash nix/gym/run-fake.sh",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "crates/gym/demo.sh --harness fake",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "bash nix/tests/boundaries.sh .",
+      "status": "PASS",
+      "evidence": "docs/evidence/shared-core-local/boundaries.log"
+    },
+    {
+      "command_or_scope": "cargo run -p planarian-gym -- verification --gate",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "cargo kani -p planarian-txn",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "cargo kani -p planarian-exec",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "nix build .#checks.x86_64-linux.package .#checks.x86_64-linux.module-eval .#checks.x86_64-linux.boundaries .#checks.x86_64-linux.verus",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "nix build .#checks.x86_64-linux.vm-runtime .#checks.x86_64-linux.vm-generations .#checks.x86_64-linux.vm-posture",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "nix run .#gym-vm",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "nix build .#checks.x86_64-linux.vm-installed-boot .#checks.x86_64-linux.vm-installed-boot-watchdog .#checks.x86_64-linux.vm-boot-confirmation",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "installed-entry publication crash matrix: legacyPackages.x86_64-linux.boot-entry-tests",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "real-filesystem ext4 and nodatacow-btrfs durability/ENOSPC acceptance",
+      "status": "NOT_RUN",
+      "evidence": null
+    },
+    {
+      "command_or_scope": "reference-hardware personal-profile performance",
+      "status": "NOT_RUN",
+      "evidence": null
+    }
+  ],
+  "non_catalog_note": "Catalog receipts cannot establish Rust checks, successful proofs, installed-entry boot behavior, real-filesystem durability or hardware performance. Attach those independent results and finding dispositions before release certification.",
+  "cases": [
+    {
+      "id": "svc-killed",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "svc-killed",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "svc-killed-defer-to-systemd",
+      "role": "intent",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "svc-killed-user-scope",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "svc-misconfig-state-file",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "svc-misconfig-listen-address",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "svc-misconfig-listen-address",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "dep-required-stopped",
+      "role": "intent",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "dep-required-stopped",
+      "role": "intent",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "dep-required-stopped-guarded",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "dep-required-stopped-guarded",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "dep-ordering-only-stopped",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "dep-ordering-only-stopped",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "dep-wants-optional-failed",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "dep-wants-optional-failed",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "drv-unbound-audio",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "drv-unbound-audio",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "drv-unbound-nic-asks",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "drv-bind-fails-restores-previous",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "drv-bind-fails-restores-previous",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "gen-bad-switch",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "gen-bad-switch",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "gen-override-only-change",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "gen-override-only-change",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "gen-disable-reenable-canonical",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "gen-disable-reenable-canonical",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "owner-rebuild-breaks-service",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "owner-rebuild-breaks-service",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-activating-bad",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-activating-bad",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-activating-good",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-activating-good",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-checking",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-checking",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-published",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-published",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-promoted",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-promoted",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-reverting",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-reverting",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-daemon-restart-reconciles",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-daemon-restart-reconciles",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-slow-worker-overlap",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-slow-worker-overlap",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-withheld-job-reply",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-job-outlives-drain",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-job-outlives-drain",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-jobs-tagged-unknown",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-simultaneous-takeover",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-simultaneous-takeover",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-runtime-rollback",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-runtime-rollback",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-stop-and-suppress",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "crash-stop-and-suppress",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "revert-fails",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "revert-fails",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "revert-fails-interlock-survives-compaction",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "revert-fails-interlock-survives-compaction",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "probe-delayed-healthy",
+      "role": "intent",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "probe-delayed-healthy",
+      "role": "intent",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "probe-diagnostic-stale-healthy",
+      "role": "intent",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "probe-diagnostic-stale-healthy",
+      "role": "intent",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "probe-failed-beats-stale",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "probe-failed-beats-stale",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "probe-http-503-degraded",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "probe-http-503-degraded",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "stale-owner-edit-during-build",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "stale-owner-edit-during-build",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "stale-untracked-file-ignored",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "gc-during-approval",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "gc-during-approval",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "intent-user-stops-service",
+      "role": "intent",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "intent-user-stops-service",
+      "role": "intent",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "intent-cli-stop-rewritten",
+      "role": "intent",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "intent-cli-stop-rewritten",
+      "role": "intent",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "intent-start-again-repairs",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "intent-start-again-repairs",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "authz-unprivileged-override-security",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "authz-unprivileged-override-security",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "authz-forged-actor-overwritten",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "authz-forged-actor-overwritten",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "suspend-resume",
+      "role": "intent",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "net-gateway-down",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "net-gateway-down",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "net-upstream-down",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "net-upstream-down",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "net-external-dependency-down",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "net-external-dependency-down",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "flap-30s",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "flap-30s",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "flap-regression-escalates",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "storage-nix-full-gc",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "storage-nix-full-gc",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "storage-budget-unsatisfiable",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "storage-budget-unsatisfiable",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "gc-retain-all-generations",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "storage-journal-fs-full",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "storage-journal-btrfs-reuse",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "storage-enospc-during-build",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "storage-boot-full-publish",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "storage-boot-full-publish",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "journal-compaction-preserves-state",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "journal-compaction-preserves-state",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "journal-torn-write",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "manifest-weaken-via-proposal",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "manifest-weaken-via-proposal",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "manifest-weaken-out-of-band",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "core-target-rejected",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "login-greeter-idle",
+      "role": "intent",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "user-unit-after-logout",
+      "role": "intent",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "cond-device-unplugged",
+      "role": "intent",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "desktop-auth-ok-compositor-fails",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "desktop-second-user-deadline",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "desktop-boot-fails-rollback",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "policy-daemon-session-drop-rebind",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "policy-daemon-session-drop-rebind",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "policy-daemon-wifi-runtime",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "policy-daemon-wifi-runtime",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "policy-stale-digest",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "policy-refinement-violation",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "approval-token-invalidated",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "approval-token-expired",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "floor-revert-blocked",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "floor-manual-rollback-needs-admin",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-kill9-service",
+      "role": "intent",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-kill9-service",
+      "role": "intent",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-kill9-undo",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-kill9-security",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-kill9-security",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-oom-kill",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-oom-kill",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "session-second-compositor-fails",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "session-logout-one-of-two",
+      "role": "intent",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "authz-nonadmin-stops-network-other-session",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "authz-unprivileged-stop-unauthorized",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "authz-unprivileged-stop-unauthorized",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "authz-user-overrides-firewall",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "boot-only-kernel-confirmed",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "boot-only-kernel-boot-fails",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "quiet-staged-update-foreground",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "quiet-repair-not-deferred",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "journal-record-edited",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "journal-record-edited",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "posture-absent-masked",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "posture-crashed-budget",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "posture-integrity-core-hash",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "posture-integrity-core-script",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "posture-integrity-journal-chain",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "posture-integrity-undeclared-early-unit",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "malicious-decl-owner-rebuild",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "malicious-decl-owner-rebuild",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "malicious-decl-catalog-enable",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "malicious-decl-catalog-enable",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "fake-assumptions-conformance",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "quiet-reference-workload",
+      "role": "must-pass",
+      "harness": "bench",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "malicious-decl-input-update",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "malicious-decl-input-update",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "catalog-change-carries-unbuilt-owner-edit",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-stop-security-unit",
+      "role": "repair",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-stop-security-unit",
+      "role": "repair",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "agent-run-own-principal",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "agent-run-own-principal",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "agent-has-its-users-permissions",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "agent-has-its-users-permissions",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "floor-service-package-fix",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "token-wall-clock-moved-back",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "approve-needs-real-terminal",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "approve-needs-real-terminal",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "identity-peer-exited",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-infer-stops-false",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-infer-stops-false",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-inferred-listed-until-ack",
+      "role": "intent",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "residue-inferred-listed-until-ack",
+      "role": "intent",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "test-build-is-integrity",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i5-reject-survives-every-setting",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i6-repair-waits-for-activation",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i6-repair-waits-for-activation",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i8-token-bound-to-candidate",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i8-token-bound-to-candidate",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i10-a-canonical-probe-cannot-be-removed",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i11-session-carries-its-sensitivity",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i12-nothing-left-open",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i14-forged-fields-ignored",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i14-forged-fields-ignored",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i15-old-worker-cannot-finish",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i15-old-worker-cannot-finish",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i16-boot-fallback-respects-floor",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i18-deleted-record-detected",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i18-deleted-record-detected",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i19-no-self-approval",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i19-no-self-approval",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i21-irreversible-asks-even-for-root",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i22-user-cannot-do-admin-things",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i22-user-cannot-do-admin-things",
+      "role": "must-pass",
+      "harness": "vm",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    },
+    {
+      "id": "en-i23-third-party-override-kept",
+      "role": "must-pass",
+      "harness": "fake",
+      "result": "NOT_RUN",
+      "accepted": false,
+      "waiver": null,
+      "receipt": null
+    }
+  ],
+  "errors": [],
+  "local_controls": {
+    "receipt": "docs/evidence/shared-core-local/receipt.json",
+    "source_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+    "source_fingerprint": "e46fb5cc7dc28959abcb7a45859c88a7f42b16d13c05243c28582551b2782b00",
+    "python_tests_passed": 34,
+    "before_fix_runner_negative_subcases_detected": 7,
+    "before_fix_performance_controls_detected": 2,
+    "scope": "local accounting/source controls; no Rust/catalog/VM/proof/hardware pass"
+  },
+  "tool_versions": {
+    "python3": {
+      "exit_status": 0,
+      "output": "Python 3.12.14"
+    },
+    "git": {
+      "exit_status": 0,
+      "output": "git version 2.52.0"
+    },
+    "cargo": {
+      "status": "UNAVAILABLE"
+    },
+    "rustc": {
+      "status": "UNAVAILABLE"
+    },
+    "nix": {
+      "status": "UNAVAILABLE"
+    },
+    "verus": {
+      "status": "UNAVAILABLE"
+    },
+    "cargo-kani": {
+      "status": "UNAVAILABLE"
+    }
+  },
+  "boot_acceptance": {
+    "scope": "installed UEFI systemd-boot /boot layout only",
+    "status": "NOT_RUN",
+    "targets": [
+      "checks.x86_64-linux.vm-installed-boot",
+      "checks.x86_64-linux.vm-installed-boot-watchdog",
+      "checks.x86_64-linux.vm-boot-confirmation",
+      "legacyPackages.x86_64-linux.boot-entry-tests.<boundary>-<recoverer>"
+    ],
+    "other_bootloader_initrd_layouts": "OPEN; no uniform enforcement/evidence claim"
+  },
+  "performance": {
+    "headless_owned_work_slice": "NOT_RUN",
+    "actual_scheduler_wakeups": "NOT_RUN",
+    "reference_hardware_personal_profile": "NOT_RUN",
+    "plan": "docs/shared-core-performance-plan.md",
+    "plan_adoption": "PROPOSED_NOT_ADOPTED",
+    "thresholds": {
+      "idle_cpu_percent_one_core": 0.5,
+      "resident_bytes": 50000000
+    },
+    "local_metric_controls_only": 10
+  },
+  "durability": {
+    "ext4": "NOT_RUN",
+    "nodatacow_btrfs": "NOT_RUN",
+    "XFS": "OUTSIDE_CLAIM",
+    "ZFS": "OUTSIDE_CLAIM",
+    "power_loss": "NOT_RUN"
+  },
+  "bypasses": {
+    "open_R11": "B-20 Medium; arbitrary-editor override replacement CAS is unmet",
+    "zero_High_is_not_R_S_closure": true
+  },
+  "candidate_type": "Full repository candidate from exact signed805cd1c base; all282 baseline blobs/root tree/commit verified locally. No current-candidate release certification.",
+  "delivery": {
+    "write_access": "VERIFIED",
+    "implementation_candidate": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+    "publication_evidence": "docs/evidence/shared-core-local/publication.json",
+    "note": "Earlier403 is resolved. Branch/PR state is tracked in GitHub, separately from incomplete acceptance."
+  }
+}

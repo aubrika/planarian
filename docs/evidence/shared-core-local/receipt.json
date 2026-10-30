@@ -1,0 +1,318 @@
+{
+  "format_version": 1,
+  "kind": "local_accounting_and_source_controls",
+  "source_revision": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+  "source_fingerprint": "e46fb5cc7dc28959abcb7a45859c88a7f42b16d13c05243c28582551b2782b00",
+  "source_verified": true,
+  "source_unchanged": true,
+  "tool_versions": {
+    "python3": {
+      "exit_status": 0,
+      "output": "Python 3.12.14"
+    },
+    "git": {
+      "exit_status": 0,
+      "output": "git version 2.52.0"
+    },
+    "cargo": {
+      "status": "UNAVAILABLE"
+    },
+    "rustc": {
+      "status": "UNAVAILABLE"
+    },
+    "nix": {
+      "status": "UNAVAILABLE"
+    },
+    "verus": {
+      "status": "UNAVAILABLE"
+    },
+    "cargo-kani": {
+      "status": "UNAVAILABLE"
+    }
+  },
+  "commands": [
+    {
+      "name": "acceptance",
+      "argv": [
+        "python3",
+        "nix/gym/test_acceptance.py"
+      ],
+      "exit_status": 0,
+      "expected_exit_status": 0,
+      "matches_expected": true,
+      "scope": "Executable acceptance accounting controls; stub Nix/cargo, no VM",
+      "log": "docs/evidence/shared-core-local/acceptance.log",
+      "log_sha256": "60f0bf7e59c803640827ab8a36486f4862cfdf514734bba850aa8597a8ac3245"
+    },
+    {
+      "name": "proof-accounting",
+      "argv": [
+        "python3",
+        "nix/gym/test_proofs.py"
+      ],
+      "exit_status": 0,
+      "expected_exit_status": 0,
+      "matches_expected": true,
+      "scope": "Verifier-accounting controls with explicit synthetic output; no proof result",
+      "log": "docs/evidence/shared-core-local/proof-accounting.log",
+      "log_sha256": "dfdfe77eb9f558b4ce1baf2bdb9cf0f3be718ff50398534da528cc2e255ec763"
+    },
+    {
+      "name": "manifest-accounting",
+      "argv": [
+        "python3",
+        "nix/gym/test_manifest.py"
+      ],
+      "exit_status": 0,
+      "expected_exit_status": 0,
+      "matches_expected": true,
+      "scope": "Immutable-candidate receipt controls; no catalog execution",
+      "log": "docs/evidence/shared-core-local/manifest-accounting.log",
+      "log_sha256": "e4b1e7a191d891aff49a6539a74d4e834bb2b04b7272114e57fa254007b377b6"
+    },
+    {
+      "name": "performance-accounting",
+      "argv": [
+        "python3",
+        "nix/gym/test_performance.py"
+      ],
+      "exit_status": 0,
+      "expected_exit_status": 0,
+      "matches_expected": true,
+      "scope": "Metric/import controls; synthetic fixtures, no hardware measurements",
+      "log": "docs/evidence/shared-core-local/performance-accounting.log",
+      "log_sha256": "913b67e0178474c4997fbd1a7a800ab330577698f86480e81ab189decd6738b1"
+    },
+    {
+      "name": "baseline-runner-detection",
+      "argv": [
+        "env",
+        "PLANARIAN_VM_RUNNER=/tmp/planarian-baseline-run-vm.sh",
+        "python3",
+        "nix/gym/test_acceptance.py",
+        "AcceptanceContract.test_actual_runner_propagates_build_and_verdict_failures"
+      ],
+      "exit_status": 1,
+      "expected_exit_status": 1,
+      "matches_expected": true,
+      "scope": "Intentional seven negative assertion failures against actual baseline runner",
+      "log": "docs/evidence/shared-core-local/baseline-runner-detection.log",
+      "log_sha256": "a1d7dd3985e84ae62ddaf54d1e0d260f44f3da7686b008b0a7175cfc5fb278f9"
+    },
+    {
+      "name": "baseline-performance-detection",
+      "argv": [
+        "env",
+        "PLANARIAN_PERFORMANCE_BASELINE=/tmp/planarian-baseline-bench.nix",
+        "python3",
+        "nix/gym/test_performance.py",
+        "PerformanceContract.test_complete_service_cpu_includes_an_exited_helper",
+        "PerformanceContract.test_no_real_frame_stream_cannot_claim_p99"
+      ],
+      "exit_status": 1,
+      "expected_exit_status": 1,
+      "matches_expected": true,
+      "scope": "Intentional two failures against actual baseline metric functions",
+      "log": "docs/evidence/shared-core-local/baseline-performance-detection.log",
+      "log_sha256": "a6de6178d54ee6b1b3777e253d6af35e2c308044882975e7fd3fc41baa6eec85"
+    },
+    {
+      "name": "source-proof-map",
+      "argv": [
+        "python3",
+        "nix/gym/proofs.py",
+        "check",
+        "--source-only"
+      ],
+      "exit_status": 0,
+      "expected_exit_status": 0,
+      "matches_expected": true,
+      "scope": "Source declaration accounting only; no successful verification",
+      "log": "docs/evidence/shared-core-local/source-proof-map.log",
+      "log_sha256": "8798eddd2456418dac8ae941c3a1b8b9f1da230ea453917460dff1bdf974f985"
+    },
+    {
+      "name": "trust-sites",
+      "argv": [
+        "python3",
+        "nix/gym/proofs.py",
+        "trust-sites"
+      ],
+      "exit_status": 0,
+      "expected_exit_status": 0,
+      "matches_expected": true,
+      "scope": "Count explicit trust sites; proposed G5 is separately recorded",
+      "log": "docs/evidence/shared-core-local/trust-sites.log",
+      "log_sha256": "1a252402972f6057fa53cc172b52b9ffca698e18311facd0f3b06ecaaef79e17"
+    },
+    {
+      "name": "boundaries",
+      "argv": [
+        "bash",
+        "nix/tests/boundaries.sh",
+        "."
+      ],
+      "exit_status": 0,
+      "expected_exit_status": 0,
+      "matches_expected": true,
+      "scope": "Repository dependency boundaries",
+      "log": "docs/evidence/shared-core-local/boundaries.log",
+      "log_sha256": "c98ff0f96a0a73e210d9d3400b50ddcdd5b6cbc0c314e27457b4ccd0adc9e0ac"
+    },
+    {
+      "name": "shell-syntax",
+      "argv": [
+        "bash",
+        "-n",
+        "nix/gym/run-vm.sh",
+        "nix/gym/run-fake.sh",
+        "crates/gym/demo.sh"
+      ],
+      "exit_status": 0,
+      "expected_exit_status": 0,
+      "matches_expected": true,
+      "scope": "Shell parser only",
+      "log": "docs/evidence/shared-core-local/shell-syntax.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "whitespace",
+      "argv": [
+        "git",
+        "diff",
+        "--check",
+        "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a",
+        "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a"
+      ],
+      "exit_status": 0,
+      "expected_exit_status": 0,
+      "matches_expected": true,
+      "scope": "Patch whitespace only",
+      "log": "docs/evidence/shared-core-local/whitespace.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "config-syntax",
+      "argv": [
+        "python3",
+        "-c",
+        "from pathlib import Path; import tomllib,yaml; files=list(Path('.github/workflows').glob('*.yml')); [yaml.safe_load(p.read_text()) for p in files]; configs=list(Path('docs').glob('*.toml'))+list(Path('crates/gym/catalog').glob('*.toml')); [tomllib.loads(p.read_text()) for p in configs]; print(f'{len(files)} YAML and {len(configs)} TOML files parsed')"
+      ],
+      "exit_status": 0,
+      "expected_exit_status": 0,
+      "matches_expected": true,
+      "scope": "YAML/TOML syntax only; no Nix evaluation",
+      "log": "docs/evidence/shared-core-local/config-syntax.log",
+      "log_sha256": "19fb4b9543b209861e3fbfb0d8a552d57133f2ae93ff9ad74c6c78936e72526a"
+    }
+  ],
+  "rust_regressions": "NOT_RUN",
+  "nix_vm_acceptance": "NOT_RUN",
+  "actual_verification": "NOT_RUN",
+  "reference_hardware_measurement": "NOT_RUN",
+  "declared_ratchet": {
+    "baseline": {
+      "trust_count": 37,
+      "internal_unproven": 5,
+      "discharged": 47,
+      "assumed": 56,
+      "per_invariant": {
+        "I1": [
+          0,
+          2
+        ],
+        "I10": [
+          1,
+          2
+        ],
+        "I11": [
+          2,
+          2
+        ],
+        "I12": [
+          9,
+          8
+        ],
+        "I13": [
+          0,
+          1
+        ],
+        "I14": [
+          1,
+          2
+        ],
+        "I15": [
+          2,
+          2
+        ],
+        "I16": [
+          2,
+          3
+        ],
+        "I17": [
+          0,
+          2
+        ],
+        "I18": [
+          5,
+          3
+        ],
+        "I19": [
+          3,
+          3
+        ],
+        "I2": [
+          0,
+          2
+        ],
+        "I20": [
+          0,
+          2
+        ],
+        "I21": [
+          2,
+          4
+        ],
+        "I22": [
+          5,
+          4
+        ],
+        "I23": [
+          3,
+          1
+        ],
+        "I3": [
+          0,
+          2
+        ],
+        "I4": [
+          0,
+          1
+        ],
+        "I5": [
+          4,
+          3
+        ],
+        "I6": [
+          7,
+          5
+        ],
+        "I7": [
+          0,
+          1
+        ],
+        "I8": [
+          1,
+          1
+        ]
+      }
+    },
+    "current_support": {
+      "discharged": 47,
+      "assumed": 57,
+      "trust_count": 38,
+      "internal_unproven": 5
+    },
+    "status": "PROPOSED_G5_REGRESSION_NOT_ADOPTED; existing baseline unchanged; actual gate NOT_RUN"
+  }
+}
