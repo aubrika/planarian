@@ -17,7 +17,7 @@
 use crate::machine::{step_allowed, tag};
 use planarian_schema::{
     Actor, GenerationId, Hash, Incident, IncidentId, Lease, OpId, Outcome, Override, OwnerId, Resolution, Timestamp,
-    Transaction, Transition, TxnId, TxnState, UnitId,
+    StorePath, Transaction, Transition, TxnId, TxnState, UnitId,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -145,6 +145,12 @@ pub struct TerminalTxn {
     pub transition: Transition,
     /// The most recent reason journaled with a step (why it reverted, …).
     pub why: String,
+    /// Additive terminal evidence format. Zero means the historical archive
+    /// discarded operation acknowledgments; it cannot establish success.
+    #[serde(default, skip_serializing_if = "terminal_evidence_legacy")]
+    pub evidence_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ops: Option<Vec<OpRecord>>,
 }
 
 /// An unresolved RecoveryFailed (§12c). While any exists, autonomous mutation is blocked.
@@ -158,6 +164,14 @@ pub struct InterlockEntry {
     pub candidate_override: Option<Hash>,
     pub revert_to: GenerationId,
     pub note: String,
+    /// Zero is a historical/sentinel entry with unknown candidate-root
+    /// evidence; it must not be read as proof that nothing needs protection.
+    #[serde(default, skip_serializing_if = "interlock_evidence_legacy")]
+    pub evidence_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<(GenerationId, StorePath)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc_root: Option<String>,
 }
 
 /// A map from transaction id, stored as a vector sorted by id; vstd
@@ -189,8 +203,9 @@ pub struct Ledger {
     pub external: Option<(u64, Hash)>,
     pub interlock: IdMap<InterlockEntry>,
     pub last_reconciliation: Option<Reconciliation>,
-    /// Every agent started, in order: (name, the uid that started it). The
-    /// last entry for a name is the one in force.
+    /// Current registration per agent name: (name, the uid that started it).
+    /// Every launch is still journaled; replay replaces an existing row.
+    /// Historical duplicate checkpoint rows normalize to their last owner.
     #[serde(default)]
     pub agents: Vec<(String, u32)>,
 }
@@ -391,6 +406,82 @@ pub open spec fn advance_ok(l: Ledger, i: int, epoch: u64, to: TxnState) -> bool
 }
 
 // ---------- Small verified helpers ----------
+
+fn agent_name_eq(a: &str, b: &str) -> (r: bool)
+    ensures
+        r == (a@ == b@),
+{
+    let n = a.unicode_len();
+    if n != b.unicode_len() {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < n
+        invariant
+            n == a@.len(),
+            n == b@.len(),
+            i <= n,
+            forall|j: int| 0 <= j < i ==> a@[j] == b@[j],
+        decreases n - i,
+    {
+        if a.get_char(i) != b.get_char(i) {
+            return false;
+        }
+        i += 1;
+    }
+    assert(a@ =~= b@);
+    true
+}
+
+/// Reduce old checkpoint registrations after the original checkpoint bytes
+/// have passed integrity and ledger validation. Keep the last occurrence,
+/// exactly preserving the historical lookup's last-recorded owner semantics.
+pub fn normalize_agent_registry(agents: &mut Vec<(String, u32)>) {
+    let mut i: usize = 0;
+    while i < agents.len()
+        invariant
+            i <= agents@.len(),
+        decreases agents.len() - i,
+    {
+        let mut j = i + 1;
+        let mut duplicate = false;
+        while j < agents.len()
+            invariant
+                i < agents@.len(),
+                i < j <= agents@.len(),
+            decreases agents.len() - j,
+        {
+            if agent_name_eq(agents[i].0.as_str(), agents[j].0.as_str()) {
+                duplicate = true;
+                break;
+            }
+            j += 1;
+        }
+        if duplicate {
+            agents.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Applying a launch retains one current row, while the original AgentStarted
+/// record and its attribution remain in the durable journal prefix.
+fn record_agent(agents: &mut Vec<(String, u32)>, name: String, by: u32) {
+    let mut i: usize = 0;
+    while i < agents.len()
+        invariant
+            i <= agents@.len(),
+        decreases agents.len() - i,
+    {
+        if agent_name_eq(agents[i].0.as_str(), name.as_str()) {
+            agents.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    agents.push((name, by));
+}
 
 fn flying_exec(s: &TxnState) -> (r: bool)
     ensures
@@ -762,6 +853,8 @@ fn archive(terminal: &mut BTreeMap<TxnId, TerminalTxn>, id: TxnId, l: LiveTxn) {
             path: l.path,
             transition: l.txn.transition,
             why: l.why,
+            evidence_version: 1,
+            ops: Some(l.ops),
         },
     );
     while terminal.len() > TERMINAL_KEEP {
@@ -900,7 +993,7 @@ impl Ledger {
                 }
             },
             Record::Reconciliation(r) => self.last_reconciliation = Some(r),
-            Record::AgentStarted { name, by } => self.agents.push((name, by)),
+            Record::AgentStarted { name, by } => record_agent(&mut self.agents, name, by),
         }
     }
 
@@ -974,6 +1067,9 @@ impl Ledger {
                 candidate_override: l.txn.candidate_override,
                 revert_to: l.txn.revert_to,
                 note: note.clone(),
+                evidence_version: 1,
+                candidate: l.txn.candidate.clone(),
+                gc_root: l.txn.gc_root.clone(),
             };
             put(&mut self.interlock, txn, entry);
         }
@@ -1299,7 +1395,53 @@ proof fn lemma_push(pre: Ledger, post: Ledger)
 
 pub const TERMINAL_KEEP: usize = 256;
 
+fn terminal_evidence_legacy(version: &u32) -> bool {
+    *version == 0
+}
+
+fn interlock_evidence_legacy(version: &u32) -> bool {
+    *version == 0
+}
+
 impl Ledger {
+    /// Backend acknowledgments are evidence distinct from lifecycle. An old
+    /// terminal checkpoint did not retain them, so its Committed state cannot
+    /// establish that the backend operation succeeded.
+    pub fn operations(&self, txn: TxnId) -> Option<&[OpRecord]> {
+        if let Some(live) = self.live.get(&txn) {
+            return Some(&live.ops);
+        }
+        self.terminal.get(&txn).filter(|t| t.evidence_version == 1).and_then(|t| t.ops.as_deref())
+    }
+
+    pub fn operation_outcome(&self, txn: TxnId) -> Outcome {
+        let Some(ops) = self.operations(txn) else {
+            return Outcome::Unknown("operation acknowledgments unavailable in historical terminal evidence".into());
+        };
+        if ops.is_empty() {
+            let bookkeeping = self.terminal.get(&txn).is_some_and(|t| {
+                t.state == TxnState::Committed && matches!(
+                    &t.transition,
+                    Transition::LiftOverride(_) | Transition::Resolve { .. }
+                        | Transition::SetOverride(planarian_schema::Override {
+                            desired: planarian_schema::OverrideDesired::LeaveAlone, ..
+                        })
+                )
+            });
+            return if bookkeeping { Outcome::Succeeded } else { Outcome::Unknown("no backend operation acknowledged".into()) };
+        }
+        if let Some(op) = ops.iter().find(|o| matches!(&o.ack, Some(Outcome::Failed(_)))) {
+            return op.ack.clone().expect("matched acknowledgment");
+        }
+        if let Some(op) = ops.iter().find(|o| o.ack.is_none() || matches!(&o.ack, Some(Outcome::Unknown(_)))) {
+            return op.ack.clone().unwrap_or_else(|| Outcome::Unknown(format!("{} reply unavailable", op.call)));
+        }
+        if let Some(op) = ops.iter().find(|o| matches!(&o.ack, Some(Outcome::Partial(_)))) {
+            return op.ack.clone().expect("matched acknowledgment");
+        }
+        Outcome::Succeeded
+    }
+
     pub fn epoch(&self, txn: TxnId) -> Option<u64> {
         self.live.get(&txn).map(|l| l.txn.lease.epoch).or_else(|| self.terminal.get(&txn).map(|t| t.epoch))
     }

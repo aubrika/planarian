@@ -39,6 +39,15 @@ pub struct World {
     pub now: Timestamp,
     pub current: GenerationId,
     pub boot_default: GenerationId,
+    pub one_shot: Option<GenerationId>,
+    pub last_booted: Option<GenerationId>,
+    /// Publish selection but lose/fail the reply: hard outcomes still mutate.
+    pub boot_once_reply: Option<planarian_schema::Outcome>,
+    pub boot_selection_unknown: bool,
+    pub boot_identity_unknown: bool,
+    pub fail_withdraw: bool,
+    /// Withdrawal may land even when its reply is lost, Partial or Failed.
+    pub withdraw_reply: Option<planarian_schema::Outcome>,
     pub boot_entries: BTreeSet<GenerationId>,
     pub generations: BTreeMap<GenerationId, StorePath>,
     /// Generations whose probes fail.
@@ -120,7 +129,12 @@ impl GenerationBackend for FakeHost {
     }
 
     fn last_booted(&self) -> Result<GenerationId, Outcome> {
-        Ok(self.w().boot_default)
+        let w = self.w();
+        if w.boot_identity_unknown {
+            Err(Outcome::Unknown("booted generation unreadable (injected)".into()))
+        } else {
+            Ok(w.last_booted.unwrap_or(w.boot_default))
+        }
     }
 
     fn stage(&self, _owner: &PinnedSource, _overrides: &OverrideSet) -> Result<StagedSource, Outcome> {
@@ -189,6 +203,44 @@ impl GenerationBackend for FakeHost {
         w.boot_entries.insert(g);
         w.boot_default = g;
         Outcome::Succeeded
+    }
+
+    fn publish_boot_once(&self, g: GenerationId, keep: GenerationId, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, "publish_boot_once") {
+            return Outcome::fenced();
+        }
+        if w.fail_publish {
+            return Outcome::Failed("publication failed before selection (injected)".into());
+        }
+        w.boot_entries.insert(g);
+        w.boot_entries.insert(keep);
+        w.boot_default = keep;
+        w.one_shot = Some(g);
+        w.boot_once_reply.clone().unwrap_or(Outcome::Succeeded)
+    }
+
+    fn one_shot_pending(&self) -> Result<Option<GenerationId>, Outcome> {
+        let w = self.w();
+        if w.boot_selection_unknown {
+            Err(Outcome::Unknown("boot selection unreadable (injected)".into()))
+        } else {
+            Ok(w.one_shot)
+        }
+    }
+
+    fn withdraw_boot_once(&self, keep: GenerationId, op: &OpId) -> Outcome {
+        let mut w = self.w();
+        if !self.admit(&mut w, op, "withdraw_boot_once") {
+            return Outcome::fenced();
+        }
+        if w.fail_withdraw {
+            return Outcome::Unknown("withdrawal not acknowledged (injected)".into());
+        }
+        w.one_shot = None;
+        w.boot_entries.insert(keep);
+        w.boot_default = keep;
+        w.withdraw_reply.clone().unwrap_or(Outcome::Succeeded)
     }
 
     fn protect(&self, g: GenerationId, op: &OpId) -> Outcome {

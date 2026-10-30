@@ -161,9 +161,16 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             unit_op(&mut f, u, Recovery::Revertible)
         }
         Transition::SetOverride(s) => {
-            unit_op(&mut f, &s.unit, Recovery::Idempotent);
-            f.affected_units = vec![s.unit.clone()];
-            f.disruption = Disruption::None;
+            // Stopped actuates the same stop as StopAndSuppress: preserve
+            // every dependent's sensitivity and disruption before policy.
+            if s.desired == OverrideDesired::Stopped {
+                unit_op(&mut f, &s.unit, Recovery::Revertible);
+            } else {
+                // LeaveAlone records intent only; it never stops the unit.
+                unit_op(&mut f, &s.unit, Recovery::Idempotent);
+                f.affected_units = vec![s.unit.clone()];
+                f.disruption = Disruption::None;
+            }
         }
         Transition::LiftOverride(u) => {
             unit_op(&mut f, u, Recovery::Idempotent);
@@ -196,7 +203,13 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             let config = i.candidate_overrides.map(|c| diff(i.base_overrides, c)).unwrap_or_default();
             let mut all_defs = i.defs.clone();
             for (k, v) in &cand.units {
-                all_defs.entry(k.clone()).or_insert_with(|| v.clone());
+                all_defs.entry(k.clone()).and_modify(|old| {
+                    // Risk follows both versions while switching: reducing
+                    // a declaration never erases the old effects, and a new
+                    // declaration may raise their floor.
+                    old.sensitivity = old.sensitivity.union(&v.sensitivity);
+                    old.restart_disruption = old.restart_disruption.max(v.restart_disruption);
+                }).or_insert_with(|| v.clone());
             }
             let mut services = i.base.services.clone();
             services.extend(cand.services.iter().map(|(k, v)| (k.clone(), *v)));

@@ -49,6 +49,8 @@ pub enum RecoveryAction {
     /// A boot-only candidate waits for its boot (§12 step 7): leave it until
     /// a reboot; then confirm it if it booted, else Reverted.
     AwaitBoot,
+    /// Reconcile a boot publication whose call may have taken effect.
+    ReconcileBootPublication,
     /// No recovery path: RecoveryFailed.
     Fail,
 }
@@ -67,7 +69,8 @@ pub fn should_take_over(
 ) -> bool {
     let in_window = matches!(
         state,
-        TxnState::Activating | TxnState::Checking | TxnState::Published | TxnState::Promoted | TxnState::Reverting
+        TxnState::Activating | TxnState::Checking | TxnState::PublishingBoot | TxnState::Published
+            | TxnState::Promoted | TxnState::Reverting
     );
     if !in_window || mine {
         return false;
@@ -122,6 +125,7 @@ pub fn recovery_action(state: &TxnState, strategy: RecoveryStrategy) -> Recovery
         (TxnState::Published, S::RevertGeneration) => A::RecheckPublished,
         (TxnState::Promoted, S::RevertGeneration) => A::WriteCommitted,
         (TxnState::Reverting, S::RevertGeneration) => A::RevertGeneration,
+        (TxnState::PublishingBoot, S::RevertGeneration) => A::ReconcileBootPublication,
         (TxnState::AwaitingBoot, S::RevertGeneration) => A::AwaitBoot,
         (TxnState::Activating, S::UnbindDevice) => A::DriverBound,
         (TxnState::Checking, S::UnbindDevice) => A::CheckDevice,
@@ -203,6 +207,10 @@ pub enum CrashPoint {
     OpBegun(&'static str),
     /// After the call returned, before its OpAck is journaled.
     OpCalled(&'static str),
+    /// After the acknowledgment is durable, before the next state write.
+    OpAcked(&'static str),
+    /// The required floor is durable, immediately before Committed.
+    FloorEstablished,
 }
 
 pub struct Kernel<S: Store, H: Host> {
@@ -232,14 +240,32 @@ impl<S: Store, H: Host> Kernel<S, H> {
     }
 
     fn record(&mut self, r: Record) -> R<()> {
-        let now = self.host.now();
         let txn = match &r {
             Record::Advance { txn, .. } | Record::Takeover { txn, .. } | Record::Renew { txn, .. } => Some(*txn),
             Record::OpBegin { op, .. } | Record::OpAck { op, .. } => Some(op.txn),
             _ => None,
         };
-        match self.journal.append(now, r) {
-            Err(JournalError::Full) => {
+        self.record_owned(txn, r)
+    }
+
+    /// Transaction-derived global records (overrides, completion bookkeeping)
+    /// need the same ownership boundary as records carrying an OpId/epoch.
+    fn record_owned(&mut self, txn: Option<TxnId>, r: Record) -> R<()> {
+        let now = self.host.now();
+        let epoch = txn.map(|id| self.epoch(id)).transpose()?;
+        let appended = self.journal.locked(|j| -> R<()> {
+            if let (Some(id), Some(epoch)) = (txn, epoch) {
+                let live = j.ledger().live.get(&id).ok_or(KernelError::NotLive(id))?;
+                let fence = j.store().fence(id).map_err(JournalError::from)?;
+                if live.txn.lease.epoch != epoch || !fence_admits(fence, epoch) {
+                    return Err(KernelError::LostLease(id));
+                }
+            }
+            j.append(now, r)?;
+            Ok(())
+        })?;
+        match appended {
+            Err(KernelError::Journal(JournalError::Full)) => {
                 // A transaction that may already have mutated the system cannot
                 // be left without a record: fixed-size sentinel, interlock (§12c).
                 let mutating =
@@ -250,7 +276,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
                 }
                 Err(KernelError::Journal(JournalError::Full))
             }
-            r => r.map(|_| ()).map_err(KernelError::from),
+            r => r,
         }
     }
 
@@ -260,6 +286,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
         self.record(rec)?;
         if to.is_terminal()
             && to != TxnState::Committed
+            && to != TxnState::RecoveryFailed
             && let Some(root) = &txn.gc_root
         {
             self.host.release_gc_root(root);
@@ -292,6 +319,9 @@ impl<S: Store, H: Host> Kernel<S, H> {
             return Err(KernelError::Crashed);
         }
         self.record(Record::OpAck { op, outcome: outcome.clone() })?;
+        if self.crash_at == Some(CrashPoint::OpAcked(name)) {
+            return Err(KernelError::Crashed);
+        }
         Ok((op, outcome))
     }
 
@@ -414,11 +444,20 @@ impl<S: Store, H: Host> Kernel<S, H> {
             return self.reject(id, RejectReason::Other("candidate failed verification".into()));
         }
         self.wait_built(id, "takes effect at boot")?;
-        let base = txn.base;
-        let o = self.call(id, "publish_boot_once", |h, op| h.generations().publish_boot_once(cand, base, op))?;
+        let keep = txn.revert_to;
+        if !self.automatic_target_eligible(keep)? {
+            return self.reject(id, RejectReason::Other("no eligible automatic boot fallback above the floor".into()));
+        }
+        // The candidate, rooted path and eligible fallback are already in
+        // Prepared. Enter the recoverable/exclusive state BEFORE OpBegin and
+        // BEFORE any boot mutation. A failed/lost reply proves no absence of effect.
+        self.advance(&txn, TxnState::PublishingBoot, "boot publication intent")?;
+        let (op, o) = self.call_op(id, "publish_boot_once", |h, op| h.generations().publish_boot_once(cand, keep, op))?;
         if !o.is_success() {
-            // All or nothing (the backend's contract): nothing was published.
-            return self.reject(id, RejectReason::Other(format!("publish_boot_once: {o:?}")));
+            if let Err(why) = self.drain_op(id, &op)? {
+                return self.recovery_failed(&txn, &why);
+            }
+            return self.reconcile_boot_publication(&txn);
         }
         self.advance(&txn, TxnState::AwaitingBoot, "published to boot once; restart to finish")?;
         Ok(TxnState::AwaitingBoot)
@@ -462,12 +501,12 @@ impl<S: Store, H: Host> Kernel<S, H> {
                     reason.clone(),
                     caller.clone(),
                 );
-                self.record(Record::OverrideSet(s))?;
+                self.record_owned(Some(txn.id), Record::OverrideSet(s))?;
             }
             Transition::SetOverride(s) => match s.desired {
                 OverrideDesired::LeaveAlone | OverrideDesired::Stopped => {
                     let s = Override { by: caller.clone(), attribution: Attribution::Attested, ..s.clone() };
-                    self.record(Record::OverrideSet(s))?;
+                    self.record_owned(Some(txn.id), Record::OverrideSet(s))?;
                 }
                 OverrideDesired::Absent | OverrideDesired::Detected => {
                     return self
@@ -489,11 +528,11 @@ impl<S: Store, H: Host> Kernel<S, H> {
             }
             Transition::SetOverride(_) => Outcome::Succeeded,
             Transition::LiftOverride(u) => {
-                self.record(Record::OverrideLifted(u.clone()))?;
+                self.record_owned(Some(txn.id), Record::OverrideLifted(u.clone()))?;
                 Outcome::Succeeded
             }
             Transition::Resolve { txn: target, resolution } => {
-                self.record(Record::Resolved { txn: *target, resolution: *resolution, by: caller })?;
+                self.record_owned(Some(txn.id), Record::Resolved { txn: *target, resolution: *resolution, by: caller })?;
                 Outcome::Succeeded
             }
             t => {
@@ -604,15 +643,21 @@ impl<S: Store, H: Host> Kernel<S, H> {
             return self.recovery_failed(txn, "AwaitingBoot without a candidate");
         };
         let gens = self.host.generations();
-        // Still pending, or the boot loader cannot say: no reboot yet; leave it.
+        // Still pending, or the boot loader cannot say: keep tracking it. A
+        // different selection is an unexplained external change, not evidence
+        // that our publication can safely be forgotten.
         match gens.one_shot_pending() {
             Ok(Some(g)) if g == cand => return Ok(TxnState::AwaitingBoot),
             Err(_) => return Ok(TxnState::AwaitingBoot),
-            _ => {}
+            Ok(Some(_)) => return self.recovery_failed(txn, "one-shot selection names an unrelated generation"),
+            Ok(None) => {}
         }
-        if gens.last_booted().ok() != Some(cand) {
-            self.advance(txn, TxnState::Reverted, "the boot-only candidate did not boot; the default entry did")?;
-            return Ok(TxnState::Reverted);
+        match gens.last_booted() {
+            Ok(booted) if booted == cand => {}
+            Ok(_) => {
+                return self.withdraw_boot_publication(txn, "the boot-only candidate did not boot; selection reconciled");
+            }
+            Err(o) => return self.recovery_failed(txn, &format!("cannot establish booted generation: {o:?}")),
         }
         match self.host.check(txn, CheckPhase::Candidate) {
             Verdict::Pass => {
@@ -627,10 +672,53 @@ impl<S: Store, H: Host> Kernel<S, H> {
     }
 
     fn write_committed(&mut self, txn: &Transaction) -> R<TxnState> {
-        self.advance(txn, TxnState::Committed, "")?;
-        if let Some(cand) = Self::candidate(txn) {
-            self.record(Record::LiveTested(Some(cand)))?;
+        if txn.check.version != planarian_schema::CHECK_CONTEXT_VERSION {
+            return self.recovery_failed(txn, "completion intent unavailable in historical/unsupported check context");
         }
+        // Completing a security fix is a write-ahead obligation of every
+        // generation path, including watchdog and boot-only completion. If
+        // this write or Committed fails, Promoted remains recoverable; a
+        // completed floor write is conservative until completion resumes.
+        let candidate = Self::candidate(txn);
+        if let Some(required) = txn.check.required_floor
+            && (candidate != Some(required) || txn.check.floor_fixes.is_empty())
+        {
+            return self.recovery_failed(txn, "security floor intent does not name the candidate");
+        }
+        let epoch = self.held.get(&txn.id).copied().ok_or(KernelError::LostLease(txn.id))?;
+        let now = self.host.now();
+        let crash = self.crash_at.clone();
+        // Global floor/baseline records do not themselves carry an epoch.
+        // Check ownership under the journal lock and keep that lock through
+        // Committed, so a fenced writer cannot overwrite a later completion's
+        // LiveTested record after takeover. Each append is independently durable.
+        let completion = self.journal.locked(|j| -> R<()> {
+            let live = j.ledger().live.get(&txn.id).ok_or(KernelError::NotLive(txn.id))?;
+            let fence = j.store().fence(txn.id).map_err(JournalError::from)?;
+            if live.txn.lease.epoch != epoch || live.txn.state != TxnState::Promoted || !fence_admits(fence, epoch) {
+                return Err(KernelError::LostLease(txn.id));
+            }
+            if let Some(required) = txn.check.required_floor {
+                if j.ledger().security_floor.is_none_or(|f| f.0 < required.0) {
+                    j.append(now, Record::SecurityFloor(Some(required)))?;
+                }
+                if crash == Some(CrashPoint::FloorEstablished) {
+                    return Err(KernelError::Crashed);
+                }
+            }
+            if let Some(candidate) = candidate {
+                j.append(now, Record::LiveTested(Some(candidate)))?;
+            }
+            j.append(now, Record::Advance { txn: txn.id, epoch, to: TxnState::Committed, note: String::new() })?;
+            if crash == Some(CrashPoint::State("Committed")) {
+                return Err(KernelError::Crashed);
+            }
+            Ok(())
+        })?;
+        if matches!(&completion, Err(KernelError::Journal(JournalError::Full))) {
+            self.journal.write_sentinel(txn.id, "journal full during durable completion")?;
+        }
+        completion?;
         Ok(TxnState::Committed)
     }
 
@@ -654,7 +742,51 @@ impl<S: Store, H: Host> Kernel<S, H> {
         Ok(if o.is_success() { Swap::Done } else { Swap::Failed(format!("{o:?}")) })
     }
 
+    fn automatic_target_eligible(&mut self, target: GenerationId) -> R<bool> {
+        Ok(self.journal.sync_ledger()?.security_floor.is_none_or(|f| target.0 >= f.0))
+    }
+
+    /// Resolve an interrupted publication from observed bootloader evidence,
+    /// after takeover has fenced and drained the old operation. Unknown is an
+    /// interlock, never a claim that the candidate did not get published.
+    fn reconcile_boot_publication(&mut self, txn: &Transaction) -> R<TxnState> {
+        let Some(cand) = Self::candidate(txn) else {
+            return self.recovery_failed(txn, "boot publication without a candidate");
+        };
+        match self.host.generations().one_shot_pending() {
+            Ok(Some(g)) if g == cand => {
+                self.advance(txn, TxnState::AwaitingBoot, "reconciled published one-shot candidate")?;
+                Ok(TxnState::AwaitingBoot)
+            }
+            Ok(None) => match self.host.generations().last_booted() {
+                Ok(booted) if booted == cand => {
+                    self.advance(txn, TxnState::AwaitingBoot, "candidate booted during publication recovery")?;
+                    self.await_boot(txn)
+                }
+                Ok(_) => self.withdraw_boot_publication(txn, "interrupted publication withdrawn"),
+                Err(o) => self.recovery_failed(txn, &format!("cannot establish booted generation: {o:?}")),
+            },
+            Ok(Some(_)) => self.recovery_failed(txn, "one-shot selection names an unrelated generation"),
+            Err(o) => self.recovery_failed(txn, &format!("cannot establish one-shot selection: {o:?}")),
+        }
+    }
+
+    fn withdraw_boot_publication(&mut self, txn: &Transaction, why: &str) -> R<TxnState> {
+        if !self.automatic_target_eligible(txn.revert_to)? {
+            return self.recovery_failed(txn, "automatic boot fallback is below the security floor");
+        }
+        let o = self.call(txn.id, "withdraw_boot_once", |h, op| h.generations().withdraw_boot_once(txn.revert_to, op))?;
+        if !o.is_success() {
+            return self.recovery_failed(txn, &format!("cannot prove boot publication withdrawn: {o:?}"));
+        }
+        self.advance(txn, TxnState::Reverted, why)?;
+        Ok(TxnState::Reverted)
+    }
+
     fn revert_generation(&mut self, txn: &Transaction, why: &str) -> R<TxnState> {
+        if !self.automatic_target_eligible(txn.revert_to)? {
+            return self.recovery_failed(txn, "automatic revert target is below the security floor");
+        }
         let state = self.live(txn.id)?.txn.state;
         if state != TxnState::Reverting {
             self.advance(txn, TxnState::Reverting, why)?;
@@ -749,11 +881,24 @@ impl<S: Store, H: Host> Kernel<S, H> {
 
     /// Whether the watchdog should take this transaction over (§12 recovery watchdog).
     pub fn watchdog_should_take_over(&self, txn: &Transaction) -> bool {
+        let historical_publication = txn.state == TxnState::Built
+            && self.journal.ledger().live.get(&txn.id).is_some_and(|l| l.ops.iter().any(|o| o.call == "publish_boot_once"));
+        // AwaitingBoot is intentionally parked during the publishing boot,
+        // regardless of its deadline. After a reboot it has a recovery
+        // obligation even when the daemon never starts; the independent
+        // watchdog must reconcile it under the same fencing rules.
+        let previous_boot = txn.lease.owner.boot_id() != self.me.boot_id();
+        let boot_reconciliation = txn.state == TxnState::AwaitingBoot && previous_boot;
+        let state = if historical_publication || boot_reconciliation { &TxnState::PublishingBoot } else { &txn.state };
+        // A takeover can persist the fence and crash before journaling its
+        // lease. A live process renewing the old ledger epoch is still fenced
+        // and cannot complete; do not let its heartbeat strand recovery.
+        let owner_admitted = self.journal.store().fence(txn.id).ok().flatten() == Some(txn.lease.epoch);
         should_take_over(
-            &txn.state,
+            state,
             txn.lease.owner == self.me,
             // An owner from an earlier boot is gone, whatever now holds its pid.
-            txn.lease.owner.boot_id() == self.me.boot_id() && self.host.pid_alive(txn.lease.owner.pid()),
+            !previous_boot && owner_admitted && self.host.pid_alive(txn.lease.owner.pid()),
             self.host.boot_now(),
             txn.deadline,
             txn.lease.renewed,
@@ -788,7 +933,14 @@ impl<S: Store, H: Host> Kernel<S, H> {
         })??;
         self.held.insert(id, new.epoch);
 
-        let l = self.live(id)?;
+        let mut l = self.live(id)?;
+        // Old writers could call publish_boot_once while still Built. An
+        // existing operation record is evidence of a possible mutation, not
+        // permission to reinterpret that historical state as unmutated.
+        if l.txn.state == TxnState::Built && l.ops.iter().any(|o| o.call == "publish_boot_once") {
+            self.advance(&l.txn, TxnState::PublishingBoot, "upgraded historical boot publication obligation")?;
+            l = self.live(id)?;
+        }
         if l.txn.state.is_pre_mutation() {
             return Ok(Some(new));
         }
@@ -888,6 +1040,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
             A::CheckDevice => self.check_device(&txn),
             A::RevertDevice => self.revert_device(&txn, "recovery: re-run revert"),
             A::AwaitBoot => self.await_boot(&txn),
+            A::ReconcileBootPublication => self.reconcile_boot_publication(&txn),
             A::Fail => {
                 let why = format!("no recovery path for {} under {:?}", tag(&txn.state), txn.recovery);
                 self.recovery_failed(&txn, &why)
@@ -937,4 +1090,84 @@ enum Swap {
     Done,
     Failed(String),
     ThirdParty,
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use crate::fake::{FakeHost, World};
+    use crate::store::MemStore;
+    use planarian_schema::{
+        ChangeId, CheckContext, DerivedFacts, Disruption, Expectation, PolicyVersion, Recovery,
+        Sensitivities, Settle, StorePath,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_fenced_completion_cannot_write_global_floor_or_baseline_records() {
+        let store = MemStore::new(1 << 20);
+        let daemon = OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO };
+        let host = FakeHost::new(Arc::new(Mutex::new(World::default())), store.clone());
+        let mut kernel = Kernel::new(Journal::open(store.clone()).unwrap(), host, daemon.clone());
+        let transaction = Transaction {
+            id: TxnId(0),
+            state: TxnState::Prepared,
+            lease: Lease {
+                txn: TxnId(0), owner: daemon, epoch: 1, worker_pid: None, renewed: Timestamp(0), jobs: vec![],
+            },
+            base_source: None,
+            staged_source: None,
+            base_override: None,
+            candidate_override: None,
+            gc_root: None,
+            recovery: RecoveryStrategy::RevertGeneration,
+            transition: Transition::ApplyChange { change: ChangeId("security-fix".into()), args: BTreeMap::new() },
+            facts: DerivedFacts {
+                affected_units: Vec::new(), sensitivity: Sensitivities::default(), disruption: Disruption::Brief,
+                recovery: Recovery::Revertible, touches_manifest: false, touches_canonical_probe: false,
+                changes_desired: false, below_security_floor: false, restores_unattributed_stop: false,
+                other_sessions_affected: false, affected_sessions: Vec::new(), touches_core: false,
+                caller: Actor::user(1000), config_diff: None,
+            },
+            base: GenerationId(1),
+            candidate: Some((GenerationId(2), StorePath("/nix/store/security-fix".into()))),
+            policy: PolicyVersion(Hash::ZERO),
+            approval: None,
+            snapshot: None,
+            expected: Expectation {
+                units: BTreeMap::new(), generation: None, may_change: BTreeSet::new(), others_unchanged: true,
+                settle: Settle::Duration(Millis(0)),
+            },
+            started: Timestamp(0),
+            deadline: Timestamp(1000),
+            revert_to: GenerationId(1),
+            prior_driver: None,
+            check: CheckContext {
+                required_floor: Some(GenerationId(2)), floor_fixes: vec!["inspected-fix".into()], ..Default::default()
+            },
+        };
+        let id = kernel.prepare(transaction).unwrap();
+        let transaction = kernel.journal.ledger().live[&id].txn.clone();
+        for state in [TxnState::Activating, TxnState::Checking, TxnState::Published, TxnState::Promoted] {
+            kernel.advance(&transaction, state, "test completion boundary").unwrap();
+        }
+        let mut successor = Journal::open(store.clone()).unwrap();
+        let mut lease = transaction.lease.clone();
+        lease.epoch = 2;
+        lease.owner = OwnerId::Watchdog { pid: 200, boot_id: Hash::ZERO };
+        store.set_fence(id, 2).unwrap();
+        // A takeover may crash after persisting its fence but before its
+        // journal record. The old ledger epoch alone is never authority.
+        let before_fence_reconciliation = kernel.journal.ledger().clone();
+        assert!(matches!(kernel.write_committed(&transaction), Err(KernelError::LostLease(t)) if t == id));
+        assert_eq!(kernel.journal.sync_ledger().unwrap(), &before_fence_reconciliation);
+        successor.append(Timestamp(1), Record::Takeover { txn: id, from_epoch: 1, lease }).unwrap();
+        // Simulate later durable bookkeeping while the old writer is paused.
+        successor.append(Timestamp(2), Record::SecurityFloor(Some(GenerationId(3)))).unwrap();
+        successor.append(Timestamp(3), Record::LiveTested(Some(GenerationId(3)))).unwrap();
+        let before = successor.ledger().clone();
+        assert!(matches!(kernel.write_committed(&transaction), Err(KernelError::LostLease(t)) if t == id));
+        assert_eq!(kernel.journal.sync_ledger().unwrap(), &before);
+    }
 }

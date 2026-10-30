@@ -18,7 +18,7 @@ use planarian_schema::{Actor, Hash, RecoveryStrategy, RejectReason, Timestamp, T
 
 fn any_state() -> TxnState {
     let i: u8 = kani::any();
-    match i % 14 {
+    match i % 15 {
         0 => TxnState::Prepared,
         1 => TxnState::Staged,
         2 => TxnState::Built,
@@ -32,6 +32,7 @@ fn any_state() -> TxnState {
         10 => TxnState::RecoveryFailed,
         11 => TxnState::Rejected(RejectReason::Interrupted),
         12 => TxnState::AwaitingBoot,
+        13 => TxnState::PublishingBoot,
         _ => TxnState::Cancelled(Actor::Daemon),
     }
 }
@@ -49,7 +50,8 @@ fn any_strategy() -> RecoveryStrategy {
 fn in_window(s: &TxnState) -> bool {
     matches!(
         s,
-        TxnState::Activating | TxnState::Checking | TxnState::Published | TxnState::Promoted | TxnState::Reverting
+        TxnState::Activating | TxnState::Checking | TxnState::PublishingBoot | TxnState::Published
+            | TxnState::Promoted | TxnState::Reverting
     )
 }
 
@@ -71,6 +73,7 @@ fn idx(s: &TxnState) -> u8 {
         TxnState::Rejected(_) => 11,
         TxnState::Cancelled(_) => 12,
         TxnState::AwaitingBoot => 13,
+        TxnState::PublishingBoot => 14,
     }
 }
 
@@ -132,7 +135,10 @@ fn action_ok(action: RecoveryAction, from: &TxnState, strategy: RecoveryStrategy
             path_ok(from, strategy, &[Published, RecoveryFailed]);
             reverts_ok(from, strategy);
         }
-        A::WriteCommitted => path_ok(from, strategy, &[Promoted, Committed]),
+        A::WriteCommitted => {
+            path_ok(from, strategy, &[Promoted, Committed]);
+            path_ok(from, strategy, &[Promoted, RecoveryFailed]);
+        }
         A::RevertGeneration | A::RevertDevice => reverts_ok(from, strategy),
         A::DriverBound => {
             path_ok(from, strategy, &[from.clone(), Checking, Committed]);
@@ -144,10 +150,19 @@ fn action_ok(action: RecoveryAction, from: &TxnState, strategy: RecoveryStrategy
             path_ok(from, strategy, &[Checking, Committed]);
             reverts_ok(from, strategy);
         }
+        A::ReconcileBootPublication => {
+            path_ok(from, strategy, &[PublishingBoot, AwaitingBoot, Promoted, Committed]);
+            path_ok(from, strategy, &[PublishingBoot, AwaitingBoot, Promoted, RecoveryFailed]);
+            path_ok(from, strategy, &[PublishingBoot, AwaitingBoot, RecoveryFailed]);
+            path_ok(from, strategy, &[PublishingBoot, AwaitingBoot, Reverting, Reverted]);
+            path_ok(from, strategy, &[PublishingBoot, Reverted]);
+            path_ok(from, strategy, &[PublishingBoot, RecoveryFailed]);
+        }
         A::AwaitBoot => {
             // After a reboot (before one, the transaction is left as is):
             // the candidate booted and passed, failed, or did not boot.
             path_ok(from, strategy, &[AwaitingBoot, Promoted, Committed]);
+            path_ok(from, strategy, &[AwaitingBoot, Promoted, RecoveryFailed]);
             path_ok(from, strategy, &[AwaitingBoot, RecoveryFailed]);
             path_ok(from, strategy, &[AwaitingBoot, Reverted]);
             reverts_ok(from, strategy);

@@ -31,12 +31,26 @@ use crate::chain::{self, Follows, Link, Verdict};
 use crate::ledger::{Entry, InterlockEntry, Ledger, LedgerError, Record};
 use crate::store::Store;
 use planarian_schema::{GenerationId, Hash, Timestamp, Transition, TxnId};
+use serde::{Deserialize, Serialize};
 use std::io;
 
 const HEADER: usize = 16;
 const PREV: usize = 32;
 /// Prefixed to the CRC input, so a frame of another format never passes.
 const FORMAT: &[u8] = b"planarian-journal-2";
+
+/// Identity of a verified local journal prefix. `head` commits to
+/// every record through `sequence`; compaction preserves sequence/head while
+/// changing the checkpoint identity. This is no off-machine witness.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalPrefix {
+    pub format: u32,
+    pub sequence: u64,
+    pub checkpoint_sequence: u64,
+    /// Digest of the exact checkpoint bytes incorporated in this cut, if any.
+    pub checkpoint: Option<Hash>,
+    pub head: Hash,
+}
 
 #[derive(Debug)]
 pub enum JournalError {
@@ -260,7 +274,7 @@ impl<S: Store> Journal<S> {
             });
         };
         let (seq, payload) = (f.seq, f.payload);
-        let ledger: Ledger =
+        let mut ledger: Ledger =
             serde_json::from_slice(payload).map_err(|e| JournalError::Corrupt(format!("checkpoint: {e}")))?;
         if ledger.last_seq != seq {
             return Err(JournalError::Corrupt("checkpoint seq disagrees with its ledger".into()));
@@ -270,6 +284,10 @@ impl<S: Store> Journal<S> {
         if !ledger.well_formed() {
             return Err(JournalError::Corrupt("checkpoint breaks the ledger invariant".into()));
         }
+        // Normalize only the verified in-memory representation. Never rewrite
+        // or reserialize old bytes before their original CRC/sequence and
+        // ledger checks, or change the prefix/checkpoint identity being read.
+        crate::ledger::normalize_agent_registry(&mut ledger.agents);
         Ok(Some((seq, ledger, f.prev)))
     }
 
@@ -443,6 +461,10 @@ impl<S: Store> Journal<S> {
     /// edited on disk after it was read. Read-only.
     pub fn verify_chain(&mut self) -> Result<(), JournalError> {
         let _g = self.store.lock()?;
+        self.verify_chain_locked()
+    }
+
+    fn verify_chain_locked(&self) -> Result<(), JournalError> {
         let (start, ckpt) = match self.load_checkpoint()? {
             Some((seq, _, h)) => (h, seq),
             None => (Hash::ZERO, 0),
@@ -486,6 +508,24 @@ impl<S: Store> Journal<S> {
     /// The chain head after the last record (carried by the next checkpoint).
     pub fn head(&self) -> Hash {
         self.head
+    }
+
+    /// Read one verified journal cut for normal state collection. The ledger
+    /// and its prefix are copied under the same lock, including concurrent
+    /// watchdog records and compaction. Reporting uses the resulting cached
+    /// snapshot and never calls this method, probes, or mutation backends.
+    pub fn verified_snapshot(&mut self) -> Result<(Ledger, JournalPrefix), JournalError> {
+        let _g = self.store.lock()?;
+        self.refresh()?;
+        self.verify_chain_locked()?;
+        let prefix = JournalPrefix {
+            format: 2,
+            sequence: self.ledger.last_seq,
+            checkpoint_sequence: self.checkpoint_seq,
+            checkpoint: self.store.read_checkpoint()?.map(|bytes| Hash::of(&bytes)),
+            head: self.head,
+        };
+        Ok((self.ledger.clone(), prefix))
     }
 
     /// Catch up on records written by other handles since this one last looked.
@@ -618,9 +658,9 @@ impl<S: Store> Journal<S> {
         if self.ledger.interlock.contains_key(&txn) {
             return;
         }
-        let (transition, revert_to) = match self.ledger.live.get(&txn) {
-            Some(l) => (l.txn.transition.clone(), l.txn.revert_to),
-            None => (Transition::Rollback, GenerationId(0)),
+        let (transition, revert_to, candidate, gc_root, evidence_version) = match self.ledger.live.get(&txn) {
+            Some(l) => (l.txn.transition.clone(), l.txn.revert_to, l.txn.candidate.clone(), l.txn.gc_root.clone(), 1),
+            None => (Transition::Rollback, GenerationId(0), None, None, 0),
         };
         self.ledger.add_interlock(InterlockEntry {
             txn,
@@ -630,6 +670,9 @@ impl<S: Store> Journal<S> {
             candidate_override: None,
             revert_to,
             note: text,
+            evidence_version,
+            candidate,
+            gc_root,
         });
     }
 }
@@ -640,4 +683,49 @@ fn sentinel_txn(bytes: &[u8]) -> Option<TxnId> {
     let text = std::str::from_utf8(&bytes[..end]).ok()?;
     let id = text.strip_prefix("RecoveryFailed txn=")?.split_whitespace().next()?;
     id.parse::<u64>().ok().map(TxnId)
+}
+
+#[cfg(test)]
+mod agent_registry_checkpoint_tests {
+    use super::*;
+    use crate::store::MemStore;
+
+    fn historical_checkpoint() -> (MemStore, Vec<u8>, Hash) {
+        let store = MemStore::new(1 << 20);
+        let ledger = Ledger {
+            last_seq: 3,
+            agents: vec![("coder".into(), 1000), ("tester".into(), 1001), ("coder".into(), 0)],
+            ..Default::default()
+        };
+        let head = Hash::of(b"historical journal prefix");
+        let bytes = frame(3, &head, &serde_json::to_vec(&ledger).unwrap());
+        store.write_checkpoint(&bytes).unwrap();
+        (store, bytes, head)
+    }
+
+    #[test]
+    fn old_duplicate_registrations_normalize_after_original_checkpoint_verification() {
+        let (store, bytes, head) = historical_checkpoint();
+        let mut journal = Journal::open(store.clone()).unwrap();
+        assert_eq!(journal.ledger().agents, vec![("tester".into(), 1001), ("coder".into(), 0)]);
+        assert_eq!(journal.ledger().agent_for("coder"), Some(0), "historical last-recorded owner is preserved");
+        let (ledger, prefix) = journal.verified_snapshot().unwrap();
+        assert_eq!(prefix.checkpoint, Some(Hash::of(&bytes)), "prefix identifies the original stored bytes");
+        assert_eq!(prefix.head, head);
+        assert_eq!(prefix.sequence, 3);
+        assert_eq!(store.read_checkpoint().unwrap(), Some(bytes), "reading does not rewrite old evidence");
+        journal.compact().unwrap();
+        let replayed = Journal::open(store).unwrap();
+        assert_eq!(replayed.ledger(), &ledger);
+        assert_eq!(replayed.head(), head);
+    }
+
+    #[test]
+    fn old_duplicate_registrations_do_not_bypass_original_checkpoint_integrity() {
+        let (store, mut bytes, _) = historical_checkpoint();
+        bytes[HEADER + PREV] ^= 1;
+        store.write_checkpoint(&bytes).unwrap();
+        assert!(matches!(Journal::open(store.clone()), Err(JournalError::Corrupt(_))));
+        assert_eq!(store.read_checkpoint().unwrap(), Some(bytes), "invalid evidence is retained without normalization writes");
+    }
 }

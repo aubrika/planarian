@@ -340,12 +340,49 @@ impl World {
         (eval, broken)
     }
 
+    fn activation_for(&self, g: GenerationId) -> ActivationPlan {
+        let cur = self.gens[&self.current].clone();
+        let new = self.gens[&g].clone();
+        let mut plan = new.eval.activation.clone();
+        for u in new.eval.units.keys() {
+            match cur.eval.units.get(u) {
+                None => {
+                    plan.start.insert(u.clone());
+                }
+                Some(old) if old != &new.eval.units[u] || new.broken.contains(u) != cur.broken.contains(u) => {
+                    plan.restart.insert(u.clone());
+                }
+                _ => {}
+            }
+        }
+        for (k, v) in &new.eval.options {
+            if cur.eval.options.get(k) != Some(v) {
+                // An option change restarts the services of its module (`services.<name>.…`).
+                if let Some(svc) = k.strip_prefix("services.").and_then(|r| r.split('.').next()) {
+                    let id = UnitId::service(svc);
+                    if new.eval.units.contains_key(&id) {
+                        plan.restart.insert(id);
+                    }
+                }
+            }
+        }
+        for u in cur.eval.units.keys() {
+            if !new.eval.units.contains_key(u) {
+                plan.stop.insert(u.clone());
+            }
+        }
+        plan
+    }
+
     pub fn add_generation(&mut self, overrides: &OverrideSet) -> GenerationId {
         let (eval, broken) = self.evaluate(overrides);
         let id = GenerationId(self.gens.keys().map(|g| g.0).max().unwrap_or(0) + 1);
         let path = StorePath(format!("/nix/store/{:03}-nixos-system-fake", id.0));
         let created = (self.rebuild_uid, self.now);
         self.gens.insert(id, Gen { path, eval, broken, created });
+        let hash = World::override_hash_of(overrides);
+        self.override_store.insert(hash, overrides.clone());
+        self.gen_overrides.insert(id, hash);
         id
     }
 
@@ -581,7 +618,7 @@ impl Fake {
         }
         let out = f(&mut w);
         match injected {
-            Some(Injected::Partial) => Outcome::Failed("partially applied (injected)".into()),
+            Some(Injected::Partial) => Outcome::Partial("partially applied (injected)".into()),
             Some(Injected::Unknown) => Outcome::Unknown("no answer (injected)".into()),
             _ => out,
         }
@@ -610,7 +647,7 @@ impl UnitBackend for Fake {
         Ok(self.w().units.keys().cloned().collect())
     }
 
-    fn start_agent(&self, name: &str, _argv: &[String]) -> Outcome {
+    fn start_agent(&self, name: &str, _argv: &[String], _by: u32) -> Outcome {
         let mut w = self.w();
         let now = w.now;
         let id = UnitId::service(&format!("planarian-agent-{name}"));
@@ -718,39 +755,22 @@ impl GenerationBackend for Fake {
                 g
             }
         };
-        let cur = w.gens[&w.current].clone();
         let new = w.gens[&g].clone();
-        let mut plan = new.eval.activation.clone();
-        for u in new.eval.units.keys() {
-            match cur.eval.units.get(u) {
-                None => {
-                    plan.start.insert(u.clone());
-                }
-                Some(old) if old != &new.eval.units[u] || new.broken.contains(u) != cur.broken.contains(u) => {
-                    plan.restart.insert(u.clone());
-                }
-                _ => {}
-            }
-        }
-        for (k, v) in &new.eval.options {
-            if cur.eval.options.get(k) != Some(v) {
-                // An option change restarts the services of its module (`services.<name>.…`).
-                if let Some(svc) = k.strip_prefix("services.").and_then(|r| r.split('.').next()) {
-                    let id = UnitId::service(svc);
-                    if new.eval.units.contains_key(&id) {
-                        plan.restart.insert(id);
-                    }
-                }
-            }
-        }
-        for u in cur.eval.units.keys() {
-            if !new.eval.units.contains_key(u) {
-                plan.stop.insert(u.clone());
-            }
-        }
+        let plan = w.activation_for(g);
         let root = format!("/nix/var/nix/gcroots/planarian/builds/{}", eval.source.to_hex());
         w.gc_roots.insert(root.clone());
         Ok(Built { generation: g, path: new.path, root, activation: plan })
+    }
+
+    fn preflight_existing(&self, g: GenerationId, path: &StorePath) -> Result<Built, Outcome> {
+        let mut w = self.w();
+        if w.gens.get(&g).is_none_or(|target| &target.path != path) || w.collected.contains(&g) {
+            return Err(Outcome::Unknown("preflight target is missing or changed".into()));
+        }
+        let activation = w.activation_for(g);
+        let root = format!("/nix/var/nix/gcroots/planarian/preflight/{}/{}", g.0, w.gens[&g].eval.source.to_hex());
+        w.gc_roots.insert(root.clone());
+        Ok(Built { generation: g, path: path.clone(), root, activation })
     }
 
     fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
@@ -835,6 +855,15 @@ impl GenerationBackend for Fake {
         Ok(self.w().one_shot)
     }
 
+    fn withdraw_boot_once(&self, keep: GenerationId, op: &OpId) -> Outcome {
+        self.run(op, format!("withdraw_boot_once({})", keep.0), |w| {
+            w.one_shot = None;
+            w.boot_entries.insert(keep);
+            w.boot_default = keep;
+            Outcome::Succeeded
+        })
+    }
+
     fn protect(&self, g: GenerationId, op: &OpId) -> Outcome {
         self.run(op, format!("protect({})", g.0), |_| Outcome::Succeeded)
     }
@@ -889,6 +918,11 @@ impl GenerationBackend for Fake {
     fn read_overrides(&self) -> Result<(OverrideSet, Hash), Outcome> {
         let w = self.w();
         Ok((w.overrides.clone(), World::override_hash_of(&w.overrides)))
+    }
+
+    fn read_override(&self, hash: &Hash) -> Result<OverrideSet, Outcome> {
+        self.w().override_store.get(hash).cloned()
+            .ok_or_else(|| Outcome::Unknown("override content is unavailable".into()))
     }
 
     fn remember_override(&self, set: &OverrideSet) -> Result<Hash, Outcome> {

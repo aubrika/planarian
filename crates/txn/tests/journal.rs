@@ -8,6 +8,118 @@ use planarian_txn::journal::{Journal, JournalError};
 use planarian_txn::ledger::{Entry, Record};
 use planarian_txn::store::{FileStore, MemStore, Store};
 
+#[test]
+fn exported_prefix_and_ledger_survive_other_writers_replay_and_compaction() {
+    let store = MemStore::new(1 << 20);
+    let mut reader = Journal::open(store.clone()).unwrap();
+    let (_, empty) = reader.verified_snapshot().unwrap();
+    assert_eq!((empty.sequence, empty.checkpoint_sequence, empty.head), (0, 0, Hash::ZERO));
+    let mut writer = Journal::open(store.clone()).unwrap();
+    writer.append(Timestamp(1), Record::KnownGood(G1)).unwrap();
+    let (ledger, before) = reader.verified_snapshot().unwrap();
+    assert_eq!(ledger.known_good, Some(G1));
+    assert_eq!(ledger.last_seq, before.sequence);
+    assert_eq!(before.head, writer.head());
+    assert_eq!(before.checkpoint, None);
+    writer.compact().unwrap();
+    let (ledger_after, after) = reader.verified_snapshot().unwrap();
+    assert_eq!(ledger, ledger_after);
+    assert_eq!(before.sequence, after.sequence);
+    assert_eq!(before.head, after.head);
+    assert_eq!(after.checkpoint_sequence, after.sequence);
+    assert_eq!(after.checkpoint, store.read_checkpoint().unwrap().map(|bytes| Hash::of(&bytes)));
+    let (replayed, reopened) = Journal::open(store).unwrap().verified_snapshot().unwrap();
+    assert_eq!(replayed, ledger);
+    assert_eq!(reopened, after);
+}
+
+#[test]
+fn exported_prefix_refuses_retained_record_damage() {
+    let store = MemStore::new(1 << 20);
+    let mut j = Journal::open(store.clone()).unwrap();
+    j.append(Timestamp(1), Record::KnownGood(G1)).unwrap();
+    j.verified_snapshot().unwrap();
+    store.write_at(48, b"X").unwrap();
+    assert!(matches!(j.verified_snapshot(), Err(JournalError::Integrity(_))));
+}
+
+/// Candidate/root identities must outlive the bounded terminal archive and
+/// survive the real checkpoint storage layout while recovery is interlocked.
+#[test]
+fn boot_publication_interlock_preserves_candidate_roots_on_disk() {
+    for sentinel in [false, true] {
+        let rig = Rig::new();
+        let mut daemon = rig.daemon();
+        let id = daemon.prepare(good_change()).unwrap();
+        if sentinel {
+            daemon.crash_at = Some(planarian_txn::kernel::CrashPoint::State("PublishingBoot"));
+            assert!(daemon.run_boot_only(id).is_err());
+        } else {
+            rig.w().boot_once_reply = Some(Outcome::Unknown("lost publication reply".into()));
+            rig.w().boot_selection_unknown = true;
+            assert_eq!(daemon.run_boot_only(id).unwrap(), TxnState::RecoveryFailed);
+        }
+        let entries = daemon.journal.segment().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let journal_dir = directory.path().join("journal");
+        let txn_dir = directory.path().join("txn");
+        let mut disk = Journal::open(FileStore::open(&journal_dir, &txn_dir, 1 << 20).unwrap()).unwrap();
+        for entry in entries {
+            disk.append(entry.at, entry.record).unwrap();
+        }
+        if sentinel {
+            disk.write_sentinel(id, "publication recovery out of journal space").unwrap();
+        }
+        disk.compact().unwrap();
+        drop(disk);
+        let replayed = Journal::open(FileStore::open(&journal_dir, &txn_dir, 1 << 20).unwrap()).unwrap();
+        let obligation = &replayed.ledger().interlock[&id];
+        assert_eq!(obligation.evidence_version, 1);
+        assert_eq!(obligation.candidate, Some((G2, path(G2))));
+        assert_eq!(obligation.gc_root.as_deref(), Some("/nix/var/nix/gcroots/planarian/builds/cand"));
+        assert_eq!(obligation.revert_to, G1);
+    }
+}
+
+#[test]
+fn historical_interlock_does_not_invent_candidate_root_evidence() {
+    let old = r#"{"txn":1,"transition":"Rollback","failed_from":"Published","base_override":null,"candidate_override":null,"revert_to":1,"note":"old recovery"}"#;
+    let entry: planarian_txn::ledger::InterlockEntry = serde_json::from_str(old).unwrap();
+    assert_eq!(entry.evidence_version, 0);
+    assert!(entry.candidate.is_none());
+    assert!(entry.gc_root.is_none());
+    assert_eq!(serde_json::to_string(&entry).unwrap(), old);
+}
+
+#[test]
+fn repeated_agent_launches_keep_one_registration_through_replay_and_compaction() {
+    let store = MemStore::new(1 << 20);
+    let mut journal = Journal::open(store.clone()).unwrap();
+    let mut owners = std::collections::BTreeMap::new();
+    for n in 0..300u64 {
+        let name = format!("agent-{}", n % 3);
+        let by = if n % 2 == 0 { ALICE } else { ADMIN };
+        journal.append(Timestamp(n), Record::AgentStarted { name: name.clone(), by }).unwrap();
+        owners.insert(name, by);
+        assert_eq!(journal.ledger().agents.len(), owners.len());
+    }
+    assert_eq!(journal.segment().unwrap().len(), 300, "every accepted launch retains its own journal record");
+    assert_eq!(journal.ledger().last_seq, 300);
+    assert_eq!(journal.ledger().agents.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(), owners);
+    let ledger = journal.ledger().clone();
+    let head = journal.head();
+    drop(journal);
+    let mut replayed = Journal::open(store.clone()).unwrap();
+    assert_eq!(replayed.ledger(), &ledger);
+    replayed.compact().unwrap();
+    let compacted = Journal::open(store).unwrap();
+    assert_eq!(compacted.ledger(), &ledger);
+    assert_eq!(compacted.head(), head);
+    for (name, by) in owners {
+        assert_eq!(compacted.ledger().agent_for(&name), Some(by));
+    }
+}
+
 /// A realistic history: commits, a revert, a suppression, an incident, a
 /// RecoveryFailed and its resolution.
 fn history() -> Vec<Entry> {
@@ -426,4 +538,33 @@ fn erased_middle_header_is_an_integrity_failure() {
     drop(j);
     s.write_at(offs[2], &[0u8; 16]).unwrap();
     assert!(matches!(Journal::open(s), Err(JournalError::Integrity(_))));
+}
+
+
+/// D03: checkpoint compaction must preserve actual acknowledgments. An old
+/// archive with no such evidence stays unknown, regardless of Committed.
+#[test]
+fn terminal_operation_evidence_survives_compaction_without_inventing_legacy_success() {
+    let rig = Rig::new();
+    let mut daemon = rig.daemon();
+    let id = daemon.prepare(txn(Transition::RestartUnit(web()), Actor::Daemon)).unwrap();
+    assert_eq!(daemon.run(id).unwrap(), TxnState::Committed);
+    assert_eq!(daemon.journal.ledger().operation_outcome(id), Outcome::Succeeded);
+    let archived = daemon.journal.ledger().terminal[&id].clone();
+    assert_eq!(archived.evidence_version, 1);
+    assert_eq!(archived.ops.as_ref().unwrap().len(), 1);
+    daemon.journal.compact().unwrap();
+    let reopened = Journal::open(rig.store.clone()).unwrap();
+    assert_eq!(reopened.ledger().terminal[&id], archived);
+    let mut old = serde_json::to_value(archived).unwrap();
+    old.as_object_mut().unwrap().remove("evidence_version");
+    old.as_object_mut().unwrap().remove("ops");
+    let legacy: planarian_txn::ledger::TerminalTxn = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(legacy.evidence_version, 0);
+    assert!(legacy.ops.is_none());
+    assert_eq!(serde_json::to_value(&legacy).unwrap(), old, "old checksum bytes retain their JSON shape");
+    let mut ledger = reopened.ledger().clone();
+    ledger.terminal.insert(id, legacy);
+    assert_eq!(ledger.state(id), Some(TxnState::Committed));
+    assert!(matches!(ledger.operation_outcome(id), Outcome::Unknown(_)));
 }

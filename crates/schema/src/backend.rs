@@ -100,8 +100,10 @@ pub trait UnitBackend {
     }
     fn list(&self) -> Result<Vec<UnitId>, Outcome>;
     /// Start an agent as its own principal (§11, §16): the transient unit
-    /// `planarian-agent-<name>`, under a dynamic uid of its own.
-    fn start_agent(&self, _name: &str, _argv: &[String]) -> Outcome {
+    /// `planarian-agent-<name>`, under a dynamic uid of its own. `by` is the
+    /// authenticated launching uid, used only for resource admission and
+    /// attribution; authority is still derived from the durable start record.
+    fn start_agent(&self, _name: &str, _argv: &[String], _by: u32) -> Outcome {
         Outcome::Failed("this backend cannot start agents".into())
     }
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome;
@@ -126,6 +128,18 @@ pub trait GenerationBackend {
     fn evaluate(&self, src: &StagedSource) -> Result<EvaluatedGeneration, Outcome>;
     /// Store-only; roots its own output.
     fn build(&self, eval: &EvaluatedGeneration) -> Result<Built, Outcome>;
+    /// Derive activation consequences relative to the running generation and
+    /// retain the exact selected store path through preparation and approval.
+    /// A prior health verdict or equal manifests do not replace this evidence.
+    fn preflight_existing(&self, _g: GenerationId, _path: &StorePath) -> Result<Built, Outcome> {
+        Err(Outcome::Unknown("existing-generation activation evidence unavailable".into()))
+    }
+    /// Read and validate a remembered override's exact content for risk
+    /// derivation; absence is unknown, never an empty configuration diff.
+    fn read_override(&self, _hash: &Hash) -> Result<OverrideSet, Outcome> {
+        Err(Outcome::Unknown("generation override evidence unavailable".into()))
+    }
+
     fn verify_candidate(&self, path: &StorePath, expected: &Hash) -> Result<bool, Outcome>;
     fn pending_jobs(&self) -> Result<Vec<JobId>, Outcome>;
     /// `None`: the backend cannot say whether work tagged with `op` exists.
@@ -139,9 +153,15 @@ pub trait GenerationBackend {
     /// Boot entry only; no re-activation.
     fn publish_boot(&self, g: GenerationId, op: &OpId) -> Outcome;
     /// The boot-only path (§12 step 7, §12f): `g` boots once, at the next
-    /// boot; `keep` stays the default. All or nothing.
+    /// boot; `keep` stays the default. Non-success may still have effects;
+    /// callers must reconcile under their durable publication intent.
     fn publish_boot_once(&self, _g: GenerationId, _keep: GenerationId, _op: &OpId) -> Outcome {
         Outcome::Failed("this boot loader cannot boot a generation once".into())
+    }
+    /// Withdraw any one-shot selection and restore the eligible default.
+    /// Success proves both effects; non-success leaves a recovery obligation.
+    fn withdraw_boot_once(&self, _keep: GenerationId, _op: &OpId) -> Outcome {
+        Outcome::Unknown("this boot loader cannot prove one-shot withdrawal".into())
     }
     /// Who created generation `g` and when (its profile link's owner and
     /// time): the provenance of a rebuild made outside Planarian (§15).
@@ -213,6 +233,11 @@ pub struct SessionInfo {
     pub class: String,
     pub seat: Option<String>,
     pub remote: bool,
+    /// The backend identified an eligible graphical session (logind Type=x11
+    /// or wayland, State=active or online). Missing historical evidence is
+    /// false: an authenticated login alone never implies a compositor.
+    #[serde(default)]
+    pub graphical: bool,
     pub created: Timestamp,
     /// logind `State=active`: the session in the foreground of its seat.
     #[serde(default)]
@@ -226,6 +251,13 @@ impl SessionInfo {
     /// §10: only `user`-class sessions with a seat, or remote user sessions, count.
     pub fn establishes(&self) -> bool {
         self.class == "user" && (self.seat.is_some() || self.remote)
+    }
+
+    /// Graphical readiness is expected for a local seated user desktop. Locked
+    /// and backgrounded desktops remain eligible; greeters, SSH/TTY-only and
+    /// closing sessions do not create a compositor expectation.
+    pub fn graphical_establishes(&self) -> bool {
+        self.establishes() && self.graphical && self.seat.is_some() && !self.remote
     }
 }
 
