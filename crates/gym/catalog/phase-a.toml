@@ -2931,7 +2931,7 @@ refused_with = "CoreTarget"
 [[fault]]
 id = "en-i6-repair-waits-for-activation"
 family = "english"
-summary = "While a slow generation change sits in Activating, gym-web crashes. Its restart is not executed until the activation leaves the exclusive states; then it runs."
+summary = "While a slow generation change sits in Activating, gym-web crashes. No repair is prepared until the activation leaves the exclusive states; by the end gym-web runs again."
 spec = ["I6"]
 tags = ["english"]
 scoring = "must-pass"
@@ -2947,11 +2947,13 @@ window = "5m"
 [fault.required_post]
 units = { "service:gym-web" = "Running" }
 
+# No restart prepared while the change was Activating. Afterwards either a
+# restart repairs gym-web, or the activation itself starts it again (on the
+# VM, switch-to-configuration starts failed units).
 [[fault.required_post.txn]]
 transition = "RestartUnit"
 target = "service:gym-web"
-terminal = "Committed"
-started_after = { transition = "ApplyChange", left = "Activating" }
+not_during = { transition = "ApplyChange", state = "Activating" }
 
 # I8: "...an approval token bound to the concrete candidate, re-validated immediately before execution."
 [[fault]]
@@ -3072,7 +3074,7 @@ transition = "ApplyChange"
 caller = "user:1001"
 tier = "AskFirst"
 never = ["Activating"]
-facts = { affected_units = ["service:sshd"] }
+affected_includes = ["service:sshd"]
 
 # I15: "a mutating call with a stale epoch is refused; only the lease holder advances the journal."
 [[fault]]

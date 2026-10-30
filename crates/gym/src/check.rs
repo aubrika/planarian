@@ -1071,6 +1071,44 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             .map(|t| t.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "))
             .unwrap_or_default()
     );
+    // I6: none of the matching transactions was prepared while another
+    // transaction was in a state (none at all passes).
+    if let Some(during) = spec.get("not_during").and_then(T::as_table) {
+        match &e.entries {
+            None => v.unchecked.push(format!("{label}: not_during (journal history)")),
+            Some(en) => {
+                let other = during.get("transition").and_then(T::as_str).unwrap_or("");
+                let state = during.get("state").and_then(T::as_str).unwrap_or("");
+                let others: BTreeSet<TxnId> =
+                    all.iter().filter(|x| transition_name(&x.transition) == other).map(|x| x.id).collect();
+                let mine: BTreeSet<TxnId> = matching.iter().map(|x| x.id).collect();
+                let mut inside: BTreeSet<TxnId> = BTreeSet::new();
+                let mut saw_state = false;
+                for x in en {
+                    match &x.record {
+                        Record::Advance { txn, to, .. } if others.contains(txn) => {
+                            if state_name(to) == state {
+                                inside.insert(*txn);
+                                saw_state = true;
+                            } else {
+                                inside.remove(txn);
+                            }
+                        }
+                        Record::Prepared(p) if mine.contains(&p.id) && !inside.is_empty() => {
+                            v.failures.push(format!("{label}: txn {} prepared while {other} was {state}", p.id.0));
+                        }
+                        _ => {}
+                    }
+                }
+                if !saw_state {
+                    v.failures.push(format!("{label}: no {other} was ever {state}"));
+                }
+            }
+        }
+        if spec.get("terminal").is_none() {
+            return;
+        }
+    }
     // A refusal for this reason (I5: never converted to a tier), from the
     // executor log; and no matching transaction ran.
     if let Some(why) = s("refused_with") {
@@ -1247,6 +1285,24 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             }
         }
     }
+    // The derived affected units include these (others may come with the
+    // real activation, as dbus-broker does).
+    if let Some(want) = spec.get("affected_includes").and_then(T::as_array) {
+        let facts = e.log.iter().find_map(|r| match &r.result {
+            Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if *txn == t.id => r.facts.clone(),
+            _ => None,
+        });
+        match facts {
+            None => v.failures.push(format!("{label}: no derived facts in the executor log")),
+            Some(f) => {
+                for u in want.iter().filter_map(T::as_str) {
+                    if !f.affected_units.contains(&unit(u)) {
+                        v.failures.push(format!("{label}: {u} not among the affected units {:?}", f.affected_units));
+                    }
+                }
+            }
+        }
+    }
     // Parked for approval, and activated only once approved.
     if s("not_activated_before") == Some("approval") {
         let parked = e.log.iter().any(|r| matches!(&r.result, Submitted::Parked { txn, .. } if *txn == t.id));
@@ -1333,6 +1389,8 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
 }
 
 const TXN_KEYS: &[&str] = &[
+    "not_during",
+    "affected_includes",
     "transition",
     "target",
     "change",
