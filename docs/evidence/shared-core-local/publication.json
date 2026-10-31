@@ -1,0 +1,46 @@
+{
+  "format_version": 1,
+  "repository": "aubrika/planarian",
+  "previous_upload_error": {
+    "http_status": 403,
+    "message": "Resource not accessible by integration",
+    "resolved": true
+  },
+  "write_access": "VERIFIED_BY_SUCCESSFUL_GIT_DATA_WRITES",
+  "installation_id": 177044518,
+  "implementation_candidate": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+  "source_commits": [
+    {
+      "local": "e8f98a453d6db35dc2e03fc5d10e2ef72dd127f3",
+      "remote": "741c1f5014838c4eb4bfacf971ba456cc8905d98",
+      "tree": "a7ab11b7b72a3cf9446bbec344250d79ac47dbcb"
+    },
+    {
+      "local": "39d602702469abd2f20795d8d50d78bd5fe44879",
+      "remote": "90e2f11d24f3b3a27f7ffee7ab664b603ce20b38",
+      "tree": "a9cc8b22a9332c0daa14d64f1e5bfc7927c1a118"
+    },
+    {
+      "local": "29e3702c72986029705d576ce536c45a9917e9c4",
+      "remote": "20916c3f05a81e6321f746f3c66a68c240fbae4d",
+      "tree": "9873137c0f37d9799bcd06aa39e475eceb8491a3"
+    },
+    {
+      "local": "86fd5758f5ed7ffabb2e447d170bd91f6eef0366",
+      "remote": "0741ede6368dd81960a026d0c2b00e554a32723e",
+      "tree": "91fbf985c7264504ed9583000e68a50933bf73d1"
+    },
+    {
+      "local": "47ab9bc0d83a8fd49ac64ac81f46c0bbac7b7af4",
+      "remote": "3b69e6f24864af890188033d3948cd21603f8e4b",
+      "tree": "03325b8b59722f89e61c35de47867903c96fb8d6"
+    },
+    {
+      "local": "58cb4cbabeff718c63c6d9e135ef114816cce74b",
+      "remote": "eaf5a567d2ccbfd06b7159d6e63dac4c2a2d970a",
+      "tree": "9b164de6036d95d3afc7efc0b76c65e63a365ae2"
+    }
+  ],
+  "all_source_trees_match_saved_commits": true,
+  "note": "Publication/ref/PR state is recorded in GitHub; this evidence does not assert acceptance."
+}

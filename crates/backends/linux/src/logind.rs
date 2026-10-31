@@ -73,6 +73,8 @@ pub fn parse_session(id: &str, text: &str) -> Option<SessionInfo> {
         class: get("Class"),
         seat: Some(get("Seat")).filter(|s| !s.is_empty()),
         remote: get("Remote") == "yes",
+        graphical: matches!(get("Type").as_str(), "x11" | "wayland")
+            && matches!(get("State").as_str(), "active" | "online"),
         active: get("State") == "active",
         idle: get("IdleHint") == "yes",
         // `Timestamp` is printed; `TimestampMonotonic` is not wall time. Use the
@@ -85,7 +87,7 @@ pub fn parse_session(id: &str, text: &str) -> Option<SessionInfo> {
 /// exits 0) for a comma-separated list, so every session went unseen.
 pub fn show_session_argv(id: &str) -> Vec<String> {
     let mut a: Vec<String> = ["loginctl", "show-session", id].map(String::from).to_vec();
-    a.extend(["User", "Class", "Seat", "Remote", "State", "IdleHint"].map(|p| format!("--property={p}")));
+    a.extend(["User", "Class", "Seat", "Remote", "Type", "State", "IdleHint"].map(|p| format!("--property={p}")));
     a
 }
 
@@ -179,6 +181,7 @@ mod tests {
             class: "user".into(),
             seat: Some("seat0".into()),
             remote: false,
+            graphical: true,
             created: Timestamp(0),
             active: true,
             idle: false,
@@ -198,6 +201,7 @@ mod tests {
     fn one_property_flag_each() {
         let a = show_session_argv("2");
         assert!(a.iter().all(|x| !x.starts_with("--property=") || !x.contains(',')), "{a:?}");
+        assert!(a.iter().any(|x| x == "--property=Type"), "graphical eligibility comes from logind");
         // What systemd 260 prints for that form, in its own order.
         let s = parse_session("2", "User=1000\nSeat=seat0\nRemote=no\nClass=user\n").unwrap();
         assert!(s.establishes());
@@ -214,5 +218,31 @@ mod tests {
         assert!(!g.establishes());
         let r = parse_session("5", "User=1000\nClass=user\nSeat=\nRemote=yes\n").unwrap();
         assert!(r.establishes() && r.seat.is_none());
+    }
+
+    #[test]
+    fn desktop_eligibility_requires_graphical_type_and_live_lifecycle() {
+        let base = "User=1000\nClass=user\nSeat=seat0\nRemote=no\n";
+        let graphical = |kind: &str, state: &str| {
+            parse_session("2", &format!("{base}Type={kind}\nState={state}\nIdleHint=yes\n")).unwrap()
+        };
+        assert!(graphical("wayland", "active").graphical_establishes());
+        let locked = graphical("x11", "online");
+        assert!(locked.graphical_establishes() && !locked.active && locked.idle);
+        assert!(!graphical("wayland", "closing").graphical_establishes());
+        assert!(!graphical("tty", "active").graphical_establishes());
+        assert!(!parse_session("2", base).unwrap().graphical_establishes(), "missing type is no desktop evidence");
+        let remote = parse_session("ssh", "User=1000\nClass=user\nRemote=yes\nType=tty\nState=active\n").unwrap();
+        assert!(remote.establishes() && !remote.graphical_establishes());
+        let greeter = parse_session("g", "User=990\nClass=greeter\nSeat=seat0\nType=wayland\nState=active\n").unwrap();
+        assert!(!greeter.graphical_establishes());
+    }
+
+    #[test]
+    fn old_session_records_do_not_gain_graphical_evidence() {
+        let old = r#"{"id":"2","uid":1000,"class":"user","seat":"seat0","remote":false,"created":0}"#;
+        let session: SessionInfo = serde_json::from_str(old).unwrap();
+        assert!(session.establishes());
+        assert!(!session.graphical_establishes());
     }
 }

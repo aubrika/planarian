@@ -1,5 +1,7 @@
 # What Planarian guarantees, and how we know
 
+> Shared-core integration: the proof/test tables below describe their stated models and historical revisions. They do not certify the merged candidate. Current records are in `shared-core-review.md` and `shared-core-acceptance.json`; actual current-source Verus/Kani artifacts and the required VM/hardware tests remain necessary. B-20 is the closed instance-authority finding; R11 concerns the adopted cooperative writer boundary and any remaining B-21 enforcement gap.
+
 A map of Planarian's core from four angles: the trust boundary, the
 transaction state machine, the policy decision, and the ledger. It lists
 every guarantee, what establishes it (a Verus proof, a Kani harness, or
@@ -403,15 +405,20 @@ What each phase moves from 𝒯 (or from "tested") into 𝒱:
 | D | switch and rollback (I1, I3), the Rust supervisor, store integrity for content-addressed paths | P2, P3, P6 and C Nix and systemd themselves |
 | E | Asterinas OSTD, the model channel (I9), the core update path (I2) | P8 (the kernel), most of what remains of the platform |
 
-What never moves: hardware and firmware, the hash function, the people
-who approve, and the proof tools themselves. The last is worth saying
-plainly: Verus, Z3 and the Rust compiler are trusted today, but
-`assumptions.md` does not list them, so the trust count does not count
-them. Whether it should is an open question. The end state is the
-formula from §0 taken seriously: 𝒯 shrinks toward that floor while 𝒱
-grows, so |𝒯|/|𝒱| falls, and |𝒯| never reaches zero.
+What remains trusted includes hardware and firmware, the hash function,
+the people who approve, and the proof tools. Proof-validity trust is
+explicitly listed as V7–V11 in `assumptions.md`, including Verus, Z3,
+rustc and Kani/CBMC, and counted by the existing trust ratchet. The end
+state still has a nonzero trusted floor; verification does not prove its
+own tools sound.
 
-Four invariants have no proof scheduled even in the end state: I4 and I20
+Several listed invariants lack a complete proof schedule even in the end state: I4 and I20
 depend on what services and the init system report (I20 becomes provable
 once the supervisor is Planarian's own, in D, if the SPEC adds it), and
 I7's completeness is a property of `exec` that C could take on.
+
+## Current proof accounting and format evidence
+
+The numerical baseline remains 47:56, trust 37 and internal-unproven 5. The shared-core proof map names 45 unique obligations supporting 47 historical invariant edges; it requires complete successful source-bound verifier artifacts and rejects duplicate/deleted/unverified mappings. I24 and I25 are separately stated tested v4.6 invariants, not new discharged proofs inferred from source names. The previous G5 proposal is superseded by the adopted bounded-Built/waiting-AwaitingBoot contract and is removed without resetting that baseline.
+
+Terminal operation evidence, sampled expectation and observed health are separate from transaction lifecycle. Missing historical acknowledgments remain Unknown. The atomic SwapStep property proves a model decision; real replacement acceptance additionally requires the I23 directory lock under the adopted writer model, with non-cooperating writers explicitly X-12.

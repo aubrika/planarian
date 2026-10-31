@@ -3,6 +3,14 @@
 Where Planarian stands against the Phase A exit gate (SPEC §4), with the
 evidence for each criterion and how to reproduce it. Updated 2026-10-30.
 
+## Current shared-core integration
+
+The gate remains uncalled. The shared-core PR merges the adopted v4.6 contract and later fixes through main `20d4f2c`. Its current reconciliation is `docs/shared-core-review.md`. The manifest still names an earlier candidate and needs regeneration; old 9aca/eaf5 records do not certify the merged source. The superseded G5 proposal is absent, with the 47:56 / trust 37 / internal-unproven 5 baseline unchanged.
+
+At `1d10786`, formatting and all Kani harnesses passed; Verus reported zero errors, while Clippy and two executor fixture tests failed. Installed-entry VMs failed their initial canonical root-filesystem space check; four other VM jobs stopped at the same package tests. Prepared fixes retain the canonical thresholds and test oracles. Later source implements delayed boot-only confirmation and bounded Built parking; those changes and external-dependency module validation require new compiled/proof/installed-entry results. Exact runs and limits are recorded in the reconciliation.
+
+The current source must pass compilation/tests/proofs, role-qualified exact catalog coverage, installed-entry boot tests and the declared performance/durability scopes before freeze. A source merge or authored test does not establish a pass. Main's approval PTY fix and the later R03/R08/R10/agent-instance fixes are retained.
+
 ## Summary
 
 **The gate is not called.** SPEC v4.6 (installed 2026-10-30) holds Phase A
@@ -23,8 +31,7 @@ Where that stands, in rule 19's order:
 The bypass register has no open High row: B-1 and B-2 closed on
 2026-10-30, and B-20, found in the review, is closed. Agents act with the
 permissions of the user who started them, attributed per instance
-(owner decision, 2026-10-30; §11, I24, X-11). Six Medium rows stay open,
-none for Phase A.
+(owner decision, 2026-10-30; §11, I24, X-11). Six pre-existing Medium rows remain open; shared-core B-21 additionally tracks the pending Phase A cooperative-lock acceptance. A zero High count closes no R/S requirement.
 
 The criteria below are the last results recorded before v4.6, on the
 v4.4 catalog (101 entries; it has 128 at v4.6). They are history, not the

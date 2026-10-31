@@ -58,6 +58,7 @@ fn user_units_follow_sessions_and_desktop_deadline() {
         class: "user".into(),
         seat: Some("seat0".into()),
         remote: false,
+        graphical: true,
         active: true,
         idle: false,
         created,
@@ -90,6 +91,7 @@ fn user_units_follow_sessions_and_desktop_deadline() {
         class: "greeter".into(),
         seat: Some("seat0".into()),
         remote: false,
+        graphical: true,
         active: true,
         idle: false,
         created,
@@ -132,6 +134,7 @@ fn unknown_session_creation_time_counts_from_first_sight() {
         class: "user".into(),
         seat: Some("seat0".into()),
         remote: false,
+        graphical: true,
         active: true,
         idle: false,
         created: Timestamp(0),
@@ -155,6 +158,7 @@ fn second_session_of_one_uid_is_judged_on_its_own() {
             class: "user".into(),
             seat: Some("seat0".into()),
             remote: false,
+            graphical: true,
             active: id == "s2",
             idle: false,
             created,
@@ -170,4 +174,66 @@ fn second_session_of_one_uid_is_judged_on_its_own() {
     let s2: UnitId = "target@1000/s2:graphical-session".parse().unwrap();
     assert_eq!(s.status(&s1, &defs), UnitStatus::Running);
     assert_eq!(s.status(&s2, &defs), UnitStatus::Stopped);
+}
+
+#[test]
+fn ssh_and_tty_logins_do_not_create_compositor_expectations() {
+    let (fake, mut a) = rig();
+    let created = fake.w().now;
+    for (id, remote, seat) in [("ssh", true, None), ("tty", false, Some("seat0".into()))] {
+        fake.w().sessions.push(SessionInfo {
+            id: id.into(),
+            uid: 1000,
+            class: "user".into(),
+            seat,
+            remote,
+            graphical: false,
+            active: true,
+            idle: false,
+            created,
+        });
+    }
+    for _ in 0..14 {
+        tick(&fake, &mut a);
+    }
+    let (s, defs) = tick(&fake, &mut a);
+    assert!(s.conditions.contains(&Condition::SessionEstablished { uid: Some(1000) }));
+    assert!(defs.contains_key(&"service@1000:pipewire".parse().unwrap()), "ordinary user services remain applicable");
+    assert!(defs.keys().all(|id| id.name != "graphical-session"), "authentication creates no desktop deadline");
+}
+
+#[test]
+fn locked_and_inactive_graphical_sessions_keep_their_own_readiness() {
+    let (fake, mut a) = rig();
+    let created = fake.w().now;
+    fake.w().sessions.push(SessionInfo {
+        id: "locked".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        graphical: true,
+        active: false,
+        idle: true,
+        created,
+    });
+    fake.w().sessions.push(SessionInfo {
+        id: "lock-helper".into(),
+        uid: 1000,
+        class: "lock-screen".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        graphical: true,
+        active: true,
+        idle: false,
+        created,
+    });
+    fake.w().compositors.insert("locked".into(), true);
+    for _ in 0..14 {
+        tick(&fake, &mut a);
+    }
+    let (s, defs) = tick(&fake, &mut a);
+    let desktop: UnitId = "target@1000/locked:graphical-session".parse().unwrap();
+    assert_eq!(s.status(&desktop, &defs), UnitStatus::Running);
+    assert!(!defs.contains_key(&"target@1000/lock-helper:graphical-session".parse().unwrap()));
 }

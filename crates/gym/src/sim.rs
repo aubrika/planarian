@@ -323,6 +323,11 @@ impl Sim {
         Journal::open(self.fake.store.clone()).map(|j| j.ledger().clone()).unwrap_or_default()
     }
 
+    /// Sampled health/status transitions, independent of transaction state.
+    pub fn status_timeline(&self) -> &BTreeMap<UnitId, Vec<(Timestamp, String)>> {
+        &self.timeline
+    }
+
     fn harvest(&mut self) {
         let now = self.now();
         if let Some(c) = self.core.as_mut() {
@@ -974,6 +979,7 @@ impl Sim {
                     class: "user".into(),
                     seat: Some("seat0".into()),
                     remote: false,
+                    graphical: true,
                     active: true,
                     idle: false,
                     created: now,
@@ -1026,6 +1032,7 @@ impl Sim {
                     uid,
                     class: "user".into(),
                     remote: seat.is_none(),
+                    graphical: seat.is_some(),
                     seat,
                     active: true,
                     idle: false,
@@ -1370,6 +1377,7 @@ impl Sim {
                 let (facts, decision) = core.ex.last.clone().unzip();
                 let now = self.fake.w().now;
                 self.log.push(planarian_daemon::LogRecord {
+                    format: 2,
                     at: now,
                     proposal: p,
                     caller: Actor::user(pe.uid),
@@ -1382,6 +1390,11 @@ impl Sim {
                     path: vec![],
                     why: String::new(),
                     agent: None,
+                    operation: None,
+                    expectation: None,
+                    pre_status: BTreeMap::new(),
+                    post_status: BTreeMap::new(),
+                    post_units: None,
                 });
                 return Ok(());
             }
@@ -1437,6 +1450,7 @@ impl Sim {
         let crashed = matches!(&r, planarian_exec::Submitted::Error(e) if e.contains("Crashed"));
         let now = self.fake.w().now;
         self.log.push(planarian_daemon::LogRecord {
+            format: 2,
             at: now,
             proposal: p,
             caller: Actor::user(pe.uid),
@@ -1449,6 +1463,11 @@ impl Sim {
             path: vec![],
             why: String::new(),
             agent: None,
+            operation: None,
+            expectation: None,
+            pre_status: BTreeMap::new(),
+            post_status: BTreeMap::new(),
+            post_units: None,
         });
         if crashed {
             self.kill_daemon();

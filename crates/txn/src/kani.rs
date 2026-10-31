@@ -18,7 +18,7 @@ use planarian_schema::{Actor, Hash, RecoveryStrategy, RejectReason, Timestamp, T
 
 fn any_state() -> TxnState {
     let i: u8 = kani::any();
-    match i % 14 {
+    match i % 15 {
         0 => TxnState::Prepared,
         1 => TxnState::Staged,
         2 => TxnState::Built,
@@ -32,6 +32,7 @@ fn any_state() -> TxnState {
         10 => TxnState::RecoveryFailed,
         11 => TxnState::Rejected(RejectReason::Interrupted),
         12 => TxnState::AwaitingBoot,
+        13 => TxnState::PublishingBoot,
         _ => TxnState::Cancelled(Actor::Daemon),
     }
 }
@@ -49,7 +50,12 @@ fn any_strategy() -> RecoveryStrategy {
 fn in_window(s: &TxnState) -> bool {
     matches!(
         s,
-        TxnState::Activating | TxnState::Checking | TxnState::Published | TxnState::Promoted | TxnState::Reverting
+        TxnState::Activating
+            | TxnState::Checking
+            | TxnState::PublishingBoot
+            | TxnState::Published
+            | TxnState::Promoted
+            | TxnState::Reverting
     )
 }
 
@@ -71,6 +77,7 @@ fn idx(s: &TxnState) -> u8 {
         TxnState::Rejected(_) => 11,
         TxnState::Cancelled(_) => 12,
         TxnState::AwaitingBoot => 13,
+        TxnState::PublishingBoot => 14,
     }
 }
 
@@ -84,6 +91,18 @@ fn path_ok(from: &TxnState, strategy: RecoveryStrategy, path: &[TxnState]) {
         i += 1;
     }
     assert!(path[path.len() - 1].is_terminal());
+}
+
+/// SPEC §10's only admission pause is Promoted. Completion paths continue to
+/// use path_ok's terminal assertion; this checks the actual pending path.
+fn admitted_boot_wait_ok(from: &TxnState, strategy: RecoveryStrategy, path: &[TxnState]) {
+    assert!(idx(&path[0]) == idx(from));
+    let mut i = 0;
+    while i + 1 < path.len() {
+        assert!(step_allowed(&path[i], &path[i + 1], strategy));
+        i += 1;
+    }
+    assert!(idx(&path[path.len() - 1]) == idx(&TxnState::Promoted));
 }
 
 /// `revert_generation` / `revert_device` from `from`: Reverting (unless
@@ -132,7 +151,14 @@ fn action_ok(action: RecoveryAction, from: &TxnState, strategy: RecoveryStrategy
             path_ok(from, strategy, &[Published, RecoveryFailed]);
             reverts_ok(from, strategy);
         }
-        A::WriteCommitted => path_ok(from, strategy, &[Promoted, Committed]),
+        A::WriteCommitted => {
+            // Boot-only admission parks here until the same-boot checkpoint;
+            // checkpoint failure restores the publishing boot/default source.
+            admitted_boot_wait_ok(from, strategy, &[Promoted]);
+            path_ok(from, strategy, &[Promoted, Committed]);
+            path_ok(from, strategy, &[Promoted, RecoveryFailed]);
+            reverts_ok(from, strategy);
+        }
         A::RevertGeneration | A::RevertDevice => reverts_ok(from, strategy),
         A::DriverBound => {
             path_ok(from, strategy, &[from.clone(), Checking, Committed]);
@@ -144,10 +170,19 @@ fn action_ok(action: RecoveryAction, from: &TxnState, strategy: RecoveryStrategy
             path_ok(from, strategy, &[Checking, Committed]);
             reverts_ok(from, strategy);
         }
+        A::ReconcileBootPublication => {
+            admitted_boot_wait_ok(from, strategy, &[PublishingBoot, AwaitingBoot, Promoted]);
+            path_ok(from, strategy, &[PublishingBoot, AwaitingBoot, Promoted, RecoveryFailed]);
+            path_ok(from, strategy, &[PublishingBoot, AwaitingBoot, RecoveryFailed]);
+            path_ok(from, strategy, &[PublishingBoot, AwaitingBoot, Reverting, Reverted]);
+            path_ok(from, strategy, &[PublishingBoot, Reverted]);
+            path_ok(from, strategy, &[PublishingBoot, RecoveryFailed]);
+        }
         A::AwaitBoot => {
             // After a reboot (before one, the transaction is left as is):
             // the candidate booted and passed, failed, or did not boot.
-            path_ok(from, strategy, &[AwaitingBoot, Promoted, Committed]);
+            admitted_boot_wait_ok(from, strategy, &[AwaitingBoot, Promoted]);
+            path_ok(from, strategy, &[AwaitingBoot, Promoted, RecoveryFailed]);
             path_ok(from, strategy, &[AwaitingBoot, RecoveryFailed]);
             path_ok(from, strategy, &[AwaitingBoot, Reverted]);
             reverts_ok(from, strategy);
@@ -160,7 +195,8 @@ fn action_ok(action: RecoveryAction, from: &TxnState, strategy: RecoveryStrategy
 /// every state a live transaction can be left in, under every strategy,
 /// every path recovery can take starts at that state, takes only steps
 /// `machine::step_allowed` permits (the Verus-verified rules), and ends in a
-/// terminal state. Nothing mutated is ever answered with a refusal, and
+/// terminal state or the explicit admitted-boot checkpoint wait. Nothing
+/// mutated is ever answered with a refusal, and
 /// anything not yet mutated is.
 #[kani::proof]
 #[kani::unwind(6)]

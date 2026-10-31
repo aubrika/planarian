@@ -16,8 +16,8 @@
 
 use crate::machine::{step_allowed, tag};
 use planarian_schema::{
-    Actor, GenerationId, Hash, Incident, IncidentId, Lease, OpId, Outcome, Override, OwnerId, Resolution, Timestamp,
-    Transaction, Transition, TxnId, TxnState, UnitId,
+    Actor, GenerationId, Hash, Incident, IncidentId, Lease, OpId, Outcome, Override, OwnerId, Resolution, StorePath,
+    Timestamp, Transaction, Transition, TxnId, TxnState, UnitId,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
@@ -59,6 +59,13 @@ pub enum Record {
         #[serde(default)]
         boot_at: Timestamp,
     },
+    /// Readiness admission is distinct from the same-boot ten-minute
+    /// confirmation. The current epoch owns this evidence (SPEC §10, §12).
+    BootAdmitted {
+        txn: TxnId,
+        epoch: u64,
+        admission: BootAdmission,
+    },
     /// Written and fsynced before the backend call it names.
     OpBegin {
         op: OpId,
@@ -95,7 +102,7 @@ pub enum Record {
     AgentStarted {
         name: String,
         /// Zero in records written before v4.6, which then match no peer.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "agent_instance_unknown")]
         instance: [u8; 16],
         by: u32,
     },
@@ -134,6 +141,17 @@ pub struct LiveTxn {
     /// The most recent non-empty note on an Advance.
     #[serde(default)]
     pub why: String,
+    /// Missing in historical checkpoints: no same-boot admission is implied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_admission: Option<BootAdmission>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[verifier::external_derive]
+pub struct BootAdmission {
+    pub version: u32,
+    pub boot_id: Hash,
+    pub boot_at: Timestamp,
 }
 
 /// What remains of a terminal transaction: enough to refuse stale epochs and
@@ -148,6 +166,12 @@ pub struct TerminalTxn {
     pub transition: Transition,
     /// The most recent reason journaled with a step (why it reverted, …).
     pub why: String,
+    /// Additive terminal evidence format. Zero means the historical archive
+    /// discarded operation acknowledgments; it cannot establish success.
+    #[serde(default, skip_serializing_if = "terminal_evidence_legacy")]
+    pub evidence_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ops: Option<Vec<OpRecord>>,
 }
 
 /// An unresolved RecoveryFailed (§12c). While any exists, autonomous mutation is blocked.
@@ -161,6 +185,14 @@ pub struct InterlockEntry {
     pub candidate_override: Option<Hash>,
     pub revert_to: GenerationId,
     pub note: String,
+    /// Zero is a historical/sentinel entry with unknown candidate-root
+    /// evidence; it must not be read as proof that nothing needs protection.
+    #[serde(default, skip_serializing_if = "interlock_evidence_legacy")]
+    pub evidence_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<(GenerationId, StorePath)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc_root: Option<String>,
 }
 
 /// A map from transaction id, stored as a vector sorted by id; vstd
@@ -192,9 +224,9 @@ pub struct Ledger {
     pub external: Option<(u64, Hash)>,
     pub interlock: IdMap<InterlockEntry>,
     pub last_reconciliation: Option<Reconciliation>,
-    /// Every agent started, in order: (name, instance, the uid that started
-    /// it). A peer is matched by its instance, never its name (I24).
-    #[serde(default)]
+    /// Current registration per name, bound to its started instance (I24).
+    /// Every launch remains journaled; replacement revokes earlier instances.
+    #[serde(default, serialize_with = "serialize_agent_registry", deserialize_with = "deserialize_agent_registry")]
     pub agents: Vec<(String, [u8; 16], u32)>,
 }
 
@@ -354,7 +386,7 @@ pub open spec fn rules(l: Ledger, e: Entry) -> bool {
         Record::Prepared(t) => prepared_rule(l, *t),
         Record::Advance { txn, epoch, to, .. } => advance_rule(l, txn, epoch, to),
         Record::Takeover { txn, from_epoch, lease } => takeover_rule(l, txn, from_epoch, lease),
-        Record::Renew { txn, epoch, .. } => renew_rule(l, txn, epoch),
+        Record::Renew { txn, epoch, .. } | Record::BootAdmitted { txn, epoch, .. } => renew_rule(l, txn, epoch),
         Record::OpBegin { op, .. } => op_begin_rule(l, op),
         Record::OpAck { op, .. } => op_ack_rule(l, op),
         Record::Resolved { txn, .. } => has_id(l.interlock.entries@, txn),
@@ -394,6 +426,82 @@ pub open spec fn advance_ok(l: Ledger, i: int, epoch: u64, to: TxnState) -> bool
 }
 
 // ---------- Small verified helpers ----------
+
+fn agent_name_eq(a: &str, b: &str) -> (r: bool)
+    ensures
+        r == (a@ == b@),
+{
+    let n = a.unicode_len();
+    if n != b.unicode_len() {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < n
+        invariant
+            n == a@.len(),
+            n == b@.len(),
+            i <= n,
+            forall|j: int| 0 <= j < i ==> a@[j] == b@[j],
+        decreases n - i,
+    {
+        if a.get_char(i) != b.get_char(i) {
+            return false;
+        }
+        i += 1;
+    }
+    assert(a@ =~= b@);
+    true
+}
+
+/// Reduce old checkpoint registrations after the original checkpoint bytes
+/// have passed integrity and ledger validation. Keep the last occurrence,
+/// exactly preserving the historical lookup's last-recorded owner semantics.
+pub fn normalize_agent_registry(agents: &mut Vec<(String, [u8; 16], u32)>) {
+    let mut i: usize = 0;
+    while i < agents.len()
+        invariant
+            i <= agents@.len(),
+        decreases agents.len() - i,
+    {
+        let mut j = i + 1;
+        let mut duplicate = false;
+        while j < agents.len()
+            invariant
+                i < agents@.len(),
+                i < j <= agents@.len(),
+            decreases agents.len() - j,
+        {
+            if agent_name_eq(agents[i].0.as_str(), agents[j].0.as_str()) {
+                duplicate = true;
+                break;
+            }
+            j += 1;
+        }
+        if duplicate {
+            agents.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Applying a launch retains one current row, while the original AgentStarted
+/// record and its attribution remain in the durable journal prefix.
+fn record_agent(agents: &mut Vec<(String, [u8; 16], u32)>, name: String, instance: [u8; 16], by: u32) {
+    let mut i: usize = 0;
+    while i < agents.len()
+        invariant
+            i <= agents@.len(),
+        decreases agents.len() - i,
+    {
+        if agent_name_eq(agents[i].0.as_str(), name.as_str()) {
+            agents.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    agents.push((name, instance, by));
+}
 
 fn flying_exec(s: &TxnState) -> (r: bool)
     ensures
@@ -630,7 +738,7 @@ impl Ledger {
                 }
                 Ok(())
             },
-            Record::Renew { txn, epoch, .. } => {
+            Record::Renew { txn, epoch, .. } | Record::BootAdmitted { txn, epoch, .. } => {
                 let i = match find(&self.live, *txn) {
                     Some(i) => i,
                     None => return Err(LedgerError::NotLive(*txn)),
@@ -765,6 +873,8 @@ fn archive(terminal: &mut BTreeMap<TxnId, TerminalTxn>, id: TxnId, l: LiveTxn) {
             path: l.path,
             transition: l.txn.transition,
             why: l.why,
+            evidence_version: 1,
+            ops: Some(l.ops),
         },
     );
     while terminal.len() > TERMINAL_KEEP {
@@ -886,6 +996,7 @@ impl Ledger {
             Record::Advance { txn, epoch, to, note } => self.apply_advance(txn, epoch, to, note),
             Record::Takeover { txn, from_epoch, lease } => self.apply_takeover(txn, from_epoch, lease),
             Record::Renew { txn, epoch, worker_pid, boot_at } => self.apply_renew(txn, epoch, boot_at, worker_pid),
+            Record::BootAdmitted { txn, epoch, admission } => self.apply_boot_admitted(txn, epoch, admission),
             Record::OpBegin { op, call } => self.apply_op_begin(op, call),
             Record::OpAck { op, outcome } => self.apply_op_ack(op, outcome),
             Record::OverrideSet(s) => set_override(&mut self.overrides, s),
@@ -903,7 +1014,7 @@ impl Ledger {
                 }
             },
             Record::Reconciliation(r) => self.last_reconciliation = Some(r),
-            Record::AgentStarted { name, instance, by } => self.agents.push((name, instance, by)),
+            Record::AgentStarted { name, instance, by } => record_agent(&mut self.agents, name, instance, by),
         }
     }
 
@@ -921,7 +1032,7 @@ impl Ledger {
         let mut path = Vec::new();
         push_tag(&mut path, &t.state);
         let why = String::new();
-        self.live.entries.push((id, LiveTxn { txn: t, ops: Vec::new(), path, why }));
+        self.live.entries.push((id, LiveTxn { txn: t, ops: Vec::new(), path, why, boot_admission: None }));
         proof {
             let n = pre.live.entries@.len();
             assert(self.live.entries@ =~= pre.live.entries@.push(self.live.entries@[n as int]));
@@ -977,6 +1088,9 @@ impl Ledger {
                 candidate_override: l.txn.candidate_override,
                 revert_to: l.txn.revert_to,
                 note: note.clone(),
+                evidence_version: 1,
+                candidate: l.txn.candidate.clone(),
+                gc_root: l.txn.gc_root.clone(),
             };
             put(&mut self.interlock, txn, entry);
         }
@@ -1066,6 +1180,36 @@ impl Ledger {
         let (id, mut l) = self.live.entries.remove(i);
         l.txn.lease.renewed = at;
         l.txn.lease.worker_pid = worker_pid;
+        self.live.entries.insert(i, (id, l));
+        proof {
+            assert(self.live.entries@ =~= pre.live.entries@.update(i as int, self.live.entries@[i as int]));
+            if inv(pre) {
+                lemma_update(pre, *self, i as int);
+            }
+        }
+    }
+
+    #[allow(unused_variables)] // used in the specification
+    fn apply_boot_admitted(&mut self, txn: TxnId, epoch: u64, admission: BootAdmission)
+        requires
+            renew_rule(*old(self), txn, epoch),
+        ensures
+            final(self).last_seq == old(self).last_seq,
+            inv(*old(self)) ==> inv(*final(self)),
+            inv(*old(self)) ==> epochs_grow(*old(self), *final(self)),
+    {
+        let ghost pre = *self;
+        let i = match find(&self.live, txn) {
+            Some(i) => i,
+            None => {
+                proof {
+                    assert(false);
+                }
+                return;
+            },
+        };
+        let (id, mut l) = self.live.entries.remove(i);
+        l.boot_admission = Some(admission);
         self.live.entries.insert(i, (id, l));
         proof {
             assert(self.live.entries@ =~= pre.live.entries@.update(i as int, self.live.entries@[i as int]));
@@ -1302,7 +1446,103 @@ proof fn lemma_push(pre: Ledger, post: Ledger)
 
 pub const TERMINAL_KEEP: usize = 256;
 
+fn terminal_evidence_legacy(version: &u32) -> bool {
+    *version == 0
+}
+
+fn interlock_evidence_legacy(version: &u32) -> bool {
+    *version == 0
+}
+
+fn agent_instance_unknown(instance: &[u8; 16]) -> bool {
+    *instance == [0; 16]
+}
+
+type AgentRegistry = Vec<(String, [u8; 16], u32)>;
+
+/// Preserve historical checkpoint JSON until its original checksum is checked.
+/// Legacy rows carry no instance authority; zero never matches a peer.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum AgentRegistration {
+    Legacy((String, u32)),
+    Bound((String, [u8; 16], u32)),
+}
+
+fn serialize_agent_registry<S: Serializer>(
+    agents: &[(String, [u8; 16], u32)],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let rows: Vec<AgentRegistration> = agents
+        .iter()
+        .map(|(name, instance, by)| {
+            if *instance == [0; 16] {
+                AgentRegistration::Legacy((name.clone(), *by))
+            } else {
+                AgentRegistration::Bound((name.clone(), *instance, *by))
+            }
+        })
+        .collect();
+    rows.serialize(serializer)
+}
+
+fn deserialize_agent_registry<'de, D: Deserializer<'de>>(deserializer: D) -> Result<AgentRegistry, D::Error> {
+    let rows = Vec::<AgentRegistration>::deserialize(deserializer)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| match row {
+            AgentRegistration::Legacy((name, by)) => (name, [0; 16], by),
+            AgentRegistration::Bound(row) => row,
+        })
+        .collect())
+}
+
 impl Ledger {
+    /// Backend acknowledgments are evidence distinct from lifecycle. An old
+    /// terminal checkpoint did not retain them, so its Committed state cannot
+    /// establish that the backend operation succeeded.
+    pub fn operations(&self, txn: TxnId) -> Option<&[OpRecord]> {
+        if let Some(live) = self.live.get(&txn) {
+            return Some(&live.ops);
+        }
+        self.terminal.get(&txn).filter(|t| t.evidence_version == 1).and_then(|t| t.ops.as_deref())
+    }
+
+    pub fn operation_outcome(&self, txn: TxnId) -> Outcome {
+        let Some(ops) = self.operations(txn) else {
+            return Outcome::Unknown("operation acknowledgments unavailable in historical terminal evidence".into());
+        };
+        if ops.is_empty() {
+            let bookkeeping = self.terminal.get(&txn).is_some_and(|t| {
+                t.state == TxnState::Committed
+                    && matches!(
+                        &t.transition,
+                        Transition::LiftOverride(_)
+                            | Transition::Resolve { .. }
+                            | Transition::SetOverride(planarian_schema::Override {
+                                desired: planarian_schema::OverrideDesired::LeaveAlone,
+                                ..
+                            })
+                    )
+            });
+            return if bookkeeping {
+                Outcome::Succeeded
+            } else {
+                Outcome::Unknown("no backend operation acknowledged".into())
+            };
+        }
+        if let Some(op) = ops.iter().find(|o| matches!(&o.ack, Some(Outcome::Failed(_)))) {
+            return op.ack.clone().expect("matched acknowledgment");
+        }
+        if let Some(op) = ops.iter().find(|o| o.ack.is_none() || matches!(&o.ack, Some(Outcome::Unknown(_)))) {
+            return op.ack.clone().unwrap_or_else(|| Outcome::Unknown(format!("{} reply unavailable", op.call)));
+        }
+        if let Some(op) = ops.iter().find(|o| matches!(&o.ack, Some(Outcome::Partial(_)))) {
+            return op.ack.clone().expect("matched acknowledgment");
+        }
+        Outcome::Succeeded
+    }
+
     pub fn epoch(&self, txn: TxnId) -> Option<u64> {
         self.live.get(&txn).map(|l| l.txn.lease.epoch).or_else(|| self.terminal.get(&txn).map(|t| t.epoch))
     }

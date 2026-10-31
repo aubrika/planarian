@@ -4,7 +4,7 @@
 
 use crate::sim::Sim;
 use planarian_exec::Submitted;
-use planarian_schema::{Actor, Disruption, Transition, TxnState};
+use planarian_schema::{Actor, Disruption, Outcome, Timestamp, Transition, TxnState, UnitId};
 use std::collections::BTreeMap;
 use std::fmt;
 use toml::Value as T;
@@ -19,13 +19,36 @@ pub struct Metrics {
     intent_entries: usize,
     unnecessary: usize,
     disruption: BTreeMap<&'static str, usize>,
-    /// Seconds from injection to the last committed autonomous transaction,
-    /// for each repair entry that was cleared.
+    /// Seconds from injection to sampled satisfaction of the required unit
+    /// predicates. Transaction completion is never a health timestamp.
     time_to_repair: Vec<u64>,
+    repair_time_unmeasured: usize,
+    operation_outcomes: BTreeMap<&'static str, usize>,
     restarts: BTreeMap<String, usize>,
     recovery_failed: usize,
     recovery_failed_injected: usize,
     recovery_failed_in: Vec<String>,
+}
+
+fn health_satisfied_at(entry: &T, timeline: &BTreeMap<UnitId, Vec<(Timestamp, String)>>) -> Option<Timestamp> {
+    let units = entry.get("required_post")?.get("units")?.as_table()?;
+    if units.is_empty() {
+        return None;
+    }
+    let mut last = Timestamp(0);
+    for (name, value) in units {
+        let wanted = value.as_str()?;
+        let named = crate::sim::unit(name);
+        let lines: Vec<_> = timeline.iter().filter(|(u, _)| crate::check::same_unit(&named, u)).collect();
+        if lines.is_empty() {
+            return None;
+        }
+        for (_, line) in lines {
+            let (at, _) = line.iter().rev().take_while(|(_, status)| status == wanted).last()?;
+            last = last.max(*at);
+        }
+    }
+    Some(last)
 }
 
 fn disruption_name(d: Disruption) -> &'static str {
@@ -45,22 +68,17 @@ impl Metrics {
         self.passed += pass as usize;
         self.partial += partial as usize;
         let scoring = entry.get("scoring").and_then(T::as_str).unwrap_or("");
-        let cleared = pass || partial;
+        let cleared = pass;
         let autonomous = |r: &&planarian_daemon::LogRecord| !matches!(r.caller, Actor::User { .. });
         let executed = |r: &&planarian_daemon::LogRecord| matches!(&r.result, Submitted::Finished { state, .. } if !matches!(state, TxnState::Rejected(_) | TxnState::Cancelled(_)));
         if scoring == "repair" {
             self.repair_entries += 1;
             if cleared {
                 self.repaired += 1;
-                let last = sim
-                    .log
-                    .iter()
-                    .filter(autonomous)
-                    .filter(|r| matches!(r.result, Submitted::Finished { state: TxnState::Committed, .. }))
-                    .map(|r| r.at.0)
-                    .max();
-                if let Some(t) = last {
-                    self.time_to_repair.push(t.saturating_sub(sim.start.0) / 1000);
+                if let Some(t) = health_satisfied_at(entry, sim.status_timeline()) {
+                    self.time_to_repair.push(t.0.saturating_sub(sim.start.0) / 1000);
+                } else {
+                    self.repair_time_unmeasured += 1;
                 }
             }
         }
@@ -71,6 +89,16 @@ impl Metrics {
             self.unnecessary += sim.log.iter().filter(autonomous).filter(executed).count();
         }
         for r in sim.log.iter().filter(executed) {
+            if let Submitted::Finished { txn, .. } = &r.result {
+                let operation = r.operation.clone().unwrap_or_else(|| sim.ledger().operation_outcome(*txn));
+                let key = match operation {
+                    Outcome::Succeeded => "succeeded",
+                    Outcome::Failed(_) => "failed",
+                    Outcome::Partial(_) => "partial",
+                    Outcome::Unknown(_) => "unknown",
+                };
+                *self.operation_outcomes.entry(key).or_default() += 1;
+            }
             if let Some(f) = &r.facts {
                 *self.disruption.entry(disruption_name(f.disruption)).or_default() += 1;
             }
@@ -96,12 +124,17 @@ impl fmt::Display for Metrics {
         writeln!(f, "metrics (fake harness, {} runnable entries):", self.runnable)?;
         writeln!(
             f,
-            "  cleared: {} fully checked, {} with every fake-checkable key holding ({:.0}% of runnable)",
+            "  evidence: {} fully checked passes ({:.0}% of runnable); {} partial verdicts",
             self.passed,
-            self.partial,
-            100.0 * (self.passed + self.partial) as f64 / self.runnable.max(1) as f64
+            100.0 * self.passed as f64 / self.runnable.max(1) as f64,
+            self.partial
         )?;
-        writeln!(f, "  repair rate: {}/{} repair entries cleared", self.repaired, self.repair_entries)?;
+        writeln!(
+            f,
+            "  repair rate: {}/{} repair entries with verified required postconditions",
+            self.repaired, self.repair_entries
+        )?;
+        writeln!(f, "  operation outcomes (independent of lifecycle/health): {:?}", self.operation_outcomes)?;
         writeln!(
             f,
             "  unnecessary interventions: {} on {} intent entries (must be 0)",
@@ -113,8 +146,18 @@ impl fmt::Display for Metrics {
         let mut t = self.time_to_repair.clone();
         t.sort();
         if !t.is_empty() {
-            writeln!(f, "  time to repair: median {} s, max {} s (simulated time)", t[t.len() / 2], t[t.len() - 1])?;
+            writeln!(
+                f,
+                "  time to sampled health satisfaction: median {} s, max {} s (simulated time)",
+                t[t.len() / 2],
+                t[t.len() - 1]
+            )?;
         }
+        writeln!(
+            f,
+            "  repair latency unmeasured: {} passing repair entries without required-unit timeline evidence",
+            self.repair_time_unmeasured
+        )?;
         let max = self.restarts.iter().max_by_key(|(_, n)| **n);
         if let Some((u, n)) = max {
             writeln!(
@@ -134,5 +177,39 @@ impl fmt::Display for Metrics {
             },
             self.recovery_failed_injected
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_coverage_does_not_count_as_a_verified_repair() {
+        let sim = Sim::new();
+        let entry: T = toml::from_str("scoring = 'repair'").unwrap();
+        let mut metrics = Metrics::default();
+        metrics.add(&entry, false, true, Some(&sim));
+        assert_eq!(metrics.repair_entries, 1);
+        assert_eq!(metrics.repaired, 0);
+        assert_eq!(metrics.partial, 1);
+    }
+
+    #[test]
+    fn repair_time_comes_from_health_samples_and_rejects_missing_or_failed_samples() {
+        let entry: T = toml::from_str("[required_post.units]\n'service:gym-web' = 'Running'").unwrap();
+        let unit = UnitId::service("gym-web");
+        let mut timeline = BTreeMap::from([(
+            unit.clone(),
+            vec![
+                (Timestamp(0), "Running".into()),
+                (Timestamp(1000), "Failed".into()),
+                (Timestamp(19_000), "Running".into()),
+            ],
+        )]);
+        assert_eq!(health_satisfied_at(&entry, &timeline), Some(Timestamp(19_000)));
+        timeline.get_mut(&unit).unwrap().push((Timestamp(20_000), "Unknown".into()));
+        assert_eq!(health_satisfied_at(&entry, &timeline), None);
+        assert_eq!(health_satisfied_at(&entry, &BTreeMap::new()), None);
     }
 }

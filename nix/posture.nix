@@ -52,6 +52,10 @@ let
     touch "/run/planarian/failed-$class"
     # I20: no agent principal runs while Planarian is failed (their
     # ConditionPathExistsGlob keeps them from starting again).
+    # Launcher-created transient units all require this slice. The marker is
+    # written first: starts after the stop are inhibited by their own systemd
+    # condition, and starts racing the stop are stopped with the slice.
+    systemctl stop planarian-agents.slice || true
     ${optionalString (cfg.agentUnits != [ ]) "systemctl stop ${concatStringsSep " " cfg.agentUnits} || true"}
     # Alarm: on the login screen (getty's issue) and in every session; the
     # tray and the console read /run/planarian/alarm.
@@ -195,6 +199,18 @@ in
     environment.systemPackages = [ ack ];
     environment.etc."planarian/core.sha256".source = coreHash;
 
+    # A bounded cgroup for public-launcher agents, separate from the daemon,
+    # watchdog, logins and administrator recovery work. Individual transient
+    # units also have per-agent task, memory and CPU limits.
+    systemd.slices.planarian-agents = {
+      description = "Planarian launcher agents";
+      sliceConfig = {
+        TasksMax = 1024;
+        MemoryMax = "1G";
+        CPUQuota = "200%";
+      };
+    };
+
     systemd.targets.planarian-ready = {
       description = "Planarian is ready";
       wantedBy = [ "multi-user.target" ];
@@ -221,6 +237,7 @@ in
       unitConfig.DefaultDependencies = false;
       serviceConfig = {
         Type = "oneshot";
+        Slice = "planarian-monitor.slice";
         RemainAfterExit = true;
         ExecStart = "${respond} %i";
       };
@@ -233,6 +250,7 @@ in
       after = [ "sysinit.target" ];
       serviceConfig = {
         Type = "oneshot";
+        Slice = "planarian-monitor.slice";
         ExecStart = check;
         TimeoutStartSec = cfg.bootReadyTimeout + 30;
       };
@@ -242,7 +260,7 @@ in
       description = "Planarian failure posture: lift restrictions once ready";
       wantedBy = [ "planarian-ready.target" ];
       after = [ "planarian-ready.target" ];
-      serviceConfig = { Type = "oneshot"; ExecStart = lift; };
+      serviceConfig = { Type = "oneshot"; Slice = "planarian-monitor.slice"; ExecStart = lift; };
     };
 
     systemd.services.planariad = {
@@ -293,7 +311,7 @@ in
     # I20: agents start only once Planarian is ready, and never while a
     # failure class is raised.
     systemd.services = lib.genAttrs (map (lib.removeSuffix ".service") cfg.agentUnits) (_: {
-      requires = [ "planarian-ready.target" ];
+      bindsTo = [ "planarian-ready.target" ];
       after = [ "planarian-ready.target" ];
       unitConfig.ConditionPathExistsGlob = "!/run/planarian/failed-*";
     });

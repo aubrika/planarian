@@ -1,7 +1,7 @@
 //! planarian-recovery (§12 recovery watchdog). A separate unit with
 //! `Restart=always`, started before planariad and independent of it. Every
 //! 10 s it reads the journal. A transaction in Activating, Checking,
-//! Published, Promoted or Reverting whose owner is dead, or whose lease went
+//! PublishingBoot, Published, Promoted or Reverting whose owner is dead, or whose lease went
 //! unrenewed past its deadline, is taken over: fence, confirm quiescence, then
 //! run the crash-recovery table. From Checking that means the entire
 //! authorized commit path, or a revert; never a partial path. When the
@@ -68,7 +68,20 @@ fn pass(
         Err(e) => return Err(format!("journal: {e:?}")),
     };
     let real = Real::new(paths.clone(), file.devices.clone());
-    let mut k = Kernel::new(journal, ExecHost::new(real, canonical.clone()), me.clone());
+    let host = ExecHost::new(real, canonical.clone());
+    // Recovery uses the same durable applicability context as the daemon,
+    // including authorized suppressions and the floor, never an empty default
+    // that would revive intentionally stopped units during probe checks.
+    {
+        let l = journal.ledger();
+        let mut ctx = host.ctx.lock().unwrap_or_else(|e| e.into_inner());
+        ctx.known_good = l.known_good.unwrap_or_default();
+        ctx.live_tested = l.live_tested;
+        ctx.accepted_baseline = l.accepted_baseline;
+        ctx.security_floor = l.security_floor;
+        ctx.overrides = l.overrides.clone();
+    }
+    let mut k = Kernel::new(journal, host, me.clone());
     let live: Vec<_> = k.journal.ledger().live.values().map(|l| l.txn.clone()).collect();
     for txn in live {
         if !k.watchdog_should_take_over(&txn) {

@@ -2,16 +2,15 @@
 # gym's fault catalog on real VMs (one NixOS test per entry). Linux runners
 # have KVM once /dev/kvm is opened to the runner user.
 #
-# A push runs the VM checks, the GA demonstration and the gym smoke entries
-# (a newer push cancels them); the whole catalog is one job per VM entry (94
-# at v4.6, several hundred runner minutes), so it runs only by hand (Actions →
-# VM tests → Run workflow → catalog).
+# Pushes and pull requests run the core VM checks and critical catalog cases;
+# newer revisions cancel them. The complete catalog is derived from the
+# current manifest and runs by hand (Actions → VM tests → Run workflow → catalog).
 name: VM tests
 
 on:
   push:
     branches: [main]
-    paths-ignore: ["docs/**", "**.md"]
+  pull_request:
   workflow_dispatch:
     inputs:
       catalog:
@@ -25,7 +24,7 @@ on:
 
 concurrency:
   group: vm-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   vm:
@@ -33,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        check: [vm-runtime, vm-generations, vm-posture, installer]
+        check: [vm-runtime, vm-generations, vm-posture, installer, vm-installed-boot, vm-installed-boot-watchdog, vm-boot-confirmation]
     steps:
       - uses: actions/checkout@v4
       - name: Enable KVM
@@ -44,6 +43,25 @@ jobs:
         with:
           extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
       - run: nix build -L .#checks.x86_64-linux.${{ matrix.check }}
+
+  installed-publication:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        point: [built, publication-intent, operation-intent, mutation, acknowledgment, awaiting-boot]
+        recoverer: [daemon, watchdog]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      - run: nix build -L .#legacyPackages.x86_64-linux.boot-entry-tests.${{ matrix.point }}-${{ matrix.recoverer }}
 
   ga-demo:
     runs-on: ubuntu-24.04
@@ -64,7 +82,7 @@ jobs:
       - name: Verdict
         run: |
           cat verdict/verdict.json
-          jq -e '.result == "PASS"' verdict/verdict.json
+          python3 nix/gym/acceptance.py check --harness vm --id "${{ matrix.id }}" --waivers docs/acceptance-waivers.toml verdict/verdict.json
 
   # Catalog entries that guard the gym harness itself on every push: a step
   # timed into a change (the pause handshake, a PATH-dependent fault), a
@@ -80,7 +98,9 @@ jobs:
              posture-absent-masked, posture-crashed-budget, posture-integrity-core-hash,
              posture-integrity-journal-chain, posture-integrity-undeclared-early-unit, journal-record-edited,
              malicious-decl-owner-rebuild, malicious-decl-catalog-enable, malicious-decl-input-update,
-             residue-stop-security-unit, residue-kill9-security]
+             residue-stop-security-unit, residue-kill9-security,
+             gc-during-approval, agent-run-own-principal, agent-has-its-users-permissions,
+             probe-http-503-degraded, floor-service-package-fix, approve-at-terminal-runs, agent-name-collision]
     steps:
       - uses: actions/checkout@v4
       - name: Enable KVM
@@ -94,7 +114,7 @@ jobs:
       - name: Verdict
         run: |
           cat verdict/verdict.json
-          jq -e '.result == "PASS"' verdict/verdict.json
+          python3 nix/gym/acceptance.py check --harness vm --id "${{ matrix.id }}" --waivers docs/acceptance-waivers.toml verdict/verdict.json
 
   # The Firecracker microVM target (SPEC §4, Phase A): non-gating, allowed to
   # stay red. Boots Planarian under Firecracker and checks one repair.
@@ -122,7 +142,7 @@ jobs:
         env:
           ONLY: ${{ inputs.ids }}
         run: |
-          python3 -c 'import json, os, tomllib; d = tomllib.load(open("crates/gym/catalog/phase-a.toml", "rb")); only = os.environ["ONLY"].split(); print("ids=" + json.dumps([e["id"] for e in d["fault"] if "vm" in e.get("harness", []) and (not only or e["id"] in only)]))' >> "$GITHUB_OUTPUT"
+          python3 -c 'import json, os, sys; sys.path.insert(0, "nix/gym"); import acceptance; entries = acceptance.catalog_entries("crates/gym/catalog/phase-a.toml"); ids = acceptance.expected_entries(entries, "vm", os.environ["ONLY"].split()); print("ids=" + json.dumps(list(ids)))' >> "$GITHUB_OUTPUT"
 
   catalog:
     needs: catalog-ids
@@ -148,9 +168,7 @@ jobs:
       - name: Verdict
         run: |
           cat verdict/verdict.json
-          # UNSUPPORTED only where the test VM cannot run the entry by design
-          # (docs/ga-status.md); anywhere else it is a harness regression.
-          jq -e --arg id '${{ matrix.id }}' '.result == "PASS" or (.result == "UNSUPPORTED" and ($id == "storage-nix-full-gc" or $id == "desktop-boot-fails-rollback"))' verdict/verdict.json
+          python3 nix/gym/acceptance.py check --harness vm --id "${{ matrix.id }}" --waivers docs/acceptance-waivers.toml verdict/verdict.json
           jq -r '"\(.id): \(.result)"' verdict/verdict.json >> "$GITHUB_STEP_SUMMARY"
       # Best effort: the verdict is in the log above too, and a private
       # repository's artifact storage is small (the evidence is not uploaded).

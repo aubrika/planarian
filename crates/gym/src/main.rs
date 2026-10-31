@@ -122,7 +122,41 @@ fn load(path: &str) -> Vec<T> {
         eprintln!("{path}: {e}");
         std::process::exit(2)
     });
-    doc.get("fault").and_then(T::as_array).cloned().unwrap_or_default()
+    let entries = doc.get("fault").and_then(T::as_array).cloned().unwrap_or_default();
+    if let Err(error) = validate_catalog(&entries) {
+        eprintln!("{path}: {error}");
+        std::process::exit(2);
+    }
+    entries
+}
+
+fn validate_catalog(entries: &[T]) -> Result<(), String> {
+    let mut ids = std::collections::BTreeSet::new();
+    if entries.is_empty() {
+        return Err("catalog contains no faults".into());
+    }
+    for entry in entries {
+        let id = entry.get("id").and_then(T::as_str).unwrap_or("");
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+            return Err(format!("invalid catalog id: {id:?}"));
+        }
+        if !ids.insert(id) {
+            return Err(format!("duplicate catalog id: {id}"));
+        }
+        if !matches!(entry.get("scoring").and_then(T::as_str), Some("must-pass" | "intent" | "repair")) {
+            return Err(format!("{id}: missing or invalid acceptance role"));
+        }
+        let harnesses = entry.get("harness").and_then(T::as_array).ok_or_else(|| format!("{id}: no harness"))?;
+        let mut seen = std::collections::BTreeSet::new();
+        if harnesses.is_empty()
+            || harnesses
+                .iter()
+                .any(|h| !matches!(h.as_str(), Some("fake" | "vm" | "bench")) || !seen.insert(h.as_str()))
+        {
+            return Err(format!("{id}: invalid harness applicability"));
+        }
+    }
+    Ok(())
 }
 
 fn main() {
@@ -148,7 +182,7 @@ fn main() {
     let mut harness = "fake".to_string();
     let mut verbose = false;
     let mut show_notices = false;
-    let mut strict = false;
+    let mut verdict_dir: Option<std::path::PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -168,7 +202,13 @@ fn main() {
             "--socket" => i += 1,
             "-v" | "--verbose" => verbose = true,
             "--notices" => show_notices = true,
-            "--strict" => strict = true,
+            // Kept for old invocations; applicable UNSUPPORTED now always
+            // fails. Reviewed scoped waivers are interpreted by acceptance.py.
+            "--strict" => {}
+            "--verdict-dir" => {
+                verdict_dir = args.get(i + 1).map(std::path::PathBuf::from);
+                i += 1;
+            }
             other => {
                 eprintln!("unknown argument {other}");
                 std::process::exit(2);
@@ -177,8 +217,25 @@ fn main() {
         i += 1;
     }
     let entries = load(&catalog);
+    let mut requested = std::collections::BTreeSet::new();
+    for id in &ids {
+        if !requested.insert(id) || !entries.iter().any(|entry| entry.get("id").and_then(T::as_str) == Some(id)) {
+            eprintln!("duplicate or unknown requested id: {id}");
+            std::process::exit(2);
+        }
+    }
+    if let Some(dir) = &verdict_dir {
+        std::fs::create_dir_all(dir).unwrap_or_else(|error| {
+            eprintln!("{}: {error}", dir.display());
+            std::process::exit(2);
+        });
+    }
     let _ = CATALOG.set(entries.clone());
     let cmd = args.first().map(String::as_str).unwrap_or("list");
+    if !matches!(harness.as_str(), "fake" | "vm") {
+        eprintln!("unknown harness: {harness}");
+        std::process::exit(2);
+    }
     if harness == "vm" && cmd != "list" {
         eprintln!("The VM harness runs as NixOS tests: `nix build .#checks.x86_64-linux.vm-runtime` (needs KVM).");
         std::process::exit(2);
@@ -190,6 +247,21 @@ fn main() {
     if selected.is_empty() {
         eprintln!("no catalog entries matched {ids:?}");
         std::process::exit(2);
+    }
+    if cmd == "run" && !ids.is_empty() {
+        for entry in &selected {
+            if !entry
+                .get("harness")
+                .and_then(T::as_array)
+                .is_some_and(|hs| hs.iter().any(|h| h.as_str() == Some(harness.as_str())))
+            {
+                eprintln!(
+                    "requested entry is not applicable to {harness}: {}",
+                    entry.get("id").and_then(T::as_str).unwrap_or("?")
+                );
+                std::process::exit(2);
+            }
+        }
     }
     match cmd {
         "list" => {
@@ -209,7 +281,32 @@ fn main() {
             let mut metrics = metrics::Metrics::default();
             for e in selected {
                 let id = e.get("id").and_then(T::as_str).unwrap_or("?");
+                if let Some(dir) = &verdict_dir {
+                    let path = dir.join(format!("{id}.json"));
+                    if path.exists() {
+                        std::fs::remove_file(&path).unwrap_or_else(|error| {
+                            eprintln!("{}: {error}", path.display());
+                            std::process::exit(2);
+                        });
+                    }
+                }
                 let r = run_entry(e);
+                if r.result != Result_::NotFake
+                    && let Some(dir) = &verdict_dir
+                {
+                    let verdict = serde_json::json!({
+                        "id": id,
+                        "result": format!("{:?}", r.result).to_uppercase(),
+                        "role": e.get("scoring").and_then(T::as_str),
+                        "harness": "fake",
+                        "notes": r.notes,
+                    });
+                    let path = dir.join(format!("{id}.json"));
+                    std::fs::write(&path, verdict.to_string()).unwrap_or_else(|error| {
+                        eprintln!("{}: {error}", path.display());
+                        std::process::exit(2);
+                    });
+                }
                 metrics.add(e, r.result == Result_::Pass, r.result == Result_::Partial, r.sim.as_ref());
                 *tally.entry(format!("{:?}", r.result)).or_insert(0) += 1;
                 if r.result != Result_::NotFake {
@@ -232,11 +329,19 @@ fn main() {
             }
             println!("\n{tally:?}");
             println!("\n{metrics}");
-            // A failure fails the run, and so does a key left unchecked (a
-            // pass that proves less than it says). Entries this harness
-            // cannot run are listed, and fail it only with --strict.
+            // Applicability comes from the catalog. An applicable required
+            // case cannot disappear behind an UNSUPPORTED verdict.
             let failed = tally.contains_key("Fail") || tally.contains_key("Partial");
-            std::process::exit(if failed || (strict && worst == Result_::Unsupported) { 1 } else { 0 });
+            // Exit 3 is exclusively unsupported coverage; the wrapper may
+            // accept it only after validating reviewed scoped waivers. A
+            // failing execution keeps exit 1 even if another case is waived.
+            std::process::exit(if failed {
+                1
+            } else if worst == Result_::Unsupported {
+                3
+            } else {
+                0
+            });
         }
         "serve" => {
             let socket = args.iter().position(|a| a == "--socket").and_then(|i| args.get(i + 1)).cloned();

@@ -33,8 +33,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 /// The 10-minute checkpoint for boot confirmation and initial enrollment (§10, §16).
 pub const CONFIRM_AFTER: Millis = Millis::secs(600);
 const NOTICES_KEPT: usize = 64;
+/// Bound durable launcher-name ownership independently of live systemd units.
+/// Names retain their owner after exit/failure; callers may reuse their names.
+/// The root reserve is name-count capacity, not a separate resource cgroup.
+const AGENT_NAMES_PER_CALLER: usize = 32;
+const AGENT_NAMES_ROOT: usize = 64;
+const AGENT_NAMES_MAX: usize = 256;
+const AGENT_NAMES_ROOT_RESERVE: usize = 32;
 /// How long an external dependency's probes time out before it is said.
 const UNREACHABLE_AFTER: Millis = Millis::secs(120);
+const RESTART_REMINDER: Millis = Millis::secs(24 * 3600);
 
 #[derive(Clone, Debug)]
 pub struct CoreConfig {
@@ -64,8 +72,9 @@ pub struct Peer {
     /// The logind session of the calling process (`sd_pid_get_session`), if any.
     pub session: Option<String>,
     /// The agent this process belongs to: its cgroup is the unit
-    /// `planarian-agent-<name>` (§11). An agent is its own principal, never
-    /// the uid it runs under, and is never an administrator or in a session.
+    /// `planarian-agent-<name>` (§11). Its launching user's permissions are
+    /// looked up from the journal; its dynamic uid conveys no authority and
+    /// it inherits no login session, seat, or terminal.
     pub agent: Option<String>,
     /// The agent unit's instance the process runs in (its InvocationID,
     /// from the cgroup), which authority is bound to (I24).
@@ -106,6 +115,10 @@ pub fn agent_principal(name: &str) -> PrincipalId {
 /// The executor log (I7): one record per submitted proposal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogRecord {
+    /// Format 2 separates lifecycle, acknowledged operation, expectation,
+    /// and the health statuses sampled afterward. Legacy records default 0.
+    #[serde(default)]
+    pub format: u32,
     pub at: Timestamp,
     pub proposal: Proposal,
     pub caller: Actor,
@@ -128,6 +141,18 @@ pub struct LogRecord {
     /// The agent that sent the request, acting for `caller` (§11).
     #[serde(default)]
     pub agent: Option<String>,
+    #[serde(default)]
+    pub operation: Option<Outcome>,
+    #[serde(default)]
+    pub expectation: Option<Outcome>,
+    #[serde(default)]
+    pub pre_status: BTreeMap<UnitId, UnitStatus>,
+    #[serde(default)]
+    pub post_status: BTreeMap<UnitId, UnitStatus>,
+    /// Raw post-observation and probe evidence stay separate from desired
+    /// overrides and their derived status (Overridden is not a health pass).
+    #[serde(default)]
+    pub post_units: Option<BTreeMap<UnitId, (Observed, Vec<planarian_schema::Evidence>)>>,
 }
 
 pub struct Core<B: Backends + Clone, S: Store> {
@@ -148,8 +173,13 @@ pub struct Core<B: Backends + Clone, S: Store> {
     pub log: Vec<LogRecord>,
     cfg: CoreConfig,
     last: Option<(SystemState, UnitDefs)>,
+    /// Collected with a verified journal context during normal observation.
+    /// Reading or signing it performs no new probes or backend mutations.
+    last_health: Option<crate::hooks::HealthReport>,
     choices: BTreeMap<u32, Vec<intent::Match>>,
     incident_parked: BTreeMap<IncidentId, TxnId>,
+    /// Next boot-clock reminder for each published candidate (§12f).
+    restart_reminders: BTreeMap<TxnId, Timestamp>,
     confirm: Option<(GenerationId, Timestamp)>,
     manifest_gen: GenerationId,
     /// The running generation's manifest, before the external source joins it.
@@ -208,6 +238,8 @@ pub struct Core<B: Backends + Clone, S: Store> {
 pub struct Resume {
     peer: Peer,
     kind: ResumeKind,
+    principal: PrincipalId,
+    administrator: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +249,16 @@ enum ResumeKind {
 }
 
 impl Resume {
+    /// Authenticated principal for expensive-work admission. Launched
+    /// agents share the principal and limits of their launching user.
+    pub fn principal(&self) -> PrincipalId {
+        self.principal
+    }
+
+    pub fn administrator(&self) -> bool {
+        self.administrator
+    }
+
     /// A few words for "busy with …".
     pub fn describe(&self) -> String {
         match &self.kind {
@@ -229,12 +271,39 @@ impl Resume {
 /// How often the daemon checks the §12b collection bounds.
 pub const GC_CHECK: Millis = Millis(3600 * 1000);
 
-fn outcome_of(state: &TxnState) -> Outcome {
+fn outcome_of(ledger: &Ledger, txn: TxnId, state: &TxnState) -> Outcome {
     match state {
-        TxnState::Committed => Outcome::Succeeded,
+        TxnState::Committed => ledger.operation_outcome(txn),
         TxnState::Reverted => Outcome::Failed("reverted".into()),
         s => Outcome::Unknown(format!("{s:?}")),
     }
+}
+
+fn expectation_after(record: &LogRecord, state: &SystemState, defs: &UnitDefs) -> Outcome {
+    let expected = &record.proposal.expected;
+    let mut missed = Vec::new();
+    for (unit, want) in &expected.units {
+        let actual = state.status(unit, defs);
+        if &actual != want {
+            missed.push(format!("{unit}: expected {want:?}, observed {actual:?}"));
+        }
+    }
+    if let Some(generation) = expected.generation
+        && state.generation != generation
+    {
+        missed.push(format!("generation: expected {}, observed {}", generation.0, state.generation.0));
+    }
+    if expected.others_unchanged {
+        for (unit, before) in &record.pre_status {
+            if *before == UnitStatus::Running
+                && !expected.may_change.contains(unit)
+                && state.status(unit, defs) != UnitStatus::Running
+            {
+                missed.push(format!("{unit}: previously Running, observed {:?}", state.status(unit, defs)));
+            }
+        }
+    }
+    if missed.is_empty() { Outcome::Succeeded } else { Outcome::Partial(missed.join("; ")) }
 }
 
 impl<B: Backends + Clone, S: Store> Core<B, S> {
@@ -281,14 +350,21 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let asm = Assembler::new(manifest.clone(), cfg.exec.canonical.clone());
         let now = b.clock().now();
         let last_booted = b.generations().last_booted().ok();
+        let checkpoint = Timestamp(0).plus(CONFIRM_AFTER);
+        let admitted = ledger.live.values().any(|l| {
+            l.txn.state == TxnState::Promoted
+                && l.path.iter().any(|p| p == "AwaitingBoot")
+                && l.txn.candidate.as_ref().is_some_and(|(g, _)| *g == current)
+        });
         let confirm = match ledger.known_good {
-            None => Some((current, now.plus(CONFIRM_AFTER))),
+            _ if admitted => Some((current, checkpoint)),
+            None => Some((current, checkpoint)),
             Some(_)
                 if ledger.live_tested.is_some()
                     && ledger.live_tested == last_booted
                     && last_booted == Some(current) =>
             {
-                Some((current, now.plus(CONFIRM_AFTER)))
+                Some((current, checkpoint))
             }
             _ => None,
         };
@@ -302,8 +378,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             log: vec![],
             cfg,
             last: None,
+            last_health: None,
             choices: BTreeMap::new(),
             incident_parked: BTreeMap::new(),
+            restart_reminders: BTreeMap::new(),
             confirm,
             manifest_gen: current,
             gen_manifest: manifest,
@@ -412,6 +490,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             p.extend(entries.into_iter().filter(|g| *g < current).max());
         }
         p.extend(l.live.values().filter_map(|t| t.txn.candidate.as_ref().map(|(g, _)| *g)));
+        // RecoveryFailed is terminal in lifecycle but its candidate/root and
+        // fallback remain obligations until an administrator resolves it.
+        for pending in l.interlock.values() {
+            p.push(pending.revert_to);
+            p.extend(pending.candidate.as_ref().map(|(generation, _)| *generation));
+        }
         p.sort();
         p.dedup();
         p
@@ -419,7 +503,19 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
     /// Observe without acting (also used to answer requests).
     pub fn observe(&mut self) -> (SystemState, UnitDefs) {
-        let l = self.ledger();
+        let (l, journal) = match self.ex.kernel.journal.verified_snapshot() {
+            Ok((ledger, prefix)) => (ledger, crate::hooks::JournalEvidence::Verified(prefix)),
+            Err(e) => {
+                let evidence = if matches!(e, JournalError::Integrity(_) | JournalError::Corrupt(_)) {
+                    crate::hooks::JournalEvidence::Invalid
+                } else {
+                    crate::hooks::JournalEvidence::Unavailable
+                };
+                // The report explicitly refuses a head; the last accepted
+                // context is still useful for describing observed health.
+                (self.ex.kernel.journal.ledger().clone(), evidence)
+            }
+        };
         let current = self.b.generations().current().unwrap_or(self.manifest_gen);
         if current != self.manifest_gen {
             if let Ok(e) = self.b.generations().path_of(current).and_then(|p| self.b.generations().evaluate_built(&p)) {
@@ -444,11 +540,21 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         };
         let s = self.asm.observe(&self.b, &ctx);
         let defs = self.asm.defs();
+        self.last_health = Some(crate::hooks::report(
+            crate::hooks::DisclosureProfile::Minimal,
+            &s,
+            &defs,
+            l.incidents.values(),
+            journal,
+        ));
         self.last = Some((s.clone(), defs.clone()));
         if !self.awaiting_post.is_empty() {
             let digest = s.digest();
             for mut r in self.awaiting_post.drain(..) {
                 r.post_digest = Some(digest);
+                r.expectation = Some(expectation_after(&r, &s, &defs));
+                r.post_status = defs.keys().map(|unit| (unit.clone(), s.status(unit, &defs))).collect();
+                r.post_units = Some(s.units.clone());
                 self.log.push(r);
             }
         }
@@ -457,6 +563,29 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
     fn proposal(&self, t: Transition, s: &SystemState, defs: &UnitDefs, source: Source, reason: String) -> Proposal {
         Proposal { observed: s.digest(), expected: predict(&t, s, defs), transition: t, reason, source }
+    }
+
+    fn response(&self, result: &Submitted) -> Response {
+        let mut response = render::response(result);
+        if let Response::Done { txn, state, message, evidence } = &mut response {
+            let operation = self.ex.kernel.journal.ledger().operation_outcome(*txn);
+            *evidence = Some(planarian_ipc::ExecutionEvidence {
+                format: 1,
+                operation: operation.clone(),
+                expectation: None,
+                post_status: None,
+            });
+            if *state != TxnState::Committed {
+                return response;
+            }
+            *message = match operation {
+                Outcome::Succeeded => "operation succeeded; current health is shown in status".into(),
+                Outcome::Failed(why) => format!("operation failed: {why}; current health is shown in status"),
+                Outcome::Partial(why) => format!("operation partially applied: {why}; check status"),
+                Outcome::Unknown(why) => format!("operation outcome is unknown: {why}; check status"),
+            };
+        }
+        response
     }
 
     fn submit(&mut self, p: Proposal, authz: Authorization, s: &SystemState, defs: &UnitDefs) -> Submitted {
@@ -497,11 +626,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     txn.0,
                     render::transition(&p.transition)
                 )),
-                TxnState::AwaitingBoot => self.notice(format!(
-                    "transaction {}: {} takes effect when you restart; restart to finish",
-                    txn.0,
-                    render::transition(&p.transition)
-                )),
+                TxnState::AwaitingBoot => {
+                    self.restart_reminders.insert(*txn, self.b.clock().boot_now().plus(RESTART_REMINDER));
+                    self.notice(format!(
+                        "transaction {}: {} is waiting for a restart; restart to finish",
+                        txn.0,
+                        render::transition(&p.transition)
+                    ));
+                }
                 _ => {}
             }
         }
@@ -540,6 +672,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             None => (vec![], String::new()),
         };
         let record = LogRecord {
+            format: 2,
             at: now,
             proposal: p,
             caller,
@@ -552,6 +685,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             path,
             why,
             agent: self.acting_agent.clone(),
+            operation: txn.map(|id| l.operation_outcome(id)),
+            expectation: None,
+            pre_status: defs.keys().map(|unit| (unit.clone(), s.status(unit, defs))).collect(),
+            post_status: BTreeMap::new(),
+            post_units: None,
         };
         // A finished transaction's record waits for the next observation for
         // its post-state (observing here would run the probes again).
@@ -830,9 +968,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     /// The health report (§10 hook), with the profile the core computes.
-    pub fn health_report(&mut self) -> crate::hooks::HealthReport {
-        let (s, defs) = self.observe();
-        crate::hooks::report(crate::hooks::DisclosureProfile::Minimal, &s, &defs, self.incidents.incidents.values())
+    pub fn health_report(&self) -> Option<crate::hooks::HealthReport> {
+        self.last_health.clone()
     }
 
     /// A verified external document is now in force (or, with `None`, the
@@ -1022,6 +1159,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
         let l = self.ledger();
         if l.interlocked() {
+            for (id, r) in self.ex.expire_waiting() {
+                self.waiting_result(id, r, now);
+            }
             if !self.interlock_noted {
                 self.notice(
                     "recovery failed; autonomous repair is stopped until an administrator runs `planarian resolve`"
@@ -1039,11 +1179,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             // §12f: an activation window opened for a waiting generation.
             if !busy {
                 for (id, r) in self.ex.activate_waiting(&s) {
-                    self.notice(format!(
-                        "transaction {}: activated now that nothing is in the way: {}",
-                        id.0,
-                        render::submitted_short(&r)
-                    ));
+                    self.waiting_result(id, r, now);
+                }
+            } else {
+                // A concurrent repair cannot extend the parking limit.
+                for (id, r) in self.ex.expire_waiting() {
+                    self.waiting_result(id, r, now);
                 }
             }
             // Quiet mode defers garbage collection (§12f).
@@ -1062,8 +1203,71 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.notice(format!("journal compaction failed: {e:?}"));
         }
         self.confirm_boot(&s, &defs, now);
+        self.note_waiting_boot();
         self.note_space();
         self.note_unreachable(&s, &defs, now);
+    }
+
+    fn waiting_result(&mut self, id: TxnId, result: Submitted, now: Timestamp) {
+        if matches!(&result, Submitted::Finished { state: TxnState::Cancelled(Actor::Daemon), .. }) {
+            let transition = self.ledger().terminal.get(&id).map(|t| t.transition.clone());
+            if let Some(t) = transition {
+                let what = render::transition(&t);
+                let reissue = match t {
+                    Transition::ApplyChange { .. } => format!("run `planarian {what}`"),
+                    _ => "repeat the original request with `planarian ask`".to_string(),
+                };
+                self.notice(format!(
+                    "transaction {}: {what} was cancelled after waiting 24 hours for an activation window; to reissue it, {reissue}",
+                    id.0
+                ));
+            }
+            // No mutation occurred. Reopen the incident that was waiting on
+            // this attempt and return exactly the budget slot it consumed.
+            let reopened: Vec<Incident> = self
+                .incidents
+                .incidents
+                .values_mut()
+                .filter(|i| i.attempts.last().is_some_and(|(txn, _)| *txn == id))
+                .map(|i| {
+                    i.state = IncidentState::Open;
+                    i.budget_left = i.budget_left.saturating_add(1).min(planarian_incident::BUDGET);
+                    i.next_attempt = now;
+                    i.clone()
+                })
+                .collect();
+            for i in reopened {
+                self.journal(Record::Incident(i));
+            }
+        } else {
+            self.notice(format!(
+                "transaction {}: activation-window result: {}",
+                id.0,
+                render::submitted_short(&result)
+            ));
+        }
+    }
+
+    fn note_waiting_boot(&mut self) {
+        let now = self.b.clock().boot_now();
+        let waiting: Vec<(TxnId, Transition)> = self
+            .ledger()
+            .live
+            .values()
+            .filter(|t| t.txn.state == TxnState::AwaitingBoot)
+            .map(|t| (t.txn.id, t.txn.transition.clone()))
+            .collect();
+        self.restart_reminders.retain(|id, _| waiting.iter().any(|(t, _)| t == id));
+        for (id, transition) in waiting {
+            if self.restart_reminders.get(&id).is_none_or(|due| now >= *due) {
+                self.notice(format!(
+                    "transaction {}: {} is waiting for a restart; restart to finish",
+                    id.0,
+                    render::transition(&transition)
+                ));
+                self.restart_reminders.insert(id, now.plus(RESTART_REMINDER));
+            }
+        }
     }
 
     /// §10: a probe that times out yields Unknown, never Failed, so an
@@ -1237,7 +1441,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 );
                 match self.submit(p, authorization_of(Actor::Daemon), s, defs) {
                     Submitted::Finished { txn, state, .. } => {
-                        if let Some(i) = self.incidents.record_attempt(inc.id, txn, outcome_of(&state), now) {
+                        let operation = outcome_of(&self.ledger(), txn, &state);
+                        if let Some(i) = self.incidents.record_attempt(inc.id, txn, operation.clone(), now) {
                             if matches!(i.state, IncidentState::Cooldown { .. }) {
                                 self.notice(format!(
                                     "{}: tried {} time(s) and it keeps failing; it needs a person (I'll try once more in {} min)",
@@ -1249,15 +1454,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                             self.journal(Record::Incident(i));
                         }
                         self.notice(format!(
-                            "{}: {} → {:?}{because}",
+                            "{}: {} → lifecycle {:?}, operation {:?}; health awaits observation{because}",
                             inc.target,
                             render::transition(&c.transition),
-                            state
+                            state,
+                            operation
                         ));
-                        // §1: other units in trouble because of the one just
-                        // repaired are told so (their incidents close once
-                        // they are well again).
-                        if state == TxnState::Committed {
+                        // Acknowledged actuation does not prove repair. Name
+                        // the causal action without claiming these units are
+                        // healthy; their incidents close only on observation.
+                        if state == TxnState::Committed && operation.is_success() {
                             let dependents: Vec<(UnitId, UnitStatus)> = others_rooted
                                 .iter()
                                 .filter(|(t, root, _)| *root == c.target && *t != c.target)
@@ -1265,7 +1471,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                                 .collect();
                             for (d, st) in dependents {
                                 self.notice(format!(
-                                    "{d}: {st:?} (root cause: {}); repaired with {}",
+                                    "{d}: {st:?} (root cause: {}); acted with {}; health awaits observation",
                                     c.target,
                                     render::transition(&c.transition)
                                 ));
@@ -1297,9 +1503,48 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
     }
 
-    fn confirm_boot(&mut self, s: &SystemState, defs: &UnitDefs, now: Timestamp) {
+    fn confirm_boot(&mut self, s: &SystemState, defs: &UnitDefs, _now: Timestamp) {
+        // An admitted boot-only transaction remains Promoted across daemon and
+        // watchdog restarts. Its durable admission, rather than a fresh daemon
+        // startup time, defines the same-boot checkpoint.
+        let admitted = self
+            .ledger()
+            .live
+            .values()
+            .find(|l| l.txn.state == TxnState::Promoted && l.path.iter().any(|p| p == "AwaitingBoot"))
+            .map(|l| l.txn.clone());
+        if let Some(txn) = admitted {
+            if self.b.clock().boot_now() < Timestamp(0).plus(CONFIRM_AFTER) {
+                return;
+            }
+            let canonical_passed =
+                txn.candidate.as_ref().is_some_and(|(g, _)| *g == s.generation) && self.canonical_healthy(s, defs);
+            match self.ex.kernel.confirm_boot(txn.id, canonical_passed) {
+                Ok(TxnState::Committed) => {
+                    self.confirm = None;
+                    self.notice(format!("generation {} is now the boot-confirmed known-good baseline", s.generation.0));
+                    if let Some(g) = txn.check.required_floor {
+                        self.notice(format!(
+                            "security floor is now generation {} (it fixes {}); going back below it needs an administrator",
+                            g.0,
+                            txn.check.floor_fixes.join(", ")
+                        ));
+                    }
+                }
+                Ok(TxnState::Promoted) => {}
+                Ok(state) => {
+                    self.confirm = None;
+                    self.notice(format!(
+                        "boot-only transaction {} ended {state:?}; restart to finish recovery",
+                        txn.id.0
+                    ));
+                }
+                Err(e) => self.notice(format!("boot confirmation remains pending: {e:?}")),
+            }
+            return;
+        }
         let Some((g, at)) = self.confirm else { return };
-        if now < at {
+        if self.b.clock().boot_now() < at {
             return;
         }
         self.confirm = None;
@@ -1355,6 +1600,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// and run it as `handle` would have, against a fresh observation.
     pub fn resume(&mut self, r: Resume, prebuilt: Prebuilt) -> Response {
         self.ex.prebuilt = Some(prebuilt);
+        let acting_agent = std::mem::replace(&mut self.acting_agent, r.peer.agent.clone());
         let defer = std::mem::replace(&mut self.defer, false);
         let resp = match r.kind {
             ResumeKind::Submit { t, source, reason } => self.user_submit(t, r.peer, source, reason),
@@ -1362,22 +1608,34 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         };
         self.defer = defer;
         self.ex.prebuilt = None;
+        self.acting_agent = acting_agent;
         resp
     }
 
     fn user_submit(&mut self, t: Transition, peer: Peer, source: Source, reason: String) -> Response {
-        if self.defer
-            && self.deferred.is_none()
-            && let Some(job) = self.ex.prebuild_job(&t)
-        {
-            self.deferred = Some((job, Resume { peer, kind: ResumeKind::Submit { t, source, reason } }));
-            return Response::Ok { message: "deferred".into() };
-        }
+        // Bind attribution and policy to the same fresh logind observation,
+        // including the first request after login or a changed session state.
         let (s, defs) = self.observe();
-        let p = self.proposal(t, &s, &defs, source, reason);
         let authz = self.authz(&peer);
+        if self.defer && self.deferred.is_none() {
+            match self.ex.prebuild_job(&t, &authz) {
+                Ok(Some(job)) => {
+                    let resume = Resume {
+                        peer,
+                        kind: ResumeKind::Submit { t, source, reason },
+                        principal: authz.principal,
+                        administrator: authz.capabilities.administrator,
+                    };
+                    self.deferred = Some((job, resume));
+                    return Response::Ok { message: "deferred".into() };
+                }
+                Err(r) => return self.response(&r),
+                Ok(None) => {}
+            }
+        }
+        let p = self.proposal(t, &s, &defs, source, reason);
         let r = self.submit(p, authz, &s, &defs);
-        render::response(&r)
+        self.response(&r)
     }
 
     fn status(&mut self) -> StatusReport {
@@ -1617,11 +1875,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     Source::User,
                     "from the CLI".into(),
                 );
-                // Incident control state changes only on an authorized,
-                // successful human action (§13, R08): a refused or failed
-                // release leaves the record, its budget and cooldown alone.
-                let released = matches!(&r, Response::Done { state: TxnState::Committed, .. });
-                if !released {
+                // Only successful authorized release changes incident control
+                // state; LiftOverride's durable commit witnesses that action.
+                if !matches!(&r, Response::Done { state: TxnState::Committed, .. }) {
                     return r;
                 }
                 // Releasing an inferred stop also releases what went down with it.
@@ -1650,9 +1906,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     reason: "stopped from the CLI".into(),
                 };
                 match self.user_submit(t, peer, Source::User, "planarian stop".into()) {
-                    Response::Done { txn, state, message } => Response::Done {
+                    Response::Done { txn, state, message, evidence } => Response::Done {
                         txn,
                         state,
+                        evidence,
                         message: format!(
                             "{message}. Note: `stop` means stop and leave stopped until the next boot; `planarian release {unit}` lets it run again."
                         ),
@@ -1705,28 +1962,70 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         message: "an agent cannot start agents".into(),
                     };
                 }
-                if !planarian_schema::backend::valid_agent_name(&name) || argv.is_empty() {
+                if !planarian_schema::backend::valid_agent_name(&name)
+                    || argv.is_empty()
+                    || argv.len() > 64
+                    || argv.iter().map(String::len).sum::<usize>() > 16384
+                {
                     return Response::Error {
                         message: "agent run <name> -- <command>: the name is 1-32 of a-z, 0-9 and -".into(),
                     };
                 }
-                // A name in use is refused, so a second start never rebinds
-                // what a running agent may do (I24, B-20).
+                // Read authority/registration state before bounded launch work.
+                // A live name cannot be rebound, even by an administrator (I24).
+                let ledger = match self.ex.kernel.journal.sync_ledger() {
+                    Ok(l) => l.clone(),
+                    Err(e) => return Response::Error { message: format!("cannot establish agent owner: {e:?}") },
+                };
                 if self.b.units().agent_running(&name) {
-                    let owner = self.ledger().agent_owner(&name);
                     return Response::Rejected {
                         reason: "Unauthorized".into(),
-                        message: match owner {
-                            Some(u) => format!("agent {name} is already running, started by uid {u}; stop it first"),
+                        message: match ledger.agent_owner(&name) {
+                            Some(by) => format!("agent {name} is already running, started by uid {by}; stop it first"),
                             None => format!("agent {name} is already running; stop it first"),
                         },
                     };
                 }
-                match self.b.units().start_agent(&name, &argv) {
+                // Reuse of a stopped name cannot confer authority on its old
+                // instance, and a transfer counts against the new caller's cap.
+                let owners: BTreeMap<&str, u32> =
+                    ledger.agents.iter().map(|(name, _, by)| (name.as_str(), *by)).collect();
+                if ledger.agent_owner(&name) != Some(peer.uid) {
+                    let owned = owners.values().filter(|by| **by == peer.uid).count();
+                    let per_caller = if peer.uid == 0 { AGENT_NAMES_ROOT } else { AGENT_NAMES_PER_CALLER };
+                    let total =
+                        if peer.uid == 0 { AGENT_NAMES_MAX } else { AGENT_NAMES_MAX - AGENT_NAMES_ROOT_RESERVE };
+                    let takes_root_reserve = peer.uid != 0
+                        && ledger.agent_owner(&name) == Some(0)
+                        && owners.len() >= AGENT_NAMES_MAX - AGENT_NAMES_ROOT_RESERVE;
+                    if owned >= per_caller
+                        || (!owners.contains_key(name.as_str()) && owners.len() >= total)
+                        || takes_root_reserve
+                    {
+                        return Response::Error {
+                            message: "registered agent-name capacity reached; reuse an agent name you already own"
+                                .into(),
+                        };
+                    }
+                }
+                match self.b.units().start_agent(&name, &argv, peer.uid) {
                     Ok(instance) => {
-                        // Journaled once it has started, with the instance it
-                        // started as: a failed start binds nothing (I24).
-                        self.journal(Record::AgentStarted { name: name.clone(), instance: instance.0, by: peer.uid });
+                        // I24: only the actual successfully started instance
+                        // acquires its user's authority, after a durable append.
+                        // A failed append leaves the unit unprivileged.
+                        let at = self.b.clock().now();
+                        if let Err(e) = self
+                            .ex
+                            .kernel
+                            .journal
+                            .append(at, Record::AgentStarted { name: name.clone(), instance: instance.0, by: peer.uid })
+                        {
+                            return Response::Error {
+                                message: format!(
+                                    "agent started without authority because its instance could not be journaled: {e:?}; stop its unit before retrying"
+                                ),
+                            };
+                        }
                         self.notice(format!(
                             "agent {name} started by uid {} ({}); it acts with that user's permissions",
                             peer.uid,
@@ -1755,17 +2054,33 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     };
                 }
                 if self.defer && self.deferred.is_none() {
-                    let t = self.ex.parked.values().find(|p| p.bound_to == hash).map(|p| p.proposal.transition.clone());
-                    if let Some(job) = t.and_then(|t| self.ex.prebuild_job(&t)) {
-                        let req = Request::Approve { hash };
-                        self.deferred = Some((job, Resume { peer, kind: ResumeKind::Request(req) }));
-                        return Response::Ok { message: "deferred".into() };
+                    let approver = self.authz(&peer);
+                    let parked = self.ex.parked.values().find(|p| p.bound_to == hash).cloned();
+                    if let Some(p) = parked
+                        && planarian_policy::may_approve(&approver, p.authz.principal, p.class)
+                        && !planarian_exec::token_expired(self.b.clock().boot_now(), p.issued)
+                    {
+                        match self.ex.prebuild_job(&p.proposal.transition, &p.authz) {
+                            Ok(Some(job)) => {
+                                let req = Request::Approve { hash };
+                                let resume = Resume {
+                                    peer,
+                                    kind: ResumeKind::Request(req),
+                                    principal: approver.principal,
+                                    administrator: approver.capabilities.administrator,
+                                };
+                                self.deferred = Some((job, resume));
+                                return Response::Ok { message: "deferred".into() };
+                            }
+                            Err(r) => return self.response(&r),
+                            Ok(None) => {}
+                        }
                     }
                 }
                 let (s, defs) = self.observe();
                 let approver = self.authz(&peer);
                 let r = self.ex.approve(&hash, &approver, &s, &defs);
-                render::response(&r)
+                self.response(&r)
             }
             Request::Cancel { txn } => {
                 let Some(p) = self.ex.parked.get(&txn) else {
@@ -1777,7 +2092,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     };
                 }
                 let r = self.ex.cancel(txn, Actor::user(peer.uid));
-                render::response(&r)
+                self.response(&r)
             }
             Request::Resolve { txn, resolution } => self.user_submit(
                 Transition::Resolve { txn, resolution },
@@ -1869,7 +2184,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
                 let authz = self.authz(&peer);
                 let r = self.submit(p, authz, &s, &defs);
-                render::response(&r)
+                self.response(&r)
             }
             #[cfg(feature = "gym-hooks")]
             Request::GymCompact => match self.ex.kernel.journal.compact() {

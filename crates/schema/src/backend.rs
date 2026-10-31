@@ -99,14 +99,14 @@ pub trait UnitBackend {
         vec![]
     }
     fn list(&self) -> Result<Vec<UnitId>, Outcome>;
-    /// Start an agent (§11, §16): the transient unit `planarian-agent-<name>`,
-    /// under a dynamic uid of its own. Returns the started unit's instance
-    /// (its InvocationID), read back once it has started (I24).
-    fn start_agent(&self, _name: &str, _argv: &[String]) -> Result<InstanceId, Outcome> {
+    /// Start an agent in a transient dynamic-uid unit (§11, §16). `by` is
+    /// authenticated launcher metadata for admission/resource attribution.
+    /// Authority is bound only after successful start to the returned unit
+    /// instance, read back from the supervisor (I24).
+    fn start_agent(&self, _name: &str, _argv: &[String], _by: u32) -> Result<InstanceId, Outcome> {
         Err(Outcome::Failed("this backend cannot start agents".into()))
     }
-    /// Whether an agent's unit under this name is loaded and running (I24:
-    /// `agent run` refuses a name in use).
+    /// Whether the named agent is still running; a name in use is refused.
     fn agent_running(&self, _name: &str) -> bool {
         false
     }
@@ -132,6 +132,18 @@ pub trait GenerationBackend {
     fn evaluate(&self, src: &StagedSource) -> Result<EvaluatedGeneration, Outcome>;
     /// Store-only; roots its own output.
     fn build(&self, eval: &EvaluatedGeneration) -> Result<Built, Outcome>;
+    /// Derive activation consequences relative to the running generation and
+    /// retain the exact selected store path through preparation and approval.
+    /// A prior health verdict or equal manifests do not replace this evidence.
+    fn preflight_existing(&self, _g: GenerationId, _path: &StorePath) -> Result<Built, Outcome> {
+        Err(Outcome::Unknown("existing-generation activation evidence unavailable".into()))
+    }
+    /// Read and validate a remembered override's exact content for risk
+    /// derivation; absence is unknown, never an empty configuration diff.
+    fn read_override(&self, _hash: &Hash) -> Result<OverrideSet, Outcome> {
+        Err(Outcome::Unknown("generation override evidence unavailable".into()))
+    }
+
     fn verify_candidate(&self, path: &StorePath, expected: &Hash) -> Result<bool, Outcome>;
     fn pending_jobs(&self) -> Result<Vec<JobId>, Outcome>;
     /// `None`: the backend cannot say whether work tagged with `op` exists.
@@ -145,9 +157,15 @@ pub trait GenerationBackend {
     /// Boot entry only; no re-activation.
     fn publish_boot(&self, g: GenerationId, op: &OpId) -> Outcome;
     /// The boot-only path (§12 step 7, §12f): `g` boots once, at the next
-    /// boot; `keep` stays the default. All or nothing.
+    /// boot; `keep` stays the default. Non-success may still have effects;
+    /// callers must reconcile under their durable publication intent.
     fn publish_boot_once(&self, _g: GenerationId, _keep: GenerationId, _op: &OpId) -> Outcome {
         Outcome::Failed("this boot loader cannot boot a generation once".into())
+    }
+    /// Withdraw any one-shot selection and restore the eligible default.
+    /// Success proves both effects; non-success leaves a recovery obligation.
+    fn withdraw_boot_once(&self, _keep: GenerationId, _op: &OpId) -> Outcome {
+        Outcome::Unknown("this boot loader cannot prove one-shot withdrawal".into())
     }
     /// Who created generation `g` and when (its profile link's owner and
     /// time): the provenance of a rebuild made outside Planarian (§15).
@@ -219,6 +237,11 @@ pub struct SessionInfo {
     pub class: String,
     pub seat: Option<String>,
     pub remote: bool,
+    /// The backend identified an eligible graphical session (logind Type=x11
+    /// or wayland, State=active or online). Missing historical evidence is
+    /// false: an authenticated login alone never implies a compositor.
+    #[serde(default)]
+    pub graphical: bool,
     pub created: Timestamp,
     /// logind `State=active`: the session in the foreground of its seat.
     #[serde(default)]
@@ -232,6 +255,13 @@ impl SessionInfo {
     /// §10: only `user`-class sessions with a seat, or remote user sessions, count.
     pub fn establishes(&self) -> bool {
         self.class == "user" && (self.seat.is_some() || self.remote)
+    }
+
+    /// Graphical readiness is expected for a local seated user desktop. Locked
+    /// and backgrounded desktops remain eligible; greeters, SSH/TTY-only and
+    /// closing sessions do not create a compositor expectation.
+    pub fn graphical_establishes(&self) -> bool {
+        self.establishes() && self.graphical && self.seat.is_some() && !self.remote
     }
 }
 
@@ -326,10 +356,11 @@ impl InstanceId {
     /// From systemd's form (32 hex digits, as `InvocationID` and the
     /// cgroup's `trusted.invocation_id` carry it) or the 16 raw bytes.
     pub fn parse(b: &[u8]) -> Option<InstanceId> {
-        let b = b.strip_suffix(b"\n").unwrap_or(b);
         if b.len() == 16 {
-            return Some(InstanceId(b.try_into().ok()?));
+            let raw: [u8; 16] = b.try_into().ok()?;
+            return (raw != [0; 16]).then_some(InstanceId(raw));
         }
+        let b = b.strip_suffix(b"\n").unwrap_or(b);
         let s = std::str::from_utf8(b).ok()?.trim();
         if s.len() != 32 {
             return None;
@@ -345,4 +376,19 @@ impl InstanceId {
 /// The unit an agent runs in (§11, §16).
 pub fn agent_unit(name: &str) -> String {
     format!("planarian-agent-{name}")
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::InstanceId;
+
+    #[test]
+    fn instance_evidence_rejects_zero_and_preserves_raw_newline_bytes() {
+        assert_eq!(InstanceId::parse(&[0; 16]), None);
+        assert_eq!(InstanceId::parse(b"00000000000000000000000000000000"), None);
+        let mut raw = [1; 16];
+        raw[15] = b'\n';
+        assert_eq!(InstanceId::parse(&raw), Some(InstanceId(raw)));
+        assert_eq!(InstanceId::parse(b"0101010101010101010101010101010a\n"), Some(InstanceId(raw)));
+    }
 }

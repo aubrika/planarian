@@ -1,0 +1,106 @@
+FFFFFFF
+======================================================================
+FAIL: test_actual_runner_propagates_build_and_verdict_failures (__main__.AcceptanceContract.test_actual_runner_propagates_build_and_verdict_failures) (mode='build-error')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/planarian/nix/gym/test_acceptance.py", line 140, in test_actual_runner_propagates_build_and_verdict_failures
+    self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+AssertionError: 0 == 0 : running 2 entr(y|ies) on the VM harness; results in /tmp/tmp.0JQm23YaAU
+ERROR        intent
+             the test did not run
+ERROR        required
+             the test did not run
+
+{'ERROR': 2}
+cleared on the VM harness: 0 of 2 run
+
+
+======================================================================
+FAIL: test_actual_runner_propagates_build_and_verdict_failures (__main__.AcceptanceContract.test_actual_runner_propagates_build_and_verdict_failures) (mode='FAIL')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/planarian/nix/gym/test_acceptance.py", line 140, in test_actual_runner_propagates_build_and_verdict_failures
+    self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+AssertionError: 0 == 0 : running 2 entr(y|ies) on the VM harness; results in /tmp/tmp.EHkmpzPpXB
+FAIL         intent
+FAIL         required
+
+{'FAIL': 2}
+cleared on the VM harness: 0 of 2 run
+
+
+======================================================================
+FAIL: test_actual_runner_propagates_build_and_verdict_failures (__main__.AcceptanceContract.test_actual_runner_propagates_build_and_verdict_failures) (mode='PARTIAL')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/planarian/nix/gym/test_acceptance.py", line 140, in test_actual_runner_propagates_build_and_verdict_failures
+    self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+AssertionError: 0 == 0 : running 2 entr(y|ies) on the VM harness; results in /tmp/tmp.PJUrrCAX50
+PARTIAL      intent
+PARTIAL      required
+
+{'PARTIAL': 2}
+cleared on the VM harness: 0 of 2 run
+
+
+======================================================================
+FAIL: test_actual_runner_propagates_build_and_verdict_failures (__main__.AcceptanceContract.test_actual_runner_propagates_build_and_verdict_failures) (mode='ERROR')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/planarian/nix/gym/test_acceptance.py", line 140, in test_actual_runner_propagates_build_and_verdict_failures
+    self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+AssertionError: 0 == 0 : running 2 entr(y|ies) on the VM harness; results in /tmp/tmp.mzXJdneoJe
+ERROR        intent
+ERROR        required
+
+{'ERROR': 2}
+cleared on the VM harness: 0 of 2 run
+
+
+======================================================================
+FAIL: test_actual_runner_propagates_build_and_verdict_failures (__main__.AcceptanceContract.test_actual_runner_propagates_build_and_verdict_failures) (mode='UNSUPPORTED')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/planarian/nix/gym/test_acceptance.py", line 140, in test_actual_runner_propagates_build_and_verdict_failures
+    self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+AssertionError: 0 == 0 : running 2 entr(y|ies) on the VM harness; results in /tmp/tmp.vHUZBp37ag
+UNSUPPORTED  intent
+UNSUPPORTED  required
+
+{'UNSUPPORTED': 2}
+cleared on the VM harness: 0 of 2 run
+
+
+======================================================================
+FAIL: test_actual_runner_propagates_build_and_verdict_failures (__main__.AcceptanceContract.test_actual_runner_propagates_build_and_verdict_failures) (mode='missing')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/planarian/nix/gym/test_acceptance.py", line 140, in test_actual_runner_propagates_build_and_verdict_failures
+    self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+AssertionError: 0 == 0 : running 2 entr(y|ies) on the VM harness; results in /tmp/tmp.CZYajvpxWF
+ERROR        intent
+             the test did not run
+PASS         required
+
+{'ERROR': 1, 'PASS': 1}
+cleared on the VM harness: 1 of 2 run
+
+
+======================================================================
+FAIL: test_actual_runner_propagates_build_and_verdict_failures (__main__.AcceptanceContract.test_actual_runner_propagates_build_and_verdict_failures) (mode='duplicate')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/planarian/nix/gym/test_acceptance.py", line 140, in test_actual_runner_propagates_build_and_verdict_failures
+    self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+AssertionError: 0 == 0 : running 2 entr(y|ies) on the VM harness; results in /tmp/tmp.jJ9i64kiRf
+PASS         required
+PASS         required
+
+{'PASS': 2}
+cleared on the VM harness: 2 of 2 run
+
+
+----------------------------------------------------------------------
+Ran 1 test in 0.295s
+
+FAILED (failures=7)

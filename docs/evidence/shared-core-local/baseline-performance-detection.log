@@ -1,0 +1,31 @@
+FF
+======================================================================
+FAIL: test_complete_service_cpu_includes_an_exited_helper (__main__.PerformanceContract.test_complete_service_cpu_includes_an_exited_helper)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/planarian/nix/gym/test_performance.py", line 110, in test_complete_service_cpu_includes_an_exited_helper
+    self.assertEqual(actual, 20.0, "the service's exited helper CPU must remain measured")
+AssertionError: 0.0 != 20.0 : the service's exited helper CPU must remain measured
+
+======================================================================
+FAIL: test_no_real_frame_stream_cannot_claim_p99 (__main__.PerformanceContract.test_no_real_frame_stream_cannot_claim_p99)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/planarian/nix/gym/test_performance.py", line 123, in test_no_real_frame_stream_cannot_claim_p99
+    self.assertIsNone(result["p99_ms"], "an engine's one-second min FPS is not a frame sample")
+AssertionError: 50.0 is not None : an engine's one-second min FPS is not a frame sample
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.002s
+
+FAILED (failures=2)
+probe-0: {
+ "frames": 1000,
+ "p99_ms": 50.0,
+ "source": "darkplaces one-second min",
+ "engine": "1000 frames 10 seconds 100 fps, one-second fps min/avg/max: 20",
+ "tail": [
+  "1000 frames 10 seconds 100 fps, one-second fps min/avg/max: 20 100 120"
+ ],
+ "mangohud_files": []
+}

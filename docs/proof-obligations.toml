@@ -1,0 +1,275 @@
+# Proposed mapping for owner review. Successful current-source verifier artifacts
+# are required by the gate; this manifest alone is not a proof result.
+format_version = 1
+review_status = "proposed"
+baseline_revision = "805cd1c953d78044a8c94ef9e3d35e33eb1dfb1a"
+
+[[obligation]]
+id = "exec::approval_tokens_expire_after_their_lifetime"
+engine = "kani"
+source = "crates/exec/src/kani.rs"
+invariants = ["I8"]
+
+[[obligation]]
+id = "policy::administrator_class_only_on_ask_first"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I16"]
+
+[[obligation]]
+id = "policy::agents_and_unattributed_are_refused"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I22"]
+
+[[obligation]]
+id = "policy::core_is_never_a_target"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I5"]
+
+[[obligation]]
+id = "policy::decide"
+engine = "verus"
+source = "crates/policy/src/lib.rs"
+invariants = ["I5"]
+
+[[obligation]]
+id = "policy::global_floors"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I21"]
+
+[[obligation]]
+id = "policy::i10_canonical_probe_changes_ask"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I10"]
+
+[[obligation]]
+id = "policy::i11_non_routine_session_asks"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I11"]
+
+[[obligation]]
+id = "policy::i11_session_only_raises"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I11"]
+
+[[obligation]]
+id = "policy::i14_facts_caller_is_not_authority"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I14"]
+
+[[obligation]]
+id = "policy::i16_below_floor_needs_administrator"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I16"]
+
+[[obligation]]
+id = "policy::i19_no_self_approval"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I19"]
+
+[[obligation]]
+id = "policy::i5_autonomy_never_touches_reject"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I5"]
+
+[[obligation]]
+id = "policy::may_approve"
+engine = "verus"
+source = "crates/policy/src/lib.rs"
+invariants = ["I19"]
+
+[[obligation]]
+id = "policy::may_grant"
+engine = "verus"
+source = "crates/policy/src/lib.rs"
+invariants = ["I19"]
+
+[[obligation]]
+id = "policy::only_administrators_resolve"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I22"]
+
+[[obligation]]
+id = "policy::own_session_is_per_session"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I21"]
+
+[[obligation]]
+id = "policy::security_override_held_for_administrator"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I22"]
+
+[[obligation]]
+id = "policy::security_restart_runs_alone_only_to_restore"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I22"]
+
+[[obligation]]
+id = "policy::unauthorized_is_refused_first"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I5"]
+
+[[obligation]]
+id = "policy::users_cannot_change_generations"
+engine = "verus"
+source = "crates/policy/src/proofs.rs"
+invariants = ["I22"]
+
+[[obligation]]
+id = "txn::add_interlock"
+engine = "verus"
+source = "crates/txn/src/ledger.rs"
+invariants = ["I12"]
+
+[[obligation]]
+id = "txn::an_edited_record_breaks_the_chain"
+engine = "verus"
+source = "crates/txn/src/chain.rs"
+invariants = ["I18"]
+
+[[obligation]]
+id = "txn::appending_keeps_the_chain"
+engine = "verus"
+source = "crates/txn/src/chain.rs"
+invariants = ["I18"]
+
+[[obligation]]
+id = "txn::apply"
+engine = "verus"
+source = "crates/txn/src/ledger.rs"
+invariants = ["I6", "I12"]
+
+[[obligation]]
+id = "txn::boot_only_never_activates"
+engine = "verus"
+source = "crates/txn/src/machine.rs"
+invariants = ["I6"]
+
+[[obligation]]
+id = "txn::compatible_exec"
+engine = "verus"
+source = "crates/txn/src/ledger.rs"
+invariants = ["I6"]
+
+[[obligation]]
+id = "txn::follows"
+engine = "verus"
+source = "crates/txn/src/chain.rs"
+invariants = ["I18"]
+
+[[obligation]]
+id = "txn::generations_commit_after_promotion"
+engine = "verus"
+source = "crates/txn/src/machine.rs"
+invariants = ["I23"]
+
+[[obligation]]
+id = "txn::i12_steps_terminate"
+engine = "verus"
+source = "crates/txn/src/machine.rs"
+invariants = ["I12"]
+
+[[obligation]]
+id = "txn::i12_terminal_always_reachable"
+engine = "verus"
+source = "crates/txn/src/machine.rs"
+invariants = ["I12"]
+
+[[obligation]]
+id = "txn::i6_one_generation_active"
+engine = "verus"
+source = "crates/txn/src/ledger.rs"
+invariants = ["I6"]
+
+[[obligation]]
+id = "txn::next_link"
+engine = "verus"
+source = "crates/txn/src/chain.rs"
+invariants = ["I18"]
+
+[[obligation]]
+id = "txn::only_generations_publish"
+engine = "verus"
+source = "crates/txn/src/machine.rs"
+invariants = ["I6"]
+
+[[obligation]]
+id = "txn::override_swap_never_overwrites_a_third_party"
+engine = "kani"
+source = "crates/txn/src/kani.rs"
+invariants = ["I23"]
+
+[[obligation]]
+id = "txn::recovery_table_follows_the_state_machine"
+engine = "kani"
+source = "crates/txn/src/kani.rs"
+invariants = ["I12"]
+
+[[obligation]]
+id = "txn::refusal_only_before_mutation"
+engine = "verus"
+source = "crates/txn/src/machine.rs"
+invariants = ["I12"]
+
+[[obligation]]
+id = "txn::runtime_never_reverts"
+engine = "verus"
+source = "crates/txn/src/machine.rs"
+invariants = ["I23"]
+
+[[obligation]]
+id = "txn::step_allowed"
+engine = "verus"
+source = "crates/txn/src/machine.rs"
+invariants = ["I12"]
+
+[[obligation]]
+id = "txn::takeover_fences_out_the_previous_owner"
+engine = "kani"
+source = "crates/txn/src/kani.rs"
+invariants = ["I15"]
+
+[[obligation]]
+id = "txn::terminal_is_final"
+engine = "verus"
+source = "crates/txn/src/machine.rs"
+invariants = ["I12"]
+
+[[obligation]]
+id = "txn::validate"
+engine = "verus"
+source = "crates/txn/src/ledger.rs"
+invariants = ["I6", "I15"]
+
+[[obligation]]
+id = "txn::verify"
+engine = "verus"
+source = "crates/txn/src/chain.rs"
+invariants = ["I18"]
+
+[[obligation]]
+id = "txn::watchdog_takes_over_only_when_it_should"
+engine = "kani"
+source = "crates/txn/src/kani.rs"
+invariants = ["I12"]
+
+[[obligation]]
+id = "txn::well_formed"
+engine = "verus"
+source = "crates/txn/src/ledger.rs"
+invariants = ["I6"]

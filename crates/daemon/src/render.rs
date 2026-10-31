@@ -63,6 +63,9 @@ pub fn record(r: &Record) -> String {
             format!("txn {}: taken over by {:?} (epoch {})", txn.0, lease.owner, lease.epoch)
         }
         Record::Renew { txn, .. } => format!("txn {}: lease renewed", txn.0),
+        Record::BootAdmitted { txn, .. } => {
+            format!("txn {}: boot admitted; waiting for the ten-minute confirmation", txn.0)
+        }
         Record::OpBegin { op, call } => format!("txn {}: {call}", op.txn.0),
         Record::OpAck { op, outcome } => format!("txn {}: → {outcome:?}", op.txn.0),
         Record::OverrideSet(s) => format!("{} left alone {} (by {:?})", s.unit, until(&s.until), s.by),
@@ -157,7 +160,7 @@ pub fn response(s: &Submitted) -> Response {
                 TxnState::Cancelled(_) => "withdrawn".to_string(),
                 s => tag(s).to_string(),
             };
-            Response::Done { txn: *txn, state: state.clone(), message }
+            Response::Done { txn: *txn, state: state.clone(), message, evidence: None }
         }
         Submitted::Parked { txn, approve, facts } => Response::NeedsApproval {
             txn: *txn,

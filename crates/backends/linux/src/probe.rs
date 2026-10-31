@@ -1,7 +1,7 @@
 //! `ProbeBackend`: TCP, HTTP, sandboxed exec and free-space probes (§10 probe
-//! contract). All the probes in a batch run concurrently, and each has its own
-//! timeout. Output is data: it is truncated and logged, never interpreted as
-//! instructions.
+//! contract). Admission and concurrency are bounded; each probe has one total
+//! deadline, including name resolution and queue time. Output is bounded data,
+//! logged without being interpreted as instructions.
 //!
 //! Exec probes run under `systemd-run` with a dedicated dynamic user, no
 //! capabilities, NoNewPrivileges, a CPU quota, a runtime limit and, unless
@@ -10,7 +10,8 @@
 use crate::cmd::run_limited;
 use planarian_schema::{ProbeBackend, ProbeDef, ProbeKind, ProbeResult, ProbeSandbox, SideEffects, UnitId};
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -23,17 +24,59 @@ fn io_result(e: std::io::Error) -> ProbeResult {
     }
 }
 
-fn connect(addr: &str, timeout: Duration) -> Result<TcpStream, ProbeResult> {
-    let sa = addr
-        .to_socket_addrs()
-        .map_err(|e| ProbeResult::Error(format!("{addr}: {e}")))?
-        .next()
-        .ok_or_else(|| ProbeResult::Error(format!("{addr}: no address")))?;
-    TcpStream::connect_timeout(&sa, timeout).map_err(io_result)
+/// The process-based resolver is cancellable: timing out joins no detached
+/// libc resolver thread. `getent` is supplied in both installed service PATHs.
+/// The command runner kills and reaps its entire process group on timeout.
+fn resolve_with(program: &str, host: &str, deadline: Instant) -> Result<Vec<IpAddr>, ProbeResult> {
+    let left = remaining(deadline)?;
+    let out = run_limited(&[program, "ahosts", "--", host], left, 16 * 1024);
+    if out.timed_out {
+        return Err(ProbeResult::Timeout);
+    }
+    if !out.ok() {
+        return Err(ProbeResult::Error(format!("resolution of {host}: {}", out.tail())));
+    }
+    let mut addresses = Vec::new();
+    for line in out.stdout.lines() {
+        if let Some(ip) = line.split_whitespace().next().and_then(|s| s.parse::<IpAddr>().ok())
+            && !addresses.contains(&ip)
+        {
+            addresses.push(ip);
+        }
+        if addresses.len() >= 16 {
+            break;
+        }
+    }
+    if addresses.is_empty() { Err(ProbeResult::Error(format!("{host}: no usable address"))) } else { Ok(addresses) }
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, ProbeResult> {
+    deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(ProbeResult::Timeout)
+}
+
+fn connect(addr: &str, deadline: Instant) -> Result<TcpStream, ProbeResult> {
+    if addr.len() > 1024 {
+        return Err(ProbeResult::Error("probe address exceeds 1024 bytes".into()));
+    }
+    let addresses = if let Ok(sa) = addr.parse::<SocketAddr>() {
+        vec![sa]
+    } else {
+        let (host, port) = addr.rsplit_once(':').ok_or_else(|| ProbeResult::Error("missing TCP port".into()))?;
+        let port = port.parse::<u16>().map_err(|_| ProbeResult::Error("invalid TCP port".into()))?;
+        resolve_with("getent", host, deadline)?.into_iter().map(|ip| SocketAddr::new(ip, port)).collect()
+    };
+    let mut last = ProbeResult::Error("no usable address".into());
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, remaining(deadline)?) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = io_result(e),
+        }
+    }
+    Err(last)
 }
 
 pub fn tcp(addr: &str, timeout: Duration) -> ProbeResult {
-    match connect(addr, timeout) {
+    match connect(addr, Instant::now() + timeout) {
         Ok(_) => ProbeResult::Pass,
         Err(r) => r,
     }
@@ -53,34 +96,57 @@ pub fn parse_url(url: &str) -> Option<(String, String, String)> {
 
 /// The status code from an HTTP/1.x status line.
 pub fn status_of(head: &str) -> Option<u16> {
-    let line = head.lines().next()?;
+    let (line, _) = head.split_once("\r\n")?;
     let mut parts = line.split_whitespace();
-    if !parts.next()?.starts_with("HTTP/1.") {
+    if !matches!(parts.next()?, "HTTP/1.0" | "HTTP/1.1") {
         return None;
     }
-    parts.next()?.parse().ok()
+    let code = parts.next()?;
+    if code.len() != 3 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    code.parse().ok().filter(|code| (100..=599).contains(code))
 }
 
 pub fn http(url: &str, want: u16, timeout: Duration, bytes_max: usize) -> ProbeResult {
+    if url.len() > 8192 || url.contains('\r') || url.contains('\n') {
+        return ProbeResult::Error("HTTP probe URL is oversized or contains a line break".into());
+    }
     let Some((addr, host, path)) = parse_url(url) else {
         return ProbeResult::Error(format!("unsupported URL {url:?} (only http:// in Phase A)"));
     };
     let deadline = Instant::now() + timeout;
-    let mut s = match connect(&addr, timeout) {
+    let mut s = match connect(&addr, deadline) {
         Ok(s) => s,
         Err(r) => return r,
     };
-    let left = deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
-    let _ = s.set_read_timeout(Some(left));
-    let _ = s.set_write_timeout(Some(left));
     let req =
         format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: planarian-probe\r\nConnection: close\r\n\r\n");
-    if let Err(e) = s.write_all(req.as_bytes()) {
-        return io_result(e);
+    let mut sent = 0;
+    while sent < req.len() {
+        let left = match remaining(deadline) {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
+        if let Err(e) = s.set_write_timeout(Some(left)) {
+            return ProbeResult::Error(e.to_string());
+        }
+        match s.write(&req.as_bytes()[sent..]) {
+            Ok(0) => return ProbeResult::Error("HTTP request write returned zero".into()),
+            Ok(n) => sent += n,
+            Err(e) => return io_result(e),
+        }
     }
     let mut buf = vec![0u8; bytes_max.clamp(64, 65536)];
     let mut n = 0;
     while n < buf.len() {
+        let left = match remaining(deadline) {
+            Ok(t) => t,
+            Err(r) => return r,
+        };
+        if let Err(e) = s.set_read_timeout(Some(left)) {
+            return ProbeResult::Error(e.to_string());
+        }
         match s.read(&mut buf[n..]) {
             Ok(0) => break,
             Ok(k) => {
@@ -103,6 +169,9 @@ pub fn http(url: &str, want: u16, timeout: Duration, bytes_max: usize) -> ProbeR
 pub fn sandbox_argv(argv: &[String], sb: &ProbeSandbox, timeout: Duration) -> Vec<String> {
     let mut a: Vec<String> =
         ["systemd-run", "--wait", "--pipe", "--quiet", "--collect", "--service-type=exec"].map(String::from).into();
+    // Keep transient work in the same persistent accounting parent as the
+    // daemon/watchdog; its CPU remains counted after --collect removes it.
+    a.push("--slice=planarian-monitor.slice".into());
     if sb.uid == 0 {
         a.push("--property=DynamicUser=yes".into());
     } else {
@@ -111,7 +180,15 @@ pub fn sandbox_argv(argv: &[String], sb: &ProbeSandbox, timeout: Duration) -> Ve
     a.push("--property=NoNewPrivileges=yes".into());
     a.push(format!("--property=CapabilityBoundingSet={}", sb.caps.join(" ")));
     a.push(format!("--property=AmbientCapabilities={}", sb.caps.join(" ")));
-    a.push(format!("--property=RuntimeMaxSec={}", timeout.as_secs().max(1)));
+    a.push(format!("--property=RuntimeMaxSec={}ms", timeout.as_millis().max(1)));
+    // Bound time before RuntimeMaxSec starts as well. Job timeout cancels
+    // queued starts; TimeoutStartSec bounds a start already in progress. With
+    // the 100ms kill grace, both fit within the command's 2s scheduling margin.
+    let startup_ms = timeout.as_millis().clamp(1, 500);
+    a.push(format!("--property=JobTimeoutSec={startup_ms}ms"));
+    a.push(format!("--property=TimeoutStartSec={startup_ms}ms"));
+    a.push("--property=TimeoutStopSec=100ms".into());
+    a.push("--property=KillMode=control-group".into());
     a.push(format!(
         "--property=CPUQuota={}%",
         (sb.cpu_ms as u64 * 100 / timeout.as_millis().max(1) as u64).clamp(1, 100)
@@ -133,6 +210,8 @@ pub fn exec(argv: &[String], sb: &ProbeSandbox, timeout: Duration) -> ProbeResul
     let o = run_limited(&refs, timeout + Duration::from_secs(2), sb.max_output as usize);
     if o.timed_out {
         ProbeResult::Timeout
+    } else if o.truncated {
+        ProbeResult::Error("probe output is incomplete".into())
     } else if o.ok() {
         ProbeResult::Pass
     } else if o.status.is_none() {
@@ -153,6 +232,8 @@ pub fn dbus(service: &str, path: &str, method: &str, timeout: Duration) -> Probe
     let o = run_limited(&argv, timeout + Duration::from_secs(2), 4096);
     if o.timed_out {
         ProbeResult::Timeout
+    } else if o.truncated {
+        ProbeResult::Error("probe output is incomplete".into())
     } else if o.ok() {
         ProbeResult::Pass
     } else if o.status.is_none() {
@@ -185,8 +266,12 @@ pub fn free_space(path: &str, min_bytes: u64, min_permille: u16) -> ProbeResult 
     }
 }
 
-fn run_one(p: &ProbeDef) -> ProbeResult {
-    let timeout = Duration::from_millis(p.timeout.0.max(1));
+fn run_one(p: &ProbeDef, enqueued: Instant) -> ProbeResult {
+    let deadline = enqueued + Duration::from_millis(p.timeout.0.max(1));
+    let timeout = match remaining(deadline) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
     let bytes_max = match p.side_effects {
         SideEffects::Measurement { bytes_max, .. } => bytes_max as usize,
         _ => 4096,
@@ -204,15 +289,57 @@ fn run_one(p: &ProbeDef) -> ProbeResult {
     }
 }
 
+/// No persistent queue: reject overflow as Unknown evidence. These limits
+/// apply across concurrent callers in this process, not just within one batch.
+const MAX_CONCURRENT: usize = 16;
+const MAX_BATCH: usize = 128;
+static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+struct Permit;
+impl Permit {
+    fn acquire() -> Option<Self> {
+        ACTIVE
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_CONCURRENT).then_some(n + 1))
+            .ok()
+            .map(|_| Self)
+    }
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        ACTIVE.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl ProbeBackend for Probes {
     fn run_batch(&self, jobs: &[(UnitId, ProbeDef)]) -> Vec<ProbeResult> {
-        std::thread::scope(|s| {
-            let handles: Vec<_> = jobs.iter().map(|(_, p)| s.spawn(move || run_one(p))).collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| ProbeResult::Error("probe panicked".into())))
-                .collect()
-        })
+        let enqueued = Instant::now();
+        let mut results = Vec::with_capacity(jobs.len());
+        for chunk in jobs.iter().take(MAX_BATCH).collect::<Vec<_>>().chunks(MAX_CONCURRENT) {
+            results.extend(std::thread::scope(|s| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|(_, p)| {
+                        // A caller cannot create unbounded workers while another
+                        // batch is still running. There is no wait for a permit.
+                        Permit::acquire().map(|permit| {
+                            s.spawn(move || {
+                                let _permit = permit;
+                                run_one(p, enqueued)
+                            })
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| match h {
+                        Some(h) => h.join().unwrap_or_else(|_| ProbeResult::Error("probe panicked".into())),
+                        None => ProbeResult::Error("probe concurrency limit reached".into()),
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        results.extend((MAX_BATCH..jobs.len()).map(|_| ProbeResult::Error("probe batch limit reached".into())));
+        results
     }
 }
 
@@ -241,15 +368,21 @@ mod tests {
         assert_eq!(parse_url("https://x/"), None);
         assert_eq!(status_of("HTTP/1.1 503 Service Unavailable\r\n"), Some(503));
         assert_eq!(status_of("garbage"), None);
+        assert_eq!(status_of("HTTP/1.1 200 incomplete status line"), None);
+        assert_eq!(status_of("HTTP/1.garbage 200 OK\r\n"), None);
+        assert_eq!(status_of("HTTP/1.1 20 OK\r\n"), None);
     }
 
     #[test]
     fn tcp_and_http_against_a_local_server() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for (i, s) in l.incoming().enumerate() {
-                let mut s = s.unwrap();
+        let server = std::thread::spawn(move || {
+            for i in 0..3 {
+                let (mut s, _) = l.accept().unwrap();
+                if i == 2 {
+                    break; // The last connection tests TCP readiness only.
+                }
                 let mut buf = [0u8; 512];
                 let _ = s.read(&mut buf);
                 let body = if i == 0 { "HTTP/1.1 200 OK\r\n\r\nok" } else { "HTTP/1.1 503 Busy\r\n\r\n" };
@@ -260,6 +393,7 @@ mod tests {
         assert_eq!(http(&url, 200, Duration::from_secs(2), 4096), ProbeResult::Pass);
         assert!(matches!(http(&url, 200, Duration::from_secs(2), 4096), ProbeResult::Fail(m) if m.contains("503")));
         assert_eq!(tcp(&addr.to_string(), Duration::from_secs(1)), ProbeResult::Pass);
+        server.join().unwrap();
         // Port 1 is closed in any test environment; a freshly released
         // ephemeral port is not (another test may have taken it).
         assert!(matches!(tcp("127.0.0.1:1", Duration::from_secs(1)), ProbeResult::Fail(_)));
@@ -271,8 +405,44 @@ mod tests {
         let a = sandbox_argv(&["true".into()], &sb, Duration::from_secs(10));
         assert!(a.contains(&"--property=DynamicUser=yes".to_string()));
         assert!(a.contains(&"--property=PrivateNetwork=yes".to_string()));
+        assert!(a.contains(&"--slice=planarian-monitor.slice".to_string()));
         assert_eq!(a.last().unwrap(), "true");
         assert_eq!(free_space("/", 0, 0), ProbeResult::Pass);
         assert!(matches!(free_space("/", u64::MAX, 0), ProbeResult::Fail(_)));
+    }
+    #[test]
+    fn trickling_http_has_one_total_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for b in b"HTTP/1.1 200 OK\r\n" {
+                if stream.write_all(&[*b]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let start = Instant::now();
+        assert_eq!(http(&url, 200, Duration::from_millis(70), 4096), ProbeResult::Timeout);
+        assert!(start.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn resolver_process_is_cancelled_inside_the_total_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = dir.path().join("resolver");
+        std::fs::write(&resolver, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::set_permissions(&resolver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..3 {
+            let start = Instant::now();
+            assert_eq!(
+                resolve_with(resolver.to_str().unwrap(), "stalled.invalid", start + Duration::from_millis(50)),
+                Err(ProbeResult::Timeout)
+            );
+            assert!(start.elapsed() < Duration::from_millis(500));
+        }
     }
 }

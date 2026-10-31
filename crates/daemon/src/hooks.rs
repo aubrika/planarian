@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 const DESIRED_TAG: &[u8] = b"planarian desired-state v1\0";
 const HEALTH_TAG: &[u8] = b"planarian health-report v1\0";
+const HEALTH_TAG_V2: &[u8] = b"planarian health-report v2\0";
 
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -278,6 +279,19 @@ pub struct IncidentSummary {
     pub state: String,
 }
 
+/// The journal context used when collecting the physical observations in
+/// this report. It witnesses a prefix, not an atomic snapshot of the host.
+/// No paths, record contents, or failure details are disclosed by Minimal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JournalEvidence {
+    Verified(planarian_txn::journal::JournalPrefix),
+    /// Legacy reports stored no head. Never infer one from their contents.
+    #[default]
+    LegacyUnavailable,
+    Unavailable,
+    Invalid,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthReport {
     pub format: u32,
@@ -289,6 +303,8 @@ pub struct HealthReport {
     /// Unit → status kind (`Running`, `Failed`, ...), with no payload.
     pub units: BTreeMap<String, String>,
     pub incidents: Vec<IncidentSummary>,
+    #[serde(default)]
+    pub journal: JournalEvidence,
 }
 
 /// The variant name of a status, dropping its payload (probe ids, reasons).
@@ -323,10 +339,11 @@ pub fn report<'a>(
     s: &SystemState,
     defs: &UnitDefs,
     incidents: impl IntoIterator<Item = &'a Incident>,
+    journal: JournalEvidence,
 ) -> HealthReport {
     match profile {
         DisclosureProfile::Minimal => HealthReport {
-            format: 1,
+            format: 2,
             profile,
             at: s.observed_at,
             generation: s.generation,
@@ -337,6 +354,7 @@ pub fn report<'a>(
                 .filter(|i| !matches!(i.state, IncidentState::Closed))
                 .map(|i| IncidentSummary { kind: format!("{:?}", i.kind), state: incident_state(&i.state).into() })
                 .collect(),
+            journal,
         },
     }
 }
@@ -365,10 +383,11 @@ pub fn health_key(dir: &Path) -> std::io::Result<SigningKey> {
 
 /// Write `health-report.json` and its signature (local only in Phase A).
 pub fn emit(dir: &Path, key: &SigningKey, r: &HealthReport) -> std::io::Result<PathBuf> {
+    let tag = report_tag(r).ok_or_else(|| std::io::Error::other("unsupported health-report format or evidence"))?;
     let bytes = serde_json::to_vec_pretty(r).map_err(std::io::Error::other)?;
     let p = dir.join("health-report.json");
     let tmp = dir.join("health-report.json.tmp");
-    std::fs::write(sig_path(&tmp), hex(&key.sign(&tagged(HEALTH_TAG, &bytes)).to_bytes()))?;
+    std::fs::write(sig_path(&tmp), hex(&key.sign(&tagged(tag, &bytes)).to_bytes()))?;
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(sig_path(&tmp), sig_path(&p))?;
     std::fs::rename(&tmp, &p)?;
@@ -377,8 +396,25 @@ pub fn emit(dir: &Path, key: &SigningKey, r: &HealthReport) -> std::io::Result<P
 
 /// Check a report against the core's public key.
 pub fn verify_report(public: &VerifyingKey, bytes: &[u8], sig_hex: &str) -> bool {
+    let Ok(report) = serde_json::from_slice::<HealthReport>(bytes) else { return false };
+    let Some(tag) = report_tag(&report) else { return false };
     let Some(sig) = unhex(sig_hex).and_then(|s| Signature::from_slice(&s).ok()) else { return false };
-    public.verify(&tagged(HEALTH_TAG, bytes), &sig).is_ok()
+    public.verify(&tagged(tag, bytes), &sig).is_ok()
+}
+
+fn report_tag(report: &HealthReport) -> Option<&'static [u8]> {
+    match (report.format, &report.journal) {
+        (1, JournalEvidence::LegacyUnavailable) => Some(HEALTH_TAG),
+        (2, JournalEvidence::Verified(p))
+            if p.format == 2
+                && p.checkpoint_sequence <= p.sequence
+                && (p.checkpoint_sequence == 0 || p.checkpoint.is_some()) =>
+        {
+            Some(HEALTH_TAG_V2)
+        }
+        (2, JournalEvidence::Unavailable | JournalEvidence::Invalid) => Some(HEALTH_TAG_V2),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -516,7 +552,7 @@ mod tests {
             UnitId::service("gym-web"),
             (Observed::Failed(Reason::DriverError("/secret/path v1.2".into())), vec![]),
         );
-        let r = report(DisclosureProfile::Minimal, &s, &UnitDefs::new(), []);
+        let r = report(DisclosureProfile::Minimal, &s, &UnitDefs::new(), [], JournalEvidence::Unavailable);
         let text = serde_json::to_string(&r).unwrap();
         assert!(!text.contains("secret") && !text.contains("1.2"), "{text}");
         assert!(r.units.values().all(|v| !v.contains('(')));
@@ -535,5 +571,72 @@ mod tests {
         .unwrap();
         assert!(verify_report(&public, &bytes, &sig));
         assert!(!verify_report(&public, &[bytes.as_slice(), b" "].concat(), &sig));
+    }
+
+    #[test]
+    fn the_signature_covers_the_head_sequence_and_checkpoint() {
+        use planarian_schema::Hash;
+        use planarian_txn::journal::JournalPrefix;
+        let s = planarian_schema::fixtures::empty_state(1000);
+        let prefix = JournalPrefix {
+            format: 2,
+            sequence: 42,
+            checkpoint_sequence: 10,
+            checkpoint: Some(Hash::of(b"checkpoint")),
+            head: Hash::of(b"prefix"),
+        };
+        let r = report(DisclosureProfile::Minimal, &s, &UnitDefs::new(), [], JournalEvidence::Verified(prefix));
+        let k = key(7);
+        let bytes = serde_json::to_vec(&r).unwrap();
+        let sig = hex(&k.sign(&tagged(HEALTH_TAG_V2, &bytes)).to_bytes());
+        assert!(verify_report(&k.verifying_key(), &bytes, &sig));
+        for field in ["head", "sequence", "checkpoint_sequence", "checkpoint"] {
+            let mut edited = r.clone();
+            let JournalEvidence::Verified(p) = &mut edited.journal else { panic!() };
+            match field {
+                "head" => p.head = Hash::of(b"another prefix"),
+                "sequence" => p.sequence += 1,
+                "checkpoint_sequence" => p.checkpoint_sequence += 1,
+                _ => p.checkpoint = Some(Hash::of(b"another checkpoint")),
+            }
+            assert!(!verify_report(&k.verifying_key(), &serde_json::to_vec(&edited).unwrap(), &sig), "{field}");
+        }
+        // A format-1 verifier cannot accidentally accept the new domain.
+        let signature = Signature::from_slice(&unhex(&sig).unwrap()).unwrap();
+        assert!(k.verifying_key().verify(&tagged(HEALTH_TAG, &bytes), &signature).is_err());
+        let desired_signature = hex(&k.sign(&tagged(DESIRED_TAG, &bytes)).to_bytes());
+        assert!(!verify_report(&k.verifying_key(), &bytes, &desired_signature));
+    }
+
+    #[test]
+    fn legacy_reports_have_explicitly_unavailable_evidence_and_unknown_formats_fail_closed() {
+        let s = planarian_schema::fixtures::empty_state(1000);
+        let r = report(DisclosureProfile::Minimal, &s, &UnitDefs::new(), [], JournalEvidence::Unavailable);
+        // This is the complete old wire shape: format 1, without a journal field.
+        let mut legacy = serde_json::to_value(r).unwrap();
+        legacy["format"] = 1.into();
+        legacy.as_object_mut().unwrap().remove("journal");
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let k = key(8);
+        let sig = hex(&k.sign(&tagged(HEALTH_TAG, &bytes)).to_bytes());
+        assert!(verify_report(&k.verifying_key(), &bytes, &sig));
+        let parsed: HealthReport = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.journal, JournalEvidence::LegacyUnavailable);
+        // No old record is reinterpreted as having stored a journal witness.
+        legacy["format"] = 2.into();
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let sig = hex(&k.sign(&tagged(HEALTH_TAG_V2, &bytes)).to_bytes());
+        assert!(!verify_report(&k.verifying_key(), &bytes, &sig));
+        legacy["format"] = 3.into();
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let sig = hex(&k.sign(&tagged(HEALTH_TAG_V2, &bytes)).to_bytes());
+        assert!(!verify_report(&k.verifying_key(), &bytes, &sig));
+        for journal in [JournalEvidence::Unavailable, JournalEvidence::Invalid] {
+            let r = report(DisclosureProfile::Minimal, &s, &UnitDefs::new(), [], journal);
+            let bytes = serde_json::to_vec(&r).unwrap();
+            let sig = hex(&k.sign(&tagged(HEALTH_TAG_V2, &bytes)).to_bytes());
+            assert!(verify_report(&k.verifying_key(), &bytes, &sig));
+            assert!(!String::from_utf8(bytes).unwrap().contains("head"));
+        }
     }
 }

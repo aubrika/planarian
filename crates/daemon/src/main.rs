@@ -100,6 +100,16 @@ const MAX_CONNS: usize = 64;
 /// session (§16, B-15): services with dynamic uids cannot fill them all.
 const RESERVED: usize = 16;
 
+/// Includes the running build. Leave room for administrator work even when
+/// user-controlled catalog requests fill their allowance.
+const MAX_BUILDS: usize = 8;
+const RESERVED_BUILDS: usize = 2;
+const BUILDS_PER_PRINCIPAL: usize = 2;
+
+fn admits_build(admin: bool, mine: usize, total: usize) -> bool {
+    mine < BUILDS_PER_PRINCIPAL && total < if admin { MAX_BUILDS } else { MAX_BUILDS - RESERVED_BUILDS }
+}
+
 /// Whether one more connection from this peer fits.
 fn admits(peer: &Peer, mine: usize, total: usize) -> bool {
     let cap = if peer.admin || peer.session.is_some() { MAX_CONNS } else { MAX_CONNS - RESERVED };
@@ -196,26 +206,38 @@ fn peer_of(s: &UnixStream, admin_group: &str) -> Option<Peer> {
     Some(Peer { uid, admin: is_admin(uid, admin_group), session, agent: None, instance: None, tty: p.tty })
 }
 
-/// The agent whose unit (`/system.slice/planarian-agent-<name>.service`,
-/// or below it) holds this cgroup, if any.
-fn agent_of_cgroup(cgroup: &str) -> Option<String> {
+/// Resolve only supervisor-owned launcher locations, never a unit-looking
+/// name inside a user/delegated cgroup. Descendants inherit the enclosing
+/// agent's identity and instance, not a unit name they create themselves.
+fn agent_unit_cgroup(cgroup: &str) -> Option<(String, String)> {
     let line = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
-    let mut parts = line.split('/').filter(|c| !c.is_empty());
-    if parts.next()? != "system.slice" {
+    let parts: Vec<&str> = line.strip_prefix('/')?.split('/').collect();
+    if parts.iter().any(|c| c.is_empty() || *c == "." || *c == "..") {
         return None;
     }
-    let name = parts.next()?.strip_prefix("planarian-agent-")?.strip_suffix(".service")?;
-    planarian_schema::backend::valid_agent_name(name).then(|| name.to_string())
+    let unit_index = if parts.first() == Some(&"system.slice") {
+        1
+    } else if parts.starts_with(&["planarian.slice", "planarian-agents.slice"]) {
+        2
+    } else {
+        return None;
+    };
+    let name = parts.get(unit_index)?.strip_prefix("planarian-agent-")?.strip_suffix(".service")?;
+    if !planarian_schema::backend::valid_agent_name(name) {
+        return None;
+    }
+    Some((name.to_string(), parts[..=unit_index].join("/")))
 }
 
-/// The InvocationID of the agent unit holding this cgroup (I24): systemd
-/// writes it to the unit's cgroup as the `trusted.invocation_id` xattr,
-/// which only root can set, so a process in the unit cannot change it.
+fn agent_of_cgroup(cgroup: &str) -> Option<String> {
+    agent_unit_cgroup(cgroup).map(|(name, _)| name)
+}
+
+/// Read the actual launcher unit root, even for a delegated descendant or
+/// the nested supervised slice. Only root may set this trusted xattr (I24).
 fn instance_of_cgroup(cgroup: &str) -> Option<planarian_schema::InstanceId> {
-    let line = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
-    let mut parts = line.split('/').filter(|c| !c.is_empty());
-    let (slice, unit) = (parts.next()?, parts.next()?);
-    let dir = format!("/sys/fs/cgroup/{slice}/{unit}");
+    let (_, unit) = agent_unit_cgroup(cgroup)?;
+    let dir = format!("/sys/fs/cgroup/{unit}");
     let mut buf = [0u8; 64];
     let n = rustix::fs::getxattr(dir.as_str(), "trusted.invocation_id", &mut buf).ok()?;
     planarian_schema::InstanceId::parse(&buf[..n])
@@ -302,6 +324,8 @@ fn gym_arm(core: &mut Core<Real, FileStore>) {
         "State" => Some(CrashPoint::State(name)),
         "OpBegun" => Some(CrashPoint::OpBegun(name)),
         "OpCalled" => Some(CrashPoint::OpCalled(name)),
+        "OpAcked" => Some(CrashPoint::OpAcked(name)),
+        "FloorEstablished" => Some(CrashPoint::FloorEstablished),
         _ => None,
     };
 }
@@ -527,6 +551,7 @@ fn main() {
     let mut next_tick = Instant::now();
     // One build at a time; later ones wait their turn.
     let mut building = false;
+    let mut building_principal = None;
     let mut queued: VecDeque<(PrebuildJob<<Real as Backends>::Gens>, Resume, Reply)> = VecDeque::new();
     let start = |job: PrebuildJob<_>, resume: Resume, reply: Reply, core: &mut Core<Real, FileStore>| {
         let what = resume.describe();
@@ -566,10 +591,23 @@ fn main() {
                     *busy.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
                 match core.take_deferred() {
-                    Some((job, resume)) if building => queued.push_back((job, resume, reply)),
                     Some((job, resume)) => {
-                        building = true;
-                        start(job, resume, reply, &mut core);
+                        let principal = resume.principal();
+                        let mine = usize::from(building_principal == Some(principal))
+                            + queued.iter().filter(|(_, r, _)| r.principal() == principal).count();
+                        let total = usize::from(building) + queued.len();
+                        if !admits_build(resume.administrator(), mine, total) {
+                            let _ = reply.send(Response::Rejected {
+                                reason: "Busy".into(),
+                                message: "catalog work limit reached; try again after the pending work finishes".into(),
+                            });
+                        } else if building {
+                            queued.push_back((job, resume, reply));
+                        } else {
+                            building = true;
+                            building_principal = Some(principal);
+                            start(job, resume, reply, &mut core);
+                        }
                     }
                     None => {
                         let _ = reply.send(resp);
@@ -578,6 +616,7 @@ fn main() {
             }
             Ok(Event::Built(resume, pre, reply)) => {
                 core.building = None;
+                building_principal = None;
                 if let Some(snap) = Snapshot::take(&mut core) {
                     let b = Busy { with: resume.describe(), since: Instant::now() };
                     *busy.lock().unwrap_or_else(|e| e.into_inner()) = Some((b, snap));
@@ -589,8 +628,14 @@ fn main() {
                 gym_crash(&resp);
                 *busy.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 let _ = reply.send(resp);
-                match queued.pop_front() {
-                    Some((job, resume, reply)) => start(job, resume, reply, &mut core),
+                // Administrator and recovery work uses reserved capacity
+                // and is selected before another user's queued build.
+                let next = queued.iter().position(|(_, r, _)| r.administrator()).unwrap_or(0);
+                match queued.remove(next) {
+                    Some((job, resume, reply)) => {
+                        building_principal = Some(resume.principal());
+                        start(job, resume, reply, &mut core);
+                    }
                     None => building = false,
                 }
             }
@@ -635,8 +680,13 @@ fn hooks_tick(
         && Instant::now() >= *next_report
     {
         *next_report = Instant::now() + *every;
-        if let Err(e) = hooks::emit(state, key, &core.health_report()) {
-            eprintln!("planariad: health report: {e}");
+        match core.health_report() {
+            Some(report) => {
+                if let Err(e) = hooks::emit(state, key, &report) {
+                    eprintln!("planariad: health report: {e}");
+                }
+            }
+            None => eprintln!("planariad: health report unavailable before the first state collection"),
         }
     }
 }
@@ -672,6 +722,17 @@ mod tests {
     }
 
     #[test]
+    fn expensive_work_is_bounded_per_principal_with_admin_reserve() {
+        assert!(admits_build(false, 0, MAX_BUILDS - RESERVED_BUILDS - 1));
+        assert!(!admits_build(false, 0, MAX_BUILDS - RESERVED_BUILDS));
+        assert!(admits_build(true, 0, MAX_BUILDS - 1));
+        assert!(!admits_build(true, 0, MAX_BUILDS));
+        for admin in [false, true] {
+            assert!(!admits_build(admin, BUILDS_PER_PRINCIPAL, 0));
+        }
+    }
+
+    #[test]
     fn agent_from_cgroup() {
         assert_eq!(agent_of_cgroup("0::/system.slice/planarian-agent-coder.service\n"), Some("coder".into()));
         assert_eq!(agent_of_cgroup("0::/system.slice/planarian-agent-coder.service/sub\n"), Some("coder".into()));
@@ -680,6 +741,24 @@ mod tests {
         // an agent unit is not one, and neither is a bad name.
         assert_eq!(agent_of_cgroup("0::/user.slice/user-1000.slice/planarian-agent-coder.service\n"), None);
         assert_eq!(agent_of_cgroup("0::/system.slice/planarian-agent-Coder.service\n"), None);
+        let supervised = "0::/planarian.slice/planarian-agents.slice/planarian-agent-coder.service/sub\n";
+        assert_eq!(agent_of_cgroup(supervised), Some("coder".into()));
+        assert_eq!(
+            agent_unit_cgroup(supervised),
+            Some(("coder".into(), "planarian.slice/planarian-agents.slice/planarian-agent-coder.service".into()))
+        );
+        assert_eq!(
+            agent_unit_cgroup("0::/system.slice/planarian-agent-coder.service/sub\n"),
+            Some(("coder".into(), "system.slice/planarian-agent-coder.service".into()))
+        );
+        for spoof in [
+            "0::/user.slice/user-1000.slice/user@1000.service/planarian.slice/planarian-agents.slice/planarian-agent-coder.service",
+            "0::/system.slice/other.service/planarian-agent-coder.service",
+            "0::/planarian.slice/planarian-agents.slice/other.service/planarian-agent-coder.service",
+            "0::/planarian.slice/planarian-agents.slice/../planarian-agent-coder.service",
+        ] {
+            assert_eq!(agent_unit_cgroup(spoof), None, "{spoof}");
+        }
     }
 
     #[test]

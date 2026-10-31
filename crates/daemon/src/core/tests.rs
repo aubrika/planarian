@@ -85,6 +85,28 @@ impl Rig {
 }
 
 #[test]
+fn health_reporting_only_reads_the_cached_state_and_journal_cut() {
+    let mut r = Rig::new();
+    assert!(r.core.health_report().is_none(), "no invented initial snapshot");
+    r.core.observe();
+    let before = r.core.health_report().unwrap();
+    let crate::hooks::JournalEvidence::Verified(prefix) = &before.journal else { panic!("verified context") };
+    assert_eq!(prefix.sequence, r.core.ex.kernel.journal.ledger().last_seq);
+    assert_eq!(prefix.head, r.core.ex.kernel.journal.head());
+    let calls = r.fake.w().calls.len();
+    let now = r.fake.w().now;
+    r.fake.w().kill(&UnitId::service("gym-web"));
+    for _ in 0..3 {
+        assert_eq!(r.core.health_report().unwrap(), before);
+    }
+    assert_eq!(r.fake.w().calls.len(), calls, "reporting starts no backend operations");
+    assert_eq!(r.fake.w().now, now, "reporting runs no probes or sleeps");
+    assert_eq!(r.core.ex.kernel.journal.ledger().last_seq, prefix.sequence, "reporting appends no records");
+    r.core.observe();
+    assert_ne!(r.core.health_report().unwrap().units, before.units, "the next collection sees the failure");
+}
+
+#[test]
 fn svc_killed_is_repaired_once_and_closes() {
     let mut r = Rig::new();
     r.ticks(2);
@@ -217,6 +239,79 @@ fn unprivileged_override_of_a_security_unit_is_held_for_an_administrator() {
     assert_eq!(r.status("service:sshd"), UnitStatus::Overridden(OverrideDesired::Stopped));
     let l = r.core.ledger();
     assert_eq!(l.overrides[0].by.uid(), Some(1000), "attributed to alice, not the approver");
+}
+
+#[test]
+fn the_first_request_after_login_keeps_the_fresh_authenticated_session() {
+    let mut r = Rig::new();
+    r.core.observe();
+    assert!(r.core.asm.sessions.is_empty());
+    let now = r.fake.clock().now();
+    r.fake.w().sessions.push(SessionInfo {
+        id: "fresh-login".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        graphical: true,
+        created: now,
+        active: true,
+        idle: false,
+    });
+    // No daemon tick occurs between logind's change and the request.
+    let req = Request::SetOverride {
+        unit: UnitId::service("sshd"),
+        until: Until::Explicit,
+        desired: OverrideDesired::Stopped,
+    };
+    let response = r.core.handle(ALICE.in_session("fresh-login"), req);
+    let Response::NeedsApproval { approve, .. } = response else { panic!("must ask: {response:?}") };
+    let proposer = Actor::User {
+        uid: 1000,
+        session: Some("fresh-login".into()),
+        seat: Some("seat0".into()),
+        active: true,
+    };
+    assert_eq!(r.core.ex.parked.values().next().unwrap().authz.actor, proposer);
+    let response = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    assert!(matches!(response, Response::Done { state: TxnState::Committed, .. }), "{response:?}");
+    assert_eq!(r.core.ledger().overrides[0].by, proposer);
+}
+
+#[test]
+fn root_proposals_need_an_independent_administrators_fresh_request_at_the_public_api() {
+    let disable_sshd = || Request::Apply {
+        change: ChangeId("service-enable".into()),
+        args: [("service".into(), Value::Str("sshd".into())), ("enabled".into(), Value::Bool(false))].into(),
+    };
+    let mut r = Rig::new();
+    let response = r.core.handle(ADMIN, disable_sshd());
+    let Response::NeedsApproval { txn, approve, .. } = response else { panic!("must ask: {response:?}") };
+    let pending = r.core.ledger();
+    // Another administrator at a terminal still cannot approve in Phase A.
+    // Root without a terminal cannot approve either.
+    for peer in [Peer::new(1001, true).at_terminal(), ADMIN] {
+        let response = r.core.handle(peer, Request::Approve { hash: approve });
+        let Response::Error { message } = response else { panic!("must refuse: {response:?}") };
+        assert!(message.contains("requires root at an interactive terminal"), "{message}");
+        assert_eq!(r.core.ledger(), pending, "a refused approval keeps its durable obligation unchanged");
+    }
+    let response = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    let Response::Rejected { reason, message } = response else { panic!("must reject: {response:?}") };
+    assert_eq!(reason, "Unauthorized");
+    assert!(message.contains("your own request"), "{message}");
+    assert_eq!(r.core.ledger(), pending, "root cannot self-approve");
+    assert_eq!(r.core.ledger().live[&txn].txn.state, TxnState::Prepared);
+    assert_eq!(r.calls("activate_live"), 0);
+    assert_eq!(r.fake.w().current, GenerationId(1));
+
+    // The supported workflow starts a fresh request as an existing non-root
+    // administrator, then obtains root's independent terminal approval.
+    let mut fresh = Rig::new();
+    let response = fresh.core.handle(Peer::new(1001, true), disable_sshd());
+    let Response::NeedsApproval { approve, .. } = response else { panic!("must ask: {response:?}") };
+    let response = fresh.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    assert!(matches!(response, Response::Done { state: TxnState::Committed, .. }), "{response:?}");
 }
 
 /// §11 (owner decision, 2026-10-30): an agent has the permissions of the
@@ -692,6 +787,7 @@ fn a_repaired_root_cause_is_named_for_its_dependents() {
         class: "user".into(),
         seat: Some("seat0".into()),
         remote: false,
+        graphical: true,
         active: true,
         idle: false,
         created: now,
@@ -754,6 +850,7 @@ fn waiting_generation_is_prepared_again_after_a_restart() {
         class: "user".into(),
         seat: Some("seat0".into()),
         remote: false,
+        graphical: true,
         created: Timestamp(0),
         active: true,
         idle: false,
@@ -789,6 +886,179 @@ fn waiting_generation_is_prepared_again_after_a_restart() {
             .values()
             .any(|t| t.state == TxnState::Committed && matches!(t.transition, Transition::ApplyChange { .. }))
     );
+}
+
+#[test]
+fn foreground_waiting_expires_with_a_named_reissue_notice_and_reopens_its_incident() {
+    let mut r = Rig::new();
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        graphical: true,
+        created: Timestamp(0),
+        active: true,
+        idle: false,
+    });
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    let args = [("scale".to_string(), Value::Str("1.25".into()))].into();
+    let response =
+        r.core.handle(ALICE.in_session("s1"), Request::Apply { change: ChangeId("font-scale".into()), args });
+    let Response::Done { txn, state: TxnState::Built, .. } = response else {
+        panic!("must wait: {response:?}");
+    };
+    // A linked repair has consumed an attempt while waiting. Cancellation
+    // returns that slot and lifts its hold without claiming a successful fix.
+    let incident = Incident {
+        id: IncidentId(99),
+        kind: IncidentKind::Repair,
+        target: UnitId::service("gym-web"),
+        divergence: (DesiredStatus::Running, UnitStatus::Stopped),
+        opened: Timestamp(0),
+        attempts: vec![(txn, Outcome::Unknown("Built".into()))],
+        budget_left: 0,
+        state: IncidentState::Cooldown { until: Timestamp(u64::MAX) },
+        backoff: Millis::secs(60),
+        next_attempt: Timestamp(u64::MAX),
+        regressions: 0,
+    };
+    r.core.incidents.incidents.insert(incident.id, incident.clone());
+    r.core.journal(Record::Incident(incident));
+    r.fake.w().units.get_mut(&UnitId::service("gym-web")).unwrap().observed = Observed::Failed(Reason::ExitCode(1));
+    r.fake.advance(planarian_exec::PARKING_LIMIT);
+    // The tick cancels even while quiet mode is still holding. Its notice
+    // follows the normal non-urgent quiet queue rather than interrupting.
+    r.core.tick();
+    assert_eq!(r.core.ledger().terminal[&txn].state, TxnState::Cancelled(Actor::Daemon));
+    assert_eq!(r.fake.w().current, GenerationId(1));
+    assert!(r.core.quiet_queue.iter().any(|n| {
+        n.contains("cancelled after waiting 24 hours")
+            && n.contains("font-scale")
+            && n.contains("planarian apply font-scale scale=1.25")
+    }));
+    let now = r.fake.clock().now();
+    let reopened = &r.core.ledger().incidents[&IncidentId(99)];
+    assert_eq!(reopened.state, IncidentState::Open);
+    assert_eq!(reopened.budget_left, 1);
+    assert_eq!(reopened.next_attempt, now);
+    assert!(matches!(&reopened.attempts[0].1, Outcome::Unknown(_)));
+}
+
+#[test]
+fn published_boot_candidate_waits_without_limit_and_repeats_restart_notice_daily() {
+    let mut r = Rig::new();
+    r.fake.w().rules.push(planarian_fake::Rule {
+        option: "planarian.reference.fontScale".into(),
+        value: Value::Str("1.25".into()),
+        effect: planarian_fake::Effect::NeedsReboot,
+    });
+    let args = [("scale".to_string(), Value::Str("1.25".into()))].into();
+    let response = r.core.handle(ALICE, Request::Apply { change: ChangeId("font-scale".into()), args });
+    let Response::Done { txn, state: TxnState::AwaitingBoot, .. } = response else {
+        panic!("must publish for boot: {response:?}");
+    };
+    let candidate = r.core.ledger().live[&txn].txn.candidate.as_ref().unwrap().0;
+    let root = r.core.ledger().live[&txn].txn.gc_root.clone().unwrap();
+    let reminders = |core: &Core<Fake, MemStore>| {
+        core.notices.iter().filter(|n| n.contains("waiting for a restart") && n.contains("restart to finish")).count()
+    };
+    assert_eq!(reminders(&r.core), 1);
+    r.fake.advance(Millis(RESTART_REMINDER.0 - 1));
+    r.core.tick();
+    assert_eq!(reminders(&r.core), 1);
+    r.fake.advance(Millis(1));
+    r.core.tick();
+    assert_eq!(reminders(&r.core), 2);
+    r.fake.advance(RESTART_REMINDER);
+    r.core.tick();
+    assert_eq!(reminders(&r.core), 3);
+    assert_eq!(r.core.ledger().live[&txn].txn.state, TxnState::AwaitingBoot);
+    assert!(r.core.status().in_flight.iter().any(|(id, state, _)| *id == txn && *state == TxnState::AwaitingBoot));
+    assert_eq!(r.fake.w().boot_default, GenerationId(1));
+    assert!(r.fake.w().boot_entries.contains(&candidate));
+    assert!(r.fake.w().gc_roots.contains(&root));
+    assert_eq!(r.fake.w().current, GenerationId(1));
+}
+
+fn admitted_boot_candidate() -> (Rig, TxnId, GenerationId, Hash) {
+    let mut r = Rig::new();
+    r.fake.w().rules.push(planarian_fake::Rule {
+        option: "planarian.reference.fontScale".into(),
+        value: Value::Str("1.25".into()),
+        effect: planarian_fake::Effect::NeedsReboot,
+    });
+    let args = [("scale".to_string(), Value::Str("1.25".into()))].into();
+    let response = r.core.handle(ALICE, Request::Apply { change: ChangeId("font-scale".into()), args });
+    let Response::Done { txn, state: TxnState::AwaitingBoot, .. } = response else {
+        panic!("must publish for boot: {response:?}");
+    };
+    let candidate = r.core.ledger().live[&txn].txn.candidate.as_ref().unwrap().0;
+    r.fake.w().alive.remove(&100);
+    r.fake.w().reboot();
+    r.fake.w().alive.insert(101);
+    let boot_id = Hash::of(b"admitted boot");
+    r.core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id },
+        config(),
+    );
+    assert_eq!(r.core.ledger().live[&txn].txn.state, TxnState::Promoted);
+    assert_eq!(r.fake.w().boot_default, candidate);
+    assert_eq!(r.core.ledger().known_good, Some(GenerationId(1)));
+    assert_eq!(r.core.ledger().live_tested, None);
+    (r, txn, candidate, boot_id)
+}
+
+#[test]
+fn admitted_candidate_confirms_at_ten_boot_minutes_across_a_daemon_restart() {
+    let (mut r, txn, candidate, boot_id) = admitted_boot_candidate();
+    // Admission probes may consume boot time. Test the checkpoint itself,
+    // not ten minutes after this process happened to start.
+    let remaining = CONFIRM_AFTER.0 - r.fake.clock().boot_now().0 - 1;
+    r.fake.advance(Millis(remaining));
+    r.core.tick();
+    assert_eq!(r.core.ledger().live[&txn].txn.state, TxnState::Promoted);
+    assert_eq!(r.core.ledger().known_good, Some(GenerationId(1)));
+    assert_eq!(r.core.ledger().live_tested, None);
+    r.fake.w().alive.remove(&101);
+    r.fake.w().alive.insert(102);
+    let mut cfg = config();
+    cfg.fresh_boot = false;
+    r.core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 102, boot_id },
+        cfg,
+    );
+    assert_eq!(r.core.ledger().live[&txn].txn.state, TxnState::Promoted);
+    r.fake.advance(Millis(1));
+    r.core.tick();
+    let ledger = r.core.ledger();
+    assert_eq!(ledger.terminal[&txn].state, TxnState::Committed);
+    assert_eq!(ledger.known_good, Some(candidate));
+    assert_eq!(ledger.live_tested, None, "a boot-only candidate is never live-tested");
+    assert_eq!(r.calls("activate_live"), 0);
+}
+
+#[test]
+fn failed_canonical_confirmation_restores_the_boot_fallback_without_live_activation() {
+    let (mut r, txn, candidate, _) = admitted_boot_candidate();
+    r.fake.w().blocked.insert(UnitId::service("sshd"));
+    let remaining = CONFIRM_AFTER.0 - r.fake.clock().boot_now().0;
+    r.fake.advance(Millis(remaining));
+    r.core.tick();
+    let ledger = r.core.ledger();
+    assert_eq!(ledger.terminal[&txn].state, TxnState::Reverted);
+    assert_eq!(ledger.known_good, Some(GenerationId(1)));
+    assert_eq!(ledger.live_tested, None);
+    assert_eq!(r.fake.w().boot_default, GenerationId(1));
+    assert_eq!(r.fake.w().current, candidate, "the recovery takes effect at restart");
+    assert_eq!(r.calls("activate_live"), 0);
+    assert!(r.core.notices.iter().any(|n| n.contains("restart to finish recovery")));
 }
 
 /// §9 hook: a verified external document's units join the generation's;
@@ -840,4 +1110,343 @@ fn external_desired_state_joins_with_provenance() {
     // Dropped: the unit is no longer desired.
     r.core.set_external(None);
     assert!(!r.core.asm.manifest().units.contains_key(&ext));
+}
+
+/// A failed same-name request cannot transfer a running agent's authority.
+#[test]
+fn agent_name_cannot_be_reattributed_by_another_launcher() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let launch = || Request::AgentRun { name: "owned-helper".into(), argv: vec!["true".into()] };
+    assert!(matches!(r.core.handle(ALICE, launch()), Response::Ok { .. }));
+    assert!(matches!(r.core.handle(ADMIN, launch()), Response::Rejected { .. }));
+    assert_eq!(r.core.ledger().agent_owner("owned-helper"), Some(1000));
+    let instance = r.fake.w().agent_instances.get("owned-helper").copied();
+    let resp =
+        r.core.handle(Peer::agent(61186, "owned-helper", instance), Request::Stop { unit: UnitId::service("gym-web") });
+    assert!(matches!(resp, Response::Rejected { .. }), "{resp:?}");
+}
+
+/// Reusing a stopped unit name grants only the fresh instance authority.
+#[test]
+fn stopped_agent_name_reuse_cannot_rebind_the_old_instance() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let launch = || Request::AgentRun { name: "reused".into(), argv: vec!["true".into()] };
+    assert!(matches!(r.core.handle(ALICE, launch()), Response::Ok { .. }));
+    let old = r.fake.w().agent_instances["reused"];
+    r.fake.w().units.remove(&UnitId::service("planarian-agent-reused"));
+    assert!(matches!(r.core.handle(ADMIN, launch()), Response::Ok { .. }));
+    let new = r.fake.w().agent_instances["reused"];
+    assert_ne!(old, new);
+    assert_eq!(r.core.ledger().agent_for("reused", old.0), None);
+    assert_eq!(r.core.ledger().agent_for("reused", new.0), Some(ADMIN.uid));
+    let stop = || Request::Stop { unit: UnitId::service("gym-web") };
+    let refused = r.core.handle(Peer::agent(61186, "reused", Some(old)), stop());
+    assert!(matches!(refused, Response::Rejected { .. }), "{refused:?}");
+    let allowed = r.core.handle(Peer::agent(61187, "reused", Some(new)), stop());
+    assert!(matches!(allowed, Response::Done { state: TxnState::Committed, .. }), "{allowed:?}");
+}
+
+#[test]
+fn failed_agent_instance_append_grants_no_authority() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    r.fake.store.tear_write_containing("AgentStarted");
+    let response = r.core.handle(ADMIN, Request::AgentRun { name: "unrecorded".into(), argv: vec!["true".into()] });
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert!(r.fake.store.torn());
+    let instance = r.fake.w().agent_instances["unrecorded"];
+    assert_eq!(r.core.ledger().agent_for("unrecorded", instance.0), None);
+    let response = r
+        .core
+        .handle(Peer::agent(61185, "unrecorded", Some(instance)), Request::Stop { unit: UnitId::service("gym-web") });
+    assert!(matches!(response, Response::Rejected { .. }), "{response:?}");
+}
+
+#[test]
+fn oversized_agent_commands_do_not_get_authority() {
+    let mut r = Rig::new();
+    let resp = r.core.handle(ALICE, Request::AgentRun { name: "too-big".into(), argv: vec!["x".repeat(16385)] });
+    assert!(matches!(resp, Response::Error { .. }));
+    assert_eq!(r.core.ledger().agent_owner("too-big"), None);
+}
+
+/// R05: completed/failed unit lifetimes cannot evade durable name admission.
+/// The proposed contract permits 32 names per ordinary uid, 224 ordinary
+/// names overall and 32 reserved root names (256 total), independent of how
+/// many systemd units remain active. Every reuse still journals its start.
+#[test]
+fn short_lived_agent_names_are_bounded_and_preserve_root_reserve() {
+    let mut r = Rig::new();
+    let launch = |name: String| Request::AgentRun { name, argv: vec!["true".into()] };
+    for caller in 0..7 {
+        let peer = Peer::new(1000 + caller, false);
+        for slot in 0..32 {
+            let name = format!("finished-{caller}-{slot}");
+            let response = r.core.handle(peer.clone(), launch(name.clone()));
+            assert!(matches!(response, Response::Ok { .. }), "{response:?}");
+            // Model a command that has already exited and been collected.
+            // No live-unit count can bound this durable ownership history.
+            r.fake.w().units.remove(&UnitId::service(&format!("planarian-agent-{name}")));
+        }
+        let seq = r.core.ledger().last_seq;
+        let response = r.core.handle(peer, launch(format!("caller-overflow-{caller}")));
+        assert!(matches!(response, Response::Error { .. }), "{response:?}");
+        assert_eq!(r.core.ledger().last_seq, seq, "denied name is not journaled");
+    }
+    let seq = r.core.ledger().last_seq;
+    let response = r.core.handle(Peer::new(2000, false), launch("ordinary-global-overflow".into()));
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert_eq!(r.core.ledger().last_seq, seq);
+    assert_eq!(r.core.ledger().agent_owner("ordinary-global-overflow"), None);
+
+    // A full caller/global budget must still permit an owned name's reuse.
+    // Repeated launch events must not grow the checkpoint's owner registry.
+    for _ in 0..4 {
+        let seq = r.core.ledger().last_seq;
+        let response = r.core.handle(ALICE, launch("finished-0-0".into()));
+        assert!(matches!(response, Response::Ok { .. }), "{response:?}");
+        assert!(r.core.ledger().last_seq > seq, "journal every successful new instance before granting authority");
+        r.fake.w().units.remove(&UnitId::service("planarian-agent-finished-0-0"));
+        assert_eq!(r.core.ledger().agents.len(), 224, "reuse does not accumulate owner rows");
+    }
+    for slot in 0..32 {
+        let name = format!("root-reserve-{slot}");
+        let response = r.core.handle(ADMIN, launch(name.clone()));
+        assert!(matches!(response, Response::Ok { .. }), "{response:?}");
+        r.fake.w().units.remove(&UnitId::service(&format!("planarian-agent-{name}")));
+    }
+    let seq = r.core.ledger().last_seq;
+    let response = r.core.handle(ADMIN, launch("root-total-overflow".into()));
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert_eq!(r.core.ledger().last_seq, seq);
+    // Reassignment of a stopped root name must not consume root's reserve.
+    let response = r.core.handle(Peer::new(2000, false), launch("root-reserve-0".into()));
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert_eq!(r.core.ledger().agent_owner("root-reserve-0"), Some(0));
+    r.core.ex.kernel.journal.compact().unwrap();
+    let replay = Journal::open(r.fake.store.clone()).unwrap();
+    assert_eq!(replay.ledger().agents.len(), 256);
+    assert_eq!(replay.ledger().agent_owner("finished-0-0"), Some(ALICE.uid));
+    let mut cfg = config();
+    cfg.fresh_boot = false;
+    let mut restarted = Core::start(replay, r.fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, cfg);
+    assert!(matches!(restarted.handle(ADMIN, launch("still-full".into())), Response::Error { .. }));
+    assert!(matches!(restarted.handle(ADMIN, launch("root-reserve-0".into())), Response::Ok { .. }));
+    assert_eq!(restarted.ledger().agents.len(), 256);
+}
+
+/// A durable start whose backend launch failed still owns its name. Such
+/// historical records have no live unit to count, but consume name capacity.
+#[test]
+fn failed_agent_start_history_cannot_bypass_name_limits() {
+    let mut r = Rig::new();
+    for slot in 0..32 {
+        r.core.journal(Record::AgentStarted { name: format!("failed-{slot}"), instance: [0; 16], by: ALICE.uid });
+    }
+    let seq = r.core.ledger().last_seq;
+    let response =
+        r.core.handle(ALICE, Request::AgentRun { name: "failed-history-overflow".into(), argv: vec!["true".into()] });
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert_eq!(r.core.ledger().last_seq, seq);
+    assert_eq!(r.core.ledger().agent_owner("failed-history-overflow"), None);
+    assert!(matches!(
+        r.core.handle(
+            ADMIN,
+            Request::AgentRun { name: "recovery-after-failed-starts".into(), argv: vec!["true".into()] }
+        ),
+        Response::Ok { .. }
+    ));
+    assert!(matches!(
+        r.core.handle(ALICE, Request::AgentRun { name: "failed-0".into(), argv: vec!["true".into()] }),
+        Response::Ok { .. }
+    ));
+    assert_eq!(r.core.ledger().agents.len(), 33);
+}
+
+#[test]
+fn root_agent_name_limit_still_allows_owned_name_reuse() {
+    let mut r = Rig::new();
+    for slot in 0..64 {
+        r.core.journal(Record::AgentStarted { name: format!("root-history-{slot}"), instance: [0; 16], by: 0 });
+    }
+    let seq = r.core.ledger().last_seq;
+    let response =
+        r.core.handle(ADMIN, Request::AgentRun { name: "root-caller-overflow".into(), argv: vec!["true".into()] });
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert_eq!(r.core.ledger().last_seq, seq);
+    assert!(matches!(
+        r.core.handle(ADMIN, Request::AgentRun { name: "root-history-0".into(), argv: vec!["true".into()] }),
+        Response::Ok { .. }
+    ));
+    assert_eq!(r.core.ledger().agents.len(), 64);
+}
+
+/// R08: a denied release cannot replenish retry budgets, clear a hold, or
+/// fan out releases to linked inferred stops.
+#[test]
+fn denied_release_preserves_incident_and_linked_overrides() {
+    let mut r = Rig::new();
+    let target = UnitId::service("gym-db");
+    let linked = UnitId::service("gym-app");
+    let now = r.fake.clock().now();
+    for (unit, reason) in
+        [(target.clone(), "outside stop".to_string()), (linked, format!("stopped together with {target}"))]
+    {
+        let mut o = Override::attested(unit, OverrideDesired::Stopped, Until::NextBoot, reason, Actor::Unattributed);
+        o.attribution = Attribution::Inferred;
+        r.core.journal(Record::OverrideSet(o));
+    }
+    let incident = Incident {
+        id: IncidentId(91),
+        kind: IncidentKind::Repair,
+        target: target.clone(),
+        divergence: (DesiredStatus::Running, UnitStatus::Stopped),
+        opened: now,
+        attempts: vec![],
+        budget_left: 0,
+        state: IncidentState::Cooldown { until: now.plus(Millis::secs(3600)) },
+        backoff: Millis::secs(300),
+        next_attempt: now.plus(Millis::secs(300)),
+        regressions: 2,
+    };
+    r.core.incidents.incidents.insert(incident.id, incident.clone());
+    let before = r.core.ledger().overrides;
+    let denied = r.core.handle(ALICE, Request::LiftOverride { unit: target.clone() });
+    assert!(matches!(denied, Response::Rejected { .. }), "{denied:?}");
+    assert_eq!(r.core.incidents.incidents[&incident.id], incident);
+    assert_eq!(r.core.ledger().overrides, before);
+    let allowed = r.core.handle(ADMIN, Request::LiftOverride { unit: target });
+    assert!(matches!(allowed, Response::Done { state: TxnState::Committed, .. }), "{allowed:?}");
+    let after = &r.core.incidents.incidents[&incident.id];
+    assert_eq!(after.state, IncidentState::Open);
+    assert_eq!(after.budget_left, 1);
+    assert!(r.core.ledger().overrides.is_empty());
+}
+
+/// R09: admission happens before a job is handed to the build queue, while
+/// a valid administrator request that will require AskFirst remains valid.
+#[test]
+fn deferred_catalog_work_authenticates_before_staging() {
+    let mut r = Rig::new();
+    r.core.defer = true;
+    let args = [("service".into(), Value::Str("sshd".into())), ("enabled".into(), Value::Bool(false))].into();
+    let req = Request::Apply { change: ChangeId("service-enable".into()), args };
+    let denied = r.core.handle(ALICE, req.clone());
+    assert!(matches!(denied, Response::Rejected { .. }), "{denied:?}");
+    assert!(r.core.take_deferred().is_none());
+    assert!(r.fake.w().staged.is_empty());
+    assert_eq!(r.fake.w().builds, 0);
+    let accepted = r.core.handle(Peer::new(1001, true), req);
+    assert!(matches!(accepted, Response::Ok { .. }));
+    let (job, resume) = r.core.take_deferred().expect("authorized AskFirst candidate may be built");
+    assert_eq!(resume.principal(), Actor::user(1001).principal());
+    let response = r.core.resume(resume, job.run());
+    assert!(matches!(response, Response::NeedsApproval { .. }), "{response:?}");
+}
+
+#[test]
+fn deferred_agent_work_keeps_launching_principal_limits_and_attribution() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    r.core.log.clear();
+    r.core.journal(Record::AgentStarted { name: "coder".into(), instance: [1; 16], by: ALICE.uid });
+    r.core.defer = true;
+    let request = Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".into(), Value::Str("1.25".into()))].into(),
+    };
+    let placeholder = r.core.handle(Peer::agent(61184, "coder", Some(InstanceId([1; 16]))), request);
+    assert!(matches!(placeholder, Response::Ok { .. }));
+    let (job, resume) = r.core.take_deferred().unwrap();
+    assert_eq!(resume.principal(), Actor::user(ALICE.uid).principal());
+    assert!(!resume.administrator());
+    let response = r.core.resume(resume, job.run());
+    assert!(matches!(response, Response::Done { state: TxnState::Committed, .. }), "{response:?}");
+    r.ticks(1);
+    let entry = r.core.log.iter().find(|l| matches!(l.proposal.transition, Transition::ApplyChange { .. })).unwrap();
+    assert_eq!(entry.agent.as_deref(), Some("coder"));
+    assert_eq!(entry.facts.as_ref().unwrap().caller, Actor::user(ALICE.uid));
+}
+
+/// D03: runtime lifecycle completion cannot manufacture backend success or
+/// healthy post-state. Failure remains durable after compaction/restart.
+#[test]
+fn committed_runtime_failure_is_not_a_repaired_incident() {
+    let mut r = Rig::new();
+    let unit = UnitId::service("gym-web");
+    r.ticks(2);
+    r.fake.w().units.get_mut(&unit).unwrap().fail_on_start = true;
+    r.fake.w().signal(&unit, 11);
+    r.ticks(4);
+    r.core.observe();
+    let incident = r.core.incidents.active_for(&unit).expect("still failed").clone();
+    assert!(!incident.attempts.is_empty());
+    for (txn, outcome) in &incident.attempts {
+        assert_eq!(r.core.ledger().state(*txn), Some(TxnState::Committed), "runtime lifecycle completes");
+        assert!(matches!(outcome, Outcome::Failed(_)), "backend failure is not success: {outcome:?}");
+    }
+    let record = r
+        .core
+        .log
+        .iter()
+        .find(|record| {
+            matches!(&record.proposal.source, Source::Diagnoser { .. })
+                && record.proposal.transition == Transition::RestartUnit(unit.clone())
+        })
+        .expect("attempt log");
+    assert_eq!(record.format, 2);
+    assert!(matches!(record.operation, Some(Outcome::Failed(_))));
+    assert!(matches!(record.expectation, Some(Outcome::Partial(_))));
+    assert!(matches!(record.post_status.get(&unit), Some(UnitStatus::Failed(_))));
+    assert!(!r.core.notices.iter().any(|line| line.contains("repaired with")));
+    let txn = incident.attempts[0].0;
+    r.core.ex.kernel.journal.compact().unwrap();
+    let replay = Journal::open(r.fake.store.clone()).unwrap();
+    assert_eq!(replay.ledger().state(txn), Some(TxnState::Committed));
+    assert!(matches!(replay.ledger().operation_outcome(txn), Outcome::Failed(_)));
+}
+
+#[test]
+fn operation_expectation_and_health_are_independent_results() {
+    for injected in [planarian_fake::Injected::Partial, planarian_fake::Injected::Unknown] {
+        let mut r = Rig::new();
+        let unit = UnitId::service("gym-web");
+        r.ticks(2);
+        r.fake.w().inject.insert("restart".into(), injected);
+        let response = r.core.handle(ADMIN, Request::Restart { unit: unit.clone() });
+        let Response::Done { state: TxnState::Committed, message, .. } = response else { panic!("{response:?}") };
+        assert!(!message.starts_with("operation succeeded"), "{message}");
+        r.core.observe();
+        let record = r.core.log.last().expect("post-observed log");
+        match injected {
+            planarian_fake::Injected::Partial => assert!(matches!(record.operation, Some(Outcome::Partial(_)))),
+            planarian_fake::Injected::Unknown => assert!(matches!(record.operation, Some(Outcome::Unknown(_)))),
+            planarian_fake::Injected::Fenced => unreachable!(),
+        }
+        assert_eq!(record.expectation, Some(Outcome::Succeeded), "effect may land despite failed/lost reply");
+        assert_eq!(record.post_status.get(&unit), Some(&UnitStatus::Running));
+    }
+}
+
+#[test]
+fn recovery_interlock_keeps_its_candidate_and_fallback_protected() {
+    let mut r = Rig::new();
+    let mut ledger = r.core.ledger();
+    ledger.add_interlock(planarian_txn::ledger::InterlockEntry {
+        txn: TxnId(20),
+        transition: Transition::Rollback,
+        failed_from: "PublishingBoot".into(),
+        base_override: None,
+        candidate_override: None,
+        revert_to: GenerationId(7),
+        note: "selection unknown".into(),
+        evidence_version: 1,
+        candidate: Some((GenerationId(9), StorePath("/nix/store/candidate".into()))),
+        gc_root: Some("/nix/var/nix/gcroots/planarian/builds/pending".into()),
+    });
+    let protected = r.core.protect(&ledger, GenerationId(1));
+    assert!(protected.contains(&GenerationId(7)), "fallback stays protected");
+    assert!(protected.contains(&GenerationId(9)), "selected candidate stays protected after RecoveryFailed");
 }

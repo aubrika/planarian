@@ -107,12 +107,13 @@ impl Assembler {
     pub fn defs(&self) -> UnitDefs {
         let mut defs = self.manifest.units.clone();
         let uids: BTreeSet<u32> = self.sessions.iter().filter(|s| s.establishes()).map(|s| s.uid).collect();
-        // §9: a session-bound unit (graphical-session) is one instance per
-        // established session, so a second session's failure is its own incident.
+        // §9: graphical-session is one instance per eligible graphical session.
+        // General SSH/TTY authentication still establishes user services, but
+        // cannot create a compositor incident.
         let bound: Vec<UnitDef> = defs.values().filter(|d| session_bound(d)).cloned().collect();
         for t in bound {
             defs.remove(&t.id);
-            for s in self.sessions.iter().filter(|s| s.establishes()) {
+            for s in self.sessions.iter().filter(|s| s.graphical_establishes()) {
                 let id = UnitId {
                     kind: t.id.kind,
                     name: t.id.name.clone(),
@@ -254,7 +255,7 @@ impl Assembler {
     fn session_of(&self, id: &UnitId) -> Option<&SessionInfo> {
         match &id.scope {
             Scope::User { uid, session: Some(sid) } => {
-                self.sessions.iter().find(|s| &s.id == sid && s.uid == *uid && s.establishes())
+                self.sessions.iter().find(|s| &s.id == sid && s.uid == *uid && s.graphical_establishes())
             }
             _ => None,
         }

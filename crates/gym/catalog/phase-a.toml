@@ -2354,7 +2354,7 @@ terminal = "Committed"
 [[fault]]
 id = "boot-only-kernel-confirmed"
 family = "boot-only-change"
-summary = "A kernel parameter change takes the boot-only path: published as a one-shot next-boot entry, AwaitingBoot, a 'restart to finish' notice, the base still the default. At the next boot it is confirmed, becomes the default, and commits."
+summary = "A kernel parameter change waits in AwaitingBoot with the publishing generation as fallback. At next-boot admission it becomes default and Promoted; the same-boot ten-minute canonical checkpoint confirms it and commits without LiveTested."
 spec = ["§12 step 7", "§12f", "§10 boot confirmation", "§15 v4.4"]
 tags = ["acceptance"]
 scoring = "must-pass"
@@ -2362,7 +2362,7 @@ harness = ["fake"]
 intent = { kind = "none" }
 inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
 after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }]
-window = "5m"
+window = "12m"
 
 [fault.required_post]
 generation = "candidate"

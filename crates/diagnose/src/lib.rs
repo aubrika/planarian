@@ -53,6 +53,39 @@ fn walkable(kind: &EdgeKind) -> bool {
     }
 }
 
+/// A declared external dependency can rule out a local repair even when its
+/// Diagnostic confidence is too low to select it as a root cause. This is a
+/// negative safety check, not a new functional edge: Wants and Ordering never
+/// participate, and weak Diagnostic edges between local units stay unwalkable.
+/// Missing/Unknown evidence cannot establish that a local restart is useful.
+fn external_dependency_obstructs(target: &UnitId, i: &Inputs<'_>) -> bool {
+    let mut pending = vec![target.clone()];
+    let mut seen = BTreeSet::new();
+    while let Some(unit) = pending.pop() {
+        if !seen.insert(unit.clone()) {
+            continue;
+        }
+        let Some(def) = i.defs.get(&unit) else { continue };
+        for edge in &def.edges {
+            if edge.to.name.starts_with("external:")
+                && matches!(edge.kind, EdgeKind::Requires | EdgeKind::Diagnostic { .. })
+            {
+                let has_readiness =
+                    i.defs.get(&edge.to).is_some_and(|d| d.probes.iter().any(|p| p.role == ProbeRole::Readiness));
+                if !has_readiness
+                    || !matches!(i.state.status(&edge.to, i.defs), UnitStatus::Running | UnitStatus::Bound)
+                {
+                    return true;
+                }
+            }
+            if walkable(&edge.kind) && diverges(&edge.to, i) {
+                pending.push(edge.to.clone());
+            }
+        }
+    }
+    false
+}
+
 /// The divergent units reachable from `target` through walkable edges, with
 /// their walkable edges among themselves.
 fn subgraph(target: &UnitId, i: &Inputs<'_>) -> BTreeMap<UnitId, Vec<UnitId>> {
@@ -170,6 +203,12 @@ fn est_tier(t: &Transition) -> u8 {
 /// Candidate transitions for an incident, in the order to try them (§13 steps 2–3).
 pub fn candidates(incident: &Incident, i: &Inputs<'_>) -> Vec<Candidate> {
     let root = root_cause(&incident.target, i);
+    // An external outage cannot be repaired by restarting a client, changing
+    // its runtime options, or rolling back this node. Preserve Unknown rather
+    // than inventing a definite failure for a timed-out dependency.
+    if root.name.starts_with("external:") || external_dependency_obstructs(&incident.target, i) {
+        return vec![];
+    }
     if i.state.overridden(&root) {
         return vec![]; // I13
     }

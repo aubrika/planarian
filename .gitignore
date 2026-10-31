@@ -1,4 +1,7 @@
 /target
+/proof-result
+/proof-results/
+__pycache__/
 /result
 /result-*
 .claude/worktrees/

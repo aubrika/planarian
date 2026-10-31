@@ -52,12 +52,14 @@ Planarian's own code that the proven gates take input from (SPEC §17a). Counted
 
 ## Progress assumptions for I12
 
-**G1** Some lease holder eventually runs. **G2** A fenced worker eventually stops issuing calls, or its calls are refused. **G3** Journal writes eventually succeed. **G4** Backend calls terminate.
+**G1** Some lease holder eventually runs. **G2** A fenced worker eventually stops issuing calls, or its calls are refused. **G3** Journal writes eventually succeed. **G4** Backend calls terminate. Intentionally parked states follow the separately adopted SPEC v4.6 I12/§12f contract: Built expires at 24 hours; AwaitingBoot is reported as waiting for reboot. The former draft G5 proposal is superseded and is not a current extra assumption.
 
 The ids (V, P, G, U) are what `docs/verification-ratio.toml` cites. The trust count is the number of V, P and G ids plus every `external_body` and `assume` site in the verified crates; the internal-unproven count is the number of U ids (`planarian-gym verification`). Per invariant, `assumes` lists what that invariant specifically rests on; proof-validity trust (V7–V11) underlies every proof alike and is counted once, in the trust count, not repeated on each row.
 
 ## Fake harness (tests only, not proof sites)
 
-`txn::fake` models the backends in memory. Each kernel test's claim is only as good as the fake's fidelity to the contracts above: fencing refuses a stale epoch before any effect, `jobs_tagged` finds every job an op started (or answers `None`), and `swap_override` is a compare-and-swap. The VM harness exists to check the real backends against these same contracts.
+`txn::fake` models the backends in memory. Each kernel test's claim is only as good as the fake's fidelity to the contracts above: fencing refuses a stale epoch before any effect, `jobs_tagged` finds every job an op started (or answers `None`), and `swap_override` is a compare-and-swap. The VM harness must check real backends against these contracts; its presence is not evidence of a pass. Under adopted SPEC v4.6 I23, real replacement additionally requires the exclusive directory lock for cooperating writers; writers outside that boundary are X-12. An atomic SwapStep model is not arbitrary-editor CAS. Cooperative enforcement is implemented; its compiled/backend race and durability acceptance remain R11/B-21 until executed.
+
+The new withdrawal contract also injects accepted Partial/Unknown and Fenced outcomes against the shared fake adapter; dedicated kernel regressions retain roots after lost withdrawal replies. These authored additions remain UNRUN in this draft.
 
 The catalog entry `fake-assumptions-conformance` (`crates/gym/src/conformance.rs`) runs both halves on every CI run. It holds one check per row above against the fake. It then injects Partial (the effect landed, the call failed), Unknown and Fenced into each mutating call (restart, stop, activate_live, publish_boot, publish_boot_once, swap_override, bind, collect_garbage) during a catalog entry that makes that call. Every transaction must end terminal (I12) and the journal must replay (I15). No fake-harness entry makes `cancel`, `unbind` or the runtime `set`. `GenerationBackend::protect` has no caller.

@@ -24,6 +24,9 @@ pub enum TxnState {
     Checking,
     /// Boot entry written.
     Published,
+    /// Durable intent to publish a boot-only candidate. Boot selection may
+    /// already have changed, even without an acknowledged backend reply.
+    PublishingBoot,
     /// A boot-only candidate published as a one-shot next-boot entry (§12f);
     /// active for I6, confirmed or reverted at that boot.
     AwaitingBoot,
@@ -60,7 +63,8 @@ impl TxnState {
     /// States in which no other transition may execute (I6).
     pub open spec fn exclusive(self) -> bool {
         match self {
-            TxnState::Activating | TxnState::Published | TxnState::Promoted | TxnState::Reverting => true,
+            TxnState::Activating | TxnState::Checking | TxnState::PublishingBoot | TxnState::Published
+            | TxnState::Promoted | TxnState::Reverting => true,
             _ => false,
         }
     }
@@ -91,7 +95,8 @@ impl TxnState {
             r == self.exclusive(),
     {
         match self {
-            TxnState::Activating | TxnState::Published | TxnState::Promoted | TxnState::Reverting => true,
+            TxnState::Activating | TxnState::Checking | TxnState::PublishingBoot | TxnState::Published
+            | TxnState::Promoted | TxnState::Reverting => true,
             _ => false,
         }
     }
@@ -213,11 +218,47 @@ pub struct Manifest {
 
 /// Recorded at Prepared (§12 step 4) for the Checking and revert probe runs:
 /// the candidate's and the base's manifests, and every unit's status before.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub const CHECK_CONTEXT_VERSION: u32 = 1;
+
+fn legacy_check_version(version: &u32) -> bool {
+    *version == 0
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckContext {
+    /// Payload version, independent of journal framing. Zero is the historical
+    /// context, which did not store individual probe or completion obligations.
+    #[serde(default, skip_serializing_if = "legacy_check_version")]
+    pub version: u32,
+    /// Executor-derived completion obligation, durable before activation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_floor: Option<GenerationId>,
+    /// Identities of fixes in the inspected package set that derived the floor.
+    /// This is evidence of that inspection, not a complete vulnerability oracle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub floor_fixes: Vec<String>,
+    /// Every applicable Readiness probe with fresh passing pre-change evidence,
+    /// including probes on aggregate Degraded/Unknown units. None means unknown
+    /// historical evidence, never an empty preservation obligation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passing_readiness: Option<Vec<(UnitId, crate::unit::ProbeDef)>>,
     pub candidate: Option<Manifest>,
     pub base: Manifest,
     pub pre: std::collections::BTreeMap<UnitId, UnitStatus>,
+}
+
+impl Default for CheckContext {
+    fn default() -> Self {
+        Self {
+            version: CHECK_CONTEXT_VERSION,
+            required_floor: None,
+            floor_fixes: Vec::new(),
+            passing_readiness: Some(Vec::new()),
+            candidate: None,
+            base: Manifest::default(),
+            pre: Default::default(),
+        }
+    }
 }
 
 impl Outcome {

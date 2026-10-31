@@ -3,7 +3,7 @@
 
 use planarian_ipc::{Request, Response, SOCKET, StatusReport};
 use planarian_schema::{
-    ChangeId, Hash, IncidentState, OverrideDesired, Resolution, TxnId, UnitId, UnitStatus, Until, Value,
+    ChangeId, Hash, IncidentState, OverrideDesired, Resolution, TxnId, TxnState, UnitId, UnitStatus, Until, Value,
 };
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
@@ -203,7 +203,10 @@ fn print_status(r: &StatusReport) {
         }
     }
     for (t, s, what) in &r.in_flight {
-        println!("\nin progress: transaction {} ({s:?}): {what}", t.0);
+        match s {
+            TxnState::AwaitingBoot => println!("\nwaiting for a restart: transaction {}: {what}", t.0),
+            _ => println!("\nin progress: transaction {} ({s:?}): {what}", t.0),
+        }
     }
     if let Some(sp) = &r.space {
         let gb = |n: u64| n as f64 / 1e9;
@@ -243,11 +246,31 @@ fn print_status(r: &StatusReport) {
     }
 }
 
+/// Lifecycle completion does not establish operation success. Missing legacy
+/// or unsupported evidence stays unknown for both text and JSON automation.
+fn response_code(resp: &Response) -> i32 {
+    match resp {
+        Response::Done { state: TxnState::Committed, evidence: Some(evidence), .. }
+            if evidence.format == 1 && evidence.operation.is_success() =>
+        {
+            0
+        }
+        Response::Done {
+            state: TxnState::Committed | TxnState::Reverted | TxnState::RecoveryFailed | TxnState::Rejected(_),
+            ..
+        }
+        | Response::Rejected { .. }
+        | Response::Unmatched { .. }
+        | Response::Error { .. } => 1,
+        _ => 0,
+    }
+}
+
 /// Print a response; returns the exit code.
 fn print(resp: &Response, json: bool) -> i32 {
     if json {
         println!("{}", serde_json::to_string_pretty(resp).unwrap_or_default());
-        return 0;
+        return response_code(resp);
     }
     match resp {
         Response::Status(r) => print_status(r),
@@ -298,7 +321,7 @@ fn print(resp: &Response, json: bool) -> i32 {
             return 1;
         }
     }
-    0
+    response_code(resp)
 }
 
 fn run(args: Vec<String>) -> i32 {
@@ -385,5 +408,45 @@ mod tests {
         ));
         assert!(matches!(p("override backup --until 20m"), Request::SetOverride { until: Until::At(_), .. }));
         assert!(parse(&["bogus".into()]).is_err());
+    }
+
+    #[test]
+    fn committed_failure_and_unknown_evidence_are_nonzero_in_text_and_json() {
+        use planarian_ipc::ExecutionEvidence;
+        use planarian_schema::Outcome;
+        for operation in [
+            Outcome::Failed("refused".into()),
+            Outcome::Partial("some effect".into()),
+            Outcome::Unknown("reply lost".into()),
+        ] {
+            let response = Response::Done {
+                txn: TxnId(1),
+                state: TxnState::Committed,
+                message: "lifecycle committed".into(),
+                evidence: Some(ExecutionEvidence { format: 1, operation, expectation: None, post_status: None }),
+            };
+            assert_ne!(print(&response, false), 0);
+            assert_ne!(print(&response, true), 0);
+        }
+        let mut response = Response::Done {
+            txn: TxnId(1),
+            state: TxnState::Committed,
+            message: "operation succeeded".into(),
+            evidence: Some(ExecutionEvidence {
+                format: 1,
+                operation: Outcome::Succeeded,
+                expectation: None,
+                post_status: None,
+            }),
+        };
+        assert_eq!(response_code(&response), 0);
+        if let Response::Done { evidence: Some(evidence), .. } = &mut response {
+            evidence.format = 99;
+        }
+        assert_ne!(response_code(&response), 0, "unknown format provides no success evidence");
+        if let Response::Done { evidence, .. } = &mut response {
+            *evidence = None;
+        }
+        assert_ne!(response_code(&response), 0, "historical lifecycle alone provides no success evidence");
     }
 }

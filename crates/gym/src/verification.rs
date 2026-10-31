@@ -9,8 +9,9 @@
 //! assumptions.md (P, G, V) plus every `external_body` and `assume` site in
 //! the verified crates. The internal-unproven count is the number of U ids:
 //! Planarian's own unproven code that the proven gates take input from. A
-//! discharged obligation is a Verus lemma or verified function, or a Kani
-//! harness, named in the file and present in the source.
+//! discharged obligation has a unique id in the explicit proof map and
+//! successful verifier artifacts for the complete current source snapshot.
+//! Mere presence of a function name is not verification evidence.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,7 +21,6 @@ const RATIO: &str = "docs/verification-ratio.toml";
 const ASSUMPTIONS: &str = "docs/assumptions.md";
 const BYPASSES: &str = "docs/bypasses.md";
 const CATALOG: &str = "crates/gym/catalog/phase-a.toml";
-const VERIFIED: &[&str] = &["crates/policy/src", "crates/schema/src", "crates/txn/src"];
 
 fn rust_files(dir: &Path, out: &mut Vec<String>) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -50,18 +50,18 @@ fn defined(krate: &str, name: &str) -> bool {
 
 /// `external_body` attributes and `assume(` calls in the verified crates
 /// (Kani's input bounds, `kani::assume`, are not trust).
-fn trust_sites() -> usize {
-    let mut files = vec![];
-    for d in VERIFIED {
-        rust_files(Path::new(d), &mut files);
+fn trust_sites() -> Result<usize, String> {
+    let output = std::process::Command::new("python3")
+        .args(["nix/gym/proofs.py", "trust-sites"])
+        .output()
+        .map_err(|error| format!("cannot account trust sites: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("trust-site accounting failed: {}", String::from_utf8_lossy(&output.stderr).trim()));
     }
-    files
-        .iter()
-        .map(|f| {
-            f.matches("#[verifier::external_body]").count()
-                + f.lines().filter(|l| l.contains("assume(") && !l.contains("kani::assume")).count()
-        })
-        .sum()
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .map_err(|error| format!("invalid trust-site accounting result: {error}"))
 }
 
 pub struct Report {
@@ -129,7 +129,14 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
         .collect();
     let internal = ids.iter().filter(|i| i.starts_with('U')).count();
     let trust_ids = ids.len() - internal;
-    let trust_count = trust_ids + trust_sites();
+    let sites = match trust_sites() {
+        Ok(sites) => sites,
+        Err(error) => {
+            errors.push(error);
+            0
+        }
+    };
+    let trust_count = trust_ids + sites;
 
     let mut lines = vec![];
     let mut per: BTreeMap<String, (usize, usize)> = BTreeMap::new();
@@ -140,6 +147,12 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
             inv.get("discharged").and_then(T::as_array).into_iter().flatten().filter_map(T::as_str).collect();
         let assumes: Vec<&str> =
             inv.get("assumes").and_then(T::as_array).into_iter().flatten().filter_map(T::as_str).collect();
+        if names.iter().collect::<std::collections::BTreeSet<_>>().len() != names.len() {
+            errors.push(format!("{id}: duplicate proof obligation id"));
+        }
+        if assumes.iter().collect::<std::collections::BTreeSet<_>>().len() != assumes.len() {
+            errors.push(format!("{id}: duplicate assumption id"));
+        }
         for n in &names {
             match n.split_once("::") {
                 Some((k, f)) if defined(k, f) => {}
@@ -154,7 +167,9 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
         let (d, a) = (names.len(), assumes.len());
         d_sum += d;
         a_sum += a;
-        per.insert(id.clone(), (d, a));
+        if per.insert(id.clone(), (d, a)).is_some() {
+            errors.push(format!("duplicate invariant id: {id}"));
+        }
         let phase = inv.get("phase").and_then(T::as_str).unwrap_or("");
         lines.push(format!(
             "  {id:<4} rests on {d} discharged and {a} assumed ({}){}",
@@ -202,6 +217,11 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
             errors.push(format!("the global ratio fell: {d_sum}:{a_sum} < {bd}:{ba}"));
         }
         if let Some(bp) = base.and_then(|b| b.get("per_invariant")).and_then(T::as_table) {
+            for id in bp.keys() {
+                if !per.contains_key(id) {
+                    errors.push(format!("baseline invariant removed: {id}"));
+                }
+            }
             for (id, (d, a)) in &per {
                 let Some([pd, pa]) = bp.get(id).and_then(T::as_array).map(|v| {
                     [v.first().and_then(T::as_integer).unwrap_or(0), v.get(1).and_then(T::as_integer).unwrap_or(0)]
@@ -233,6 +253,23 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
     for sev in ["High", "Medium", "Low"] {
         let ids = open.get(sev).cloned().unwrap_or_default();
         text.push_str(&format!("  open {sev}: {} {}\n", ids.len(), ids.join(" ")));
+    }
+    // The source map records which successful verifier actually covers each
+    // unique obligation. Its runner rejects missing, failed, stale or edited
+    // artifacts; source-name and count checks alone cannot discharge a claim.
+    let artifacts = std::env::var("PLANARIAN_PROOF_ARTIFACTS").unwrap_or_else(|_| "proof-results".into());
+    match std::process::Command::new("python3").args(["nix/gym/proofs.py", "check", "--artifacts", &artifacts]).output()
+    {
+        Ok(output) => {
+            text.push_str(&String::from_utf8_lossy(&output.stdout));
+            if !output.status.success() {
+                errors.push(format!(
+                    "successful current-source proof artifacts required: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        }
+        Err(error) => errors.push(format!("proof artifact check could not run: {error}")),
     }
     if write_baseline {
         let per_s: Vec<String> = per.iter().map(|(k, (d, a))| format!("{k} = [{d}, {a}]")).collect();

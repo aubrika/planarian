@@ -50,6 +50,41 @@ let
   export = cfg.services.planarian.export;
   unit = id: builtins.head (builtins.filter (u: u.id == id) export.units);
   app = unit "service:gym-app";
+  # S06: exercise the module's real assertions, not a second implementation
+  # of its confidence or edge rules. These checks fail on the former module
+  # that exported weak/missing external prerequisites without refusing them.
+  externalCase = { edges, establishes ? "service:external:module-upstream returns HTTP 200", target ? true, role ? "Readiness" }:
+    sys.extendModules {
+      modules = [ {
+        services.planarian.units = {
+          module-client = {
+            inherit edges;
+            probes = [ {
+              id = "module-client-http";
+              type = "http";
+              url = "https://example.invalid/health";
+              inherit establishes role;
+            } ];
+          };
+        } // pkgs.lib.optionalAttrs target {
+          "external:module-upstream" = {
+            sensitivity = [ "External" ];
+            probes = [ {
+              id = "module-upstream-http";
+              type = "http";
+              url = "https://example.invalid/health";
+              establishes = "the upstream endpoint returns HTTP 200";
+            } ];
+          };
+        };
+      } ];
+    };
+  externalEdge = kind: confidence: { to = "service:external:module-upstream"; inherit kind confidence; };
+  externalRefused = system: builtins.any
+    (a: !a.assertion && pkgs.lib.hasInfix "external dependency" a.message)
+    system.config.assertions;
+  permitsExternal = args: !(externalRefused (externalCase args));
+  rejectsExternal = args: externalRefused (externalCase args);
   check = cond: msg: if cond then true else throw "planarian module eval: ${msg}";
   checks = [
     (check (builtins.any (u: u.id == "service:sshd") export.units) "sshd is a canonical unit")
@@ -68,9 +103,26 @@ let
     (check (builtins.any (w: pkgs.lib.hasInfix "NTS" w) cfg.warnings) "unauthenticated NTP is reported as a notice (§12h)")
     (check (!cfg.systemd.services.planariad.restartIfChanged) "planariad survives activation")
     (check (!cfg.systemd.services.planarian-recovery.stopIfChanged) "the watchdog survives activation")
+    (check (cfg.systemd.services.planariad.serviceConfig.Slice == "planarian-monitor.slice"
+      && cfg.systemd.services.planarian-recovery.serviceConfig.Slice == "planarian-monitor.slice")
+      "daemon and independent watchdog share persistent owned-work accounting")
+    (check (cfg.systemd.slices.planarian-monitor.sliceConfig.CPUAccounting
+      && cfg.systemd.slices.planarian-monitor.sliceConfig.MemoryAccounting)
+      "owned monitor helper CPU and memory remain accounted after exit")
     (check (export.coreUnits."planariad.service" != "") "core unit hashes exported")
     (check (builtins.any (a: pkgs.lib.hasInfix "test build" a.message) refused) "the module refuses the test build outside the gym (B-13)")
     (check (builtins.all (a: !(pkgs.lib.hasInfix "test build" a.message)) (builtins.filter (a: !a.assertion) cfg.assertions)) "the shipped package is not refused")
+    (check (permitsExternal { edges = [ (externalEdge "Requires" 0) ]; }) "external Requires is traversable")
+    (check (permitsExternal { edges = [ (externalEdge "Diagnostic" 700) ]; }) "external Diagnostic at the 700 threshold is traversable")
+    (check (rejectsExternal { edges = [ (externalEdge "Diagnostic" 500) ]; }) "external Diagnostic confidence 500 is rejected")
+    (check (rejectsExternal { edges = [ (externalEdge "Diagnostic" 699) ]; }) "external Diagnostic below the 700 threshold is rejected")
+    (check (rejectsExternal { edges = [ (externalEdge "Wants" 1000) ]; }) "Wants cannot satisfy a named external Readiness dependency")
+    (check (rejectsExternal { edges = [ (externalEdge "Ordering" 1000) ]; }) "Ordering cannot satisfy a named external Readiness dependency")
+    (check (rejectsExternal { edges = [ ]; }) "a named external Readiness dependency needs an edge")
+    (check (rejectsExternal { edges = [ (externalEdge "Requires" 1000) ]; target = false; }) "an external edge needs a represented dependency unit")
+    (check (permitsExternal { edges = [ (externalEdge "Wants" 1000) (externalEdge "Ordering" 1000) ]; establishes = "the local endpoint returns HTTP 200"; }) "unrelated Wants and Ordering stay non-functional annotations")
+    (check (permitsExternal { edges = [ { to = "service:gym-db"; kind = "Diagnostic"; confidence = 500; } ]; establishes = "the local endpoint returns HTTP 200"; }) "weak local Diagnostic annotations are not external prerequisites")
+    (check (permitsExternal { edges = [ ]; role = "Diagnostic"; }) "Diagnostic probe text does not create a Readiness prerequisite")
   ];
 in
 assert builtins.all (x: x) checks;

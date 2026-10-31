@@ -684,9 +684,8 @@ fn posture_seen(cfg: &FileConfig, since_unix: u64) -> crate::evidence::PostureSe
     p
 }
 
-/// Send a request as `actor` from a process that has a controlling terminal
-/// (`script` allocates one) or that has none (`setsid`, a new session): the
-/// daemon reads which from the process (§11, B-3).
+/// Send a request as `actor` from a fresh controlling PTY/session or a
+/// session without a terminal. The daemon derives terminal identity (§11).
 fn request_at(actor: &str, req: &Request, tty: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "planarian-gym".into());
     let json = serde_json::to_string(req).expect("serializes");
@@ -699,36 +698,52 @@ fn request_at(actor: &str, req: &Request, tty: bool) -> Result<(), String> {
         format!("runuser -u {user} -- {exe} vm request --json '{q}'")
     };
     std::fs::write(&script, format!("#!/bin/sh\nexec {inner}\n")).map_err(|e| e.to_string())?;
-    sh(&format!("chmod +x {}", script.display()));
-    let cmd = if tty {
-        // A new session whose controlling terminal is a fresh pty, whatever
-        // the step's own stdin is (the daemon reads the terminal from the
-        // peer's /proc, §11, B-3); the request's answer is copied out.
-        let helper = PathBuf::from(RUN).join("on-a-terminal.py");
+    if !sh(&format!("chmod +x {}", script.display())) {
+        return Err("cannot make terminal request executable".into());
+    }
+    let helper = PathBuf::from(RUN).join("on-a-terminal.py");
+    if tty {
         std::fs::write(&helper, ON_A_TERMINAL).map_err(|e| e.to_string())?;
-        format!("python3 {} {} < /dev/null", helper.display(), script.display())
+    }
+    // The subprocess runner supplies null stdin and bounds the complete
+    // process group, output and socket wait, independently of driver stdin.
+    let path = script.to_string_lossy().into_owned();
+    let helper_path = helper.to_string_lossy().into_owned();
+    let argv =
+        if tty { vec!["python3", helper_path.as_str(), path.as_str()] } else { vec!["setsid", "-w", path.as_str()] };
+    let output = planarian_backend_linux::cmd::run(&argv, Duration::from_secs(660));
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+    if output.ok() {
+        Ok(())
     } else {
-        format!("setsid -w {} < /dev/null", script.display())
-    };
-    if sh(&cmd) { Ok(()) } else { Err(format!("request as {user} failed")) }
+        Err(format!(
+            "terminal request as {user} failed (status {:?}, timed_out {}): {}",
+            output.status,
+            output.timed_out,
+            output.tail()
+        ))
+    }
 }
 
-/// Run argv[1] as the leader of a new session on a new pty, print what it
-/// writes, and exit with its status.
-const ON_A_TERMINAL: &str = r#"import os, pty, sys
+/// A session-leading child gets the PTY as its controlling terminal. Stream
+/// output to the bounded outer runner instead of accumulating it in memory.
+const ON_A_TERMINAL: &str = r#"import errno, os, pty, sys
 pid, fd = pty.fork()
 if pid == 0:
     os.execv(sys.argv[1], [sys.argv[1]])
-out = b""
 while True:
     try:
         b = os.read(fd, 4096)
-    except OSError:
-        break
+    except OSError as error:
+        if error.errno == errno.EIO:
+            break
+        raise
     if not b:
         break
-    out += b
-sys.stdout.write(out.decode(errors="replace"))
+    sys.stdout.buffer.write(b)
+    sys.stdout.buffer.flush()
+os.close(fd)
 _, status = os.waitpid(pid, 0)
 sys.exit(os.waitstatus_to_exitcode(status))
 "#;
@@ -745,9 +760,11 @@ fn request_as(actor: &str, req: &Request) -> Result<(), String> {
         let unit = planarian_schema::backend::agent_unit(name);
         let cmd = format!(
             "uid=$(systemctl show -p UID --value {unit}); gid=$(systemctl show -p GID --value {unit}); \
+             cg=$(systemctl show -p ControlGroup --value {unit}); \
              [ -n \"$uid\" ] && [ \"$uid\" != \"[not set]\" ] || exit 1; \
-             sh -c 'echo $$ > /sys/fs/cgroup/system.slice/{unit}.service/cgroup.procs && \
-             exec setpriv --reuid=$0 --regid=$1 --clear-groups {exe} vm request --json \"$2\"' \"$uid\" \"$gid\" '{q}'"
+             case \"$cg\" in /*) ;; *) exit 1 ;; esac; [ \"$cg\" != / ] || exit 1; \
+             sh -c 'echo $$ > \"/sys/fs/cgroup$3/cgroup.procs\" && \
+             exec setpriv --reuid=$0 --regid=$1 --clear-groups {exe} vm request --json \"$2\"' \"$uid\" \"$gid\" '{q}' \"$cg\""
         );
         return if sh(&cmd) { Ok(()) } else { Err(format!("request as {actor} failed")) };
     }
@@ -1256,13 +1273,15 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 std::fs::write(Path::new(RUN).join("held-tokens"), held).map_err(|e| e.to_string())?;
                 return Ok(());
             }
+            if r.status.pending.is_empty() {
+                return Err(
+                    "approve_pending found no pending approval; refusing to silently skip the acceptance step".into()
+                );
+            }
             for p in r.status.pending {
-                // A refused approval is the step's outcome, not the harness's
-                // error; the answer is in responses.jsonl and printed by
-                // `vm request`, and a harness failure is said here.
-                if let Err(e) = request_at(actor, &Request::Approve { hash: p.approve }, tty) {
-                    eprintln!("approve_pending: {e}");
-                }
+                // A policy refusal is captured as a response by `vm request`;
+                // a failed transport is a harness error and must propagate.
+                request_at(actor, &Request::Approve { hash: p.approve }, tty)?;
             }
         }
         // I14: a request line carrying fields it must not set, sent to the
@@ -1348,7 +1367,7 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
             let user = user_for(&format!("user:{uid}"));
             let tty = 2 + (uid - 1000).clamp(0, 5);
             sh(&format!(
-                "systemd-run --unit=gym-session-{uid} -p PAMName=login -p User={user} -p TTYPath=/dev/tty{tty} \
+                "systemd-run --unit=gym-session-{uid} -p PAMName=login -p User={user} -p Environment=XDG_SESSION_TYPE=wayland -p TTYPath=/dev/tty{tty} \
                  -p StandardInput=tty -p StandardOutput=tty sleep infinity; sleep 5"
             ));
         }

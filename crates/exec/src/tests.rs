@@ -118,6 +118,25 @@ fn root() -> Authorization {
     user_authorization(Actor::user(0), true)
 }
 
+/// S04: I19 prevents root from approving its own proposal. The daemon also
+/// restricts Phase A approval to root at a terminal; its public-API regression
+/// covers the resulting need for an independent administrator's fresh request.
+#[test]
+fn root_proposals_require_resubmission_by_an_independent_administrator() {
+    let mut r = Rig::new();
+    let off = change("service-enable", &[("service", Value::Str("sshd".into())), ("enabled", Value::Bool(false))]);
+    let Submitted::Parked { approve, .. } = r.propose(off.clone(), root()) else { panic!("must ask") };
+    let (state, defs) = r.observe();
+    let pending = r.ex.kernel.journal.ledger().clone();
+    assert!(matches!(r.ex.approve(&approve, &root(), &state, &defs), Submitted::Rejected { .. }));
+    assert_eq!(r.ex.kernel.journal.ledger(), &pending, "self-approval changes no durable state");
+    // A fresh proposal by the already-authorized non-root administrator can
+    // be approved as root; no account creation or authority expansion occurs.
+    let mut fresh = Rig::new();
+    let Submitted::Parked { approve, .. } = fresh.propose(off, admin()) else { panic!("must ask") };
+    assert_eq!(finished(&fresh.approve(approve)), TxnState::Committed);
+}
+
 fn alice() -> Authorization {
     user_authorization(Actor::local(ALICE, "2"), false)
 }
@@ -521,10 +540,94 @@ fn session(id: &str, uid: u32) -> SessionInfo {
         class: "user".into(),
         seat: Some("seat0".into()),
         remote: false,
+        graphical: true,
         created: Timestamp(0),
         active: true,
         idle: false,
     }
+}
+
+fn waiting_font_scale(r: &mut Rig) -> TxnId {
+    r.fake.w().sessions.push(session("s1", ALICE));
+    r.fake.w().foreground.insert("s1".into());
+    let result = r.propose(change("font-scale", &[("scale", Value::Str("1.25".into()))]), alice());
+    let Submitted::Finished { txn, state: TxnState::Built, .. } = result else {
+        panic!("must wait in Built: {result:?}");
+    };
+    txn
+}
+
+#[test]
+fn foreground_parking_expires_at_24_boot_hours_and_releases_the_candidate() {
+    let mut r = Rig::new();
+    let id = waiting_font_scale(&mut r);
+    let root = r.ex.kernel.journal.ledger().live[&id].txn.gc_root.clone().unwrap();
+    let (state, _) = r.observe();
+    // Neither direction of wall-clock correction changes the boot deadline.
+    r.fake.w().wall_skew = 48 * 3600 * 1000;
+    assert!(r.ex.activate_waiting(&state).is_empty());
+    r.fake.w().wall_skew = -48 * 3600 * 1000;
+    r.fake.advance(Millis(PARKING_LIMIT.0 - 1));
+    assert!(r.ex.activate_waiting(&state).is_empty());
+    assert!(r.fake.w().gc_roots.contains(&root));
+    r.fake.advance(Millis(1));
+    let expired = r.ex.activate_waiting(&state);
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].0, id);
+    assert_eq!(finished(&expired[0].1), TxnState::Cancelled(Actor::Daemon));
+    assert_eq!(r.ex.kernel.journal.ledger().terminal[&id].state, TxnState::Cancelled(Actor::Daemon));
+    assert!(!r.fake.w().gc_roots.contains(&root));
+    assert_eq!(r.fake.w().current, GenerationId(1));
+    assert_eq!(r.fake.w().boot_default, GenerationId(1));
+    assert!(!r.fake.w().calls.iter().any(|c| c.call == "activate_live" || c.call == "publish_boot_once"));
+    assert!(r.ex.activate_waiting(&state).is_empty(), "cancellation is reported once");
+}
+
+#[test]
+fn opening_the_window_at_the_deadline_cancels_instead_of_activating() {
+    let mut r = Rig::new();
+    let id = waiting_font_scale(&mut r);
+    r.fake.advance(PARKING_LIMIT);
+    r.fake.w().foreground.clear();
+    let (state, _) = r.observe();
+    let results = r.ex.activate_waiting(&state);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, id);
+    assert_eq!(finished(&results[0].1), TxnState::Cancelled(Actor::Daemon));
+    assert_eq!(r.fake.w().current, GenerationId(1));
+}
+
+#[test]
+fn a_window_before_the_parking_deadline_still_activates() {
+    let mut r = Rig::new();
+    let id = waiting_font_scale(&mut r);
+    r.fake.advance(Millis(PARKING_LIMIT.0 - 60_000));
+    r.fake.w().foreground.clear();
+    let (state, _) = r.observe();
+    let results = r.ex.activate_waiting(&state);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, id);
+    assert_eq!(finished(&results[0].1), TxnState::Committed);
+    assert_ne!(r.fake.w().current, GenerationId(1));
+}
+
+#[test]
+fn failed_cancellation_keeps_the_waiting_plan_and_root_for_retry() {
+    let mut r = Rig::new();
+    let id = waiting_font_scale(&mut r);
+    let root = r.ex.kernel.journal.ledger().live[&id].txn.gc_root.clone().unwrap();
+    r.fake.advance(PARKING_LIMIT);
+    r.fake.store.set_enospc(true);
+    let failed = r.ex.expire_waiting();
+    assert_eq!(failed.len(), 1);
+    assert!(matches!(&failed[0].1, Submitted::Error(_)));
+    assert_eq!(r.ex.kernel.journal.ledger().live[&id].txn.state, TxnState::Built);
+    assert!(r.fake.w().gc_roots.contains(&root));
+    r.fake.store.set_enospc(false);
+    let retried = r.ex.expire_waiting();
+    assert_eq!(retried.len(), 1);
+    assert_eq!(finished(&retried[0].1), TxnState::Cancelled(Actor::Daemon));
+    assert!(!r.fake.w().gc_roots.contains(&root));
 }
 
 /// authz-nonadmin-stops-network-other-session, at the executor: the session
@@ -600,4 +703,247 @@ fn interlock_holds_off_non_administrators() {
     assert!(!matches!(&s, Submitted::Rejected { detail, .. } if detail.contains("interlock")), "{s:?}");
     let s = r.propose(Transition::RestartUnit(pw), admin());
     assert!(!matches!(&s, Submitted::Rejected { detail, .. } if detail.contains("interlock")), "{s:?}");
+}
+
+/// S07: outstanding approval authority belongs to one executor lifetime,
+/// including when a checkpoint retains its Prepared transaction.
+#[test]
+fn unused_approval_does_not_survive_restart_or_compaction() {
+    for compact in [false, true] {
+        let mut r = Rig::new();
+        let off = change("service-enable", &[("service", Value::Str("sshd".into())), ("enabled", Value::Bool(false))]);
+        let Submitted::Parked { approve, txn, .. } = r.propose(off, admin()) else { panic!() };
+        if compact {
+            r.ex.kernel.journal.compact().unwrap();
+        }
+        let store = r.fake.store.clone();
+        let journal = Journal::open(store).unwrap();
+        r.ex = Executor::new(journal, r.fake.clone(), OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO }, config());
+        assert!(r.ex.parked.is_empty());
+        r.ex.kernel.reconcile().unwrap();
+        assert!(matches!(r.approve(approve), Submitted::Rejected { .. }));
+        assert_eq!(r.fake.w().current, GenerationId(1));
+        assert_eq!(r.ex.kernel.journal.ledger().state(txn), Some(TxnState::Rejected(RejectReason::Interrupted)));
+        assert!(!r.fake.w().calls.iter().any(|c| c.call.starts_with("activate_live")));
+    }
+}
+
+/// S07: consumption is durable independently of the transient parked map.
+#[test]
+fn consumed_approval_replay_protection_survives_restart_and_compaction() {
+    let mut r = Rig::new();
+    let off = change("service-enable", &[("service", Value::Str("sshd".into())), ("enabled", Value::Bool(false))]);
+    let Submitted::Parked { approve, .. } = r.propose(off, admin()) else { panic!() };
+    assert_eq!(finished(&r.approve(approve)), TxnState::Committed);
+    let tokens = r.ex.kernel.journal.ledger().tokens_used.clone();
+    assert_eq!(tokens.len(), 1);
+    r.ex.kernel.journal.compact().unwrap();
+    let journal = Journal::open(r.fake.store.clone()).unwrap();
+    r.ex = Executor::new(journal, r.fake.clone(), OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO }, config());
+    r.ex.kernel.reconcile().unwrap();
+    assert_eq!(r.ex.kernel.journal.ledger().tokens_used, tokens);
+    let current = r.fake.w().current;
+    assert!(matches!(r.approve(approve), Submitted::Rejected { .. }));
+    assert_eq!(r.fake.w().current, current);
+}
+
+/// A torn replay-protection append must never authorize an activation.
+#[test]
+fn approval_consumption_write_failure_keeps_execution_parked() {
+    let mut r = Rig::new();
+    let off = change("service-enable", &[("service", Value::Str("sshd".into())), ("enabled", Value::Bool(false))]);
+    let Submitted::Parked { approve, txn, .. } = r.propose(off, admin()) else { panic!() };
+    r.fake.store.tear_write_containing("TokenUsed");
+    assert!(matches!(r.approve(approve), Submitted::Error(_)));
+    assert!(r.fake.store.torn(), "the failure was injected at consumption");
+    assert!(r.ex.parked.contains_key(&txn));
+    assert_eq!(r.fake.w().current, GenerationId(1));
+    assert!(!r.fake.w().calls.iter().any(|c| c.call.starts_with("activate_live")));
+}
+
+/// R03: syntax cannot hide a service stop's dependent effects or the
+/// SessionLoss floor. Authorization remains independent of risk.
+#[test]
+fn stopped_override_has_the_same_effects_and_floor_as_a_stop() {
+    let dm = UnitId::service("display-manager");
+    let gs = UnitId::target("graphical-session");
+    let session_targets: Vec<UnitId> = [("1", 1001), ("2", 1002)]
+        .into_iter()
+        .map(|(id, uid)| UnitId { scope: Scope::User { uid, session: Some(id.into()) }, ..gs.clone() })
+        .collect();
+    for caller in [admin(), user_authorization(Actor::user(1001), true)] {
+        let mut expected = None;
+        for kind in 0..3 {
+            let mut r = Rig::new();
+            r.fake.w().sessions = vec![session("1", 1001), session("2", 1002)];
+            let edge =
+                Edge { from: gs.clone(), kind: EdgeKind::Requires, to: dm.clone(), origin: EdgeOrigin::Manifest };
+            let mut manifest = r.asm.manifest().clone();
+            manifest.units.get_mut(&gs).unwrap().edges.push(edge);
+            r.asm.set_manifest(manifest);
+            let t = match kind {
+                0 => Transition::StopUnit(dm.clone()),
+                1 => Transition::StopAndSuppress { unit: dm.clone(), until: Until::Explicit, reason: "test".into() },
+                _ => Transition::SetOverride(Override::attested(
+                    dm.clone(),
+                    OverrideDesired::Stopped,
+                    Until::Explicit,
+                    "test".into(),
+                    caller.actor.clone(),
+                )),
+            };
+            let result = r.propose(t, caller.clone());
+            assert!(matches!(result, Submitted::Parked { .. }), "{result:?}");
+            let (facts, decision) = r.ex.last.clone().unwrap();
+            assert_eq!(facts.disruption, Disruption::SessionLoss);
+            // The assembler instantiates the template for each graphical
+            // session. Both concrete dependents must carry the stop's risk.
+            assert!(facts.affected_units.contains(&dm));
+            for target in &session_targets {
+                assert!(facts.affected_units.contains(target), "{facts:?}");
+            }
+            assert!(!facts.affected_units.contains(&gs));
+            assert!(facts.other_sessions_affected);
+            assert_eq!(facts.affected_sessions, vec!["1".to_string(), "2".to_string()]);
+            let effect = (facts.affected_units, facts.sensitivity, facts.disruption, facts.recovery, decision);
+            if let Some(ref wanted) = expected {
+                assert_eq!(&effect, wanted);
+            } else {
+                expected = Some(effect);
+            }
+        }
+    }
+    let mut r = Rig::new();
+    let leave = Transition::SetOverride(Override::attested(
+        dm,
+        OverrideDesired::LeaveAlone,
+        Until::Explicit,
+        "test".into(),
+        admin().actor,
+    ));
+    let _ = r.propose(leave, admin());
+    assert_eq!(r.ex.last.as_ref().unwrap().0.disruption, Disruption::None);
+    assert_eq!(r.fake.w().units[&UnitId::service("display-manager")].observed, Observed::Active);
+}
+
+/// R04: equal UnitDefs do not imply equal service contents. Existing and
+/// fresh generations use the same content-sensitive activation discovery.
+#[test]
+fn existing_generation_derives_activation_and_override_configuration() {
+    for (service, disruption) in
+        [("display-manager", Disruption::SessionLoss), ("NetworkManager", Disruption::ConnectivityLoss)]
+    {
+        let mut r = Rig::new();
+        let set = OverrideSet {
+            assignments: [(format!("services.{service}.settings"), Value::Str("changed".into()))].into(),
+        };
+        let target = r.fake.w().add_generation(&set);
+        let path = r.fake.generations().path_of(target).unwrap();
+        let preflight = r.fake.generations().preflight_existing(target, &path).unwrap();
+        assert!(preflight.activation.restart.contains(&UnitId::service(service)));
+        r.fake.generations().release_root(&preflight.root);
+        let (mut state, defs) = r.observe();
+        state.known_good = target;
+        for t in [Transition::SwitchGeneration(target), Transition::Revert { to: target }, Transition::Rollback] {
+            let p = Proposal {
+                observed: state.digest(),
+                expected: predict(&t, &state, &defs),
+                transition: t,
+                source: Source::User,
+                reason: "test".into(),
+            };
+            let plan = r.ex.plan(&p, &user_authorization(Actor::user(1001), true), &state, &defs, None).unwrap();
+            assert_eq!(plan.base_eval.units, plan.cand_eval.as_ref().unwrap().units);
+            assert_eq!(plan.facts.disruption, disruption);
+            assert!(plan.facts.affected_units.contains(&UnitId::service(service)));
+            assert!(
+                plan.facts.config_diff.as_ref().unwrap().options.contains_key(&format!("services.{service}.settings"))
+            );
+            assert_eq!(plan.decision, Decision::Allow { tier: Tier::AskFirst, approver: ApproverClass::AnyApprover });
+            r.ex.release(&plan);
+        }
+    }
+}
+
+#[test]
+fn unauthorized_catalog_change_does_no_expensive_work() {
+    let mut r = Rig::new();
+    let t = change("service-enable", &[("service", Value::Str("sshd".into())), ("enabled", Value::Bool(false))]);
+    let result = r.propose(t.clone(), alice());
+    assert!(matches!(result, Submitted::Rejected { reason: RejectReason::Unauthorized, .. }), "{result:?}");
+    assert!(r.ex.prebuild_job(&t, &alice()).is_err());
+    assert!(r.fake.w().staged.is_empty());
+    assert_eq!(r.fake.w().builds, 0);
+    assert!(r.ex.prebuild_job(&t, &admin()).unwrap().is_some(), "AskFirst may require a candidate");
+}
+
+/// The GC oracle keeps both normal and retain-all behavior: the candidate
+/// stays rooted through approval, remains verifiable, and commits afterward.
+#[test]
+fn approval_candidate_survives_collection_and_commits_in_both_retention_modes() {
+    for retain_all in [false, true] {
+        let mut r = Rig::new();
+        r.fake.w().gc_budget.retain_all = retain_all;
+        r.fake.w().gc_budget.keep_generations = 1;
+        let t = change("service-enable", &[("service", Value::Str("sshd".into())), ("enabled", Value::Bool(false))]);
+        let Submitted::Parked { txn, approve, .. } = r.propose(t, admin()) else { panic!("must await approval") };
+        let candidate = r.ex.kernel.journal.ledger().live[&txn].txn.candidate.clone().unwrap();
+        assert_eq!(finished(&r.propose(Transition::CollectGarbage { emergency: false }, admin())), TxnState::Committed);
+        assert!(r.fake.generations().verify_candidate(&candidate.1, &Hash::ZERO).unwrap());
+        assert!(!r.fake.w().collected.contains(&candidate.0));
+        assert_eq!(finished(&r.approve(approve)), TxnState::Committed);
+        assert_eq!(r.fake.w().current, candidate.0);
+    }
+}
+
+#[test]
+fn changed_activation_preflight_is_rejected_before_execution() {
+    let mut r = Rig::new();
+    let target = r.fake.w().add_generation(&OverrideSet::default());
+    let (state, defs) = r.observe();
+    let t = Transition::SwitchGeneration(target);
+    let p = Proposal {
+        observed: state.digest(),
+        expected: predict(&t, &state, &defs),
+        transition: t,
+        source: Source::User,
+        reason: "test".into(),
+    };
+    let plan = r.ex.plan(&p, &admin(), &state, &defs, None).unwrap();
+    let transaction = r.ex.transaction(&p, &plan, &state, &defs);
+    let id = r.ex.kernel.prepare(transaction).unwrap();
+    r.fake.w().gens.get_mut(&target).unwrap().eval.activation.restart.insert(UnitId::service("display-manager"));
+    let result = r.ex.run(id, &plan);
+    assert!(matches!(result, Submitted::Rejected { reason: RejectReason::Stale, .. }), "{result:?}");
+    assert_eq!(r.fake.w().current, state.generation);
+    assert!(!r.fake.w().calls.iter().any(|c| c.call.starts_with("activate_live")));
+    assert_eq!(r.ex.kernel.journal.ledger().state(id), Some(TxnState::Rejected(RejectReason::Stale)));
+}
+
+#[test]
+fn historical_unknown_recovery_candidate_blocks_even_administrator_gc() {
+    let mut r = Rig::new();
+    r.ex.kernel.journal.write_sentinel(TxnId(99), "historical evidence unavailable").unwrap();
+    for emergency in [false, true] {
+        let before = r.fake.w().calls.len();
+        let result = r.propose(Transition::CollectGarbage { emergency }, admin());
+        assert!(
+            matches!(&result, Submitted::Rejected { detail, .. } if detail.contains("protected candidate")),
+            "{result:?}"
+        );
+        assert_eq!(r.fake.w().calls.len(), before, "no collection before protected identities are reconciled");
+    }
+}
+
+#[test]
+fn unacknowledged_runtime_setting_does_not_create_a_persistence_followup() {
+    for injected in [planarian_fake::Injected::Partial, planarian_fake::Injected::Unknown] {
+        let mut r = Rig::new();
+        r.fake.w().inject.insert("set".into(), injected);
+        let result = r.propose(
+            Transition::SetRuntimeOption { path: "font.scale".into(), value: Value::Str("1.25".into()) },
+            alice(),
+        );
+        assert!(matches!(result, Submitted::Finished { state: TxnState::Committed, followup: None, .. }), "{result:?}");
+    }
 }

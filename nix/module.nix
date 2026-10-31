@@ -112,7 +112,14 @@ let
         type = types.enum [ "None" "Measurement" "Audible" "Visible" "RemoteStateChange" "Disk" ];
         default = if builtins.elem config.type [ "tcp" "http" ] then "Measurement" else "None";
       };
-      establishes = mkOption { type = types.str; description = "What a pass actually shows, in plain words."; };
+      establishes = mkOption {
+        type = types.str;
+        description = ''
+          What a pass actually shows, in plain words. Name an external
+          prerequisite by its unit ID (`service:external:<name>`); a Readiness
+          probe requires a declared traversable edge to that unit (§10).
+        '';
+      };
     };
   };
 
@@ -190,6 +197,36 @@ let
       ++ mk "Ordering" "SystemdAfter" svc.after;
 
   edgeKind = e: if e.kind == "Diagnostic" then { Diagnostic = { inherit (e) confidence; }; } else e.kind;
+
+  # §10: a declared external dependency must be traversable by the
+  # diagnoser. Wants/Ordering remain annotations and never satisfy a
+  # Readiness probe's named prerequisite. Do not infer dependencies from
+  # arbitrary URLs or prose: establishes names the external unit explicitly.
+  externalId = id: lib.hasPrefix "service:external:" id;
+  traversable = e: e.kind == "Requires" || (e.kind == "Diagnostic" && e.confidence >= 700);
+  externalReferences = establishes:
+    lib.unique (lib.concatMap (part: if builtins.isList part then part else [ ])
+      (builtins.split "(service:external:[a-zA-Z0-9_@/+.-]+)" establishes));
+  externalAssertions = lib.concatLists (lib.mapAttrsToList
+    (name: u:
+      let
+        edges = u.edges ++ lib.filter (e: e.to != null) (derivedEdges name u);
+        declaredExternal = lib.filter (e: externalId (toId e.to)) u.edges;
+        probeAssertions = lib.concatMap
+          (p: map (target: {
+            assertion = builtins.elem target managed
+              && (target == unitId name u
+                || lib.any (e: toId e.to == target && traversable e) edges);
+            message = "services.planarian.units.${name}.probes (${p.id}) names external dependency ${target}; declare that unit and a Requires or Diagnostic edge with confidence >= 700 (SPEC §10).";
+          }) (externalReferences p.establishes))
+          (lib.filter (p: p.role == "Readiness") u.probes);
+      in
+      map (e: {
+        assertion = builtins.elem (toId e.to) managed
+          && (e.kind != "Diagnostic" || e.confidence >= 700);
+        message = "services.planarian.units.${name} declares external dependency ${toId e.to}; its unit must exist and a Diagnostic edge needs confidence >= 700 (SPEC §10).";
+      }) declaredExternal ++ probeAssertions)
+    cfg.units);
 
   edgesJSON = name: u:
     let
@@ -506,7 +543,7 @@ in
         assertion = !(cfg.package.testBuild or false) || cfg.testBuild;
         message = "services.planarian.package is the gym's test build (planarian-gym-hooks), which accepts fault injection over its socket; it is for the gym's VM tests only (SPEC §15).";
       }
-    ];
+    ] ++ externalAssertions;
 
     services.planarian.units = {
       fs-root = mkDefault { kind = "device"; };
@@ -604,6 +641,16 @@ in
     environment.systemPackages = [ cfg.package ] ++ lib.optional (cfg.console.enable || cfg.tray.enable) cfg.console.package;
     users.groups.planarian-admin = { };
 
+    # Stable accounting parent for owned monitor work, including short-lived
+    # systemd-run probe/activation services. Sibling agent workloads and the
+    # shared Nix/systemd daemons are outside this explicitly measured scope.
+    systemd.slices.planarian-monitor = {
+      description = "Planarian monitor and owned helpers";
+      wantedBy = [ "multi-user.target" ];
+      unitConfig.StopWhenUnneeded = false;
+      sliceConfig = { CPUAccounting = true; MemoryAccounting = true; };
+    };
+
     # The healer is not the patient (Principle 1): no activation restarts or
     # stops these two (NixOS honours X-RestartIfChanged/X-StopIfChanged), and a
     # candidate whose unit files for them differ is refused as touching the core.
@@ -613,7 +660,7 @@ in
       before = [ "planariad.service" ];
       restartIfChanged = false;
       stopIfChanged = false;
-      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux ];
+      path = [ config.nix.package pkgs.git pkgs.glibc.bin config.systemd.package pkgs.util-linux ];
       environment.PLANARIAN_CONFIG = "/etc/planarian/config.json";
       serviceConfig = {
         # On btrfs the journal is rewritten in place: mark its directory
@@ -625,6 +672,7 @@ in
           fi
         ''}";
         ExecStart = "${cfg.package}/bin/planarian-recovery";
+        Slice = "planarian-monitor.slice";
         Restart = "always";
         RestartSec = 2;
         StateDirectory = "planarian";
@@ -662,11 +710,12 @@ in
       after = [ "planarian-recovery.service" ];
       restartIfChanged = false;
       stopIfChanged = false;
-      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux pkgs.kmod ]
+      path = [ config.nix.package pkgs.git pkgs.glibc.bin config.systemd.package pkgs.util-linux pkgs.kmod ]
         ++ lib.optional config.networking.networkmanager.enable config.networking.networkmanager.package;
       environment.PLANARIAN_CONFIG = "/etc/planarian/config.json";
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/planariad";
+        Slice = "planarian-monitor.slice";
         Restart = "always";
         RestartSec = 2;
         StateDirectory = "planarian";

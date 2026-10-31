@@ -34,6 +34,8 @@ use std::collections::BTreeMap;
 
 pub const GENERATION_DEADLINE: Millis = Millis::secs(15 * 60);
 pub const NETWORK_DEADLINE: Millis = Millis::secs(90);
+/// §12f: an activation window cannot hold a generation transaction forever.
+pub const PARKING_LIMIT: Millis = Millis::secs(24 * 3600);
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -96,6 +98,13 @@ struct Plan {
     candidate_override: Option<Hash>,
 }
 
+struct Waiting {
+    plan: Plan,
+    /// Boot time when this transaction entered Built. A daemon restart
+    /// rejects the old Built transaction and prepares a new one (§12f).
+    since: Timestamp,
+}
+
 pub struct Executor<B: Backends + Clone, S: Store> {
     pub kernel: Kernel<S, ExecHost<B>>,
     pub b: B,
@@ -116,7 +125,7 @@ pub struct Executor<B: Backends + Clone, S: Store> {
     /// generation and the packages it fixed, for the daemon to report.
     pub floor_raised: Option<(GenerationId, Vec<String>)>,
     /// Generation transactions waiting in `Built` for an activation window (§12f).
-    waiting: BTreeMap<TxnId, Plan>,
+    waiting: BTreeMap<TxnId, Waiting>,
 }
 
 /// What stage, evaluate and build produced for a catalog change.
@@ -250,6 +259,31 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         gens.evaluate_built(&path).map_err(outcome_msg)
     }
 
+    /// Cheap admission before any staging/evaluation/build. This checks
+    /// catalog membership, arguments, and the caller's catalog capability;
+    /// candidate-derived scope and every risk floor remain checked later.
+    pub fn admit_catalog(&self, t: &Transition, authz: &Authorization) -> Result<(), Submitted> {
+        let Transition::ApplyChange { change, args } = t else { return Ok(()) };
+        if !self.cfg.tables.catalog.contains(change) {
+            return Err(reject(RejectReason::NotInCatalog, "not in the active catalog"));
+        }
+        let admitted = match &authz.actor {
+            Actor::User { .. } => {
+                authz.capabilities.administrator
+                    || (authz.capabilities.user_controllable
+                        && self.cfg.settings.user_controllable_changes.contains(change))
+            }
+            Actor::Agent(_) | Actor::Unattributed => false,
+            _ => true,
+        };
+        if !admitted {
+            return Err(reject(RejectReason::Unauthorized, "caller cannot apply this catalog entry"));
+        }
+        planarian_changes::handle(&self.cfg.catalog, change, args)
+            .map_err(|e| reject(RejectReason::Other("arguments".into()), e.to_string()))?;
+        Ok(())
+    }
+
     fn plan(
         &self,
         p: &Proposal,
@@ -258,6 +292,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         defs: &UnitDefs,
         prebuilt: Option<Prebuilt>,
     ) -> Result<Plan, Submitted> {
+        self.admit_catalog(&p.transition, authz)?;
         let gens = self.b.generations();
         // §11: actor fields inside a proposal are overwritten from the caller.
         let transition = match &p.transition {
@@ -344,8 +379,17 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                     None => build_candidate(gens, &self.cfg.owner, &self.cfg.catalog, &transition, &live)?,
                 };
                 let fail = |what: &str, o: Outcome| reject(RejectReason::Other(what.into()), outcome_msg(o));
-                gens.remember_override(&live).map_err(|o| fail("override", o))?;
-                let cand_hash = gens.remember_override(&merged).map_err(|o| fail("override", o))?;
+                if let Err(o) = gens.remember_override(&live) {
+                    gens.release_root(&built.root);
+                    return Err(fail("override", o));
+                }
+                let cand_hash = match gens.remember_override(&merged) {
+                    Ok(hash) => hash,
+                    Err(o) => {
+                        gens.release_root(&built.root);
+                        return Err(fail("override", o));
+                    }
+                };
                 plan.candidate = Some((built.generation, built.path.clone()));
                 plan.base_override = Some(live_hash);
                 plan.candidate_override = Some(cand_hash);
@@ -355,10 +399,10 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 cand_overrides = Some(merged);
             }
             Transition::SwitchGeneration(g) | Transition::Revert { to: g } => {
-                self.plan_existing(&mut plan, *g, live_hash)?;
+                cand_overrides = self.plan_existing(&mut plan, *g, live_hash)?;
             }
             Transition::Rollback => {
-                self.plan_existing(&mut plan, state.known_good, live_hash)?;
+                cand_overrides = self.plan_existing(&mut plan, state.known_good, live_hash)?;
             }
             _ => {}
         }
@@ -410,18 +454,55 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         Ok(plan)
     }
 
-    fn plan_existing(&self, plan: &mut Plan, g: GenerationId, live_hash: Hash) -> Result<(), Submitted> {
+    fn plan_existing(
+        &self,
+        plan: &mut Plan,
+        g: GenerationId,
+        live_hash: Hash,
+    ) -> Result<Option<OverrideSet>, Submitted> {
         let gens = self.b.generations();
         let fail = |o: Outcome| reject(RejectReason::Other("generation".into()), outcome_msg(o));
         let path = gens.path_of(g).map_err(fail)?;
         let eval = gens.evaluate_built(&path).map_err(fail)?;
+        // A previously vetted manifest says nothing about today's service
+        // contents or activation. Obtain the same preflight as a fresh build.
+        let built = gens.preflight_existing(g, &path).map_err(fail)?;
+        if built.generation != g || built.path != path {
+            gens.release_root(&built.root);
+            return Err(reject(RejectReason::Other("generation".into()), "preflight target changed"));
+        }
+        let recorded = match gens.override_for(g) {
+            Ok(h) => h,
+            Err(o) => {
+                gens.release_root(&built.root);
+                return Err(fail(o));
+            }
+        };
+        let overrides = match recorded {
+            Some(h) => {
+                let set = match gens.read_override(&h) {
+                    Ok(s) => s,
+                    Err(o) => {
+                        gens.release_root(&built.root);
+                        return Err(fail(o));
+                    }
+                };
+                plan.base_override = Some(live_hash);
+                plan.candidate_override = Some(h);
+                Some(set)
+            }
+            None => {
+                gens.release_root(&built.root);
+                return Err(reject(
+                    RejectReason::Other("generation".into()),
+                    "target generation has no trustworthy override configuration; administrator recovery is required",
+                ));
+            }
+        };
         plan.candidate = Some((g, path));
         plan.cand_eval = Some(eval);
-        if let Some(h) = gens.override_for(g).map_err(fail)? {
-            plan.base_override = Some(live_hash);
-            plan.candidate_override = Some(h);
-        }
-        Ok(())
+        plan.built = Some(built);
+        Ok(overrides)
     }
 
     fn release(&self, plan: &Plan) {
@@ -437,6 +518,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             "transition": plan.transition,
             "staged_source": plan.staged.as_ref().map(|s| s.staged_source),
             "candidate": plan.candidate,
+            "activation": plan.built.as_ref().map(|b| &b.activation),
             "base": state.generation,
             "policy": self.policy_version(),
             "cumulative": cumulative.hash(),
@@ -488,9 +570,15 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             revert_to: state.generation,
             prior_driver,
             check: CheckContext {
+                version: CHECK_CONTEXT_VERSION,
                 candidate: plan.cand_eval.as_ref().map(manifest_of),
                 base: manifest_of(&plan.base_eval),
                 pre: defs.keys().map(|u| (u.clone(), state.status(u, defs))).collect(),
+                floor_fixes: plan.cand_eval.as_ref().map(|c| c.security_fixes(&plan.base_eval)).unwrap_or_default(),
+                required_floor: plan.candidate.as_ref().and_then(|(g, _)| {
+                    plan.cand_eval.as_ref().filter(|c| !c.security_fixes(&plan.base_eval).is_empty()).map(|_| *g)
+                }),
+                passing_readiness: Some(host::passing_readiness(state, defs)),
             },
         }
     }
@@ -519,22 +607,27 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     /// The slow part of planning `t`, to run elsewhere: `Some` for a catalog
     /// change, whose staging, evaluation and build can take minutes. Hand
     /// its result to `prebuilt` before submitting `t`.
-    pub fn prebuild_job(&self, t: &Transition) -> Option<PrebuildJob<B::Gens>>
+    pub fn prebuild_job(&self, t: &Transition, authz: &Authorization) -> Result<Option<PrebuildJob<B::Gens>>, Submitted>
     where
         B::Gens: Clone,
     {
         if !matches!(t, Transition::ApplyChange { .. }) {
-            return None;
+            return Ok(None);
         }
-        let (live, live_hash) = self.b.generations().read_overrides().ok()?;
-        Some(PrebuildJob {
+        self.admit_catalog(t, authz)?;
+        let (live, live_hash) = self
+            .b
+            .generations()
+            .read_overrides()
+            .map_err(|o| reject(RejectReason::Other("overrides".into()), outcome_msg(o)))?;
+        Ok(Some(PrebuildJob {
             gens: self.b.generations().clone(),
             owner: self.cfg.owner.clone(),
             catalog: self.cfg.catalog.clone(),
             transition: t.clone(),
             live,
             live_hash,
-        })
+        }))
     }
 
     /// Submit a proposal. `state` and `defs` are the current observation.
@@ -548,6 +641,21 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             };
         }
         self.last = None;
+        if matches!(p.transition, Transition::CollectGarbage { .. })
+            && self
+                .kernel
+                .journal
+                .ledger()
+                .interlock
+                .values()
+                .any(|pending| pending.transition.changes_generation() && pending.evidence_version != 1)
+        {
+            self.prebuilt = None;
+            return reject(
+                RejectReason::Other("unknown protected candidate".into()),
+                "historical recovery evidence does not identify every protected candidate; an administrator must reconcile and resolve it before collection",
+            );
+        }
         // §12c: while the recovery interlock is set, only administrators'
         // operations and a user's own overrides run (the ledger refuses the
         // autonomous callers itself).
@@ -613,6 +721,9 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             return self.run(id, &plan);
         }
         if plan.built.as_ref().is_some_and(|b| b.activation.boot_only()) {
+            if let Some(refusal) = self.revalidate_preflight(id, &plan) {
+                return refusal;
+            }
             return match self.kernel.run_boot_only(id) {
                 Ok(end) => Submitted::Finished { txn: id, state: end, followup: None },
                 Err(e) => Self::kernel_error(e),
@@ -625,7 +736,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             let why = if foreground { "waiting: foreground work holds" } else { "waiting: a session is in use" };
             return match self.kernel.wait_built(id, why) {
                 Ok(end) => {
-                    self.waiting.insert(id, plan);
+                    self.waiting.insert(id, Waiting { plan, since: self.b.clock().boot_now() });
                     Submitted::Finished { txn: id, state: end, followup: None }
                 }
                 Err(e) => Self::kernel_error(e),
@@ -650,32 +761,96 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         self.b.sessions().sessions().unwrap_or_default().iter().filter(|s| s.establishes() && s.active).all(|s| s.idle)
     }
 
+    /// Cancel candidates that have waited for the activation window for
+    /// 24 hours, even when foreground work still holds. AwaitingBoot is not
+    /// in this map: its publication waits for a reboot without a limit.
+    pub fn expire_waiting(&mut self) -> Vec<(TxnId, Submitted)> {
+        let now = self.b.clock().boot_now();
+        let expired: Vec<TxnId> =
+            self.waiting.iter().filter(|(_, w)| now >= w.since.plus(PARKING_LIMIT)).map(|(id, _)| *id).collect();
+        expired
+            .into_iter()
+            .map(|id| {
+                let result = match self.kernel.cancel(id, Actor::Daemon) {
+                    Ok(state) => {
+                        // The terminal journal step releases the adopted GC
+                        // root. Keep the plan until cancellation is durable.
+                        self.waiting.remove(&id);
+                        Submitted::Finished { txn: id, state, followup: None }
+                    }
+                    Err(e) => Self::kernel_error(e),
+                };
+                (id, result)
+            })
+            .collect()
+    }
+
     /// Activate transactions waiting in `Built` whose window has opened: no
     /// foreground work, and the sessions idle (or the change does not disturb
     /// one). Returns what ran.
     pub fn activate_waiting(&mut self, state: &SystemState) -> Vec<(TxnId, Submitted)> {
+        let mut out = self.expire_waiting();
         let foreground = state.conditions.iter().any(|c| matches!(c, Condition::Foreground { .. }));
         if foreground || self.waiting.is_empty() {
-            return vec![];
+            return out;
         }
         let ready: Vec<TxnId> = self
             .waiting
             .iter()
-            .filter(|(_, p)| {
-                !p.built.as_ref().is_some_and(|b| self.disturbs_a_session(&b.activation)) || self.sessions_idle()
+            .filter(|(_, w)| {
+                !w.plan.built.as_ref().is_some_and(|b| self.disturbs_a_session(&b.activation)) || self.sessions_idle()
             })
             .map(|(id, _)| *id)
             .collect();
-        let mut out = vec![];
         for id in ready {
-            if let Some(plan) = self.waiting.remove(&id) {
-                out.push((id, self.run(id, &plan)));
+            if let Some(waiting) = self.waiting.remove(&id) {
+                out.push((id, self.run(id, &waiting.plan)));
             }
         }
         out
     }
 
+    /// Immediately before mutation, require the current activation evidence
+    /// to match the candidate-bound plan approved and scheduled earlier.
+    /// Waiting/approval does not freeze service contents or supervisor state.
+    fn revalidate_preflight(&mut self, id: TxnId, plan: &Plan) -> Option<Submitted> {
+        let built = plan.built.as_ref()?;
+        let gens = self.b.generations();
+        let base = self.kernel.journal.ledger().live.get(&id).map(|t| t.txn.base);
+        let valid = match gens.current() {
+            Ok(g) if Some(g) == base => match gens.preflight_existing(built.generation, &built.path) {
+                Ok(now) => {
+                    let same = now.generation == built.generation
+                        && now.path == built.path
+                        && now.activation == built.activation;
+                    if now.root != built.root {
+                        gens.release_root(&now.root);
+                    }
+                    same
+                }
+                Err(_) => false,
+            },
+            _ => false,
+        };
+        if valid {
+            return None;
+        }
+        match self.kernel.reject(id, RejectReason::Stale) {
+            Ok(_) => {
+                self.release(plan);
+                Some(reject(
+                    RejectReason::Stale,
+                    "activation preflight changed or became unavailable; resubmit the change",
+                ))
+            }
+            Err(e) => Some(Self::kernel_error(e)),
+        }
+    }
+
     fn run(&mut self, id: TxnId, plan: &Plan) -> Submitted {
+        if let Some(refusal) = self.revalidate_preflight(id, plan) {
+            return refusal;
+        }
         match self.kernel.run(id) {
             Ok(end) => {
                 let followup = self.after(id, plan, &end);
@@ -694,14 +869,12 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             let _ = self.b.generations().record_override(*g, &h);
         }
         // §12e: a committed generation that fixes a known vulnerability is the
-        // new security floor. Derived here, never set by a proposal; it only
-        // moves forward, and only to a generation that committed live.
+        // new security floor. The kernel durably establishes that obligation
+        // before Committed; this is notification only, never a second write.
         if let (Some((g, _)), Some(cand)) = (&plan.candidate, &plan.cand_eval) {
             let fixes = cand.security_fixes(&plan.base_eval);
             let floor = self.kernel.journal.ledger().security_floor;
-            if !fixes.is_empty() && floor.is_none_or(|f| f.0 < g.0) {
-                let now = self.b.clock().now();
-                let _ = self.kernel.journal.append(now, Record::SecurityFloor(Some(*g)));
+            if !fixes.is_empty() && floor.is_some_and(|f| f.0 >= g.0) {
                 self.floor_raised = Some((*g, fixes));
             }
         }
@@ -710,6 +883,12 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             self.session.cumulative = self.session.cumulative.then(d);
         }
         if let Transition::SetRuntimeOption { path, value } = &plan.transition {
+            // Runtime Committed records re-observation/lifecycle, including
+            // Failed/Partial/Unknown backend replies. Persistence needs an
+            // acknowledged successful setting, not just terminal bookkeeping.
+            if !self.kernel.journal.ledger().operation_outcome(id).is_success() {
+                return None;
+            }
             let (change, args) = planarian_changes::writeback(path, value)?;
             return Some(Proposal {
                 observed: Hash::ZERO, // the daemon fills in the digest it observes
@@ -802,8 +981,18 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         if self.kernel.journal.ledger().tokens_used.iter().any(|(n, _)| *n == nonce) {
             return reject(RejectReason::Other("approval".into()), "this approval was already used");
         }
-        let _ =
-            self.kernel.journal.append(now, Record::TokenUsed { nonce, expires: parked.issued.plus(TOKEN_LIFETIME) });
+        if let Err(e) =
+            self.kernel.journal.append(now, Record::TokenUsed { nonce, expires: parked.issued.plus(TOKEN_LIFETIME) })
+        {
+            // The original candidate is still parked. A deterministic
+            // rebuild may reuse its exact root; keep that durable obligation
+            // rooted while discarding only a distinct temporary preflight.
+            let held = self.kernel.journal.ledger().live.get(&parked.txn).and_then(|t| t.txn.gc_root.as_ref());
+            if plan.built.as_ref().is_some_and(|b| Some(&b.root) != held) {
+                self.release(&plan);
+            }
+            return Submitted::Error(format!("could not durably consume approval: {e:?}"));
+        }
         self.parked.remove(&parked.txn);
         let source = parked.proposal.source.clone();
         self.schedule(parked.txn, plan, &source, state)

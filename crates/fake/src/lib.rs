@@ -141,6 +141,9 @@ pub struct Call {
 #[derive(Debug, Default)]
 pub struct World {
     pub now: Timestamp,
+    /// Absolute simulation time at the start of this boot. Evidence and wall
+    /// time stay monotonic while CLOCK_BOOTTIME restarts at zero.
+    pub boot_started: Timestamp,
     /// Wall clock minus boot clock, in ms (`set_wall_clock`, §12h).
     pub wall_skew: i64,
     // ---- NixOS ----
@@ -346,12 +349,49 @@ impl World {
         (eval, broken)
     }
 
+    fn activation_for(&self, g: GenerationId) -> ActivationPlan {
+        let cur = self.gens[&self.current].clone();
+        let new = self.gens[&g].clone();
+        let mut plan = new.eval.activation.clone();
+        for u in new.eval.units.keys() {
+            match cur.eval.units.get(u) {
+                None => {
+                    plan.start.insert(u.clone());
+                }
+                Some(old) if old != &new.eval.units[u] || new.broken.contains(u) != cur.broken.contains(u) => {
+                    plan.restart.insert(u.clone());
+                }
+                _ => {}
+            }
+        }
+        for (k, v) in &new.eval.options {
+            if cur.eval.options.get(k) != Some(v) {
+                // An option change restarts the services of its module (`services.<name>.…`).
+                if let Some(svc) = k.strip_prefix("services.").and_then(|r| r.split('.').next()) {
+                    let id = UnitId::service(svc);
+                    if new.eval.units.contains_key(&id) {
+                        plan.restart.insert(id);
+                    }
+                }
+            }
+        }
+        for u in cur.eval.units.keys() {
+            if !new.eval.units.contains_key(u) {
+                plan.stop.insert(u.clone());
+            }
+        }
+        plan
+    }
+
     pub fn add_generation(&mut self, overrides: &OverrideSet) -> GenerationId {
         let (eval, broken) = self.evaluate(overrides);
         let id = GenerationId(self.gens.keys().map(|g| g.0).max().unwrap_or(0) + 1);
         let path = StorePath(format!("/nix/store/{:03}-nixos-system-fake", id.0));
         let created = (self.rebuild_uid, self.now);
         self.gens.insert(id, Gen { path, eval, broken, created });
+        let hash = World::override_hash_of(overrides);
+        self.override_store.insert(hash, overrides.clone());
+        self.gen_overrides.insert(id, hash);
         id
     }
 
@@ -497,6 +537,7 @@ impl World {
     }
 
     pub fn reboot(&mut self) {
+        self.boot_started = self.now;
         // A one-shot entry boots once; one that fails to boot falls back to
         // the default (the boot loader's own fallback).
         self.booted = match self.one_shot.take() {
@@ -587,7 +628,7 @@ impl Fake {
         }
         let out = f(&mut w);
         match injected {
-            Some(Injected::Partial) => Outcome::Failed("partially applied (injected)".into()),
+            Some(Injected::Partial) => Outcome::Partial("partially applied (injected)".into()),
             Some(Injected::Unknown) => Outcome::Unknown("no answer (injected)".into()),
             _ => out,
         }
@@ -616,10 +657,13 @@ impl UnitBackend for Fake {
         Ok(self.w().units.keys().cloned().collect())
     }
 
-    fn start_agent(&self, name: &str, _argv: &[String]) -> Result<InstanceId, Outcome> {
+    fn start_agent(&self, name: &str, _argv: &[String], _by: u32) -> Result<InstanceId, Outcome> {
         let mut w = self.w();
         let now = w.now;
         let id = UnitId::service(&format!("planarian-agent-{name}"));
+        if w.units.get(&World::key(&id)).is_some_and(|u| matches!(u.observed, Observed::Active)) {
+            return Err(Outcome::Failed("agent unit is already running".into()));
+        }
         w.units.insert(World::key(&id), UnitSim::active(now));
         // A fresh InvocationID per start, as systemd gives one.
         w.next_instance += 1;
@@ -742,39 +786,22 @@ impl GenerationBackend for Fake {
                 g
             }
         };
-        let cur = w.gens[&w.current].clone();
         let new = w.gens[&g].clone();
-        let mut plan = new.eval.activation.clone();
-        for u in new.eval.units.keys() {
-            match cur.eval.units.get(u) {
-                None => {
-                    plan.start.insert(u.clone());
-                }
-                Some(old) if old != &new.eval.units[u] || new.broken.contains(u) != cur.broken.contains(u) => {
-                    plan.restart.insert(u.clone());
-                }
-                _ => {}
-            }
-        }
-        for (k, v) in &new.eval.options {
-            if cur.eval.options.get(k) != Some(v) {
-                // An option change restarts the services of its module (`services.<name>.…`).
-                if let Some(svc) = k.strip_prefix("services.").and_then(|r| r.split('.').next()) {
-                    let id = UnitId::service(svc);
-                    if new.eval.units.contains_key(&id) {
-                        plan.restart.insert(id);
-                    }
-                }
-            }
-        }
-        for u in cur.eval.units.keys() {
-            if !new.eval.units.contains_key(u) {
-                plan.stop.insert(u.clone());
-            }
-        }
+        let plan = w.activation_for(g);
         let root = format!("/nix/var/nix/gcroots/planarian/builds/{}", eval.source.to_hex());
         w.gc_roots.insert(root.clone());
         Ok(Built { generation: g, path: new.path, root, activation: plan })
+    }
+
+    fn preflight_existing(&self, g: GenerationId, path: &StorePath) -> Result<Built, Outcome> {
+        let mut w = self.w();
+        if w.gens.get(&g).is_none_or(|target| &target.path != path) || w.collected.contains(&g) {
+            return Err(Outcome::Unknown("preflight target is missing or changed".into()));
+        }
+        let activation = w.activation_for(g);
+        let root = format!("/nix/var/nix/gcroots/planarian/preflight/{}/{}", g.0, w.gens[&g].eval.source.to_hex());
+        w.gc_roots.insert(root.clone());
+        Ok(Built { generation: g, path: path.clone(), root, activation })
     }
 
     fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
@@ -859,6 +886,15 @@ impl GenerationBackend for Fake {
         Ok(self.w().one_shot)
     }
 
+    fn withdraw_boot_once(&self, keep: GenerationId, op: &OpId) -> Outcome {
+        self.run(op, format!("withdraw_boot_once({})", keep.0), |w| {
+            w.one_shot = None;
+            w.boot_entries.insert(keep);
+            w.boot_default = keep;
+            Outcome::Succeeded
+        })
+    }
+
     fn protect(&self, g: GenerationId, op: &OpId) -> Outcome {
         self.run(op, format!("protect({})", g.0), |_| Outcome::Succeeded)
     }
@@ -913,6 +949,14 @@ impl GenerationBackend for Fake {
     fn read_overrides(&self) -> Result<(OverrideSet, Hash), Outcome> {
         let w = self.w();
         Ok((w.overrides.clone(), World::override_hash_of(&w.overrides)))
+    }
+
+    fn read_override(&self, hash: &Hash) -> Result<OverrideSet, Outcome> {
+        self.w()
+            .override_store
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| Outcome::Unknown("override content is unavailable".into()))
     }
 
     fn remember_override(&self, set: &OverrideSet) -> Result<Hash, Outcome> {
@@ -1157,7 +1201,7 @@ impl ProcessBackend for Fake {
 }
 
 impl Clock for Fake {
-    /// The world's `now` is elapsed time (boot time); the wall clock is it
+    /// The world's `now` is elapsed simulation time; the wall clock is it
     /// plus `wall_skew`, which only `set_wall_clock` moves (§12h).
     fn now(&self) -> Timestamp {
         let w = self.w();
@@ -1165,7 +1209,8 @@ impl Clock for Fake {
     }
 
     fn boot_now(&self) -> Timestamp {
-        self.w().now
+        let w = self.w();
+        Timestamp(w.now.0.saturating_sub(w.boot_started.0))
     }
 
     fn sleep(&self, d: Millis) {
@@ -1212,7 +1257,12 @@ impl Backends for Fake {
 /// A fake machine built from the gym fixtures (catalog `[[fixture]]`), on its
 /// first generation, healthy, with nobody logged in.
 pub fn gym_world(store: MemStore) -> Fake {
-    let mut w = World { now: Timestamp(1_700_000_000_000), power: Some(PowerSource::Ac), ..Default::default() };
+    let mut w = World {
+        now: Timestamp(1_700_000_000_000),
+        boot_started: Timestamp(1_700_000_000_000),
+        power: Some(PowerSource::Ac),
+        ..Default::default()
+    };
     w.base_units = fixtures::gym_units();
     w.base_user_units = fixtures::gym_user_units();
     w.base_options = [
@@ -1323,3 +1373,20 @@ pub fn gym_world(store: MemStore) -> Fake {
 }
 
 pub mod fixtures;
+
+#[cfg(test)]
+mod agent_instance_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_same_name_start_cannot_replace_a_live_instance() {
+        let fake = gym_world(MemStore::new(1 << 20));
+        let first = fake.start_agent("helper", &["sleep".into()], 1000).unwrap();
+        assert!(fake.start_agent("helper", &["sleep".into()], 0).is_err());
+        assert_eq!(fake.w().agent_instances.get("helper"), Some(&first));
+        let unit = UnitId::service("planarian-agent-helper");
+        fake.w().units.get_mut(&World::key(&unit)).unwrap().observed = Observed::Bound;
+        let next = fake.start_agent("helper", &["sleep".into()], 0).unwrap();
+        assert_ne!(next, first);
+    }
+}

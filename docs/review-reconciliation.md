@@ -57,3 +57,7 @@ implementation it requires is listed as open or closed separately).
 | B-20 | A second `agent run` under a running agent's name rebinds its authority (I24) | open: registered and fixed first (rule 19(b)) |
 | — | Approval at a terminal had no effect on the VM harness (the `script` wrapper) | fixed in `b219d81`; VM confirmation pending |
 | — | Collected generations kept their build and `gen-<n>` GC roots, so collection freed nothing | fixed in `805cd1c` |
+
+## Shared-core integration note
+
+The tables above are deliberately the b219d81 review snapshot. Later main fixes (including `8231a07`, `4d27bce`, `c6347cb` and `20d4f2c`) and the shared-core implementation are reconciled in `docs/shared-core-review.md`. Adopted v4.6 contracts govern; historical open rows and superseded PR proposals do not override them or certify the merged candidate.

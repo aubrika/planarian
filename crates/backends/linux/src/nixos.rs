@@ -17,7 +17,7 @@
 
 use crate::Paths;
 use crate::admitted;
-use crate::cmd::{Output, run};
+use crate::cmd::{MAX_OUTPUT, Output, run};
 use planarian_changes::{parse as parse_overrides, render};
 use planarian_schema::*;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,40 @@ use std::time::Duration;
 const NIX: Duration = Duration::from_secs(30 * 60);
 const QUICK: Duration = Duration::from_secs(30);
 pub const ACTIVATION: Duration = Duration::from_secs(16 * 60);
+
+/// systemd-boot entry identities in EFI are UTF-16LE after four attribute
+/// bytes. Missing means absent; malformed or unreadable never means absent.
+fn efi_entry_at(path: &Path) -> Result<Option<String>, Outcome> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Outcome::Unknown(format!("cannot read EFI entry: {e}"))),
+    };
+    if bytes.len() < 6 || bytes.len() % 2 != 0 || bytes.len() > 4096 {
+        return Err(Outcome::Unknown("malformed EFI entry".into()));
+    }
+    let units: Vec<u16> = bytes[4..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    if units.last() != Some(&0) {
+        return Err(Outcome::Unknown("unterminated EFI entry".into()));
+    }
+    let name = String::from_utf16(&units).map_err(|_| Outcome::Unknown("invalid UTF-16 EFI entry".into()))?;
+    let name = name.trim_end_matches('\0');
+    if name.contains('\0') {
+        return Err(Outcome::Unknown("embedded terminator in EFI entry".into()));
+    }
+    Ok((!name.is_empty()).then(|| name.to_owned()))
+}
+
+fn profile_number_for_entry(name: &str) -> Result<u64, Outcome> {
+    let number = name
+        .strip_prefix("nixos-generation-")
+        .and_then(|s| s.strip_suffix(".conf"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0);
+    number
+        .filter(|n| format!("nixos-generation-{n}.conf") == name)
+        .ok_or_else(|| Outcome::Unknown("unrecognized boot entry identity".into()))
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Registry {
@@ -141,6 +175,57 @@ pub fn parse_dry_activate(text: &str) -> ActivationPlan {
         }
     }
     plan
+}
+
+/// Accept only the pinned NixOS dry-activation protocol. Empty, malformed or
+/// truncated discovery is not evidence of an activation with no effects.
+fn checked_dry_activate(out: &Output) -> Result<ActivationPlan, Outcome> {
+    if let Some(why) = dry_activate_failure(out) {
+        return Err(Outcome::Unknown(why));
+    }
+    if out.stdout.len() >= MAX_OUTPUT
+        || out.stderr.len() >= MAX_OUTPUT
+        || (!out.stdout.is_empty() && !out.stdout.ends_with('\n'))
+        || (!out.stderr.is_empty() && !out.stderr.ends_with('\n'))
+    {
+        return Err(Outcome::Unknown("dry-activation output is incomplete".into()));
+    }
+    let text = format!("{}\n{}", out.stdout, out.stderr);
+    if !text.lines().any(|line| line.trim() == "would activate the configuration...") {
+        return Err(Outcome::Unknown("dry-activation protocol marker is missing".into()));
+    }
+    let effects = ["stop", "restart", "start", "reload"];
+    for line in text.lines().map(str::trim).filter(|line| line.starts_with("would ")) {
+        if line == "would activate the configuration..." {
+            continue;
+        }
+        if let Some(list) = line.strip_prefix("would NOT stop the following changed units: ") {
+            if list.is_empty() {
+                return Err(Outcome::Unknown("malformed dry-activation skip list".into()));
+            }
+            continue;
+        }
+        let list = effects.iter().find_map(|verb| {
+            let prefix = format!("would {verb} the following units: ");
+            line.strip_prefix(prefix.as_str())
+        });
+        let Some(list) = list else {
+            return Err(Outcome::Unknown(format!("unmodeled dry-activation effect: {line}")));
+        };
+        for unit in list.split(',').map(str::trim) {
+            // Socket/mount/swap effects do not fit Phase A's current unit
+            // schema. Refuse them rather than silently dropping their risk.
+            let name = unit.strip_suffix(".service").or_else(|| unit.strip_suffix(".target"));
+            if name.is_none_or(|name| name.is_empty() || name.chars().any(char::is_whitespace)) {
+                return Err(Outcome::Unknown(format!("unmodeled or malformed activation unit: {unit}")));
+            }
+        }
+    }
+    Ok(parse_dry_activate(&text))
+}
+
+fn discover_activation(path: &Path, timeout: Duration) -> Result<ActivationPlan, Outcome> {
+    checked_dry_activate(&run(&[&path.join("bin/switch-to-configuration").to_string_lossy(), "dry-activate"], timeout))
 }
 
 /// The Nix function given to `nix eval --apply`: the export, plus the current
@@ -283,6 +368,7 @@ impl Nixos {
         let mut cmd: Vec<String> = [
             "systemd-run",
             &unit,
+            "--slice=planarian-monitor.slice",
             "--wait",
             "--collect",
             "--quiet",
@@ -419,6 +505,62 @@ impl Nixos {
         name.strip_suffix("-link")?.rsplit('-').next()?.parse().ok()
     }
 
+    fn generation_for_entry(&self, name: &str) -> Result<GenerationId, Outcome> {
+        let n = profile_number_for_entry(name)?;
+        let link = self.paths.profile.with_file_name(format!("system-{n}-link"));
+        self.id_of_link(&link)
+    }
+
+    fn systemd_boot_default(&self, loader: &Path, efivars: &Path) -> Result<GenerationId, Outcome> {
+        let selected = |name: &str| {
+            profile_number_for_entry(name)?;
+            let entry = loader.parent().expect("loader.conf has a parent").join("entries").join(name);
+            if !entry.is_file() {
+                return Err(Outcome::Unknown("selected boot entry is not installed".into()));
+            }
+            self.generation_for_entry(name)
+        };
+        let variable = efivars.join("LoaderEntryDefault-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f");
+        if let Some(name) = efi_entry_at(&variable)? {
+            return selected(&name);
+        }
+        let text = std::fs::read_to_string(loader)
+            .map_err(|e| Outcome::Unknown(format!("cannot read systemd-boot default: {e}")))?;
+        let defaults: Vec<&str> = text
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                if parts.next() == Some("default") { Some((parts.next(), parts.next())) } else { None }
+            })
+            .map(|(entry, extra)| if extra.is_none() { entry.unwrap_or("") } else { "" })
+            .collect();
+        if defaults.len() != 1 {
+            return Err(Outcome::Unknown("no unique installed boot default".into()));
+        }
+        selected(defaults[0])
+    }
+
+    /// A persistent EFI default overrides NixOS's loader.conf. Establish the
+    /// authorized profile entry explicitly so a vulnerable manual fallback
+    /// cannot remain the automatic choice after publishing a security fix.
+    fn select_systemd_boot_default(&self, generation: GenerationId) -> Outcome {
+        let Some(number) = self.profile_generation() else {
+            return Outcome::Unknown("cannot identify installed boot default entry".into());
+        };
+        let name = format!("nixos-generation-{number}.conf");
+        if self.generation_for_entry(&name) != Ok(generation) {
+            return Outcome::Unknown("profile changed before selecting the boot default".into());
+        }
+        let o = run(&["bootctl", "set-default", &name], QUICK);
+        if !o.ok() {
+            return Outcome::Unknown(format!("cannot establish persistent boot default: {}", o.tail()));
+        }
+        match self.systemd_boot_default(Path::new("/boot/loader/loader.conf"), Path::new("/sys/firmware/efi/efivars")) {
+            Ok(actual) if actual == generation => Outcome::Succeeded,
+            _ => Outcome::Unknown("persistent boot default did not verify".into()),
+        }
+    }
+
     fn boot_menu_for(&self, path: &str) -> bool {
         match std::fs::read_to_string(self.boot_menu_path()) {
             Ok(p) => p.trim() == path,
@@ -527,6 +669,79 @@ impl Nixos {
         format!("planarian-op-{}-{}-{}", op.txn.0, op.epoch, op.seq)
     }
 
+    fn preflight_path(&self, generation: GenerationId, path: StorePath, root: String) -> Result<Built, Outcome> {
+        let current = std::fs::canonicalize("/run/current-system")
+            .map_err(|e| Outcome::Unknown(format!("cannot identify preflight base: {e}")))?;
+        let mut activation = discover_activation(Path::new(&path.0), Duration::from_secs(120))?;
+        let differs = |name: &str| -> Result<bool, Outcome> {
+            let candidate = std::fs::read_link(Path::new(&path.0).join(name))
+                .map_err(|e| Outcome::Unknown(format!("candidate {name}: {e}")))?;
+            let base =
+                std::fs::read_link(current.join(name)).map_err(|e| Outcome::Unknown(format!("current {name}: {e}")))?;
+            Ok(candidate != base)
+        };
+        let params = |base: &Path| {
+            std::fs::read(base.join("kernel-params")).map_err(|e| Outcome::Unknown(format!("kernel-params: {e}")))
+        };
+        activation.needs_reboot_to_confirm =
+            differs("kernel")? || differs("initrd")? || params(Path::new(&path.0))? != params(&current)?;
+        if std::fs::canonicalize("/run/current-system").ok().as_ref() != Some(&current) {
+            return Err(Outcome::Unknown("running generation changed during preflight".into()));
+        }
+        Ok(Built { generation, path, root, activation })
+    }
+
+    /// The callback exposes the final comparison/replacement boundary to the
+    /// negative R11 regression. The production caller supplies a no-op: this
+    /// does not make check-then-rename atomic against arbitrary editors.
+    fn swap_override_after_comparison<F: FnOnce()>(
+        &self,
+        from: &Hash,
+        to: &Hash,
+        op: &OpId,
+        after_comparison: F,
+    ) -> Outcome {
+        if !admitted(&self.paths.txn_dir(), op) {
+            return Outcome::fenced();
+        }
+        let live = self.override_file(&self.paths.owner);
+        // All supported writers lock this same directory inode. Keep the guard
+        // through comparison, rename and directory fsync; non-cooperating root
+        // editors remain the explicitly accepted X-12 bypass.
+        let _writer_lock = match std::fs::File::open(live.parent().expect("override has a parent")).and_then(|lock| {
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+            Ok(lock)
+        }) {
+            Ok(lock) => lock,
+            Err(e) => return Outcome::Unknown(format!("override writer lock unavailable: {e}")),
+        };
+        if !admitted(&self.paths.txn_dir(), op) {
+            return Outcome::fenced();
+        }
+        let current = match std::fs::read_to_string(&live) {
+            Ok(t) => sha(&t),
+            Err(e) => return Outcome::Failed(e.to_string()),
+        };
+        if current == *to {
+            return Outcome::Succeeded;
+        }
+        if current != *from {
+            return Outcome::Failed("planarian/overrides.nix was changed by someone else".into());
+        }
+        let text = match std::fs::read_to_string(self.store_dir().join(format!("{}.nix", to.to_hex()))) {
+            Ok(t) if sha(&t) == *to => t,
+            _ => return Outcome::Failed("override content for this transaction is missing".into()),
+        };
+        after_comparison();
+        if !admitted(&self.paths.txn_dir(), op) {
+            return Outcome::fenced();
+        }
+        match Self::write_atomically(&live, &text) {
+            Ok(()) => Outcome::Succeeded,
+            Err(e) => Outcome::Failed(e.to_string()),
+        }
+    }
+
     fn write_atomically(target: &Path, text: &str) -> std::io::Result<()> {
         use std::io::Write;
         let dir = target.parent().expect("has a parent");
@@ -576,6 +791,11 @@ impl GenerationBackend for Nixos {
     }
 
     fn boot_default(&self) -> Result<GenerationId, Outcome> {
+        let loader = Path::new("/boot/loader/loader.conf");
+        let efivars = Path::new("/sys/firmware/efi/efivars");
+        if loader.is_file() && efivars.is_dir() {
+            return self.systemd_boot_default(loader, efivars);
+        }
         self.id_of_link(&self.paths.profile)
     }
 
@@ -682,24 +902,38 @@ impl GenerationBackend for Nixos {
         // reached (`/run/current-system` is resolved the same way).
         let path = std::fs::canonicalize(&printed).map(|p| p.to_string_lossy().into_owned()).unwrap_or(printed);
         let generation = self.with_registry(|r| r.id_for(&path))?;
-        let dry = run(&[&format!("{path}/bin/switch-to-configuration"), "dry-activate"], Duration::from_secs(120));
-        // The plan is the risk evidence (§9 step 3): a dry activation that
-        // failed, timed out or was cut short yields none, never a smaller one
-        // (rule 21, R10). The candidate is not usable.
-        if let Some(why) = dry_activate_failure(&dry) {
+        let result = self.preflight_path(generation, StorePath(path), root.to_string_lossy().into_owned());
+        if result.is_err() {
             let _ = std::fs::remove_file(&root);
-            return Err(Outcome::Failed(why));
         }
-        let mut activation = parse_dry_activate(&format!("{}\n{}", dry.stdout, dry.stderr));
-        let differs = |f: &str| {
-            std::fs::read_link(format!("{path}/{f}")).ok()
-                != std::fs::read_link(format!("/run/current-system/{f}")).ok()
-        };
-        activation.needs_reboot_to_confirm = differs("kernel") || differs("initrd") || {
-            std::fs::read_to_string(format!("{path}/kernel-params")).ok()
-                != std::fs::read_to_string("/run/current-system/kernel-params").ok()
-        };
-        Ok(Built { generation, path: StorePath(path), root: root.to_string_lossy().into_owned(), activation })
+        result
+    }
+
+    fn preflight_existing(&self, g: GenerationId, path: &StorePath) -> Result<Built, Outcome> {
+        if self.path_of(g)? != *path {
+            return Err(Outcome::Unknown("selected generation path changed".into()));
+        }
+        let root = self.paths.gcroots.join("builds").join(format!("existing-{}-{}", g.0, Timestamp_now()));
+        std::fs::create_dir_all(root.parent().expect("parent")).map_err(|e| Outcome::Failed(e.to_string()))?;
+        std::os::unix::fs::symlink(&path.0, &root).map_err(|e| Outcome::Failed(e.to_string()))?;
+        if let Err(e) = std::fs::File::open(root.parent().expect("parent")).and_then(|dir| dir.sync_all()) {
+            let _ = std::fs::remove_file(&root);
+            return Err(Outcome::Failed(e.to_string()));
+        }
+        let result = self.preflight_path(g, path.clone(), root.to_string_lossy().into_owned());
+        if result.is_err() {
+            let _ = std::fs::remove_file(&root);
+        }
+        result
+    }
+
+    fn read_override(&self, hash: &Hash) -> Result<OverrideSet, Outcome> {
+        let text = std::fs::read_to_string(self.store_dir().join(format!("{}.nix", hash.to_hex())))
+            .map_err(|e| Outcome::Unknown(format!("override evidence: {e}")))?;
+        if sha(&text) != *hash {
+            return Err(Outcome::Unknown("override evidence hash mismatch".into()));
+        }
+        parse_overrides(&text).ok_or_else(|| Outcome::Unknown("invalid remembered override".into()))
     }
 
     fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
@@ -778,7 +1012,7 @@ impl GenerationBackend for Nixos {
         // Idempotent: the profile points at g and the boot menu was installed
         // for it (a revert after a publish that failed and was undone, or a
         // retry after a crash past the install).
-        if already && self.boot_menu_for(&path.0) {
+        if already && self.boot_menu_for(&path.0) && self.boot_default() == Ok(g) {
             return Outcome::Succeeded;
         }
         if !already {
@@ -790,12 +1024,15 @@ impl GenerationBackend for Nixos {
         let o = run(&[&format!("{}/bin/switch-to-configuration", path.0), "boot"], Duration::from_secs(300));
         if o.ok() {
             let _ = std::fs::write(self.boot_menu_path(), &path.0);
+            if Path::new("/boot/loader/loader.conf").is_file() && Path::new("/sys/firmware/efi/efivars").is_dir() {
+                return self.select_systemd_boot_default(g);
+            }
             return Outcome::Succeeded;
         }
-        // All or nothing: the boot loader failed (a full /boot), so the menu on
-        // disk is still the previous one. Point the profile back at what that
-        // menu boots and drop the new profile generation, so the boot default
-        // is not left naming a generation the menu does not have.
+        // Best-effort profile cleanup after an installer failure. A failed
+        // installer may have changed boot files: rollback of the profile does
+        // not establish that the previous menu was restored. The transaction
+        // must retain its mutation/reconciliation obligation.
         if !already {
             let added = std::fs::read_link(&self.paths.profile)
                 .ok()
@@ -812,11 +1049,16 @@ impl GenerationBackend for Nixos {
     /// The boot-only path with systemd-boot (§12f): `g` gets its own profile
     /// generation and boot entry, `keep` is made the newest profile
     /// generation again (so the menu's default stays `keep`), and the entry
-    /// for `g` is set to boot once (`bootctl set-oneshot`). All or nothing:
-    /// on any failure the profile is put back on `keep`'s boot menu.
+    /// for `g` is set to boot once (`bootctl set-oneshot`). Any failed or lost
+    /// reply may follow partial effects; PublishingBoot owns reconciliation.
     fn publish_boot_once(&self, g: GenerationId, keep: GenerationId, op: &OpId) -> Outcome {
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
+        }
+        if !Path::new("/boot/loader/loader.conf").is_file() || !Path::new("/sys/firmware/efi/efivars").is_dir() {
+            return Outcome::Unknown(
+                "boot-only publication requires installed systemd-boot at /boot and writable EFI variables".into(),
+            );
         }
         let (Ok(path), Ok(kept)) = (self.path_of(g), self.path_of(keep)) else {
             return Outcome::Failed("unknown generation".into());
@@ -840,8 +1082,43 @@ impl GenerationBackend for Nixos {
             return err(&o);
         }
         let _ = std::fs::write(self.boot_menu_path(), &kept.0);
+        let selected = self.select_systemd_boot_default(keep);
+        if !selected.is_success() {
+            return selected;
+        }
         let o = run(&["bootctl", "set-oneshot", &format!("nixos-generation-{n}.conf")], QUICK);
-        if o.ok() { Outcome::Succeeded } else { err(&o) }
+        if !o.ok() {
+            return err(&o);
+        }
+        match self.one_shot_pending() {
+            Ok(Some(actual)) if actual == g => Outcome::Succeeded,
+            _ => Outcome::Unknown("one-shot selection did not verify after publication".into()),
+        }
+    }
+
+    fn withdraw_boot_once(&self, keep: GenerationId, op: &OpId) -> Outcome {
+        if !admitted(&self.paths.txn_dir(), op) {
+            return Outcome::fenced();
+        }
+        // Clear even after a lost publication reply: lack of acknowledgment
+        // says nothing about whether the EFI mutation took effect.
+        let cleared = run(&["bootctl", "set-oneshot", ""], QUICK);
+        if !cleared.ok() {
+            return Outcome::Unknown(format!("cannot establish one-shot cancellation: {}", cleared.tail()));
+        }
+        match self.one_shot_pending() {
+            Ok(None) => {}
+            Ok(Some(_)) => return Outcome::Unknown("one-shot entry remains selected".into()),
+            Err(o) => return o,
+        }
+        let published = self.publish_boot(keep, op);
+        if published != Outcome::Succeeded {
+            return published;
+        }
+        match self.boot_default() {
+            Ok(g) if g == keep => Outcome::Succeeded,
+            _ => Outcome::Unknown("fallback boot default could not be verified".into()),
+        }
     }
 
     /// The pending one-shot entry, from systemd-boot's `LoaderEntryOneShot`
@@ -852,16 +1129,16 @@ impl GenerationBackend for Nixos {
             return Err(Outcome::Unknown("no EFI variables".into()));
         }
         let var = efivars.join("LoaderEntryOneShot-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f");
-        let Ok(bytes) = std::fs::read(&var) else { return Ok(None) };
-        // 4 bytes of attributes, then UTF-16LE.
-        let units: Vec<u16> =
-            bytes.get(4..).unwrap_or(&[]).chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        let name = String::from_utf16_lossy(&units).trim_end_matches('\0').to_string();
-        let Some(n) = name.strip_prefix("nixos-generation-").and_then(|r| r.strip_suffix(".conf")) else {
-            return Ok(None);
-        };
-        let link = self.paths.profile.with_file_name(format!("system-{n}-link"));
-        self.id_of_link(&link).map(Some)
+        match efi_entry_at(&var)? {
+            Some(name) => {
+                profile_number_for_entry(&name)?;
+                if !Path::new("/boot/loader/entries").join(&name).is_file() {
+                    return Err(Outcome::Unknown("one-shot entry is not installed".into()));
+                }
+                self.generation_for_entry(&name).map(Some)
+            }
+            None => Ok(None),
+        }
     }
 
     fn protect(&self, g: GenerationId, op: &OpId) -> Outcome {
@@ -890,28 +1167,7 @@ impl GenerationBackend for Nixos {
     }
 
     fn swap_override(&self, from: &Hash, to: &Hash, op: &OpId) -> Outcome {
-        if !admitted(&self.paths.txn_dir(), op) {
-            return Outcome::fenced();
-        }
-        let live = self.override_file(&self.paths.owner);
-        let current = match std::fs::read_to_string(&live) {
-            Ok(t) => sha(&t),
-            Err(e) => return Outcome::Failed(e.to_string()),
-        };
-        if current == *to {
-            return Outcome::Succeeded;
-        }
-        if current != *from {
-            return Outcome::Failed("planarian/overrides.nix was changed by someone else".into());
-        }
-        let text = match std::fs::read_to_string(self.store_dir().join(format!("{}.nix", to.to_hex()))) {
-            Ok(t) if sha(&t) == *to => t,
-            _ => return Outcome::Failed("override content for this transaction is missing".into()),
-        };
-        match Self::write_atomically(&live, &text) {
-            Ok(()) => Outcome::Succeeded,
-            Err(e) => Outcome::Failed(e.to_string()),
-        }
+        self.swap_override_after_comparison(from, to, op, || {})
     }
 
     fn path_of(&self, g: GenerationId) -> Result<StorePath, Outcome> {
@@ -1056,6 +1312,127 @@ mod tests {
         assert_eq!(closure_bytes_of("nonsense"), None);
     }
 
+    #[test]
+    fn cooperating_override_editor_waits_until_promotion_or_restoration_finishes() {
+        use std::sync::mpsc::sync_channel;
+
+        for restoration in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let paths = Paths { state: d.path().join("state"), owner: d.path().join("owner"), ..Default::default() };
+            let live = paths.owner.join("planarian/overrides.nix");
+            std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(paths.txn_dir().join("7")).unwrap();
+            std::fs::write(paths.txn_dir().join("7/lease"), "1").unwrap();
+            let n = Nixos::new(paths);
+            let base = OverrideSet::default();
+            let mut candidate = base.clone();
+            candidate.assignments.insert("a.b".into(), Value::Bool(true));
+            let base_hash = n.remember_override(&base).unwrap();
+            let candidate_hash = n.remember_override(&candidate).unwrap();
+            let (from, to, initial, replacement) = if restoration {
+                (candidate_hash, base_hash, render(&candidate), render(&base))
+            } else {
+                (base_hash, candidate_hash, render(&base), render(&candidate))
+            };
+            std::fs::write(&live, initial).unwrap();
+            let editor_live = live.clone();
+            let (compared_tx, compared_rx) = sync_channel(0);
+            let (blocked_tx, blocked_rx) = sync_channel(0);
+            let third_party = "# cooperating editor's later source\n";
+            let editor = std::thread::spawn(move || {
+                compared_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let lock = std::fs::File::open(editor_live.parent().unwrap()).unwrap();
+                assert_eq!(
+                    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive),
+                    Err(rustix::io::Errno::WOULDBLOCK)
+                );
+                blocked_tx.send(()).unwrap();
+                rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+                assert_eq!(std::fs::read_to_string(&editor_live).unwrap(), replacement);
+                Nixos::write_atomically(&editor_live, third_party).unwrap();
+            });
+            let op = OpId { txn: TxnId(7), epoch: 1, seq: 1 };
+            let outcome = n.swap_override_after_comparison(&from, &to, &op, || {
+                compared_tx.send(()).unwrap();
+                blocked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            });
+            assert_eq!(outcome, Outcome::Succeeded);
+            editor.join().unwrap();
+            assert_eq!(std::fs::read_to_string(&live).unwrap(), third_party);
+        }
+    }
+
+    /// X-12: a root editor that ignores the directory lock is outside the
+    /// adopted writer model. Characterize both promotion/restoration races
+    /// without pretending advisory locking gives arbitrary-editor CAS.
+    #[test]
+    fn noncooperating_override_editors_remain_the_explicit_x12_bypass() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::sync::mpsc::sync_channel;
+
+        for restoration in [false, true] {
+            for rename_editor in [false, true] {
+                let d = tempfile::tempdir().unwrap();
+                let paths =
+                    Paths { state: d.path().join("state"), owner: d.path().join("owner"), ..Default::default() };
+                let live = paths.owner.join("planarian/overrides.nix");
+                std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+                std::fs::create_dir_all(paths.txn_dir().join("7")).unwrap();
+                std::fs::write(paths.txn_dir().join("7/lease"), "1").unwrap();
+                let n = Nixos::new(paths);
+                let base = OverrideSet::default();
+                let mut candidate = base.clone();
+                candidate.assignments.insert("a.b".into(), Value::Bool(true));
+                let base_hash = n.remember_override(&base).unwrap();
+                let candidate_hash = n.remember_override(&candidate).unwrap();
+                let (from, to, initial, replacement) = if restoration {
+                    (candidate_hash, base_hash, render(&candidate), render(&base))
+                } else {
+                    (base_hash, candidate_hash, render(&base), render(&candidate))
+                };
+                std::fs::write(&live, initial).unwrap();
+                // Opening before the comparison also exercises an editor whose
+                // write permission cannot be revoked merely by chmod afterward.
+                let mut preopened = std::fs::OpenOptions::new().write(true).open(&live).unwrap();
+                let editor_live = live.clone();
+                let (compared_tx, compared_rx) = sync_channel(0);
+                let (edited_tx, edited_rx) = sync_channel(0);
+                let third_party = "# unrelated editor's source\n";
+                let editor = std::thread::spawn(move || {
+                    compared_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    if rename_editor {
+                        let renamed = editor_live.with_extension("external");
+                        let mut f = std::fs::File::create(&renamed).unwrap();
+                        f.write_all(third_party.as_bytes()).unwrap();
+                        f.sync_all().unwrap();
+                        std::fs::rename(&renamed, &editor_live).unwrap();
+                        std::fs::File::open(editor_live.parent().unwrap()).unwrap().sync_all().unwrap();
+                    } else {
+                        preopened.set_len(0).unwrap();
+                        preopened.seek(SeekFrom::Start(0)).unwrap();
+                        preopened.write_all(third_party.as_bytes()).unwrap();
+                        preopened.sync_all().unwrap();
+                    }
+                    assert_eq!(std::fs::read_to_string(&editor_live).unwrap(), third_party);
+                    edited_tx.send(()).unwrap();
+                });
+                let op = OpId { txn: TxnId(7), epoch: 1, seq: 1 };
+                let outcome = n.swap_override_after_comparison(&from, &to, &op, || {
+                    compared_tx.send(()).unwrap();
+                    edited_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                });
+                editor.join().unwrap();
+                assert_eq!(outcome, Outcome::Succeeded);
+                assert_eq!(std::fs::read_to_string(&live).unwrap(), replacement);
+                assert_ne!(
+                    std::fs::read_to_string(&live).unwrap(),
+                    third_party,
+                    "non-cooperating root edits are the accepted X-12 bypass"
+                );
+            }
+        }
+    }
+
     /// R10: nonzero exit, timeout and truncated output each refuse the plan.
     #[test]
     fn a_failed_dry_activation_is_no_plan() {
@@ -1091,6 +1468,76 @@ mod tests {
         let b = r.id_for("/nix/store/b");
         assert_eq!(r.id_for("/nix/store/a"), a);
         assert!(b > a);
+    }
+
+    /// A manually selected EFI default wins over loader.conf; the profile
+    /// link alone is therefore not evidence of the next automatic boot.
+    #[test]
+    fn boot_default_evidence_includes_persistent_efi_selection() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = dir.path().join("profiles");
+        let efivars = dir.path().join("efivars");
+        let loader = dir.path().join("loader.conf");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::create_dir_all(&efivars).unwrap();
+        std::fs::create_dir(dir.path().join("entries")).unwrap();
+        std::fs::write(dir.path().join("entries/nixos-generation-1.conf"), "test G1").unwrap();
+        std::fs::write(dir.path().join("entries/nixos-generation-2.conf"), "test G2").unwrap();
+        let g1path = dir.path().join("g1");
+        let g2path = dir.path().join("g2");
+        std::fs::create_dir(&g1path).unwrap();
+        std::fs::create_dir(&g2path).unwrap();
+        symlink(&g1path, profiles.join("system-1-link")).unwrap();
+        symlink(&g2path, profiles.join("system-2-link")).unwrap();
+        symlink("system-2-link", profiles.join("system")).unwrap();
+        let backend = Nixos::new(Paths {
+            state: dir.path().join("state"),
+            profile: profiles.join("system"),
+            ..Default::default()
+        });
+        std::fs::create_dir_all(&backend.paths.state).unwrap();
+        let g1 = backend.id_of_link(&profiles.join("system-1-link")).unwrap();
+        let g2 = backend.id_of_link(&profiles.join("system-2-link")).unwrap();
+        std::fs::write(&loader, "timeout 0\ndefault nixos-generation-2.conf\n").unwrap();
+        assert_eq!(backend.systemd_boot_default(&loader, &efivars), Ok(g2));
+        std::fs::remove_file(dir.path().join("entries/nixos-generation-2.conf")).unwrap();
+        assert!(
+            backend.systemd_boot_default(&loader, &efivars).is_err(),
+            "profile links cannot invent an installed entry"
+        );
+        std::fs::write(dir.path().join("entries/nixos-generation-2.conf"), "test G2").unwrap();
+        let variable = efivars.join("LoaderEntryDefault-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f");
+        let encode = |name: &str| {
+            let mut bytes = vec![7, 0, 0, 0];
+            for word in name.encode_utf16().chain([0]) {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            bytes
+        };
+        std::fs::write(&variable, encode("nixos-generation-1.conf")).unwrap();
+        assert_eq!(backend.systemd_boot_default(&loader, &efivars), Ok(g1));
+        for unknown in [
+            "@saved",
+            "nixos-generation-0.conf",
+            "nixos-generation-+1.conf",
+            "nixos-generation-01.conf",
+            "nixos-generation-999.conf",
+            "third-party.conf",
+            "nixos-generation-1.conf\0trailing",
+        ] {
+            std::fs::write(&variable, encode(unknown)).unwrap();
+            assert!(backend.systemd_boot_default(&loader, &efivars).is_err(), "{unknown:?}");
+        }
+        std::fs::write(&variable, [7, 0, 0, 0, 65]).unwrap();
+        assert!(backend.systemd_boot_default(&loader, &efivars).is_err());
+        let mut unterminated = encode("nixos-generation-1.conf");
+        unterminated.truncate(unterminated.len() - 2);
+        std::fs::write(&variable, unterminated).unwrap();
+        assert!(backend.systemd_boot_default(&loader, &efivars).is_err());
+        std::fs::remove_file(&variable).unwrap();
+        std::fs::write(&loader, "default nixos-generation-1.conf\ndefault nixos-generation-2.conf\n").unwrap();
+        assert!(backend.systemd_boot_default(&loader, &efivars).is_err());
     }
 
     #[test]
@@ -1190,5 +1637,27 @@ mod tests {
         std::fs::write(owner.join("configuration.nix"), "{ }\n# edited by the gym\n").unwrap();
         git(&["add", "configuration.nix"]);
         assert_ne!(n.source_hash(&src).unwrap(), s.base_source, "tracked edit → stale");
+    }
+    #[test]
+    fn discovery_checks_real_command_exit_timeout_and_protocol() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let script = bin.join("switch-to-configuration");
+        for body in [
+            "echo 'would activate the configuration...'; exit 7",
+            "sleep 5",
+            "echo 'would restart the following units: sshd.service'",
+            "echo 'would activate the configuration...'; echo 'would restart the following units: '",
+            "echo 'would activate the configuration...'; echo 'would restart systemd'",
+        ] {
+            std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(discover_activation(dir.path(), Duration::from_millis(50)).is_err(), "{body}");
+        }
+        std::fs::write(&script, "#!/bin/sh\necho 'would activate the configuration...'\necho 'would restart the following units: sshd.service'\n").unwrap();
+        let plan = discover_activation(dir.path(), Duration::from_secs(1)).unwrap();
+        assert!(plan.restart.contains(&UnitId::service("sshd")));
     }
 }

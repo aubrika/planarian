@@ -88,7 +88,8 @@ pub enum Transition {
         path: String,
         value: Value,
     },
-    /// Leave-alone only; does not stop anything.
+    /// LeaveAlone records intent only; Stopped records intent and stops the
+    /// unit with the same affected-unit and disruption floors as StopUnit.
     SetOverride(Override),
     LiftOverride(UnitId),
     /// The user's "stop X": suppression journaled, then stop.

@@ -509,3 +509,506 @@ fn journal_full_mid_transaction_writes_the_sentinel() {
     }
     assert!(seen > 0, "no capacity filled the journal mid-transaction");
 }
+
+/// Publication must be durably recoverable before any boot selection effect,
+/// including an accepted call whose acknowledgment and reply were lost.
+#[test]
+fn boot_publication_crash_boundaries_remain_tracked_for_both_owners() {
+    for watchdog in [false, true] {
+        for point in [
+            CrashPoint::State("Built"),
+            CrashPoint::State("PublishingBoot"),
+            CrashPoint::OpBegun("publish_boot_once"),
+            CrashPoint::OpCalled("publish_boot_once"),
+            CrashPoint::OpAcked("publish_boot_once"),
+            CrashPoint::State("AwaitingBoot"),
+        ] {
+            let rig = Rig::new();
+            let mut daemon = rig.daemon();
+            let id = daemon.prepare(good_change()).unwrap();
+            daemon.crash_at = Some(point.clone());
+            lost_or_crashed(daemon.run_boot_only(id));
+            rig.kill(DAEMON);
+            let mut owner = if watchdog { rig.watchdog() } else { rig.daemon2() };
+            let before = owner.journal.sync_ledger().unwrap().live[&id].txn.clone();
+            if before.state == TxnState::PublishingBoot {
+                assert!(owner.watchdog_should_take_over(&before));
+            }
+            let end = owner.recover(id, before.lease.epoch).unwrap();
+            let published =
+                matches!(point, CrashPoint::OpCalled(_) | CrashPoint::OpAcked(_) | CrashPoint::State("AwaitingBoot"));
+            if published {
+                assert_eq!(end, TxnState::AwaitingBoot, "{point:?}, watchdog={watchdog}");
+                let live = &owner.journal.ledger().live[&id].txn;
+                assert_eq!(live.candidate.as_ref().unwrap().0, G2);
+                assert_eq!(live.revert_to, G1);
+                assert_eq!(rig.w().one_shot, Some(G2));
+                assert!(rig.w().gc_roots.contains(live.gc_root.as_ref().unwrap()));
+            } else {
+                assert!(matches!(end, TxnState::Reverted | TxnState::Rejected(_)), "{end:?}");
+                assert_eq!(rig.w().one_shot, None);
+            }
+            assert_eq!(rig.w().boot_default, G1);
+            assert_eq!(rig.w().override_hash, base_override());
+            assert_eq!(rig.w().current, G1, "publishing never live-activates");
+        }
+    }
+}
+
+#[test]
+fn partial_unknown_and_failed_boot_publication_reconcile_actual_effects() {
+    for reply in [
+        Outcome::Partial("selection written but metadata incomplete".into()),
+        Outcome::Unknown("accepted, reply lost".into()),
+        Outcome::Failed("error returned after selection".into()),
+    ] {
+        let rig = Rig::new();
+        rig.w().boot_once_reply = Some(reply);
+        let mut daemon = rig.daemon();
+        let id = daemon.prepare(good_change()).unwrap();
+        assert_eq!(daemon.run_boot_only(id).unwrap(), TxnState::AwaitingBoot);
+        assert_eq!(rig.w().one_shot, Some(G2));
+        assert!(daemon.journal.ledger().live.contains_key(&id));
+    }
+    let rig = Rig::new();
+    rig.w().fail_publish = true;
+    let mut daemon = rig.daemon();
+    let id = daemon.prepare(good_change()).unwrap();
+    assert_eq!(daemon.run_boot_only(id).unwrap(), TxnState::Reverted);
+    assert_eq!(rig.w().one_shot, None);
+}
+
+#[test]
+fn unknown_boot_selection_interlocks_and_keeps_the_candidate_root() {
+    let rig = Rig::new();
+    rig.w().boot_once_reply = Some(Outcome::Unknown("accepted".into()));
+    rig.w().boot_selection_unknown = true;
+    let mut daemon = rig.daemon();
+    let id = daemon.prepare(good_change()).unwrap();
+    assert_eq!(daemon.run_boot_only(id).unwrap(), TxnState::RecoveryFailed);
+    assert!(daemon.journal.ledger().interlocked());
+    assert_eq!(rig.w().one_shot, Some(G2));
+    assert!(rig.w().gc_roots.contains("/nix/var/nix/gcroots/planarian/builds/cand"));
+}
+
+/// No bootloader reply may turn a possibly running candidate into an
+/// untracked Reverted transaction. These are evidence failures, not proof
+/// that publication or boot did not happen.
+#[test]
+fn unknown_boot_identity_or_unrelated_selection_preserves_the_obligation() {
+    for watchdog in [false, true] {
+        for publishing in [false, true] {
+            for unknown_identity in [false, true] {
+                let rig = Rig::new();
+                let mut daemon = rig.daemon();
+                let id = daemon.prepare(good_change()).unwrap();
+                if publishing {
+                    daemon.crash_at = Some(CrashPoint::OpCalled("publish_boot_once"));
+                    lost_or_crashed(daemon.run_boot_only(id));
+                } else {
+                    assert_eq!(daemon.run_boot_only(id).unwrap(), TxnState::AwaitingBoot);
+                }
+                {
+                    let mut w = rig.w();
+                    // The candidate may already have booted while the daemon
+                    // was gone; a missing identity must never be read as G1.
+                    w.current = G2;
+                    w.last_booted = Some(G2);
+                    w.one_shot = if unknown_identity { None } else { Some(GenerationId(3)) };
+                    w.boot_identity_unknown = unknown_identity;
+                }
+                rig.kill(DAEMON);
+                let mut owner = if watchdog { rig.watchdog() } else { rig.daemon2() };
+                assert_eq!(owner.recover(id, 1).unwrap(), TxnState::RecoveryFailed);
+                assert!(owner.journal.ledger().interlocked());
+                let w = rig.w();
+                assert_eq!(w.current, G2);
+                assert_eq!(w.boot_default, G1);
+                assert!(w.gc_roots.contains("/nix/var/nix/gcroots/planarian/builds/cand"));
+                assert!(w.calls.iter().all(|c| c.call != "withdraw_boot_once"));
+            }
+        }
+    }
+}
+
+#[test]
+fn interrupted_withdrawal_never_claims_the_boot_candidate_untracked() {
+    let rig = Rig::new();
+    let mut daemon = rig.daemon();
+    let id = daemon.prepare(good_change()).unwrap();
+    daemon.crash_at = Some(CrashPoint::State("PublishingBoot"));
+    lost_or_crashed(daemon.run_boot_only(id));
+    rig.kill(DAEMON);
+    rig.w().fail_withdraw = true;
+    let mut watchdog = rig.watchdog();
+    assert_eq!(watchdog.recover(id, 1).unwrap(), TxnState::RecoveryFailed);
+    assert!(watchdog.journal.ledger().interlocked());
+    assert!(!rig.w().gc_roots.is_empty());
+}
+
+#[test]
+fn withdrawal_effects_with_failed_partial_or_lost_replies_remain_interlocked() {
+    for watchdog in [false, true] {
+        for reply in [
+            Outcome::Failed("reply lost after withdrawal".into()),
+            Outcome::Partial("selection cleared before partial reply".into()),
+            Outcome::Unknown("accepted withdrawal without acknowledgment".into()),
+        ] {
+            let rig = Rig::new();
+            let mut daemon = rig.daemon();
+            let id = daemon.prepare(good_change()).unwrap();
+            assert_eq!(daemon.run_boot_only(id).unwrap(), TxnState::AwaitingBoot);
+            {
+                let mut w = rig.w();
+                w.one_shot = None;
+                w.boot_default = G2;
+                // The publishing generation booted; the stale default is
+                // what withdrawal must repair, not evidence of admission.
+                w.last_booted = Some(G1);
+                w.withdraw_reply = Some(reply.clone());
+            }
+            rig.kill(DAEMON);
+            let mut owner = if watchdog { rig.watchdog() } else { rig.daemon2() };
+            assert_eq!(owner.recover(id, 1).unwrap(), TxnState::RecoveryFailed);
+            let w = rig.w();
+            assert_eq!(w.boot_default, G1, "the withdrawal actually landed despite its reply");
+            assert_eq!(w.one_shot, None);
+            assert!(!w.gc_roots.is_empty());
+            assert!(owner.journal.ledger().interlocked());
+            assert!(
+                owner.journal.ledger().operations(id).unwrap().iter().any(|operation| {
+                    operation.call == "withdraw_boot_once" && operation.ack.as_ref() == Some(&reply)
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn every_generation_completion_establishes_the_same_floor() {
+    for boot_only in [false, true] {
+        for watchdog in [false, true] {
+            let rig = Rig::new();
+            let mut txn = good_change();
+            txn.check.required_floor = Some(G2);
+            txn.check.floor_fixes = vec!["inspected-package-fix".into()];
+            let mut daemon = rig.daemon();
+            let id = daemon.prepare(txn).unwrap();
+            if boot_only {
+                assert_eq!(daemon.run_boot_only(id).unwrap(), TxnState::AwaitingBoot);
+                {
+                    let mut w = rig.w();
+                    w.one_shot = None;
+                    w.last_booted = Some(G2);
+                    w.current = G2;
+                    w.now = Timestamp(1_000);
+                }
+                if watchdog {
+                    rig.kill(DAEMON);
+                    assert_eq!(rig.watchdog().recover(id, 1).unwrap(), TxnState::Promoted);
+                } else {
+                    assert_eq!(daemon.run(id).unwrap(), TxnState::Promoted);
+                }
+                let pending = planarian_txn::journal::Journal::open(rig.store.clone()).unwrap();
+                assert_eq!(pending.ledger().security_floor, None, "admission does not establish a floor");
+                assert_eq!(pending.ledger().live_tested, None, "boot-only never becomes live-tested");
+                rig.w().now = Timestamp(600_000);
+                assert_eq!(rig.daemon2().confirm_boot(id, true).unwrap(), TxnState::Committed);
+            } else if watchdog {
+                daemon.crash_at = Some(CrashPoint::State("Promoted"));
+                lost_or_crashed(daemon.run(id));
+                rig.kill(DAEMON);
+                assert_eq!(rig.watchdog().recover(id, 1).unwrap(), TxnState::Committed);
+            } else {
+                assert_eq!(daemon.run(id).unwrap(), TxnState::Committed);
+            }
+            let journal = planarian_txn::journal::Journal::open(rig.store.clone()).unwrap();
+            assert_eq!(journal.ledger().security_floor, Some(G2));
+            assert_eq!(journal.ledger().terminal[&id].state, TxnState::Committed);
+            assert_eq!(journal.ledger().live_tested, if boot_only { None } else { Some(G2) });
+            assert_eq!(journal.ledger().known_good, if boot_only { Some(G2) } else { None });
+            assert_eq!(rig.w().gen_overrides.get(&G2), Some(&cand_override()));
+        }
+    }
+}
+
+#[test]
+fn watchdog_admits_boot_completion_only_after_the_publishing_boot() {
+    let rig = Rig::new();
+    let mut txn = good_change();
+    txn.check.required_floor = Some(G2);
+    txn.check.floor_fixes = vec!["inspected-package-fix".into()];
+    let mut daemon = rig.daemon();
+    let id = daemon.prepare(txn).unwrap();
+    assert_eq!(daemon.run_boot_only(id).unwrap(), TxnState::AwaitingBoot);
+    rig.kill(DAEMON);
+    let parked = daemon.journal.ledger().live[&id].txn.clone();
+    assert!(!rig.watchdog().watchdog_should_take_over(&parked), "same-boot parking does not expire");
+    {
+        let mut w = rig.w();
+        w.one_shot = None;
+        w.last_booted = Some(G2);
+        w.current = G2;
+    }
+    let mut watchdog = planarian_txn::kernel::Kernel::new(
+        planarian_txn::journal::Journal::open(rig.store.clone()).unwrap(),
+        rig.host(),
+        OwnerId::Watchdog { pid: WATCHDOG, boot_id: Hash::of(b"the candidate boot") },
+    );
+    assert!(watchdog.watchdog_should_take_over(&parked), "new-boot completion is watchdog-owned if needed");
+    assert_eq!(watchdog.recover(id, 1).unwrap(), TxnState::Promoted);
+    assert_eq!(watchdog.journal.ledger().security_floor, None);
+    assert_eq!(watchdog.journal.ledger().live_tested, None);
+}
+
+#[test]
+fn completion_crashes_and_torn_floor_or_commit_writes_preserve_the_obligation() {
+    for boundary in ["floor-write", "after-floor", "commit-write", "after-commit"] {
+        let rig = Rig::new();
+        let mut daemon = rig.daemon();
+        let mut txn = good_change();
+        txn.check.required_floor = Some(G2);
+        txn.check.floor_fixes = vec!["inspected-package-fix".into()];
+        let id = daemon.prepare(txn).unwrap();
+        match boundary {
+            "floor-write" => rig.store.tear_write_containing("SecurityFloor"),
+            "commit-write" => rig.store.tear_write_containing("Committed"),
+            "after-floor" => daemon.crash_at = Some(CrashPoint::FloorEstablished),
+            "after-commit" => daemon.crash_at = Some(CrashPoint::State("Committed")),
+            _ => unreachable!(),
+        }
+        assert!(daemon.run(id).is_err(), "{boundary}");
+        rig.kill(DAEMON);
+        let mut restarted = rig.daemon2();
+        restarted.reconcile().unwrap();
+        assert_eq!(restarted.journal.ledger().security_floor, Some(G2), "{boundary}");
+        assert_eq!(restarted.journal.ledger().terminal[&id].state, TxnState::Committed, "{boundary}");
+    }
+}
+
+#[test]
+fn completion_never_lowers_an_existing_floor() {
+    let rig = Rig::new();
+    let mut daemon = rig.daemon();
+    daemon.journal.append(Timestamp(1), planarian_txn::ledger::Record::SecurityFloor(Some(GenerationId(3)))).unwrap();
+    let mut txn = good_change();
+    txn.check.required_floor = Some(G2);
+    txn.check.floor_fixes = vec!["inspected-package-fix".into()];
+    let id = daemon.prepare(txn).unwrap();
+    assert_eq!(daemon.run(id).unwrap(), TxnState::Committed);
+    assert_eq!(daemon.journal.ledger().security_floor, Some(GenerationId(3)));
+}
+
+#[test]
+fn historical_completion_without_floor_intent_is_interlocked() {
+    let rig = Rig::new();
+    let mut daemon = rig.daemon();
+    let mut txn = good_change();
+    txn.check.version = 0;
+    txn.check.passing_readiness = None;
+    let id = daemon.prepare(txn).unwrap();
+    assert_eq!(daemon.run(id).unwrap(), TxnState::RecoveryFailed);
+    assert!(daemon.journal.ledger().interlocked());
+}
+
+#[test]
+fn legacy_built_publication_is_taken_over_as_a_mutation_obligation() {
+    let rig = Rig::new();
+    let mut daemon = rig.daemon();
+    let id = daemon.prepare(good_change()).unwrap();
+    daemon.wait_built(id, "old format").unwrap();
+    let op = OpId { txn: id, epoch: 1, seq: 1 };
+    daemon
+        .journal
+        .append(Timestamp(2), planarian_txn::ledger::Record::OpBegin { op, call: "publish_boot_once".into() })
+        .unwrap();
+    assert!(rig.host().publish_boot_once(G2, G1, &op).is_success());
+    rig.kill(DAEMON);
+    let mut watchdog = rig.watchdog();
+    let txn = watchdog.journal.ledger().live[&id].txn.clone();
+    assert!(watchdog.watchdog_should_take_over(&txn));
+    assert_eq!(watchdog.recover(id, 1).unwrap(), TxnState::AwaitingBoot);
+    assert_eq!(rig.w().one_shot, Some(G2));
+}
+
+#[test]
+fn failed_boot_only_generation_uses_floor_eligible_fallback_not_old_known_good() {
+    let rig = Rig::new();
+    let g3 = GenerationId(3);
+    {
+        let mut w = rig.w();
+        w.current = G2;
+        w.boot_default = G2;
+        w.last_booted = Some(G2);
+        w.generations.insert(g3, path(g3));
+    }
+    let mut daemon = rig.daemon();
+    daemon.journal.append(Timestamp(1), planarian_txn::ledger::Record::KnownGood(G1)).unwrap();
+    daemon.journal.append(Timestamp(2), planarian_txn::ledger::Record::SecurityFloor(Some(G2))).unwrap();
+    let mut txn = good_change();
+    txn.base = G2;
+    txn.revert_to = G2;
+    txn.candidate = Some((g3, path(g3)));
+    let id = daemon.prepare(txn).unwrap();
+    assert_eq!(daemon.run_boot_only(id).unwrap(), TxnState::AwaitingBoot);
+    assert_eq!(rig.w().boot_default, G2);
+    rig.w().one_shot = None; // candidate failed; installed loader chose its default
+    rig.kill(DAEMON);
+    let mut watchdog = rig.watchdog();
+    assert_eq!(watchdog.recover(id, 1).unwrap(), TxnState::Reverted);
+    assert_eq!(rig.w().boot_default, G2);
+    assert!(rig.w().boot_entries.contains(&G1), "manual boot-confirmed fallback stays available");
+}
+
+#[test]
+fn no_floor_eligible_automatic_boot_target_refuses_before_publication() {
+    let rig = Rig::new();
+    let mut daemon = rig.daemon();
+    daemon.journal.append(Timestamp(1), planarian_txn::ledger::Record::SecurityFloor(Some(G2))).unwrap();
+    let id = daemon.prepare(good_change()).unwrap();
+    assert!(matches!(daemon.run_boot_only(id).unwrap(), TxnState::Rejected(_)));
+    assert_eq!(rig.w().one_shot, None);
+    assert!(rig.w().calls.is_empty());
+}
+
+#[test]
+fn a_fence_ahead_of_the_journal_blocks_override_and_publication_intents() {
+    use planarian_txn::store::Store;
+    for boot_only in [false, true] {
+        let rig = Rig::new();
+        let mut daemon = rig.daemon();
+        let transaction = if boot_only {
+            good_change()
+        } else {
+            txn(
+                Transition::StopAndSuppress { unit: web(), until: Until::Explicit, reason: "maintenance".into() },
+                Actor::user(ADMIN),
+            )
+        };
+        let id = daemon.prepare(transaction).unwrap();
+        let before = daemon.journal.ledger().clone();
+        // Another owner fenced us but died before appending Takeover.
+        rig.store.set_fence(id, 2).unwrap();
+        let result = if boot_only { daemon.run_boot_only(id) } else { daemon.run(id) };
+        assert!(matches!(result, Err(KernelError::LostLease(t)) if t == id));
+        assert_eq!(daemon.journal.sync_ledger().unwrap(), &before);
+        assert!(rig.w().calls.is_empty());
+        assert_eq!(rig.w().one_shot, None);
+    }
+}
+
+#[test]
+fn watchdog_recovers_a_physically_fenced_owner_even_if_its_pid_is_alive() {
+    use planarian_txn::store::Store;
+    let rig = Rig::new();
+    let mut daemon = rig.daemon();
+    let mut transaction = good_change();
+    transaction.check.required_floor = Some(G2);
+    transaction.check.floor_fixes = vec!["inspected-fix".into()];
+    let id = daemon.prepare(transaction).unwrap();
+    daemon.crash_at = Some(CrashPoint::State("Promoted"));
+    lost_or_crashed(daemon.run(id));
+    // The process remains alive and its ledger lease is recent, but the
+    // physical fence establishes that it can no longer mutate or complete.
+    rig.store.set_fence(id, 2).unwrap();
+    let mut watchdog = rig.watchdog();
+    let transaction = watchdog.journal.ledger().live[&id].txn.clone();
+    assert!(watchdog.watchdog_should_take_over(&transaction));
+    assert_eq!(watchdog.recover(id, 1).unwrap(), TxnState::Committed);
+    assert_eq!(watchdog.journal.ledger().terminal[&id].epoch, 3);
+    assert_eq!(watchdog.journal.ledger().security_floor, Some(G2));
+}
+
+#[test]
+fn intentional_boot_parking_has_no_forced_reboot_or_untracked_cancellation() {
+    let rig = Rig::new();
+    let mut daemon = rig.daemon();
+    let id = daemon.prepare(good_change()).unwrap();
+    assert_eq!(daemon.run_boot_only(id).unwrap(), TxnState::AwaitingBoot);
+    rig.w().now = Timestamp(30 * 24 * 3600 * 1000);
+    let parked = daemon.journal.ledger().live[&id].txn.clone();
+    assert!(!rig.watchdog().watchdog_should_take_over(&parked), "parking waits for an operator-selected reboot");
+    assert_eq!(daemon.run(id).unwrap(), TxnState::AwaitingBoot);
+    assert!(
+        daemon.cancel(id, Actor::user(ADMIN)).is_err(),
+        "generic pre-mutation cancellation cannot withdraw a published candidate"
+    );
+    assert_eq!(state_of(&mut daemon, id), TxnState::AwaitingBoot);
+    assert_eq!(rig.w().one_shot, Some(G2));
+    assert!(rig.w().calls.iter().all(|c| !c.call.starts_with("activate_live")));
+    assert!(!rig.w().gc_roots.is_empty());
+}
+
+fn admitted_boot(rig: &Rig) -> (K, TxnId) {
+    let mut daemon = rig.daemon();
+    daemon.journal.append(Timestamp(1), planarian_txn::ledger::Record::KnownGood(G1)).unwrap();
+    let mut transaction = good_change();
+    transaction.check.required_floor = Some(G2);
+    transaction.check.floor_fixes = vec!["inspected-package-fix".into()];
+    let id = daemon.prepare(transaction).unwrap();
+    assert_eq!(daemon.run_boot_only(id).unwrap(), TxnState::AwaitingBoot);
+    {
+        let mut w = rig.w();
+        w.one_shot = None;
+        w.last_booted = Some(G2);
+        w.current = G2;
+        w.now = Timestamp(1_000);
+    }
+    assert_eq!(daemon.run(id).unwrap(), TxnState::Promoted);
+    (daemon, id)
+}
+
+#[test]
+fn watchdog_does_not_supply_the_daemons_boot_confirmation_checkpoint() {
+    let rig = Rig::new();
+    let (_, id) = admitted_boot(&rig);
+    rig.w().now = Timestamp(600_000);
+    let mut watchdog = rig.watchdog();
+    let before = watchdog.journal.ledger().clone();
+    assert_eq!(watchdog.confirm_boot(id, true).unwrap(), TxnState::Promoted);
+    assert_eq!(watchdog.journal.sync_ledger().unwrap(), &before);
+    assert_eq!(watchdog.journal.ledger().known_good, Some(G1));
+    assert_eq!(watchdog.journal.ledger().security_floor, None);
+}
+
+#[test]
+fn boot_completion_requires_durable_generation_override_metadata_before_bookkeeping() {
+    let rig = Rig::new();
+    let (mut daemon, id) = admitted_boot(&rig);
+    rig.w().now = Timestamp(600_000);
+    rig.w().fail_record_override = true;
+    assert!(matches!(daemon.confirm_boot(id, true), Err(KernelError::Completion(_))));
+    assert_eq!(state_of(&mut daemon, id), TxnState::Promoted);
+    assert_eq!(daemon.journal.ledger().known_good, Some(G1));
+    assert_eq!(daemon.journal.ledger().live_tested, None);
+    assert_eq!(daemon.journal.ledger().security_floor, None);
+    rig.w().fail_record_override = false;
+    assert_eq!(daemon.confirm_boot(id, true).unwrap(), TxnState::Committed);
+    assert_eq!(daemon.journal.ledger().known_good, Some(G2));
+    assert_eq!(daemon.journal.ledger().security_floor, Some(G2));
+    assert_eq!(rig.w().gen_overrides.get(&G2), Some(&cand_override()));
+}
+
+#[test]
+fn an_unsupported_boot_admission_never_implies_confirmation() {
+    use planarian_txn::ledger::{BootAdmission, Record};
+    let rig = Rig::new();
+    let (mut daemon, id) = admitted_boot(&rig);
+    daemon
+        .journal
+        .append(
+            Timestamp(2),
+            Record::BootAdmitted {
+                txn: id,
+                epoch: 1,
+                admission: BootAdmission { version: 0, boot_id: Hash::ZERO, boot_at: Timestamp(1_000) },
+            },
+        )
+        .unwrap();
+    rig.w().now = Timestamp(600_000);
+    assert_eq!(daemon.confirm_boot(id, true).unwrap(), TxnState::RecoveryFailed);
+    assert!(daemon.journal.ledger().interlocked());
+    assert_eq!(daemon.journal.ledger().known_good, Some(G1));
+    assert_eq!(daemon.journal.ledger().security_floor, None);
+    assert_eq!(daemon.journal.ledger().live_tested, None);
+}

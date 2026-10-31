@@ -102,11 +102,9 @@ impl<B: Backends> ExecHost<B> {
                 }
             }
         }
-        // Executor-owned (§9): every unit that is desired-present under these
-        // defs and was Running before is Running now. This covers both "no
-        // unit outside may_change leaves Running" and "no applicable Readiness
-        // probe that passed before fails after" (Running needs every applicable
-        // Readiness probe passing, I4).
+        out.extend(preservation_violations(&txn.check, txn.started, phase, s, defs));
+        // Preserve aggregate Running separately from individual probe evidence:
+        // an already Degraded/Unknown unit can still have required passing probes.
         for (u, before) in &txn.check.pre {
             if *before != UnitStatus::Running || !defs.contains_key(u) || !s.expected(u, defs) {
                 continue;
@@ -193,6 +191,24 @@ impl<B: Backends> Host for ExecHost<B> {
         }
     }
 
+    fn check_boot_confirmation(&self, txn: &Transaction) -> Verdict {
+        let manifest = txn.check.candidate.as_ref().unwrap_or(&txn.check.base);
+        let (s, defs) = self.observe(manifest);
+        if txn.candidate.as_ref().is_none_or(|(g, _)| *g != s.generation) {
+            return Verdict::Fail("the admitted generation is no longer running".into());
+        }
+        let failed: Vec<String> = defs
+            .iter()
+            .filter_map(|(id, def)| {
+                let canonical =
+                    def.probes.iter().any(|p| p.origin == ProbeOrigin::Canonical && p.role == ProbeRole::Readiness);
+                (canonical && s.expected(id, &defs) && s.status(id, &defs) != UnitStatus::Running)
+                    .then(|| format!("{id}: canonical readiness did not pass"))
+            })
+            .collect();
+        if failed.is_empty() { Verdict::Pass } else { Verdict::Fail(failed.join("; ")) }
+    }
+
     fn release_gc_root(&self, path: &str) -> bool {
         self.b.generations().release_root(path)
     }
@@ -241,4 +257,181 @@ pub fn changed_units(a: &Manifest, b: &Manifest) -> BTreeSet<UnitId> {
         }
     }
     out
+}
+
+/// Capture the independently passing applicable probes before policy-approved
+/// activation. This evidence is stored in Prepared, so recovery has the same
+/// obligation even if the daemon and its volatile state are gone.
+pub fn passing_readiness(state: &SystemState, defs: &UnitDefs) -> Vec<(UnitId, ProbeDef)> {
+    let mut passed = Vec::new();
+    for (unit, def) in defs {
+        if !state.expected(unit, defs) {
+            continue;
+        }
+        let Some((_, evidence)) = state.units.get(unit) else { continue };
+        for probe in def.probes.iter().filter(|p| p.role == ProbeRole::Readiness) {
+            let latest = evidence.iter().filter(|e| e.probe == probe.id).max_by_key(|e| e.at);
+            if latest.is_some_and(|e| {
+                e.at <= state.observed_at && e.fresh_at(state.observed_at) && e.result == ProbeResult::Pass
+            }) {
+                passed.push((unit.clone(), probe.clone()));
+            }
+        }
+    }
+    passed
+}
+
+fn preservation_violations(
+    check: &CheckContext,
+    started: Timestamp,
+    phase: CheckPhase,
+    state: &SystemState,
+    defs: &UnitDefs,
+) -> Vec<String> {
+    if check.version != CHECK_CONTEXT_VERSION {
+        return vec!["individual pre-change probe evidence unavailable in historical/unsupported check context".into()];
+    }
+    let Some(passing) = &check.passing_readiness else {
+        return vec!["individual pre-change probe evidence unavailable".into()];
+    };
+    let mut out = Vec::new();
+    for (unit, before) in passing {
+        // Desired-state changes may remove applicability. Definition weakening
+        // cannot manufacture a pass: an applicable preserved probe must still
+        // have the same definition and fresh, newly observed passing evidence.
+        if !state.expected(unit, defs) {
+            continue;
+        }
+        if !defs.get(unit).is_some_and(|d| d.probes.iter().any(|p| p == before)) {
+            out.push(format!("{unit}: previously passing Readiness probe {} changed or disappeared", before.id.0));
+            continue;
+        }
+        let latest =
+            state.units.get(unit).and_then(|(_, ev)| ev.iter().filter(|e| e.probe == before.id).max_by_key(|e| e.at));
+        let fresh =
+            latest.is_some_and(|e| e.at >= started && e.at <= state.observed_at && e.fresh_at(state.observed_at));
+        // §12c: rollback cannot cure unrelated filesystem fullness. Preserve
+        // the existing revert-only exception for a newly observed FreeSpace
+        // failure; missing/Unknown evidence and every other probe still fail.
+        if phase == CheckPhase::Revert
+            && matches!(before.kind, ProbeKind::FreeSpace { .. })
+            && fresh
+            && latest.is_some_and(|e| matches!(&e.result, ProbeResult::Fail(_)))
+        {
+            continue;
+        }
+        if !fresh || !latest.is_some_and(|e| e.result == ProbeResult::Pass) {
+            out.push(format!(
+                "{unit}: previously passing Readiness probe {} has no fresh post-change pass",
+                before.id.0
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod preservation_tests {
+    use super::*;
+    use planarian_schema::fixtures;
+
+    fn candidate_violations(
+        check: &CheckContext,
+        started: Timestamp,
+        state: &SystemState,
+        defs: &UnitDefs,
+    ) -> Vec<String> {
+        preservation_violations(check, started, CheckPhase::Candidate, state, defs)
+    }
+
+    fn baseline(a: ProbeResult) -> (CheckContext, SystemState, UnitDefs, UnitId) {
+        let mut d = fixtures::service("mixed");
+        d.probes = vec![fixtures::readiness("A"), fixtures::readiness("B")];
+        let unit = d.id.clone();
+        let defs = fixtures::defs([d]);
+        let mut state = fixtures::empty_state(1000);
+        fixtures::observe(&mut state, &defs, &unit, Observed::Active, ProbeResult::Pass);
+        state.units.get_mut(&unit).unwrap().1[0].result = a;
+        let check = CheckContext { passing_readiness: Some(passing_readiness(&state, &defs)), ..Default::default() };
+        (check, state, defs, unit)
+    }
+
+    #[test]
+    fn mixed_baselines_preserve_each_passing_probe_through_replay() {
+        for a in [ProbeResult::Fail("A down".into()), ProbeResult::Timeout, ProbeResult::Error("A unknown".into())] {
+            let (check, mut state, defs, unit) = baseline(a);
+            assert_eq!(check.passing_readiness.as_ref().unwrap().len(), 1);
+            // The exact context reconstructed from Prepared/checkpoint must
+            // carry the obligation used by daemon and watchdog checking alike.
+            let restored: CheckContext = serde_json::from_slice(&serde_json::to_vec(&check).unwrap()).unwrap();
+            assert!(candidate_violations(&restored, Timestamp(1000), &state, &defs).is_empty());
+            state.units.get_mut(&unit).unwrap().1[1].result = ProbeResult::Fail("B regressed".into());
+            assert_eq!(candidate_violations(&restored, Timestamp(1000), &state, &defs).len(), 1);
+        }
+    }
+
+    #[test]
+    fn missing_stale_timeout_error_and_old_pass_are_not_preservation_evidence() {
+        let (check, state, defs, unit) = baseline(ProbeResult::Fail("A".into()));
+        for result in [ProbeResult::Timeout, ProbeResult::Error("lost".into())] {
+            let mut after = state.clone();
+            after.units.get_mut(&unit).unwrap().1[1].result = result;
+            assert!(!candidate_violations(&check, Timestamp(1000), &after, &defs).is_empty());
+        }
+        let mut missing = state.clone();
+        missing.units.get_mut(&unit).unwrap().1.pop();
+        assert!(!candidate_violations(&check, Timestamp(1000), &missing, &defs).is_empty());
+        let mut stale = state.clone();
+        stale.observed_at = Timestamp(100_000);
+        assert!(!candidate_violations(&check, Timestamp(1000), &stale, &defs).is_empty());
+        assert!(!candidate_violations(&check, Timestamp(1001), &state, &defs).is_empty());
+    }
+
+    #[test]
+    fn authorized_removal_changes_applicability_but_probe_removal_does_not() {
+        let (check, state, mut defs, unit) = baseline(ProbeResult::Fail("A".into()));
+        defs.get_mut(&unit).unwrap().probes.pop();
+        assert!(!candidate_violations(&check, Timestamp(1000), &state, &defs).is_empty());
+        defs.remove(&unit);
+        assert!(candidate_violations(&check, Timestamp(1000), &state, &defs).is_empty());
+    }
+
+    #[test]
+    fn only_fresh_filesystem_failure_is_exempt_during_revert() {
+        let (_, mut state, mut defs, unit) = baseline(ProbeResult::Pass);
+        defs.get_mut(&unit).unwrap().probes[0].kind = ProbeKind::FreeSpace {
+            path: "/boot".into(),
+            min_bytes: 1,
+            min_permille: 1,
+        };
+        let check = CheckContext { passing_readiness: Some(passing_readiness(&state, &defs)), ..Default::default() };
+        let errors = |phase, state: &SystemState| preservation_violations(&check, Timestamp(1000), phase, state, &defs);
+        state.units.get_mut(&unit).unwrap().1[0].result = ProbeResult::Fail("disk full".into());
+        assert!(!errors(CheckPhase::Candidate, &state).is_empty());
+        assert!(errors(CheckPhase::Revert, &state).is_empty());
+        // The storage exception cannot hide a second, unrelated regression.
+        state.units.get_mut(&unit).unwrap().1[1].result = ProbeResult::Fail("B regressed".into());
+        assert!(!errors(CheckPhase::Revert, &state).is_empty());
+        state.units.get_mut(&unit).unwrap().1[1].result = ProbeResult::Pass;
+        for result in [ProbeResult::Timeout, ProbeResult::Error("unavailable".into())] {
+            state.units.get_mut(&unit).unwrap().1[0].result = result;
+            assert!(!errors(CheckPhase::Revert, &state).is_empty());
+        }
+        state.units.get_mut(&unit).unwrap().1[0].result = ProbeResult::Fail("disk full".into());
+        state.observed_at = Timestamp(100_000);
+        assert!(!errors(CheckPhase::Revert, &state).is_empty());
+        state.observed_at = Timestamp(1000);
+        state.units.get_mut(&unit).unwrap().1.remove(0);
+        assert!(!errors(CheckPhase::Revert, &state).is_empty());
+    }
+
+    #[test]
+    fn old_context_does_not_invent_an_empty_probe_obligation() {
+        let old = r#"{"candidate":null,"base":{"units":{},"user_units":[]},"pre":{}}"#;
+        let ctx: CheckContext = serde_json::from_str(old).unwrap();
+        assert_eq!(ctx.version, 0);
+        assert!(ctx.passing_readiness.is_none());
+        assert_eq!(serde_json::to_string(&ctx).unwrap(), old);
+        assert!(!candidate_violations(&ctx, Timestamp(0), &fixtures::empty_state(0), &UnitDefs::new()).is_empty());
+    }
 }

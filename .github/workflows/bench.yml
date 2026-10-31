@@ -1,8 +1,8 @@
-name: Invisibility budget
+name: Headless invisibility subset
 
-# SPEC §21 (catalog quiet-reference-workload): the idle budget and the
-# reference game's frame times with Planarian stopped, idle and busy. On
-# demand and weekly: it downloads Xonotic (about 1 GB) and runs for a while.
+# SPEC §21: complete selected-service cgroup idle costs and actual frame
+# samples from Xonotic/llvmpipe. This cannot certify personal-profile GA or
+# the still-required external HID/optical input-to-display measurements.
 on:
   workflow_dispatch:
   schedule:
@@ -14,6 +14,8 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
+      - name: Performance-evidence negative regressions
+        run: python3 nix/gym/test_performance.py
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -24,10 +26,12 @@ jobs:
       - run: nix build -L .#legacyPackages.x86_64-linux.bench.invisibility -o bench
       - name: Report
         if: always()
-        run: cat bench/report.json || true
+        run: cat bench/report.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: invisibility-report
-          path: bench/report.json
-          if-no-files-found: ignore
+          name: headless-invisibility-evidence
+          path: |
+            bench/report.json
+            bench/raw.tar.gz
+          if-no-files-found: error

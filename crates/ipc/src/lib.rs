@@ -5,7 +5,7 @@
 //! daemon takes it from `SO_PEERCRED` (§11).
 
 use planarian_schema::{
-    ChangeId, DerivedFacts, EdgeKind, GenerationId, Hash, Incident, IncidentState, OverrideDesired, ProbeId,
+    ChangeId, DerivedFacts, EdgeKind, GenerationId, Hash, Incident, IncidentState, Outcome, OverrideDesired, ProbeId,
     Resolution, Timestamp, Transition, TxnId, TxnState, UnitId, UnitStatus, Until, Value,
 };
 use serde::{Deserialize, Serialize};
@@ -254,6 +254,17 @@ pub struct Choice {
     pub confidence: u16,
 }
 
+/// Additive completion evidence version 1. A missing legacy payload carries
+/// no acknowledgment/expectation/health evidence. Immediate responses leave
+/// post-observation fields None; the ordinary state collection fills the log.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionEvidence {
+    pub format: u32,
+    pub operation: Outcome,
+    pub expectation: Option<Outcome>,
+    pub post_status: Option<BTreeMap<UnitId, UnitStatus>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Response {
@@ -265,11 +276,14 @@ pub enum Response {
     Incidents {
         incidents: Vec<Incident>,
     },
-    /// A transaction ran to a terminal state.
+    /// Transaction lifecycle (which may be parked awaiting a window/boot).
+    /// Committed alone does not assert backend success or resulting health.
     Done {
         txn: TxnId,
         state: TxnState,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<ExecutionEvidence>,
     },
     /// AskFirst: waiting for `planarian approve <approve>` (as root).
     NeedsApproval {
@@ -329,5 +343,41 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
         let a = Request::Ask { phrase: "restart wifi".into(), choice: None };
         assert_eq!(serde_json::from_str::<Request>(&a.encode()).unwrap(), a);
+    }
+
+    #[test]
+    fn completion_evidence_keeps_legacy_and_unknown_formats_explicit() {
+        let legacy = r#"{"kind":"done","txn":1,"state":"Committed","message":"done"}"#;
+        let response: Response = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(&response, Response::Done { evidence: None, .. }));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response.encode()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(legacy).unwrap()
+        );
+        let mut new: serde_json::Value = serde_json::from_str(legacy).unwrap();
+        new["evidence"] = serde_json::json!({
+            "format": 1, "operation": {"Failed": "backend refused"},
+            "expectation": null, "post_status": null,
+        });
+        let response: Response = serde_json::from_value(new.clone()).unwrap();
+        assert!(matches!(
+            response,
+            Response::Done {
+                evidence: Some(ExecutionEvidence {
+                    format: 1,
+                    operation: Outcome::Failed(_),
+                    expectation: None,
+                    post_status: None
+                }),
+                ..
+            }
+        ));
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "kebab-case")]
+        enum LegacyResponse {
+            Done { state: TxnState },
+        }
+        let LegacyResponse::Done { state } = serde_json::from_value::<LegacyResponse>(new).unwrap();
+        assert_eq!(state, TxnState::Committed, "old consumers can only read lifecycle");
     }
 }
