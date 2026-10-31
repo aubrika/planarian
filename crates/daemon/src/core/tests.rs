@@ -911,3 +911,81 @@ fn agents_per_uid_are_limited() {
         Observed::Failed(planarian_schema::Reason::ExitCode(0));
     assert!(matches!(run(&mut r, ALICE, "three"), Response::Ok { .. }), "a stopped agent frees its slot");
 }
+
+/// P7 (§12a): a write-back issued while a generation transaction is active
+/// (here one waiting in Built while Foreground holds) is queued, not
+/// refused; it is submitted, with the same caller, once that transaction is
+/// terminal, and commits. Nothing says it failed.
+#[test]
+fn a_write_back_queues_behind_a_generation_transaction() {
+    let mut r = Rig::new();
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: Timestamp(0),
+        active: true,
+        idle: false,
+    });
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    let mut args = BTreeMap::new();
+    args.insert("scale".to_string(), Value::Str("1.25".into()));
+    let resp = r.core.handle(ALICE.in_session("s1"), Request::Apply { change: ChangeId("font-scale".into()), args });
+    assert!(matches!(resp, Response::Done { state: TxnState::Built, .. }), "{resp:?}");
+
+    let authz = r.core.authz(&ALICE.in_session("s1"));
+    let (s, defs) = r.core.observe();
+    let t = Transition::SetRuntimeOption { path: "font.scale".into(), value: Value::Str("1.5".into()) };
+    let p = r.core.proposal(t, &s, &defs, Source::User, "bigger".into());
+    let res = r.core.submit(p, authz, &s, &defs);
+    assert!(matches!(res, Submitted::Finished { state: TxnState::Committed, .. }), "{res:?}");
+    assert_eq!(r.core.writebacks.len(), 1, "queued behind the waiting generation");
+
+    r.fake.w().foreground.clear();
+    r.ticks(6);
+    assert!(r.core.writebacks.is_empty());
+    let l = r.core.ledger();
+    assert!(!l.live.values().any(|t| t.txn.transition.changes_generation()));
+    let applied: Vec<_> = l
+        .terminal
+        .values()
+        .filter(|t| matches!(t.transition, Transition::ApplyChange { .. }))
+        .map(|t| t.state.clone())
+        .collect();
+    assert_eq!(applied, vec![TxnState::Committed, TxnState::Committed], "the change, then the write-back");
+    assert!(!r.core.notices.iter().any(|n| n.contains("will not survive")), "{:?}", r.core.notices);
+}
+
+/// P8 (§12f): while Foreground holds, a repair the foreground work does not
+/// depend on is deferred in fact: never attempted, no budget or backoff
+/// spent. It runs once quiet mode ends.
+#[test]
+fn a_deferred_repair_is_deferred_in_fact() {
+    let mut r = Rig::new();
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: Timestamp(0),
+        active: true,
+        idle: false,
+    });
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    let web = UnitId::service("gym-web");
+    r.fake.w().signal(&web, 11);
+    r.ticks(30);
+    assert_eq!(r.calls("restart(service:gym-web)"), 0, "deferred while the game runs");
+    let i = r.core.incidents.active_for(&web).expect("an incident is open").clone();
+    assert!(i.attempts.is_empty(), "no budget spent: {:?}", i.attempts);
+
+    r.fake.w().foreground.clear();
+    r.ticks(4);
+    assert_eq!(r.calls("restart(service:gym-web)"), 1);
+    assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
+}

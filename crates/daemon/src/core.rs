@@ -155,6 +155,9 @@ pub struct Core<B: Backends + Clone, S: Store> {
     last: Option<(SystemState, UnitDefs)>,
     choices: BTreeMap<u32, Vec<intent::Match>>,
     incident_parked: BTreeMap<IncidentId, TxnId>,
+    /// §12a write-backs queued behind an active generation transaction,
+    /// with their caller (P7). Submitted once none is live.
+    writebacks: Vec<(Proposal, Authorization)>,
     confirm: Option<(GenerationId, Timestamp)>,
     manifest_gen: GenerationId,
     /// The running generation's manifest, before the external source joins it.
@@ -330,6 +333,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             last: None,
             choices: BTreeMap::new(),
             incident_parked: BTreeMap::new(),
+            writebacks: vec![],
             confirm,
             manifest_gen: current,
             gen_manifest: manifest,
@@ -504,7 +508,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let pre = s.digest();
         let policy = self.ex.policy_version();
         let caller = authz.actor.clone();
-        let mut result = self.ex.submit(p.clone(), authz.clone(), s, defs);
+        let result = self.ex.submit(p.clone(), authz.clone(), s, defs);
         if let Some((facts, _)) = self.ex.last.clone() {
             self.touched.extend(facts.affected_units.iter().cloned());
             // §11: the affected sessions are notified either way.
@@ -601,12 +605,33 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.log.push(record);
         }
         // §12a: the runtime change is in effect; persist it in the background.
-        if let Submitted::Finished { followup: Some(wb), .. } = &mut result {
-            let mut wb = wb.clone();
+        if let Submitted::Finished { followup: Some(wb), .. } = &result {
+            self.writebacks.push((wb.clone(), authz.clone()));
+            self.flush_writebacks();
+        }
+        result
+    }
+
+    /// A generation transaction is live, in any state (I6: one waiting in
+    /// `Built` counts).
+    fn generation_active(&mut self) -> bool {
+        self.ledger().live.values().any(|t| t.txn.transition.changes_generation())
+    }
+
+    /// §12a (P7): submit the queued write-backs, unless a generation
+    /// transaction is active: then they stay queued, which is not a failure
+    /// and gives no notice. One refused as busy goes back on the queue.
+    fn flush_writebacks(&mut self) {
+        while !self.writebacks.is_empty() && !self.generation_active() {
+            let (mut wb, authz) = self.writebacks.remove(0);
             let (s2, d2) = self.observe();
             wb.observed = s2.digest();
             match self.ex.submit(wb.clone(), authz.clone(), &s2, &d2) {
                 Submitted::Finished { state: TxnState::Committed, .. } => {}
+                Submitted::Rejected { reason: RejectReason::Other(w), .. } if w == "busy" => {
+                    self.writebacks.insert(0, (wb, authz));
+                    return;
+                }
                 Submitted::Parked { approve, .. } => {
                     self.notice(format!("saving the setting needs approval: planarian approve {approve}"))
                 }
@@ -616,7 +641,6 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 )),
             }
         }
-        result
     }
 
     fn is_canonical(&self, u: &UnitId, defs: &UnitDefs) -> bool {
@@ -1132,6 +1156,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
 
+        // §12a: write-backs that waited for a generation transaction.
+        if !l.interlocked() {
+            self.flush_writebacks();
+        }
+
         for t in self.ex.expire() {
             self.notice(format!("approval for transaction {} expired", t.0));
         }
@@ -1253,8 +1282,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let parked = self.ex.parked.clone();
         let ex = &self.ex;
         self.incident_parked.retain(|_, t| parked.contains_key(t) || ex.is_waiting(*t));
-        let Some(inc) =
-            self.incidents.actionable(now).into_iter().find(|i| !self.incident_parked.contains_key(&i.id)).cloned()
+        // §12f (P8): in quiet mode a deferred repair is deferred in fact: the
+        // loop skips it, so its budget and backoff do not advance.
+        let quiet = self.quiet;
+        let Some(inc) = self
+            .incidents
+            .actionable(now)
+            .into_iter()
+            .filter(|i| !quiet || foreground_depends_on(&i.target, defs))
+            .find(|i| !self.incident_parked.contains_key(&i.id))
+            .cloned()
         else {
             return;
         };
@@ -2118,6 +2155,19 @@ fn signal_name(e: Ending) -> String {
         Ending::Exited(n) => format!("exit status {n}"),
         Ending::OomKill => "the OOM killer".into(),
     }
+}
+
+/// §12f: units foreground work plausibly depends on, whose repairs quiet
+/// mode does not defer: a user's own units (audio), devices (sound, GPU,
+/// input, network cards), and units whose restart drops a session or the
+/// network (compositor, display manager, network, Bluetooth).
+fn foreground_depends_on(u: &UnitId, defs: &UnitDefs) -> bool {
+    matches!(u.scope, Scope::User { .. })
+        || u.kind == UnitKind::Device
+        || u.name.contains("bluetooth")
+        || defs
+            .get(u)
+            .is_some_and(|d| matches!(d.restart_disruption, Disruption::SessionLoss | Disruption::ConnectivityLoss))
 }
 
 /// Notices quiet mode never holds back (§12f): alarms, integrity findings,
