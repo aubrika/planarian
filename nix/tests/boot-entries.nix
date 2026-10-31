@@ -98,11 +98,15 @@ pkgs.testers.runNixOSTest (
           efi.keepVariables = true;
           diskSize = 24576;
           memorySize = 3072;
+          # useBootLoader starts from an auto-sized backing image. diskSize
+          # enlarges its qcow2 overlay, but not its partition/filesystem.
+          fileSystems."/".autoResize = true;
           # With useBootLoader the test has a private store. A path mentioned
           # only by the host-side testScript is not copied into that store.
           additionalPaths = [ exports shim ../template/planarian/overrides.nix ];
         };
         boot.loader.grub.enable = lib.mkForce false;
+        boot.growPartition = true;
         boot.loader.systemd-boot.enable = true;
         boot.loader.systemd-boot.editor = false;
         boot.loader.timeout = 0;
@@ -156,12 +160,20 @@ pkgs.testers.runNixOSTest (
       def status():
           return view()["status"]
 
+      def transaction(number):
+          rows = [row for row in view()["timeline"] if row["txn"] == number]
+          assert len(rows) == 1, (number, rows)
+          return rows[0]
+
       def floor():
           # StatusReport deliberately has no floor field. Inspect the journal's
           # rendered durable records; this test does not compact its history.
           lines = json.loads(machine.succeed("planarian --json log -n 1000"))["lines"]
           records = sorted((line for line in lines if line["text"].startswith("security floor: ")), key=lambda line: line["seq"])
-          assert records, "no durable security-floor record"
+          if not records:
+              # This fresh fixture has not compacted or truncated its history;
+              # before the first security commit it has no floor record.
+              return None
           text = records[-1]["text"]
           if text == "security floor: None":
               return None
@@ -205,14 +217,21 @@ pkgs.testers.runNixOSTest (
       machine.wait_for_unit("multi-user.target")
       wait_ready()
       machine.succeed("test -d /sys/firmware/efi/efivars", "test -f /boot/loader/loader.conf", "findmnt /boot -n -o FSTYPE | grep -x vfat")
+      machine.succeed("df -B1 / /nix /boot")
+      # Preserve the canonical 2 GiB / 5% readiness threshold. This verifies
+      # the partition/filesystem actually grew, rather than trusting diskSize.
+      machine.wait_until_succeeds("python3 -c " + shlex.quote("import os; s=os.statvfs('/'); assert s.f_bavail*s.f_frsize >= max(2147483648, s.f_blocks*s.f_frsize//20)"), timeout=90)
+      machine.wait_until_succeeds("planarian --json status | jq -e '.units[] | select(.unit == \"device:fs-root\") | .status == \"Bound\"'", timeout=90)
       machine.succeed("grep -q planarian-boot-slot=g1 /proc/cmdline")
       machine.succeed("test \"$(readlink -f /run/booted-system)\" = ${g1}")
       machine.succeed("mkdir -p /etc/nixos/planarian", "install -m644 ${shim} /etc/nixos/flake.nix", "install -m644 ${exports} /etc/nixos/exports.json", "install -m644 ${../template/planarian/overrides.nix} /etc/nixos/planarian/overrides.nix", "ln -s ${g1} /etc/nixos/g1", "ln -s ${g2} /etc/nixos/g2", "ln -s ${g3} /etc/nixos/g3")
       machine.succeed("timeout -k 5 120 boot-test-terminal planarian mark-good </dev/null")
       g1_id = status()["generation"]
       assert status()["known_good"] == g1_id
+      assert status()["live_tested"] is None
+      assert floor() is None
 
-      with subtest("G2 boots its installed entry and commits its security floor before delayed confirmation"):
+      with subtest("G2 admits its installed entry without committing before confirmation"):
           submit(2)
           machine.wait_until_succeeds("planarian log -n 200 | grep AwaitingBoot", timeout=180)
           assert variable("LoaderEntryOneShot") == profile_entry(paths[2])
@@ -221,29 +240,44 @@ pkgs.testers.runNixOSTest (
           machine.start()
           wait_ready()
           machine.succeed("grep -q planarian-boot-slot=g2 /proc/cmdline", "test \"$(readlink -f /run/booted-system)\" = ${g2}")
-          machine.wait_until_succeeds("planarian log -n 250 | grep 'txn 1: Committed'", timeout=180)
+          machine.wait_until_succeeds("planarian --json console | jq -e '.timeline[] | select(.txn == 1) | (.state == \"Promoted\" and .live)'", timeout=180)
           g2_id = status()["generation"]
           assert g2_id > g1_id
-          assert floor() == g2_id, status()
-          assert status()["live_tested"] == g2_id, status()
+          assert transaction(1)["state"] == "Promoted"
+          assert transaction(1)["live"]
+          assert floor() is None, status()
+          assert status()["live_tested"] is None, status()
           assert status()["known_good"] == g1_id, status()
           assert variable("LoaderEntryDefault") == profile_entry(paths[2])
           assert not variable("LoaderEntryOneShot")
           # The vulnerable manual fallback is still present in the installed ESP.
           machine.succeed("test -f /boot/loader/entries/" + profile_entry(paths[1]))
 
-      if confirmation:
-          with subtest("a healthy admitted boot confirms only at the delayed milestone"):
-              machine.wait_until_succeeds("planarian --json status | jq -e '.known_good == .generation'", timeout=660)
-              assert status()["known_good"] == g2_id
-      else:
+      if not confirmation:
           with subtest("failure after admission and before confirmation invokes the declared posture"):
               machine.succeed("systemctl stop planariad")
               machine.wait_until_succeeds("test -e /run/planarian/failed-absent", timeout=90)
               machine.succeed("systemctl start planariad")
               machine.wait_for_unit("planarian-ready.target")
+              assert transaction(1)["state"] == "Promoted"
+              assert transaction(1)["live"]
               assert status()["known_good"] == g1_id
-              assert floor() == g2_id
+              assert status()["live_tested"] is None
+              assert floor() is None
+
+      with subtest("G2 confirms and commits only at the real ten-minute checkpoint"):
+          machine.wait_until_succeeds("planarian --json console | jq -e '.timeline[] | select(.txn == 1) | (.state == \"Committed\" and (.live | not))'", timeout=660)
+          uptime = float(machine.succeed("cut -d' ' -f1 /proc/uptime").strip())
+          assert uptime >= 600, f"boot-only commitment happened before confirmation: {uptime}s"
+          assert transaction(1)["state"] == "Committed"
+          assert not transaction(1)["live"]
+          assert status()["known_good"] == g2_id
+          assert floor() == g2_id
+          # Boot-only admission/confirmation is not a live activation test.
+          assert status()["live_tested"] is None
+          assert variable("LoaderEntryDefault") == profile_entry(paths[2])
+
+      if not confirmation:
           with subtest("publication crash boundaries remain tracked or prove withdrawal"):
               machine.succeed("systemctl stop planarian-recovery", "mkdir -p /run/systemd/system/planariad.service.d", "printf '[Service]\\nRestart=no\\n' > /run/systemd/system/planariad.service.d/boot-test.conf", "systemctl daemon-reload")
               if recoverer == "daemon":

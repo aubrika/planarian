@@ -36,6 +36,7 @@ jobs:
           python3 nix/gym/test_proofs.py
           python3 nix/gym/test_manifest.py
           python3 nix/gym/test_performance.py
+          python3 nix/gym/test_boot_fixture.py
       - name: Fault catalog, fake harness (complete applicable set and scoped waivers)
         if: success() || failure()
         run: bash nix/gym/run-fake.sh
