@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-# Planarian
+# What is Planarian?
 
 A self-healing layer for NixOS ([Why Planarian?](docs/why.md)). It keeps three
 things separate: what your system is meant to be (from your configuration),
@@ -23,7 +23,7 @@ services and rebuilds and activates your NixOS configuration on its own. Try
 it in a VM, or on a machine you can afford to break. Phase A (the
 deterministic core, NixOS 26.05) is being finished against SPEC v4.6; its
 exit gate is not called yet ([`docs/ga-status.md`](docs/ga-status.md)), and
-later phases are not started. No language model is involved.
+later phases are not started. No on-device language model is involved at this stage.
 `policy::decide`, the journal state machine and the ledger are verified with
 Verus, and the transaction kernel's recovery rules are checked with Kani
 ([`docs/verification.md`](docs/verification.md)).
