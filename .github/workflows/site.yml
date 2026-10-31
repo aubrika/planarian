@@ -1,0 +1,124 @@
+# The guarantees site (SPEC §17c). Every push to main, every tag and every PR
+# builds it, and the build is the check: `planarian-gym site` fails on any
+# reference it cannot resolve (§18 rule 22). main is published to GitHub
+# Pages on every push; a tag's snapshot is built once and kept as a release
+# asset (immutable, never committed), and every deploy of main publishes all
+# the tagged snapshots beside it, under one versions index.
+name: Guarantees site
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  site:
+    runs-on: ubuntu-24.04
+    outputs:
+      snapshot: ${{ steps.name.outputs.snapshot }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@v31
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Snapshot name and the other published snapshots
+        id: name
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then snap="${GITHUB_REF_NAME}"; else snap=main; fi
+          others=$( (echo main; git tag -l 'v*') | sort -u | paste -sd, -)
+          echo "snapshot=$snap" >> "$GITHUB_OUTPUT"
+          echo "others=$others" >> "$GITHUB_OUTPUT"
+      # The verdicts the pages show; a failing entry fails ci.yml, not this.
+      - name: Fault catalog, fake harness
+        run: cargo run -q -p planarian-gym -- run > target/fake-results.txt || true
+      - name: Generate the site (fails on any unresolved reference)
+        run: >
+          cargo run -q -p planarian-gym -- site
+          --out target/site
+          --results target/fake-results.txt
+          --commit "${GITHUB_SHA}"
+          --repo "${GITHUB_REPOSITORY}"
+          --snapshot "${{ steps.name.outputs.snapshot }}"
+          --others "${{ steps.name.outputs.others }}"
+      - name: Render (mdBook from the flake's pinned nixpkgs)
+        run: nix shell --inputs-from . nixpkgs#mdbook -c mdbook build target/site
+      - name: API docs
+        run: |
+          cargo doc -q --workspace --no-deps --document-private-items
+          cp -r target/doc target/site/book/rustdoc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site-${{ steps.name.outputs.snapshot }}
+          path: target/site/book
+          retention-days: 7
+
+  # A tag: keep its snapshot as an immutable release asset, then redeploy
+  # main, which collects every tagged snapshot.
+  snapshot:
+    needs: site
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-${{ needs.site.outputs.snapshot }}
+          path: this
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -czf "guarantees-site-${GITHUB_REF_NAME}.tar.gz" -C this .
+          gh release view "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1 \
+            || gh release create "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --verify-tag --notes "Release ${GITHUB_REF_NAME}."
+          gh release upload "${GITHUB_REF_NAME}" "guarantees-site-${GITHUB_REF_NAME}.tar.gz" -R "${GITHUB_REPOSITORY}"
+          gh workflow run site.yml -R "${GITHUB_REPOSITORY}" --ref main
+
+  # main: publish this build and every tagged snapshot, under one versions
+  # index. Needs GitHub Pages enabled with GitHub Actions as its source.
+  deploy:
+    needs: site
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-main
+          path: pages/main
+      - name: Every tagged snapshot, from its release asset (never rebuilt)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for tag in $(gh release list -R "${GITHUB_REPOSITORY}" --limit 200 --json tagName -q '.[].tagName'); do
+            if gh release download "$tag" -R "${GITHUB_REPOSITORY}" -p "guarantees-site-$tag.tar.gz" -D assets 2>/dev/null; then
+              mkdir -p "pages/$tag" && tar -xzf "assets/guarantees-site-$tag.tar.gz" -C "pages/$tag"
+            fi
+          done
+          {
+            echo '<!doctype html><meta charset="utf-8"><title>Planarian guarantees: versions</title>'
+            echo '<h1>Planarian guarantees</h1><p>Generated from the repository at one commit per snapshot (SPEC §17c).</p><ul>'
+            for d in $(ls pages | sort -r); do echo "<li><a href=\"$d/index.html\">$d</a></li>"; done
+            echo '</ul>'
+          } > pages/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+      - id: deployment
+        uses: actions/deploy-pages@v4

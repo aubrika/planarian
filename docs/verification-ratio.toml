@@ -109,7 +109,7 @@ assumes = ["P4"]
 id = "I8"
 statement = "A tier-3 transition executes only with an approval token bound to the concrete candidate, re-validated before execution."
 phase = "A, C (proof)"
-tested = ["exec tests", "gym policy-token-*"]
+tested = ["exec tests", "gym approval-token-*"]
 discharged = ["exec::approval_tokens_expire_after_their_lifetime"]
 assumes = ["P5"]
 
@@ -117,7 +117,7 @@ assumes = ["P5"]
 id = "I10"
 statement = "No change that alters a canonical probe executes below AskFirst; canonical probes come from the installed core package."
 phase = "A"
-tested = ["state tests", "gym probe-tamper"]
+tested = ["state tests", "gym en-i10-a-canonical-probe-cannot-be-removed"]
 discharged = ["policy::i10_canonical_probe_changes_ask"]
 assumes = ["V1", "U1"]
 
