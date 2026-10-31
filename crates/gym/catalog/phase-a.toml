@@ -3935,13 +3935,13 @@ refused_with = "Unauthorized"
 [[fault]]
 id = "en-i23-third-party-override-kept"
 family = "english"
-summary = "Between a change's boot entry being published and its override promotion, a third party rewrites the override file. Planarian does not overwrite it: the third party's file stands, and the change does not commit (it stops at RecoveryFailed for a person to resolve). Before it, a runtime restart of gym-web wrote no boot entry."
+summary = "Between a change's boot entry being published and its override promotion, a third party rewrites the override file. Planarian does not overwrite it: the third party's file stands, and the change does not commit (it stops at RecoveryFailed for a person to resolve). Before it, a runtime restart of gym-web wrote no boot entry. On the VM the third party is a cooperating writer: it holds the lock on planarian/ across the daemon's compare-and-swap and replaces the file before letting go, so the swap waits and then sees the edit (R11)."
 spec = ["I23"]
 tags = ["english"]
 scoring = "must-pass"
-# Fake only: on the VM the gap between Published and promotion is too short
-# for the harness's watcher to land an edit in it.
-harness = ["fake"]
+# On the VM the daemon pauses before its swap (gym hook), the writer takes
+# the lock there and the daemon goes on into it.
+harness = ["fake", "vm"]
 intent = { kind = "none" }
 setup = [
   { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" },

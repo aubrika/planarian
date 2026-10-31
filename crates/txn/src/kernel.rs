@@ -377,8 +377,14 @@ impl<S: Store, H: Host> Kernel<S, H> {
                     renewed: self.host.boot_now(),
                     jobs: vec![],
                 };
-                j.store().set_fence(id, 1)?;
-                j.append(now, Record::Prepared(Box::new(txn))).map(|_| id)
+                // Exclusive: an id is never prepared twice (C5).
+                j.store().create_fence(id, 1)?;
+                let r = j.append(now, Record::Prepared(Box::new(txn))).map(|_| id);
+                if r.is_err() {
+                    // No record names it; take the fence back.
+                    let _ = j.store().forget_fences(&|t| t != id);
+                }
+                r
             })?
             .map_err(KernelError::from)
             .inspect(|id| {

@@ -28,6 +28,9 @@ use std::time::Duration;
 
 const NIX: Duration = Duration::from_secs(30 * 60);
 const QUICK: Duration = Duration::from_secs(30);
+/// Twice §12f's 24 h bound on parking in `Built`: a remembered override is
+/// never pruned while a transaction that remembered it can still use it.
+const OVERRIDE_GRACE: Duration = Duration::from_secs(48 * 3600);
 pub const ACTIVATION: Duration = Duration::from_secs(16 * 60);
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -527,6 +530,66 @@ impl Nixos {
         format!("planarian-op-{}-{}-{}", op.txn.0, op.epoch, op.seq)
     }
 
+    /// §9 step 4 (I23, R11): an exclusive `flock` on a directory, held until
+    /// the returned handle drops. The directory itself is locked, so nothing
+    /// is added to the owner's tree. Cooperating writers take the same lock;
+    /// one that does not is outside I23 (`docs/bypasses.md`, X-12).
+    fn lock_dir(dir: &Path) -> std::io::Result<std::fs::File> {
+        let d = std::fs::File::open(dir)?;
+        rustix::fs::flock(&d, rustix::fs::FlockOperation::LockExclusive)?;
+        Ok(d)
+    }
+
+    /// Promote, restore and collect (the system profile and boot menu) are
+    /// serialized across the daemon and the watchdog (§28, C5).
+    fn lock_profile(&self) -> Result<std::fs::File, Outcome> {
+        std::fs::create_dir_all(&self.paths.state).map_err(|e| Outcome::Failed(e.to_string()))?;
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.paths.state.join("profile.lock"))
+            .map_err(|e| Outcome::Failed(e.to_string()))?;
+        rustix::fs::flock(&f, rustix::fs::FlockOperation::LockExclusive).map_err(|e| Outcome::Failed(e.to_string()))?;
+        Ok(f)
+    }
+
+    /// The content-addressed override store keeps what a generation still in
+    /// the profile or protected references, the live file's content, and
+    /// anything remembered within `OVERRIDE_GRACE` (a transaction still in
+    /// flight has remembered its base and candidate but recorded neither).
+    /// Everything else goes (§28, C5). Returns the pruned hashes.
+    fn prune_override_store(&self, keep_gens: &[GenerationId], now: std::time::SystemTime) -> Vec<String> {
+        let mut keep: BTreeSet<String> = BTreeSet::new();
+        if let Ok(reg) = self.with_registry(|r| r.overrides.clone()) {
+            for g in keep_gens {
+                if let Some(h) = reg.get(&g.0) {
+                    keep.insert(h.to_hex());
+                }
+            }
+        }
+        if let Ok(t) = std::fs::read_to_string(self.override_file(&self.paths.owner)) {
+            keep.insert(sha(&t).to_hex());
+        }
+        let Ok(entries) = std::fs::read_dir(self.store_dir()) else { return vec![] };
+        let mut gone = vec![];
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(hex) = name.strip_suffix(".nix") else { continue };
+            let recent = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_none_or(|age| age < OVERRIDE_GRACE);
+            if !keep.contains(hex) && !recent && std::fs::remove_file(e.path()).is_ok() {
+                gone.push(hex.to_string());
+            }
+        }
+        gone.sort();
+        gone
+    }
+
     fn write_atomically(target: &Path, text: &str) -> std::io::Result<()> {
         use std::io::Write;
         let dir = target.parent().expect("has a parent");
@@ -768,6 +831,10 @@ impl GenerationBackend for Nixos {
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
         }
+        let _lock = match self.lock_profile() {
+            Ok(l) => l,
+            Err(o) => return o,
+        };
         let path = match self.path_of(g) {
             Ok(p) => p,
             Err(o) => return o,
@@ -818,6 +885,10 @@ impl GenerationBackend for Nixos {
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
         }
+        let _lock = match self.lock_profile() {
+            Ok(l) => l,
+            Err(o) => return o,
+        };
         let (Ok(path), Ok(kept)) = (self.path_of(g), self.path_of(keep)) else {
             return Outcome::Failed("unknown generation".into());
         };
@@ -890,10 +961,18 @@ impl GenerationBackend for Nixos {
     }
 
     fn swap_override(&self, from: &Hash, to: &Hash, op: &OpId) -> Outcome {
+        #[cfg(feature = "gym-hooks")]
+        crate::gym::pause_point("swap_override");
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
         }
         let live = self.override_file(&self.paths.owner);
+        // Compare and rename under one lock: a cooperating writer cannot land
+        // between the two (I23).
+        let _lock = match Self::lock_dir(live.parent().expect("has a parent")) {
+            Ok(l) => l,
+            Err(e) => return Outcome::Failed(format!("cannot lock planarian/: {e}")),
+        };
         let current = match std::fs::read_to_string(&live) {
             Ok(t) => sha(&t),
             Err(e) => return Outcome::Failed(e.to_string()),
@@ -974,6 +1053,10 @@ impl GenerationBackend for Nixos {
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
         }
+        let _lock = match self.lock_profile() {
+            Ok(l) => l,
+            Err(o) => return o,
+        };
         let (plan, gens) = match self.plan_profile(protect, emergency) {
             Ok(p) => p,
             Err(o) => return o,
@@ -1008,6 +1091,17 @@ impl GenerationBackend for Nixos {
             }
         }
         self.prune_roots(&gens, protect);
+        let kept: Vec<GenerationId> = self
+            .profile_generations()
+            .iter()
+            .filter_map(|(_, p)| {
+                self.with_registry(|r| r.paths.iter().find(|(_, q)| *q == p).map(|(id, _)| GenerationId(*id)))
+                    .ok()
+                    .flatten()
+            })
+            .chain(protect.iter().copied())
+            .collect();
+        self.prune_override_store(&kept, std::time::SystemTime::now());
         let o = run(&["nix-store", "--gc"], NIX);
         if !o.ok() {
             return err(&o);
@@ -1045,6 +1139,78 @@ mod tests {
         assert!(std::fs::symlink_metadata(builds.join("b")).is_ok(), "pending: still the build's");
         assert!(std::fs::symlink_metadata(paths.gcroots.join("gen-5")).is_err(), "no longer protected");
         assert!(std::fs::symlink_metadata(paths.gcroots.join("gen-6")).is_ok(), "protected");
+    }
+
+    fn override_rig() -> (tempfile::TempDir, Nixos, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let owner = d.path().join("owner");
+        std::fs::create_dir_all(owner.join("planarian")).unwrap();
+        let live = owner.join("planarian/overrides.nix");
+        std::fs::write(&live, render(&OverrideSet::default())).unwrap();
+        let paths = Paths { state: d.path().join("state"), owner, ..Default::default() };
+        let lease = paths.txn_dir().join("9");
+        std::fs::create_dir_all(&lease).unwrap();
+        std::fs::write(lease.join("lease"), "1\n").unwrap();
+        (d, Nixos::new(paths), live)
+    }
+
+    /// I23 (R11): the compare and the rename are one step under the lock on
+    /// `planarian/`. A cooperating writer holding it, which replaces the file
+    /// before letting go, is seen: the swap fails and its edit stays.
+    #[test]
+    fn the_override_swap_waits_for_the_directory_lock() {
+        let (_d, n, live) = override_rig();
+        let from = sha(&std::fs::read_to_string(&live).unwrap());
+        let mut set = OverrideSet::default();
+        set.assignments.insert("a.b".into(), Value::Bool(true));
+        let to = n.remember_override(&set).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let live = live.clone();
+            std::thread::spawn(move || {
+                let _l = Nixos::lock_dir(live.parent().unwrap()).unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::write(&live, "# the owner's edit\n{ }\n").unwrap();
+            })
+        };
+        held_rx.recv().unwrap();
+        let op = OpId { txn: TxnId(9), epoch: 1, seq: 1 };
+        let o = n.swap_override(&from, &to, &op);
+        writer.join().unwrap();
+        assert!(matches!(o, Outcome::Failed(ref m) if m.contains("changed by someone else")), "{o:?}");
+        assert_eq!(std::fs::read_to_string(&live).unwrap(), "# the owner's edit\n{ }\n");
+        // Unlocked and unchanged: the swap goes through.
+        let from = sha(&std::fs::read_to_string(&live).unwrap());
+        std::fs::write(n.store_dir().join(format!("{}.nix", from.to_hex())), std::fs::read(&live).unwrap()).unwrap();
+        assert_eq!(n.swap_override(&from, &to, &op), Outcome::Succeeded);
+        assert_eq!(sha(&std::fs::read_to_string(&live).unwrap()), to);
+    }
+
+    /// C5: the override store keeps what a kept generation references, the
+    /// live content and anything recent; the rest is pruned.
+    #[test]
+    fn the_override_store_is_pruned() {
+        let (_d, n, live) = override_rig();
+        let remember = |k: &str| {
+            let mut s = OverrideSet::default();
+            s.assignments.insert(k.into(), Value::Bool(true));
+            n.remember_override(&s).unwrap().to_hex()
+        };
+        let (kept, dropped, gone) = (remember("kept"), remember("dropped"), remember("orphan"));
+        let live_hex = sha(&std::fs::read_to_string(&live).unwrap()).to_hex();
+        std::fs::write(n.store_dir().join(format!("{live_hex}.nix")), std::fs::read(&live).unwrap()).unwrap();
+        n.record_override(GenerationId(1), &Hash::from_hex(&kept).unwrap()).unwrap();
+        n.record_override(GenerationId(2), &Hash::from_hex(&dropped).unwrap()).unwrap();
+        let now = std::time::SystemTime::now();
+        assert!(n.prune_override_store(&[GenerationId(1)], now).is_empty(), "all recent: kept");
+        let later = now + OVERRIDE_GRACE + Duration::from_secs(60);
+        let mut want = vec![dropped, gone];
+        want.sort();
+        assert_eq!(n.prune_override_store(&[GenerationId(1)], later), want);
+        for h in [&kept, &live_hex] {
+            assert!(n.store_dir().join(format!("{h}.nix")).exists(), "{h} kept");
+        }
     }
 
     #[test]

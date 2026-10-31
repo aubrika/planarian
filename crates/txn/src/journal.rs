@@ -239,6 +239,10 @@ impl<S: Store> Journal<S> {
         {
             let _g = j.store.lock()?;
             j.reload()?;
+            // A fence at or past `next_txn` has no record: its prepare died
+            // between creating the fence and journaling `Prepared` (C5).
+            let next = j.ledger.next_txn.max(1);
+            j.store.forget_fences(&|t| t.0 < next)?;
         }
         Ok(j)
     }
@@ -602,6 +606,10 @@ impl<S: Store> Journal<S> {
         self.store.write_at(0, &[0; HEADER])?;
         self.store.sync()?;
         self.offset = 0;
+        // Terminal transactions' fences go once the checkpoint that records
+        // them as terminal is durable (§9 step 4, C5). Live ones stay.
+        let live = &self.ledger.live;
+        self.store.forget_fences(&|t| live.get(&t).is_some())?;
         self.clear_resolved_sentinel()
     }
 
