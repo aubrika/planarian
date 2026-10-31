@@ -832,8 +832,15 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         if self.kernel.journal.ledger().tokens_used.iter().any(|(n, _)| *n == nonce) {
             return reject(RejectReason::Other("approval".into()), "this approval was already used");
         }
-        let _ =
-            self.kernel.journal.append(now, Record::TokenUsed { nonce, expires: parked.issued.plus(TOKEN_LIFETIME) });
+        let _ = self.kernel.journal.append(
+            now,
+            Record::TokenUsed {
+                nonce,
+                expires: parked.issued.plus(TOKEN_LIFETIME),
+                approver: approver.principal.0,
+                txn: parked.txn.0,
+            },
+        );
         self.parked.remove(&parked.txn);
         let source = parked.proposal.source.clone();
         self.schedule(parked.txn, plan, &source, state)

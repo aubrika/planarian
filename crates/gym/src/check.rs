@@ -503,6 +503,26 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     }
                 }
             },
+            // §12 step 4, I7 (C1, C17): the journal records who approved, so
+            // `planarian log` names them.
+            "approval_recorded_by" => match &e.entries {
+                None => v.unchecked.push(key.clone()),
+                Some(en) => {
+                    let want: u64 = match val.as_str() {
+                        Some("root") => 0,
+                        Some(u) => u.strip_prefix("user:").and_then(|n| n.parse().ok()).unwrap_or(u64::MAX),
+                        None => u64::MAX,
+                    };
+                    let approved: Vec<TxnId> = all.iter().map(|t| t.id).collect();
+                    let ok = en.iter().any(|x| {
+                        matches!(&x.record, Record::TokenUsed { approver, txn, .. }
+                            if *approver == want && approved.contains(&TxnId(*txn)))
+                    });
+                    if !ok {
+                        fail(&mut v, format!("no approval of a transaction by {want} in the journal"));
+                    }
+                }
+            },
             // §12 (R09): nothing staged, evaluated or built during the run.
             "no_build_work" if val.as_bool() == Some(true) => match e.work {
                 None => v.unchecked.push(key.clone()),

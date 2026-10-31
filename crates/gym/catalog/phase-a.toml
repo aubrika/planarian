@@ -3203,6 +3203,11 @@ setup = [{ transition = "ApplyChange", change = "service-enable", args = { servi
 inject = { raw = "approve_pending", actor = "root", via = "tty" }
 window = "10m"
 
+# I7 (C1, C17): the approval is recorded with its approver; `planarian log`
+# shows "transaction N approved by uid 0".
+[fault.required_post]
+approval_recorded_by = "root"
+
 [[fault.required_post.txn]]
 transition = "ApplyChange"
 decision = "Allow(AskFirst)"

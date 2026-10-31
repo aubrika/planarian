@@ -84,9 +84,16 @@ pub enum Record {
         seq: u64,
         digest: Hash,
     },
+    /// An approval used (§12 step 4, I7): by whom, for which transaction.
     TokenUsed {
         nonce: [u8; 16],
         expires: Timestamp,
+        /// The approver's PrincipalId (a human's is their uid); 0 in records
+        /// from before v4.6.
+        #[serde(default)]
+        approver: u64,
+        #[serde(default)]
+        txn: u64,
     },
     /// `planarian agent run <name>` by this uid (§11, I24): the started
     /// unit's instance (its InvocationID) acts with that user's permissions,
@@ -896,7 +903,7 @@ impl Ledger {
             Record::AcceptedBaseline(g) => self.accepted_baseline = g,
             Record::SecurityFloor(g) => self.security_floor = g,
             Record::ExternalAccepted { seq, digest } => self.external = Some((seq, digest)),
-            Record::TokenUsed { nonce, expires } => use_token(&mut self.tokens_used, at, nonce, expires),
+            Record::TokenUsed { nonce, expires, .. } => use_token(&mut self.tokens_used, at, nonce, expires),
             Record::Resolved { txn, .. } => {
                 if let Some(k) = find(&self.interlock, txn) {
                     self.interlock.entries.remove(k);
