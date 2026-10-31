@@ -80,8 +80,12 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds("test ! -e /run/planarian/alarm", timeout=120)
 
     with subtest("Crashed: planarian-recovery crash-looping (P15)"):
-        for _ in range(8):
-            machine.succeed("systemctl kill --signal=SIGSEGV planarian-recovery.service || true")
+        # SIGKILL: a crash without a core dump, so every kill lands on a
+        # running watchdog (a SIGSEGV's dump outlasts the 2 s RestartSec,
+        # and half the kills found it already down). Twelve in 36 s spend
+        # the budget of five in 300 s.
+        for _ in range(12):
+            machine.succeed("systemctl kill --signal=SIGKILL planarian-recovery.service || true")
             machine.sleep(3)
         machine.wait_until_succeeds("test -s /run/planarian/alarm", timeout=120)
         assert alarm().startswith("crashed"), alarm()
