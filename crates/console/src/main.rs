@@ -16,7 +16,7 @@ mod mark;
 use iced::widget::{button, canvas, column, container, row, rule, scrollable, text};
 use iced::{Color, Element, Fill, Subscription, Task, Theme, color, time, window};
 use mark::{Mark, Motion};
-use planarian_ipc::{ConsoleReport, Request, Response, SOCKET, status_words};
+use planarian_ipc::{ConsoleReport, Request, Response, SOCKET, status_words, waiting_words};
 use planarian_schema::{IncidentState, UnitId, Until};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -167,8 +167,9 @@ impl Console {
         if let Some(n) = r.status.notices.iter().find(|n| n.starts_with("building ")) {
             return Some((Motion::Working, n.clone()));
         }
-        r.status.in_flight.first().map(|(t, state, what)| {
-            (Motion::Working, format!("working on #{}: {what} ({})", t.0, planarian_state_name(state)))
+        r.status.in_flight.first().map(|(t, state, what)| match waiting_words(state) {
+            Some(w) => (Motion::Still, format!("#{} is {w}: {what}", t.0)),
+            None => (Motion::Working, format!("working on #{}: {what} ({})", t.0, planarian_state_name(state))),
         })
     }
 

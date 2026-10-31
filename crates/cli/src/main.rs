@@ -203,7 +203,10 @@ fn print_status(r: &StatusReport) {
         }
     }
     for (t, s, what) in &r.in_flight {
-        println!("\nin progress: transaction {} ({s:?}): {what}", t.0);
+        match planarian_ipc::waiting_words(s) {
+            Some(w) => println!("\n{w}: transaction {}: {what}", t.0),
+            None => println!("\nin progress: transaction {} ({s:?}): {what}", t.0),
+        }
     }
     if let Some(sp) = &r.space {
         let gb = |n: u64| n as f64 / 1e9;

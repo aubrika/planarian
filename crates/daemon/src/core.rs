@@ -35,6 +35,9 @@ pub const CONFIRM_AFTER: Millis = Millis::secs(600);
 const NOTICES_KEPT: usize = 64;
 /// How long an external dependency's probes time out before it is said.
 const UNREACHABLE_AFTER: Millis = Millis::secs(120);
+/// The "restart to finish" notice repeats this often while a change waits
+/// for its boot (§12f).
+const RESTART_REMINDER: Millis = Millis::secs(24 * 3600);
 
 #[derive(Clone, Debug)]
 pub struct CoreConfig {
@@ -162,6 +165,9 @@ pub struct Core<B: Backends + Clone, S: Store> {
     pub new_declarations: Vec<(String, String)>,
     new_declarations_since: Timestamp,
     interlock_noted: bool,
+    /// When each transaction in `AwaitingBoot` was last said to need a
+    /// restart (`CLOCK_BOOTTIME`); repeated daily (§12f).
+    restart_reminded: BTreeMap<TxnId, Timestamp>,
     /// Incidents whose opening was already announced.
     diag_noted: BTreeSet<IncidentId>,
     /// External dependencies whose probes time out: since when, and
@@ -316,6 +322,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             new_declarations: vec![],
             new_declarations_since: now,
             interlock_noted: false,
+            restart_reminded: BTreeMap::new(),
             diag_noted: BTreeSet::new(),
             unreachable: BTreeMap::new(),
             chain_checked: None,
@@ -1083,6 +1090,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         for t in self.ex.expire() {
             self.notice(format!("approval for transaction {} expired", t.0));
         }
+        self.remind_restart(&l);
         for (t, change) in self.ex.expire_waiting() {
             self.notice(format!(
                 "transaction {} cancelled: it waited a day in Built without an activation window ({}); issue it again to retry",
@@ -1098,6 +1106,26 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         self.confirm_boot(&s, &defs, now);
         self.note_space();
         self.note_unreachable(&s, &defs, now);
+    }
+
+    /// §12f: a transaction in `AwaitingBoot` has no time limit; the "restart
+    /// to finish" notice is repeated once a day until that restart.
+    fn remind_restart(&mut self, l: &Ledger) {
+        let now = self.b.clock().boot_now();
+        let waiting: Vec<(TxnId, String)> = l
+            .live
+            .values()
+            .filter(|t| t.txn.state == TxnState::AwaitingBoot)
+            .map(|t| (t.txn.id, render::transition(&t.txn.transition)))
+            .collect();
+        self.restart_reminded.retain(|id, _| waiting.iter().any(|(w, _)| w == id));
+        for (id, what) in waiting {
+            let last = *self.restart_reminded.entry(id).or_insert(now);
+            if now > last.plus(RESTART_REMINDER) {
+                self.restart_reminded.insert(id, now);
+                self.notice(format!("transaction {}: {what} is still waiting for a restart; restart to finish", id.0));
+            }
+        }
     }
 
     /// §10: a probe that times out yields Unknown, never Failed, so an
