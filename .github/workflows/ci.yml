@@ -24,19 +24,26 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: clippy with the gym's fault-injection hooks
+        if: success() || failure()
         run: cargo clippy -p planarian-daemon -p planarian-backend-linux --features planarian-daemon/gym-hooks -- -D warnings
-      - run: cargo test --workspace
+      - name: Workspace tests (retain diagnostics after lint failures)
+        if: success() || failure()
+        run: cargo test --workspace --no-fail-fast
       - name: Acceptance-tool negative regressions
+        if: success() || failure()
         run: |
           python3 nix/gym/test_acceptance.py
           python3 nix/gym/test_proofs.py
           python3 nix/gym/test_manifest.py
           python3 nix/gym/test_performance.py
       - name: Fault catalog, fake harness (complete applicable set and scoped waivers)
+        if: success() || failure()
         run: bash nix/gym/run-fake.sh
       - name: GA demonstration, fake harness
+        if: success() || failure()
         run: crates/gym/demo.sh --harness fake
       - name: Dependency boundaries
+        if: success() || failure()
         run: bash nix/tests/boundaries.sh .
 
   nix:

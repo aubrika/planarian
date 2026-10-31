@@ -1409,6 +1409,8 @@ fn agent_instance_unknown(instance: &[u8; 16]) -> bool {
     *instance == [0; 16]
 }
 
+type AgentRegistry = Vec<(String, [u8; 16], u32)>;
+
 /// Preserve historical checkpoint JSON until its original checksum is checked.
 /// Legacy rows carry no instance authority; zero never matches a peer.
 #[derive(Serialize, Deserialize)]
@@ -1435,9 +1437,7 @@ fn serialize_agent_registry<S: Serializer>(
     rows.serialize(serializer)
 }
 
-fn deserialize_agent_registry<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<(String, [u8; 16], u32)>, D::Error> {
+fn deserialize_agent_registry<'de, D: Deserializer<'de>>(deserializer: D) -> Result<AgentRegistry, D::Error> {
     let rows = Vec::<AgentRegistration>::deserialize(deserializer)?;
     Ok(rows
         .into_iter()
