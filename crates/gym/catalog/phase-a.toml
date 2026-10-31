@@ -1142,6 +1142,32 @@ target = "service:gym-web"
 kind = "diagnostic"
 first_candidate = "reobserve:gym-web-tcp"
 
+# R06 (§10 probe contract): a probe's timeout bounds the whole probe, and a
+# straggler never holds the batch.
+[[fault]]
+id = "probe-trickling-endpoint"
+family = "probe-timeout-service-healthy"
+summary = "gym-web's /health sends one byte every 2 s and never finishes, so a per-read timeout would never fire. Its 10 s timeout bounds the whole probe: Timeout, Unknown, never Failed, and gym-web is not restarted. Meanwhile the loop keeps ticking: gym-cache crashes and is repaired."
+spec = ["§10 probe contract", "R06"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { raw = "set_knob", unit = "service:gym-web", knob = "health_trickle", value = "2s" }
+after = [{ raw = "wait", for = "45s" }, { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGSEGV" }, { raw = "wait", for = "2m" }]
+window = "4m"
+
+[fault.required_post]
+no_txn_on = ["service:gym-web"]
+status_never = { "service:gym-web" = ["Failed"] }
+status_seen = { "service:gym-web" = ["Unknown"] }
+units = { "service:gym-cache" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-cache"
+terminal = "Committed"
+
 [[fault]]
 id = "probe-diagnostic-stale-healthy"
 family = "probe-timeout-service-healthy"
