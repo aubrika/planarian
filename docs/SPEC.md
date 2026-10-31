@@ -1,6 +1,6 @@
 # Planarian — Spec v4.6
 
-Oct 30, 2026 · supersedes Spec v4.5 · incorporates the Phase A close-out review of Oct 30 against commit `805cd1c` (the merged findings of the 29 Oct code audits and the 30 Oct third-party handoff, with the owner decisions of 30 Oct; changes listed in §28), on top of the vulnerability review merged in v4.5 (§27). Phase A stays held open: the gate is called only when §28's required changes have landed, B-20 is closed, and every doc agrees with the head (§18 rule 19). The non-normative directions from that review (fleet, remote principals, app capabilities, forecasting, Asterinas convergence, self-improvement) remain in `docs/future-work.md` and are not Phase A–C requirements.
+Oct 30, 2026 · supersedes Spec v4.5 · incorporates the Phase A close-out review of Oct 30 against commit `805cd1c` (the merged findings of the 29 Oct code audits and the 30 Oct third-party handoff, with the owner decisions of 30 Oct; changes listed in §28), on top of the vulnerability review merged in v4.5 (`docs/spec-history.md` §27). Phase A stays held open: the gate is called only when §28's required changes have landed, B-20 is closed, and every doc agrees with the head (§18 rule 19). The non-normative directions from that review (fleet, remote principals, app capabilities, forecasting, Asterinas convergence, self-improvement) remain in `docs/future-work.md` and are not Phase A–C requirements.
 
 ---
 
@@ -162,7 +162,7 @@ planarian/
     cli/                     `planarian`, `ask`
     console/                 iced read-only console (§16a)
     tray/                    status indicator (StatusNotifierItem); ships with the console
-    gym/                     catalog, VM harness (NixOS VM, Firecracker, Asterinas NixOS), scoring, metrics, verification accounting (§15, §17a, §17b)
+    gym/                     catalog, VM harness (NixOS VM, Firecracker, Asterinas NixOS), scoring, metrics, verification accounting, the guarantees site generator (§15, §17a, §17b, §17c)
     sandbox/                 (B) dry-run and Firecracker-from-snapshot tier (§12g); not present in A
     model/                   (B) not present in A
   nix/
@@ -176,7 +176,7 @@ planarian/
     tests/                   NixOS VM tests: the gym's VM harness, runtime/generations/posture/installer tests, the boundaries check, the Verus check
     gym/                     run-vm.sh (the by-hand VM catalog runner)
   share/canonical.json       canonical probes (§9)
-  docs/                      SPEC.md (this), AGENTS.md (§18), deviations.md, pins.md, assumptions.md (§17a), bypasses.md (§17b), verification.md and verification-ratio.toml (§17a), guarantees.md, ga-status.md, catalog-review.md, planarian-os.md, why.md (public design essay), future-work.md (non-normative)
+  docs/                      SPEC.md (this), AGENTS.md (§18), deviations.md, pins.md, assumptions.md (§17a), bypasses.md (§17b), spec-history.md (changes through v4.4), verification.md and verification-ratio.toml (§17a), guarantees.md, ga-status.md, catalog-review.md, planarian-os.md, why.md (public design essay), future-work.md (non-normative)
 ```
 
 The layout above is descriptive of the repository at v4.6; it replaces the aspirational v4.5 layout (separate backend crates, `nix/manifest.nix`, `nix/changes/`, stub `sandbox`/`model` crates), which `docs/deviations.md` recorded only in part.
@@ -906,9 +906,28 @@ Proof targets, in order: Phase A — `schema::digest`; `policy::decide` (purity;
 
 ### 17b. Bypass register
 
-`docs/bypasses.md` lists every known route by which the machine can reach a state this spec says cannot happen, or by which a stated guarantee stops describing the real machine, whether or not a proof is involved. One row per route: id (B for open, X for accepted; never reused), route, what it breaks (always invoked, tamperproof, or correct), severity (High: defeats a stated guarantee in the shipped configuration without root; Medium: needs root, a network position, or a likely deployment, or the spec overstates the mechanism; Low: narrow, availability-only, or process; Accepted: outside the claim by design), status, mitigation, and phase. Any change that adds a path to the machine (a request type, backend call, hook, or posture option) adds a row or states in its PR that it opens none. `planarian-gym verification --gate` checks the file's format and fails a gate with an open High row. The file has three tables — **Open**, **Closed** (status `Closed (<sha>)`, kept forever), and **Accepted** — and a row moves between them when its status changes; the format check rejects a Closed row in the Open table. **Rows added at v4.6:** B-20 (High, Open: agent-name collision rebinds a running agent's authority; closed by I24); X-12 (Accepted: an override-file writer that does not take the daemon's lock).
+`docs/bypasses.md` lists every known route by which the machine can reach a state this spec says cannot happen, or by which a stated guarantee stops describing the real machine, whether or not a proof is involved. One row per route: id (B for open, X for accepted; never reused), route, what it breaks (always invoked, tamperproof, or correct), severity (High: defeats a stated guarantee in the shipped configuration without root; Medium: needs root, a network position, or a likely deployment, or the spec overstates the mechanism; Low: narrow, availability-only, or process; Accepted: outside the claim by design), status, mitigation, phase, and the invariants it limits (`all`, or `—` for none; §17c). Any change that adds a path to the machine (a request type, backend call, hook, or posture option) adds a row or states in its PR that it opens none. `planarian-gym verification --gate` checks the file's format and fails a gate with an open High row. The file has three tables — **Open**, **Closed** (status `Closed (<sha>)`, kept forever), and **Accepted** — and a row moves between them when its status changes; the format check rejects a Closed row in the Open table. **Rows added at v4.6:** B-20 (High, Open: agent-name collision rebinds a running agent's authority; closed by I24); X-12 (Accepted: an override-file writer that does not take the daemon's lock).
 
 Verus subset applies to `schema`, `policy`, `txn` only. `exec`, `diagnose`, `incident`, `state` keep the no-`dyn` and no-`unsafe` rules so they can be brought in later; `intent`, `console`, `daemon`, `cli`, `gym` are unconstrained.
+
+### 17c. Guarantees site
+
+Planarian publishes a generated documentation site organized around its guarantees, as docs.rs is organized around a crate's API: every page is computed from the repository at one commit, never written by hand, and every claim links down to the code, proofs, tests and limits that carry it. It exists so an auditor can start from "what does this system promise?" and reach the exact lines that keep the promise, at the exact commit under audit.
+
+**Sources.** The site is built only from files the repository already maintains: the invariant table (§7), `docs/verification-ratio.toml` (obligations and assumptions per invariant), `docs/assumptions.md`, `docs/bypasses.md`, the gym catalog (each entry's `spec` and `invariants` fields) and its latest run results, `docs/spec-history.md`, and the source tree (to locate each obligation by name). Nothing on the site is entered anywhere else.
+
+**Pages.**
+
+- **One page per invariant:** the statement verbatim from §7; proof phase, status and d:a against the baseline; each discharged obligation with its kind (verified fn, proof fn, Kani harness), what it guarantees, and a permalink to its line at the commit; the assumptions it rests on, each with its text, its kind (platform, proof-validity, internal unproven) and the other invariants that rest on it; the global proof-validity assumptions that apply to every proof; the gym entries that exercise it, with harness, expectation and the verdict from the run at that commit; the bypass rows that limit it; and its history across spec versions.
+- **Reverse indexes:** per assumption (which invariants fall if it is false); per bypass (which guarantees it narrows); per source file (which invariants and obligations live there); per gym entry (what it exercises).
+- **The spec itself**, one page per section, with cross-references as links.
+- **API docs:** `cargo doc` output for the workspace, linked from invariant pages for the types they concern. Proof obligations link to source lines, not rustdoc, because rustdoc renders `verus!` blocks poorly.
+
+**Versions.** A snapshot is built for every tagged release and for the head of `main`. Tagged snapshots are immutable and kept; `main` is rebuilt on every push. Every page names its commit and spec version in its first line and links to the same page in other snapshots.
+
+**The build is the check.** The generator fails the build on any reference it cannot resolve: an obligation name with no matching function, an assumption or bypass id with no entry, an invariant with no page, a gym entry naming an invariant that does not exist, a bypass row with no invariants column. CI runs it on every push, so a docs failure is a build failure; a gate claim (§18 rule 19) may cite the site's snapshot at the gate commit.
+
+**Where it lives.** The generator is a subcommand of `planarian-gym` (`planarian-gym site`), beside `verification`, which already parses these files and checks the same names. The site is an mdBook published to GitHub Pages from CI. It is generated output and is never committed to the repository.
 
 ## 18. Instructions to the coding agent (AGENTS.md)
 
@@ -934,6 +953,7 @@ Verus subset applies to `schema`, `policy`, `txn` only. `exec`, `diagnose`, `inc
 19. **v4.6 handoff, in this order.** (a) Reconcile: the close-out review in the project ("Phase A close-out review, head 805cd1c") lists every finding with its status at that head; before touching anything, confirm each item you take on is still open at *your* head and record which commit closed the ones that aren't. (b) B-20 first (I24; §11, §16): register the row, fix, add `agent-name-collision` to both harnesses. (c) The documentation sweep: every doc agrees with head and with this spec before any further status is cited (`ga-status.md`'s summary; `guarantees.md`'s accounting; `bypasses.md`'s three tables; `AGENTS.md` mirroring §18 rules 0–21; `catalog-review.md`'s counts and a v4.6 section; `phase-a.toml`'s header; the deviations rows §28 names). (d) The §28 required changes, one PR each, each with its §15 acceptance case landing in the same PR. (e) §15's harness contract and §17a's accounting checks. (f) Then, and only then, run the whole VM catalog on one commit and update `ga-status.md` from that run; a gate claim cites one commit and one run, never a union of runs.
 20. **Equivalent effects, equivalent treatment.** When two spellings of a request, two paths to a commit, or two sources of a proposal produce the same effect on the machine, they get the same derived facts, the same floors, and the same bookkeeping (§11, I25). A PR that adds a spelling, a path or a source states which existing one it is equivalent to and shows the gym case that holds them equal.
 21. **Nothing is derived from a failed tool.** A backend or helper that exits nonzero, times out, or returns truncated output never contributes a smaller plan, a `None` disruption, or a passing verdict; the step fails or the change parks (§9 step 3, §15 harness contract).
+22. The guarantees site (§17c) builds on every push. A change that renames an obligation, adds an invariant or assumption, or adds a bypass row makes the site resolve in the same PR.
 
 ## 19. Open questions (owner decides)
 
@@ -949,6 +969,8 @@ Verus subset applies to `schema`, `policy`, `txn` only. `exec`, `diagnose`, `inc
 - [x] Phase B grants to non-human principals: catalog and model-catalog authority only; merge authority requires two distinct approvers.
 - [x] Learned `Diagnostic` edges are never admitted without a passing gym case.
 - [x] Spec vulnerability review (Oct 29) merged as v4.5: a launcher for agents; the floor from the whole closure; no request field decides authority; trust accounting in three parts; I2, I14, I16, I18 qualified; the bypass register as a gate.
+- [x] Repairs run while an admitted boot-only change awaits its confirmation; a canonical repair in that window means it is not confirmed (Oct 31; I6, §10).
+- [x] Guarantees site: generated per commit and per tag, organized around invariants, published to GitHub Pages; never hand-edited (Oct 31; §17c).
 - [x] Agents act with their user's permissions, attributed per instance (Oct 30; §11, I24). GC stays Runtime with `retainAllGenerations` (Oct 30; I21, §12b).
 - [x] Close-out review (Oct 30) merged as v4.6. Decided: boot-only fallback is the publishing (running) generation, never `known_good` automatically (§12 step 7); parking in `Built` is bounded at 24 h, `AwaitingBoot` is unbounded and reported as waiting (§12f, I12); an external dependency needs a traversable edge, and the module rejects weaker ones (§10); approval tokens die with the daemon (§12 step 4, §12h). Taken as defaults, overturnable here: boot confirmation has two milestones, admission and the 10-minute confirmation (§10); only seated sessions carry a graphical expectation (§10); §6 describes the repository as it is.
 - [ ] `assets/identity/source/prompts.md` records that the raster master was generated with an image model. Keep the provenance note in the public repository, or remove it? And is the identity kit under the repository's MPL-2.0 or reserved? (Not a spec matter; recorded here so it is decided.)
@@ -995,92 +1017,9 @@ Not Phase A work; kept so the design is not lost.
 | Disk | Bounded by keep-N and space budgets; `BudgetUnsatisfiable` reported if the protected set alone exceeds them |
 | Executor log | Tens of KB/day in steady state; rotated at 50 MB, kept 30 days |
 
-## 22. Changes from v3
+## 22–27. Earlier changes
 
-- Restored principles (now 12) and invariants (I1–I14) that v3 referenced but omitted.
-- Desired/observed/health separated; conditions (`AfterLogin`, `DeviceConnected`, power); suppressions; `Unknown`, `Transitioning`, stale evidence; user-scoped units. Fixes the login-screen and user-stopped-service faults.
-- Edges typed (`Ordering`/`Requires`/`Diagnostic`); `After=` no longer implies dependency.
-- Probe contract: sandbox, limits, side effects; disruptive probes OnDemand only; `establishes` field.
-- Sensitivity composable; `Disruption` and `Recovery` as separate properties; `Decision::Reject` separate from tiers; `max_tier` can no longer make a forbidden action approvable.
-- Policy facts derived by the executor from the evaluated generation (I14); `OptionChange.sensitivity` removed from proposals; refinement check and executor-owned requirements made explicit.
-- Approval bound to the concrete candidate, base, policy version, cumulative hash, derived facts; re-validated at execution; single-use.
-- Transaction kernel with write-ahead journal, `Partial`/`Unknown` outcomes, recovery watchdog as a separate unit, daemon restart reconciliation, self-protection during activation; `live_tested` vs boot-confirmed `known_good`.
-- Change catalog with handlers replaces free-form `ConfigDiff` in proposals; override file promoted only on commit; user config pinned per transaction.
-- Incident lifecycle: defer to systemd, backoff, durable budgets, regression and flap handling, cooldowns, escalation.
-- Gym: lifecycle and intent families; unnecessary-intervention and disruption metrics; held-out families for B; GA includes the kill-mid-activation demonstration.
-- Verification narrowed to `schema`/`policy`/`txn` with `docs/assumptions.md`; re-observation claim corrected; store-integrity claim corrected for input-addressed paths.
-- GC: in-flight candidates protected; space budgets.
-- `mark-good` authorization; log record contents; `dyn`/generics contradiction resolved.
-- Phase A scope kept full and Asterinas target kept non-gating, per owner decision.
-
-## 23. Changes from v4
-
-- §12: exclusive transaction ownership with lease epochs; worker fencing via pidfd and job draining; the watchdog may not commit before `Published`; the daemon waits for a watchdog-held lease; I15 added; gym case for overlapping owners.
-- §9/§12: immutable staged source (NAR-hashed) evaluated with pure-eval; build before approval; `verify_candidate` before activation; the token binds expectation, revert target, and recovery strategy; `activate_live` and `publish_boot` separated; `Published`/`Promoted` journaled; atomic-rename-plus-dir-fsync promotion; watchdog revert restores the override source; crash-recovery table.
-- §8/§9/§10: `ProbeRole` Readiness vs Diagnostic; side-effect probes are Diagnostic; status derivation puts definite `Failed` above Unknown; probe applicability follows the candidate's authorized desired state, distinct from definition tampering.
-- §8/§9: `Condition::SessionEstablished` from logind replaces the circular `AfterLogin`; the session probe is the result, not the prerequisite.
-- §8/§12/§14: `StopAndSuppress` composite; suppression journaled before stop; no post-hoc prompt; CLI `StopUnit` rewritten.
-- §11: `SO_PEERCRED` authentication; authorization rule separate from risk; actor fields overwritten; global floors for NonReversible and disruption apply to every transition kind.
-- §8/§9/§13: `Wants` edge kind preserved as weak; SCC-based root-causing for cycles.
-- §10/§12c: per-filesystem storage units; preallocated journal; ENOSPC behavior by state; `CollectGarbage { emergency }`; `BudgetUnsatisfiable`.
-- §12: read-only vs mutating backend calls; `Prepared` on the Allow path; per-transition `RecoveryStrategy`; Runtime outcomes never trigger generation reversion; `restartIfChanged`/`stopIfChanged` as the real self-protection mechanism.
-- §16: `accepted_baseline` distinct from boot-confirmed `known_good`; initial enrollment; operational limits made normative.
-- §17a: progress assumptions stated for I12; fencing and idempotence added to the trusted-assumptions list.
-- §12a, §14, §20, §21 made self-contained.
-
-## 24. Changes from v4.1
-
-- §12: takeover requires confirmed quiescence (jobs cancelled and gone, workers reaped); a drain timeout ends in `RecoveryFailed`, never in proceeding; lease transfer is atomic via `flock` plus rename; the watchdog triggers on `Published`/`Promoted` too and, from `Checking`, completes the whole authorized commit path or reverts.
-- §8/§12: per-transition `Handler` and `RecoveryStrategy` independent of tier; `Rollback` is a generation operation even at Runtime tier; `BindDriver` is a device operation with `UnbindDevice` recovery; the crash-recovery table branches on strategy.
-- §9/§12b: transaction-specific `base.nix` with content-hash identities; promotion and restoration idempotent by hash comparison; no shared `.prev`; GC root created at `Built` and kept through approval; dirty-Git staging defined by Nix-visible bytes.
-- §12c: length-prefixed CRC'd records with torn-tail handling; checkpoint-then-truncate compaction preserving all live state; filesystem contract for ext4/XFS/btrfs/ZFS with a sentinel fallback.
-- §8/§10: `SideEffects::Measurement` permits bounded network/local I/O for Readiness probes; `RemoteStateChange` stays Diagnostic; external dependencies are units with edges.
-
-## 25. Changes from v4.2
-
-- §9: `base_source` (owner source with base override) separated from `staged_source` (candidate tree); stale check compares the working tree to `base_source` only; both bound to the token; Git-revision wording removed; step numbering fixed.
-- §9/§12: `build` roots its own output under `gcroots/planarian/builds/` without a lease; the transaction adopts the root; orphan roots cleaned at startup.
-- §12: durable `OpId` journaled before every mutating call and tagged onto the backend job; quiescence covers jobs discovered by `jobs_tagged` for unacknowledged ops; a backend that cannot say → `RecoveryFailed`.
-- §12/§12c: `RecoveryFailed` sets a persisted **recovery interlock** carried in the checkpoint; cleared only by administrator `planarian resolve`; crash table row for `Checking, ReobserveOnly`.
-- Consistency: `ProbeRole`, canonical-probe paragraph, and agent instruction 4 all carry the `Measurement` exception; I12's terminal set includes `Rejected` and `Cancelled`.
-- I4 reworded to applicable Readiness probes; atomic transaction creation with initial lease; `Rejected`/`Cancelled` terminal states; incident closure on the desired predicate; `SessionEstablished` scoped to `user`-class sessions and a specific session id; intent-case scoring scoped to autonomous action.
-
-## 26. Changes from v4.3
-
-Incorporates the owner-approved conceptual review (Future Work v0.2 §1.1–§1.11 and the decisions in its §13).
-
-- §7: principles 13–15 (reference monitor and species-blind principals; invisible under normal use; failure response enforced outside the monitor); principle 9 generalized to attributed overrides. Invariants I16 (security floor), I17 (administrator set non-empty), I18 (hash-chained journal), I19 (no self-approval, no self-escalation), I20 (no agent without the monitor).
-- §8: `Suppression` generalized to `Override { desired: LeaveAlone | Stopped | Absent | Detected, attribution }`; `Suppress`/`Unsuppress` become `SetOverride`/`LiftOverride`; `UnitStatus::Overridden`. `Actor::User` carries session, seat, and active; `Actor::Agent` reserved. `Condition::Foreground`. `security_floor` in `SystemState`; `below_security_floor` and `other_sessions_affected` in `DerivedFacts`. Typed probe kinds `DBus`, `FilePresent`; `Exec` administrator-only. `Posture`, `FailureClass`. `RejectReason` gains the `Unauthorized`, `Interrupted`, and `NoSpace` variants v4.3 used but did not declare.
-- §9: probe-kind rule; signed external desired-state source (hook); catalog coverage as a gym metric; `NotInCatalog` by phase; graphical-session readiness bound to the session's compositor; learned edges need a gym case. New §9a: PlanarianOS as a distribution with three profiles, per-profile gates, accounts, live mode.
-- §10: foreground signals; user services desired while any session of the uid exists; actor resolution from logind; boot report; signed health report (hook) with a core-computed disclosure profile.
-- §11: principals and capabilities; Phase B non-human grants; overrides on Security units need an administrator; per-session "own session"; multi-user and security-floor floors; approval as a capability with no self-approval; deliberate actions carry identity; the unattributed residue by posture.
-- §12: activation window and sandbox check on the generation path. New §12d (boot ordering, `planarian-ready.target`, failure classes, responses, four postures, configurable timeout, boot-chain locking), §12e (security floor), §12f (activation scheduling and quiet mode), §12g (sandbox tier, Phase B). §12c: hash-chained records and chain head in the checkpoint.
-- §13–§14: overrides; quiet-mode deferral; attributed stop phrasings.
-- §15: v4.4 acceptance cases; malicious-declaration family; invisibility, coverage, AskFirst-rate, and verification metrics as ratchets; Firecracker target non-gating from A.
-- §16: CLI additions; frontends section (the console is one optional frontend).
-- §17a: the verification ratio d:a and the trust count reported at every gate. Phase A proof targets add I16 (in `decide` and target selection) and I19.
-- §18: agent instructions 10–17; rule 4's preserve list extended to I10–I20.
-- §4, §5, §6, §19, §20, §21: roadmap rows (Phase C is PlanarianOS), scope, layout, decisions, model residency, broker and future directions, invisibility budget. §20's idle unload stays at 10 min, now declared rather than fixed.
-- §1–§3: overview prose, the diagram, and feature-table rows updated to overrides, attributed actions, the security floor, failure posture, quiet mode, and the sandbox tier.
-- Consistency pass after review: `Decision::Allow` carries an `ApproverClass`; `ApprovalToken` binds its approver; `PrincipalId`, `Capability`, `Grant`, and `Authorization` declared; `Actor::Unattributed` for inferred overrides, which never apply to Security-sensitive units; `EscalationReason` (including `RevertBlockedByFloor`); a boot-only generation path with the `AwaitingBoot` state; I1 and I6 clarified against the floor and waiting transactions; the v4-review Security-override case changed from rejected to held for administrator approval; CLI verbs `override`/`release` replace `suppress`/`unsuppress`; §12c's checkpoint also carries overrides and the security floor.
-
-## 27. Changes from v4.4
-
-Incorporates the spec vulnerability review of Oct 29 (findings B-1–B-18 against commit `1bc09b2`).
-
-- §5, §6, §7, §17b, §18: the bypass register `docs/bypasses.md`; principle 16 (name every way around); agent rule 18; no gate passes with an open High row (B-14 and the review's appendix).
-- §7: principle 6 and I14 extended from proposals to every request field (B-3); I2 states what the A–D core hash detects (B-12); I16 states the inspected set (B-2); I18 states whom the chain holds against (B-8).
-- §10, §11: identity from a pidfd, never a bare pid (B-6); a caller property that matters is established by the daemon (B-3); agents are their own principals, started by `planarian agent run` with `DynamicUser=` (B-1); approval's terminal established by the daemon (B-3); `inferStops = false` exempts units from residue inference, and inferred overrides stay listed until acknowledged (B-11; the review's `Critical` sensitivity became this manifest option, so no proved type changes); sensitivity completeness with fail-closed defaults and a gym entry (B-5).
-- §10: the boot report covers units in A, processes from C, and flags a test build (B-10, B-13).
-- §12c: chain head in the signed health report for off-machine witnessing (C), measured-boot anchor (E); the external source's sequence number in the checkpoint (B-8, B-16).
-- §12d: alarms are local in A; a dead-man signal from C; the core hash covers every Planarian binary and script; a test build is an `Integrity` failure (B-9, B-12, B-13).
-- §12e: the floor is derived from the whole system closure, with a CVE feed from B; gym case for a service-package fix (B-2).
-- §12h (new): time on `CLOCK_BOOTTIME` for everything that does not survive a reboot; NTS recommended (B-7).
-- §20, I9: the model is treated as an adversary, so its judgement is not a vector; containment is, and the model service's sandbox is now normative, with a gym case in B (B-18; the review's accepted row X-9 withdrawn).
-- §11, §19: `inferStops` marked provisional, with the condition for replacing it by an `importance` property.
-- §15, §16: test builds named and confined; socket slots reserved for administrators and sessions; `agent run`; new metrics (B-13, B-15, B-1).
-- §17a: 𝒯 accounted as platform trust, proof-validity trust (now including the specifications, Verus, Z3, and rustc), and the internal-unproven count; every proved invariant gets a gym entry written from the English (B-4, B-14).
-- Not spec changes: `guarantees.md` says Kani runs by hand, but CI runs it (B-17; correct the doc).
+The changes from v3 through v4.4 (§22–§27) are in `docs/spec-history.md`, with their section numbers unchanged. Only the latest revision's changes stay in this file.
 
 ## 28. Changes from v4.5
 
@@ -1135,6 +1074,8 @@ Incorporates the Phase A close-out review of Oct 30 against commit `805cd1c`: fo
 
 - §17a: the accounting is checked (no duplicate ids, baseline invariants required, obligations tied to verifier output) [R14, D1]; the Phase A proof status stated, with the residue Kani harnesses and the I17 proof named as still required [D4].
 - §17b: three tables, Closed rows kept; B-20 and X-12 [D13].
+- §17c (new, Oct 31): the guarantees site; bypass rows name the invariants they limit; rule 22.
+- I6, §10, §12 Concurrency (owner decision, Oct 31): unit and device repairs run during a boot-only `Promoted`, and a canonical unit that needed a repair since admission means the change is not confirmed.
 - §18: rules 19–21 (the handoff order; equivalent effects; nothing from a failed tool); rule 4's preserve list to I25 [D5].
 - §19: the Oct 30 decisions recorded; two owner items added [Q7, Q8].
 - §6: the layout describes the repository as it is [D14, H14].
