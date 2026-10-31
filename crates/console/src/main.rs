@@ -168,7 +168,11 @@ impl Console {
             return Some((Motion::Working, n.clone()));
         }
         r.status.in_flight.first().map(|(t, state, what)| {
-            (Motion::Working, format!("working on #{}: {what} ({})", t.0, planarian_state_name(state)))
+            if *state == planarian_schema::TxnState::AwaitingBoot {
+                (Motion::Still, format!("waiting for a restart: #{}: {what}", t.0))
+            } else {
+                (Motion::Working, format!("working on #{}: {what} ({})", t.0, planarian_state_name(state)))
+            }
         })
     }
 
@@ -394,6 +398,7 @@ fn timeline<'a>(r: &'a ConsoleReport) -> Element<'a, Message> {
 
 fn planarian_state_name(s: &planarian_schema::TxnState) -> String {
     match s {
+        planarian_schema::TxnState::AwaitingBoot => "waiting for a restart".into(),
         planarian_schema::TxnState::Rejected(r) => format!("Rejected ({r:?})"),
         planarian_schema::TxnState::Cancelled(a) => format!("Cancelled by {a:?}"),
         other => format!("{other:?}"),

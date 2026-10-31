@@ -141,6 +141,9 @@ pub struct Call {
 #[derive(Debug, Default)]
 pub struct World {
     pub now: Timestamp,
+    /// Absolute simulation time at the start of this boot. Evidence and wall
+    /// time stay monotonic while CLOCK_BOOTTIME restarts at zero.
+    pub boot_started: Timestamp,
     /// Wall clock minus boot clock, in ms (`set_wall_clock`, §12h).
     pub wall_skew: i64,
     // ---- NixOS ----
@@ -534,6 +537,7 @@ impl World {
     }
 
     pub fn reboot(&mut self) {
+        self.boot_started = self.now;
         // A one-shot entry boots once; one that fails to boot falls back to
         // the default (the boot loader's own fallback).
         self.booted = match self.one_shot.take() {
@@ -1197,7 +1201,7 @@ impl ProcessBackend for Fake {
 }
 
 impl Clock for Fake {
-    /// The world's `now` is elapsed time (boot time); the wall clock is it
+    /// The world's `now` is elapsed simulation time; the wall clock is it
     /// plus `wall_skew`, which only `set_wall_clock` moves (§12h).
     fn now(&self) -> Timestamp {
         let w = self.w();
@@ -1205,7 +1209,8 @@ impl Clock for Fake {
     }
 
     fn boot_now(&self) -> Timestamp {
-        self.w().now
+        let w = self.w();
+        Timestamp(w.now.0.saturating_sub(w.boot_started.0))
     }
 
     fn sleep(&self, d: Millis) {
@@ -1252,7 +1257,12 @@ impl Backends for Fake {
 /// A fake machine built from the gym fixtures (catalog `[[fixture]]`), on its
 /// first generation, healthy, with nobody logged in.
 pub fn gym_world(store: MemStore) -> Fake {
-    let mut w = World { now: Timestamp(1_700_000_000_000), power: Some(PowerSource::Ac), ..Default::default() };
+    let mut w = World {
+        now: Timestamp(1_700_000_000_000),
+        boot_started: Timestamp(1_700_000_000_000),
+        power: Some(PowerSource::Ac),
+        ..Default::default()
+    };
     w.base_units = fixtures::gym_units();
     w.base_user_units = fixtures::gym_user_units();
     w.base_options = [

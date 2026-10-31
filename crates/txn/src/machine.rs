@@ -14,7 +14,8 @@ verus! {
 ///   trigger generation reversion); it may commit from Activating (crash table).
 /// - Only generation operations pass through Published and Promoted.
 /// - The boot-only path (§12 step 7, §12f): Built → PublishingBoot → AwaitingBoot (a one-shot
-///   next-boot entry) → Promoted (it booted and passed) or Reverted (it did
+///   next-boot entry) → Promoted (readiness admission, waiting for the same-boot
+///   ten-minute confirmation) or Reverted (it did
 ///   not; the bootloader already fell back), or Reverting to withdraw the entry.
 /// - Any state in which mutation may have happened can end in RecoveryFailed.
 pub open spec fn step_spec(from: TxnState, to: TxnState, strategy: RecoveryStrategy) -> bool {
@@ -128,8 +129,10 @@ pub open spec fn rank(s: TxnState) -> nat {
     }
 }
 
-/// I12, termination: every allowed step lowers the rank, so a transaction
-/// takes at most eight steps and never cycles.
+/// I12, step termination: every allowed step lowers the rank, so a transaction
+/// takes at most eight steps and never cycles. Waiting is separate: Built has
+/// the §12f bound, AwaitingBoot waits for a reboot, and admitted Promoted waits
+/// for the §10 same-boot checkpoint.
 pub proof fn i12_steps_terminate(from: TxnState, to: TxnState, strategy: RecoveryStrategy)
     requires
         step_spec(from, to, strategy),

@@ -815,6 +815,179 @@ fn waiting_generation_is_prepared_again_after_a_restart() {
     );
 }
 
+#[test]
+fn foreground_waiting_expires_with_a_named_reissue_notice_and_reopens_its_incident() {
+    let mut r = Rig::new();
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        graphical: true,
+        created: Timestamp(0),
+        active: true,
+        idle: false,
+    });
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    let args = [("scale".to_string(), Value::Str("1.25".into()))].into();
+    let response = r.core.handle(ALICE.in_session("s1"), Request::Apply { change: ChangeId("font-scale".into()), args });
+    let Response::Done { txn, state: TxnState::Built, .. } = response else {
+        panic!("must wait: {response:?}");
+    };
+    // A linked repair has consumed an attempt while waiting. Cancellation
+    // returns that slot and lifts its hold without claiming a successful fix.
+    let incident = Incident {
+        id: IncidentId(99),
+        kind: IncidentKind::Repair,
+        target: UnitId::service("gym-web"),
+        divergence: (DesiredStatus::Running, UnitStatus::Stopped),
+        opened: Timestamp(0),
+        attempts: vec![(txn, Outcome::Unknown("Built".into()))],
+        budget_left: 0,
+        state: IncidentState::Cooldown { until: Timestamp(u64::MAX) },
+        backoff: Millis::secs(60),
+        next_attempt: Timestamp(u64::MAX),
+        regressions: 0,
+    };
+    r.core.incidents.incidents.insert(incident.id, incident.clone());
+    r.core.journal(Record::Incident(incident));
+    r.fake.w().units.get_mut(&UnitId::service("gym-web")).unwrap().observed =
+        Observed::Failed(Reason::ExitCode(1));
+    r.fake.advance(planarian_exec::PARKING_LIMIT);
+    // The tick cancels even while quiet mode is still holding. Its notice
+    // follows the normal non-urgent quiet queue rather than interrupting.
+    r.core.tick();
+    assert_eq!(r.core.ledger().terminal[&txn].state, TxnState::Cancelled(Actor::Daemon));
+    assert_eq!(r.fake.w().current, GenerationId(1));
+    assert!(r.core.quiet_queue.iter().any(|n| {
+        n.contains("cancelled after waiting 24 hours")
+            && n.contains("font-scale")
+            && n.contains("planarian apply font-scale scale=1.25")
+    }));
+    let now = r.fake.clock().now();
+    let reopened = &r.core.ledger().incidents[&IncidentId(99)];
+    assert_eq!(reopened.state, IncidentState::Open);
+    assert_eq!(reopened.budget_left, 1);
+    assert_eq!(reopened.next_attempt, now);
+    assert!(matches!(&reopened.attempts[0].1, Outcome::Unknown(_)));
+}
+
+#[test]
+fn published_boot_candidate_waits_without_limit_and_repeats_restart_notice_daily() {
+    let mut r = Rig::new();
+    r.fake.w().rules.push(planarian_fake::Rule {
+        option: "planarian.reference.fontScale".into(),
+        value: Value::Str("1.25".into()),
+        effect: planarian_fake::Effect::NeedsReboot,
+    });
+    let args = [("scale".to_string(), Value::Str("1.25".into()))].into();
+    let response = r.core.handle(ALICE, Request::Apply { change: ChangeId("font-scale".into()), args });
+    let Response::Done { txn, state: TxnState::AwaitingBoot, .. } = response else {
+        panic!("must publish for boot: {response:?}");
+    };
+    let candidate = r.core.ledger().live[&txn].txn.candidate.as_ref().unwrap().0;
+    let root = r.core.ledger().live[&txn].txn.gc_root.clone().unwrap();
+    let reminders = |core: &Core<Fake, MemStore>| {
+        core.notices.iter().filter(|n| n.contains("waiting for a restart") && n.contains("restart to finish")).count()
+    };
+    assert_eq!(reminders(&r.core), 1);
+    r.fake.advance(Millis(RESTART_REMINDER.0 - 1));
+    r.core.tick();
+    assert_eq!(reminders(&r.core), 1);
+    r.fake.advance(Millis(1));
+    r.core.tick();
+    assert_eq!(reminders(&r.core), 2);
+    r.fake.advance(RESTART_REMINDER);
+    r.core.tick();
+    assert_eq!(reminders(&r.core), 3);
+    assert_eq!(r.core.ledger().live[&txn].txn.state, TxnState::AwaitingBoot);
+    assert!(r.core.status().in_flight.iter().any(|(id, state, _)| *id == txn && *state == TxnState::AwaitingBoot));
+    assert_eq!(r.fake.w().boot_default, GenerationId(1));
+    assert!(r.fake.w().boot_entries.contains(&candidate));
+    assert!(r.fake.w().gc_roots.contains(&root));
+    assert_eq!(r.fake.w().current, GenerationId(1));
+}
+
+fn admitted_boot_candidate() -> (Rig, TxnId, GenerationId, Hash) {
+    let mut r = Rig::new();
+    r.fake.w().rules.push(planarian_fake::Rule {
+        option: "planarian.reference.fontScale".into(),
+        value: Value::Str("1.25".into()),
+        effect: planarian_fake::Effect::NeedsReboot,
+    });
+    let args = [("scale".to_string(), Value::Str("1.25".into()))].into();
+    let response = r.core.handle(ALICE, Request::Apply { change: ChangeId("font-scale".into()), args });
+    let Response::Done { txn, state: TxnState::AwaitingBoot, .. } = response else {
+        panic!("must publish for boot: {response:?}");
+    };
+    let candidate = r.core.ledger().live[&txn].txn.candidate.as_ref().unwrap().0;
+    r.fake.w().alive.remove(&100);
+    r.fake.w().reboot();
+    r.fake.w().alive.insert(101);
+    let boot_id = Hash::of(b"admitted boot");
+    r.core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id },
+        config(),
+    );
+    assert_eq!(r.core.ledger().live[&txn].txn.state, TxnState::Promoted);
+    assert_eq!(r.fake.w().boot_default, candidate);
+    assert_eq!(r.core.ledger().known_good, Some(GenerationId(1)));
+    assert_eq!(r.core.ledger().live_tested, None);
+    (r, txn, candidate, boot_id)
+}
+
+#[test]
+fn admitted_candidate_confirms_at_ten_boot_minutes_across_a_daemon_restart() {
+    let (mut r, txn, candidate, boot_id) = admitted_boot_candidate();
+    // Admission probes may consume boot time. Test the checkpoint itself,
+    // not ten minutes after this process happened to start.
+    let remaining = CONFIRM_AFTER.0 - r.fake.clock().boot_now().0 - 1;
+    r.fake.advance(Millis(remaining));
+    r.core.tick();
+    assert_eq!(r.core.ledger().live[&txn].txn.state, TxnState::Promoted);
+    assert_eq!(r.core.ledger().known_good, Some(GenerationId(1)));
+    assert_eq!(r.core.ledger().live_tested, None);
+    r.fake.w().alive.remove(&101);
+    r.fake.w().alive.insert(102);
+    let mut cfg = config();
+    cfg.fresh_boot = false;
+    r.core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 102, boot_id },
+        cfg,
+    );
+    assert_eq!(r.core.ledger().live[&txn].txn.state, TxnState::Promoted);
+    r.fake.advance(Millis(1));
+    r.core.tick();
+    let ledger = r.core.ledger();
+    assert_eq!(ledger.terminal[&txn].state, TxnState::Committed);
+    assert_eq!(ledger.known_good, Some(candidate));
+    assert_eq!(ledger.live_tested, None, "a boot-only candidate is never live-tested");
+    assert_eq!(r.calls("activate_live"), 0);
+}
+
+#[test]
+fn failed_canonical_confirmation_restores_the_boot_fallback_without_live_activation() {
+    let (mut r, txn, candidate, _) = admitted_boot_candidate();
+    r.fake.w().blocked.insert(UnitId::service("sshd"));
+    let remaining = CONFIRM_AFTER.0 - r.fake.clock().boot_now().0;
+    r.fake.advance(Millis(remaining));
+    r.core.tick();
+    let ledger = r.core.ledger();
+    assert_eq!(ledger.terminal[&txn].state, TxnState::Reverted);
+    assert_eq!(ledger.known_good, Some(GenerationId(1)));
+    assert_eq!(ledger.live_tested, None);
+    assert_eq!(r.fake.w().boot_default, GenerationId(1));
+    assert_eq!(r.fake.w().current, candidate, "the recovery takes effect at restart");
+    assert_eq!(r.calls("activate_live"), 0);
+    assert!(r.core.notices.iter().any(|n| n.contains("restart to finish recovery")));
+}
+
 /// §9 hook: a verified external document's units join the generation's;
 /// a failure of one says where its declaration came from (future-work T5);
 /// a unit the generation declares stays the generation's.

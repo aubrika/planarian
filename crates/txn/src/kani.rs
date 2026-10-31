@@ -93,6 +93,18 @@ fn path_ok(from: &TxnState, strategy: RecoveryStrategy, path: &[TxnState]) {
     assert!(path[path.len() - 1].is_terminal());
 }
 
+/// SPEC §10's only admission pause is Promoted. Completion paths continue to
+/// use path_ok's terminal assertion; this checks the actual pending path.
+fn admitted_boot_wait_ok(from: &TxnState, strategy: RecoveryStrategy, path: &[TxnState]) {
+    assert!(idx(&path[0]) == idx(from));
+    let mut i = 0;
+    while i + 1 < path.len() {
+        assert!(step_allowed(&path[i], &path[i + 1], strategy));
+        i += 1;
+    }
+    assert!(idx(&path[path.len() - 1]) == idx(&TxnState::Promoted));
+}
+
 /// `revert_generation` / `revert_device` from `from`: Reverting (unless
 /// already there), then Reverted or RecoveryFailed.
 fn reverts_ok(from: &TxnState, strategy: RecoveryStrategy) {
@@ -140,8 +152,12 @@ fn action_ok(action: RecoveryAction, from: &TxnState, strategy: RecoveryStrategy
             reverts_ok(from, strategy);
         }
         A::WriteCommitted => {
+            // Boot-only admission parks here until the same-boot checkpoint;
+            // checkpoint failure restores the publishing boot/default source.
+            admitted_boot_wait_ok(from, strategy, &[Promoted]);
             path_ok(from, strategy, &[Promoted, Committed]);
             path_ok(from, strategy, &[Promoted, RecoveryFailed]);
+            reverts_ok(from, strategy);
         }
         A::RevertGeneration | A::RevertDevice => reverts_ok(from, strategy),
         A::DriverBound => {
@@ -155,7 +171,7 @@ fn action_ok(action: RecoveryAction, from: &TxnState, strategy: RecoveryStrategy
             reverts_ok(from, strategy);
         }
         A::ReconcileBootPublication => {
-            path_ok(from, strategy, &[PublishingBoot, AwaitingBoot, Promoted, Committed]);
+            admitted_boot_wait_ok(from, strategy, &[PublishingBoot, AwaitingBoot, Promoted]);
             path_ok(from, strategy, &[PublishingBoot, AwaitingBoot, Promoted, RecoveryFailed]);
             path_ok(from, strategy, &[PublishingBoot, AwaitingBoot, RecoveryFailed]);
             path_ok(from, strategy, &[PublishingBoot, AwaitingBoot, Reverting, Reverted]);
@@ -165,7 +181,7 @@ fn action_ok(action: RecoveryAction, from: &TxnState, strategy: RecoveryStrategy
         A::AwaitBoot => {
             // After a reboot (before one, the transaction is left as is):
             // the candidate booted and passed, failed, or did not boot.
-            path_ok(from, strategy, &[AwaitingBoot, Promoted, Committed]);
+            admitted_boot_wait_ok(from, strategy, &[AwaitingBoot, Promoted]);
             path_ok(from, strategy, &[AwaitingBoot, Promoted, RecoveryFailed]);
             path_ok(from, strategy, &[AwaitingBoot, RecoveryFailed]);
             path_ok(from, strategy, &[AwaitingBoot, Reverted]);
@@ -179,7 +195,8 @@ fn action_ok(action: RecoveryAction, from: &TxnState, strategy: RecoveryStrategy
 /// every state a live transaction can be left in, under every strategy,
 /// every path recovery can take starts at that state, takes only steps
 /// `machine::step_allowed` permits (the Verus-verified rules), and ends in a
-/// terminal state. Nothing mutated is ever answered with a refusal, and
+/// terminal state or the explicit admitted-boot checkpoint wait. Nothing
+/// mutated is ever answered with a refusal, and
 /// anything not yet mutated is.
 #[kani::proof]
 #[kani::unwind(6)]

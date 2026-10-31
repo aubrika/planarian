@@ -545,6 +545,89 @@ fn session(id: &str, uid: u32) -> SessionInfo {
     }
 }
 
+fn waiting_font_scale(r: &mut Rig) -> TxnId {
+    r.fake.w().sessions.push(session("s1", ALICE));
+    r.fake.w().foreground.insert("s1".into());
+    let result = r.propose(change("font-scale", &[("scale", Value::Str("1.25".into()))]), alice());
+    let Submitted::Finished { txn, state: TxnState::Built, .. } = result else {
+        panic!("must wait in Built: {result:?}");
+    };
+    txn
+}
+
+#[test]
+fn foreground_parking_expires_at_24_boot_hours_and_releases_the_candidate() {
+    let mut r = Rig::new();
+    let id = waiting_font_scale(&mut r);
+    let root = r.ex.kernel.journal.ledger().live[&id].txn.gc_root.clone().unwrap();
+    let (state, _) = r.observe();
+    // Neither direction of wall-clock correction changes the boot deadline.
+    r.fake.w().wall_skew = 48 * 3600 * 1000;
+    assert!(r.ex.activate_waiting(&state).is_empty());
+    r.fake.w().wall_skew = -48 * 3600 * 1000;
+    r.fake.advance(Millis(PARKING_LIMIT.0 - 1));
+    assert!(r.ex.activate_waiting(&state).is_empty());
+    assert!(r.fake.w().gc_roots.contains(&root));
+    r.fake.advance(Millis(1));
+    let expired = r.ex.activate_waiting(&state);
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].0, id);
+    assert_eq!(finished(&expired[0].1), TxnState::Cancelled(Actor::Daemon));
+    assert_eq!(r.ex.kernel.journal.ledger().terminal[&id].state, TxnState::Cancelled(Actor::Daemon));
+    assert!(!r.fake.w().gc_roots.contains(&root));
+    assert_eq!(r.fake.w().current, GenerationId(1));
+    assert_eq!(r.fake.w().boot_default, GenerationId(1));
+    assert!(!r.fake.w().calls.iter().any(|c| c.call == "activate_live" || c.call == "publish_boot_once"));
+    assert!(r.ex.activate_waiting(&state).is_empty(), "cancellation is reported once");
+}
+
+#[test]
+fn opening_the_window_at_the_deadline_cancels_instead_of_activating() {
+    let mut r = Rig::new();
+    let id = waiting_font_scale(&mut r);
+    r.fake.advance(PARKING_LIMIT);
+    r.fake.w().foreground.clear();
+    let (state, _) = r.observe();
+    let results = r.ex.activate_waiting(&state);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, id);
+    assert_eq!(finished(&results[0].1), TxnState::Cancelled(Actor::Daemon));
+    assert_eq!(r.fake.w().current, GenerationId(1));
+}
+
+#[test]
+fn a_window_before_the_parking_deadline_still_activates() {
+    let mut r = Rig::new();
+    let id = waiting_font_scale(&mut r);
+    r.fake.advance(Millis(PARKING_LIMIT.0 - 60_000));
+    r.fake.w().foreground.clear();
+    let (state, _) = r.observe();
+    let results = r.ex.activate_waiting(&state);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, id);
+    assert_eq!(finished(&results[0].1), TxnState::Committed);
+    assert_ne!(r.fake.w().current, GenerationId(1));
+}
+
+#[test]
+fn failed_cancellation_keeps_the_waiting_plan_and_root_for_retry() {
+    let mut r = Rig::new();
+    let id = waiting_font_scale(&mut r);
+    let root = r.ex.kernel.journal.ledger().live[&id].txn.gc_root.clone().unwrap();
+    r.fake.advance(PARKING_LIMIT);
+    r.fake.store.set_enospc(true);
+    let failed = r.ex.expire_waiting();
+    assert_eq!(failed.len(), 1);
+    assert!(matches!(&failed[0].1, Submitted::Error(_)));
+    assert_eq!(r.ex.kernel.journal.ledger().live[&id].txn.state, TxnState::Built);
+    assert!(r.fake.w().gc_roots.contains(&root));
+    r.fake.store.set_enospc(false);
+    let retried = r.ex.expire_waiting();
+    assert_eq!(retried.len(), 1);
+    assert_eq!(finished(&retried[0].1), TxnState::Cancelled(Actor::Daemon));
+    assert!(!r.fake.w().gc_roots.contains(&root));
+}
+
 /// authz-nonadmin-stops-network-other-session, at the executor: the session
 /// facts come from logind, and decide the floor.
 #[test]

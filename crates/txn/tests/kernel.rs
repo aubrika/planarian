@@ -698,13 +698,19 @@ fn every_generation_completion_establishes_the_same_floor() {
                     w.one_shot = None;
                     w.last_booted = Some(G2);
                     w.current = G2;
+                    w.now = Timestamp(1_000);
                 }
                 if watchdog {
                     rig.kill(DAEMON);
-                    assert_eq!(rig.watchdog().recover(id, 1).unwrap(), TxnState::Committed);
+                    assert_eq!(rig.watchdog().recover(id, 1).unwrap(), TxnState::Promoted);
                 } else {
-                    assert_eq!(daemon.run(id).unwrap(), TxnState::Committed);
+                    assert_eq!(daemon.run(id).unwrap(), TxnState::Promoted);
                 }
+                let pending = planarian_txn::journal::Journal::open(rig.store.clone()).unwrap();
+                assert_eq!(pending.ledger().security_floor, None, "admission does not establish a floor");
+                assert_eq!(pending.ledger().live_tested, None, "boot-only never becomes live-tested");
+                rig.w().now = Timestamp(600_000);
+                assert_eq!(rig.daemon2().confirm_boot(id, true).unwrap(), TxnState::Committed);
             } else if watchdog {
                 daemon.crash_at = Some(CrashPoint::State("Promoted"));
                 lost_or_crashed(daemon.run(id));
@@ -716,6 +722,9 @@ fn every_generation_completion_establishes_the_same_floor() {
             let journal = planarian_txn::journal::Journal::open(rig.store.clone()).unwrap();
             assert_eq!(journal.ledger().security_floor, Some(G2));
             assert_eq!(journal.ledger().terminal[&id].state, TxnState::Committed);
+            assert_eq!(journal.ledger().live_tested, if boot_only { None } else { Some(G2) });
+            assert_eq!(journal.ledger().known_good, if boot_only { Some(G2) } else { None });
+            assert_eq!(rig.w().gen_overrides.get(&G2), Some(&cand_override()));
         }
     }
 }
@@ -744,8 +753,9 @@ fn watchdog_admits_boot_completion_only_after_the_publishing_boot() {
         OwnerId::Watchdog { pid: WATCHDOG, boot_id: Hash::of(b"the candidate boot") },
     );
     assert!(watchdog.watchdog_should_take_over(&parked), "new-boot completion is watchdog-owned if needed");
-    assert_eq!(watchdog.recover(id, 1).unwrap(), TxnState::Committed);
-    assert_eq!(watchdog.journal.ledger().security_floor, Some(G2));
+    assert_eq!(watchdog.recover(id, 1).unwrap(), TxnState::Promoted);
+    assert_eq!(watchdog.journal.ledger().security_floor, None);
+    assert_eq!(watchdog.journal.ledger().live_tested, None);
 }
 
 #[test]
@@ -924,4 +934,78 @@ fn intentional_boot_parking_has_no_forced_reboot_or_untracked_cancellation() {
     assert_eq!(rig.w().one_shot, Some(G2));
     assert!(rig.w().calls.iter().all(|c| !c.call.starts_with("activate_live")));
     assert!(!rig.w().gc_roots.is_empty());
+}
+
+fn admitted_boot(rig: &Rig) -> (K, TxnId) {
+    let mut daemon = rig.daemon();
+    daemon.journal.append(Timestamp(1), planarian_txn::ledger::Record::KnownGood(G1)).unwrap();
+    let mut transaction = good_change();
+    transaction.check.required_floor = Some(G2);
+    transaction.check.floor_fixes = vec!["inspected-package-fix".into()];
+    let id = daemon.prepare(transaction).unwrap();
+    assert_eq!(daemon.run_boot_only(id).unwrap(), TxnState::AwaitingBoot);
+    {
+        let mut w = rig.w();
+        w.one_shot = None;
+        w.last_booted = Some(G2);
+        w.current = G2;
+        w.now = Timestamp(1_000);
+    }
+    assert_eq!(daemon.run(id).unwrap(), TxnState::Promoted);
+    (daemon, id)
+}
+
+#[test]
+fn watchdog_does_not_supply_the_daemons_boot_confirmation_checkpoint() {
+    let rig = Rig::new();
+    let (_, id) = admitted_boot(&rig);
+    rig.w().now = Timestamp(600_000);
+    let mut watchdog = rig.watchdog();
+    let before = watchdog.journal.ledger().clone();
+    assert_eq!(watchdog.confirm_boot(id, true).unwrap(), TxnState::Promoted);
+    assert_eq!(watchdog.journal.sync_ledger().unwrap(), &before);
+    assert_eq!(watchdog.journal.ledger().known_good, Some(G1));
+    assert_eq!(watchdog.journal.ledger().security_floor, None);
+}
+
+#[test]
+fn boot_completion_requires_durable_generation_override_metadata_before_bookkeeping() {
+    let rig = Rig::new();
+    let (mut daemon, id) = admitted_boot(&rig);
+    rig.w().now = Timestamp(600_000);
+    rig.w().fail_record_override = true;
+    assert!(matches!(daemon.confirm_boot(id, true), Err(KernelError::Completion(_))));
+    assert_eq!(state_of(&mut daemon, id), TxnState::Promoted);
+    assert_eq!(daemon.journal.ledger().known_good, Some(G1));
+    assert_eq!(daemon.journal.ledger().live_tested, None);
+    assert_eq!(daemon.journal.ledger().security_floor, None);
+    rig.w().fail_record_override = false;
+    assert_eq!(daemon.confirm_boot(id, true).unwrap(), TxnState::Committed);
+    assert_eq!(daemon.journal.ledger().known_good, Some(G2));
+    assert_eq!(daemon.journal.ledger().security_floor, Some(G2));
+    assert_eq!(rig.w().gen_overrides.get(&G2), Some(&cand_override()));
+}
+
+#[test]
+fn an_unsupported_boot_admission_never_implies_confirmation() {
+    use planarian_txn::ledger::{BootAdmission, Record};
+    let rig = Rig::new();
+    let (mut daemon, id) = admitted_boot(&rig);
+    daemon
+        .journal
+        .append(
+            Timestamp(2),
+            Record::BootAdmitted {
+                txn: id,
+                epoch: 1,
+                admission: BootAdmission { version: 0, boot_id: Hash::ZERO, boot_at: Timestamp(1_000) },
+            },
+        )
+        .unwrap();
+    rig.w().now = Timestamp(600_000);
+    assert_eq!(daemon.confirm_boot(id, true).unwrap(), TxnState::RecoveryFailed);
+    assert!(daemon.journal.ledger().interlocked());
+    assert_eq!(daemon.journal.ledger().known_good, Some(G1));
+    assert_eq!(daemon.journal.ledger().security_floor, None);
+    assert_eq!(daemon.journal.ledger().live_tested, None);
 }

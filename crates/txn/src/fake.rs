@@ -66,6 +66,8 @@ pub struct World {
     /// `activate_live` of these generations fails outright.
     pub fail_activate: BTreeSet<GenerationId>,
     pub fail_publish: bool,
+    pub fail_record_override: bool,
+    pub gen_overrides: BTreeMap<GenerationId, Hash>,
     pub jobs_tagged_unknown: bool,
     pub calls: Vec<CallLog>,
     pub alive: BTreeSet<u32>,
@@ -301,7 +303,12 @@ impl GenerationBackend for FakeHost {
         Ok(None)
     }
 
-    fn record_override(&self, _g: GenerationId, _hash: &Hash) -> Result<(), Outcome> {
+    fn record_override(&self, g: GenerationId, hash: &Hash) -> Result<(), Outcome> {
+        let mut w = self.w();
+        if w.fail_record_override {
+            return Err(Outcome::Failed("cannot durably record generation override".into()));
+        }
+        w.gen_overrides.insert(g, *hash);
         Ok(())
     }
 
@@ -410,6 +417,10 @@ impl Host for FakeHost {
             return Verdict::Fail(format!("{dev} bound to {}", d.as_ref().expect("checked").name));
         }
         Verdict::Pass
+    }
+
+    fn check_boot_confirmation(&self, txn: &Transaction) -> Verdict {
+        self.check(txn, CheckPhase::Candidate)
     }
 
     fn release_gc_root(&self, path: &str) -> bool {

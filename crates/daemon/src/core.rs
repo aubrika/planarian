@@ -42,6 +42,7 @@ const AGENT_NAMES_MAX: usize = 256;
 const AGENT_NAMES_ROOT_RESERVE: usize = 32;
 /// How long an external dependency's probes time out before it is said.
 const UNREACHABLE_AFTER: Millis = Millis::secs(120);
+const RESTART_REMINDER: Millis = Millis::secs(24 * 3600);
 
 #[derive(Clone, Debug)]
 pub struct CoreConfig {
@@ -177,6 +178,8 @@ pub struct Core<B: Backends + Clone, S: Store> {
     last_health: Option<crate::hooks::HealthReport>,
     choices: BTreeMap<u32, Vec<intent::Match>>,
     incident_parked: BTreeMap<IncidentId, TxnId>,
+    /// Next boot-clock reminder for each published candidate (§12f).
+    restart_reminders: BTreeMap<TxnId, Timestamp>,
     confirm: Option<(GenerationId, Timestamp)>,
     manifest_gen: GenerationId,
     /// The running generation's manifest, before the external source joins it.
@@ -347,14 +350,21 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let asm = Assembler::new(manifest.clone(), cfg.exec.canonical.clone());
         let now = b.clock().now();
         let last_booted = b.generations().last_booted().ok();
+        let checkpoint = Timestamp(0).plus(CONFIRM_AFTER);
+        let admitted = ledger.live.values().any(|l| {
+            l.txn.state == TxnState::Promoted
+                && l.path.iter().any(|p| p == "AwaitingBoot")
+                && l.txn.candidate.as_ref().is_some_and(|(g, _)| *g == current)
+        });
         let confirm = match ledger.known_good {
-            None => Some((current, now.plus(CONFIRM_AFTER))),
+            _ if admitted => Some((current, checkpoint)),
+            None => Some((current, checkpoint)),
             Some(_)
                 if ledger.live_tested.is_some()
                     && ledger.live_tested == last_booted
                     && last_booted == Some(current) =>
             {
-                Some((current, now.plus(CONFIRM_AFTER)))
+                Some((current, checkpoint))
             }
             _ => None,
         };
@@ -371,6 +381,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             last_health: None,
             choices: BTreeMap::new(),
             incident_parked: BTreeMap::new(),
+            restart_reminders: BTreeMap::new(),
             confirm,
             manifest_gen: current,
             gen_manifest: manifest,
@@ -615,11 +626,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     txn.0,
                     render::transition(&p.transition)
                 )),
-                TxnState::AwaitingBoot => self.notice(format!(
-                    "transaction {}: {} takes effect when you restart; restart to finish",
-                    txn.0,
-                    render::transition(&p.transition)
-                )),
+                TxnState::AwaitingBoot => {
+                    self.restart_reminders.insert(*txn, self.b.clock().boot_now().plus(RESTART_REMINDER));
+                    self.notice(format!(
+                        "transaction {}: {} is waiting for a restart; restart to finish",
+                        txn.0,
+                        render::transition(&p.transition)
+                    ));
+                }
                 _ => {}
             }
         }
@@ -1145,6 +1159,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
         let l = self.ledger();
         if l.interlocked() {
+            for (id, r) in self.ex.expire_waiting() {
+                self.waiting_result(id, r, now);
+            }
             if !self.interlock_noted {
                 self.notice(
                     "recovery failed; autonomous repair is stopped until an administrator runs `planarian resolve`"
@@ -1162,11 +1179,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             // §12f: an activation window opened for a waiting generation.
             if !busy {
                 for (id, r) in self.ex.activate_waiting(&s) {
-                    self.notice(format!(
-                        "transaction {}: activated now that nothing is in the way: {}",
-                        id.0,
-                        render::submitted_short(&r)
-                    ));
+                    self.waiting_result(id, r, now);
+                }
+            } else {
+                // A concurrent repair cannot extend the parking limit.
+                for (id, r) in self.ex.expire_waiting() {
+                    self.waiting_result(id, r, now);
                 }
             }
             // Quiet mode defers garbage collection (§12f).
@@ -1185,8 +1203,71 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.notice(format!("journal compaction failed: {e:?}"));
         }
         self.confirm_boot(&s, &defs, now);
+        self.note_waiting_boot();
         self.note_space();
         self.note_unreachable(&s, &defs, now);
+    }
+
+    fn waiting_result(&mut self, id: TxnId, result: Submitted, now: Timestamp) {
+        if matches!(&result, Submitted::Finished { state: TxnState::Cancelled(Actor::Daemon), .. }) {
+            let transition = self.ledger().terminal.get(&id).map(|t| t.transition.clone());
+            if let Some(t) = transition {
+                let what = render::transition(&t);
+                let reissue = match t {
+                    Transition::ApplyChange { .. } => format!("run `planarian {what}`"),
+                    _ => "repeat the original request with `planarian ask`".to_string(),
+                };
+                self.notice(format!(
+                    "transaction {}: {what} was cancelled after waiting 24 hours for an activation window; to reissue it, {reissue}",
+                    id.0
+                ));
+            }
+            // No mutation occurred. Reopen the incident that was waiting on
+            // this attempt and return exactly the budget slot it consumed.
+            let reopened: Vec<Incident> = self
+                .incidents
+                .incidents
+                .values_mut()
+                .filter(|i| i.attempts.last().is_some_and(|(txn, _)| *txn == id))
+                .map(|i| {
+                    i.state = IncidentState::Open;
+                    i.budget_left = i.budget_left.saturating_add(1).min(planarian_incident::BUDGET);
+                    i.next_attempt = now;
+                    i.clone()
+                })
+                .collect();
+            for i in reopened {
+                self.journal(Record::Incident(i));
+            }
+        } else {
+            self.notice(format!(
+                "transaction {}: activation-window result: {}",
+                id.0,
+                render::submitted_short(&result)
+            ));
+        }
+    }
+
+    fn note_waiting_boot(&mut self) {
+        let now = self.b.clock().boot_now();
+        let waiting: Vec<(TxnId, Transition)> = self
+            .ledger()
+            .live
+            .values()
+            .filter(|t| t.txn.state == TxnState::AwaitingBoot)
+            .map(|t| (t.txn.id, t.txn.transition.clone()))
+            .collect();
+        self.restart_reminders.retain(|id, _| waiting.iter().any(|(t, _)| t == id));
+        for (id, transition) in waiting {
+            if self.restart_reminders.get(&id).is_none_or(|due| now >= *due) {
+                self.notice(format!(
+                    "transaction {}: {} is waiting for a restart; restart to finish",
+                    id.0,
+                    render::transition(&transition)
+                ));
+                self.restart_reminders.insert(id, now.plus(RESTART_REMINDER));
+            }
+        }
     }
 
     /// §10: a probe that times out yields Unknown, never Failed, so an
@@ -1422,9 +1503,42 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
     }
 
-    fn confirm_boot(&mut self, s: &SystemState, defs: &UnitDefs, now: Timestamp) {
+    fn confirm_boot(&mut self, s: &SystemState, defs: &UnitDefs, _now: Timestamp) {
+        // An admitted boot-only transaction remains Promoted across daemon and
+        // watchdog restarts. Its durable admission, rather than a fresh daemon
+        // startup time, defines the same-boot checkpoint.
+        let admitted = self.ledger().live.values().find(|l| {
+            l.txn.state == TxnState::Promoted && l.path.iter().any(|p| p == "AwaitingBoot")
+        }).map(|l| l.txn.clone());
+        if let Some(txn) = admitted {
+            if self.b.clock().boot_now() < Timestamp(0).plus(CONFIRM_AFTER) {
+                return;
+            }
+            let canonical_passed = txn.candidate.as_ref().is_some_and(|(g, _)| *g == s.generation)
+                && self.canonical_healthy(s, defs);
+            match self.ex.kernel.confirm_boot(txn.id, canonical_passed) {
+                Ok(TxnState::Committed) => {
+                    self.confirm = None;
+                    self.notice(format!("generation {} is now the boot-confirmed known-good baseline", s.generation.0));
+                    if let Some(g) = txn.check.required_floor {
+                        self.notice(format!(
+                            "security floor is now generation {} (it fixes {}); going back below it needs an administrator",
+                            g.0,
+                            txn.check.floor_fixes.join(", ")
+                        ));
+                    }
+                }
+                Ok(TxnState::Promoted) => {}
+                Ok(state) => {
+                    self.confirm = None;
+                    self.notice(format!("boot-only transaction {} ended {state:?}; restart to finish recovery", txn.id.0));
+                }
+                Err(e) => self.notice(format!("boot confirmation remains pending: {e:?}")),
+            }
+            return;
+        }
         let Some((g, at)) = self.confirm else { return };
-        if now < at {
+        if self.b.clock().boot_now() < at {
             return;
         }
         self.confirm = None;

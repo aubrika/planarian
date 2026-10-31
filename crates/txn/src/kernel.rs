@@ -7,7 +7,7 @@
 //! and process control sit below it, behind `Host`.
 
 use crate::journal::{Journal, JournalError};
-use crate::ledger::{LedgerError, LiveTxn, Reconciliation, Record};
+use crate::ledger::{BootAdmission, LedgerError, LiveTxn, Reconciliation, Record};
 use crate::machine::tag;
 use crate::store::Store;
 use planarian_schema::{
@@ -21,6 +21,8 @@ pub const JOB_DRAIN: Millis = Millis::secs(60);
 /// How long a lease may go unrenewed before the watchdog treats the owner as gone,
 /// once the transaction's deadline has passed.
 pub const LEASE_GRACE: Millis = Millis::secs(30);
+/// SPEC §10: confirmation is a same-boot checkpoint, never admission.
+pub const BOOT_CONFIRM_AFTER: Millis = Millis::secs(10 * 60);
 
 /// One row of the crash-recovery table (§12): what recovery does from the
 /// state a transaction was left in. `Kernel::recover_steps` dispatches on it.
@@ -169,6 +171,9 @@ pub trait Host {
     /// Run the applicable Readiness probes from the candidate's UnitDefs and the
     /// installed core, plus the expectation and executor-owned requirements.
     fn check(&self, txn: &Transaction, phase: CheckPhase) -> Verdict;
+    /// Fresh canonical evidence after takeover/draining, at the confirmation
+    /// checkpoint. An admission check cannot substitute for this observation.
+    fn check_boot_confirmation(&self, txn: &Transaction) -> Verdict;
     /// Remove a GC root (I3). Returns false if it could not be removed.
     fn release_gc_root(&self, path: &str) -> bool;
     fn now(&self) -> Timestamp;
@@ -188,6 +193,8 @@ pub enum KernelError {
     /// Another owner holds the lease; this handle no longer owns the transaction.
     LostLease(TxnId),
     NotLive(TxnId),
+    /// Metadata required for later generation rollback is not durable yet.
+    Completion(Outcome),
 }
 
 impl From<JournalError> for KernelError {
@@ -245,7 +252,10 @@ impl<S: Store, H: Host> Kernel<S, H> {
 
     fn record(&mut self, r: Record) -> R<()> {
         let txn = match &r {
-            Record::Advance { txn, .. } | Record::Takeover { txn, .. } | Record::Renew { txn, .. } => Some(*txn),
+            Record::Advance { txn, .. }
+            | Record::Takeover { txn, .. }
+            | Record::Renew { txn, .. }
+            | Record::BootAdmitted { txn, .. } => Some(*txn),
             Record::OpBegin { op, .. } | Record::OpAck { op, .. } => Some(op.txn),
             _ => None,
         };
@@ -629,6 +639,14 @@ impl<S: Store, H: Host> Kernel<S, H> {
     }
 
     fn promote_and_commit(&mut self, txn: &Transaction) -> R<TxnState> {
+        let promoted = self.promote(txn)?;
+        if promoted != TxnState::Promoted {
+            return Ok(promoted);
+        }
+        self.write_committed(txn, false)
+    }
+
+    fn promote(&mut self, txn: &Transaction) -> R<TxnState> {
         match self.swap_override(txn, txn.base_override, txn.candidate_override)? {
             Swap::Done => {}
             Swap::Failed(why) => return self.revert_generation(txn, &format!("promotion: {why}")),
@@ -638,14 +656,15 @@ impl<S: Store, H: Host> Kernel<S, H> {
             }
         }
         self.advance(txn, TxnState::Promoted, "")?;
-        self.write_committed(txn)
+        Ok(TxnState::Promoted)
     }
 
     /// The crash table's AwaitingBoot row (§12): no reboot since the one-shot
     /// entry was published (it is still pending), leave it; after a reboot,
     /// the candidate booted →
     /// the boot-confirmation probes decide (pass: it becomes the default,
-    /// Promoted, Committed; fail: revert); it did not boot → Reverted.
+    /// Promoted; the later same-boot checkpoint decides completion. A failure
+    /// restores the publishing generation's boot selection without activation.
     pub fn await_boot(&mut self, txn: &Transaction) -> R<TxnState> {
         let Some(cand) = Self::candidate(txn) else {
             return self.recovery_failed(txn, "AwaitingBoot without a candidate");
@@ -674,13 +693,81 @@ impl<S: Store, H: Host> Kernel<S, H> {
                 if !o.is_success() {
                     return self.revert_generation(txn, &format!("publish_boot: {o:?}"));
                 }
-                self.promote_and_commit(txn)
+                self.record_boot_admission(txn)?;
+                self.promote(txn)
             }
             Verdict::Fail(why) => self.revert_generation(txn, &why),
         }
     }
 
-    fn write_committed(&mut self, txn: &Transaction) -> R<TxnState> {
+    fn boot_only(&self, id: TxnId) -> bool {
+        self.journal.ledger().live.get(&id).is_some_and(|l| l.path.iter().any(|s| s == "AwaitingBoot"))
+    }
+
+    fn record_boot_admission(&mut self, txn: &Transaction) -> R<()> {
+        let epoch = self.epoch(txn.id)?;
+        self.record(Record::BootAdmitted {
+            txn: txn.id,
+            epoch,
+            admission: BootAdmission { version: 1, boot_id: self.me.boot_id(), boot_at: self.host.boot_now() },
+        })
+    }
+
+    /// Recovery preserves admission as a pending obligation. A different boot
+    /// needs its own fresh readiness admission; neither owner mints confirmation.
+    fn await_boot_confirmation(&mut self, txn: &Transaction) -> R<TxnState> {
+        let Some(admission) = self.live(txn.id)?.boot_admission.filter(|a| a.version == 1) else {
+            return self.recovery_failed(txn, "same-boot admission evidence unavailable or unsupported");
+        };
+        let candidate = Self::candidate(txn);
+        if self.host.generations().last_booted().ok() != candidate
+            || self.host.generations().current().ok() != candidate
+        {
+            return self.revert_generation(txn, "admitted generation is no longer the booted running generation");
+        }
+        if admission.boot_id != self.me.boot_id() {
+            match self.host.check(txn, CheckPhase::Candidate) {
+                Verdict::Pass => self.record_boot_admission(txn)?,
+                Verdict::Fail(why) => return self.revert_generation(txn, &why),
+            }
+        }
+        Ok(TxnState::Promoted)
+    }
+
+    /// The daemon supplies the canonical probe verdict at the ten-minute
+    /// checkpoint. Fencing, current generation and durable admission are still
+    /// checked here, shared with every generation completion path.
+    pub fn confirm_boot(&mut self, id: TxnId, canonical_passed: bool) -> R<TxnState> {
+        let l = self.live(id)?;
+        if l.txn.state != TxnState::Promoted || !self.boot_only(id) {
+            return Err(KernelError::NotLive(id));
+        }
+        // The independent watchdog may preserve/readmit this obligation, but
+        // SPEC §12 reserves the confirmation checkpoint for the daemon.
+        if self.me.is_watchdog() {
+            return Ok(TxnState::Promoted);
+        }
+        if self.host.boot_now() < Timestamp(0).plus(BOOT_CONFIRM_AFTER) {
+            return Ok(TxnState::Promoted);
+        }
+        if self.held.get(&id) != Some(&l.txn.lease.epoch) && self.take_over(id, l.txn.lease.epoch)?.is_none() {
+            return Ok(TxnState::RecoveryFailed);
+        }
+        let txn = self.live(id)?.txn;
+        let waiting = self.await_boot_confirmation(&txn)?;
+        if waiting != TxnState::Promoted {
+            return Ok(waiting);
+        }
+        if !canonical_passed {
+            return self.revert_generation(&txn, "canonical probes failed at the ten-minute checkpoint; restart to finish");
+        }
+        if let Verdict::Fail(why) = self.host.check_boot_confirmation(&txn) {
+            return self.revert_generation(&txn, &format!("ten-minute canonical confirmation: {why}"));
+        }
+        self.write_committed(&txn, true)
+    }
+
+    fn write_committed(&mut self, txn: &Transaction, boot_confirmed: bool) -> R<TxnState> {
         if txn.check.version != planarian_schema::CHECK_CONTEXT_VERSION {
             return self.recovery_failed(txn, "completion intent unavailable in historical/unsupported check context");
         }
@@ -695,8 +782,12 @@ impl<S: Store, H: Host> Kernel<S, H> {
             return self.recovery_failed(txn, "security floor intent does not name the candidate");
         }
         let epoch = self.held.get(&txn.id).copied().ok_or(KernelError::LostLease(txn.id))?;
+        let boot_only = self.boot_only(txn.id);
+        let boot_id = self.me.boot_id();
+        let boot_now = self.host.boot_now();
         let now = self.host.now();
         let crash = self.crash_at.clone();
+        let generations = self.host.generations();
         // Global floor/baseline records do not themselves carry an epoch.
         // Check ownership under the journal lock and keep that lock through
         // Committed, so a fenced writer cannot overwrite a later completion's
@@ -707,6 +798,16 @@ impl<S: Store, H: Host> Kernel<S, H> {
             if live.txn.lease.epoch != epoch || live.txn.state != TxnState::Promoted || !fence_admits(fence, epoch) {
                 return Err(KernelError::LostLease(txn.id));
             }
+            if boot_only
+                && (!boot_confirmed
+                    || boot_now < Timestamp(0).plus(BOOT_CONFIRM_AFTER)
+                    || !live.boot_admission.as_ref().is_some_and(|a| a.version == 1 && a.boot_id == boot_id))
+            {
+                return Err(KernelError::LostLease(txn.id));
+            }
+            if let (Some(candidate), Some(hash)) = (candidate, txn.candidate_override) {
+                generations.record_override(candidate, &hash).map_err(KernelError::Completion)?;
+            }
             if let Some(required) = txn.check.required_floor {
                 if j.ledger().security_floor.is_none_or(|f| f.0 < required.0) {
                     j.append(now, Record::SecurityFloor(Some(required)))?;
@@ -716,7 +817,11 @@ impl<S: Store, H: Host> Kernel<S, H> {
                 }
             }
             if let Some(candidate) = candidate {
-                j.append(now, Record::LiveTested(Some(candidate)))?;
+                if boot_only {
+                    j.append(now, Record::KnownGood(candidate))?;
+                } else {
+                    j.append(now, Record::LiveTested(Some(candidate)))?;
+                }
             }
             j.append(now, Record::Advance { txn: txn.id, epoch, to: TxnState::Committed, note: String::new() })?;
             if crash == Some(CrashPoint::State("Committed")) {
@@ -794,6 +899,9 @@ impl<S: Store, H: Host> Kernel<S, H> {
     }
 
     fn revert_generation(&mut self, txn: &Transaction, why: &str) -> R<TxnState> {
+        if self.boot_only(txn.id) {
+            return self.revert_boot_only(txn, why);
+        }
         if !self.automatic_target_eligible(txn.revert_to)? {
             return self.recovery_failed(txn, "automatic revert target is below the security floor");
         }
@@ -830,6 +938,30 @@ impl<S: Store, H: Host> Kernel<S, H> {
             }
             Verdict::Fail(f) => self.recovery_failed(txn, &format!("revert probes: {f}")),
         }
+    }
+
+    /// Boot-only rollback changes the next boot and desired source. The
+    /// running candidate remains in place until the user restarts (§12).
+    fn revert_boot_only(&mut self, txn: &Transaction, why: &str) -> R<TxnState> {
+        if !self.automatic_target_eligible(txn.revert_to)? {
+            return self.recovery_failed(txn, "automatic boot fallback is below the security floor");
+        }
+        if self.live(txn.id)?.txn.state != TxnState::Reverting {
+            self.advance(txn, TxnState::Reverting, why)?;
+        }
+        let published = self.call(txn.id, "publish_boot(revert_to)", |h, op| {
+            h.generations().publish_boot(txn.revert_to, op)
+        })?;
+        if !published.is_success() {
+            return self.recovery_failed(txn, &format!("boot-only revert publish_boot: {published:?}"));
+        }
+        match self.swap_override(txn, txn.candidate_override, txn.base_override)? {
+            Swap::Done => {}
+            Swap::Failed(why) => return self.recovery_failed(txn, &format!("override restore: {why}")),
+            Swap::ThirdParty => return self.recovery_failed(txn, "override changed by a third party"),
+        }
+        self.advance(txn, TxnState::Reverted, &format!("{why}; restart to finish boot-only recovery"))?;
+        Ok(TxnState::Reverted)
     }
 
     fn recovery_failed(&mut self, txn: &Transaction, why: &str) -> R<TxnState> {
@@ -1041,7 +1173,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
                 }
                 Verdict::Fail(why) => self.revert_generation(&txn, &why),
             },
-            A::WriteCommitted => self.write_committed(&txn),
+            A::WriteCommitted if self.boot_only(id) => self.await_boot_confirmation(&txn),
+            A::WriteCommitted => self.write_committed(&txn, false),
             A::RevertGeneration => self.revert_generation(&txn, "recovery: re-run revert"),
             A::DriverBound => {
                 let Transition::BindDriver { device, driver } = &txn.transition else { unreachable!() };
@@ -1074,7 +1207,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
         for l in live {
             found.push((l.txn.id, l.txn.state.clone()));
             let holder = &l.txn.lease.owner;
-            if holder.is_watchdog() && self.host.pid_alive(holder.pid()) {
+            if holder.is_watchdog() && holder.boot_id() == self.me.boot_id() && self.host.pid_alive(holder.pid()) {
                 actions.push(format!("txn {}: held by the watchdog; waiting", l.txn.id.0));
                 waiting.push(l.txn.id);
                 continue;
@@ -1194,14 +1327,14 @@ mod completion_tests {
         // A takeover may crash after persisting its fence but before its
         // journal record. The old ledger epoch alone is never authority.
         let before_fence_reconciliation = kernel.journal.ledger().clone();
-        assert!(matches!(kernel.write_committed(&transaction), Err(KernelError::LostLease(t)) if t == id));
+        assert!(matches!(kernel.write_committed(&transaction, false), Err(KernelError::LostLease(t)) if t == id));
         assert_eq!(kernel.journal.sync_ledger().unwrap(), &before_fence_reconciliation);
         successor.append(Timestamp(1), Record::Takeover { txn: id, from_epoch: 1, lease }).unwrap();
         // Simulate later durable bookkeeping while the old writer is paused.
         successor.append(Timestamp(2), Record::SecurityFloor(Some(GenerationId(3)))).unwrap();
         successor.append(Timestamp(3), Record::LiveTested(Some(GenerationId(3)))).unwrap();
         let before = successor.ledger().clone();
-        assert!(matches!(kernel.write_committed(&transaction), Err(KernelError::LostLease(t)) if t == id));
+        assert!(matches!(kernel.write_committed(&transaction, false), Err(KernelError::LostLease(t)) if t == id));
         assert_eq!(kernel.journal.sync_ledger().unwrap(), &before);
     }
 }

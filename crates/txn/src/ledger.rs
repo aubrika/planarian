@@ -59,6 +59,13 @@ pub enum Record {
         #[serde(default)]
         boot_at: Timestamp,
     },
+    /// Readiness admission is distinct from the same-boot ten-minute
+    /// confirmation. The current epoch owns this evidence (SPEC §10, §12).
+    BootAdmitted {
+        txn: TxnId,
+        epoch: u64,
+        admission: BootAdmission,
+    },
     /// Written and fsynced before the backend call it names.
     OpBegin {
         op: OpId,
@@ -134,6 +141,17 @@ pub struct LiveTxn {
     /// The most recent non-empty note on an Advance.
     #[serde(default)]
     pub why: String,
+    /// Missing in historical checkpoints: no same-boot admission is implied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_admission: Option<BootAdmission>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[verifier::external_derive]
+pub struct BootAdmission {
+    pub version: u32,
+    pub boot_id: Hash,
+    pub boot_at: Timestamp,
 }
 
 /// What remains of a terminal transaction: enough to refuse stale epochs and
@@ -368,7 +386,7 @@ pub open spec fn rules(l: Ledger, e: Entry) -> bool {
         Record::Prepared(t) => prepared_rule(l, *t),
         Record::Advance { txn, epoch, to, .. } => advance_rule(l, txn, epoch, to),
         Record::Takeover { txn, from_epoch, lease } => takeover_rule(l, txn, from_epoch, lease),
-        Record::Renew { txn, epoch, .. } => renew_rule(l, txn, epoch),
+        Record::Renew { txn, epoch, .. } | Record::BootAdmitted { txn, epoch, .. } => renew_rule(l, txn, epoch),
         Record::OpBegin { op, .. } => op_begin_rule(l, op),
         Record::OpAck { op, .. } => op_ack_rule(l, op),
         Record::Resolved { txn, .. } => has_id(l.interlock.entries@, txn),
@@ -720,7 +738,7 @@ impl Ledger {
                 }
                 Ok(())
             },
-            Record::Renew { txn, epoch, .. } => {
+            Record::Renew { txn, epoch, .. } | Record::BootAdmitted { txn, epoch, .. } => {
                 let i = match find(&self.live, *txn) {
                     Some(i) => i,
                     None => return Err(LedgerError::NotLive(*txn)),
@@ -978,6 +996,7 @@ impl Ledger {
             Record::Advance { txn, epoch, to, note } => self.apply_advance(txn, epoch, to, note),
             Record::Takeover { txn, from_epoch, lease } => self.apply_takeover(txn, from_epoch, lease),
             Record::Renew { txn, epoch, worker_pid, boot_at } => self.apply_renew(txn, epoch, boot_at, worker_pid),
+            Record::BootAdmitted { txn, epoch, admission } => self.apply_boot_admitted(txn, epoch, admission),
             Record::OpBegin { op, call } => self.apply_op_begin(op, call),
             Record::OpAck { op, outcome } => self.apply_op_ack(op, outcome),
             Record::OverrideSet(s) => set_override(&mut self.overrides, s),
@@ -1013,7 +1032,7 @@ impl Ledger {
         let mut path = Vec::new();
         push_tag(&mut path, &t.state);
         let why = String::new();
-        self.live.entries.push((id, LiveTxn { txn: t, ops: Vec::new(), path, why }));
+        self.live.entries.push((id, LiveTxn { txn: t, ops: Vec::new(), path, why, boot_admission: None }));
         proof {
             let n = pre.live.entries@.len();
             assert(self.live.entries@ =~= pre.live.entries@.push(self.live.entries@[n as int]));
@@ -1161,6 +1180,36 @@ impl Ledger {
         let (id, mut l) = self.live.entries.remove(i);
         l.txn.lease.renewed = at;
         l.txn.lease.worker_pid = worker_pid;
+        self.live.entries.insert(i, (id, l));
+        proof {
+            assert(self.live.entries@ =~= pre.live.entries@.update(i as int, self.live.entries@[i as int]));
+            if inv(pre) {
+                lemma_update(pre, *self, i as int);
+            }
+        }
+    }
+
+    #[allow(unused_variables)] // used in the specification
+    fn apply_boot_admitted(&mut self, txn: TxnId, epoch: u64, admission: BootAdmission)
+        requires
+            renew_rule(*old(self), txn, epoch),
+        ensures
+            final(self).last_seq == old(self).last_seq,
+            inv(*old(self)) ==> inv(*final(self)),
+            inv(*old(self)) ==> epochs_grow(*old(self), *final(self)),
+    {
+        let ghost pre = *self;
+        let i = match find(&self.live, txn) {
+            Some(i) => i,
+            None => {
+                proof {
+                    assert(false);
+                }
+                return;
+            },
+        };
+        let (id, mut l) = self.live.entries.remove(i);
+        l.boot_admission = Some(admission);
         self.live.entries.insert(i, (id, l));
         proof {
             assert(self.live.entries@ =~= pre.live.entries@.update(i as int, self.live.entries@[i as int]));

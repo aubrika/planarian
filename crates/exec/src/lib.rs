@@ -34,6 +34,8 @@ use std::collections::BTreeMap;
 
 pub const GENERATION_DEADLINE: Millis = Millis::secs(15 * 60);
 pub const NETWORK_DEADLINE: Millis = Millis::secs(90);
+/// §12f: an activation window cannot hold a generation transaction forever.
+pub const PARKING_LIMIT: Millis = Millis::secs(24 * 3600);
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -96,6 +98,13 @@ struct Plan {
     candidate_override: Option<Hash>,
 }
 
+struct Waiting {
+    plan: Plan,
+    /// Boot time when this transaction entered Built. A daemon restart
+    /// rejects the old Built transaction and prepares a new one (§12f).
+    since: Timestamp,
+}
+
 pub struct Executor<B: Backends + Clone, S: Store> {
     pub kernel: Kernel<S, ExecHost<B>>,
     pub b: B,
@@ -116,7 +125,7 @@ pub struct Executor<B: Backends + Clone, S: Store> {
     /// generation and the packages it fixed, for the daemon to report.
     pub floor_raised: Option<(GenerationId, Vec<String>)>,
     /// Generation transactions waiting in `Built` for an activation window (§12f).
-    waiting: BTreeMap<TxnId, Plan>,
+    waiting: BTreeMap<TxnId, Waiting>,
 }
 
 /// What stage, evaluate and build produced for a catalog change.
@@ -727,7 +736,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             let why = if foreground { "waiting: foreground work holds" } else { "waiting: a session is in use" };
             return match self.kernel.wait_built(id, why) {
                 Ok(end) => {
-                    self.waiting.insert(id, plan);
+                    self.waiting.insert(id, Waiting { plan, since: self.b.clock().boot_now() });
                     Submitted::Finished { txn: id, state: end, followup: None }
                 }
                 Err(e) => Self::kernel_error(e),
@@ -752,26 +761,54 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         self.b.sessions().sessions().unwrap_or_default().iter().filter(|s| s.establishes() && s.active).all(|s| s.idle)
     }
 
+    /// Cancel candidates that have waited for the activation window for
+    /// 24 hours, even when foreground work still holds. AwaitingBoot is not
+    /// in this map: its publication waits for a reboot without a limit.
+    pub fn expire_waiting(&mut self) -> Vec<(TxnId, Submitted)> {
+        let now = self.b.clock().boot_now();
+        let expired: Vec<TxnId> = self
+            .waiting
+            .iter()
+            .filter(|(_, w)| now >= w.since.plus(PARKING_LIMIT))
+            .map(|(id, _)| *id)
+            .collect();
+        expired
+            .into_iter()
+            .map(|id| {
+                let result = match self.kernel.cancel(id, Actor::Daemon) {
+                    Ok(state) => {
+                        // The terminal journal step releases the adopted GC
+                        // root. Keep the plan until cancellation is durable.
+                        self.waiting.remove(&id);
+                        Submitted::Finished { txn: id, state, followup: None }
+                    }
+                    Err(e) => Self::kernel_error(e),
+                };
+                (id, result)
+            })
+            .collect()
+    }
+
     /// Activate transactions waiting in `Built` whose window has opened: no
     /// foreground work, and the sessions idle (or the change does not disturb
     /// one). Returns what ran.
     pub fn activate_waiting(&mut self, state: &SystemState) -> Vec<(TxnId, Submitted)> {
+        let mut out = self.expire_waiting();
         let foreground = state.conditions.iter().any(|c| matches!(c, Condition::Foreground { .. }));
         if foreground || self.waiting.is_empty() {
-            return vec![];
+            return out;
         }
         let ready: Vec<TxnId> = self
             .waiting
             .iter()
-            .filter(|(_, p)| {
-                !p.built.as_ref().is_some_and(|b| self.disturbs_a_session(&b.activation)) || self.sessions_idle()
+            .filter(|(_, w)| {
+                !w.plan.built.as_ref().is_some_and(|b| self.disturbs_a_session(&b.activation)) || self.sessions_idle()
             })
             .map(|(id, _)| *id)
             .collect();
-        let mut out = vec![];
         for id in ready {
-            if let Some(plan) = self.waiting.remove(&id) {
-                out.push((id, self.run(id, &plan)));
+            if let Some(waiting) = self.waiting.remove(&id) {
+                out.push((id, self.run(id, &waiting.plan)));
             }
         }
         out

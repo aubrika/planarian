@@ -191,6 +191,22 @@ impl<B: Backends> Host for ExecHost<B> {
         }
     }
 
+    fn check_boot_confirmation(&self, txn: &Transaction) -> Verdict {
+        let manifest = txn.check.candidate.as_ref().unwrap_or(&txn.check.base);
+        let (s, defs) = self.observe(manifest);
+        if txn.candidate.as_ref().is_none_or(|(g, _)| *g != s.generation) {
+            return Verdict::Fail("the admitted generation is no longer running".into());
+        }
+        let failed: Vec<String> = defs.iter().filter_map(|(id, def)| {
+            let canonical = def.probes.iter().any(|p| {
+                p.origin == ProbeOrigin::Canonical && p.role == ProbeRole::Readiness
+            });
+            (canonical && s.expected(id, &defs) && s.status(id, &defs) != UnitStatus::Running)
+                .then(|| format!("{id}: canonical readiness did not pass"))
+        }).collect();
+        if failed.is_empty() { Verdict::Pass } else { Verdict::Fail(failed.join("; ")) }
+    }
+
     fn release_gc_root(&self, path: &str) -> bool {
         self.b.generations().release_root(path)
     }

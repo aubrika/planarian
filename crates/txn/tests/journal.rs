@@ -379,7 +379,7 @@ fn ledger_invariant_checked_on_load() {
         t.id = TxnId(id);
         t.lease.txn = TxnId(id);
         t.state = state;
-        (TxnId(id), LiveTxn { txn: t, ops: vec![], path: vec![], why: String::new() })
+        (TxnId(id), LiveTxn { txn: t, ops: vec![], path: vec![], why: String::new(), boot_admission: None })
     };
     let mut l = Ledger { next_txn: 3, ..Ledger::default() };
     l.live.entries = vec![live(1, TxnState::Activating), live(2, TxnState::Prepared)];
