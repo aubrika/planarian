@@ -190,6 +190,8 @@ pub struct World {
     pub nospace_on_build: bool,
     /// How many times `build` ran.
     pub builds: usize,
+    /// Sources staged (§9 step 1), for admission-before-work checks (R09).
+    pub stages: usize,
     pub block_on_activate: BTreeSet<UnitId>,
     pub fail_activate: BTreeSet<GenerationId>,
     pub slow_activation: Option<(Millis, bool)>,
@@ -674,6 +676,7 @@ impl GenerationBackend for Fake {
 
     fn stage(&self, _owner: &PinnedSource, overrides: &OverrideSet) -> Result<StagedSource, Outcome> {
         let mut w = self.w();
+        w.stages += 1;
         let dir = format!("/var/lib/planarian/stage/{}", w.staged.len() + 1);
         let files = w.owner_files.clone();
         let base = w.overrides.clone();
@@ -1264,6 +1267,26 @@ pub fn gym_world(store: MemStore) -> Fake {
             option: "gym.vulnlib".into(),
             value: Value::Str("1.1".into()),
             effect: Effect::Package { name: "gym-vulnlib".into(), version: "1.1".into(), insecure: false },
+        },
+        // The same fix in a release that also needs a reboot (the boot-only
+        // path, I25).
+        Rule {
+            option: "gym.vulnlib".into(),
+            value: Value::Str("1.2".into()),
+            effect: Effect::Package { name: "gym-vulnlib".into(), version: "1.2".into(), insecure: false },
+        },
+        Rule { option: "gym.vulnlib".into(), value: Value::Str("1.2".into()), effect: Effect::NeedsReboot },
+        // A library a later release makes insecure: going back to the older
+        // generation is not a fix (§12e).
+        Rule {
+            option: "gym.newlib".into(),
+            value: Value::Str("1.0".into()),
+            effect: Effect::Package { name: "gym-newlib".into(), version: "1.0".into(), insecure: false },
+        },
+        Rule {
+            option: "gym.newlib".into(),
+            value: Value::Str("2.0".into()),
+            effect: Effect::Package { name: "gym-newlib".into(), version: "2.0".into(), insecure: true },
         },
         Rule {
             option: "services.gym-web.listenAddress".into(),

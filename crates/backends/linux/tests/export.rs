@@ -17,7 +17,7 @@ fn module_export_parses() {
     assert!(eval.units.contains_key(&UnitId::target("graphical-session")));
     assert_eq!(
         eval.units[&UnitId::target("graphical-session")].desired.when,
-        Condition::SessionEstablished { uid: None }
+        Condition::SessionEstablished { uid: None, seated: false }
     );
     assert!(eval.user_units.iter().any(|u| u.id.name == "pipewire"));
     assert_eq!(eval.core_units.len(), 2);

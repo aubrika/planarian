@@ -123,6 +123,8 @@
 # `when` on an action: { journal = "<TxnState>" } fires the instant that state
 # is durably journaled; { op_called = "<call>" } fires after that backend call
 # was made and before its outcome is journaled (the activation is running);
+# { op_begun = "<call>" } fires after that call's OpBegin is journaled and
+# before the call is made;
 # { after = "<duration>" } fires relative to the previous step.
 #
 # ───────────────────────────────────────────────────────────────────────────
@@ -1393,6 +1395,33 @@ window = "1m"
 [fault.required_post]
 overrides = [{ unit = "service@1000:pipewire", until = "Explicit", by = "user:1000" }]
 
+# C3 (§12 step 5): preconditions are the executor's.
+[[fault]]
+id = "override-over-attested-refused"
+family = "intentional-service-stop"
+summary = "alice stops her own pipewire with an override. An administrator then sets a different override on the same unit: Rejected(Precondition), naming alice as the holder; her override stands."
+spec = ["§12 step 5", "§11", "C3"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "greeter_login", uid = 1000 },
+  { transition = "SetOverride", unit = "service@1000:pipewire", desired = "Stopped", until = "Explicit", reason = "mine", source = "user", actor = "user:1000" },
+  { raw = "wait", for = "30s" },
+]
+inject = { transition = "SetOverride", unit = "service@1000:pipewire", desired = "LeaveAlone", until = "Explicit", reason = "admin's", source = "user", actor = "user:1001" }
+window = "1m"
+
+[fault.required_post]
+overrides = [{ unit = "service@1000:pipewire", until = "Explicit", by = "user:1000" }]
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+caller = "user:1001"
+refused_with = "Precondition"
+reject_detail = "set by uid 1000"
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Family: suspend-resume
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1886,6 +1915,24 @@ no_autonomous_txn = true
 # Family: boot-to-desktop-failure
 # ═══════════════════════════════════════════════════════════════════════════
 
+# S05 (§10): only a seated session carries a graphical expectation.
+[[fault]]
+id = "ssh-session-expects-no-desktop"
+family = "boot-to-desktop-failure"
+summary = "alice logs in over SSH only (a user session with no seat) and stays for 5 min. Her user services are desired, but no compositor is expected: graphical-session has no instance for that session and no incident opens."
+spec = ["§10 conditions", "S05"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { raw = "session_login", uid = 1000, session = "ssh1" }
+after = [{ raw = "wait", for = "5m" }]
+window = "6m"
+
+[fault.required_post]
+no_incident_on = ["target:graphical-session"]
+units = { "service@1000:pipewire" = "Running" }
+
 [[fault]]
 id = "desktop-auth-ok-compositor-fails"
 family = "boot-to-desktop-failure"
@@ -2121,6 +2168,79 @@ count = 0
 target = "service:gym-web"
 escalation = "RevertBlockedByFloor"
 
+# I25: post-commit bookkeeping on every commit path.
+[[fault]]
+id = "floor-moves-via-watchdog"
+family = "security-floor"
+summary = "The daemon is killed once the security update is Promoted and stays down; the watchdog completes the commit. The floor moves to the fixing generation: the floor record is part of the commit, whoever writes Committed."
+spec = ["§12e", "I25", "I16", "R02"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "gym:security-fix", args = { version = "1.1" }, source = "user", actor = "user:1001" },
+  { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Promoted" } },
+  { raw = "hold_down" },
+]
+inject = { raw = "wait", for = "3m" }
+window = "5m"
+
+[fault.required_post]
+security_floor = "candidate"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+owner = "watchdog"
+
+[[fault]]
+id = "floor-moves-via-boot-only"
+family = "security-floor"
+summary = "A security update that also needs a reboot takes the boot-only path: published to boot once, the machine restarts, the boot is confirmed and the change commits. The floor moves to it, as on the live path."
+spec = ["§12e", "§12f", "I25", "R02"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "gym:security-fix", args = { version = "1.2" }, source = "user", actor = "user:1001" }]
+inject = { raw = "reboot" }
+window = "20m"
+
+[fault.required_post]
+security_floor = "candidate"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+
+[[fault]]
+id = "revert-to-older-sets-no-floor"
+family = "security-floor"
+summary = "gym-newlib 1.0 is added, then a release makes it 2.0, which carries knownVulnerabilities. Undoing back to the 1.0 generation is a Revert to an older generation that merely lacks the newer package: it sets no security floor (§12e)."
+spec = ["§12e", "I25"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "gym:newlib", args = { version = "1.0" }, source = "user", actor = "user:1001" },
+  { raw = "wait", for = "2m" },
+  { transition = "ApplyChange", change = "gym:newlib", args = { version = "2.0" }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty" },
+  { raw = "wait", for = "2m" },
+]
+inject = { raw = "cli", argv = ["undo"], actor = "user:1001" }
+after = [{ raw = "approve_pending", actor = "root", via = "tty" }]
+window = "5m"
+
+[fault.required_post]
+security_floor = "none"
+
+[[fault.required_post.txn]]
+transition = "Revert"
+terminal = "Committed"
+
 [[fault]]
 id = "floor-manual-rollback-needs-admin"
 family = "security-floor"
@@ -2169,6 +2289,33 @@ units = { "service:gym-web" = "Overridden" }
 overrides = [{ unit = "service:gym-web", by = "Unattributed", attribution = "Inferred", until = "NextBoot" }]
 reports = ["InferredOverride", "Undo"]
 no_txn_on = ["service:gym-web"]
+
+# P23 (§16): the first raw stop caught as the residue teaches the attributed form.
+[[fault]]
+id = "residue-first-kill-teaches-stop"
+family = "unattributed-residue"
+summary = "A user's first raw kill -9 of gym-web is caught as the unattributed residue; its notice names planarian stop service:gym-web as the attributed way. A later raw stop of gym-db is inferred the same way, without the lesson again."
+spec = ["§16 stopping", "§11 unattributed residue", "P23"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake"]
+intent = { kind = "no-intervention", because = "unattributed stops under Standard are inferred as intended" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+after = [{ raw = "wait", for = "1m" }, { raw = "stop_unit_out_of_band", unit = "service:gym-db", actor = "root" }, { raw = "wait", for = "1m" }]
+window = "3m"
+
+[fault.required_post]
+overrides = [
+  { unit = "service:gym-web", by = "Unattributed", attribution = "Inferred", until = "NextBoot" },
+  { unit = "service:gym-db", by = "Unattributed", attribution = "Inferred", until = "NextBoot" },
+  { unit = "service:gym-app", by = "Unattributed", attribution = "Inferred", until = "NextBoot" },
+]
+reports = ["InferredOverride", "Undo"]
+notices_count = [
+  { match = "Next time, planarian stop service:gym-web does the same", count = 1 },
+  { match = "Next time, planarian stop", count = 1 },
+  { match = "service:gym-db: stopped outside Planarian", count = 1 },
+]
 
 [[fault]]
 id = "residue-kill9-undo"
@@ -2351,6 +2498,81 @@ terminal = "Committed"
 # Family: activation scheduling (§12 step 7, §12f)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# S03 (§12f, I12): AwaitingBoot is unbounded, reported as waiting, and
+# its notice repeats daily.
+[[fault]]
+id = "awaiting-boot-reminds-daily"
+family = "boot-only-change"
+summary = "A kernel parameter change takes the boot-only path and nobody restarts for two and a half days. It stays AwaitingBoot (no limit applies, nothing is cancelled), the 'restart to finish' notice is repeated once a day, and at the eventual restart it is confirmed and commits."
+spec = ["§12f", "I12", "S03"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = "60h" }, { raw = "reboot" }]
+window = "61h"
+
+[fault.required_post]
+generation = "candidate"
+reports = ["RestartToFinish"]
+notices_count = { match = "is still waiting for a restart", count = 2 }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["AwaitingBoot", "Promoted", "Committed"]
+terminal = "Committed"
+
+# R01 (§12 step 7, crash table): Publishing precedes the first boot mutation.
+[[fault]]
+id = "crash-publishing-before-publish"
+family = "boot-only-change"
+summary = "planariad is killed after journaling OpBegin(publish_boot_once) for a boot-only kernel change, before the call. On restart the Publishing row asks the boot loader: nothing is armed, so the change is Rejected(Interrupted) and not prepared again. After a reboot the machine runs the publishing generation, and boot selection, roots, overrides and the journal agree."
+spec = ["§12 step 7", "§12 crash table", "R01"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_begun = "publish_boot_once" } }
+after = [{ raw = "restart_process", process = "planariad" }, { raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "2m" }]
+window = "5m"
+
+[fault.required_post]
+generation = "base"
+boot_default = "base"
+agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Built", "Publishing", "Rejected"]
+terminal = "Rejected(Interrupted)"
+count = 1
+
+[[fault]]
+id = "crash-publishing-after-publish"
+family = "boot-only-change"
+summary = "planariad is killed after publish_boot_once armed the one-shot entry, before its outcome was journaled. On restart the Publishing row asks the boot loader: the entry is armed, so the change is AwaitingBoot. The reboot boots the candidate, it is admitted and committed, and boot selection, roots, overrides and the journal agree."
+spec = ["§12 step 7", "§12 crash table", "R01"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "publish_boot_once" } }
+after = [{ raw = "restart_process", process = "planariad" }, { raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "12m" }]
+window = "15m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Publishing", "AwaitingBoot", "Promoted", "Committed"]
+terminal = "Committed"
+
 [[fault]]
 id = "boot-only-kernel-confirmed"
 family = "boot-only-change"
@@ -2361,18 +2583,84 @@ scoring = "must-pass"
 harness = ["fake"]
 intent = { kind = "none" }
 inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
-after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }]
-window = "5m"
+after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "12m" }]
+window = "15m"
 
 [fault.required_post]
 generation = "candidate"
 boot_default = "candidate"
 reports = ["RestartToFinish"]
+agrees = true
+known_good = "candidate"
+live_tested = "never"
 
 [[fault.required_post.txn]]
 transition = "ApplyChange"
-path = ["Built", "AwaitingBoot", "Promoted", "Committed"]
+path = ["Built", "Publishing", "AwaitingBoot", "Promoted", "Committed"]
 never = ["Activating"]
+
+# S02 (§10): admission and confirmation are two milestones.
+[[fault]]
+id = "boot-only-admitted-not-confirmed"
+family = "boot-only-change"
+summary = "A boot-only kernel change boots and is admitted (Promoted: the candidate is the default, its override promoted). sshd then crashes; repairs run while the admitted change is unconfirmed, so sshd is restarted at once, but a canonical unit that needed a repair counts against the change: at the 10-minute checkpoint it is withdrawn, never committed: Reverted, the publishing generation is the default again, the base override restored, and a notice names sshd and says a restart completes it."
+spec = ["§10 boot confirmation", "§12 step 7", "S02", "I6"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "2m" }, { raw = "kill_unit", unit = "service:sshd", signal = "SIGKILL" }, { raw = "wait", for = "10m" }]
+window = "15m"
+
+[fault.required_post]
+boot_default = "base"
+units = { "service:sshd" = "Running" }
+notices_count = { match = "not confirmed (service:sshd needed a repair before the 10-minute checkpoint)", count = 1 }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["AwaitingBoot", "Promoted", "Reverting", "Reverted"]
+never = ["Committed", "Activating"]
+terminal = "Reverted"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:sshd"
+terminal = "Committed"
+while_admitted = true
+
+# I6 (owner decision, 31 Oct): repairs run while an admitted boot-only
+# change waits for its confirmation.
+[[fault]]
+id = "boot-only-repair-during-confirmation"
+family = "boot-only-change"
+summary = "A boot-only kernel change boots and is admitted. Two minutes later gym-web (not canonical) crashes: it is repaired at once, without waiting for the 10-minute checkpoint, and the change is still confirmed and committed there."
+spec = ["§10 boot confirmation", "I6"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "2m" }, { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }, { raw = "wait", for = "10m" }]
+window = "15m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+units = { "service:gym-web" = "Running" }
+agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["AwaitingBoot", "Promoted", "Committed"]
+terminal = "Committed"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+terminal = "Committed"
+while_admitted = true
 
 [[fault]]
 id = "boot-only-kernel-boot-fails"
@@ -2420,6 +2708,59 @@ reports = ["WaitsForWindow"]
 transition = "ApplyChange"
 path = ["Built", "Activating", "Committed"]
 terminal = "Committed"
+
+# S03 (§12f, I12): parking in Built is bounded at 24 h.
+[[fault]]
+id = "built-parking-expires"
+family = "activation-scheduling"
+summary = "alice changes her font scale while a game holds Foreground in her session, and the game never lets go. After a day in Built the change is Cancelled by the daemon, with one notice naming it and how to issue it again; it never activates, even once the game ends."
+spec = ["§12f", "I12", "S03"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "foreground", session = "s1", on = true },
+]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" }
+after = [{ raw = "wait", for = "25h" }, { raw = "foreground", session = "s1", on = false }, { raw = "wait", for = "5m" }]
+window = "26h"
+
+[fault.required_post]
+reports = ["WaitsForWindow"]
+notices_count = { match = "waited a day in Built", count = 1 }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Built", "Cancelled"]
+terminal = "Cancelled"
+
+# C21 (§12): re-prepared transactions keep their original caller and source.
+[[fault]]
+id = "reprepared-keeps-caller"
+family = "activation-scheduling"
+summary = "alice changes her font scale while a game holds Foreground in her session, so it waits in Built. The daemon restarts: the change is prepared again as alice's, in her session (not the daemon's), and commits once Foreground ends."
+spec = ["§12", "§12f", "C21"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "foreground", session = "s1", on = true },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" },
+  { raw = "wait", for = "1m" },
+]
+inject = { raw = "restart_process", process = "planariad" }
+after = [{ raw = "wait", for = "2m" }, { raw = "foreground", session = "s1", on = false }]
+window = "5m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+caller = "user:1000@s1"
+source = "user"
 
 [[fault]]
 id = "quiet-repair-not-deferred"
@@ -2860,6 +3201,105 @@ tier = "AskFirst"
 facts = { disruption = "SessionLoss" }
 affected_includes = ["service:display-manager"]
 
+# R09 (§12): admission before work.
+[[fault]]
+id = "unauthorized-change-does-no-work"
+family = "authority"
+summary = "alice, who may not change the configuration beyond her own settings, asks to disable sshd: refused Unauthorized before any source is staged, evaluated or built."
+spec = ["§12 admission", "§11 authorization", "R09"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the fake counts its stages and builds; the VM has no such counter.
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1000" }
+window = "2m"
+
+[fault.required_post]
+no_build_work = true
+units = { "service:sshd" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = "Unauthorized"
+
+# R07 (§9): the post-check is per probe, not per unit status.
+[[fault]]
+id = "degraded-unit-loses-a-probe"
+family = "bad-generation"
+summary = "gym-web is already Degraded: its HTTP check fails (503) while its TCP check passes. A change then breaks gym-web's listen address, so the TCP check fails too. The check after activation compares each Readiness probe that passed before, not the unit's status, so Checking fails and the change is reverted."
+spec = ["§9 executor-owned post-check", "R07"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "set_persistent_knob", unit = "service:gym-web", knob = "health", value = 503 },
+  { raw = "wait", for = "1m" },
+]
+inject = { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" }
+window = "10m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Reverted"
+
+# S07 (§12 step 4, §12h): approval tokens die with the daemon.
+[[fault]]
+id = "approval-dies-with-daemon"
+family = "authority"
+summary = "An administrator asks to disable sshd (AskFirst) and the approval is issued. The daemon restarts before anyone approves. The old approval is void: presenting it is refused, the change is asked for again, and nothing runs until the new request is approved."
+spec = ["§12 step 4", "§12h", "S07"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty", hold_token = true },
+  { raw = "restart_process", process = "planariad" },
+]
+inject = { raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }
+window = "3m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+reports = ["TokenReplayRefused", "NeedsApproval"]
+
+# The latest ApplyChange is the change asked for again after the restart,
+# by its original caller (C21), still waiting for approval.
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+terminal = "pending"
+caller = "user:1001"
+
+# C16 (§12c): a damaged checkpoint is Integrity, never Absent.
+[[fault]]
+id = "checkpoint-bad-crc"
+family = "failure-posture"
+summary = "The journal is compacted, then its checkpoint is damaged while the daemon is down (its CRC no longer matches). The daemon does not start from nothing: it reports an Integrity failure naming the journal."
+spec = ["§12c", "§12d", "C16"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" },
+  { raw = "wait", for = "1m" },
+  { raw = "force_compaction" },
+]
+inject = { raw = "corrupt_checkpoint" }
+after = [{ raw = "restart_process", process = "planariad" }]
+window = "2m"
+
+[fault.required_post]
+reports = ["JournalChainBroken"]
+posture = { class = "Integrity" }
+
 [[fault]]
 id = "release-refused-leaves-incident"
 family = "authority"
@@ -3027,6 +3467,11 @@ intent = { kind = "none" }
 setup = [{ transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" }]
 inject = { raw = "approve_pending", actor = "root", via = "tty" }
 window = "10m"
+
+# I7 (C1, C17): the approval is recorded with its approver; `planarian log`
+# shows "transaction N approved by uid 0".
+[fault.required_post]
+approval_recorded_by = "root"
 
 [[fault.required_post.txn]]
 transition = "ApplyChange"

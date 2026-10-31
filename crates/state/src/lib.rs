@@ -112,7 +112,10 @@ impl Assembler {
         let bound: Vec<UnitDef> = defs.values().filter(|d| session_bound(d)).cloned().collect();
         for t in bound {
             defs.remove(&t.id);
-            for s in self.sessions.iter().filter(|s| s.establishes()) {
+            // S05: a template that asks for a seat has no instance for an
+            // SSH-only session.
+            let seated = t.desired.when.needs_seat();
+            for s in self.sessions.iter().filter(|s| s.establishes() && (s.seat.is_some() || !seated)) {
                 let id = UnitId {
                     kind: t.id.kind,
                     name: t.id.name.clone(),
@@ -120,8 +123,10 @@ impl Assembler {
                 };
                 let mut d = t.clone();
                 d.id = id.clone();
-                d.desired.when =
-                    Condition::All(vec![t.desired.when.clone(), Condition::SessionEstablished { uid: Some(s.uid) }]);
+                d.desired.when = Condition::All(vec![
+                    t.desired.when.clone(),
+                    Condition::SessionEstablished { uid: Some(s.uid), seated },
+                ]);
                 for e in d.edges.iter_mut() {
                     e.from = id.clone();
                 }
@@ -137,8 +142,10 @@ impl Assembler {
                 };
                 let mut d = t.clone();
                 d.id = id.clone();
-                d.desired.when =
-                    Condition::All(vec![t.desired.when.clone(), Condition::SessionEstablished { uid: Some(*uid) }]);
+                d.desired.when = Condition::All(vec![
+                    t.desired.when.clone(),
+                    Condition::SessionEstablished { uid: Some(*uid), seated: false },
+                ]);
                 for e in d.edges.iter_mut() {
                     e.from = id.clone();
                     if let Scope::User { .. } = e.to.scope {
@@ -338,7 +345,7 @@ impl Assembler {
 
         let mut conditions = BTreeSet::new();
         for s in self.sessions.iter().filter(|s| s.establishes()) {
-            conditions.insert(Condition::SessionEstablished { uid: Some(s.uid) });
+            conditions.insert(Condition::SessionEstablished { uid: Some(s.uid), seated: s.seat.is_some() });
         }
         // §10 quiet mode: foreground work in a live session.
         for sid in b.sessions().foreground() {

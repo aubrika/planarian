@@ -76,7 +76,7 @@ fn integrity_failure(who: &str, what: &str) -> ! {
 
 fn journal_failure(who: &str, e: &JournalError) -> ! {
     match e {
-        JournalError::Integrity(why) => integrity_failure(who, &format!("journal: the hash chain is broken: {why}")),
+        JournalError::Integrity(why) => integrity_failure(who, &format!("journal: integrity: {why}")),
         JournalError::Legacy => {
             eprintln!(
                 "{who}: the journal under /var/lib/planarian/journal was written by an earlier Planarian (format 1, \
@@ -389,6 +389,13 @@ fn main() {
     // The user an agent acts for is an administrator as that user is now (§11).
     let admins = file.admin_group.clone();
     core.admin_of = std::sync::Arc::new(move |uid| is_admin(uid, &admins));
+    // What earlier runs proposed, and who asked, for changes prepared again
+    // after this restart (§12, C21).
+    for name in ["executor.jsonl.1", "executor.jsonl"] {
+        if let Ok(text) = std::fs::read_to_string(paths.state.join("log").join(name)) {
+            core.remember(text.lines().filter_map(|l| serde_json::from_str(l).ok()));
+        }
+    }
     // §9 hook: the external desired-state source, from its verified cache
     // first; an altered cache is an integrity finding like any other.
     let mut external = match &file.external_source {

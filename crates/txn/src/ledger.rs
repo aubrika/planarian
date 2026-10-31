@@ -84,9 +84,16 @@ pub enum Record {
         seq: u64,
         digest: Hash,
     },
+    /// An approval used (§12 step 4, I7): by whom, for which transaction.
     TokenUsed {
         nonce: [u8; 16],
         expires: Timestamp,
+        /// The approver's PrincipalId (a human's is their uid); 0 in records
+        /// from before v4.6.
+        #[serde(default)]
+        approver: u64,
+        #[serde(default)]
+        txn: u64,
     },
     /// `planarian agent run <name>` by this uid (§11, I24): the started
     /// unit's instance (its InvocationID) acts with that user's permissions,
@@ -134,6 +141,12 @@ pub struct LiveTxn {
     /// The most recent non-empty note on an Advance.
     #[serde(default)]
     pub why: String,
+    /// It took the boot-only path (set when it entered Publishing). Once
+    /// admitted at boot (Promoted), it no longer excludes unit and device
+    /// repairs (I6): the change is fully in place, only its confirmation
+    /// remains.
+    #[serde(default)]
+    pub boot_only: bool,
 }
 
 /// What remains of a terminal transaction: enough to refuse stale epochs and
@@ -257,14 +270,15 @@ pub open spec fn flying(s: TxnState) -> bool {
     !s.pre_mutation() && !s.terminal()
 }
 
-/// I6 (v4.4) for a pair of states, `g` saying whether each transaction
-/// changes the generation. A generation transaction in flight excludes every
-/// other in-flight transaction, except while it is `AwaitingBoot` (unit and
-/// device repairs may run then); and at most one generation transaction is
-/// active, where waiting in `Built` and `AwaitingBoot` count as active.
-pub open spec fn compatible(s1: TxnState, g1: bool, s2: TxnState, g2: bool) -> bool {
-    let excl1 = g1 && flying(s1) && !(s1 is AwaitingBoot);
-    let excl2 = g2 && flying(s2) && !(s2 is AwaitingBoot);
+/// I6 for a pair of states, `g` saying whether each transaction changes the
+/// generation. A generation transaction in an exclusive state
+/// (`TxnState::exclusive`, the one list) excludes every other in-flight
+/// transaction (unit and device repairs may run while it waits in `Built` or
+/// `AwaitingBoot`); and at most one generation transaction is active, where
+/// waiting in `Built` and `AwaitingBoot` count as active.
+pub open spec fn compatible(s1: TxnState, g1: bool, b1: bool, s2: TxnState, g2: bool, b2: bool) -> bool {
+    let excl1 = g1 && s1.exclusive() && !(s1 is Promoted && b1);
+    let excl2 = g2 && s2.exclusive() && !(s2 is Promoted && b2);
     let act1 = g1 && (flying(s1) || s1 is Built);
     let act2 = g2 && (flying(s2) || s2 is Built);
     &&& excl1 ==> !flying(s2)
@@ -294,7 +308,7 @@ pub open spec fn live_ok(x: (TxnId, LiveTxn), next_txn: u64) -> bool {
 /// Two distinct live transactions: different ids, and compatible (I6).
 pub open spec fn pair_ok(a: (TxnId, LiveTxn), b: (TxnId, LiveTxn)) -> bool {
     &&& a.0 != b.0
-    &&& compatible(a.1.txn.state, generation(a.1), b.1.txn.state, generation(b.1))
+    &&& compatible(a.1.txn.state, generation(a.1), a.1.boot_only, b.1.txn.state, generation(b.1), b.1.boot_only)
 }
 
 /// The ledger invariant. I6: at most one generation-changing transaction is
@@ -388,8 +402,10 @@ pub open spec fn advance_ok(l: Ledger, i: int, epoch: u64, to: TxnState) -> bool
     &&& forall|j: int| 0 <= j < live.len() && j != i ==> compatible(
         to,
         generation(x),
+        x.boot_only,
         (#[trigger] live[j]).1.txn.state,
         generation(live[j].1),
+        live[j].1.boot_only,
     )
 }
 
@@ -402,18 +418,10 @@ fn flying_exec(s: &TxnState) -> (r: bool)
     !s.is_pre_mutation() && !s.is_terminal()
 }
 
-fn compatible_exec(s1: &TxnState, g1: bool, s2: &TxnState, g2: bool) -> (r: bool)
+fn compatible_exec(s1: &TxnState, g1: bool, b1: bool, s2: &TxnState, g2: bool, b2: bool) -> (r: bool)
     ensures
-        r == compatible(*s1, g1, *s2, g2),
+        r == compatible(*s1, g1, b1, *s2, g2, b2),
 {
-    let awaiting1 = match s1 {
-        TxnState::AwaitingBoot => true,
-        _ => false,
-    };
-    let awaiting2 = match s2 {
-        TxnState::AwaitingBoot => true,
-        _ => false,
-    };
     let built1 = match s1 {
         TxnState::Built => true,
         _ => false,
@@ -424,8 +432,16 @@ fn compatible_exec(s1: &TxnState, g1: bool, s2: &TxnState, g2: bool) -> (r: bool
     };
     let f1 = flying_exec(s1);
     let f2 = flying_exec(s2);
-    let excl1 = g1 && f1 && !awaiting1;
-    let excl2 = g2 && f2 && !awaiting2;
+    let promoted1 = match s1 {
+        TxnState::Promoted => true,
+        _ => false,
+    };
+    let promoted2 = match s2 {
+        TxnState::Promoted => true,
+        _ => false,
+    };
+    let excl1 = g1 && s1.is_exclusive() && !(promoted1 && b1);
+    let excl2 = g2 && s2.is_exclusive() && !(promoted2 && b2);
     let act1 = g1 && (f1 || built1);
     let act2 = g2 && (f2 || built2);
     !(excl1 && f2 || excl2 && f1 || act1 && act2)
@@ -531,8 +547,10 @@ impl Ledger {
                     let ok = a.0.0 != b.0.0 && compatible_exec(
                         &a.1.txn.state,
                         a.1.txn.transition.changes_generation(),
+                        a.1.boot_only,
                         &b.1.txn.state,
                         b.1.txn.transition.changes_generation(),
+                        b.1.boot_only,
                     );
                     if !ok {
                         assert(!pair_ok(self.live.entries@[i as int], self.live.entries@[j as int]));
@@ -593,22 +611,33 @@ impl Ledger {
                     }
                 }
                 let mine = l.txn.transition.changes_generation();
+                let boot_only = l.boot_only;
                 let mut j: usize = 0;
                 while j < self.live.entries.len()
                     invariant
                         j <= self.live.entries@.len(),
                         mine == generation(self.live.entries@[i as int].1),
+                        boot_only == self.live.entries@[i as int].1.boot_only,
                         forall|k: int|
                             0 <= k < j && k != i ==> compatible(
                                 *to,
                                 mine,
+                                boot_only,
                                 (#[trigger] self.live.entries@[k]).1.txn.state,
                                 generation(self.live.entries@[k].1),
+                                self.live.entries@[k].1.boot_only,
                             ),
                     decreases self.live.entries.len() - j,
                 {
                     let o = &self.live.entries[j].1;
-                    if j != i && !compatible_exec(to, mine, &o.txn.state, o.txn.transition.changes_generation()) {
+                    if j != i && !compatible_exec(
+                        to,
+                        mine,
+                        boot_only,
+                        &o.txn.state,
+                        o.txn.transition.changes_generation(),
+                        o.boot_only,
+                    ) {
                         return Err(LedgerError::Exclusive { txn: *txn, blocker: o.txn.id });
                     }
                     j += 1;
@@ -896,7 +925,7 @@ impl Ledger {
             Record::AcceptedBaseline(g) => self.accepted_baseline = g,
             Record::SecurityFloor(g) => self.security_floor = g,
             Record::ExternalAccepted { seq, digest } => self.external = Some((seq, digest)),
-            Record::TokenUsed { nonce, expires } => use_token(&mut self.tokens_used, at, nonce, expires),
+            Record::TokenUsed { nonce, expires, .. } => use_token(&mut self.tokens_used, at, nonce, expires),
             Record::Resolved { txn, .. } => {
                 if let Some(k) = find(&self.interlock, txn) {
                     self.interlock.entries.remove(k);
@@ -921,7 +950,7 @@ impl Ledger {
         let mut path = Vec::new();
         push_tag(&mut path, &t.state);
         let why = String::new();
-        self.live.entries.push((id, LiveTxn { txn: t, ops: Vec::new(), path, why }));
+        self.live.entries.push((id, LiveTxn { txn: t, ops: Vec::new(), path, why, boot_only: false }));
         proof {
             let n = pre.live.entries@.len();
             assert(self.live.entries@ =~= pre.live.entries@.push(self.live.entries@[n as int]));
@@ -982,6 +1011,11 @@ impl Ledger {
         }
         push_tag(&mut l.path, &to);
         note_why(&mut l.why, &note);
+        let publishing = match to {
+            TxnState::Publishing => true,
+            _ => false,
+        };
+        l.boot_only = l.boot_only || publishing;
         l.txn.state = to;
         if l.txn.state.is_terminal() {
             archive(&mut self.terminal, id, l);
@@ -1166,7 +1200,9 @@ pub proof fn i6_one_generation_active(l: Ledger, a: int, b: int)
             &&& (generation(x) && generation(y)) ==> !((flying(x.txn.state) || x.txn.state is Built) && (flying(
                 y.txn.state,
             ) || y.txn.state is Built))
-            &&& (generation(x) && flying(x.txn.state) && !(x.txn.state is AwaitingBoot)) ==> !flying(y.txn.state)
+            &&& (generation(x) && x.txn.state.exclusive() && !(x.txn.state is Promoted && x.boot_only)) ==> !flying(
+                y.txn.state,
+            )
         }),
 {
     assert(pair_ok(l.live.entries@[a], l.live.entries@[b]));
@@ -1186,12 +1222,16 @@ proof fn lemma_update(pre: Ledger, post: Ledger, i: int)
         post.live.entries@[i].0 == pre.live.entries@[i].0,
         generation(post.live.entries@[i].1) == generation(pre.live.entries@[i].1),
         post.live.entries@[i].1.txn.lease.epoch >= pre.live.entries@[i].1.txn.lease.epoch,
+        post.live.entries@[i].1.boot_only == pre.live.entries@[i].1.boot_only
+            || !(post.live.entries@[i].1.txn.state is Promoted),
         post.live.entries@[i].1.txn.state == pre.live.entries@[i].1.txn.state || forall|j: int|
             0 <= j < pre.live.entries@.len() && j != i ==> compatible(
                 post.live.entries@[i].1.txn.state,
                 generation(post.live.entries@[i].1),
+                post.live.entries@[i].1.boot_only,
                 (#[trigger] pre.live.entries@[j]).1.txn.state,
                 generation(pre.live.entries@[j].1),
+                pre.live.entries@[j].1.boot_only,
             ),
     ensures
         inv(post),

@@ -193,7 +193,7 @@ fn defers_to_systemd_restart() {
 #[test]
 fn not_expected_units_open_nothing() {
     let mut d = service("graphical-session");
-    d.desired.when = Condition::SessionEstablished { uid: None };
+    d.desired.when = Condition::SessionEstablished { uid: None, seated: false };
     let mut sim = Sim::new(defs([d]));
     sim.set("graphical-session", Observed::Bound, ProbeResult::Fail("not reached".into()));
     sim.ticks(10);

@@ -128,7 +128,7 @@ let
         type = types.enum [ "Running" "Stopped" "Bound" "Absent" ];
         default = if config.kind == "device" && !(lib.hasPrefix "fs-" name) then "Bound" else "Running";
       };
-      when = mkOption { type = types.enum [ "always" "session" "ac" "battery" ]; default = "always"; };
+      when = mkOption { type = types.enum [ "always" "session" "seat" "ac" "battery" ]; default = "always"; };
       whenDevice = mkOption { type = types.nullOr types.str; default = null; description = "Desired only while this device is connected."; };
       edges = mkOption { type = types.listOf (types.submodule edgeModule); default = [ ]; };
       deriveEdges = mkOption { type = types.bool; default = true; description = "Add edges from the systemd unit's dependencies."; };
@@ -173,6 +173,14 @@ let
   toId = s: if lib.hasInfix ":" s then s else "service:${s}";
   managed = lib.mapAttrsToList unitId cfg.units;
 
+  # §10 (S06): an edge to an external dependency must be one the diagnoser
+  # follows: Requires, or Diagnostic at its threshold (0.7) or above.
+  isExternal = to: lib.hasPrefix "external:" to || lib.hasPrefix "service:external:" to;
+  weakExternalEdges = lib.concatLists (lib.mapAttrsToList (name: u:
+    map (e: "${name} -> ${e.to} (${e.kind}${lib.optionalString (e.kind == "Diagnostic") " ${toString e.confidence}/1000"})")
+      (builtins.filter (e: isExternal e.to && !(e.kind == "Requires" || (e.kind == "Diagnostic" && e.confidence >= 700))) u.edges)
+  ) cfg.units);
+
   depId = d:
     if lib.hasSuffix ".service" d then "service:${lib.removeSuffix ".service" d}"
     else if lib.hasSuffix ".target" d then "target:${lib.removeSuffix ".target" d}"
@@ -204,7 +212,8 @@ let
     if u.whenDevice != null then { DeviceConnected = toId u.whenDevice; }
     else {
       always = "Always";
-      session = { SessionEstablished = { uid = null; }; };
+      session = { SessionEstablished = { uid = null; seated = false; }; };
+      seat = { SessionEstablished = { uid = null; seated = true; }; };
       ac = "OnAcPower";
       battery = "OnBattery";
     }.${u.when};
@@ -506,6 +515,10 @@ in
         assertion = !(cfg.package.testBuild or false) || cfg.testBuild;
         message = "services.planarian.package is the gym's test build (planarian-gym-hooks), which accepts fault injection over its socket; it is for the gym's VM tests only (SPEC §15).";
       }
+      {
+        assertion = weakExternalEdges == [ ];
+        message = "services.planarian: an edge to an external dependency must be Requires, or Diagnostic with confidence at least 700 (the diagnoser's threshold), so an outage is diagnosed as one and never restarts a local unit (SPEC §10). Too weak: ${lib.concatStringsSep ", " weakExternalEdges}.";
+      }
     ];
 
     services.planarian.units = {
@@ -517,7 +530,7 @@ in
       NetworkManager = mkIf config.networking.networkmanager.enable (mkDefault { synonyms = [ "wifi" "wi-fi" "network" "internet" ]; });
       # The desktop's own unit: its absence is harm, whoever stopped it (§11).
       ${dmUnit} = mkIf hasDm (mkDefault { synonyms = [ "login screen" "greeter" ]; inferStops = false; });
-      graphical-session = mkIf hasDesktop (mkDefault { kind = "target"; when = "session"; synonyms = [ "desktop" ]; });
+      graphical-session = mkIf hasDesktop (mkDefault { kind = "target"; when = "seat"; synonyms = [ "desktop" ]; });
       pipewire = mkIf config.services.pipewire.enable (mkDefault { scope = "user"; synonyms = [ "sound" "audio" ]; });
     };
 

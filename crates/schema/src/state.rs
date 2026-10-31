@@ -121,6 +121,24 @@ impl SystemState {
             .collect()
     }
 
+    /// The applicable Readiness probes whose latest evidence is a fresh pass
+    /// (§9: what a change may not take away, whatever the unit's status).
+    pub fn passing_readiness(&self, id: &UnitId, defs: &UnitDefs) -> Vec<ProbeId> {
+        let (Some(def), Some((_, evidence))) = (defs.get(id), self.units.get(id)) else { return vec![] };
+        def.probes
+            .iter()
+            .filter(|p| p.role == ProbeRole::Readiness)
+            .filter(|p| {
+                evidence
+                    .iter()
+                    .filter(|e| e.probe == p.id)
+                    .max_by_key(|e| e.at)
+                    .is_some_and(|e| e.fresh_at(self.observed_at) && matches!(e.result, ProbeResult::Pass))
+            })
+            .map(|p| p.id.clone())
+            .collect()
+    }
+
     /// Status derivation, in the order §8 gives:
     /// Overridden; not expected; definite Failed; Unknown on stale or timed-out
     /// Readiness evidence; Running / Degraded from Active; otherwise from `Observed`.
@@ -353,13 +371,14 @@ mod tests {
     #[test]
     fn suppressed_and_not_expected() {
         let id = UnitId::target("graphical-session");
-        let defs: UnitDefs = [(id.clone(), def(&id, Condition::SessionEstablished { uid: None }, vec![]))].into();
+        let defs: UnitDefs =
+            [(id.clone(), def(&id, Condition::SessionEstablished { uid: None, seated: false }, vec![]))].into();
         let mut s = state(100_000);
         s.units.insert(id.clone(), (Observed::Bound, vec![]));
         // Idle greeter: nobody logged in (catalog: login-greeter-idle).
         assert_eq!(s.status(&id, &defs), UnitStatus::NotExpected);
         assert!(!s.expected(&id, &defs));
-        s.conditions.insert(Condition::SessionEstablished { uid: Some(1000) });
+        s.conditions.insert(Condition::SessionEstablished { uid: Some(1000), seated: false });
         assert_eq!(s.status(&id, &defs), UnitStatus::Stopped);
         assert!(s.expected(&id, &defs));
         s.overrides.push(Override {

@@ -22,7 +22,7 @@ use derive::{DeriveInput, derive, manifest_of};
 use host::ExecHost;
 use planarian_changes::CatalogConfig;
 use planarian_policy::{Input, Settings, Tables, decide, may_approve, policy_version};
-use planarian_schema::spec::{predict, refines};
+use planarian_schema::spec::{precondition, predict, refines};
 use planarian_schema::*;
 use planarian_state::Canonical;
 use planarian_txn::journal::{Journal, JournalError};
@@ -115,8 +115,9 @@ pub struct Executor<B: Backends + Clone, S: Store> {
     /// Set when the last commit raised the security floor (§12e): the
     /// generation and the packages it fixed, for the daemon to report.
     pub floor_raised: Option<(GenerationId, Vec<String>)>,
-    /// Generation transactions waiting in `Built` for an activation window (§12f).
-    waiting: BTreeMap<TxnId, Plan>,
+    /// Generation transactions waiting in `Built` for an activation window
+    /// (§12f), with when each began waiting (`CLOCK_BOOTTIME`).
+    waiting: BTreeMap<TxnId, (Timestamp, Plan)>,
 }
 
 /// What stage, evaluate and build produced for a catalog change.
@@ -190,6 +191,21 @@ fn build_candidate<G: GenerationBackend>(
 /// boot clock (§12h; §12 step 4:
 /// 24 hours). Saturating: a token issued near the end of time never expires
 /// early, and no clock value makes this panic.
+/// Why `t`'s precondition does not hold for `by` (§12 step 5), if it does
+/// not. An attested override is replaced only by its holder; anyone else
+/// gets its holder named (C3).
+pub fn unmet(t: &Transition, s: &SystemState, defs: &UnitDefs, by: &Actor) -> Option<String> {
+    if let Transition::SetOverride(sup) = t {
+        let o = s.override_of(&sup.unit)?;
+        if o.attribution == Attribution::Attested && o.by.principal() != by.principal() {
+            let holder = o.by.uid().map(|u| format!("uid {u}")).unwrap_or_else(|| format!("{:?}", o.by));
+            return Some(format!("{} holds an override set by {holder}; they lift it (planarian release)", sup.unit));
+        }
+        return None;
+    }
+    (!precondition(t, s, defs)).then(|| format!("the precondition of {t:?} does not hold"))
+}
+
 pub fn token_expired(now: Timestamp, issued: Timestamp) -> bool {
     now > issued.plus(TOKEN_LIFETIME)
 }
@@ -431,9 +447,13 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     }
 
     /// What the approval token binds (§8 `ApprovalToken.bound_to`).
-    fn binding(&self, p: &Proposal, plan: &Plan, state: &SystemState) -> Hash {
+    /// It names the transaction too, so each request for approval has its
+    /// own: an approval issued before a restart can never approve the change
+    /// asked for again after it, however identical (§12 step 4, S07).
+    fn binding(&self, txn: TxnId, p: &Proposal, plan: &Plan, state: &SystemState) -> Hash {
         let cumulative = plan.facts.config_diff.as_ref().map(|d| self.session.cumulative.then(d)).unwrap_or_default();
         let v = serde_json::json!({
+            "txn": txn.0,
             "transition": plan.transition,
             "staged_source": plan.staged.as_ref().map(|s| s.staged_source),
             "candidate": plan.candidate,
@@ -491,6 +511,11 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 candidate: plan.cand_eval.as_ref().map(manifest_of),
                 base: manifest_of(&plan.base_eval),
                 pre: defs.keys().map(|u| (u.clone(), state.status(u, defs))).collect(),
+                pre_passing: defs
+                    .keys()
+                    .map(|u| (u.clone(), state.passing_readiness(u, defs)))
+                    .filter(|(_, p)| !p.is_empty())
+                    .collect(),
             },
         }
     }
@@ -537,6 +562,35 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         })
     }
 
+    /// Admission before work (§12, R09): the checks that need no staged
+    /// source, run before anything is staged, evaluated or built. Each is a
+    /// necessary condition of `decide`'s authorization, so admission refuses
+    /// only what policy would refuse after the build.
+    pub fn admit(&self, t: &Transition, authz: &Authorization) -> Result<(), (RejectReason, &'static str)> {
+        let Transition::ApplyChange { change, .. } = t else { return Ok(()) };
+        if !matches!(authz.actor, Actor::User { .. } | Actor::Daemon | Actor::Watchdog) {
+            return Err((RejectReason::Unauthorized, "this caller cannot change the configuration"));
+        }
+        if !self.cfg.tables.catalog.contains(change) {
+            return Err((RejectReason::NotInCatalog, "that change is not in the catalog"));
+        }
+        let admin = authz.capabilities.contains(Capability::Administrator);
+        if self.kernel.journal.ledger().interlocked() && !admin {
+            return Err((
+                RejectReason::Other("interlocked".into()),
+                "the recovery interlock is set; only an administrator can change this machine until `planarian resolve`",
+            ));
+        }
+        if matches!(authz.actor, Actor::User { .. })
+            && !admin
+            && !(authz.capabilities.contains(Capability::UserControllable)
+                && self.cfg.settings.user_controllable_changes.contains(change))
+        {
+            return Err((RejectReason::Unauthorized, "that change needs an administrator"));
+        }
+        Ok(())
+    }
+
     /// Submit a proposal. `state` and `defs` are the current observation.
     pub fn submit(&mut self, p: Proposal, authz: Authorization, state: &SystemState, defs: &UnitDefs) -> Submitted {
         let digest = state.digest();
@@ -561,6 +615,10 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 "the recovery interlock is set; only an administrator can change this machine until `planarian resolve`",
             );
         }
+        if let Err((reason, why)) = self.admit(&p.transition, &authz) {
+            self.prebuilt = None;
+            return reject(reason, why);
+        }
         let pre = self.prebuilt.take();
         let plan = match self.plan(&p, &authz, state, defs, pre) {
             Ok(plan) => plan,
@@ -580,6 +638,12 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             self.release(&plan);
             return reject(r.clone(), "refused by policy");
         }
+        // §12 step 5 (C3): preconditions are the executor's, whatever the
+        // source; checked once the caller is known to be authorized.
+        if let Some(why) = unmet(&p.transition, state, defs, &authz.actor) {
+            self.release(&plan);
+            return reject(RejectReason::Precondition, why);
+        }
         if self.stale(&plan) {
             self.release(&plan);
             return reject(RejectReason::Stale, "your configuration changed while the change was being built");
@@ -593,7 +657,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             }
         };
         if let Decision::Allow { tier: Tier::AskFirst, approver: class } = plan.decision {
-            let bound_to = self.binding(&p, &plan, state);
+            let bound_to = self.binding(id, &p, &plan, state);
             let now = self.b.clock().boot_now();
             self.parked.insert(
                 id,
@@ -625,7 +689,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             let why = if foreground { "waiting: foreground work holds" } else { "waiting: a session is in use" };
             return match self.kernel.wait_built(id, why) {
                 Ok(end) => {
-                    self.waiting.insert(id, plan);
+                    self.waiting.insert(id, (self.b.clock().boot_now(), plan));
                     Submitted::Finished { txn: id, state: end, followup: None }
                 }
                 Err(e) => Self::kernel_error(e),
@@ -661,14 +725,14 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         let ready: Vec<TxnId> = self
             .waiting
             .iter()
-            .filter(|(_, p)| {
+            .filter(|(_, (_, p))| {
                 !p.built.as_ref().is_some_and(|b| self.disturbs_a_session(&b.activation)) || self.sessions_idle()
             })
             .map(|(id, _)| *id)
             .collect();
         let mut out = vec![];
         for id in ready {
-            if let Some(plan) = self.waiting.remove(&id) {
+            if let Some((_, plan)) = self.waiting.remove(&id) {
                 out.push((id, self.run(id, &plan)));
             }
         }
@@ -690,20 +754,12 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         if *end != TxnState::Committed {
             return None;
         }
-        if let (Some((g, _)), Some(h)) = (&plan.candidate, plan.candidate_override) {
-            let _ = self.b.generations().record_override(*g, &h);
-        }
-        // §12e: a committed generation that fixes a known vulnerability is the
-        // new security floor. Derived here, never set by a proposal; it only
-        // moves forward, and only to a generation that committed live.
-        if let (Some((g, _)), Some(cand)) = (&plan.candidate, &plan.cand_eval) {
-            let fixes = cand.security_fixes(&plan.base_eval);
-            let floor = self.kernel.journal.ledger().security_floor;
-            if !fixes.is_empty() && floor.is_none_or(|f| f.0 < g.0) {
-                let now = self.b.clock().now();
-                let _ = self.kernel.journal.append(now, Record::SecurityFloor(Some(*g)));
-                self.floor_raised = Some((*g, fixes));
-            }
+        // §12e, I25: the kernel derived the floor and recorded the override
+        // content as part of the commit; this only says so.
+        if let (Some((g, _)), Some(cand)) = (&plan.candidate, &plan.cand_eval)
+            && self.kernel.journal.ledger().security_floor == Some(*g)
+        {
+            self.floor_raised = Some((*g, cand.security_fixes(&plan.base_eval)));
         }
         self.session.applied.push(id);
         if let Some(d) = &plan.facts.config_diff {
@@ -780,7 +836,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 return s;
             }
         };
-        let rebound = self.binding(&parked.proposal, &plan, state);
+        let rebound = self.binding(parked.txn, &parked.proposal, &plan, state);
         if rebound != parked.bound_to || !matches!(plan.decision, Decision::Allow { .. }) {
             // Something the approval covered changed: the token is void. Withdraw
             // this transaction and, if still allowed, park the new one.
@@ -802,8 +858,17 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         if self.kernel.journal.ledger().tokens_used.iter().any(|(n, _)| *n == nonce) {
             return reject(RejectReason::Other("approval".into()), "this approval was already used");
         }
-        let _ =
-            self.kernel.journal.append(now, Record::TokenUsed { nonce, expires: parked.issued.plus(TOKEN_LIFETIME) });
+        // Journal records carry the wall clock (§12h); `now` here is the
+        // boot clock, which times the token.
+        let _ = self.kernel.journal.append(
+            self.b.clock().now(),
+            Record::TokenUsed {
+                nonce,
+                expires: parked.issued.plus(TOKEN_LIFETIME),
+                approver: approver.principal.0,
+                txn: parked.txn.0,
+            },
+        );
         self.parked.remove(&parked.txn);
         let source = parked.proposal.source.clone();
         self.schedule(parked.txn, plan, &source, state)
@@ -825,6 +890,29 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             self.expire_one(*t);
         }
         old
+    }
+
+    /// The transaction waits in `Built` for an activation window (§12f).
+    pub fn is_waiting(&self, txn: TxnId) -> bool {
+        self.waiting.contains_key(&txn)
+    }
+
+    /// §12f, I12: parking in `Built` is bounded. A transaction that has
+    /// waited longer than the parking limit is `Cancelled(Daemon)`; returns
+    /// each one with the change it would have made, for the notice.
+    pub fn expire_waiting(&mut self) -> Vec<(TxnId, Transition)> {
+        let now = self.b.clock().boot_now();
+        let old: Vec<TxnId> =
+            self.waiting.iter().filter(|(_, (since, _))| now > since.plus(PARKING_LIMIT)).map(|(id, _)| *id).collect();
+        let mut out = vec![];
+        for id in old {
+            if let Some((_, plan)) = self.waiting.remove(&id)
+                && self.kernel.cancel(id, Actor::Daemon).is_ok()
+            {
+                out.push((id, plan.transition));
+            }
+        }
+        out
     }
 
     /// A user withdraws a parked proposal (§12 step 5).

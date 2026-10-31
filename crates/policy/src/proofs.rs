@@ -223,11 +223,12 @@ pub proof fn i19_no_self_approval(approver: Authorization, proposer: PrincipalId
 {
 }
 
-/// Neither an agent (reserved) nor the unattributed actor is ever authorized:
-/// an inferred override never passes through `decide` (§11).
+/// Neither an agent principal with no journaled start (reserved), nor the
+/// model (until Phase B grants it anything), nor the unattributed actor is
+/// ever authorized: an inferred override never passes through `decide` (§11).
 pub proof fn agents_and_unattributed_are_refused(i: Input)
     requires
-        i.authz.actor is Agent || i.authz.actor is Unattributed,
+        i.authz.actor is Agent || i.authz.actor is Model || i.authz.actor is Unattributed,
     ensures
         decide_spec(i) == Decision::Reject(RejectReason::Unauthorized),
 {

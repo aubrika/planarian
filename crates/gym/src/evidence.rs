@@ -21,12 +21,19 @@ pub struct Evidence {
     /// Generations in the boot menu, and those garbage-collected during the run.
     pub boot_entries: Vec<GenerationId>,
     pub collected: Vec<GenerationId>,
+    /// Sources staged and candidates built during the run (fake harness).
+    #[serde(default)]
+    pub work: Option<(usize, usize)>,
     /// The live override file assigns nothing (it is the base's).
     pub overrides_empty: bool,
     /// The live override file's hash at the end, and the hash of what a
     /// third party wrote to it during the run (I23), if one did.
     #[serde(default)]
     pub override_hash: Option<Hash>,
+    /// What disagrees among boot selection, GC roots, the override file and
+    /// the journal at the end (empty: they agree); None where the harness
+    /// cannot see all four.
+    pub agreement: Option<Vec<String>>,
     #[serde(default)]
     pub third_party_override: Option<Hash>,
     /// The journal at the end, and whether it replays cleanly.
