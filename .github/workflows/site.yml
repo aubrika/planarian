@@ -39,7 +39,9 @@ jobs:
           echo "others=$others" >> "$GITHUB_OUTPUT"
       # The verdicts the pages show; a failing entry fails ci.yml, not this.
       - name: Fault catalog, fake harness
-        run: cargo run -q -p planarian-gym -- run > target/fake-results.txt || true
+        run: |
+          mkdir -p target
+          cargo run -q -p planarian-gym -- run > target/fake-results.txt || [ -s target/fake-results.txt ]
       - name: Generate the site (fails on any unresolved reference)
         run: >
           cargo run -q -p planarian-gym -- site
