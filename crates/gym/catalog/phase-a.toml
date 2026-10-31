@@ -2121,6 +2121,79 @@ count = 0
 target = "service:gym-web"
 escalation = "RevertBlockedByFloor"
 
+# I25: post-commit bookkeeping on every commit path.
+[[fault]]
+id = "floor-moves-via-watchdog"
+family = "security-floor"
+summary = "The daemon is killed once the security update is Promoted and stays down; the watchdog completes the commit. The floor moves to the fixing generation: the floor record is part of the commit, whoever writes Committed."
+spec = ["§12e", "I25", "I16", "R02"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "gym:security-fix", args = { version = "1.1" }, source = "user", actor = "user:1001" },
+  { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Promoted" } },
+  { raw = "hold_down" },
+]
+inject = { raw = "wait", for = "3m" }
+window = "5m"
+
+[fault.required_post]
+security_floor = "candidate"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+owner = "watchdog"
+
+[[fault]]
+id = "floor-moves-via-boot-only"
+family = "security-floor"
+summary = "A security update that also needs a reboot takes the boot-only path: published to boot once, the machine restarts, the boot is confirmed and the change commits. The floor moves to it, as on the live path."
+spec = ["§12e", "§12f", "I25", "R02"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "gym:security-fix", args = { version = "1.2" }, source = "user", actor = "user:1001" }]
+inject = { raw = "reboot" }
+window = "20m"
+
+[fault.required_post]
+security_floor = "candidate"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+
+[[fault]]
+id = "revert-to-older-sets-no-floor"
+family = "security-floor"
+summary = "gym-newlib 1.0 is added, then a release makes it 2.0, which carries knownVulnerabilities. Undoing back to the 1.0 generation is a Revert to an older generation that merely lacks the newer package: it sets no security floor (§12e)."
+spec = ["§12e", "I25"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "gym:newlib", args = { version = "1.0" }, source = "user", actor = "user:1001" },
+  { raw = "wait", for = "2m" },
+  { transition = "ApplyChange", change = "gym:newlib", args = { version = "2.0" }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty" },
+  { raw = "wait", for = "2m" },
+]
+inject = { raw = "cli", argv = ["undo"], actor = "user:1001" }
+after = [{ raw = "approve_pending", actor = "root", via = "tty" }]
+window = "5m"
+
+[fault.required_post]
+security_floor = "none"
+
+[[fault.required_post.txn]]
+transition = "Revert"
+terminal = "Committed"
+
 [[fault]]
 id = "floor-manual-rollback-needs-admin"
 family = "security-floor"

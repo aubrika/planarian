@@ -728,20 +728,12 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         if *end != TxnState::Committed {
             return None;
         }
-        if let (Some((g, _)), Some(h)) = (&plan.candidate, plan.candidate_override) {
-            let _ = self.b.generations().record_override(*g, &h);
-        }
-        // §12e: a committed generation that fixes a known vulnerability is the
-        // new security floor. Derived here, never set by a proposal; it only
-        // moves forward, and only to a generation that committed live.
-        if let (Some((g, _)), Some(cand)) = (&plan.candidate, &plan.cand_eval) {
-            let fixes = cand.security_fixes(&plan.base_eval);
-            let floor = self.kernel.journal.ledger().security_floor;
-            if !fixes.is_empty() && floor.is_none_or(|f| f.0 < g.0) {
-                let now = self.b.clock().now();
-                let _ = self.kernel.journal.append(now, Record::SecurityFloor(Some(*g)));
-                self.floor_raised = Some((*g, fixes));
-            }
+        // §12e, I25: the kernel derived the floor and recorded the override
+        // content as part of the commit; this only says so.
+        if let (Some((g, _)), Some(cand)) = (&plan.candidate, &plan.cand_eval)
+            && self.kernel.journal.ledger().security_floor == Some(*g)
+        {
+            self.floor_raised = Some((*g, cand.security_fixes(&plan.base_eval)));
         }
         self.session.applied.push(id);
         if let Some(d) = &plan.facts.config_diff {

@@ -146,6 +146,28 @@ impl<B: Backends> Host for ExecHost<B> {
     type Gen = B::Gens;
     type Inv = B::Inv;
 
+    fn floor_fixes(&self, txn: &Transaction, floor: Option<GenerationId>) -> Result<Vec<String>, Outcome> {
+        let gens = self.b.generations();
+        let Some((cand, _)) = txn.candidate.clone() else { return Ok(vec![]) };
+        let eval = |g: GenerationId| gens.path_of(g).and_then(|p| gens.evaluate_built(&p));
+        let c = eval(cand)?;
+        // The floor and every generation between it and the candidate (in A),
+        // so a Revert to an older generation is never a fix (§12e).
+        let mut earlier: Vec<GenerationId> = gens.boot_entries()?;
+        earlier.push(txn.revert_to);
+        earlier.sort();
+        earlier.dedup();
+        earlier.retain(|g| g.0 < cand.0 && floor.is_none_or(|f| g.0 >= f.0));
+        let earlier: Vec<EvaluatedGeneration> = earlier.into_iter().map(eval).collect::<Result<_, _>>()?;
+        Ok(c.packages
+            .keys()
+            .filter(|p| !c.insecure.contains(*p))
+            .filter(|p| earlier.iter().all(|e| e.insecure.contains(*p) || !e.packages.contains_key(*p)))
+            .filter(|p| earlier.iter().any(|e| e.insecure.contains(*p)))
+            .cloned()
+            .collect())
+    }
+
     fn generations(&self) -> &B::Gens {
         self.b.generations()
     }

@@ -170,6 +170,13 @@ pub trait Host {
     /// SIGTERM then SIGKILL the process group via pidfd; true once confirmed dead.
     fn kill_worker(&self, pid: u32) -> bool;
     fn pid_alive(&self, pid: u32) -> bool;
+    /// §12e, I25: the security fixes `txn`'s candidate brings, absent from
+    /// the floor generation and every generation between it and the
+    /// candidate (every earlier one, with no floor). Part of the commit:
+    /// an error here means the transaction does not commit yet.
+    fn floor_fixes(&self, _txn: &Transaction, _floor: Option<GenerationId>) -> Result<Vec<String>, Outcome> {
+        Ok(vec![])
+    }
 }
 
 #[derive(Debug)]
@@ -626,7 +633,25 @@ impl<S: Store, H: Host> Kernel<S, H> {
         }
     }
 
+    /// Post-commit bookkeeping, then `Committed` (I25), on every path that
+    /// commits a generation: the daemon's, the watchdog's, the boot-only
+    /// confirmation's. The floor record precedes `Committed`; if the floor
+    /// cannot be derived or journaled, the transaction stays where it is
+    /// (`Promoted`) and is completed later, never committed without it.
     fn write_committed(&mut self, txn: &Transaction) -> R<TxnState> {
+        if let Some(cand) = Self::candidate(txn) {
+            let floor = self.journal.ledger().security_floor;
+            if floor.is_none_or(|f| f.0 < cand.0) {
+                match self.host.floor_fixes(txn, floor) {
+                    Ok(fixes) if !fixes.is_empty() => self.record(Record::SecurityFloor(Some(cand)))?,
+                    Ok(_) => {}
+                    Err(_) => return Ok(self.live(txn.id)?.txn.state),
+                }
+            }
+            if let Some(h) = &txn.candidate_override {
+                let _ = self.host.generations().record_override(cand, h);
+            }
+        }
         self.advance(txn, TxnState::Committed, "")?;
         if let Some(cand) = Self::candidate(txn) {
             self.record(Record::LiveTested(Some(cand)))?;

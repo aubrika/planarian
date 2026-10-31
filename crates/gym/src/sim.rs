@@ -36,6 +36,7 @@ pub fn config() -> CoreConfig {
                     "gym:security-fix",
                     "gym:kernel-param",
                     "gym:touch-core",
+                    "gym:newlib",
                     "gym:drop-probe",
                     "gym:firewall-step",
                 ]
@@ -71,7 +72,15 @@ pub fn config() -> CoreConfig {
                         planarian_changes::GymChoice {
                             option: "gym.vulnlib".into(),
                             arg: "version".into(),
-                            permitted: vec!["1.1".into()],
+                            permitted: vec!["1.1".into(), "1.2".into()],
+                        },
+                    ),
+                    (
+                        "gym:newlib".into(),
+                        planarian_changes::GymChoice {
+                            option: "gym.newlib".into(),
+                            arg: "version".into(),
+                            permitted: vec!["1.0".into(), "2.0".into()],
                         },
                     ),
                     (
@@ -1346,6 +1355,7 @@ impl Sim {
                 Request::Resolve { txn, resolution }
             }
             ["diagnose", u, "--probe", p] => Request::Diagnose { unit: unit(u), probe: Some(ProbeId(p.to_string())) },
+            ["undo"] => Request::Undo,
             other => return Err(Unsupported(format!("cli {other:?}"))),
         })
     }
