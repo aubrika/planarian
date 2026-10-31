@@ -57,10 +57,12 @@ impl TxnState {
         }
     }
 
-    /// States in which no other transition may execute (I6).
+    /// States in which no other transition may execute (I6, §12 Concurrency):
+    /// one list, which the ledger reads.
     pub open spec fn exclusive(self) -> bool {
         match self {
-            TxnState::Activating | TxnState::Published | TxnState::Promoted | TxnState::Reverting => true,
+            TxnState::Activating | TxnState::Checking | TxnState::Published | TxnState::Promoted
+            | TxnState::Reverting => true,
             _ => false,
         }
     }
@@ -91,7 +93,8 @@ impl TxnState {
             r == self.exclusive(),
     {
         match self {
-            TxnState::Activating | TxnState::Published | TxnState::Promoted | TxnState::Reverting => true,
+            TxnState::Activating | TxnState::Checking | TxnState::Published | TxnState::Promoted
+            | TxnState::Reverting => true,
             _ => false,
         }
     }

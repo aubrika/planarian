@@ -264,14 +264,15 @@ pub open spec fn flying(s: TxnState) -> bool {
     !s.pre_mutation() && !s.terminal()
 }
 
-/// I6 (v4.4) for a pair of states, `g` saying whether each transaction
-/// changes the generation. A generation transaction in flight excludes every
-/// other in-flight transaction, except while it is `AwaitingBoot` (unit and
-/// device repairs may run then); and at most one generation transaction is
-/// active, where waiting in `Built` and `AwaitingBoot` count as active.
+/// I6 for a pair of states, `g` saying whether each transaction changes the
+/// generation. A generation transaction in an exclusive state
+/// (`TxnState::exclusive`, the one list) excludes every other in-flight
+/// transaction (unit and device repairs may run while it waits in `Built` or
+/// `AwaitingBoot`); and at most one generation transaction is active, where
+/// waiting in `Built` and `AwaitingBoot` count as active.
 pub open spec fn compatible(s1: TxnState, g1: bool, s2: TxnState, g2: bool) -> bool {
-    let excl1 = g1 && flying(s1) && !(s1 is AwaitingBoot);
-    let excl2 = g2 && flying(s2) && !(s2 is AwaitingBoot);
+    let excl1 = g1 && s1.exclusive();
+    let excl2 = g2 && s2.exclusive();
     let act1 = g1 && (flying(s1) || s1 is Built);
     let act2 = g2 && (flying(s2) || s2 is Built);
     &&& excl1 ==> !flying(s2)
@@ -413,14 +414,6 @@ fn compatible_exec(s1: &TxnState, g1: bool, s2: &TxnState, g2: bool) -> (r: bool
     ensures
         r == compatible(*s1, g1, *s2, g2),
 {
-    let awaiting1 = match s1 {
-        TxnState::AwaitingBoot => true,
-        _ => false,
-    };
-    let awaiting2 = match s2 {
-        TxnState::AwaitingBoot => true,
-        _ => false,
-    };
     let built1 = match s1 {
         TxnState::Built => true,
         _ => false,
@@ -431,8 +424,8 @@ fn compatible_exec(s1: &TxnState, g1: bool, s2: &TxnState, g2: bool) -> (r: bool
     };
     let f1 = flying_exec(s1);
     let f2 = flying_exec(s2);
-    let excl1 = g1 && f1 && !awaiting1;
-    let excl2 = g2 && f2 && !awaiting2;
+    let excl1 = g1 && s1.is_exclusive();
+    let excl2 = g2 && s2.is_exclusive();
     let act1 = g1 && (f1 || built1);
     let act2 = g2 && (f2 || built2);
     !(excl1 && f2 || excl2 && f1 || act1 && act2)
@@ -1173,7 +1166,7 @@ pub proof fn i6_one_generation_active(l: Ledger, a: int, b: int)
             &&& (generation(x) && generation(y)) ==> !((flying(x.txn.state) || x.txn.state is Built) && (flying(
                 y.txn.state,
             ) || y.txn.state is Built))
-            &&& (generation(x) && flying(x.txn.state) && !(x.txn.state is AwaitingBoot)) ==> !flying(y.txn.state)
+            &&& (generation(x) && x.txn.state.exclusive()) ==> !flying(y.txn.state)
         }),
 {
     assert(pair_ok(l.live.entries@[a], l.live.entries@[b]));
