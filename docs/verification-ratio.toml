@@ -21,11 +21,17 @@
 # on. Earlier: 28:43 at GA; 32:43 (four obligations mapped to I6 and I12);
 # 42:50 (I21-I23); 47:50 (I18's hash chain). Change these only when a change
 # improves them.
+#
+# Re-baselined 2026-10-31 by owner decision: I9, I24 and I25, invariants of
+# §7 that had no row, are accounted (the guarantees site, §17c, showed them
+# as "not accounted"). d:a 47:56 -> 47:62: their six assumptions are new to
+# the count, not a regression in what is proved; the trust count is
+# unchanged (37), since every id they cite was already counted.
 [baseline]
 trust_count = 37
 internal_unproven = 5
 discharged = 47
-assumed = 56
+assumed = 62
 
 [baseline.per_invariant]
 I1 = [0, 2]
@@ -50,6 +56,9 @@ I5 = [4, 3]
 I6 = [7, 5]
 I7 = [0, 1]
 I8 = [1, 1]
+I9 = [0, 1]
+I24 = [0, 3]
+I25 = [0, 2]
 
 [[invariant]]
 id = "I1"
@@ -220,3 +229,27 @@ phase = "A (proof)"
 tested = ["gym stale-owner-edit-during-build"]
 discharged = ["txn::generations_commit_after_promotion", "txn::runtime_never_reverts", "txn::override_swap_never_overwrites_a_third_party"]
 assumes = ["P3"]
+
+[[invariant]]
+id = "I9"
+statement = "The model process holds exactly one write capability: submit a proposal."
+phase = "B (by the sandbox, §20, and a gym case), E (proof)"
+tested = []
+discharged = []
+assumes = ["P8"]
+
+[[invariant]]
+id = "I24"
+statement = "An agent's authority is bound to the one AgentStarted record for the unit instance it runs in, identified by that instance (not by name)."
+phase = "A"
+tested = ["daemon core tests", "gym agent-name-collision"]
+discharged = []
+assumes = ["P4", "P6", "U5"]
+
+[[invariant]]
+id = "I25"
+statement = "Post-commit bookkeeping runs on every path that writes Committed for a generation transaction; a commit whose floor record cannot be appended does not commit."
+phase = "A"
+tested = ["gym floor-moves-via-watchdog", "gym floor-moves-via-boot-only", "gym revert-to-older-sets-no-floor"]
+discharged = []
+assumes = ["P1", "P4"]

@@ -37,7 +37,9 @@ SPEC v4.5 (2026-10-29, as §17a allows): **trust count = 37** (24 platform
 and proof-validity entries, V1–V11 and P1–P10 among them, plus the same 13
 sites), **internal-unproven count = 5** (U1–U5, reported apart), and
 **global d:a = 47:56**, because I17–I19, I21 and I22 now cite the unproven
-code they rest on. Per invariant with a proof claim in Phase A (from
+code they rest on. Re-baselined on 2026-10-31 by owner decision: I9, I24 and
+I25 were accounted (they had no row), adding six assumptions and no
+obligation, so **global d:a = 47:62**; the trust count stays 37. Per invariant with a proof claim in Phase A (from
 `planarian-gym verification` at v4.6): I5 4:3, I6 7:5, I8 1:1, I10 1:2,
 I11 2:2, I12 9:8, I14 1:2, I15 2:2, I16 2:3, I18 5:3, I19 3:3, I21 2:4,
 I22 5:4, I23 3:1. I1–I4, I7, I13, I17 and I20 are tested, not proved
@@ -57,7 +59,7 @@ path.
 count** (V, P and G entries in `assumptions.md` plus `external_body` and
 `assume` sites: 37 after the v4.5 re-accounting), the **internal-unproven
 count** (U entries: Planarian's own unproven code the gates take input from:
-5), and **d:a** (47:56). It also checks `docs/bypasses.md`'s format and lists
+5), and **d:a** (47:62). It also checks `docs/bypasses.md`'s format and lists
 its open rows by severity (§17b). On every push it fails if any number
 regresses or the register is malformed; with `--gate` (run at every phase
 gate) it also fails on an open High row. The v4.5 re-accounting and its
