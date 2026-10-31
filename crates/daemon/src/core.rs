@@ -168,6 +168,8 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// When each transaction in `AwaitingBoot` was last said to need a
     /// restart (`CLOCK_BOOTTIME`); repeated daily (§12f).
     restart_reminded: BTreeMap<TxnId, Timestamp>,
+    /// The attributed way to stop a unit has been taught once (§16, P23).
+    residue_taught: bool,
     /// Incidents whose opening was already announced.
     diag_noted: BTreeSet<IncidentId>,
     /// External dependencies whose probes time out: since when, and
@@ -323,6 +325,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             new_declarations_since: now,
             interlock_noted: false,
             restart_reminded: BTreeMap::new(),
+            residue_taught: false,
             diag_noted: BTreeSet::new(),
             unreachable: BTreeMap::new(),
             chain_checked: None,
@@ -746,8 +749,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     with.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", ")
                 )
             };
+            // §16 (P23): the first time, teach the attributed form.
+            let teach = if std::mem::replace(&mut self.residue_taught, true) {
+                String::new()
+            } else {
+                format!(" Next time, planarian stop {r} does the same with your name on it.")
+            };
             self.notice(format!(
-                "{r}: stopped outside Planarian ({how}); I take that as intended and leave it stopped until the next boot{also}. To start it again: planarian release {r}"
+                "{r}: stopped outside Planarian ({how}); I take that as intended and leave it stopped until the next boot{also}. To start it again: planarian release {r}.{teach}"
             ));
         }
         let _ = now;

@@ -2288,6 +2288,33 @@ overrides = [{ unit = "service:gym-web", by = "Unattributed", attribution = "Inf
 reports = ["InferredOverride", "Undo"]
 no_txn_on = ["service:gym-web"]
 
+# P23 (§16): the first raw stop caught as the residue teaches the attributed form.
+[[fault]]
+id = "residue-first-kill-teaches-stop"
+family = "unattributed-residue"
+summary = "A user's first raw kill -9 of gym-web is caught as the unattributed residue; its notice names planarian stop service:gym-web as the attributed way. A later raw stop of gym-db is inferred the same way, without the lesson again."
+spec = ["§16 stopping", "§11 unattributed residue", "P23"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake"]
+intent = { kind = "no-intervention", because = "unattributed stops under Standard are inferred as intended" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+after = [{ raw = "wait", for = "1m" }, { raw = "stop_unit_out_of_band", unit = "service:gym-db", actor = "root" }, { raw = "wait", for = "1m" }]
+window = "3m"
+
+[fault.required_post]
+overrides = [
+  { unit = "service:gym-web", by = "Unattributed", attribution = "Inferred", until = "NextBoot" },
+  { unit = "service:gym-db", by = "Unattributed", attribution = "Inferred", until = "NextBoot" },
+  { unit = "service:gym-app", by = "Unattributed", attribution = "Inferred", until = "NextBoot" },
+]
+reports = ["InferredOverride", "Undo"]
+notices_count = [
+  { match = "Next time, planarian stop service:gym-web does the same", count = 1 },
+  { match = "Next time, planarian stop", count = 1 },
+  { match = "service:gym-db: stopped outside Planarian", count = 1 },
+]
+
 [[fault]]
 id = "residue-kill9-undo"
 family = "unattributed-residue"

@@ -344,12 +344,16 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                 }
             }
             // Exactly this many notices mention `match` (§12f: one notice per repair).
+            // One table, or a list of them.
             "notices_count" => {
-                let m = val.get("match").and_then(T::as_str).unwrap_or("");
-                let want = val.get("count").and_then(T::as_integer).unwrap_or(0) as usize;
-                let got = e.notices.iter().filter(|n| n.contains(m)).count();
-                if got != want {
-                    fail(&mut v, format!("{got} notices mention {m}, want {want}: {:?}", e.notices));
+                let one = std::slice::from_ref(val);
+                for c in val.as_array().map(Vec::as_slice).unwrap_or(one) {
+                    let m = c.get("match").and_then(T::as_str).unwrap_or("");
+                    let want = c.get("count").and_then(T::as_integer).unwrap_or(0) as usize;
+                    let got = e.notices.iter().filter(|n| n.contains(m)).count();
+                    if got != want {
+                        fail(&mut v, format!("{got} notices mention {m}, want {want}: {:?}", e.notices));
+                    }
                 }
             }
             // An incident escalated with this reason during the run.
