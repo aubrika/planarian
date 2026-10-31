@@ -191,6 +191,12 @@ pub trait GenerationBackend {
     fn record_override(&self, g: GenerationId, hash: &Hash) -> Result<(), Outcome>;
     /// Remove a GC root symlink this backend created.
     fn release_root(&self, root: &str) -> bool;
+    /// Remove build roots no transaction can still use: older than the
+    /// longest a candidate may wait (§12f), a crashed build's included.
+    /// At startup and before every collection (§9 step 5, C4). Returns them.
+    fn age_out_build_roots(&self) -> Vec<String> {
+        vec![]
+    }
     /// Collect generations under the §12b bounds (`gc::plan`), never touching
     /// `protect` (I3), then collect store garbage. Mutating.
     fn collect_garbage(&self, protect: &[GenerationId], emergency: bool, op: &OpId) -> Outcome;

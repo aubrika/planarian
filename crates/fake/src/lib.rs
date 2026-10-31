@@ -219,6 +219,9 @@ pub struct World {
     pub agent_instances: BTreeMap<String, InstanceId>,
     /// The next build's dry activation fails this way (R10).
     pub dry_activate_fails: Option<String>,
+    /// Fault injection (C6): the next candidate's store contents no longer
+    /// hash to the NAR hash recorded when it was built.
+    pub nar_mismatch: bool,
     pub next_instance: u64,
     pub third_party_override: Option<Hash>,
     /// Units planted outside the generation (the boot report finds them).
@@ -808,7 +811,10 @@ impl GenerationBackend for Fake {
     }
 
     fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
-        let w = self.w();
+        let mut w = self.w();
+        if std::mem::take(&mut w.nar_mismatch) {
+            return Ok(false);
+        }
         Ok(w.gens.values().any(|g| &g.path == path)
             && !w.collected.iter().any(|c| w.gens.get(c).is_some_and(|g| &g.path == path)))
     }

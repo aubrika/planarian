@@ -1141,6 +1141,9 @@ impl Sim {
                 ("dry_activate", r @ ("exit-nonzero" | "timeout" | "truncated")) => {
                     self.fake.w().dry_activate_fails = Some(format!("dry activation: {r}"));
                 }
+                ("verify_candidate", "nar-mismatch") => {
+                    self.fake.w().nar_mismatch = true;
+                }
                 ("activate_live", "Failed") => {
                     let base = self.base;
                     self.fake.w().fail_activate.insert(base);

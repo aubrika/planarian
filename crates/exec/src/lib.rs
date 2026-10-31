@@ -261,6 +261,8 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     /// recorded, so a later Rollback to it can restore it.
     pub fn adopt_current(&self) {
         let gens = self.b.generations();
+        // C4: a build root left by a build that crashed goes once it is old.
+        let _ = gens.age_out_build_roots();
         if let (Ok(g), Ok((set, hash))) = (gens.current(), gens.read_overrides())
             && gens.override_for(g).ok().flatten().is_none()
         {

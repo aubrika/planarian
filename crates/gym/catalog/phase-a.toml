@@ -3201,6 +3201,30 @@ transition = "ApplyChange"
 refused_with = 'ActivationUnknown'
 
 [[fault]]
+id = "candidate-nar-mismatch-refused"
+family = "bad-generation"
+summary = "A display-scale candidate's store contents no longer hash to the NAR hash recorded when it was built. It is refused before activation: verification checks the hash, not that the path exists (§9 step 3, C6)."
+spec = ["§9 step 3", "C6"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: corrupting a store path on the VM would corrupt the host's
+# store, which the test VM shares; the backend test covers the real check.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "verify_candidate", result = "nar-mismatch" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "3m"
+
+[fault.required_post]
+generation = "base"
+override_source = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+terminal = 'Rejected(Other("candidate failed verification"))'
+
+[[fault]]
 id = "dry-activate-timeout"
 family = "bad-generation"
 summary = "The dry activation of a display-scale change times out. Its plan is unknown, never smaller: the build fails, nothing is activated, and the running generation stays (rule 21, R10)."
