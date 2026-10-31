@@ -447,9 +447,13 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     }
 
     /// What the approval token binds (§8 `ApprovalToken.bound_to`).
-    fn binding(&self, p: &Proposal, plan: &Plan, state: &SystemState) -> Hash {
+    /// It names the transaction too, so each request for approval has its
+    /// own: an approval issued before a restart can never approve the change
+    /// asked for again after it, however identical (§12 step 4, S07).
+    fn binding(&self, txn: TxnId, p: &Proposal, plan: &Plan, state: &SystemState) -> Hash {
         let cumulative = plan.facts.config_diff.as_ref().map(|d| self.session.cumulative.then(d)).unwrap_or_default();
         let v = serde_json::json!({
+            "txn": txn.0,
             "transition": plan.transition,
             "staged_source": plan.staged.as_ref().map(|s| s.staged_source),
             "candidate": plan.candidate,
@@ -653,7 +657,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             }
         };
         if let Decision::Allow { tier: Tier::AskFirst, approver: class } = plan.decision {
-            let bound_to = self.binding(&p, &plan, state);
+            let bound_to = self.binding(id, &p, &plan, state);
             let now = self.b.clock().boot_now();
             self.parked.insert(
                 id,
@@ -832,7 +836,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 return s;
             }
         };
-        let rebound = self.binding(&parked.proposal, &plan, state);
+        let rebound = self.binding(parked.txn, &parked.proposal, &plan, state);
         if rebound != parked.bound_to || !matches!(plan.decision, Decision::Allow { .. }) {
             // Something the approval covered changed: the token is void. Withdraw
             // this transaction and, if still allowed, park the new one.

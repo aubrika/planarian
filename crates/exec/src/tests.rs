@@ -340,6 +340,20 @@ fn approval_expires() {
     );
 }
 
+/// S07 (§12 step 4): each request for approval has its own approval; one
+/// issued for an earlier, identical request never approves a later one.
+#[test]
+fn an_earlier_approval_never_approves_a_later_identical_request() {
+    let mut r = Rig::new();
+    let off = || change("service-enable", &[("service", Value::Str("sshd".into())), ("enabled", Value::Bool(false))]);
+    let Submitted::Parked { txn, approve: first, .. } = r.propose(off(), admin()) else { panic!() };
+    r.ex.cancel(txn, Actor::user(1001));
+    let Submitted::Parked { approve: second, .. } = r.propose(off(), admin()) else { panic!() };
+    assert_ne!(first, second, "the same change asked for again gets a new approval");
+    assert!(matches!(r.approve(first), Submitted::Rejected { .. }), "the earlier approval is refused");
+    assert_eq!(finished(&r.approve(second)), TxnState::Committed);
+}
+
 #[test]
 fn runtime_option_then_writeback() {
     let mut r = Rig::new();
