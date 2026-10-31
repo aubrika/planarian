@@ -56,7 +56,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("Absent: planariad stopped outside a shutdown"):
         machine.succeed("systemctl stop planariad.service")
-        machine.wait_until_succeeds("test -e /run/planarian/alarm", timeout=60)
+        machine.wait_until_succeeds("test -s /run/planarian/alarm", timeout=60)
         assert alarm().startswith("absent"), alarm()
         machine.wait_until_fails("systemctl is-active gym-agent.service", timeout=60)
         machine.succeed("grep -q 'AllowGroups planarian-admin' /run/planarian/sshd/posture.conf")
@@ -72,7 +72,7 @@ pkgs.testers.runNixOSTest {
         for _ in range(8):
             machine.succeed("systemctl kill --signal=SIGSEGV planariad.service || true")
             machine.sleep(3)
-        machine.wait_until_succeeds("test -e /run/planarian/alarm", timeout=120)
+        machine.wait_until_succeeds("test -s /run/planarian/alarm", timeout=120)
         assert alarm().startswith("crashed"), alarm()
         machine.wait_until_fails("systemctl is-active gym-agent.service", timeout=60)
         machine.succeed("systemctl reset-failed planariad.service")
@@ -83,7 +83,7 @@ pkgs.testers.runNixOSTest {
         for _ in range(8):
             machine.succeed("systemctl kill --signal=SIGSEGV planarian-recovery.service || true")
             machine.sleep(3)
-        machine.wait_until_succeeds("test -e /run/planarian/alarm", timeout=120)
+        machine.wait_until_succeeds("test -s /run/planarian/alarm", timeout=120)
         assert alarm().startswith("crashed"), alarm()
         machine.wait_until_fails("systemctl is-active gym-agent.service", timeout=60)
         machine.succeed("systemctl reset-failed planarian-recovery.service")
@@ -124,6 +124,8 @@ pkgs.testers.runNixOSTest {
         machine.succeed("echo '{\"seq\": 1, \"issued\": 0, \"units\": {}}' > /var/lib/planarian/external/desired.json")
         machine.succeed("printf '%0128d' 0 > /var/lib/planarian/external/desired.json.sig")
         machine.wait_until_succeeds("test -e /run/planarian/failed-integrity", timeout=120)
+        # respond marks the class before it writes the alarm: wait for both.
+        machine.wait_until_succeeds("grep -q '^integrity' /run/planarian/alarm", timeout=60)
         assert alarm().startswith("integrity"), alarm()
         machine.succeed("grep -q 'external desired-state source' /run/planarian/integrity")
         machine.fail("systemctl is-active gym-agent.service")
@@ -151,6 +153,8 @@ pkgs.testers.runNixOSTest {
         machine.succeed("systemctl start planarian-recovery.service")
         machine.succeed("systemctl start planariad.service || true")
         machine.wait_until_succeeds("test -e /run/planarian/failed-integrity", timeout=120)
+        # respond marks the class before it writes the alarm: wait for both.
+        machine.wait_until_succeeds("grep -q '^integrity' /run/planarian/alarm", timeout=60)
         assert alarm().startswith("integrity"), alarm()
         machine.succeed("grep -q 'tampered' /run/issue.d/50-planarian.issue")
         machine.succeed("grep -q 'DenyUsers' /run/planarian/sshd/posture.conf")
