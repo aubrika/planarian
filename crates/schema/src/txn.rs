@@ -24,6 +24,9 @@ pub enum TxnState {
     Checking,
     /// Boot entry written.
     Published,
+    /// The boot-only path (§12 step 7): journaled before `publish_boot_once`,
+    /// the first boot mutation; the crash table asks the boot loader.
+    Publishing,
     /// A boot-only candidate published as a one-shot next-boot entry (§12f);
     /// active for I6, confirmed or reverted at that boot.
     AwaitingBoot,
@@ -57,10 +60,12 @@ impl TxnState {
         }
     }
 
-    /// States in which no other transition may execute (I6).
+    /// States in which no other transition may execute (I6, §12 Concurrency):
+    /// one list, which the ledger reads.
     pub open spec fn exclusive(self) -> bool {
         match self {
-            TxnState::Activating | TxnState::Published | TxnState::Promoted | TxnState::Reverting => true,
+            TxnState::Activating | TxnState::Checking | TxnState::Publishing | TxnState::Published
+            | TxnState::Promoted | TxnState::Reverting => true,
             _ => false,
         }
     }
@@ -91,7 +96,8 @@ impl TxnState {
             r == self.exclusive(),
     {
         match self {
-            TxnState::Activating | TxnState::Published | TxnState::Promoted | TxnState::Reverting => true,
+            TxnState::Activating | TxnState::Checking | TxnState::Publishing | TxnState::Published
+            | TxnState::Promoted | TxnState::Reverting => true,
             _ => false,
         }
     }
@@ -218,6 +224,10 @@ pub struct CheckContext {
     pub candidate: Option<Manifest>,
     pub base: Manifest,
     pub pre: std::collections::BTreeMap<UnitId, UnitStatus>,
+    /// Per unit, the Readiness probes passing before (§9, R07): each must
+    /// still pass after, whatever the unit's aggregate status was.
+    #[serde(default)]
+    pub pre_passing: std::collections::BTreeMap<UnitId, Vec<crate::ids::ProbeId>>,
 }
 
 impl Outcome {
@@ -251,6 +261,10 @@ pub struct ApprovalToken {
 }
 
 pub const TOKEN_LIFETIME: Millis = Millis(24 * 3600 * 1000);
+
+/// How long a transaction may wait in `Built` for an activation window
+/// (§12f, I12); `AwaitingBoot` has no limit.
+pub const PARKING_LIMIT: Millis = Millis(24 * 3600 * 1000);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {

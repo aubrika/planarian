@@ -1,7 +1,7 @@
 # Phase A gate (GA) status
 
 Where Planarian stands against the Phase A exit gate (SPEC §4), with the
-evidence for each criterion and how to reproduce it. Updated 2026-10-30.
+evidence for each criterion and how to reproduce it. Updated 2026-10-31.
 
 ## Summary
 
@@ -16,7 +16,7 @@ Where that stands, in rule 19's order:
 | (a) Reconcile the close-out review | Done: `docs/review-reconciliation.md` (R01–R16, S01–S07 at `b219d81`) |
 | (b) B-20 (I24) | Closed: agent authority bound to the instance a start journaled (`8231a07`); `agent-name-collision` on both harnesses |
 | (c) Documentation sweep | Done (`8dc27fa` and this summary) |
-| (d) §28's required changes | In progress |
+| (d) §28's required changes | In progress. Closed, each with its acceptance case: R01, R02, R03, R07, R08, R09, R10, S01, S02, S03, S05, S06, S07, C3, C14, C16, C21, I7, P23 (commits and cases in `docs/review-reconciliation.md`, "Closed since the reconciliation"). Open: R04, R05, R06, R11, C4, C6, P7, P8, P13–P18, P22, K10 |
 | (e) §15 harness contract, §17a accounting checks | Partly: VM catalog jobs green only on PASS or a named waiver (`b219d81`); the rest open |
 | (f) One whole VM catalog run, this file from it | After (d) and (e) |
 

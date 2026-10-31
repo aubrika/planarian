@@ -13,6 +13,7 @@ use planarian_txn::journal::{Journal, JournalError};
 use planarian_txn::kernel::{CrashPoint, Kernel};
 use planarian_txn::ledger::{Entry, Ledger, Record};
 use planarian_txn::machine::tag;
+use planarian_txn::store::Store as _;
 use std::collections::{BTreeMap, BTreeSet};
 use toml::Value as T;
 
@@ -36,6 +37,7 @@ pub fn config() -> CoreConfig {
                     "gym:security-fix",
                     "gym:kernel-param",
                     "gym:touch-core",
+                    "gym:newlib",
                     "gym:drop-probe",
                     "gym:firewall-step",
                 ]
@@ -71,7 +73,15 @@ pub fn config() -> CoreConfig {
                         planarian_changes::GymChoice {
                             option: "gym.vulnlib".into(),
                             arg: "version".into(),
-                            permitted: vec!["1.1".into()],
+                            permitted: vec!["1.1".into(), "1.2".into()],
+                        },
+                    ),
+                    (
+                        "gym:newlib".into(),
+                        planarian_changes::GymChoice {
+                            option: "gym.newlib".into(),
+                            arg: "version".into(),
+                            permitted: vec!["1.0".into(), "2.0".into()],
                         },
                     ),
                     (
@@ -157,6 +167,8 @@ pub struct Sim {
     held_tokens: Vec<Hash>,
     timeline: BTreeMap<UnitId, Vec<(Timestamp, String)>>,
     start_probe_defs: String,
+    /// Stages and builds when the entry's steps began.
+    start_work: (usize, usize),
     start_roots: std::collections::BTreeSet<String>,
     /// planariad's side of the failure posture (§12d); see `PostureSeen`.
     pub posture_seen: crate::evidence::PostureSeen,
@@ -277,6 +289,7 @@ impl Sim {
             held_tokens: vec![],
             timeline: BTreeMap::new(),
             start_probe_defs: String::new(),
+            start_work: (0, 0),
             start_roots: Default::default(),
             posture_seen: Default::default(),
         }
@@ -287,6 +300,9 @@ impl Sim {
         self.start = self.now();
         self.pre_status = self.statuses();
         self.start_probe_defs = self.probe_defs();
+        let w = self.fake.w();
+        self.start_work = (w.stages, w.builds);
+        drop(w);
         self.start_roots = self.build_roots();
     }
 
@@ -405,7 +421,33 @@ impl Sim {
             w.overrides.assignments.is_empty(),
         );
         let override_hash = Some(planarian_fake::World::override_hash_of(&w.overrides));
+        let work = Some((w.stages - self.start_work.0, w.builds - self.start_work.1));
         let third_party_override = w.third_party_override;
+        // §12 (R01): boot selection, roots, overrides and the journal agree.
+        let ledger = self.ledger();
+        let mut disagree = vec![];
+        if w.boot_default != w.current {
+            disagree.push(format!("boot default {} is not the running generation {}", w.boot_default.0, w.current.0));
+        }
+        if let Some(g) = w.one_shot {
+            disagree.push(format!("a one-shot entry for generation {} is still armed", g.0));
+        }
+        if let (Some(h), Some(rec)) = (override_hash, w.gen_overrides.get(&w.current))
+            && h != *rec
+        {
+            disagree.push(format!("the override file is not the one generation {} was committed with", w.current.0));
+        }
+        let live_roots: BTreeSet<&String> = ledger.live.values().filter_map(|t| t.txn.gc_root.as_ref()).collect();
+        for r in w.gc_roots.iter().filter(|r| r.contains("/builds/") && !live_roots.contains(r)) {
+            let entry =
+                w.boot_entries.iter().any(|g| w.gens.get(g).is_some_and(|x| r.ends_with(&x.eval.source.to_hex())));
+            if !entry {
+                disagree.push(format!("GC root {r} belongs to no live transaction or boot entry"));
+            }
+        }
+        for t in ledger.live.values() {
+            disagree.push(format!("transaction {} is still {}", t.txn.id.0, tag(&t.txn.state)));
+        }
         drop(w);
         crate::evidence::Evidence {
             current,
@@ -414,10 +456,12 @@ impl Sim {
             candidate: self.candidate,
             boot_entries,
             collected,
+            work,
             overrides_empty,
             override_hash,
             third_party_override,
-            ledger: self.ledger(),
+            agreement: Some(disagree),
+            ledger,
             journal_replays,
             log: self.log.clone(),
             pre_status: self.pre_status.clone(),
@@ -571,7 +615,7 @@ impl Sim {
         let j = match Journal::open(self.fake.store.clone()) {
             Ok(j) => j,
             Err(JournalError::Integrity(why)) => {
-                return self.integrity(format!("journal: the hash chain is broken: {why}"));
+                return self.integrity(format!("journal: integrity: {why}"));
             }
             Err(e) => panic!("journal: {e:?}"),
         };
@@ -582,6 +626,8 @@ impl Sim {
         let boot_id = self.boot_id();
         let mut core = Core::start(j, self.fake.clone(), OwnerId::Daemon { pid, boot_id }, cfg);
         core.admin_of = gym_admins();
+        // The executor log of the earlier runs, as the daemon reads it back.
+        core.remember(self.log.clone());
         self.core = Some(core);
         self.harvest();
     }
@@ -668,11 +714,15 @@ impl Sim {
                 || matches!(s.get("raw").and_then(T::as_str), Some("ask" | "cli" | "approve_pending"))
         };
         for (i, s) in steps.iter().enumerate() {
-            if let Some(call) = s.get("when").and_then(|w| w.get("op_called")).and_then(T::as_str) {
-                let call: &'static str = Box::leak(call.to_string().into_boxed_str());
-                if let Some(j) = (0..i).rev().find(|j| is_txn(steps[*j])) {
-                    crash = Some((j, CrashPoint::OpCalled(call)));
+            for (key, point) in [("op_called", CrashPoint::OpCalled as fn(_) -> _), ("op_begun", CrashPoint::OpBegun)] {
+                if let Some(call) = s.get("when").and_then(|w| w.get(key)).and_then(T::as_str) {
+                    let call: &'static str = Box::leak(call.to_string().into_boxed_str());
+                    if let Some(j) = (0..i).rev().find(|j| is_txn(steps[*j])) {
+                        crash = Some((j, point(call)));
+                    }
                 }
+            }
+            if s.get("when").is_some_and(|w| w.get("op_called").is_some() || w.get("op_begun").is_some()) {
                 continue;
             }
             let Some(state) = s.get("when").and_then(|w| w.get("journal")).and_then(T::as_str) else { continue };
@@ -1019,6 +1069,8 @@ impl Sim {
                 let uid = s.get("uid").and_then(T::as_integer).unwrap_or(1000) as u32;
                 let id = get("session").to_string();
                 let seat = s.get("seat").and_then(T::as_str).map(String::from);
+                // An SSH-only login (no seat) starts no compositor.
+                let compositor = seat.is_some() && get("compositor") != "fails";
                 let now = self.now();
                 let mut w = self.fake.w();
                 w.sessions.push(SessionInfo {
@@ -1031,7 +1083,7 @@ impl Sim {
                     idle: false,
                     created: now,
                 });
-                w.compositors.insert(id, get("compositor") != "fails");
+                w.compositors.insert(id, compositor);
                 let sim = planarian_fake::UnitSim::active(now);
                 for name in ["pipewire", "wireplumber"] {
                     let u = UnitId {
@@ -1144,6 +1196,21 @@ impl Sim {
                 } else {
                     let _ = Journal::open(self.fake.store.clone()).map(|mut j| j.compact());
                 }
+            }
+            // §12c (C16): a checkpoint whose bytes were damaged while the
+            // daemon was down; its CRC no longer matches.
+            "corrupt_checkpoint" => {
+                self.kill_daemon();
+                let mut b = self
+                    .fake
+                    .store
+                    .read_checkpoint()
+                    .ok()
+                    .flatten()
+                    .ok_or_else(|| Unsupported("corrupt_checkpoint: no checkpoint".into()))?;
+                let mid = b.len() / 2;
+                b[mid] ^= 0x20;
+                self.fake.store.write_checkpoint(&b).map_err(|e| Unsupported(e.to_string()))?;
             }
             "force_compaction" => {
                 self.save_segment();
@@ -1338,6 +1405,7 @@ impl Sim {
                 Request::Resolve { txn, resolution }
             }
             ["diagnose", u, "--probe", p] => Request::Diagnose { unit: unit(u), probe: Some(ProbeId(p.to_string())) },
+            ["undo"] => Request::Undo,
             other => return Err(Unsupported(format!("cli {other:?}"))),
         })
     }

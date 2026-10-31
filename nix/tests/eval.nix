@@ -47,6 +47,15 @@ let
     modules = [ { services.planarian.package = pkgs.callPackage ../package.nix { gymHooks = true; }; } ];
   };
   refused = builtins.filter (a: !a.assertion) testBuildSys.config.assertions;
+  # §10 (S06): a manifest with a 0.5-confidence edge to an external dependency.
+  weakEdgeSys = sys.extendModules {
+    modules = [ {
+      services.planarian.units.gym-db.edges = [ { to = "service:external:gym-upstream"; kind = "Diagnostic"; confidence = 500; } ];
+      services.planarian.units.gym-app.edges = [ { to = "external:gym-upstream"; kind = "Diagnostic"; confidence = 700; } ];
+    } ];
+  };
+  weakRefused = builtins.filter (a: !a.assertion) weakEdgeSys.config.assertions;
+  external = m: pkgs.lib.hasInfix "external dependency" m.message;
   export = cfg.services.planarian.export;
   unit = id: builtins.head (builtins.filter (u: u.id == id) export.units);
   app = unit "service:gym-app";
@@ -71,6 +80,8 @@ let
     (check (export.coreUnits."planariad.service" != "") "core unit hashes exported")
     (check (builtins.any (a: pkgs.lib.hasInfix "test build" a.message) refused) "the module refuses the test build outside the gym (B-13)")
     (check (builtins.all (a: !(pkgs.lib.hasInfix "test build" a.message)) (builtins.filter (a: !a.assertion) cfg.assertions)) "the shipped package is not refused")
+    (check (builtins.any (a: external a && pkgs.lib.hasInfix "gym-db -> service:external:gym-upstream (Diagnostic 500/1000)" a.message && !(pkgs.lib.hasInfix "gym-app" a.message)) weakRefused) "a 0.5-confidence edge to an external dependency is rejected, a 0.7 one is not (S06)")
+    (check (!(builtins.any external (builtins.filter (a: !a.assertion) cfg.assertions))) "the reference configuration has no weak external edge")
   ];
 in
 assert builtins.all (x: x) checks;

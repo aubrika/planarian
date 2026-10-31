@@ -81,7 +81,11 @@ pub fn record(r: &Record) -> String {
         Record::AcceptedBaseline(g) => format!("accepted baseline: {g:?}"),
         Record::SecurityFloor(g) => format!("security floor: {g:?}"),
         Record::ExternalAccepted { seq, .. } => format!("external desired state {seq} accepted"),
-        Record::TokenUsed { .. } => "approval token used".into(),
+        Record::TokenUsed { approver, txn, .. } => match (*approver, *txn) {
+            (0, _) => "approval token used".into(),
+            (a, t) if a < 1 << 32 => format!("transaction {t} approved by uid {a}"),
+            (a, t) => format!("transaction {t} approved by principal {a}"),
+        },
         Record::Resolved { txn, resolution, by } => format!("txn {} resolved as {resolution:?} by {by:?}", txn.0),
         Record::Reconciliation(r) => format!("reconciliation by {:?}: {}", r.by, r.actions.join("; ")),
         Record::AgentStarted { name, by, .. } => format!("agent {name} started by uid {by}, acting for it"),

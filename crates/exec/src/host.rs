@@ -124,6 +124,20 @@ impl<B: Backends> ExecHost<B> {
             }
             out.push(format!("{u} was Running before and is now {now:?}"));
         }
+        // Per probe (§9, R07): a Readiness probe that passed before passes
+        // now, for every unit that is still expected under these defs, so a
+        // unit already Degraded by one probe cannot lose another unnoticed.
+        for (u, passing) in &txn.check.pre_passing {
+            if !defs.contains_key(u) || !s.expected(u, defs) {
+                continue;
+            }
+            let failing = s.failing_readiness(u, defs);
+            let lost: Vec<&str> = passing.iter().filter(|p| failing.contains(p)).map(|p| p.0.as_str()).collect();
+            if lost.is_empty() || (phase == CheckPhase::Revert && space_only(u, s, defs)) {
+                continue;
+            }
+            out.push(format!("{u}: {} passed before and fails now", lost.join(", ")));
+        }
         out
     }
 }
@@ -131,6 +145,28 @@ impl<B: Backends> ExecHost<B> {
 impl<B: Backends> Host for ExecHost<B> {
     type Gen = B::Gens;
     type Inv = B::Inv;
+
+    fn floor_fixes(&self, txn: &Transaction, floor: Option<GenerationId>) -> Result<Vec<String>, Outcome> {
+        let gens = self.b.generations();
+        let Some((cand, _)) = txn.candidate.clone() else { return Ok(vec![]) };
+        let eval = |g: GenerationId| gens.path_of(g).and_then(|p| gens.evaluate_built(&p));
+        let c = eval(cand)?;
+        // The floor and every generation between it and the candidate (in A),
+        // so a Revert to an older generation is never a fix (§12e).
+        let mut earlier: Vec<GenerationId> = gens.boot_entries()?;
+        earlier.push(txn.revert_to);
+        earlier.sort();
+        earlier.dedup();
+        earlier.retain(|g| g.0 < cand.0 && floor.is_none_or(|f| g.0 >= f.0));
+        let earlier: Vec<EvaluatedGeneration> = earlier.into_iter().map(eval).collect::<Result<_, _>>()?;
+        Ok(c.packages
+            .keys()
+            .filter(|p| !c.insecure.contains(*p))
+            .filter(|p| earlier.iter().all(|e| e.insecure.contains(*p) || !e.packages.contains_key(*p)))
+            .filter(|p| earlier.iter().any(|e| e.insecure.contains(*p)))
+            .cloned()
+            .collect())
+    }
 
     fn generations(&self) -> &B::Gens {
         self.b.generations()

@@ -2,7 +2,7 @@
 //! console report. "Needs attention" is `ConsoleReport::needs_attention`,
 //! the same condition that makes the console start visible.
 
-use planarian_ipc::{ConsoleReport, status_words};
+use planarian_ipc::{ConsoleReport, status_words, waiting_words};
 use planarian_schema::IncidentState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,8 +68,11 @@ pub fn classify(report: Result<&ConsoleReport, &str>) -> Summary {
         let line = if n.starts_with("busy with ") { n.split(':').next().unwrap_or(n) } else { n };
         return Summary { level: Level::Working, line: line.to_string() };
     }
-    if let Some((t, _, what)) = s.in_flight.first() {
-        return Summary { level: Level::Working, line: format!("working on #{}: {what}", t.0) };
+    if let Some((t, state, what)) = s.in_flight.first() {
+        return match waiting_words(state) {
+            Some(w) => Summary { level: Level::Ok, line: format!("#{} is {w}: {what}", t.0) },
+            None => Summary { level: Level::Working, line: format!("working on #{}: {what}", t.0) },
+        };
     }
     let line = match &s.baseline_note {
         Some(_) => "all healthy (no baseline yet)".to_string(),
@@ -118,6 +121,17 @@ mod tests {
             next_attempt: Timestamp(0),
             regressions: 0,
         }
+    }
+
+    /// §12f, I12: a change parked by design is not work in progress or a
+    /// fault; it says what it is waiting for.
+    #[test]
+    fn a_change_waiting_for_a_restart_is_ok_and_says_so() {
+        let mut r = report();
+        r.status.in_flight.push((TxnId(4), TxnState::AwaitingBoot, "apply kernel-param".into()));
+        let s = classify(Ok(&r));
+        assert_eq!(s.level, Level::Ok);
+        assert_eq!(s.line, "#4 is waiting for a restart: apply kernel-param");
     }
 
     #[test]

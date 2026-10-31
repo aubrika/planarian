@@ -211,6 +211,16 @@ impl ConsoleReport {
     }
 }
 
+/// A transaction that is parked by design, in words (§12f, I12): never shown
+/// as work in progress or as a failure.
+pub fn waiting_words(s: &TxnState) -> Option<&'static str> {
+    match s {
+        TxnState::AwaitingBoot => Some("waiting for a restart"),
+        TxnState::Built => Some("waiting for a quiet moment"),
+        _ => None,
+    }
+}
+
 /// A unit status in words.
 pub fn status_words(s: &UnitStatus) -> String {
     use UnitStatus as S;

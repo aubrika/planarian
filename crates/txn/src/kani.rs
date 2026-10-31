@@ -18,7 +18,7 @@ use planarian_schema::{Actor, Hash, RecoveryStrategy, RejectReason, Timestamp, T
 
 fn any_state() -> TxnState {
     let i: u8 = kani::any();
-    match i % 14 {
+    match i % 15 {
         0 => TxnState::Prepared,
         1 => TxnState::Staged,
         2 => TxnState::Built,
@@ -32,6 +32,7 @@ fn any_state() -> TxnState {
         10 => TxnState::RecoveryFailed,
         11 => TxnState::Rejected(RejectReason::Interrupted),
         12 => TxnState::AwaitingBoot,
+        13 => TxnState::Publishing,
         _ => TxnState::Cancelled(Actor::Daemon),
     }
 }
@@ -46,11 +47,16 @@ fn any_strategy() -> RecoveryStrategy {
     }
 }
 
-fn in_window(s: &TxnState) -> bool {
-    matches!(
-        s,
-        TxnState::Activating | TxnState::Checking | TxnState::Published | TxnState::Promoted | TxnState::Reverting
-    )
+fn in_window(s: &TxnState, boot_only: bool) -> bool {
+    match s {
+        TxnState::Activating
+        | TxnState::Checking
+        | TxnState::Publishing
+        | TxnState::Published
+        | TxnState::Reverting => true,
+        TxnState::Promoted => !boot_only,
+        _ => false,
+    }
 }
 
 /// A variant index: comparing these avoids the derived `PartialEq`, whose
@@ -71,6 +77,7 @@ fn idx(s: &TxnState) -> u8 {
         TxnState::Rejected(_) => 11,
         TxnState::Cancelled(_) => 12,
         TxnState::AwaitingBoot => 13,
+        TxnState::Publishing => 14,
     }
 }
 
@@ -146,11 +153,22 @@ fn action_ok(action: RecoveryAction, from: &TxnState, strategy: RecoveryStrategy
         }
         A::AwaitBoot => {
             // After a reboot (before one, the transaction is left as is):
-            // the candidate booted and passed, failed, or did not boot.
+            // the candidate booted and was admitted, then confirmed at the
+            // checkpoint or withdrawn; it failed admission; or did not boot.
             path_ok(from, strategy, &[AwaitingBoot, Promoted, Committed]);
+            path_ok(from, strategy, &[AwaitingBoot, Promoted, Reverting, Reverted]);
+            path_ok(from, strategy, &[AwaitingBoot, Promoted, Reverting, RecoveryFailed]);
+            path_ok(from, strategy, &[AwaitingBoot, Promoted, RecoveryFailed]);
             path_ok(from, strategy, &[AwaitingBoot, RecoveryFailed]);
             path_ok(from, strategy, &[AwaitingBoot, Reverted]);
             reverts_ok(from, strategy);
+        }
+        A::Publishing => {
+            // R01: armed → AwaitingBoot (then as AwaitBoot); not armed →
+            // Rejected(Interrupted); cannot tell → RecoveryFailed.
+            assert!(step_allowed(from, &AwaitingBoot, strategy));
+            path_ok(from, strategy, &[Publishing, Rejected(RejectReason::Interrupted)]);
+            path_ok(from, strategy, &[Publishing, RecoveryFailed]);
         }
         A::Fail => path_ok(from, strategy, &[from.clone(), RecoveryFailed]),
     }
@@ -182,17 +200,18 @@ fn watchdog_takes_over_only_when_it_should() {
     let state = any_state();
     let (mine, alive): (bool, bool) = (kani::any(), kani::any());
     let (now, deadline, renewed): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
-    let r = should_take_over(&state, mine, alive, Timestamp(now), Timestamp(deadline), Timestamp(renewed));
+    let boot_only: bool = kani::any();
+    let r = should_take_over(&state, boot_only, mine, alive, Timestamp(now), Timestamp(deadline), Timestamp(renewed));
     if r {
-        assert!(!mine && in_window(&state));
+        assert!(!mine && in_window(&state, boot_only));
     }
     if alive && (now <= deadline || now <= renewed.saturating_add(LEASE_GRACE.0)) {
         assert!(!r);
     }
-    if !alive && !mine && in_window(&state) {
+    if !alive && !mine && in_window(&state, boot_only) {
         assert!(r);
     }
-    if alive && !mine && in_window(&state) && now > deadline && now > renewed.saturating_add(LEASE_GRACE.0) {
+    if alive && !mine && in_window(&state, boot_only) && now > deadline && now > renewed.saturating_add(LEASE_GRACE.0) {
         assert!(r);
     }
 }

@@ -302,13 +302,19 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     );
                 }
             }
+            // `true` (or "base"): still the base; "candidate": the candidate.
             "known_good" => {
-                if ledger.known_good != Some(e.base) {
-                    fail(&mut v, format!("{:?}", ledger.known_good));
+                let want = if val.as_str() == Some("candidate") { e.candidate } else { Some(e.base) };
+                if ledger.known_good != want {
+                    fail(&mut v, format!("{:?}, want {want:?}", ledger.known_good));
                 }
             }
+            // `true`: the candidate is live_tested; "never": it is not (§10:
+            // a boot-only candidate is confirmed, never live_tested).
             "live_tested" => {
-                if ledger.live_tested.is_none() || ledger.live_tested != e.candidate {
+                let never = val.as_str() == Some("never");
+                let is = ledger.live_tested.is_some() && ledger.live_tested == e.candidate;
+                if is == never {
                     fail(&mut v, format!("{:?} vs candidate {:?}", ledger.live_tested, e.candidate));
                 }
             }
@@ -344,12 +350,16 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                 }
             }
             // Exactly this many notices mention `match` (§12f: one notice per repair).
+            // One table, or a list of them.
             "notices_count" => {
-                let m = val.get("match").and_then(T::as_str).unwrap_or("");
-                let want = val.get("count").and_then(T::as_integer).unwrap_or(0) as usize;
-                let got = e.notices.iter().filter(|n| n.contains(m)).count();
-                if got != want {
-                    fail(&mut v, format!("{got} notices mention {m}, want {want}: {:?}", e.notices));
+                let one = std::slice::from_ref(val);
+                for c in val.as_array().map(Vec::as_slice).unwrap_or(one) {
+                    let m = c.get("match").and_then(T::as_str).unwrap_or("");
+                    let want = c.get("count").and_then(T::as_integer).unwrap_or(0) as usize;
+                    let got = e.notices.iter().filter(|n| n.contains(m)).count();
+                    if got != want {
+                        fail(&mut v, format!("{got} notices mention {m}, want {want}: {:?}", e.notices));
+                    }
                 }
             }
             // An incident escalated with this reason during the run.
@@ -452,6 +462,12 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
             }
             // I23: the override file at the end is the third party's, as it
             // wrote it (never replaced by Planarian), or Planarian's own.
+            // §12 (R01): boot selection, roots, overrides and journal agree.
+            "agrees" => match &e.agreement {
+                Some(d) if !d.is_empty() => fail(&mut v, d.join("; ")),
+                Some(_) => {}
+                None => v.unchecked.push(key.clone()),
+            },
             "override_file" => match (val.as_str(), &e.third_party_override) {
                 (Some("third-party"), Some(h)) => {
                     if e.override_hash != Some(*h) {
@@ -500,6 +516,35 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                             }
                             prev = Some(i);
                         }
+                    }
+                }
+            },
+            // §12 step 4, I7 (C1, C17): the journal records who approved, so
+            // `planarian log` names them.
+            "approval_recorded_by" => match &e.entries {
+                None => v.unchecked.push(key.clone()),
+                Some(en) => {
+                    let want: u64 = match val.as_str() {
+                        Some("root") => 0,
+                        Some(u) => u.strip_prefix("user:").and_then(|n| n.parse().ok()).unwrap_or(u64::MAX),
+                        None => u64::MAX,
+                    };
+                    let approved: Vec<TxnId> = all.iter().map(|t| t.id).collect();
+                    let ok = en.iter().any(|x| {
+                        matches!(&x.record, Record::TokenUsed { approver, txn, .. }
+                            if *approver == want && approved.contains(&TxnId(*txn)))
+                    });
+                    if !ok {
+                        fail(&mut v, format!("no approval of a transaction by {want} in the journal"));
+                    }
+                }
+            },
+            // §12 (R09): nothing staged, evaluated or built during the run.
+            "no_build_work" if val.as_bool() == Some(true) => match e.work {
+                None => v.unchecked.push(key.clone()),
+                Some((stages, builds)) => {
+                    if stages + builds > 0 {
+                        fail(&mut v, format!("{stages} source(s) staged and {builds} build(s) for a refused caller"));
                     }
                 }
             },
@@ -1170,13 +1215,24 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             s("transition").is_none_or(|t| transition_name(&r.proposal.transition) == t)
                 && s("target").is_none_or(|u| target_of(&r.proposal.transition) == Some(unit(u)))
                 && s("caller").is_none_or(|c| caller_is(r, c))
+                && s("reject_detail")
+                    .is_none_or(|d| matches!(&r.result, Submitted::Rejected { detail, .. } if detail.contains(d)))
                 && (matches!(&r.result, Submitted::Rejected { reason, .. } if format!("{reason:?}") == why)
                     || matches!(&r.decision, Some(Decision::Reject(reason)) if format!("{reason:?}") == why))
         });
         if !refused {
             v.failures.push(format!("{label}: not refused with {why}"));
         }
-        for t in &matching {
+        // With a caller given, only that caller's transactions must not run.
+        let by_caller = |id: TxnId| {
+            s("caller").is_none_or(|c| {
+                e.log.iter().any(|r| {
+                    matches!(&r.result, Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if *txn == id)
+                        && caller_is(r, c)
+                })
+            })
+        };
+        for t in matching.iter().filter(|t| by_caller(t.id)) {
             if t.path.iter().any(|p| p == "Activating") {
                 v.failures.push(format!("{label}: txn {} ran", t.id.0));
             }
@@ -1251,6 +1307,37 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             Some(c) if format!("{c:?}") == want => {}
             Some(c) => v.failures.push(format!("{label}: approver class {c:?}")),
             None => v.failures.push(format!("{label}: never asked for approval")),
+        }
+    }
+    // I6: it committed while an admitted boot-only change waited for its
+    // confirmation (Promoted after AwaitingBoot), so repairs did not wait.
+    if spec.get("while_admitted").and_then(T::as_bool) == Some(true) {
+        match e.entries.as_ref() {
+            None => v.unchecked.push(format!("{label}: while_admitted (journal history)")),
+            Some(en) => {
+                let mut awaited: BTreeSet<TxnId> = BTreeSet::new();
+                let mut admitted: BTreeSet<TxnId> = BTreeSet::new();
+                let mut inside = false;
+                for x in en {
+                    let Record::Advance { txn, to, .. } = &x.record else { continue };
+                    match to {
+                        TxnState::AwaitingBoot => {
+                            awaited.insert(*txn);
+                        }
+                        TxnState::Promoted if awaited.contains(txn) => {
+                            admitted.insert(*txn);
+                        }
+                        _ if admitted.contains(txn) => {
+                            admitted.remove(txn);
+                        }
+                        TxnState::Committed if *txn == t.id => inside = !admitted.is_empty(),
+                        _ => {}
+                    }
+                }
+                if !inside {
+                    v.failures.push(format!("{label}: did not commit while a boot-only change was admitted"));
+                }
+            }
         }
     }
     if let Some(want) = s("terminal_prefix")
@@ -1474,6 +1561,7 @@ const TXN_KEYS: &[&str] = &[
     "reject_detail",
     "decision_not_below",
     "refused_with",
+    "while_admitted",
     "tier",
     "started_after",
     "boot_entries_unchanged",

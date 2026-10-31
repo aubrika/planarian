@@ -340,6 +340,37 @@ fn approval_expires() {
     );
 }
 
+/// S07 (§12 step 4): each request for approval has its own approval; one
+/// issued for an earlier, identical request never approves a later one.
+#[test]
+fn an_earlier_approval_never_approves_a_later_identical_request() {
+    let mut r = Rig::new();
+    let off = || change("service-enable", &[("service", Value::Str("sshd".into())), ("enabled", Value::Bool(false))]);
+    let Submitted::Parked { txn, approve: first, .. } = r.propose(off(), admin()) else { panic!() };
+    r.ex.cancel(txn, Actor::user(1001));
+    let Submitted::Parked { approve: second, .. } = r.propose(off(), admin()) else { panic!() };
+    assert_ne!(first, second, "the same change asked for again gets a new approval");
+    assert!(matches!(r.approve(first), Submitted::Rejected { .. }), "the earlier approval is refused");
+    assert_eq!(finished(&r.approve(second)), TxnState::Committed);
+}
+
+/// §12h: the approval's journal record carries the wall clock, like every
+/// record; the boot clock only times the token. (On the VM the two differ by
+/// the whole epoch; a record on the boot clock fell outside the run.)
+#[test]
+fn the_approval_record_is_on_the_wall_clock() {
+    let mut r = Rig::new();
+    r.fake.w().wall_skew = 1_000_000_000;
+    let off = change("service-enable", &[("service", Value::Str("sshd".into())), ("enabled", Value::Bool(false))]);
+    let Submitted::Parked { approve, .. } = r.propose(off, admin()) else { panic!() };
+    let wall = r.fake.clock().now();
+    r.approve(approve);
+    let used =
+        r.ex.kernel.journal.segment().unwrap().into_iter().find(|e| matches!(e.record, Record::TokenUsed { .. }));
+    let at = used.expect("the approval is journaled").at;
+    assert!(at >= wall, "journaled at {at:?}, before the wall clock's {wall:?}");
+}
+
 #[test]
 fn runtime_option_then_writeback() {
     let mut r = Rig::new();
@@ -600,4 +631,29 @@ fn interlock_holds_off_non_administrators() {
     assert!(!matches!(&s, Submitted::Rejected { detail, .. } if detail.contains("interlock")), "{s:?}");
     let s = r.propose(Transition::RestartUnit(pw), admin());
     assert!(!matches!(&s, Submitted::Rejected { detail, .. } if detail.contains("interlock")), "{s:?}");
+}
+
+/// C3 (§12 step 5): an attested override is replaced only by its holder;
+/// anyone else is refused with the holder named. An inferred one may be.
+#[test]
+fn an_attested_override_is_replaced_only_by_its_holder() {
+    let unit =
+        UnitId { kind: UnitKind::Service, name: "pipewire".into(), scope: Scope::User { uid: 1000, session: None } };
+    let held = |attribution| Override {
+        unit: unit.clone(),
+        until: Until::Explicit,
+        reason: "mine".into(),
+        by: Actor::user(1000),
+        desired: OverrideDesired::Stopped,
+        attribution,
+        acknowledged: false,
+    };
+    let (mut s, defs) = Rig::new().observe();
+    s.overrides.push(held(Attribution::Attested));
+    let set = Transition::SetOverride(Override { desired: OverrideDesired::LeaveAlone, ..held(Attribution::Attested) });
+    assert!(unmet(&set, &s, &defs, &Actor::user(1000)).is_none(), "the holder may replace their own");
+    let why = unmet(&set, &s, &defs, &Actor::user(1001)).expect("another principal is refused");
+    assert!(why.contains("set by uid 1000"), "{why}");
+    *s.overrides.last_mut().unwrap() = held(Attribution::Inferred);
+    assert!(unmet(&set, &s, &defs, &Actor::user(1001)).is_none(), "an inferred override may be replaced");
 }

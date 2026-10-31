@@ -841,3 +841,46 @@ fn external_desired_state_joins_with_provenance() {
     r.core.set_external(None);
     assert!(!r.core.asm.manifest().units.contains_key(&ext));
 }
+
+/// §12f, I12 (S03): a repair that has to wait in Built for an activation
+/// window is not an attempt: the incident waits with it, and when the wait
+/// expires the change is Cancelled(Daemon) and the incident reopens with its
+/// budget intact.
+#[test]
+fn an_expired_wait_reopens_its_incident() {
+    let mut cfg = config();
+    cfg.exec.catalog.services.insert("gym-web".into(), "services.gym-web.enable".into());
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let now = r.fake.w().now;
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        active: true,
+        idle: false,
+        created: now,
+    });
+    r.fake.w().foreground.insert("s1".into());
+    r.fake.w().units.get_mut(&UnitId::service("gym-web")).unwrap().observed = Observed::Absent;
+    r.ticks(20);
+    let waiting = |r: &mut Rig| {
+        r.core.ledger().live.values().filter(|t| t.txn.state == TxnState::Built).map(|t| t.txn.id).collect::<Vec<_>>()
+    };
+    let first = waiting(&mut r);
+    assert_eq!(first.len(), 1, "the repair waits in Built: {:?}", r.core.notices);
+    let budget = |r: &Rig| r.core.incidents.active_for(&UnitId::service("gym-web")).map(|i| i.budget_left);
+    assert_eq!(budget(&r), Some(planarian_incident::BUDGET), "waiting spends no budget");
+    r.ticks(10);
+    assert_eq!(waiting(&mut r), first, "the incident is not retried while its repair waits");
+
+    r.fake.advance(Millis::secs(25 * 3600));
+    r.ticks(20);
+    let l = r.core.ledger();
+    assert!(matches!(l.terminal.get(&first[0]).map(|t| &t.state), Some(TxnState::Cancelled(Actor::Daemon))));
+    let again = waiting(&mut r);
+    assert!(again.len() == 1 && again != first, "the reopened incident proposes the repair again: {again:?}");
+    assert_eq!(budget(&r), Some(planarian_incident::BUDGET));
+}

@@ -35,6 +35,9 @@ pub const CONFIRM_AFTER: Millis = Millis::secs(600);
 const NOTICES_KEPT: usize = 64;
 /// How long an external dependency's probes time out before it is said.
 const UNREACHABLE_AFTER: Millis = Millis::secs(120);
+/// The "restart to finish" notice repeats this often while a change waits
+/// for its boot (§12f).
+const RESTART_REMINDER: Millis = Millis::secs(24 * 3600);
 
 #[derive(Clone, Debug)]
 pub struct CoreConfig {
@@ -162,6 +165,14 @@ pub struct Core<B: Backends + Clone, S: Store> {
     pub new_declarations: Vec<(String, String)>,
     new_declarations_since: Timestamp,
     interlock_noted: bool,
+    /// When each transaction in `AwaitingBoot` was last said to need a
+    /// restart (`CLOCK_BOOTTIME`); repeated daily (§12f).
+    restart_reminded: BTreeMap<TxnId, Timestamp>,
+    /// The attributed way to stop a unit has been taught once (§16, P23).
+    residue_taught: bool,
+    /// Canonical units repaired while an admitted boot-only change waits
+    /// for its confirmation; any one means it is not confirmed (§10).
+    repaired_before_confirmation: BTreeSet<UnitId>,
     /// Incidents whose opening was already announced.
     diag_noted: BTreeSet<IncidentId>,
     /// External dependencies whose probes time out: since when, and
@@ -183,7 +194,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     quiet: bool,
     quiet_queue: Vec<String>,
     /// Waiting generations interrupted by a restart, to prepare again (§12f).
-    reprepare: Vec<Transition>,
+    reprepare: Vec<(TxnId, Transition)>,
+    /// From the executor log of earlier runs: each transaction's proposal and
+    /// caller, so one prepared again keeps its source and caller (§12, C21).
+    pub earlier: BTreeMap<TxnId, (Proposal, Actor)>,
     /// Units Planarian's own transactions touched since the previous tick, and
     /// whether a generation changed: their stops are not someone else's.
     touched: BTreeSet<UnitId>,
@@ -254,17 +268,19 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             Err(e) => notices.push_back(format!("journal reconciliation failed: {e:?}")),
         }
         let ledger = ex.kernel.journal.ledger().clone();
-        // §12f: a generation that was waiting in Built for an activation
-        // window is Rejected(Interrupted) by the crash table, and re-prepared.
-        let reprepare: Vec<Transition> = ledger
+        // A generation waiting in Built for an activation window (§12f), or
+        // a change parked for approval (§12 step 4: tokens do not survive a
+        // restart), is Rejected(Interrupted) by the crash table and prepared
+        // again: the parked one asks for approval again.
+        let reprepare: Vec<(TxnId, Transition)> = ledger
             .terminal
             .iter()
             .filter(|(id, t)| {
                 !terminal_before.contains(id)
                     && t.state == TxnState::Rejected(RejectReason::Interrupted)
-                    && t.path.iter().rev().nth(1).is_some_and(|p| p == "Built")
+                    && t.path.iter().rev().nth(1).is_some_and(|p| p == "Built" || p == "Prepared")
             })
-            .map(|(_, t)| t.transition.clone())
+            .map(|(id, t)| (*id, t.transition.clone()))
             .collect();
         let mut incidents = Manager::restore(ledger.incidents.values().cloned());
         incidents.startup_grace = cfg.startup_grace;
@@ -281,7 +297,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let asm = Assembler::new(manifest.clone(), cfg.exec.canonical.clone());
         let now = b.clock().now();
         let last_booted = b.generations().last_booted().ok();
+        // §10: a boot-only change admitted at this boot is confirmed at its
+        // 10-minute checkpoint.
+        let admitted = ledger.live.values().any(|t| {
+            t.txn.state == TxnState::Promoted
+                && t.path.iter().any(|p| p == "AwaitingBoot")
+                && t.txn.candidate.as_ref().map(|(g, _)| *g) == Some(current)
+        });
         let confirm = match ledger.known_good {
+            _ if admitted => Some((current, now.plus(CONFIRM_AFTER))),
             None => Some((current, now.plus(CONFIRM_AFTER))),
             Some(_)
                 if ledger.live_tested.is_some()
@@ -311,6 +335,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             new_declarations: vec![],
             new_declarations_since: now,
             interlock_noted: false,
+            restart_reminded: BTreeMap::new(),
+            residue_taught: false,
+            repaired_before_confirmation: BTreeSet::new(),
             diag_noted: BTreeSet::new(),
             unreachable: BTreeMap::new(),
             chain_checked: None,
@@ -323,6 +350,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             quiet: false,
             quiet_queue: vec![],
             reprepare: vec![],
+            earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
             generation_touched: false,
             next_gc_check: Timestamp(0),
@@ -345,6 +373,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         core.reprepare = reprepare;
         core.note_declarations(None, current, false);
         core
+    }
+
+    /// Records from the executor log of earlier runs (§12, C21): what each
+    /// transaction was proposed as, and by whom.
+    pub fn remember(&mut self, records: impl IntoIterator<Item = LogRecord>) {
+        for r in records {
+            if let Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } = &r.result {
+                self.earlier.insert(*txn, (r.proposal, r.caller));
+            }
+        }
     }
 
     /// The observation the last tick (or request) acted on.
@@ -579,6 +617,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         result
     }
 
+    fn is_canonical(&self, u: &UnitId, defs: &UnitDefs) -> bool {
+        defs.get(u).is_some_and(|d| {
+            d.probes.iter().any(|p| p.origin == ProbeOrigin::Canonical && p.role == ProbeRole::Readiness)
+        })
+    }
+
     fn canonical_healthy(&self, s: &SystemState, defs: &UnitDefs) -> bool {
         defs.iter()
             .filter(|(_, d)| {
@@ -723,8 +767,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     with.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", ")
                 )
             };
+            // §16 (P23): the first time, teach the attributed form.
+            let teach = if std::mem::replace(&mut self.residue_taught, true) {
+                String::new()
+            } else {
+                format!(" Next time, planarian stop {r} does the same with your name on it.")
+            };
             self.notice(format!(
-                "{r}: stopped outside Planarian ({how}); I take that as intended and leave it stopped until the next boot{also}. To start it again: planarian release {r}"
+                "{r}: stopped outside Planarian ({how}); I take that as intended and leave it stopped until the next boot{also}. To start it again: planarian release {r}.{teach}"
             ));
         }
         let _ = now;
@@ -908,9 +958,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             return;
         }
 
-        for t in std::mem::take(&mut self.reprepare) {
-            let p = self.proposal(t.clone(), &s, &defs, Source::Maintenance, "prepared again after a restart".into());
-            let r = self.submit(p, authorization_of(Actor::Daemon), &s, &defs);
+        for (id, t) in std::mem::take(&mut self.reprepare) {
+            // Its original source and caller (C21), so floors that depend on
+            // who asked (the own-session exemption) still apply; the daemon's
+            // own only when no record of it survives.
+            let (source, authz) = match self.earlier.get(&id).cloned() {
+                Some((p, caller @ Actor::User { .. })) => {
+                    let admin = caller.uid().is_some_and(|u| (self.admin_of)(u));
+                    (p.source, user_authorization(caller, admin))
+                }
+                Some((p, caller)) => (p.source, authorization_of(caller)),
+                None => (Source::Maintenance, authorization_of(Actor::Daemon)),
+            };
+            let p = self.proposal(t.clone(), &s, &defs, source, "prepared again after a restart".into());
+            let r = self.submit(p, authz, &s, &defs);
             self.notice(format!(
                 "{}: prepared again after a restart: {}",
                 render::transition(&t),
@@ -1031,14 +1092,30 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         } else {
             self.interlock_noted = false;
-            // Unit repairs may run while a generation awaits its boot (I6).
-            let busy = l.live.values().any(|t| !t.txn.state.is_pre_mutation() && t.txn.state != TxnState::AwaitingBoot);
+            // Unit repairs may run while a generation awaits its boot, and
+            // once it is admitted at boot (I6).
+            let busy = l.live.values().any(|t| {
+                !t.txn.state.is_pre_mutation()
+                    && t.txn.state != TxnState::AwaitingBoot
+                    && !(t.txn.state == TxnState::Promoted && t.boot_only)
+            });
             if !busy {
                 self.repair_one(&s, &defs, &l);
             }
             // §12f: an activation window opened for a waiting generation.
             if !busy {
                 for (id, r) in self.ex.activate_waiting(&s) {
+                    // A repair that waited is an attempt once it runs.
+                    let linked: Vec<IncidentId> =
+                        self.incident_parked.iter().filter(|(_, t)| **t == id).map(|(i, _)| *i).collect();
+                    for inc in linked {
+                        self.incident_parked.remove(&inc);
+                        if let Submitted::Finished { state, .. } = &r
+                            && let Some(i) = self.incidents.record_attempt(inc, id, outcome_of(state), now)
+                        {
+                            self.journal(Record::Incident(i));
+                        }
+                    }
                     self.notice(format!(
                         "transaction {}: activated now that nothing is in the way: {}",
                         id.0,
@@ -1056,6 +1133,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         for t in self.ex.expire() {
             self.notice(format!("approval for transaction {} expired", t.0));
         }
+        self.remind_restart(&l);
+        for (t, change) in self.ex.expire_waiting() {
+            // §12f: the incident, if any, reopens.
+            self.incident_parked.retain(|_, w| *w != t);
+            self.notice(format!(
+                "transaction {} cancelled: it waited a day in Built without an activation window ({}); issue it again to retry",
+                t.0,
+                render::transition(&change)
+            ));
+        }
         if self.ex.kernel.journal.needs_compaction()
             && let Err(e) = self.ex.kernel.journal.compact()
         {
@@ -1064,6 +1151,26 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         self.confirm_boot(&s, &defs, now);
         self.note_space();
         self.note_unreachable(&s, &defs, now);
+    }
+
+    /// §12f: a transaction in `AwaitingBoot` has no time limit; the "restart
+    /// to finish" notice is repeated once a day until that restart.
+    fn remind_restart(&mut self, l: &Ledger) {
+        let now = self.b.clock().boot_now();
+        let waiting: Vec<(TxnId, String)> = l
+            .live
+            .values()
+            .filter(|t| t.txn.state == TxnState::AwaitingBoot)
+            .map(|t| (t.txn.id, render::transition(&t.txn.transition)))
+            .collect();
+        self.restart_reminded.retain(|id, _| waiting.iter().any(|(w, _)| w == id));
+        for (id, what) in waiting {
+            let last = *self.restart_reminded.entry(id).or_insert(now);
+            if now > last.plus(RESTART_REMINDER) {
+                self.restart_reminded.insert(id, now);
+                self.notice(format!("transaction {}: {what} is still waiting for a restart; restart to finish", id.0));
+            }
+        }
     }
 
     /// §10: a probe that times out yields Unknown, never Failed, so an
@@ -1139,9 +1246,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
     fn repair_one(&mut self, s: &SystemState, defs: &UnitDefs, l: &Ledger) {
         let now = s.observed_at;
-        // Drop parked links whose approval was decided.
+        // Drop parked links whose approval was decided or whose wait in
+        // Built ended.
         let parked = self.ex.parked.clone();
-        self.incident_parked.retain(|_, t| parked.contains_key(t));
+        let ex = &self.ex;
+        self.incident_parked.retain(|_, t| parked.contains_key(t) || ex.is_waiting(*t));
         let Some(inc) =
             self.incidents.actionable(now).into_iter().find(|i| !self.incident_parked.contains_key(&i.id)).cloned()
         else {
@@ -1235,7 +1344,19 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     Source::Diagnoser { incident: inc.id },
                     c.reason.clone(),
                 );
+                // §10: a canonical unit that needs repair before an admitted
+                // boot-only change is confirmed counts against it.
+                let admitted = l.live.values().any(|t| t.txn.state == TxnState::Promoted && t.boot_only);
+                if admitted && self.is_canonical(&c.target, defs) {
+                    self.repaired_before_confirmation.insert(c.target.clone());
+                }
                 match self.submit(p, authorization_of(Actor::Daemon), s, defs) {
+                    // §12f: waiting in Built for an activation window is not an
+                    // attempt; the incident waits with it, and reopens if the
+                    // wait expires.
+                    Submitted::Finished { txn, state: TxnState::Built, .. } => {
+                        self.incident_parked.insert(inc.id, txn);
+                    }
                     Submitted::Finished { txn, state, .. } => {
                         if let Some(i) = self.incidents.record_attempt(inc.id, txn, outcome_of(&state), now) {
                             if matches!(i.state, IncidentState::Cooldown { .. }) {
@@ -1303,7 +1424,41 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             return;
         }
         self.confirm = None;
-        if s.generation == g && self.canonical_healthy(s, defs) {
+        let healthy = s.generation == g && self.canonical_healthy(s, defs);
+        // §10, §12 step 7: the admitted boot-only change commits, or is
+        // withdrawn, here and only here.
+        let admitted: Vec<TxnId> = self
+            .ledger()
+            .live
+            .values()
+            .filter(|t| t.txn.state == TxnState::Promoted && t.path.iter().any(|p| p == "AwaitingBoot"))
+            .map(|t| t.txn.id)
+            .collect();
+        // Repairs run meanwhile, but a canonical unit that needed one is
+        // evidence against the change, even if it is up again now.
+        let repaired = std::mem::take(&mut self.repaired_before_confirmation);
+        for id in admitted {
+            match self.ex.kernel.confirm_boot_only(id, healthy && repaired.is_empty()) {
+                Ok(TxnState::Committed) => {}
+                Ok(TxnState::Reverted) => {
+                    let back = self.b.generations().boot_default().map(|d| d.0).unwrap_or_default();
+                    let why = if repaired.is_empty() {
+                        "canonical probes were failing at the 10-minute checkpoint".to_string()
+                    } else {
+                        let units: Vec<String> = repaired.iter().map(|u| u.to_string()).collect();
+                        format!("{} needed a repair before the 10-minute checkpoint", units.join(", "))
+                    };
+                    self.notice(format!(
+                        "transaction {}: not confirmed ({why}); generation {back} is the default again \
+                         and a restart completes the withdrawal",
+                        id.0
+                    ))
+                }
+                Ok(other) => self.notice(format!("transaction {}: confirmation left it {other:?}", id.0)),
+                Err(e) => self.notice(format!("transaction {}: confirmation failed: {e:?}", id.0)),
+            }
+        }
+        if healthy {
             self.journal(Record::KnownGood(g));
             self.notice(format!("generation {} is now the boot-confirmed known-good baseline", g.0));
         } else {
@@ -1366,7 +1521,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     fn user_submit(&mut self, t: Transition, peer: Peer, source: Source, reason: String) -> Response {
-        if self.defer
+        // Admission before work (R09): a caller refused anyway queues no
+        // staging or build; `submit` then refuses it, logged.
+        let who = self.authz(&peer);
+        let admitted = self.ex.admit(&t, &who).is_ok();
+        if admitted
+            && self.defer
             && self.deferred.is_none()
             && let Some(job) = self.ex.prebuild_job(&t)
         {
