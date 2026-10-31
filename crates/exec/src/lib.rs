@@ -858,8 +858,10 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         if self.kernel.journal.ledger().tokens_used.iter().any(|(n, _)| *n == nonce) {
             return reject(RejectReason::Other("approval".into()), "this approval was already used");
         }
+        // Journal records carry the wall clock (§12h); `now` here is the
+        // boot clock, which times the token.
         let _ = self.kernel.journal.append(
-            now,
+            self.b.clock().now(),
             Record::TokenUsed {
                 nonce,
                 expires: parked.issued.plus(TOKEN_LIFETIME),

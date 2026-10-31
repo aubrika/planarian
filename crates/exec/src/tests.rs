@@ -354,6 +354,23 @@ fn an_earlier_approval_never_approves_a_later_identical_request() {
     assert_eq!(finished(&r.approve(second)), TxnState::Committed);
 }
 
+/// §12h: the approval's journal record carries the wall clock, like every
+/// record; the boot clock only times the token. (On the VM the two differ by
+/// the whole epoch; a record on the boot clock fell outside the run.)
+#[test]
+fn the_approval_record_is_on_the_wall_clock() {
+    let mut r = Rig::new();
+    r.fake.w().wall_skew = 1_000_000_000;
+    let off = change("service-enable", &[("service", Value::Str("sshd".into())), ("enabled", Value::Bool(false))]);
+    let Submitted::Parked { approve, .. } = r.propose(off, admin()) else { panic!() };
+    let wall = r.fake.clock().now();
+    r.approve(approve);
+    let used =
+        r.ex.kernel.journal.segment().unwrap().into_iter().find(|e| matches!(e.record, Record::TokenUsed { .. }));
+    let at = used.expect("the approval is journaled").at;
+    assert!(at >= wall, "journaled at {at:?}, before the wall clock's {wall:?}");
+}
+
 #[test]
 fn runtime_option_then_writeback() {
     let mut r = Rig::new();
