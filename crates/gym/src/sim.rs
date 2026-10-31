@@ -423,6 +423,31 @@ impl Sim {
         let override_hash = Some(planarian_fake::World::override_hash_of(&w.overrides));
         let work = Some((w.stages - self.start_work.0, w.builds - self.start_work.1));
         let third_party_override = w.third_party_override;
+        // §12 (R01): boot selection, roots, overrides and the journal agree.
+        let ledger = self.ledger();
+        let mut disagree = vec![];
+        if w.boot_default != w.current {
+            disagree.push(format!("boot default {} is not the running generation {}", w.boot_default.0, w.current.0));
+        }
+        if let Some(g) = w.one_shot {
+            disagree.push(format!("a one-shot entry for generation {} is still armed", g.0));
+        }
+        if let (Some(h), Some(rec)) = (override_hash, w.gen_overrides.get(&w.current))
+            && h != *rec
+        {
+            disagree.push(format!("the override file is not the one generation {} was committed with", w.current.0));
+        }
+        let live_roots: BTreeSet<&String> = ledger.live.values().filter_map(|t| t.txn.gc_root.as_ref()).collect();
+        for r in w.gc_roots.iter().filter(|r| r.contains("/builds/") && !live_roots.contains(r)) {
+            let entry =
+                w.boot_entries.iter().any(|g| w.gens.get(g).is_some_and(|x| r.ends_with(&x.eval.source.to_hex())));
+            if !entry {
+                disagree.push(format!("GC root {r} belongs to no live transaction or boot entry"));
+            }
+        }
+        for t in ledger.live.values() {
+            disagree.push(format!("transaction {} is still {}", t.txn.id.0, tag(&t.txn.state)));
+        }
         drop(w);
         crate::evidence::Evidence {
             current,
@@ -435,7 +460,8 @@ impl Sim {
             overrides_empty,
             override_hash,
             third_party_override,
-            ledger: self.ledger(),
+            agreement: Some(disagree),
+            ledger,
             journal_replays,
             log: self.log.clone(),
             pre_status: self.pre_status.clone(),
@@ -688,11 +714,15 @@ impl Sim {
                 || matches!(s.get("raw").and_then(T::as_str), Some("ask" | "cli" | "approve_pending"))
         };
         for (i, s) in steps.iter().enumerate() {
-            if let Some(call) = s.get("when").and_then(|w| w.get("op_called")).and_then(T::as_str) {
-                let call: &'static str = Box::leak(call.to_string().into_boxed_str());
-                if let Some(j) = (0..i).rev().find(|j| is_txn(steps[*j])) {
-                    crash = Some((j, CrashPoint::OpCalled(call)));
+            for (key, point) in [("op_called", CrashPoint::OpCalled as fn(_) -> _), ("op_begun", CrashPoint::OpBegun)] {
+                if let Some(call) = s.get("when").and_then(|w| w.get(key)).and_then(T::as_str) {
+                    let call: &'static str = Box::leak(call.to_string().into_boxed_str());
+                    if let Some(j) = (0..i).rev().find(|j| is_txn(steps[*j])) {
+                        crash = Some((j, point(call)));
+                    }
                 }
+            }
+            if s.get("when").is_some_and(|w| w.get("op_called").is_some() || w.get("op_begun").is_some()) {
                 continue;
             }
             let Some(state) = s.get("when").and_then(|w| w.get("journal")).and_then(T::as_str) else { continue };

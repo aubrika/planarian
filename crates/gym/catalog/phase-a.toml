@@ -123,6 +123,8 @@
 # `when` on an action: { journal = "<TxnState>" } fires the instant that state
 # is durably journaled; { op_called = "<call>" } fires after that backend call
 # was made and before its outcome is journaled (the activation is running);
+# { op_begun = "<call>" } fires after that call's OpBegin is journaled and
+# before the call is made;
 # { after = "<duration>" } fires relative to the previous step.
 #
 # ───────────────────────────────────────────────────────────────────────────
@@ -2519,6 +2521,56 @@ notices_count = { match = "is still waiting for a restart", count = 2 }
 [[fault.required_post.txn]]
 transition = "ApplyChange"
 path = ["AwaitingBoot", "Promoted", "Committed"]
+terminal = "Committed"
+
+# R01 (§12 step 7, crash table): Publishing precedes the first boot mutation.
+[[fault]]
+id = "crash-publishing-before-publish"
+family = "boot-only-change"
+summary = "planariad is killed after journaling OpBegin(publish_boot_once) for a boot-only kernel change, before the call. On restart the Publishing row asks the boot loader: nothing is armed, so the change is Rejected(Interrupted) and not prepared again. After a reboot the machine runs the publishing generation, and boot selection, roots, overrides and the journal agree."
+spec = ["§12 step 7", "§12 crash table", "R01"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_begun = "publish_boot_once" } }
+after = [{ raw = "restart_process", process = "planariad" }, { raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "2m" }]
+window = "5m"
+
+[fault.required_post]
+generation = "base"
+boot_default = "base"
+agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Built", "Publishing", "Rejected"]
+terminal = "Rejected(Interrupted)"
+count = 1
+
+[[fault]]
+id = "crash-publishing-after-publish"
+family = "boot-only-change"
+summary = "planariad is killed after publish_boot_once armed the one-shot entry, before its outcome was journaled. On restart the Publishing row asks the boot loader: the entry is armed, so the change is AwaitingBoot. The reboot boots the candidate, it is admitted and committed, and boot selection, roots, overrides and the journal agree."
+spec = ["§12 step 7", "§12 crash table", "R01"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "publish_boot_once" } }
+after = [{ raw = "restart_process", process = "planariad" }, { raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "12m" }]
+window = "15m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Publishing", "AwaitingBoot", "Promoted", "Committed"]
 terminal = "Committed"
 
 [[fault]]

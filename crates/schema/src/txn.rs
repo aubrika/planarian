@@ -24,6 +24,9 @@ pub enum TxnState {
     Checking,
     /// Boot entry written.
     Published,
+    /// The boot-only path (§12 step 7): journaled before `publish_boot_once`,
+    /// the first boot mutation; the crash table asks the boot loader.
+    Publishing,
     /// A boot-only candidate published as a one-shot next-boot entry (§12f);
     /// active for I6, confirmed or reverted at that boot.
     AwaitingBoot,
@@ -61,8 +64,8 @@ impl TxnState {
     /// one list, which the ledger reads.
     pub open spec fn exclusive(self) -> bool {
         match self {
-            TxnState::Activating | TxnState::Checking | TxnState::Published | TxnState::Promoted
-            | TxnState::Reverting => true,
+            TxnState::Activating | TxnState::Checking | TxnState::Publishing | TxnState::Published
+            | TxnState::Promoted | TxnState::Reverting => true,
             _ => false,
         }
     }
@@ -93,8 +96,8 @@ impl TxnState {
             r == self.exclusive(),
     {
         match self {
-            TxnState::Activating | TxnState::Checking | TxnState::Published | TxnState::Promoted
-            | TxnState::Reverting => true,
+            TxnState::Activating | TxnState::Checking | TxnState::Publishing | TxnState::Published
+            | TxnState::Promoted | TxnState::Reverting => true,
             _ => false,
         }
     }

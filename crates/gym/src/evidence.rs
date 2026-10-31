@@ -30,6 +30,10 @@ pub struct Evidence {
     /// third party wrote to it during the run (I23), if one did.
     #[serde(default)]
     pub override_hash: Option<Hash>,
+    /// What disagrees among boot selection, GC roots, the override file and
+    /// the journal at the end (empty: they agree); None where the harness
+    /// cannot see all four.
+    pub agreement: Option<Vec<String>>,
     #[serde(default)]
     pub third_party_override: Option<Hash>,
     /// The journal at the end, and whether it replays cleanly.

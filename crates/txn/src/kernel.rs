@@ -7,7 +7,7 @@
 //! and process control sit below it, behind `Host`.
 
 use crate::journal::{Journal, JournalError};
-use crate::ledger::{LedgerError, LiveTxn, Reconciliation, Record};
+use crate::ledger::{LedgerError, LiveTxn, OpRecord, Reconciliation, Record};
 use crate::machine::tag;
 use crate::store::Store;
 use planarian_schema::{
@@ -40,6 +40,8 @@ pub enum RecoveryAction {
     WriteCommitted,
     /// A generation revert was under way: run it again (it is idempotent).
     RevertGeneration,
+    /// A boot-only publication was under way: ask what was armed (R01).
+    Publishing,
     /// A driver was being bound: Checking if it is bound, else revert.
     DriverBound,
     /// A driver bind was being checked: probes decide.
@@ -123,6 +125,7 @@ pub fn recovery_action(state: &TxnState, strategy: RecoveryStrategy) -> Recovery
         (TxnState::Promoted, S::RevertGeneration) => A::WriteCommitted,
         (TxnState::Reverting, S::RevertGeneration) => A::RevertGeneration,
         (TxnState::AwaitingBoot, S::RevertGeneration) => A::AwaitBoot,
+        (TxnState::Publishing, S::RevertGeneration) => A::Publishing,
         (TxnState::Activating, S::UnbindDevice) => A::DriverBound,
         (TxnState::Checking, S::UnbindDevice) => A::CheckDevice,
         (TxnState::Reverting, S::UnbindDevice) => A::RevertDevice,
@@ -421,14 +424,54 @@ impl<S: Store, H: Host> Kernel<S, H> {
             return self.reject(id, RejectReason::Other("candidate failed verification".into()));
         }
         self.wait_built(id, "takes effect at boot")?;
+        // R01: durable before the first boot mutation, so a crash in the
+        // publication is found and asked about, never missed.
+        self.advance(&txn, TxnState::Publishing, "publishing to boot once")?;
+        // S01: the running generation, which publishes the candidate, stays
+        // the default and is the fallback; never known_good automatically.
         let base = txn.base;
         let o = self.call(id, "publish_boot_once", |h, op| h.generations().publish_boot_once(cand, base, op))?;
         if !o.is_success() {
             // All or nothing (the backend's contract): nothing was published.
-            return self.reject(id, RejectReason::Other(format!("publish_boot_once: {o:?}")));
+            let to = TxnState::Rejected(RejectReason::Other(format!("publish_boot_once: {o:?}")));
+            self.advance(&txn, to.clone(), "nothing was published")?;
+            return Ok(to);
         }
         self.advance(&txn, TxnState::AwaitingBoot, "published to boot once; restart to finish")?;
         Ok(TxnState::AwaitingBoot)
+    }
+
+    /// The crash table's Publishing row (§12): the `publish_boot_once` op
+    /// acknowledged success → AwaitingBoot; no acknowledgement → ask the boot
+    /// loader whether the one-shot entry is armed: armed → AwaitingBoot, not
+    /// armed → Rejected(Interrupted); it cannot say → RecoveryFailed.
+    fn recover_publishing(&mut self, txn: &Transaction, ops: &[OpRecord]) -> R<TxnState> {
+        let Some(cand) = Self::candidate(txn) else {
+            return self.recovery_failed(txn, "Publishing without a candidate");
+        };
+        let publish = ops.iter().rev().find(|o| o.call == "publish_boot_once");
+        // Only a definite answer settles it: success armed the entry, and a
+        // failure armed nothing (all or nothing). No answer, an Unknown (as a
+        // takeover acknowledges the calls it superseded) or a Partial: ask.
+        let armed = match publish.and_then(|o| o.ack.as_ref()) {
+            Some(Outcome::Succeeded) => true,
+            Some(Outcome::Failed(_)) => false,
+            _ => match self.host.generations().one_shot_pending() {
+                Ok(pending) => pending == Some(cand),
+                Err(o) => {
+                    return self
+                        .recovery_failed(txn, &format!("cannot tell whether the one-shot entry is armed: {o:?}"));
+                }
+            },
+        };
+        if armed {
+            self.advance(txn, TxnState::AwaitingBoot, "recovery: the one-shot entry is armed")?;
+            Ok(TxnState::AwaitingBoot)
+        } else {
+            let to = TxnState::Rejected(RejectReason::Interrupted);
+            self.advance(txn, to.clone(), "recovery: nothing was published")?;
+            Ok(to)
+        }
     }
 
     // ---------- Fresh execution ----------
@@ -913,6 +956,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
             A::CheckDevice => self.check_device(&txn),
             A::RevertDevice => self.revert_device(&txn, "recovery: re-run revert"),
             A::AwaitBoot => self.await_boot(&txn),
+            A::Publishing => self.recover_publishing(&txn, &l.ops),
             A::Fail => {
                 let why = format!("no recovery path for {} under {:?}", tag(&txn.state), txn.recovery);
                 self.recovery_failed(&txn, &why)

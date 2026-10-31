@@ -13,9 +13,12 @@ verus! {
 /// - `ReobserveOnly` never reverts and never publishes (Runtime outcomes never
 ///   trigger generation reversion); it may commit from Activating (crash table).
 /// - Only generation operations pass through Published and Promoted.
-/// - The boot-only path (§12 step 7, §12f): Built → AwaitingBoot (a one-shot
-///   next-boot entry) → Promoted (it booted and passed) or Reverted (it did
-///   not; the bootloader already fell back), or Reverting to withdraw the entry.
+/// - The boot-only path (§12 step 7, §12f): Built → Publishing (journaled
+///   before the first boot mutation) → AwaitingBoot (a one-shot next-boot
+///   entry is armed) → Promoted (it booted and was admitted) or Reverted (it
+///   did not; the boot loader already fell back), or Reverting to withdraw the
+///   entry. From Publishing, a crash with no entry armed ends Rejected: the
+///   publication is all or nothing, so nothing was mutated.
 /// - Any state in which mutation may have happened can end in RecoveryFailed.
 pub open spec fn step_spec(from: TxnState, to: TxnState, strategy: RecoveryStrategy) -> bool {
     let generation = strategy.reverts_generation();
@@ -30,7 +33,9 @@ pub open spec fn step_spec(from: TxnState, to: TxnState, strategy: RecoveryStrat
             (TxnState::Staged, TxnState::Built) => true,
             (TxnState::Staged, TxnState::Activating) => true,
             (TxnState::Built, TxnState::Activating) => true,
-            (TxnState::Built, TxnState::AwaitingBoot) => generation,
+            (TxnState::Built, TxnState::Publishing) => generation,
+            (TxnState::Publishing, TxnState::AwaitingBoot) => generation,
+            (TxnState::Publishing, TxnState::Rejected(_)) => generation,
             (TxnState::AwaitingBoot, TxnState::Promoted) => generation,
             (TxnState::AwaitingBoot, TxnState::Reverting) => generation,
             (TxnState::AwaitingBoot, TxnState::Reverted) => generation,
@@ -79,7 +84,9 @@ pub fn step_allowed(from: &TxnState, to: &TxnState, strategy: RecoveryStrategy) 
         (TxnState::Staged, TxnState::Built) => true,
         (TxnState::Staged, TxnState::Activating) => true,
         (TxnState::Built, TxnState::Activating) => true,
-        (TxnState::Built, TxnState::AwaitingBoot) => generation,
+        (TxnState::Built, TxnState::Publishing) => generation,
+        (TxnState::Publishing, TxnState::AwaitingBoot) => generation,
+        (TxnState::Publishing, TxnState::Rejected(_)) => generation,
         (TxnState::AwaitingBoot, TxnState::Promoted) => generation,
         (TxnState::AwaitingBoot, TxnState::Reverting) => generation,
         (TxnState::AwaitingBoot, TxnState::Reverted) => generation,
@@ -109,6 +116,7 @@ pub open spec fn rank(s: TxnState) -> nat {
         TxnState::Built => 6,
         TxnState::Activating => 5,
         TxnState::Checking => 4,
+        TxnState::Publishing => 4,
         TxnState::Published => 3,
         TxnState::AwaitingBoot => 3,
         TxnState::Promoted => 2,
@@ -148,13 +156,14 @@ pub proof fn terminal_is_final(from: TxnState, to: TxnState, strategy: RecoveryS
 {
 }
 
-/// Rejected and Cancelled happen only before anything was mutated.
+/// Rejected and Cancelled happen only before anything was mutated, or (for
+/// Rejected) from Publishing, whose all-or-nothing publication armed nothing.
 pub proof fn refusal_only_before_mutation(from: TxnState, to: TxnState, strategy: RecoveryStrategy)
     requires
         step_spec(from, to, strategy),
         to is Rejected || to is Cancelled,
     ensures
-        from.pre_mutation(),
+        from.pre_mutation() || (from is Publishing && to is Rejected),
 {
 }
 
@@ -173,19 +182,22 @@ pub proof fn runtime_never_reverts(from: TxnState, to: TxnState)
 pub proof fn only_generations_publish(from: TxnState, to: TxnState, strategy: RecoveryStrategy)
     requires
         step_spec(from, to, strategy),
-        to is Published || to is Promoted || to is AwaitingBoot,
+        to is Published || to is Promoted || to is Publishing || to is AwaitingBoot,
     ensures
         strategy.reverts_generation(),
 {
 }
 
-/// A boot-only candidate is never live-activated: it reaches AwaitingBoot only
-/// from Built, and leaves it only for Promoted or a revert.
+/// A boot-only candidate is never live-activated: Publishing is journaled
+/// before any boot mutation (R01), AwaitingBoot is reached only through it,
+/// and left only for Promoted or a revert.
 pub proof fn boot_only_never_activates(from: TxnState, to: TxnState, strategy: RecoveryStrategy)
     requires
         step_spec(from, to, strategy),
     ensures
-        to is AwaitingBoot ==> from is Built,
+        to is Publishing ==> from is Built,
+        to is AwaitingBoot ==> from is Publishing,
+        from is Publishing ==> (to is AwaitingBoot || to is Rejected || to is RecoveryFailed),
         from is AwaitingBoot ==> (to is Promoted || to is Reverting || to is Reverted || to is RecoveryFailed),
 {
 }
@@ -209,6 +221,7 @@ pub fn tag(s: &TxnState) -> &'static str {
         TxnState::Activating => "Activating",
         TxnState::Checking => "Checking",
         TxnState::Published => "Published",
+        TxnState::Publishing => "Publishing",
         TxnState::AwaitingBoot => "AwaitingBoot",
         TxnState::Promoted => "Promoted",
         TxnState::Committed => "Committed",
@@ -235,6 +248,8 @@ mod tests {
             TxnState::Activating,
             TxnState::Checking,
             TxnState::Published,
+            TxnState::Publishing,
+            TxnState::AwaitingBoot,
             TxnState::Promoted,
             TxnState::Committed,
             TxnState::Reverting,

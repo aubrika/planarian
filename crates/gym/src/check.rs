@@ -456,6 +456,12 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
             }
             // I23: the override file at the end is the third party's, as it
             // wrote it (never replaced by Planarian), or Planarian's own.
+            // §12 (R01): boot selection, roots, overrides and journal agree.
+            "agrees" => match &e.agreement {
+                Some(d) if !d.is_empty() => fail(&mut v, d.join("; ")),
+                Some(_) => {}
+                None => v.unchecked.push(key.clone()),
+            },
             "override_file" => match (val.as_str(), &e.third_party_override) {
                 (Some("third-party"), Some(h)) => {
                     if e.override_hash != Some(*h) {

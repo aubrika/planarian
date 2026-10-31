@@ -1621,6 +1621,7 @@ fn evidence() -> Evidence {
         work: None,
         overrides_empty: g.read_overrides().map(|(o, _)| o.assignments.is_empty()).unwrap_or(true),
         override_hash: g.read_overrides().ok().map(|(_, h)| h),
+        agreement: None,
         third_party_override: None,
         ledger,
         journal_replays,
