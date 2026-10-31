@@ -142,7 +142,7 @@ pub fn gym_units() -> UnitDefs {
     nm.runtime_repair = Some("wifi.network".into());
     let dm = unit("service:display-manager", r, Disruption::SessionLoss, vec![]);
     let mut gs = unit("target:graphical-session", r, Disruption::SessionLoss, vec![]);
-    gs.desired.when = Condition::SessionEstablished { uid: None };
+    gs.desired.when = Condition::SessionEstablished { uid: None, seated: true };
     gs.synonyms = vec!["desktop".into()];
 
     let snd = unit(

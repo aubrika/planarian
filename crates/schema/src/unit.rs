@@ -375,8 +375,13 @@ pub enum Condition {
     Always,
     /// logind reports a session of class `user` with a seat, or a remote user
     /// session; greeter, `manager` and background sessions never count (§10).
+    /// `seated` asks for a session at a seat: the graphical expectation
+    /// (S05), which an SSH-only login never carries. As an atom (what holds
+    /// now), it says whether that session has a seat.
     SessionEstablished {
         uid: Option<u32>,
+        #[serde(default)]
+        seated: bool,
     },
     DeviceConnected(UnitId),
     OnAcPower,
@@ -397,10 +402,20 @@ impl Condition {
             Condition::Always => true,
             Condition::All(cs) => cs.iter().all(|c| c.holds(atoms)),
             Condition::Any(cs) => cs.iter().any(|c| c.holds(atoms)),
-            Condition::SessionEstablished { uid: None } => {
-                atoms.iter().any(|a| matches!(a, Condition::SessionEstablished { .. }))
-            }
+            Condition::SessionEstablished { uid, seated } => atoms.iter().any(|a| {
+                matches!(a, Condition::SessionEstablished { uid: u, seated: s }
+                    if (uid.is_none() || u == uid) && (*s || !*seated))
+            }),
             atom => atoms.contains(atom),
+        }
+    }
+
+    /// The condition asks for a seated session somewhere (S05).
+    pub fn needs_seat(&self) -> bool {
+        match self {
+            Condition::SessionEstablished { seated, .. } => *seated,
+            Condition::All(cs) | Condition::Any(cs) => cs.iter().any(Condition::needs_seat),
+            _ => false,
         }
     }
 }
@@ -691,14 +706,32 @@ mod tests {
     fn conditions() {
         let mut atoms = BTreeSet::new();
         assert!(Condition::Always.holds(&atoms));
-        assert!(!Condition::SessionEstablished { uid: None }.holds(&atoms));
-        atoms.insert(Condition::SessionEstablished { uid: Some(1000) });
-        assert!(Condition::SessionEstablished { uid: None }.holds(&atoms));
-        assert!(Condition::SessionEstablished { uid: Some(1000) }.holds(&atoms));
-        assert!(!Condition::SessionEstablished { uid: Some(1001) }.holds(&atoms));
-        let any = Condition::Any(vec![Condition::OnBattery, Condition::SessionEstablished { uid: Some(1000) }]);
+        assert!(!Condition::SessionEstablished { uid: None, seated: false }.holds(&atoms));
+        atoms.insert(Condition::SessionEstablished { uid: Some(1000), seated: false });
+        assert!(Condition::SessionEstablished { uid: None, seated: false }.holds(&atoms));
+        assert!(Condition::SessionEstablished { uid: Some(1000), seated: false }.holds(&atoms));
+        assert!(!Condition::SessionEstablished { uid: Some(1001), seated: false }.holds(&atoms));
+        let any = Condition::Any(vec![
+            Condition::OnBattery,
+            Condition::SessionEstablished { uid: Some(1000), seated: false },
+        ]);
         assert!(any.holds(&atoms));
         assert!(!Condition::All(vec![Condition::OnBattery, Condition::Always]).holds(&atoms));
+    }
+
+    /// S05: an SSH-only session satisfies `SessionEstablished` but not the
+    /// graphical expectation; a seated one satisfies both.
+    #[test]
+    fn only_a_seated_session_expects_a_desktop() {
+        let seat = Condition::SessionEstablished { uid: None, seated: true };
+        let mut atoms: BTreeSet<Condition> = [Condition::SessionEstablished { uid: Some(1000), seated: false }].into();
+        assert!(!seat.holds(&atoms));
+        assert!(Condition::SessionEstablished { uid: None, seated: false }.holds(&atoms));
+        atoms.insert(Condition::SessionEstablished { uid: Some(1002), seated: true });
+        assert!(seat.holds(&atoms));
+        assert!(!Condition::SessionEstablished { uid: Some(1000), seated: true }.holds(&atoms));
+        assert!(Condition::SessionEstablished { uid: Some(1002), seated: true }.holds(&atoms));
+        assert!(Condition::All(vec![Condition::Always, seat]).needs_seat());
     }
 
     fn probe(role: ProbeRole, side_effects: SideEffects, cadence: Cadence) -> ProbeDef {

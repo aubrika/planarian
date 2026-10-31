@@ -1039,6 +1039,8 @@ impl Sim {
                 let uid = s.get("uid").and_then(T::as_integer).unwrap_or(1000) as u32;
                 let id = get("session").to_string();
                 let seat = s.get("seat").and_then(T::as_str).map(String::from);
+                // An SSH-only login (no seat) starts no compositor.
+                let compositor = seat.is_some() && get("compositor") != "fails";
                 let now = self.now();
                 let mut w = self.fake.w();
                 w.sessions.push(SessionInfo {
@@ -1051,7 +1053,7 @@ impl Sim {
                     idle: false,
                     created: now,
                 });
-                w.compositors.insert(id, get("compositor") != "fails");
+                w.compositors.insert(id, compositor);
                 let sim = planarian_fake::UnitSim::active(now);
                 for name in ["pipewire", "wireplumber"] {
                     let u = UnitId {

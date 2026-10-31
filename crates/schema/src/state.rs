@@ -371,13 +371,14 @@ mod tests {
     #[test]
     fn suppressed_and_not_expected() {
         let id = UnitId::target("graphical-session");
-        let defs: UnitDefs = [(id.clone(), def(&id, Condition::SessionEstablished { uid: None }, vec![]))].into();
+        let defs: UnitDefs =
+            [(id.clone(), def(&id, Condition::SessionEstablished { uid: None, seated: false }, vec![]))].into();
         let mut s = state(100_000);
         s.units.insert(id.clone(), (Observed::Bound, vec![]));
         // Idle greeter: nobody logged in (catalog: login-greeter-idle).
         assert_eq!(s.status(&id, &defs), UnitStatus::NotExpected);
         assert!(!s.expected(&id, &defs));
-        s.conditions.insert(Condition::SessionEstablished { uid: Some(1000) });
+        s.conditions.insert(Condition::SessionEstablished { uid: Some(1000), seated: false });
         assert_eq!(s.status(&id, &defs), UnitStatus::Stopped);
         assert!(s.expected(&id, &defs));
         s.overrides.push(Override {

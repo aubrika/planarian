@@ -128,7 +128,7 @@ let
         type = types.enum [ "Running" "Stopped" "Bound" "Absent" ];
         default = if config.kind == "device" && !(lib.hasPrefix "fs-" name) then "Bound" else "Running";
       };
-      when = mkOption { type = types.enum [ "always" "session" "ac" "battery" ]; default = "always"; };
+      when = mkOption { type = types.enum [ "always" "session" "seat" "ac" "battery" ]; default = "always"; };
       whenDevice = mkOption { type = types.nullOr types.str; default = null; description = "Desired only while this device is connected."; };
       edges = mkOption { type = types.listOf (types.submodule edgeModule); default = [ ]; };
       deriveEdges = mkOption { type = types.bool; default = true; description = "Add edges from the systemd unit's dependencies."; };
@@ -204,7 +204,8 @@ let
     if u.whenDevice != null then { DeviceConnected = toId u.whenDevice; }
     else {
       always = "Always";
-      session = { SessionEstablished = { uid = null; }; };
+      session = { SessionEstablished = { uid = null; seated = false; }; };
+      seat = { SessionEstablished = { uid = null; seated = true; }; };
       ac = "OnAcPower";
       battery = "OnBattery";
     }.${u.when};
@@ -517,7 +518,7 @@ in
       NetworkManager = mkIf config.networking.networkmanager.enable (mkDefault { synonyms = [ "wifi" "wi-fi" "network" "internet" ]; });
       # The desktop's own unit: its absence is harm, whoever stopped it (§11).
       ${dmUnit} = mkIf hasDm (mkDefault { synonyms = [ "login screen" "greeter" ]; inferStops = false; });
-      graphical-session = mkIf hasDesktop (mkDefault { kind = "target"; when = "session"; synonyms = [ "desktop" ]; });
+      graphical-session = mkIf hasDesktop (mkDefault { kind = "target"; when = "seat"; synonyms = [ "desktop" ]; });
       pipewire = mkIf config.services.pipewire.enable (mkDefault { scope = "user"; synonyms = [ "sound" "audio" ]; });
     };
 

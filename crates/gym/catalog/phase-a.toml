@@ -1886,6 +1886,24 @@ no_autonomous_txn = true
 # Family: boot-to-desktop-failure
 # ═══════════════════════════════════════════════════════════════════════════
 
+# S05 (§10): only a seated session carries a graphical expectation.
+[[fault]]
+id = "ssh-session-expects-no-desktop"
+family = "boot-to-desktop-failure"
+summary = "alice logs in over SSH only (a user session with no seat) and stays for 5 min. Her user services are desired, but no compositor is expected: graphical-session has no instance for that session and no incident opens."
+spec = ["§10 conditions", "S05"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { raw = "session_login", uid = 1000, session = "ssh1" }
+after = [{ raw = "wait", for = "5m" }]
+window = "6m"
+
+[fault.required_post]
+no_incident_on = ["target:graphical-session"]
+units = { "service@1000:pipewire" = "Running" }
+
 [[fault]]
 id = "desktop-auth-ok-compositor-fails"
 family = "boot-to-desktop-failure"
