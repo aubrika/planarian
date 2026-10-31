@@ -599,6 +599,8 @@ impl Sim {
         let boot_id = self.boot_id();
         let mut core = Core::start(j, self.fake.clone(), OwnerId::Daemon { pid, boot_id }, cfg);
         core.admin_of = gym_admins();
+        // The executor log of the earlier runs, as the daemon reads it back.
+        core.remember(self.log.clone());
         self.core = Some(core);
         self.harvest();
     }

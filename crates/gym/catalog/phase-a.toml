@@ -2494,6 +2494,32 @@ transition = "ApplyChange"
 path = ["Built", "Activating", "Committed"]
 terminal = "Committed"
 
+# C21 (§12): re-prepared transactions keep their original caller and source.
+[[fault]]
+id = "reprepared-keeps-caller"
+family = "activation-scheduling"
+summary = "alice changes her font scale while a game holds Foreground in her session, so it waits in Built. The daemon restarts: the change is prepared again as alice's, in her session (not the daemon's), and commits once Foreground ends."
+spec = ["§12", "§12f", "C21"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "foreground", session = "s1", on = true },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" },
+  { raw = "wait", for = "1m" },
+]
+inject = { raw = "restart_process", process = "planariad" }
+after = [{ raw = "wait", for = "2m" }, { raw = "foreground", session = "s1", on = false }]
+window = "5m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+caller = "user:1000@s1"
+source = "user"
+
 [[fault]]
 id = "quiet-repair-not-deferred"
 family = "activation-scheduling"
@@ -2978,6 +3004,36 @@ generation = "base"
 [[fault.required_post.txn]]
 transition = "ApplyChange"
 terminal = "Reverted"
+
+# S07 (§12 step 4, §12h): approval tokens die with the daemon.
+[[fault]]
+id = "approval-dies-with-daemon"
+family = "authority"
+summary = "An administrator asks to disable sshd (AskFirst) and the approval is issued. The daemon restarts before anyone approves. The old approval is void: presenting it is refused, the change is asked for again, and nothing runs until the new request is approved."
+spec = ["§12 step 4", "§12h", "S07"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty", hold_token = true },
+  { raw = "restart_process", process = "planariad" },
+]
+inject = { raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }
+window = "3m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+reports = ["TokenReplayRefused", "NeedsApproval"]
+
+# The latest ApplyChange is the change asked for again after the restart,
+# by its original caller (C21), still waiting for approval.
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+terminal = "pending"
+caller = "user:1001"
 
 [[fault]]
 id = "release-refused-leaves-incident"

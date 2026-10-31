@@ -183,7 +183,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     quiet: bool,
     quiet_queue: Vec<String>,
     /// Waiting generations interrupted by a restart, to prepare again (§12f).
-    reprepare: Vec<Transition>,
+    reprepare: Vec<(TxnId, Transition)>,
+    /// From the executor log of earlier runs: each transaction's proposal and
+    /// caller, so one prepared again keeps its source and caller (§12, C21).
+    pub earlier: BTreeMap<TxnId, (Proposal, Actor)>,
     /// Units Planarian's own transactions touched since the previous tick, and
     /// whether a generation changed: their stops are not someone else's.
     touched: BTreeSet<UnitId>,
@@ -254,17 +257,19 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             Err(e) => notices.push_back(format!("journal reconciliation failed: {e:?}")),
         }
         let ledger = ex.kernel.journal.ledger().clone();
-        // §12f: a generation that was waiting in Built for an activation
-        // window is Rejected(Interrupted) by the crash table, and re-prepared.
-        let reprepare: Vec<Transition> = ledger
+        // A generation waiting in Built for an activation window (§12f), or
+        // a change parked for approval (§12 step 4: tokens do not survive a
+        // restart), is Rejected(Interrupted) by the crash table and prepared
+        // again: the parked one asks for approval again.
+        let reprepare: Vec<(TxnId, Transition)> = ledger
             .terminal
             .iter()
             .filter(|(id, t)| {
                 !terminal_before.contains(id)
                     && t.state == TxnState::Rejected(RejectReason::Interrupted)
-                    && t.path.iter().rev().nth(1).is_some_and(|p| p == "Built")
+                    && t.path.iter().rev().nth(1).is_some_and(|p| p == "Built" || p == "Prepared")
             })
-            .map(|(_, t)| t.transition.clone())
+            .map(|(id, t)| (*id, t.transition.clone()))
             .collect();
         let mut incidents = Manager::restore(ledger.incidents.values().cloned());
         incidents.startup_grace = cfg.startup_grace;
@@ -323,6 +328,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             quiet: false,
             quiet_queue: vec![],
             reprepare: vec![],
+            earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
             generation_touched: false,
             next_gc_check: Timestamp(0),
@@ -345,6 +351,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         core.reprepare = reprepare;
         core.note_declarations(None, current, false);
         core
+    }
+
+    /// Records from the executor log of earlier runs (§12, C21): what each
+    /// transaction was proposed as, and by whom.
+    pub fn remember(&mut self, records: impl IntoIterator<Item = LogRecord>) {
+        for r in records {
+            if let Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } = &r.result {
+                self.earlier.insert(*txn, (r.proposal, r.caller));
+            }
+        }
     }
 
     /// The observation the last tick (or request) acted on.
@@ -908,9 +924,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             return;
         }
 
-        for t in std::mem::take(&mut self.reprepare) {
-            let p = self.proposal(t.clone(), &s, &defs, Source::Maintenance, "prepared again after a restart".into());
-            let r = self.submit(p, authorization_of(Actor::Daemon), &s, &defs);
+        for (id, t) in std::mem::take(&mut self.reprepare) {
+            // Its original source and caller (C21), so floors that depend on
+            // who asked (the own-session exemption) still apply; the daemon's
+            // own only when no record of it survives.
+            let (source, authz) = match self.earlier.get(&id).cloned() {
+                Some((p, caller @ Actor::User { .. })) => {
+                    let admin = caller.uid().is_some_and(|u| (self.admin_of)(u));
+                    (p.source, user_authorization(caller, admin))
+                }
+                Some((p, caller)) => (p.source, authorization_of(caller)),
+                None => (Source::Maintenance, authorization_of(Actor::Daemon)),
+            };
+            let p = self.proposal(t.clone(), &s, &defs, source, "prepared again after a restart".into());
+            let r = self.submit(p, authz, &s, &defs);
             self.notice(format!(
                 "{}: prepared again after a restart: {}",
                 render::transition(&t),
