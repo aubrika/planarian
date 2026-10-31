@@ -6,7 +6,9 @@ They do not replace Nix evaluation or a real installed-entry VM run.
 """
 
 import ast
+import json
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -91,6 +93,29 @@ def evidence(state, *, known_good, floor, live_tested, uptime=600, admission=Fal
 
 
 class InstalledBootFixtureContract(unittest.TestCase):
+    def test_filesystem_readiness_accepts_running_and_rejects_nonhealthy_evidence(self):
+        commands = [
+            node.args[0].value for node in ast.walk(embedded_driver())
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "wait_until_succeeds"
+            and node.args and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and 'device:fs-root' in node.args[0].value
+        ]
+        self.assertEqual(len(commands), 1)
+        predicate = shlex.split(commands[0])[-1]
+        for status, healthy in [("Running", True), ("Bound", False), ("Unknown", False),
+                                ({"Degraded": ["space"]}, False)]:
+            with self.subTest(status=status):
+                data = {"units": [{"unit": "device:fs-root", "status": status}]}
+                run = subprocess.run(["jq", "-e", predicate], input=json.dumps(data),
+                                     text=True, capture_output=True, timeout=5)
+                self.assertEqual(run.returncode == 0, healthy, run.stdout)
+        run = subprocess.run(["jq", "-e", predicate], input='{"units": []}',
+                             text=True, capture_output=True, timeout=5)
+        self.assertNotEqual(run.returncode, 0)
+
     def test_admission_rejects_early_commit_floor_livetested_or_confirmation(self):
         code = subtest_body("G2 admits its installed entry without committing before confirmation")
         exec(code, evidence("Promoted", known_good=1, floor=None, live_tested=None, admission=True))

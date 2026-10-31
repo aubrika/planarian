@@ -662,6 +662,9 @@ fn withdrawal_effects_with_failed_partial_or_lost_replies_remain_interlocked() {
                 let mut w = rig.w();
                 w.one_shot = None;
                 w.boot_default = G2;
+                // The publishing generation booted; the stale default is
+                // what withdrawal must repair, not evidence of admission.
+                w.last_booted = Some(G1);
                 w.withdraw_reply = Some(reply.clone());
             }
             rig.kill(DAEMON);

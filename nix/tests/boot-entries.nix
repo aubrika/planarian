@@ -221,7 +221,9 @@ pkgs.testers.runNixOSTest (
       # Preserve the canonical 2 GiB / 5% readiness threshold. This verifies
       # the partition/filesystem actually grew, rather than trusting diskSize.
       machine.wait_until_succeeds("python3 -c " + shlex.quote("import os; s=os.statvfs('/'); assert s.f_bavail*s.f_frsize >= max(2147483648, s.f_blocks*s.f_frsize//20)"), timeout=90)
-      machine.wait_until_succeeds("planarian --json status | jq -e '.units[] | select(.unit == \"device:fs-root\") | .status == \"Bound\"'", timeout=90)
+      # Mounted filesystems are observed Active; healthy Readiness evidence
+      # therefore renders Running (Bound is the driver-device state).
+      machine.wait_until_succeeds("planarian --json status | jq -e '.units[] | select(.unit == \"device:fs-root\") | .status == \"Running\"'", timeout=90)
       machine.succeed("grep -q planarian-boot-slot=g1 /proc/cmdline")
       machine.succeed("test \"$(readlink -f /run/booted-system)\" = ${g1}")
       machine.succeed("mkdir -p /etc/nixos/planarian", "install -m644 ${shim} /etc/nixos/flake.nix", "install -m644 ${exports} /etc/nixos/exports.json", "install -m644 ${../template/planarian/overrides.nix} /etc/nixos/planarian/overrides.nix", "ln -s ${g1} /etc/nixos/g1", "ln -s ${g2} /etc/nixos/g2", "ln -s ${g3} /etc/nixos/g3")

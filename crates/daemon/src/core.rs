@@ -1507,15 +1507,18 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         // An admitted boot-only transaction remains Promoted across daemon and
         // watchdog restarts. Its durable admission, rather than a fresh daemon
         // startup time, defines the same-boot checkpoint.
-        let admitted = self.ledger().live.values().find(|l| {
-            l.txn.state == TxnState::Promoted && l.path.iter().any(|p| p == "AwaitingBoot")
-        }).map(|l| l.txn.clone());
+        let admitted = self
+            .ledger()
+            .live
+            .values()
+            .find(|l| l.txn.state == TxnState::Promoted && l.path.iter().any(|p| p == "AwaitingBoot"))
+            .map(|l| l.txn.clone());
         if let Some(txn) = admitted {
             if self.b.clock().boot_now() < Timestamp(0).plus(CONFIRM_AFTER) {
                 return;
             }
-            let canonical_passed = txn.candidate.as_ref().is_some_and(|(g, _)| *g == s.generation)
-                && self.canonical_healthy(s, defs);
+            let canonical_passed =
+                txn.candidate.as_ref().is_some_and(|(g, _)| *g == s.generation) && self.canonical_healthy(s, defs);
             match self.ex.kernel.confirm_boot(txn.id, canonical_passed) {
                 Ok(TxnState::Committed) => {
                     self.confirm = None;
@@ -1531,7 +1534,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 Ok(TxnState::Promoted) => {}
                 Ok(state) => {
                     self.confirm = None;
-                    self.notice(format!("boot-only transaction {} ended {state:?}; restart to finish recovery", txn.id.0));
+                    self.notice(format!(
+                        "boot-only transaction {} ended {state:?}; restart to finish recovery",
+                        txn.id.0
+                    ));
                 }
                 Err(e) => self.notice(format!("boot confirmation remains pending: {e:?}")),
             }
@@ -1607,6 +1613,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     fn user_submit(&mut self, t: Transition, peer: Peer, source: Source, reason: String) -> Response {
+        // Bind attribution and policy to the same fresh logind observation,
+        // including the first request after login or a changed session state.
+        let (s, defs) = self.observe();
         let authz = self.authz(&peer);
         if self.defer && self.deferred.is_none() {
             match self.ex.prebuild_job(&t, &authz) {
@@ -1624,7 +1633,6 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 Ok(None) => {}
             }
         }
-        let (s, defs) = self.observe();
         let p = self.proposal(t, &s, &defs, source, reason);
         let r = self.submit(p, authz, &s, &defs);
         self.response(&r)

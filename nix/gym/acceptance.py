@@ -123,7 +123,9 @@ def main(argv=None):
     parser.add_argument("--waivers")
     parser.add_argument("--report")
     parser.add_argument("verdicts", nargs="*")
-    args = parser.parse_args(argv)
+    # Verdict paths follow the options in both runner wrappers. Explicitly
+    # support interspersed options/positionals across Python minor versions.
+    args = parser.parse_intermixed_args(argv)
     try:
         entries = catalog_entries(args.catalog)
         expected = expected_entries(entries, args.harness, args.id)

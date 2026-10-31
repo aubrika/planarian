@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn partial_coverage_does_not_count_as_a_verified_repair() {
         let sim = Sim::new();
-        let entry: T = "scoring = 'repair'".parse().unwrap();
+        let entry: T = toml::from_str("scoring = 'repair'").unwrap();
         let mut metrics = Metrics::default();
         metrics.add(&entry, false, true, Some(&sim));
         assert_eq!(metrics.repair_entries, 1);
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn repair_time_comes_from_health_samples_and_rejects_missing_or_failed_samples() {
-        let entry: T = "[required_post.units]\n'service:gym-web' = 'Running'".parse().unwrap();
+        let entry: T = toml::from_str("[required_post.units]\n'service:gym-web' = 'Running'").unwrap();
         let unit = UnitId::service("gym-web");
         let mut timeline = BTreeMap::from([(
             unit.clone(),

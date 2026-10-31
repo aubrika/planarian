@@ -254,3 +254,21 @@ fn vm_plan_refuses_what_the_gym_vm_cannot_be() {
     // `internal wifi-connect` is the harness's own; the others do not exist.
     assert!(!unsupported("policy-daemon-wifi-runtime"));
 }
+
+#[test]
+fn a_full_boot_filesystem_reverts_without_claiming_the_disk_was_repaired() {
+    let (e, _) = passing("storage-boot-full-publish");
+    assert_eq!(e.current, e.base);
+    assert_eq!(e.boot_default, e.base);
+    assert_eq!(e.finals[&unit("device:fs-boot")], "Degraded");
+    assert!(e.ledger.interlock.is_empty());
+}
+
+#[test]
+fn an_override_from_a_new_login_retains_the_original_session_after_approval() {
+    let (mut e, post) = passing("authz-user-overrides-firewall");
+    assert_eq!(e.ledger.overrides[0].by, Actor::local(1000, "s1"));
+    // The judge must continue rejecting attribution that loses the session.
+    e.ledger.overrides[0].by = Actor::user(1000);
+    fails(&e, &post, "overrides");
+}

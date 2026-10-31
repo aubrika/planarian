@@ -22,7 +22,9 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Workspace clippy
+        if: success() || failure()
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: clippy with the gym's fault-injection hooks
         if: success() || failure()
         run: cargo clippy -p planarian-daemon -p planarian-backend-linux --features planarian-daemon/gym-hooks -- -D warnings

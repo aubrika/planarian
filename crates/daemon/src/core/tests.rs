@@ -241,6 +241,79 @@ fn unprivileged_override_of_a_security_unit_is_held_for_an_administrator() {
     assert_eq!(l.overrides[0].by.uid(), Some(1000), "attributed to alice, not the approver");
 }
 
+#[test]
+fn the_first_request_after_login_keeps_the_fresh_authenticated_session() {
+    let mut r = Rig::new();
+    r.core.observe();
+    assert!(r.core.asm.sessions.is_empty());
+    let now = r.fake.clock().now();
+    r.fake.w().sessions.push(SessionInfo {
+        id: "fresh-login".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        graphical: true,
+        created: now,
+        active: true,
+        idle: false,
+    });
+    // No daemon tick occurs between logind's change and the request.
+    let req = Request::SetOverride {
+        unit: UnitId::service("sshd"),
+        until: Until::Explicit,
+        desired: OverrideDesired::Stopped,
+    };
+    let response = r.core.handle(ALICE.in_session("fresh-login"), req);
+    let Response::NeedsApproval { approve, .. } = response else { panic!("must ask: {response:?}") };
+    let proposer = Actor::User {
+        uid: 1000,
+        session: Some("fresh-login".into()),
+        seat: Some("seat0".into()),
+        active: true,
+    };
+    assert_eq!(r.core.ex.parked.values().next().unwrap().authz.actor, proposer);
+    let response = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    assert!(matches!(response, Response::Done { state: TxnState::Committed, .. }), "{response:?}");
+    assert_eq!(r.core.ledger().overrides[0].by, proposer);
+}
+
+#[test]
+fn root_proposals_need_an_independent_administrators_fresh_request_at_the_public_api() {
+    let disable_sshd = || Request::Apply {
+        change: ChangeId("service-enable".into()),
+        args: [("service".into(), Value::Str("sshd".into())), ("enabled".into(), Value::Bool(false))].into(),
+    };
+    let mut r = Rig::new();
+    let response = r.core.handle(ADMIN, disable_sshd());
+    let Response::NeedsApproval { txn, approve, .. } = response else { panic!("must ask: {response:?}") };
+    let pending = r.core.ledger();
+    // Another administrator at a terminal still cannot approve in Phase A.
+    // Root without a terminal cannot approve either.
+    for peer in [Peer::new(1001, true).at_terminal(), ADMIN] {
+        let response = r.core.handle(peer, Request::Approve { hash: approve });
+        let Response::Error { message } = response else { panic!("must refuse: {response:?}") };
+        assert!(message.contains("requires root at an interactive terminal"), "{message}");
+        assert_eq!(r.core.ledger(), pending, "a refused approval keeps its durable obligation unchanged");
+    }
+    let response = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    let Response::Rejected { reason, message } = response else { panic!("must reject: {response:?}") };
+    assert_eq!(reason, "Unauthorized");
+    assert!(message.contains("your own request"), "{message}");
+    assert_eq!(r.core.ledger(), pending, "root cannot self-approve");
+    assert_eq!(r.core.ledger().live[&txn].txn.state, TxnState::Prepared);
+    assert_eq!(r.calls("activate_live"), 0);
+    assert_eq!(r.fake.w().current, GenerationId(1));
+
+    // The supported workflow starts a fresh request as an existing non-root
+    // administrator, then obtains root's independent terminal approval.
+    let mut fresh = Rig::new();
+    let response = fresh.core.handle(Peer::new(1001, true), disable_sshd());
+    let Response::NeedsApproval { approve, .. } = response else { panic!("must ask: {response:?}") };
+    let response = fresh.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    assert!(matches!(response, Response::Done { state: TxnState::Committed, .. }), "{response:?}");
+}
+
 /// §11 (owner decision, 2026-10-30): an agent has the permissions of the
 /// user who started it, bound to the instance that start journaled (I24),
 /// and is attributed to itself in the log. One with no journaled start, or
@@ -832,7 +905,8 @@ fn foreground_waiting_expires_with_a_named_reissue_notice_and_reopens_its_incide
     r.fake.w().foreground.insert("s1".into());
     r.ticks(2);
     let args = [("scale".to_string(), Value::Str("1.25".into()))].into();
-    let response = r.core.handle(ALICE.in_session("s1"), Request::Apply { change: ChangeId("font-scale".into()), args });
+    let response =
+        r.core.handle(ALICE.in_session("s1"), Request::Apply { change: ChangeId("font-scale".into()), args });
     let Response::Done { txn, state: TxnState::Built, .. } = response else {
         panic!("must wait: {response:?}");
     };
@@ -853,8 +927,7 @@ fn foreground_waiting_expires_with_a_named_reissue_notice_and_reopens_its_incide
     };
     r.core.incidents.incidents.insert(incident.id, incident.clone());
     r.core.journal(Record::Incident(incident));
-    r.fake.w().units.get_mut(&UnitId::service("gym-web")).unwrap().observed =
-        Observed::Failed(Reason::ExitCode(1));
+    r.fake.w().units.get_mut(&UnitId::service("gym-web")).unwrap().observed = Observed::Failed(Reason::ExitCode(1));
     r.fake.advance(planarian_exec::PARKING_LIMIT);
     // The tick cancels even while quiet mode is still holding. Its notice
     // follows the normal non-urgent quiet queue rather than interrupting.

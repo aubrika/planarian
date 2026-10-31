@@ -118,16 +118,18 @@ fn root() -> Authorization {
     user_authorization(Actor::user(0), true)
 }
 
-/// S04: adding an administrator cannot retroactively make that principal an
-/// approver in Phase A. A root-launched agent has this same root principal.
+/// S04: I19 prevents root from approving its own proposal. The daemon also
+/// restricts Phase A approval to root at a terminal; its public-API regression
+/// covers the resulting need for an independent administrator's fresh request.
 #[test]
 fn root_proposals_require_resubmission_by_an_independent_administrator() {
     let mut r = Rig::new();
     let off = change("service-enable", &[("service", Value::Str("sshd".into())), ("enabled", Value::Bool(false))]);
     let Submitted::Parked { approve, .. } = r.propose(off.clone(), root()) else { panic!("must ask") };
     let (state, defs) = r.observe();
+    let pending = r.ex.kernel.journal.ledger().clone();
     assert!(matches!(r.ex.approve(&approve, &root(), &state, &defs), Submitted::Rejected { .. }));
-    assert!(matches!(r.ex.approve(&approve, &admin(), &state, &defs), Submitted::Rejected { .. }));
+    assert_eq!(r.ex.kernel.journal.ledger(), &pending, "self-approval changes no durable state");
     // A fresh proposal by the already-authorized non-root administrator can
     // be approved as root; no account creation or authority expansion occurs.
     let mut fresh = Rig::new();

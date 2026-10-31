@@ -759,7 +759,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
             return Ok(waiting);
         }
         if !canonical_passed {
-            return self.revert_generation(&txn, "canonical probes failed at the ten-minute checkpoint; restart to finish");
+            return self
+                .revert_generation(&txn, "canonical probes failed at the ten-minute checkpoint; restart to finish");
         }
         if let Verdict::Fail(why) = self.host.check_boot_confirmation(&txn) {
             return self.revert_generation(&txn, &format!("ten-minute canonical confirmation: {why}"));
@@ -949,9 +950,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
         if self.live(txn.id)?.txn.state != TxnState::Reverting {
             self.advance(txn, TxnState::Reverting, why)?;
         }
-        let published = self.call(txn.id, "publish_boot(revert_to)", |h, op| {
-            h.generations().publish_boot(txn.revert_to, op)
-        })?;
+        let published =
+            self.call(txn.id, "publish_boot(revert_to)", |h, op| h.generations().publish_boot(txn.revert_to, op))?;
         if !published.is_success() {
             return self.recovery_failed(txn, &format!("boot-only revert publish_boot: {published:?}"));
         }

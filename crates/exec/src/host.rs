@@ -102,7 +102,7 @@ impl<B: Backends> ExecHost<B> {
                 }
             }
         }
-        out.extend(preservation_violations(&txn.check, txn.started, s, defs));
+        out.extend(preservation_violations(&txn.check, txn.started, phase, s, defs));
         // Preserve aggregate Running separately from individual probe evidence:
         // an already Degraded/Unknown unit can still have required passing probes.
         for (u, before) in &txn.check.pre {
@@ -197,13 +197,15 @@ impl<B: Backends> Host for ExecHost<B> {
         if txn.candidate.as_ref().is_none_or(|(g, _)| *g != s.generation) {
             return Verdict::Fail("the admitted generation is no longer running".into());
         }
-        let failed: Vec<String> = defs.iter().filter_map(|(id, def)| {
-            let canonical = def.probes.iter().any(|p| {
-                p.origin == ProbeOrigin::Canonical && p.role == ProbeRole::Readiness
-            });
-            (canonical && s.expected(id, &defs) && s.status(id, &defs) != UnitStatus::Running)
-                .then(|| format!("{id}: canonical readiness did not pass"))
-        }).collect();
+        let failed: Vec<String> = defs
+            .iter()
+            .filter_map(|(id, def)| {
+                let canonical =
+                    def.probes.iter().any(|p| p.origin == ProbeOrigin::Canonical && p.role == ProbeRole::Readiness);
+                (canonical && s.expected(id, &defs) && s.status(id, &defs) != UnitStatus::Running)
+                    .then(|| format!("{id}: canonical readiness did not pass"))
+            })
+            .collect();
         if failed.is_empty() { Verdict::Pass } else { Verdict::Fail(failed.join("; ")) }
     }
 
@@ -282,6 +284,7 @@ pub fn passing_readiness(state: &SystemState, defs: &UnitDefs) -> Vec<(UnitId, P
 fn preservation_violations(
     check: &CheckContext,
     started: Timestamp,
+    phase: CheckPhase,
     state: &SystemState,
     defs: &UnitDefs,
 ) -> Vec<String> {
@@ -305,12 +308,19 @@ fn preservation_violations(
         }
         let latest =
             state.units.get(unit).and_then(|(_, ev)| ev.iter().filter(|e| e.probe == before.id).max_by_key(|e| e.at));
-        if !latest.is_some_and(|e| {
-            e.at >= started
-                && e.at <= state.observed_at
-                && e.fresh_at(state.observed_at)
-                && e.result == ProbeResult::Pass
-        }) {
+        let fresh =
+            latest.is_some_and(|e| e.at >= started && e.at <= state.observed_at && e.fresh_at(state.observed_at));
+        // §12c: rollback cannot cure unrelated filesystem fullness. Preserve
+        // the existing revert-only exception for a newly observed FreeSpace
+        // failure; missing/Unknown evidence and every other probe still fail.
+        if phase == CheckPhase::Revert
+            && matches!(before.kind, ProbeKind::FreeSpace { .. })
+            && fresh
+            && latest.is_some_and(|e| matches!(&e.result, ProbeResult::Fail(_)))
+        {
+            continue;
+        }
+        if !fresh || !latest.is_some_and(|e| e.result == ProbeResult::Pass) {
             out.push(format!(
                 "{unit}: previously passing Readiness probe {} has no fresh post-change pass",
                 before.id.0
@@ -324,6 +334,15 @@ fn preservation_violations(
 mod preservation_tests {
     use super::*;
     use planarian_schema::fixtures;
+
+    fn candidate_violations(
+        check: &CheckContext,
+        started: Timestamp,
+        state: &SystemState,
+        defs: &UnitDefs,
+    ) -> Vec<String> {
+        preservation_violations(check, started, CheckPhase::Candidate, state, defs)
+    }
 
     fn baseline(a: ProbeResult) -> (CheckContext, SystemState, UnitDefs, UnitId) {
         let mut d = fixtures::service("mixed");
@@ -345,9 +364,9 @@ mod preservation_tests {
             // The exact context reconstructed from Prepared/checkpoint must
             // carry the obligation used by daemon and watchdog checking alike.
             let restored: CheckContext = serde_json::from_slice(&serde_json::to_vec(&check).unwrap()).unwrap();
-            assert!(preservation_violations(&restored, Timestamp(1000), &state, &defs).is_empty());
+            assert!(candidate_violations(&restored, Timestamp(1000), &state, &defs).is_empty());
             state.units.get_mut(&unit).unwrap().1[1].result = ProbeResult::Fail("B regressed".into());
-            assert_eq!(preservation_violations(&restored, Timestamp(1000), &state, &defs).len(), 1);
+            assert_eq!(candidate_violations(&restored, Timestamp(1000), &state, &defs).len(), 1);
         }
     }
 
@@ -357,24 +376,53 @@ mod preservation_tests {
         for result in [ProbeResult::Timeout, ProbeResult::Error("lost".into())] {
             let mut after = state.clone();
             after.units.get_mut(&unit).unwrap().1[1].result = result;
-            assert!(!preservation_violations(&check, Timestamp(1000), &after, &defs).is_empty());
+            assert!(!candidate_violations(&check, Timestamp(1000), &after, &defs).is_empty());
         }
         let mut missing = state.clone();
         missing.units.get_mut(&unit).unwrap().1.pop();
-        assert!(!preservation_violations(&check, Timestamp(1000), &missing, &defs).is_empty());
+        assert!(!candidate_violations(&check, Timestamp(1000), &missing, &defs).is_empty());
         let mut stale = state.clone();
         stale.observed_at = Timestamp(100_000);
-        assert!(!preservation_violations(&check, Timestamp(1000), &stale, &defs).is_empty());
-        assert!(!preservation_violations(&check, Timestamp(1001), &state, &defs).is_empty());
+        assert!(!candidate_violations(&check, Timestamp(1000), &stale, &defs).is_empty());
+        assert!(!candidate_violations(&check, Timestamp(1001), &state, &defs).is_empty());
     }
 
     #[test]
     fn authorized_removal_changes_applicability_but_probe_removal_does_not() {
         let (check, state, mut defs, unit) = baseline(ProbeResult::Fail("A".into()));
         defs.get_mut(&unit).unwrap().probes.pop();
-        assert!(!preservation_violations(&check, Timestamp(1000), &state, &defs).is_empty());
+        assert!(!candidate_violations(&check, Timestamp(1000), &state, &defs).is_empty());
         defs.remove(&unit);
-        assert!(preservation_violations(&check, Timestamp(1000), &state, &defs).is_empty());
+        assert!(candidate_violations(&check, Timestamp(1000), &state, &defs).is_empty());
+    }
+
+    #[test]
+    fn only_fresh_filesystem_failure_is_exempt_during_revert() {
+        let (_, mut state, mut defs, unit) = baseline(ProbeResult::Pass);
+        defs.get_mut(&unit).unwrap().probes[0].kind = ProbeKind::FreeSpace {
+            path: "/boot".into(),
+            min_bytes: 1,
+            min_permille: 1,
+        };
+        let check = CheckContext { passing_readiness: Some(passing_readiness(&state, &defs)), ..Default::default() };
+        let errors = |phase, state: &SystemState| preservation_violations(&check, Timestamp(1000), phase, state, &defs);
+        state.units.get_mut(&unit).unwrap().1[0].result = ProbeResult::Fail("disk full".into());
+        assert!(!errors(CheckPhase::Candidate, &state).is_empty());
+        assert!(errors(CheckPhase::Revert, &state).is_empty());
+        // The storage exception cannot hide a second, unrelated regression.
+        state.units.get_mut(&unit).unwrap().1[1].result = ProbeResult::Fail("B regressed".into());
+        assert!(!errors(CheckPhase::Revert, &state).is_empty());
+        state.units.get_mut(&unit).unwrap().1[1].result = ProbeResult::Pass;
+        for result in [ProbeResult::Timeout, ProbeResult::Error("unavailable".into())] {
+            state.units.get_mut(&unit).unwrap().1[0].result = result;
+            assert!(!errors(CheckPhase::Revert, &state).is_empty());
+        }
+        state.units.get_mut(&unit).unwrap().1[0].result = ProbeResult::Fail("disk full".into());
+        state.observed_at = Timestamp(100_000);
+        assert!(!errors(CheckPhase::Revert, &state).is_empty());
+        state.observed_at = Timestamp(1000);
+        state.units.get_mut(&unit).unwrap().1.remove(0);
+        assert!(!errors(CheckPhase::Revert, &state).is_empty());
     }
 
     #[test]
@@ -384,6 +432,6 @@ mod preservation_tests {
         assert_eq!(ctx.version, 0);
         assert!(ctx.passing_readiness.is_none());
         assert_eq!(serde_json::to_string(&ctx).unwrap(), old);
-        assert!(!preservation_violations(&ctx, Timestamp(0), &fixtures::empty_state(0), &UnitDefs::new()).is_empty());
+        assert!(!candidate_violations(&ctx, Timestamp(0), &fixtures::empty_state(0), &UnitDefs::new()).is_empty());
     }
 }

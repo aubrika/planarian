@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -56,6 +57,21 @@ class AcceptanceContract(unittest.TestCase):
         self.assertTrue(partial["acceptance_complete"])
         self.assertFalse(partial["full_harness_acceptance_complete"])
         self.assertEqual(partial["scope"], "selected-cases")
+
+    def test_cli_accepts_verdict_paths_after_and_between_options(self):
+        a, b = self.verdict("a"), self.verdict("b", "intent")
+        options = ["--catalog", str(self.catalog), "--harness", "vm", "--waivers", str(self.waivers)]
+        layouts = [
+            ["check", *options, str(a), str(b)],
+            ["check", str(a), *options, str(b)],
+            [*options, "check", str(a), str(b)],
+        ]
+        for arguments in layouts:
+            with self.subTest(arguments=arguments):
+                run = subprocess.run([sys.executable, str(HERE / "acceptance.py"), *arguments],
+                                     capture_output=True, text=True, timeout=10)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertEqual(run.stdout.count("PASS"), 2)
 
     def test_required_pass_cannot_become_unsupported_or_vanish(self):
         other = self.verdict("intent", "intent")

@@ -766,12 +766,8 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     /// in this map: its publication waits for a reboot without a limit.
     pub fn expire_waiting(&mut self) -> Vec<(TxnId, Submitted)> {
         let now = self.b.clock().boot_now();
-        let expired: Vec<TxnId> = self
-            .waiting
-            .iter()
-            .filter(|(_, w)| now >= w.since.plus(PARKING_LIMIT))
-            .map(|(id, _)| *id)
-            .collect();
+        let expired: Vec<TxnId> =
+            self.waiting.iter().filter(|(_, w)| now >= w.since.plus(PARKING_LIMIT)).map(|(id, _)| *id).collect();
         expired
             .into_iter()
             .map(|id| {
