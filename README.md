@@ -7,7 +7,7 @@
 
 # Planarian
 
-A self-healing layer for NixOS. It keeps three things separate: what your
+A self-healing layer for NixOS ([why Planarian?](docs/why.md)). It keeps three things separate: what your
 system is meant to be (from your configuration), what it observes, and whether
 what it observes is healthy. When they diverge it opens an incident and repairs
 it, deterministically, through one executor that runs every change as a
