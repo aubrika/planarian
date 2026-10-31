@@ -94,6 +94,15 @@ struct Plan {
     candidate: Option<(GenerationId, StorePath)>,
     base_override: Option<Hash>,
     candidate_override: Option<Hash>,
+    /// An existing generation's dry activation (R04); a built candidate's
+    /// is in `built`.
+    existing_activation: Option<ActivationPlan>,
+}
+
+impl Plan {
+    fn activation(&self) -> Option<&ActivationPlan> {
+        self.built.as_ref().map(|b| &b.activation).or(self.existing_activation.as_ref())
+    }
 }
 
 pub struct Executor<B: Backends + Clone, S: Store> {
@@ -183,7 +192,13 @@ fn build_candidate<G: GenerationBackend>(
     };
     let staged = gens.stage(owner, &merged).map_err(|o| no_space("stage", o))?;
     let eval = gens.evaluate(&staged).map_err(|o| fail("evaluate", o))?;
-    let built = gens.build(&eval).map_err(|o| no_space("build", o))?;
+    let built = gens.build(&eval).map_err(|o| {
+        if outcome_msg(o.clone()).contains("dry activation") {
+            reject(RejectReason::ActivationUnknown, outcome_msg(o))
+        } else {
+            no_space("build", o)
+        }
+    })?;
     Ok(Candidate { staged, eval, built, merged })
 }
 
@@ -337,6 +352,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             candidate: None,
             base_override: None,
             candidate_override: None,
+            existing_activation: None,
         };
 
         let mut cand_overrides: Option<OverrideSet> = None;
@@ -371,10 +387,10 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 cand_overrides = Some(merged);
             }
             Transition::SwitchGeneration(g) | Transition::Revert { to: g } => {
-                self.plan_existing(&mut plan, *g, live_hash)?;
+                cand_overrides = self.plan_existing(&mut plan, *g, live_hash)?;
             }
             Transition::Rollback => {
-                self.plan_existing(&mut plan, state.known_good, live_hash)?;
+                cand_overrides = self.plan_existing(&mut plan, state.known_good, live_hash)?;
             }
             _ => {}
         }
@@ -384,7 +400,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             defs,
             base: &base_eval,
             candidate: plan.cand_eval.as_ref(),
-            activation: plan.built.as_ref().map(|b| &b.activation),
+            activation: plan.activation(),
             base_overrides: &live,
             candidate_overrides: cand_overrides.as_ref(),
             caller: authz.actor.clone(),
@@ -426,18 +442,33 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         Ok(plan)
     }
 
-    fn plan_existing(&self, plan: &mut Plan, g: GenerationId, live_hash: Hash) -> Result<(), Submitted> {
+    /// Equivalent effects, equivalent facts (§11, R04): an existing
+    /// generation's facts come from its dry activation and the override
+    /// content recorded for it, as a built candidate's do. Returns that
+    /// content, if one was recorded.
+    fn plan_existing(
+        &self,
+        plan: &mut Plan,
+        g: GenerationId,
+        live_hash: Hash,
+    ) -> Result<Option<OverrideSet>, Submitted> {
         let gens = self.b.generations();
         let fail = |o: Outcome| reject(RejectReason::Other("generation".into()), outcome_msg(o));
         let path = gens.path_of(g).map_err(fail)?;
         let eval = gens.evaluate_built(&path).map_err(fail)?;
-        plan.candidate = Some((g, path));
-        plan.cand_eval = Some(eval);
+        let activation =
+            gens.dry_activation(&path).map_err(|o| reject(RejectReason::ActivationUnknown, outcome_msg(o)))?;
+        let mut content = None;
         if let Some(h) = gens.override_for(g).map_err(fail)? {
+            // Without it the swap could not write it either.
+            content = Some(gens.override_content(&h).map_err(|o| reject(RejectReason::Precondition, outcome_msg(o)))?);
             plan.base_override = Some(live_hash);
             plan.candidate_override = Some(h);
         }
-        Ok(())
+        plan.candidate = Some((g, path));
+        plan.cand_eval = Some(eval);
+        plan.existing_activation = Some(activation);
+        Ok(content)
     }
 
     fn release(&self, plan: &Plan) {

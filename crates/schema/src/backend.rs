@@ -133,6 +133,13 @@ pub trait GenerationBackend {
     /// Store-only; roots its own output.
     fn build(&self, eval: &EvaluatedGeneration) -> Result<Built, Outcome>;
     fn verify_candidate(&self, path: &StorePath, expected: &Hash) -> Result<bool, Outcome>;
+    /// What switching from the running generation to an existing one would
+    /// start, stop, restart and reload (its dry activation), for
+    /// SwitchGeneration / Revert / Rollback (§11, R04). An activation that
+    /// failed, timed out or was cut short is an error, never a smaller plan.
+    fn dry_activation(&self, _path: &StorePath) -> Result<ActivationPlan, Outcome> {
+        Err(Outcome::Unknown("this backend has no dry activation".into()))
+    }
     fn pending_jobs(&self) -> Result<Vec<JobId>, Outcome>;
     /// `None`: the backend cannot say whether work tagged with `op` exists.
     fn jobs_tagged(&self, op: &OpId) -> Result<Option<Vec<JobId>>, Outcome>;
@@ -177,6 +184,10 @@ pub trait GenerationBackend {
     fn remember_override(&self, set: &OverrideSet) -> Result<Hash, Outcome>;
     /// The override content recorded for a generation when it was committed.
     fn override_for(&self, g: GenerationId) -> Result<Option<Hash>, Outcome>;
+    /// The override content `remember_override` kept under this hash.
+    fn override_content(&self, _h: &Hash) -> Result<OverrideSet, Outcome> {
+        Err(Outcome::Unknown("this backend keeps no override content".into()))
+    }
     fn record_override(&self, g: GenerationId, hash: &Hash) -> Result<(), Outcome>;
     /// Remove a GC root symlink this backend created.
     fn release_root(&self, root: &str) -> bool;

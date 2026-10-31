@@ -24,7 +24,7 @@ implementation it requires is listed as open or closed separately).
 | R01 | Boot-only publication has an uncovered crash window | open | `kernel.rs` publishes the one-shot while the transaction says `Built`; no `Publishing` state exists | §28: `TxnState::Publishing`, crash-table row |
 | R02 | Security-floor advancement is outside durable commit | open | the floor is derived in `exec` after `Committed`, not in the kernel's commit; the watchdog and boot-only paths skip it | I25 |
 | R03 | A stopped override erases the disruption it causes | open | `derive.rs`: `SetOverride` sets `disruption = None` and narrows affected units to the unit | §11 equivalent effects |
-| R04 | Existing-generation operations omit activation consequences | open | `SwitchGeneration`/`Rollback`/`Revert` derive no activation plan or override diff | §11 equivalent effects |
+| R04 | Existing-generation operations omit activation consequences | closed | `plan_existing` takes the target's dry activation and its recorded override content; a dry activation without a plan is `ActivationUnknown` | §11 equivalent effects |
 | R05 | Launcher-created agents are outside failure-posture enforcement | closed | `start_agent` units run in `planarian-agents.slice`, ordered after `planarian-ready.target`, refused while a failure class is raised, limited per unit and per uid; the posture stops the slice | §12d `planarian-agents.slice` |
 | R06 | Probe timeouts do not bound total execution time | closed | `probe.rs`: resolution, connect and every read share one deadline; the batch returns by its allowance and a straggler is `Timeout` | §10 whole-probe deadline |
 | R07 | Already-degraded units can lose more health without blocking commit | open | `host.rs`'s check compares unit status, skips units not Running before | §9 per-probe post-check |
@@ -88,7 +88,8 @@ branch protection; the rest are in PR #2.
 | S02 | `cd9a522`, `4e5cd1c` | `boot-only-admitted-not-confirmed`, `boot-only-repair-during-confirmation`, `boot-only-kernel-confirmed` |
 | R06 | `48c3907` | `probe-trickling-endpoint` (VM); backend tests `trickling_http_has_one_total_deadline`, `a_stalled_resolver_is_inside_the_deadline`, `a_wedged_probe_does_not_hold_the_batch` |
 | R05 | `7bfe155` | `posture-stops-launched-agents` (VM); backend test `no_agent_starts_while_a_failure_class_is_raised`; core test `agents_per_uid_are_limited` |
-| R11, C5 | this PR | `en-i23-third-party-override-kept` (now also VM); backend tests `the_override_swap_waits_for_the_directory_lock`, `the_override_store_is_pruned`; txn tests `txn_fences_are_exclusive_and_swept_after_checkpoint`, `file_store_txn_dirs_are_exclusive` |
+| R04 | this PR | `switch-facts-from-dry-activation`; exec tests `rollback_facts_come_from_the_dry_activation`, `an_existing_generation_without_a_plan_is_refused`; `dry-activate-*` now refused with `ActivationUnknown` |
+| R11, C5 | `867ffc1` | `en-i23-third-party-override-kept` (now also VM); backend tests `the_override_swap_waits_for_the_directory_lock`, `the_override_store_is_pruned`; txn tests `txn_fences_are_exclusive_and_swept_after_checkpoint`, `file_store_txn_dirs_are_exclusive` |
 
 `4e5cd1c` also carries an owner decision (31 Oct) amending I6, §10 and §12
 Concurrency: unit and device repairs run while an admitted boot-only change
@@ -98,7 +99,7 @@ window means the change is not confirmed.
 These cases run on the fake harness only unless marked; the VM catalog run
 of rule 19(f) is still to come.
 
-Still open from the tables above: R04, R12, R13, R14 (the
+Still open from the tables above: R12, R13, R14 (the
 rest), R15 (the fake runner and `ci.yml`), R16 (`ga-status.md` waits for
 19(f)); S04 is docs only. Still open from §28 beyond R and S: C4, C6, P7, P8,
 P13–P18, P22, K10.

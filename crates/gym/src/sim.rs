@@ -1310,6 +1310,13 @@ impl Sim {
                         let g = w.add_generation(&o);
                         w.boot_entries.insert(g);
                     }
+                } else if edit == "build-only NetworkManager store path" {
+                    // R04: equal manifests; only the network unit's store
+                    // path differs, which only a dry activation sees.
+                    let g = w.add_generation(&OverrideSet::default());
+                    let nm = UnitId::service("NetworkManager");
+                    w.gens.get_mut(&g).expect("added").eval.activation.restart.insert(nm);
+                    w.boot_entries.insert(g);
                 } else if edit.contains("gym-web ExecStart=/bin/false") {
                     let o = OverrideSet::default();
                     let g = w.add_generation(&o);

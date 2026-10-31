@@ -745,12 +745,24 @@ impl GenerationBackend for Nixos {
         // reached (`/run/current-system` is resolved the same way).
         let path = std::fs::canonicalize(&printed).map(|p| p.to_string_lossy().into_owned()).unwrap_or(printed);
         let generation = self.with_registry(|r| r.id_for(&path))?;
+        // The candidate is not usable without its plan (rule 21, R10).
+        let activation = match self.dry_activation(&StorePath(path.clone())) {
+            Ok(a) => a,
+            Err(o) => {
+                let _ = std::fs::remove_file(&root);
+                return Err(o);
+            }
+        };
+        Ok(Built { generation, path: StorePath(path), root: root.to_string_lossy().into_owned(), activation })
+    }
+
+    fn dry_activation(&self, path: &StorePath) -> Result<ActivationPlan, Outcome> {
+        let path = &path.0;
         let dry = run(&[&format!("{path}/bin/switch-to-configuration"), "dry-activate"], Duration::from_secs(120));
         // The plan is the risk evidence (§9 step 3): a dry activation that
         // failed, timed out or was cut short yields none, never a smaller one
-        // (rule 21, R10). The candidate is not usable.
+        // (rule 21, R10).
         if let Some(why) = dry_activate_failure(&dry) {
-            let _ = std::fs::remove_file(&root);
             return Err(Outcome::Failed(why));
         }
         let mut activation = parse_dry_activate(&format!("{}\n{}", dry.stdout, dry.stderr));
@@ -762,7 +774,7 @@ impl GenerationBackend for Nixos {
             std::fs::read_to_string(format!("{path}/kernel-params")).ok()
                 != std::fs::read_to_string("/run/current-system/kernel-params").ok()
         };
-        Ok(Built { generation, path: StorePath(path), root: root.to_string_lossy().into_owned(), activation })
+        Ok(activation)
     }
 
     fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
@@ -1029,6 +1041,15 @@ impl GenerationBackend for Nixos {
 
     fn override_for(&self, g: GenerationId) -> Result<Option<Hash>, Outcome> {
         self.with_registry(|r| r.overrides.get(&g.0).copied())
+    }
+
+    fn override_content(&self, h: &Hash) -> Result<OverrideSet, Outcome> {
+        let p = self.store_dir().join(format!("{}.nix", h.to_hex()));
+        let text = std::fs::read_to_string(&p).map_err(|e| Outcome::Failed(format!("{}: {e}", p.display())))?;
+        if sha(&text) != *h {
+            return Err(Outcome::Failed(format!("{}: content does not match its hash", p.display())));
+        }
+        parse_overrides(&text).ok_or_else(|| Outcome::Failed(format!("{}: not a rendered override set", p.display())))
     }
 
     fn record_override(&self, g: GenerationId, hash: &Hash) -> Result<(), Outcome> {

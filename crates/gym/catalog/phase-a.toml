@@ -575,6 +575,31 @@ decision = "Allow(AskFirst)"
 terminal = "Reverted"
 
 [[fault]]
+id = "switch-facts-from-dry-activation"
+family = "bad-generation-activated"
+summary = "A prebuilt generation has the running one's manifest, but its NetworkManager unit has a new store path. Switching to it has the facts its dry activation shows: NetworkManager restarts, so it is ConnectivityLoss and asked first, as the same switch built as a candidate would be. Nobody approves, so nothing changes (§11 equivalent effects, R04)."
+spec = ["§11", "R04"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the VM's prebuilt generations come from its own specialisations,
+# none of which changes only a store path; the executor test covers Rollback.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "out_of_band_rebuild", edit = "build-only NetworkManager store path", activate = false }]
+inject = { transition = "SwitchGeneration", generation = "prebuilt", source = "user", actor = "user:1001" }
+window = "5m"
+
+[fault.required_post]
+generation = "base"
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "SwitchGeneration"
+decision = "Allow(AskFirst)"
+facts = { disruption = "ConnectivityLoss" }
+affected_includes = ["service:NetworkManager"]
+
+[[fault]]
 id = "gen-override-only-change"
 family = "bad-generation-activated"
 summary = "A font-scale change touches only overrides.nix. The evaluated output differs from base, Stale is never raised (no owner edit happened), and the change commits."
@@ -3173,7 +3198,7 @@ generation = "base"
 
 [[fault.required_post.txn]]
 transition = "ApplyChange"
-refused_with = 'Other("build")'
+refused_with = 'ActivationUnknown'
 
 [[fault]]
 id = "dry-activate-timeout"
@@ -3195,7 +3220,7 @@ generation = "base"
 
 [[fault.required_post.txn]]
 transition = "ApplyChange"
-refused_with = 'Other("build")'
+refused_with = 'ActivationUnknown'
 
 [[fault]]
 id = "dry-activate-truncated"
@@ -3217,7 +3242,7 @@ generation = "base"
 
 [[fault.required_post.txn]]
 transition = "ApplyChange"
-refused_with = 'Other("build")'
+refused_with = 'ActivationUnknown'
 
 # R03 (§11, rule 20): equivalent effects, equivalent facts.
 [[fault]]

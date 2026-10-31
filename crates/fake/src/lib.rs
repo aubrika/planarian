@@ -252,6 +252,42 @@ pub struct World {
 }
 
 impl World {
+    /// What switching from the current generation to `g` would do: the
+    /// dry activation the real backend runs, from the two evaluations.
+    pub fn dry_plan(&self, g: GenerationId) -> ActivationPlan {
+        let cur = &self.gens[&self.current];
+        let new = &self.gens[&g];
+        let mut plan = new.eval.activation.clone();
+        for u in new.eval.units.keys() {
+            match cur.eval.units.get(u) {
+                None => {
+                    plan.start.insert(u.clone());
+                }
+                Some(old) if old != &new.eval.units[u] || new.broken.contains(u) != cur.broken.contains(u) => {
+                    plan.restart.insert(u.clone());
+                }
+                _ => {}
+            }
+        }
+        for (k, v) in &new.eval.options {
+            if cur.eval.options.get(k) != Some(v) {
+                // An option change restarts the services of its module (`services.<name>.…`).
+                if let Some(svc) = k.strip_prefix("services.").and_then(|r| r.split('.').next()) {
+                    let id = UnitId::service(svc);
+                    if new.eval.units.contains_key(&id) {
+                        plan.restart.insert(id);
+                    }
+                }
+            }
+        }
+        for u in cur.eval.units.keys() {
+            if !new.eval.units.contains_key(u) {
+                plan.stop.insert(u.clone());
+            }
+        }
+        plan
+    }
+
     fn key(id: &UnitId) -> UnitId {
         let mut k = id.clone();
         if let Scope::User { uid, .. } = k.scope {
@@ -750,39 +786,25 @@ impl GenerationBackend for Fake {
                 g
             }
         };
-        let cur = w.gens[&w.current].clone();
         let new = w.gens[&g].clone();
-        let mut plan = new.eval.activation.clone();
-        for u in new.eval.units.keys() {
-            match cur.eval.units.get(u) {
-                None => {
-                    plan.start.insert(u.clone());
-                }
-                Some(old) if old != &new.eval.units[u] || new.broken.contains(u) != cur.broken.contains(u) => {
-                    plan.restart.insert(u.clone());
-                }
-                _ => {}
-            }
-        }
-        for (k, v) in &new.eval.options {
-            if cur.eval.options.get(k) != Some(v) {
-                // An option change restarts the services of its module (`services.<name>.…`).
-                if let Some(svc) = k.strip_prefix("services.").and_then(|r| r.split('.').next()) {
-                    let id = UnitId::service(svc);
-                    if new.eval.units.contains_key(&id) {
-                        plan.restart.insert(id);
-                    }
-                }
-            }
-        }
-        for u in cur.eval.units.keys() {
-            if !new.eval.units.contains_key(u) {
-                plan.stop.insert(u.clone());
-            }
-        }
+        let plan = w.dry_plan(g);
         let root = format!("/nix/var/nix/gcroots/planarian/builds/{}", eval.source.to_hex());
         w.gc_roots.insert(root.clone());
         Ok(Built { generation: g, path: new.path, root, activation: plan })
+    }
+
+    fn dry_activation(&self, path: &StorePath) -> Result<ActivationPlan, Outcome> {
+        let mut w = self.w();
+        if let Some(why) = w.dry_activate_fails.take() {
+            return Err(Outcome::Failed(why));
+        }
+        let g = w.gens.iter().find(|(_, x)| &x.path == path).map(|(g, _)| *g);
+        let g = g.ok_or_else(|| Outcome::Failed("unknown store path".into()))?;
+        Ok(w.dry_plan(g))
+    }
+
+    fn override_content(&self, h: &Hash) -> Result<OverrideSet, Outcome> {
+        self.w().override_store.get(h).cloned().ok_or_else(|| Outcome::Failed("no override content".into()))
     }
 
     fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
