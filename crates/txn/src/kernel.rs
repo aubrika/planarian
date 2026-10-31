@@ -655,7 +655,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
     /// The transaction took the boot-only path (§12 step 7): its journal
     /// path passed AwaitingBoot.
     pub fn boot_only(&self, id: TxnId) -> bool {
-        self.journal.ledger().live.get(&id).is_some_and(|l| l.path.iter().any(|p| p == "AwaitingBoot"))
+        self.journal.ledger().live.get(&id).is_some_and(|l| l.boot_only || l.path.iter().any(|p| p == "AwaitingBoot"))
     }
 
     /// §10 admission of a boot-only candidate that booted and passed its

@@ -170,6 +170,9 @@ pub struct Core<B: Backends + Clone, S: Store> {
     restart_reminded: BTreeMap<TxnId, Timestamp>,
     /// The attributed way to stop a unit has been taught once (§16, P23).
     residue_taught: bool,
+    /// Canonical units repaired while an admitted boot-only change waits
+    /// for its confirmation; any one means it is not confirmed (§10).
+    repaired_before_confirmation: BTreeSet<UnitId>,
     /// Incidents whose opening was already announced.
     diag_noted: BTreeSet<IncidentId>,
     /// External dependencies whose probes time out: since when, and
@@ -334,6 +337,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             interlock_noted: false,
             restart_reminded: BTreeMap::new(),
             residue_taught: false,
+            repaired_before_confirmation: BTreeSet::new(),
             diag_noted: BTreeSet::new(),
             unreachable: BTreeMap::new(),
             chain_checked: None,
@@ -611,6 +615,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
         result
+    }
+
+    fn is_canonical(&self, u: &UnitId, defs: &UnitDefs) -> bool {
+        defs.get(u).is_some_and(|d| {
+            d.probes.iter().any(|p| p.origin == ProbeOrigin::Canonical && p.role == ProbeRole::Readiness)
+        })
     }
 
     fn canonical_healthy(&self, s: &SystemState, defs: &UnitDefs) -> bool {
@@ -1082,8 +1092,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         } else {
             self.interlock_noted = false;
-            // Unit repairs may run while a generation awaits its boot (I6).
-            let busy = l.live.values().any(|t| !t.txn.state.is_pre_mutation() && t.txn.state != TxnState::AwaitingBoot);
+            // Unit repairs may run while a generation awaits its boot, and
+            // once it is admitted at boot (I6).
+            let busy = l.live.values().any(|t| {
+                !t.txn.state.is_pre_mutation()
+                    && t.txn.state != TxnState::AwaitingBoot
+                    && !(t.txn.state == TxnState::Promoted && t.boot_only)
+            });
             if !busy {
                 self.repair_one(&s, &defs, &l);
             }
@@ -1329,6 +1344,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     Source::Diagnoser { incident: inc.id },
                     c.reason.clone(),
                 );
+                // §10: a canonical unit that needs repair before an admitted
+                // boot-only change is confirmed counts against it.
+                let admitted = l.live.values().any(|t| t.txn.state == TxnState::Promoted && t.boot_only);
+                if admitted && self.is_canonical(&c.target, defs) {
+                    self.repaired_before_confirmation.insert(c.target.clone());
+                }
                 match self.submit(p, authorization_of(Actor::Daemon), s, defs) {
                     // §12f: waiting in Built for an activation window is not an
                     // attempt; the incident waits with it, and reopens if the
@@ -1413,14 +1434,23 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             .filter(|t| t.txn.state == TxnState::Promoted && t.path.iter().any(|p| p == "AwaitingBoot"))
             .map(|t| t.txn.id)
             .collect();
+        // Repairs run meanwhile, but a canonical unit that needed one is
+        // evidence against the change, even if it is up again now.
+        let repaired = std::mem::take(&mut self.repaired_before_confirmation);
         for id in admitted {
-            match self.ex.kernel.confirm_boot_only(id, healthy) {
+            match self.ex.kernel.confirm_boot_only(id, healthy && repaired.is_empty()) {
                 Ok(TxnState::Committed) => {}
                 Ok(TxnState::Reverted) => {
                     let back = self.b.generations().boot_default().map(|d| d.0).unwrap_or_default();
+                    let why = if repaired.is_empty() {
+                        "canonical probes were failing at the 10-minute checkpoint".to_string()
+                    } else {
+                        let units: Vec<String> = repaired.iter().map(|u| u.to_string()).collect();
+                        format!("{} needed a repair before the 10-minute checkpoint", units.join(", "))
+                    };
                     self.notice(format!(
-                        "transaction {}: not confirmed (canonical probes were failing at the 10-minute checkpoint); \
-                         generation {back} is the default again and a restart completes the withdrawal",
+                        "transaction {}: not confirmed ({why}); generation {back} is the default again \
+                         and a restart completes the withdrawal",
                         id.0
                     ))
                 }

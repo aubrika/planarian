@@ -1309,6 +1309,37 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             None => v.failures.push(format!("{label}: never asked for approval")),
         }
     }
+    // I6: it committed while an admitted boot-only change waited for its
+    // confirmation (Promoted after AwaitingBoot), so repairs did not wait.
+    if spec.get("while_admitted").and_then(T::as_bool) == Some(true) {
+        match e.entries.as_ref() {
+            None => v.unchecked.push(format!("{label}: while_admitted (journal history)")),
+            Some(en) => {
+                let mut awaited: BTreeSet<TxnId> = BTreeSet::new();
+                let mut admitted: BTreeSet<TxnId> = BTreeSet::new();
+                let mut inside = false;
+                for x in en {
+                    let Record::Advance { txn, to, .. } = &x.record else { continue };
+                    match to {
+                        TxnState::AwaitingBoot => {
+                            awaited.insert(*txn);
+                        }
+                        TxnState::Promoted if awaited.contains(txn) => {
+                            admitted.insert(*txn);
+                        }
+                        _ if admitted.contains(txn) => {
+                            admitted.remove(txn);
+                        }
+                        TxnState::Committed if *txn == t.id => inside = !admitted.is_empty(),
+                        _ => {}
+                    }
+                }
+                if !inside {
+                    v.failures.push(format!("{label}: did not commit while a boot-only change was admitted"));
+                }
+            }
+        }
+    }
     if let Some(want) = s("terminal_prefix")
         && !state_name(&t.state).starts_with(want)
     {
@@ -1530,6 +1561,7 @@ const TXN_KEYS: &[&str] = &[
     "reject_detail",
     "decision_not_below",
     "refused_with",
+    "while_admitted",
     "tier",
     "started_after",
     "boot_entries_unchanged",
