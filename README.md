@@ -9,10 +9,10 @@
 
 A self-healing layer for NixOS ([why Planarian?](docs/why.md)). It keeps three
 things separate: what your system is meant to be (from your configuration),
-what it observes, and whether what it observes is healthy. When they diverge it opens an incident and repairs
-it, deterministically, through one executor that runs every change as a
-journaled, revertible transaction. If Planarian itself is killed mid-change, a
-separate watchdog finishes or reverts the change.
+what it observes, and whether what it observes is healthy. When they diverge it
+opens an incident and repairs it, deterministically, through one executor that
+runs every change as a journaled, revertible transaction. If Planarian itself
+is killed mid-change, a separate watchdog finishes or reverts the change.
 
 - Specification: [`docs/SPEC.md`](docs/SPEC.md) (v4.4)
 - What differs from the spec, and why: [`docs/deviations.md`](docs/deviations.md)
