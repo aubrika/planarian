@@ -489,7 +489,7 @@ fn file_store_txn_dirs_are_exclusive() {
     assert_eq!(store.fence(TxnId(5)).unwrap(), Some(2), "takeover rewrites the lease");
     store.create_fence(TxnId(6), 1).unwrap();
     std::fs::write(tdir.join("README"), "not a txn").unwrap();
-    assert_eq!(store.forget_fences(&|t| t == TxnId(6)).unwrap(), vec![TxnId(5)]);
+    assert_eq!(store.forget_fences(|t| t == TxnId(6)).unwrap(), vec![TxnId(5)]);
     assert!(!tdir.join("5").exists());
     assert!(tdir.join("6/lease").exists() && tdir.join("README").exists());
 }

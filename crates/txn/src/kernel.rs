@@ -382,7 +382,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
                 let r = j.append(now, Record::Prepared(Box::new(txn))).map(|_| id);
                 if r.is_err() {
                     // No record names it; take the fence back.
-                    let _ = j.store().forget_fences(&|t| t != id);
+                    let _ = j.store().forget_fences(|t| t != id);
                 }
                 r
             })?

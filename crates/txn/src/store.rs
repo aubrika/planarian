@@ -37,7 +37,7 @@ pub trait Store {
     fn create_fence(&self, txn: TxnId, epoch: u64) -> io::Result<()>;
     /// Removes the fence of every transaction `keep` rejects; returns them.
     /// A transaction without a fence is never admitted, so this only narrows.
-    fn forget_fences(&self, keep: &dyn Fn(TxnId) -> bool) -> io::Result<Vec<TxnId>>;
+    fn forget_fences<F: Fn(TxnId) -> bool>(&self, keep: F) -> io::Result<Vec<TxnId>>;
 }
 
 // ---------- In-memory ----------
@@ -211,7 +211,7 @@ impl Store for MemStore {
         Ok(())
     }
 
-    fn forget_fences(&self, keep: &dyn Fn(TxnId) -> bool) -> io::Result<Vec<TxnId>> {
+    fn forget_fences<F: Fn(TxnId) -> bool>(&self, keep: F) -> io::Result<Vec<TxnId>> {
         let mut i = self.inner();
         let gone: Vec<TxnId> = i.fences.keys().copied().filter(|t| !keep(*t)).collect();
         for t in &gone {
@@ -352,7 +352,7 @@ impl Store for FileStore {
         self.replace_atomically(&d.join("lease"), format!("{epoch}\n").as_bytes())
     }
 
-    fn forget_fences(&self, keep: &dyn Fn(TxnId) -> bool) -> io::Result<Vec<TxnId>> {
+    fn forget_fences<F: Fn(TxnId) -> bool>(&self, keep: F) -> io::Result<Vec<TxnId>> {
         let entries = match std::fs::read_dir(&self.txn_dir) {
             Ok(e) => e,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
