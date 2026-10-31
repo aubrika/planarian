@@ -16,6 +16,7 @@ pkgs.stdenv.mkDerivation {
       ../../Cargo.lock
       ../../crates
       ../../share
+      ../../docs/verification-ratio.toml
       ../template/planarian/overrides.nix
     ];
   };
@@ -26,10 +27,16 @@ pkgs.stdenv.mkDerivation {
   buildPhase = ''
     runHook preBuild
     export HOME=$TMPDIR
-    cargo-verus verify -p planarian-policy -p planarian-txn --offline 2>&1 | tee verus.log
+    cargo-verus verify -p planarian-schema -p planarian-policy -p planarian-txn --offline 2>&1 | tee verus.log
     status=''${PIPESTATUS[0]}
     if [ "$status" -ne 0 ] || grep -q "verification results:: .* [1-9][0-9]* errors" verus.log; then
       echo "Verus failed (exit $status)"; exit 1
+    fi
+    # R14: the accounting's [verifier] counts are this run's ("N verified").
+    want=$(awk '/^\[verifier\]/{f=1;next} /^\[/{f=0} f && /=/{print $3}' docs/verification-ratio.toml | sort -n | paste -sd' ')
+    got=$(grep -o 'verification results:: [0-9]* verified' verus.log | awk '{print $3}' | sort -n | paste -sd' ')
+    if [ "$want" != "$got" ]; then
+      echo "Verus verified ($got) but docs/verification-ratio.toml [verifier] records ($want)"; exit 1
     fi
     runHook postBuild
   '';

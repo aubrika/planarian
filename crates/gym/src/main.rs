@@ -208,7 +208,7 @@ fn main() {
             }
         }
         "run" => {
-            let mut worst = Result_::Pass;
+            let mut unwaived_unsupported = vec![];
             let mut tally = std::collections::BTreeMap::new();
             let mut metrics = metrics::Metrics::default();
             for e in selected {
@@ -216,8 +216,11 @@ fn main() {
                 let r = run_entry(e);
                 metrics.add(e, r.result == Result_::Pass, r.result == Result_::Partial, r.sim.as_ref());
                 *tally.entry(format!("{:?}", r.result)).or_insert(0) += 1;
-                if r.result != Result_::NotFake {
-                    worst = worst.max(r.result);
+                // R15: an UNSUPPORTED the catalog does not waive for this
+                // harness (`waive_unsupported.fake`) fails a strict run.
+                if r.result == Result_::Unsupported && e.get("waive_unsupported").and_then(|w| w.get("fake")).is_none()
+                {
+                    unwaived_unsupported.push(id.to_string());
                 }
                 println!("{:<12} {id}", format!("{:?}", r.result).to_uppercase());
                 if verbose || r.result == Result_::Fail || r.result == Result_::Unsupported {
@@ -238,9 +241,13 @@ fn main() {
             println!("\n{metrics}");
             // A failure fails the run, and so does a key left unchecked (a
             // pass that proves less than it says). Entries this harness
-            // cannot run are listed, and fail it only with --strict.
+            // cannot run are listed, and fail it with --strict unless the
+            // catalog waives them for it (R12, R15).
             let failed = tally.contains_key("Fail") || tally.contains_key("Partial");
-            std::process::exit(if failed || (strict && worst == Result_::Unsupported) { 1 } else { 0 });
+            if strict && !unwaived_unsupported.is_empty() {
+                println!("unwaived UNSUPPORTED: {}", unwaived_unsupported.join(" "));
+            }
+            std::process::exit(if failed || (strict && !unwaived_unsupported.is_empty()) { 1 } else { 0 });
         }
         "serve" => {
             let socket = args.iter().position(|a| a == "--socket").and_then(|i| args.get(i + 1)).cloned();

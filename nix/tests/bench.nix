@@ -1,14 +1,18 @@
 # The invisibility budget (SPEC §21; catalog quiet-reference-workload; owner
 # decision Q7). Two parts, one report (report.json in the output):
 #
-#   idle   planariad and planarian-recovery after settling: CPU (% of one
-#          core), resident memory, and wakeups per second (context switches
-#          of all their threads), over five minutes. Targets: CPU < 0.5%,
-#          resident < 50 MB; wakeups reported.
+#   idle   every Planarian service's cgroup after settling (planariad,
+#          planarian-recovery, the transient planarian-op-* units; R13): CPU
+#          from systemd's cgroup accounting (CPUUsageNSec, % of one core),
+#          resident memory of every process in them, and wakeups per second
+#          (context switches of every thread in them), over five minutes.
+#          Targets: CPU < 0.5%, resident < 50 MB; wakeups and the cgroups'
+#          own memory (MemoryCurrent, page cache included) reported.
 #   game   Xonotic's timedemo under MangoHud, software-rendered (llvmpipe),
 #          five runs per condition, interleaved: Planarian stopped, idle, and
 #          busy (a watched service crashed and repaired every 30 s). Each
-#          run's p99 frame time is compared between conditions with a
+#          run's p99 frame time, from MangoHud's per-frame log only (a run
+#          without one has no p99; R13), is compared between conditions with a
 #          two-sided Mann-Whitney U test (alpha 0.01; with five runs a side,
 #          only a complete separation is significant).
 #
@@ -51,29 +55,46 @@ pkgs.testers.runNixOSTest {
     machine.succeed("mkdir -p /tmp/bench")
     report: dict = {}
 
-    def pids():
-        return [int(machine.succeed(f"systemctl show -p MainPID --value {u}").strip()) for u in ("planariad", "planarian-recovery")]
+    def units():
+        # Planarian's own services, not the agents it launches.
+        listed = machine.succeed(
+            "systemctl list-units --all --plain --no-legend 'planariad.service' 'planarian-recovery.service' "
+            "'planarian-op-*.service' | awk '{print $1}'").split()
+        return sorted(set(listed) | {"planariad.service", "planarian-recovery.service"})
 
-    def sample(pid):
-        stat = machine.succeed(f"cat /proc/{pid}/stat").split(")")[-1].split()
-        ticks = int(stat[11]) + int(stat[12])
-        rss = int(re.search(r"VmRSS:\s+(\d+)", machine.succeed(f"cat /proc/{pid}/status")).group(1))
-        sw = sum(int(x) for x in machine.succeed(
-            f"cat /proc/{pid}/task/*/status | sed -n 's/^\\(non\\)\\?voluntary_ctxt_switches:[[:space:]]*//p'").split())
-        return ticks, rss, sw
+    def sample():
+        # R13: cgroup accounting, so child processes and op units count.
+        out = {}
+        for u in units():
+            show = dict(l.split("=", 1) for l in machine.succeed(
+                f"systemctl show -p CPUUsageNSec -p MemoryCurrent -p ControlGroup {u}").splitlines() if "=" in l)
+            cg = show.get("ControlGroup", "")
+            procs = machine.succeed(f"cat /sys/fs/cgroup{cg}/cgroup.procs 2>/dev/null || true").split() if cg else []
+            rss = sum(int(x) for x in machine.succeed(
+                "for p in " + " ".join(procs) + "; do sed -n 's/^VmRSS:[[:space:]]*\\([0-9]*\\).*/\\1/p' /proc/$p/status 2>/dev/null; done"
+            ).split()) if procs else 0
+            sw = sum(int(x) for x in machine.succeed(
+                "for p in " + " ".join(procs) + "; do cat /proc/$p/task/*/status 2>/dev/null; done"
+                " | sed -n 's/^\\(non\\)\\?voluntary_ctxt_switches:[[:space:]]*//p'").split()) if procs else 0
+            num = lambda k: int(show[k]) if show.get(k, "").isdigit() else 0
+            out[u] = (num("CPUUsageNSec"), rss, sw, num("MemoryCurrent"))
+        return out
 
     with subtest("idle"):
         machine.sleep(120)
         window = 300
-        before = {p: sample(p) for p in pids()}
+        before = sample()
         machine.sleep(window)
-        after = {p: sample(p) for p in pids()}
-        hz = int(machine.succeed("getconf CLK_TCK").strip())
-        cpu = sum(after[p][0] - before[p][0] for p in before) / hz / window * 100
-        rss_mb = sum(after[p][1] for p in after) / 1024
-        wakeups = sum(after[p][2] - before[p][2] for p in before) / window
+        after = sample()
+        # A unit that came and went inside the window is counted by its
+        # later sample alone (an op unit is gone by the next one).
+        cpu = sum(after[u][0] - before.get(u, (0, 0, 0, 0))[0] for u in after) / 1e9 / window * 100
+        rss_mb = sum(v[1] for v in after.values()) / 1024
+        wakeups = sum(after[u][2] - before.get(u, (0, 0, 0, 0))[2] for u in after) / window
         report["idle"] = {"cpu_percent_of_one_core": round(cpu, 3), "resident_mb": round(rss_mb, 1),
-                          "wakeups_per_second": round(wakeups, 2), "window_s": window,
+                          "cgroup_memory_mb": round(sum(v[3] for v in after.values()) / 2**20, 1),
+                          "wakeups_per_second": round(wakeups, 2), "window_s": window, "units": sorted(after),
+                          "source": "cgroup accounting (CPUUsageNSec), every process in the units' cgroups",
                           "targets": {"cpu_percent_of_one_core": 0.5, "resident_mb": 50}}
         print(json.dumps(report["idle"]))
 
@@ -127,17 +148,13 @@ pkgs.testers.runNixOSTest {
                 except (ValueError, IndexError):
                     pass
         times.sort()
+        # R13: the p99 of the per-frame times, from MangoHud's log only. The
+        # engine's one-second minimum is not a p99, so a run without the log
+        # has none (and the comparison needs five a side).
         p99 = times[int(len(times) * 0.99) - 1] if len(times) >= 100 else None
-        source = "mangohud"
-        # MangoHud writes its CSV when logging stops; without one, DarkPlaces'
-        # own benchmark summary: "N frames S seconds F fps, one-second fps
-        # min/avg/max: a b c". The slowest one-second window stands in for
-        # the p99 frame time (1000 / min fps).
+        source = "mangohud per-frame log"
         engine = re.search(r"(\d+) frames ([\d.]+) seconds ([\d.]+) fps, one-second fps min/avg/max: ([\d.]+)", log)
-        if p99 is None and engine and float(engine.group(4)) > 0:
-            p99 = 1000.0 / float(engine.group(4))
-            source = "darkplaces one-second min"
-        result = {"frames": len(times) or (int(engine.group(1)) if engine else 0), "p99_ms": p99, "source": source,
+        result = {"frames": len(times), "p99_ms": p99, "source": source,
                   "engine": engine.group(0) if engine else None, "tail": log.splitlines()[-12:],
                   "mangohud_files": machine.succeed(f"ls -la {out}").splitlines()[1:]}
         print(f"{cond}-{i}:", json.dumps(result, indent=1))

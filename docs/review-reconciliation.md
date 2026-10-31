@@ -32,10 +32,10 @@ implementation it requires is listed as open or closed separately).
 | R09 | Unauthorized callers can reach expensive prebuild work | open | `user_submit` queues `prebuild_job` before `decide` runs | §12 admission before work |
 | R10 | Failed dry activation is accepted as usable risk evidence | open | `nixos.rs` parses `dry-activate` output without checking its exit or timeout | §9 step 3, rule 21 |
 | R11 | Override replacement is check-then-rename, not compare-and-swap | closed | `swap_override` compares and renames under an exclusive `flock` on `planarian/`; promote, restore and collect under `profile.lock`; `txn/<id>/` by exclusive `mkdir`, swept after the checkpoint; the override store pruned (C5) | I23 under `flock`; X-12 |
-| R12 | The VM catalog runner exits 0 after total build failure | open | `nix/gym/run-vm.sh` ends with an unconditional summary | §15 harness contract |
-| R13 | The benchmark cannot establish the full invisibility claim | open | `bench.nix` samples two MainPIDs; p99 is the engine's one-second minimum | §15, §21 |
-| R14 | The verification ratchet can inflate counts or lose coverage | partly | `b219d81`-era `verification.rs` requires an English entry per proved invariant (e49c37a); duplicates, removed baseline invariants and textual name checks remain | §17a accounting checks |
-| R15 | Unsupported regressions can remain green | partly | VM catalog jobs accept UNSUPPORTED only for two named entries (b219d81); the fake runner and `ci.yml` still accept it | §15 harness contract |
+| R12 | The VM catalog runner exits 0 after total build failure | closed | `run-vm.sh` exits 1 on ERROR, FAIL, PARTIAL and an UNSUPPORTED the catalog does not waive (`waive_unsupported.vm`, with its reason); `vm.yml` reads the same waivers | §15 harness contract |
+| R13 | The benchmark cannot establish the full invisibility claim | closed in code, run pending | idle from cgroup accounting over every Planarian service and op unit (CPUUsageNSec; RSS and wakeups of every process in them); p99 from MangoHud's per-frame log only, no fallback | §15, §21 |
+| R14 | The verification ratchet can inflate counts or lose coverage | closed | duplicate invariants and obligations rejected; a baseline invariant must still be accounted; a discharged name must be a `proof fn`, a function with `ensures` inside `verus!` or a `#[kani::proof]` harness; `[verifier]` counts tie the Verus obligations to the Verus run, which fails on a mismatch | §17a accounting checks |
+| R15 | Unsupported regressions can remain green | closed | `ci.yml` runs the fake catalog `--strict`: an UNSUPPORTED not waived for the fake harness fails it | §15 harness contract |
 | R16 | Gate and bypass documentation lag the implementation | partly | the register was reconciled through B-19/X-11 (cae89a9 … 805cd1c); `ga-status.md`, `guarantees.md`, `AGENTS.md` still lag | rule 19(c) sweep |
 
 ## Specification decisions (S)
@@ -88,7 +88,12 @@ branch protection; the rest are in PR #2.
 | S02 | `cd9a522`, `4e5cd1c` | `boot-only-admitted-not-confirmed`, `boot-only-repair-during-confirmation`, `boot-only-kernel-confirmed` |
 | R06 | `48c3907` | `probe-trickling-endpoint` (VM); backend tests `trickling_http_has_one_total_deadline`, `a_stalled_resolver_is_inside_the_deadline`, `a_wedged_probe_does_not_hold_the_batch` |
 | R05 | `7bfe155` | `posture-stops-launched-agents` (VM); backend test `no_agent_starts_while_a_failure_class_is_raised`; core test `agents_per_uid_are_limited` |
-| R04 | this PR | `switch-facts-from-dry-activation`; exec tests `rollback_facts_come_from_the_dry_activation`, `an_existing_generation_without_a_plan_is_refused`; `dry-activate-*` now refused with `ActivationUnknown` |
+| C6, C4 | `8079c64` | `candidate-nar-mismatch-refused`; backend tests `old_build_roots_age_out`, `nar_hash_from_both_json_shapes` |
+| P7, P8 | `905a06d`, `b077335` | core tests `a_write_back_queues_behind_a_generation_transaction`, `a_deferred_repair_is_deferred_in_fact` |
+| P13–P17, P22, K10 | `9abea74`, `999ac42` | vm-posture subtests P14–P17; core tests `mark_good_needs_root_at_a_terminal`, `report_boot_and_posture_answer`, `a_committed_change_missing_from_the_overrides_is_lost`; `a_weaker_posture_waits_for_the_boot`, `a_lost_change_is_reapplied`, `reapply_does_what_the_original_did` (P18 already shipped) |
+| C2, P9, P10, D4 | `ed1c15d` | core test `an_owner_edit_while_waiting_is_stale_when_the_window_opens`; `every_reader_is_bounded_by_bytes_max`; C22 and R09's bound verified unchanged |
+| R12, R14, R15, R13 | this PR | `the_accounting_checks_bite`; run-vm.sh's verdict logic exercised on a sample; the Verus check's count comparison |
+| R04 | `5d9d986` | `switch-facts-from-dry-activation`; exec tests `rollback_facts_come_from_the_dry_activation`, `an_existing_generation_without_a_plan_is_refused`; `dry-activate-*` now refused with `ActivationUnknown` |
 | R11, C5 | `867ffc1` | `en-i23-third-party-override-kept` (now also VM); backend tests `the_override_swap_waits_for_the_directory_lock`, `the_override_store_is_pruned`; txn tests `txn_fences_are_exclusive_and_swept_after_checkpoint`, `file_store_txn_dirs_are_exclusive` |
 
 `4e5cd1c` also carries an owner decision (31 Oct) amending I6, §10 and §12
@@ -99,7 +104,7 @@ window means the change is not confirmed.
 These cases run on the fake harness only unless marked; the VM catalog run
 of rule 19(f) is still to come.
 
-Still open from the tables above: R12, R13, R14 (the
-rest), R15 (the fake runner and `ci.yml`), R16 (`ga-status.md` waits for
-19(f)); S04 is docs only. Still open from §28 beyond R and S: C4, C6, P7, P8,
-P13–P18, P22, K10.
+Still open from the tables above: R13's run (the code is in; the benchmark
+runs with the 19(f) VM run), R16 (`ga-status.md` waits for 19(f)); S04 is
+docs only. Beyond R and S, §28's items are closed (below). Still required in
+Phase A by §17a: the residue classifier's Kani harnesses and the I17 proof.

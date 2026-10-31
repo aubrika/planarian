@@ -6,6 +6,13 @@
 #   listed under `tested` and not counted.
 # `assumes`: the docs/assumptions.md ids (V, P, G, U) the invariant rests on.
 #
+# `[verifier]`: what each crate's Verus run reports ("N verified, 0
+#   errors"). The Verus flake check (nix/tests/verus.nix) fails when its log
+#   disagrees, and the accounting cannot credit a crate with more distinct
+#   Verus obligations than that (R14). A discharged name must be a `proof
+#   fn`, a function with `ensures` inside `verus!`, or a `#[kani::proof]`
+#   harness; a function that is only present discharges nothing.
+#
 # `planarian-gym verification` checks that every name exists in the source
 # and every id in assumptions.md, prints the report, and fails if a ratio
 # fell or the trust count grew against [baseline] (the ratchet: every gate).
@@ -59,6 +66,11 @@ I8 = [1, 1]
 I9 = [0, 1]
 I24 = [0, 3]
 I25 = [0, 2]
+
+[verifier]
+schema = 17
+policy = 52
+txn = 52
 
 [[invariant]]
 id = "I1"

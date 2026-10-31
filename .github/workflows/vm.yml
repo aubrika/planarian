@@ -148,9 +148,14 @@ jobs:
       - name: Verdict
         run: |
           cat verdict/verdict.json
-          # UNSUPPORTED only where the test VM cannot run the entry by design
-          # (docs/ga-status.md); anywhere else it is a harness regression.
-          jq -e --arg id '${{ matrix.id }}' '.result == "PASS" or (.result == "UNSUPPORTED" and ($id == "storage-nix-full-gc" or $id == "desktop-boot-fails-rollback"))' verdict/verdict.json
+          # R12: UNSUPPORTED only where the catalog waives it for the VM
+          # (`waive_unsupported.vm`, with the reason); anything else fails.
+          python3 - verdict/verdict.json <<'PY'
+          import json, sys, tomllib
+          v = json.load(open(sys.argv[1]))
+          waived = {e["id"] for e in tomllib.load(open("crates/gym/catalog/phase-a.toml", "rb"))["fault"] if "vm" in e.get("waive_unsupported", {})}
+          sys.exit(0 if v["result"] == "PASS" or (v["result"] == "UNSUPPORTED" and v["id"] in waived) else 1)
+          PY
           jq -r '"\(.id): \(.result)"' verdict/verdict.json >> "$GITHUB_STEP_SUMMARY"
       # Best effort: the verdict is in the log above too, and a private
       # repository's artifact storage is small (the evidence is not uploaded).
