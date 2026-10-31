@@ -2494,6 +2494,33 @@ transition = "ApplyChange"
 path = ["Built", "Activating", "Committed"]
 terminal = "Committed"
 
+# S03 (§12f, I12): parking in Built is bounded at 24 h.
+[[fault]]
+id = "built-parking-expires"
+family = "activation-scheduling"
+summary = "alice changes her font scale while a game holds Foreground in her session, and the game never lets go. After a day in Built the change is Cancelled by the daemon, with one notice naming it and how to issue it again; it never activates, even once the game ends."
+spec = ["§12f", "I12", "S03"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "foreground", session = "s1", on = true },
+]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" }
+after = [{ raw = "wait", for = "25h" }, { raw = "foreground", session = "s1", on = false }, { raw = "wait", for = "5m" }]
+window = "26h"
+
+[fault.required_post]
+reports = ["WaitsForWindow"]
+notices_count = { match = "waited a day in Built", count = 1 }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Built", "Cancelled"]
+terminal = "Cancelled"
+
 # C21 (§12): re-prepared transactions keep their original caller and source.
 [[fault]]
 id = "reprepared-keeps-caller"

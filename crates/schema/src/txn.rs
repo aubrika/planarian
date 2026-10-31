@@ -256,6 +256,10 @@ pub struct ApprovalToken {
 
 pub const TOKEN_LIFETIME: Millis = Millis(24 * 3600 * 1000);
 
+/// How long a transaction may wait in `Built` for an activation window
+/// (§12f, I12); `AwaitingBoot` has no limit.
+pub const PARKING_LIMIT: Millis = Millis(24 * 3600 * 1000);
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub applied: Vec<TxnId>,

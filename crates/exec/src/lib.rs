@@ -115,8 +115,9 @@ pub struct Executor<B: Backends + Clone, S: Store> {
     /// Set when the last commit raised the security floor (§12e): the
     /// generation and the packages it fixed, for the daemon to report.
     pub floor_raised: Option<(GenerationId, Vec<String>)>,
-    /// Generation transactions waiting in `Built` for an activation window (§12f).
-    waiting: BTreeMap<TxnId, Plan>,
+    /// Generation transactions waiting in `Built` for an activation window
+    /// (§12f), with when each began waiting (`CLOCK_BOOTTIME`).
+    waiting: BTreeMap<TxnId, (Timestamp, Plan)>,
 }
 
 /// What stage, evaluate and build produced for a catalog change.
@@ -663,7 +664,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             let why = if foreground { "waiting: foreground work holds" } else { "waiting: a session is in use" };
             return match self.kernel.wait_built(id, why) {
                 Ok(end) => {
-                    self.waiting.insert(id, plan);
+                    self.waiting.insert(id, (self.b.clock().boot_now(), plan));
                     Submitted::Finished { txn: id, state: end, followup: None }
                 }
                 Err(e) => Self::kernel_error(e),
@@ -699,14 +700,14 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         let ready: Vec<TxnId> = self
             .waiting
             .iter()
-            .filter(|(_, p)| {
+            .filter(|(_, (_, p))| {
                 !p.built.as_ref().is_some_and(|b| self.disturbs_a_session(&b.activation)) || self.sessions_idle()
             })
             .map(|(id, _)| *id)
             .collect();
         let mut out = vec![];
         for id in ready {
-            if let Some(plan) = self.waiting.remove(&id) {
+            if let Some((_, plan)) = self.waiting.remove(&id) {
                 out.push((id, self.run(id, &plan)));
             }
         }
@@ -862,6 +863,24 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             self.expire_one(*t);
         }
         old
+    }
+
+    /// §12f, I12: parking in `Built` is bounded. A transaction that has
+    /// waited longer than the parking limit is `Cancelled(Daemon)`; returns
+    /// each one with the change it would have made, for the notice.
+    pub fn expire_waiting(&mut self) -> Vec<(TxnId, Transition)> {
+        let now = self.b.clock().boot_now();
+        let old: Vec<TxnId> =
+            self.waiting.iter().filter(|(_, (since, _))| now > since.plus(PARKING_LIMIT)).map(|(id, _)| *id).collect();
+        let mut out = vec![];
+        for id in old {
+            if let Some((_, plan)) = self.waiting.remove(&id)
+                && self.kernel.cancel(id, Actor::Daemon).is_ok()
+            {
+                out.push((id, plan.transition));
+            }
+        }
+        out
     }
 
     /// A user withdraws a parked proposal (§12 step 5).

@@ -1083,6 +1083,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         for t in self.ex.expire() {
             self.notice(format!("approval for transaction {} expired", t.0));
         }
+        for (t, change) in self.ex.expire_waiting() {
+            self.notice(format!(
+                "transaction {} cancelled: it waited a day in Built without an activation window ({}); issue it again to retry",
+                t.0,
+                render::transition(&change)
+            ));
+        }
         if self.ex.kernel.journal.needs_compaction()
             && let Err(e) = self.ex.kernel.journal.compact()
         {
