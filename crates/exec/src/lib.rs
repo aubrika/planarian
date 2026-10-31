@@ -886,6 +886,11 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         old
     }
 
+    /// The transaction waits in `Built` for an activation window (§12f).
+    pub fn is_waiting(&self, txn: TxnId) -> bool {
+        self.waiting.contains_key(&txn)
+    }
+
     /// §12f, I12: parking in `Built` is bounded. A transaction that has
     /// waited longer than the parking limit is `Cancelled(Daemon)`; returns
     /// each one with the change it would have made, for the notice.

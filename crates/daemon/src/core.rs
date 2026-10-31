@@ -1073,6 +1073,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             // §12f: an activation window opened for a waiting generation.
             if !busy {
                 for (id, r) in self.ex.activate_waiting(&s) {
+                    // A repair that waited is an attempt once it runs.
+                    let linked: Vec<IncidentId> =
+                        self.incident_parked.iter().filter(|(_, t)| **t == id).map(|(i, _)| *i).collect();
+                    for inc in linked {
+                        self.incident_parked.remove(&inc);
+                        if let Submitted::Finished { state, .. } = &r
+                            && let Some(i) = self.incidents.record_attempt(inc, id, outcome_of(state), now)
+                        {
+                            self.journal(Record::Incident(i));
+                        }
+                    }
                     self.notice(format!(
                         "transaction {}: activated now that nothing is in the way: {}",
                         id.0,
@@ -1092,6 +1103,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
         self.remind_restart(&l);
         for (t, change) in self.ex.expire_waiting() {
+            // §12f: the incident, if any, reopens.
+            self.incident_parked.retain(|_, w| *w != t);
             self.notice(format!(
                 "transaction {} cancelled: it waited a day in Built without an activation window ({}); issue it again to retry",
                 t.0,
@@ -1201,9 +1214,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
     fn repair_one(&mut self, s: &SystemState, defs: &UnitDefs, l: &Ledger) {
         let now = s.observed_at;
-        // Drop parked links whose approval was decided.
+        // Drop parked links whose approval was decided or whose wait in
+        // Built ended.
         let parked = self.ex.parked.clone();
-        self.incident_parked.retain(|_, t| parked.contains_key(t));
+        let ex = &self.ex;
+        self.incident_parked.retain(|_, t| parked.contains_key(t) || ex.is_waiting(*t));
         let Some(inc) =
             self.incidents.actionable(now).into_iter().find(|i| !self.incident_parked.contains_key(&i.id)).cloned()
         else {
@@ -1298,6 +1313,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     c.reason.clone(),
                 );
                 match self.submit(p, authorization_of(Actor::Daemon), s, defs) {
+                    // §12f: waiting in Built for an activation window is not an
+                    // attempt; the incident waits with it, and reopens if the
+                    // wait expires.
+                    Submitted::Finished { txn, state: TxnState::Built, .. } => {
+                        self.incident_parked.insert(inc.id, txn);
+                    }
                     Submitted::Finished { txn, state, .. } => {
                         if let Some(i) = self.incidents.record_attempt(inc.id, txn, outcome_of(&state), now) {
                             if matches!(i.state, IncidentState::Cooldown { .. }) {
