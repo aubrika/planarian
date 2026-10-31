@@ -844,9 +844,11 @@ fn external_desired_state_joins_with_provenance() {
 }
 
 /// §12f, I12 (S03): a repair that has to wait in Built for an activation
-/// window is not an attempt: the incident waits with it, and when the wait
-/// expires the change is Cancelled(Daemon) and the incident reopens with its
-/// budget intact.
+/// window (its activation would restart a busy session's audio) is not an
+/// attempt: the incident waits with it, and when the wait expires the change
+/// is Cancelled(Daemon) and the incident reopens with its budget intact.
+/// (Under Foreground the same repair would be deferred before it is
+/// proposed, P8.)
 #[test]
 fn an_expired_wait_reopens_its_incident() {
     let mut cfg = config();
@@ -864,7 +866,11 @@ fn an_expired_wait_reopens_its_incident() {
         idle: false,
         created: now,
     });
-    r.fake.w().foreground.insert("s1".into());
+    r.fake.w().activation_restarts.insert(UnitId {
+        kind: UnitKind::Service,
+        name: "pipewire".into(),
+        scope: Scope::User { uid: 1000, session: None },
+    });
     r.fake.w().units.get_mut(&UnitId::service("gym-web")).unwrap().observed = Observed::Absent;
     r.ticks(20);
     let waiting = |r: &mut Rig| {

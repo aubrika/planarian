@@ -222,6 +222,9 @@ pub struct World {
     /// Fault injection (C6): the next candidate's store contents no longer
     /// hash to the NAR hash recorded when it was built.
     pub nar_mismatch: bool,
+    /// Every candidate's activation also restarts these (a user's audio,
+    /// say), so it disturbs an active session (§12f).
+    pub activation_restarts: BTreeSet<UnitId>,
     pub next_instance: u64,
     pub third_party_override: Option<Hash>,
     /// Units planted outside the generation (the boot report finds them).
@@ -261,6 +264,9 @@ impl World {
         let cur = &self.gens[&self.current];
         let new = &self.gens[&g];
         let mut plan = new.eval.activation.clone();
+        if g != self.current {
+            plan.restart.extend(self.activation_restarts.iter().cloned());
+        }
         for u in new.eval.units.keys() {
             match cur.eval.units.get(u) {
                 None => {
