@@ -34,7 +34,10 @@ pkgs.stdenv.mkDerivation {
     fi
     # R14: the accounting's [verifier] counts are this run's ("N verified").
     want=$(awk '/^\[verifier\]/{f=1;next} /^\[/{f=0} f && /=/{print $3}' docs/verification-ratio.toml | sort -n | paste -sd' ')
-    got=$(grep -o 'verification results:: [0-9]* verified' verus.log | awk '{print $3}' | sort -n | paste -sd' ')
+    # Only Planarian's crates: in the sandbox vstd is verified too, and
+    # cargo names the crate ("Checking <crate> v…") before its results.
+    got=$(awk '/(Checking|Compiling|Fresh) [A-Za-z0-9_-]+ v/ {for (i = 1; i < NF; i++) if ($i ~ /^(Checking|Compiling|Fresh)$/) c = $(i + 1)}
+               /verification results:: [0-9]+ verified/ && c ~ /^planarian-/ {for (i = 1; i <= NF; i++) if ($i == "verified,") print $(i - 1)}' verus.log | sort -n | paste -sd' ')
     if [ "$want" != "$got" ]; then
       echo "Verus verified ($got) but docs/verification-ratio.toml [verifier] records ($want)"; exit 1
     fi
