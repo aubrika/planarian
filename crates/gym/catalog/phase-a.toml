@@ -1393,6 +1393,33 @@ window = "1m"
 [fault.required_post]
 overrides = [{ unit = "service@1000:pipewire", until = "Explicit", by = "user:1000" }]
 
+# C3 (§12 step 5): preconditions are the executor's.
+[[fault]]
+id = "override-over-attested-refused"
+family = "intentional-service-stop"
+summary = "alice stops her own pipewire with an override. An administrator then sets a different override on the same unit: Rejected(Precondition), naming alice as the holder; her override stands."
+spec = ["§12 step 5", "§11", "C3"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "greeter_login", uid = 1000 },
+  { transition = "SetOverride", unit = "service@1000:pipewire", desired = "Stopped", until = "Explicit", reason = "mine", source = "user", actor = "user:1000" },
+  { raw = "wait", for = "30s" },
+]
+inject = { transition = "SetOverride", unit = "service@1000:pipewire", desired = "LeaveAlone", until = "Explicit", reason = "admin's", source = "user", actor = "user:1001" }
+window = "1m"
+
+[fault.required_post]
+overrides = [{ unit = "service@1000:pipewire", until = "Explicit", by = "user:1000" }]
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+caller = "user:1001"
+refused_with = "Precondition"
+reject_detail = "set by uid 1000"
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Family: suspend-resume
 # ═══════════════════════════════════════════════════════════════════════════

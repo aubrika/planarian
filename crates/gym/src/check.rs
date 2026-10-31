@@ -1199,13 +1199,24 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             s("transition").is_none_or(|t| transition_name(&r.proposal.transition) == t)
                 && s("target").is_none_or(|u| target_of(&r.proposal.transition) == Some(unit(u)))
                 && s("caller").is_none_or(|c| caller_is(r, c))
+                && s("reject_detail")
+                    .is_none_or(|d| matches!(&r.result, Submitted::Rejected { detail, .. } if detail.contains(d)))
                 && (matches!(&r.result, Submitted::Rejected { reason, .. } if format!("{reason:?}") == why)
                     || matches!(&r.decision, Some(Decision::Reject(reason)) if format!("{reason:?}") == why))
         });
         if !refused {
             v.failures.push(format!("{label}: not refused with {why}"));
         }
-        for t in &matching {
+        // With a caller given, only that caller's transactions must not run.
+        let by_caller = |id: TxnId| {
+            s("caller").is_none_or(|c| {
+                e.log.iter().any(|r| {
+                    matches!(&r.result, Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if *txn == id)
+                        && caller_is(r, c)
+                })
+            })
+        };
+        for t in matching.iter().filter(|t| by_caller(t.id)) {
             if t.path.iter().any(|p| p == "Activating") {
                 v.failures.push(format!("{label}: txn {} ran", t.id.0));
             }

@@ -601,3 +601,28 @@ fn interlock_holds_off_non_administrators() {
     let s = r.propose(Transition::RestartUnit(pw), admin());
     assert!(!matches!(&s, Submitted::Rejected { detail, .. } if detail.contains("interlock")), "{s:?}");
 }
+
+/// C3 (§12 step 5): an attested override is replaced only by its holder;
+/// anyone else is refused with the holder named. An inferred one may be.
+#[test]
+fn an_attested_override_is_replaced_only_by_its_holder() {
+    let unit =
+        UnitId { kind: UnitKind::Service, name: "pipewire".into(), scope: Scope::User { uid: 1000, session: None } };
+    let held = |attribution| Override {
+        unit: unit.clone(),
+        until: Until::Explicit,
+        reason: "mine".into(),
+        by: Actor::user(1000),
+        desired: OverrideDesired::Stopped,
+        attribution,
+        acknowledged: false,
+    };
+    let (mut s, defs) = Rig::new().observe();
+    s.overrides.push(held(Attribution::Attested));
+    let set = Transition::SetOverride(Override { desired: OverrideDesired::LeaveAlone, ..held(Attribution::Attested) });
+    assert!(unmet(&set, &s, &defs, &Actor::user(1000)).is_none(), "the holder may replace their own");
+    let why = unmet(&set, &s, &defs, &Actor::user(1001)).expect("another principal is refused");
+    assert!(why.contains("set by uid 1000"), "{why}");
+    *s.overrides.last_mut().unwrap() = held(Attribution::Inferred);
+    assert!(unmet(&set, &s, &defs, &Actor::user(1001)).is_none(), "an inferred override may be replaced");
+}

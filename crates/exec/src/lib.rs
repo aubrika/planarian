@@ -22,7 +22,7 @@ use derive::{DeriveInput, derive, manifest_of};
 use host::ExecHost;
 use planarian_changes::CatalogConfig;
 use planarian_policy::{Input, Settings, Tables, decide, may_approve, policy_version};
-use planarian_schema::spec::{predict, refines};
+use planarian_schema::spec::{precondition, predict, refines};
 use planarian_schema::*;
 use planarian_state::Canonical;
 use planarian_txn::journal::{Journal, JournalError};
@@ -191,6 +191,21 @@ fn build_candidate<G: GenerationBackend>(
 /// boot clock (§12h; §12 step 4:
 /// 24 hours). Saturating: a token issued near the end of time never expires
 /// early, and no clock value makes this panic.
+/// Why `t`'s precondition does not hold for `by` (§12 step 5), if it does
+/// not. An attested override is replaced only by its holder; anyone else
+/// gets its holder named (C3).
+pub fn unmet(t: &Transition, s: &SystemState, defs: &UnitDefs, by: &Actor) -> Option<String> {
+    if let Transition::SetOverride(sup) = t {
+        let o = s.override_of(&sup.unit)?;
+        if o.attribution == Attribution::Attested && o.by.principal() != by.principal() {
+            let holder = o.by.uid().map(|u| format!("uid {u}")).unwrap_or_else(|| format!("{:?}", o.by));
+            return Some(format!("{} holds an override set by {holder}; they lift it (planarian release)", sup.unit));
+        }
+        return None;
+    }
+    (!precondition(t, s, defs)).then(|| format!("the precondition of {t:?} does not hold"))
+}
+
 pub fn token_expired(now: Timestamp, issued: Timestamp) -> bool {
     now > issued.plus(TOKEN_LIFETIME)
 }
@@ -618,6 +633,12 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         if let Decision::Reject(r) = &plan.decision {
             self.release(&plan);
             return reject(r.clone(), "refused by policy");
+        }
+        // §12 step 5 (C3): preconditions are the executor's, whatever the
+        // source; checked once the caller is known to be authorized.
+        if let Some(why) = unmet(&p.transition, state, defs, &authz.actor) {
+            self.release(&plan);
+            return reject(RejectReason::Precondition, why);
         }
         if self.stale(&plan) {
             self.release(&plan);

@@ -153,6 +153,8 @@ pub enum RejectReason {
     NoSpace,
     Refinement,
     ApprovalExpired,
+    /// The transition's precondition does not hold (§12 step 5, C3).
+    Precondition,
     Other(String),
 }
 
