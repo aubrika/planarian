@@ -320,6 +320,12 @@ in
       description = "The flake output that is this machine.";
     };
 
+    agents.limits = {
+      tasksMax = mkOption { type = types.ints.positive; default = 512; description = "TasksMax= for each agent `planarian agent run` launches (§12d)."; };
+      memoryMax = mkOption { type = types.str; default = "4G"; description = "MemoryMax= for each launched agent (§12d)."; };
+      perUid = mkOption { type = types.ints.positive; default = 4; description = "Agents one user may have running at once (§12d); a launch over it is refused."; };
+    };
+
     sessionCompositors = mkOption {
       type = types.listOf types.str;
       default = [ ];
@@ -610,6 +616,7 @@ in
       startupGraceSecs = cfg.startupGrace;
       sessionCompositors = cfg.sessionCompositors;
       inherit (cfg) posture externalSource;
+      agentLimits = { inherit (cfg.agents.limits) tasksMax memoryMax perUid; };
       healthReportSecs = cfg.healthReport.interval;
     };
 

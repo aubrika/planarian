@@ -618,7 +618,12 @@ impl UnitBackend for Fake {
         Ok(self.w().units.keys().cloned().collect())
     }
 
-    fn start_agent(&self, name: &str, _argv: &[String]) -> Result<InstanceId, Outcome> {
+    fn start_agent(
+        &self,
+        name: &str,
+        _argv: &[String],
+        _limits: &planarian_schema::backend::AgentLimits,
+    ) -> Result<InstanceId, Outcome> {
         let mut w = self.w();
         let now = w.now;
         let id = UnitId::service(&format!("planarian-agent-{name}"));

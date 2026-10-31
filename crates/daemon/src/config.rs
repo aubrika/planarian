@@ -60,6 +60,9 @@ pub struct FileConfig {
     /// build (§15, B-13). Anywhere else, a test build is an Integrity failure.
     #[serde(default)]
     pub allow_test_build: bool,
+    /// Limits on launched agents (`services.planarian.agents.limits`, §12d).
+    #[serde(default)]
+    pub agent_limits: planarian_schema::backend::AgentLimits,
 }
 
 fn default_health_secs() -> u64 {
@@ -91,6 +94,7 @@ impl Default for FileConfig {
             external_source: None,
             health_report_secs: default_health_secs(),
             allow_test_build: false,
+            agent_limits: Default::default(),
         }
     }
 }

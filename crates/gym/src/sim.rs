@@ -127,6 +127,7 @@ pub fn config() -> CoreConfig {
         fresh_boot: true,
         startup_grace: planarian_daemon::STARTUP_GRACE,
         posture: planarian_schema::Posture::Standard,
+        agent_limits: Default::default(),
     }
 }
 

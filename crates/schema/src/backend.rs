@@ -102,7 +102,7 @@ pub trait UnitBackend {
     /// Start an agent (§11, §16): the transient unit `planarian-agent-<name>`,
     /// under a dynamic uid of its own. Returns the started unit's instance
     /// (its InvocationID), read back once it has started (I24).
-    fn start_agent(&self, _name: &str, _argv: &[String]) -> Result<InstanceId, Outcome> {
+    fn start_agent(&self, _name: &str, _argv: &[String], _limits: &AgentLimits) -> Result<InstanceId, Outcome> {
         Err(Outcome::Failed("this backend cannot start agents".into()))
     }
     /// Whether an agent's unit under this name is loaded and running (I24:
@@ -345,4 +345,25 @@ impl InstanceId {
 /// The unit an agent runs in (§11, §16).
 pub fn agent_unit(name: &str) -> String {
     format!("planarian-agent-{name}")
+}
+
+/// The slice every launched agent runs in (§12d, R05): the posture stops it
+/// as a whole.
+pub const AGENTS_SLICE: &str = "planarian-agents.slice";
+
+/// Limits on launched agents (`services.planarian.agents.limits`, §12d).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLimits {
+    /// Per launch: systemd `TasksMax=` and `MemoryMax=`.
+    pub tasks_max: u32,
+    pub memory_max: String,
+    /// Agents one uid may have running at once.
+    pub per_uid: u32,
+}
+
+impl Default for AgentLimits {
+    fn default() -> AgentLimits {
+        AgentLimits { tasks_max: 512, memory_max: "4G".into(), per_uid: 4 }
+    }
 }

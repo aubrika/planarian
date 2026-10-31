@@ -196,12 +196,17 @@ fn peer_of(s: &UnixStream, admin_group: &str) -> Option<Peer> {
     Some(Peer { uid, admin: is_admin(uid, admin_group), session, agent: None, instance: None, tty: p.tty })
 }
 
-/// The agent whose unit (`/system.slice/planarian-agent-<name>.service`,
-/// or below it) holds this cgroup, if any.
+/// The cgroup path, under the root, of the agents' slice (§12d, R05):
+/// `planarian-agents.slice` is a child of `planarian.slice`. Only systemd,
+/// as root, creates units there.
+const AGENTS_CGROUP: [&str; 2] = ["planarian.slice", "planarian-agents.slice"];
+
+/// The agent whose unit (`/planarian.slice/planarian-agents.slice/
+/// planarian-agent-<name>.service`, or below it) holds this cgroup, if any.
 fn agent_of_cgroup(cgroup: &str) -> Option<String> {
     let line = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
     let mut parts = line.split('/').filter(|c| !c.is_empty());
-    if parts.next()? != "system.slice" {
+    if parts.next()? != AGENTS_CGROUP[0] || parts.next()? != AGENTS_CGROUP[1] {
         return None;
     }
     let name = parts.next()?.strip_prefix("planarian-agent-")?.strip_suffix(".service")?;
@@ -213,9 +218,11 @@ fn agent_of_cgroup(cgroup: &str) -> Option<String> {
 /// which only root can set, so a process in the unit cannot change it.
 fn instance_of_cgroup(cgroup: &str) -> Option<planarian_schema::InstanceId> {
     let line = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
-    let mut parts = line.split('/').filter(|c| !c.is_empty());
-    let (slice, unit) = (parts.next()?, parts.next()?);
-    let dir = format!("/sys/fs/cgroup/{slice}/{unit}");
+    let unit: Vec<&str> = line.split('/').filter(|c| !c.is_empty()).take(3).collect();
+    if unit.len() != 3 || unit[..2] != AGENTS_CGROUP {
+        return None;
+    }
+    let dir = format!("/sys/fs/cgroup/{}", unit.join("/"));
     let mut buf = [0u8; 64];
     let n = rustix::fs::getxattr(dir.as_str(), "trusted.invocation_id", &mut buf).ok()?;
     planarian_schema::InstanceId::parse(&buf[..n])
@@ -384,6 +391,7 @@ fn main() {
         fresh_boot: fresh_boot(&paths.state, &boot),
         startup_grace: planarian_schema::Millis::secs(file.startup_grace_secs),
         posture: file.posture,
+        agent_limits: file.agent_limits.clone(),
     };
     let mut core = Core::start(journal, real, me.clone(), core_cfg);
     // The user an agent acts for is an administrator as that user is now (§11).
@@ -680,13 +688,21 @@ mod tests {
 
     #[test]
     fn agent_from_cgroup() {
-        assert_eq!(agent_of_cgroup("0::/system.slice/planarian-agent-coder.service\n"), Some("coder".into()));
-        assert_eq!(agent_of_cgroup("0::/system.slice/planarian-agent-coder.service/sub\n"), Some("coder".into()));
+        assert_eq!(
+            agent_of_cgroup("0::/planarian.slice/planarian-agents.slice/planarian-agent-coder.service\n"),
+            Some("coder".into())
+        );
+        assert_eq!(
+            agent_of_cgroup("0::/planarian.slice/planarian-agents.slice/planarian-agent-coder.service/sub\n"),
+            Some("coder".into())
+        );
         assert_eq!(agent_of_cgroup("0::/system.slice/cron.service\n"), None);
         // Only systemd's own unit counts: a user's delegated cgroup named like
         // an agent unit is not one, and neither is a bad name.
         assert_eq!(agent_of_cgroup("0::/user.slice/user-1000.slice/planarian-agent-coder.service\n"), None);
-        assert_eq!(agent_of_cgroup("0::/system.slice/planarian-agent-Coder.service\n"), None);
+        assert_eq!(agent_of_cgroup("0::/planarian.slice/planarian-agents.slice/planarian-agent-Coder.service\n"), None);
+        // Outside the agents' slice, a unit named like an agent is not one.
+        assert_eq!(agent_of_cgroup("0::/system.slice/planarian-agent-coder.service\n"), None);
     }
 
     #[test]

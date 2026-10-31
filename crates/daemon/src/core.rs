@@ -50,6 +50,8 @@ pub struct CoreConfig {
     pub startup_grace: Millis,
     /// The failure posture the generation declares (§12d); Phase A ships Standard.
     pub posture: Posture,
+    /// Limits on launched agents (§12d, R05).
+    pub agent_limits: planarian_schema::backend::AgentLimits,
 }
 
 /// How long a generation's new declarations are named in incident reports (§15).
@@ -1882,7 +1884,26 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         },
                     };
                 }
-                match self.b.units().start_agent(&name, &argv) {
+                // §12d (R05): a per-uid limit on agents running at once.
+                let limit = self.cfg.agent_limits.per_uid;
+                let mine = self
+                    .ledger()
+                    .agents
+                    .iter()
+                    .filter(|(n, _, by)| *by == peer.uid && self.b.units().agent_running(n))
+                    .map(|(n, _, _)| n.clone())
+                    .collect::<BTreeSet<_>>();
+                if mine.len() as u32 >= limit {
+                    return Response::Rejected {
+                        reason: "Unauthorized".into(),
+                        message: format!(
+                            "uid {} already runs {} agent(s), the limit (services.planarian.agents.limits.perUid = {limit})",
+                            peer.uid,
+                            mine.len()
+                        ),
+                    };
+                }
+                match self.b.units().start_agent(&name, &argv, &self.cfg.agent_limits) {
                     Ok(instance) => {
                         // Journaled once it has started, with the instance it
                         // started as: a failed start binds nothing (I24).

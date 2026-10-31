@@ -9,7 +9,7 @@ use crate::admitted;
 use crate::cmd::run;
 use planarian_schema::{Ending, Observed, OpId, Outcome, Reason, Scope, Timestamp, UnitBackend, UnitId, UnitKind};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -191,20 +191,41 @@ impl UnitBackend for Systemd {
             .collect())
     }
 
-    fn start_agent(&self, name: &str, argv: &[String]) -> Result<planarian_schema::backend::InstanceId, Outcome> {
+    fn start_agent(
+        &self,
+        name: &str,
+        argv: &[String],
+        limits: &planarian_schema::backend::AgentLimits,
+    ) -> Result<planarian_schema::backend::InstanceId, Outcome> {
         if !planarian_schema::backend::valid_agent_name(name) {
             return Err(Outcome::Failed(format!("bad agent name {name:?}")));
         }
-        // A uid of its own (DynamicUser), so it is never the person who
-        // started it (§11); no privilege it could gain by exec.
+        // I20: no agent starts while a failure class is raised.
+        if posture_failed(Path::new(FAILED_DIR)) {
+            return Err(Outcome::Failed("a failure posture is engaged: agents do not start".into()));
+        }
         let unit = format!("--unit={}", planarian_schema::backend::agent_unit(name));
+        let slice = format!("--slice={}", planarian_schema::backend::AGENTS_SLICE);
+        let tasks = format!("--property=TasksMax={}", limits.tasks_max);
+        let memory = format!("--property=MemoryMax={}", limits.memory_max);
+        // A uid of its own (DynamicUser), so it is never the person who
+        // started it (§11); no privilege it could gain by exec. In the
+        // agents' slice, which the posture stops as a whole, after and
+        // requiring planarian-ready.target, and conditioned on no failure
+        // class being raised (§12d, I20, R05).
         let mut a: Vec<&str> = vec![
             "systemd-run",
             &unit,
+            &slice,
             "--collect",
             "--quiet",
             "--property=DynamicUser=yes",
             "--property=NoNewPrivileges=yes",
+            "--property=Requires=planarian-ready.target",
+            "--property=After=planarian-ready.target",
+            "--property=ConditionPathExistsGlob=!/run/planarian/failed-*",
+            &tasks,
+            &memory,
             "--",
         ];
         a.extend(argv.iter().map(String::as_str));
@@ -234,9 +255,34 @@ impl UnitBackend for Systemd {
     }
 }
 
+/// Where the posture marks a raised failure class (`failed-<class>`).
+const FAILED_DIR: &str = "/run/planarian";
+
+/// A failure class is raised: `failed-*` exists in `dir`.
+fn posture_failed(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("failed-")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R05, I20: the launcher refuses while a failure class is raised.
+    #[test]
+    fn no_agent_starts_while_a_failure_class_is_raised() {
+        let d = std::env::temp_dir().join(format!("planarian-posture-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(!posture_failed(&d));
+        std::fs::write(d.join("alarm"), "").unwrap();
+        assert!(!posture_failed(&d), "only failed-<class> counts");
+        std::fs::write(d.join("failed-crashed"), "").unwrap();
+        assert!(posture_failed(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn mapping() {

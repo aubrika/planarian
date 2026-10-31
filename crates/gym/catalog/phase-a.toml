@@ -2855,6 +2855,28 @@ not_started = ["service:gym-agent"]
 reports = ["PostureLifted"]
 invariants = ["I20"]
 
+# R05 (§12d, I20): agents the launcher created are stopped by the posture.
+[[fault]]
+id = "posture-stops-launched-agents"
+family = "failure-posture"
+summary = "An administrator launches an agent with `planarian agent run` (in planarian-agents.slice). planariad then crash-loops past its restart budget: planarian-failed@Crashed stops the agents' slice as a whole, so the launched agent stops too, not only the declared agent units."
+spec = ["§12d", "I20", "R05"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "agent_run", name = "launched", as = "user:1001", argv = ["/run/current-system/sw/bin/sleep", "infinity"] }, { raw = "wait", for = "10s" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGSEGV", repeat = "past-budget" }
+after = [{ raw = "wait", for = "30s" }]
+window = "4m"
+
+[fault.required_post]
+posture = { class = "Crashed", target_reached = "planarian-failed@Crashed.target", responses = ["disable_agents"] }
+invariants = ["I20"]
+
+[fault.required_post.unit_after_failure]
+"service:planarian-agent-launched" = "Stopped"
+
 [[fault]]
 id = "posture-crashed-budget"
 family = "failure-posture"

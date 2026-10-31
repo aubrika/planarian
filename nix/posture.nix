@@ -51,8 +51,11 @@ let
     fi
     touch "/run/planarian/failed-$class"
     # I20: no agent principal runs while Planarian is failed (their
-    # ConditionPathExistsGlob keeps them from starting again).
+    # ConditionPathExistsGlob keeps them from starting again): the declared
+    # agent units, and every agent the launcher created, by stopping their
+    # slice as a whole (R05).
     ${optionalString (cfg.agentUnits != [ ]) "systemctl stop ${concatStringsSep " " cfg.agentUnits} || true"}
+    systemctl stop planarian-agents.slice || true
     # Alarm: on the login screen (getty's issue) and in every session; the
     # tray and the console read /run/planarian/alarm.
     printf '%s\n%s\n' "$class" "$text" > /run/planarian/alarm
@@ -290,6 +293,12 @@ in
     });
   }
   {
+    # The launched agents' slice (§12d, R05): `planarian agent run` puts
+    # every agent here, and the posture stops it as a whole.
+    systemd.slices.planarian-agents = {
+      description = "Agents started by planarian agent run";
+      after = [ "planarian-ready.target" ];
+    };
     # I20: agents start only once Planarian is ready, and never while a
     # failure class is raised.
     systemd.services = lib.genAttrs (map (lib.removeSuffix ".service") cfg.agentUnits) (_: {

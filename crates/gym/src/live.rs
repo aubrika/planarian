@@ -622,7 +622,9 @@ fn posture_snapshot() -> (BTreeSet<String>, BTreeSet<String>) {
     if sh("journalctl -q -t planarian-posture -p alert --no-pager | grep -q 'failure class'") {
         r.insert("notify_admins".into());
     }
-    if sh("systemctl is-active --quiet gym-agent.service") {
+    // The declared agent, and any the launcher created (in their slice, R05).
+    let launched = "systemctl list-units --no-legend --state=active,activating 'planarian-agent-*.service' | grep -q .";
+    if sh("systemctl is-active --quiet gym-agent.service") || sh(launched) {
         r.insert("agents_running".into());
     } else {
         r.insert("disable_agents".into());
@@ -746,7 +748,8 @@ fn request_as(actor: &str, req: &Request) -> Result<(), String> {
         let cmd = format!(
             "uid=$(systemctl show -p UID --value {unit}); gid=$(systemctl show -p GID --value {unit}); \
              [ -n \"$uid\" ] && [ \"$uid\" != \"[not set]\" ] || exit 1; \
-             sh -c 'echo $$ > /sys/fs/cgroup/system.slice/{unit}.service/cgroup.procs && \
+             cg=$(systemctl show -p ControlGroup --value {unit}); [ -n \"$cg\" ] || exit 1; \
+             sh -c 'echo $$ > /sys/fs/cgroup'\"$cg\"'/cgroup.procs && \
              exec setpriv --reuid=$0 --regid=$1 --clear-groups {exe} vm request --json \"$2\"' \"$uid\" \"$gid\" '{q}'"
         );
         return if sh(&cmd) { Ok(()) } else { Err(format!("request as {actor} failed")) };

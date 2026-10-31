@@ -42,6 +42,7 @@ fn config() -> CoreConfig {
         fresh_boot: true,
         startup_grace: planarian_incident::STARTUP_GRACE,
         posture: planarian_schema::Posture::Standard,
+        agent_limits: Default::default(),
     }
 }
 
@@ -883,4 +884,30 @@ fn an_expired_wait_reopens_its_incident() {
     let again = waiting(&mut r);
     assert!(again.len() == 1 && again != first, "the reopened incident proposes the repair again: {again:?}");
     assert_eq!(budget(&r), Some(planarian_incident::BUDGET));
+}
+
+/// §12d (R05): one uid may have only so many agents running at once; a
+/// launch over the limit is refused, and one that has stopped frees its slot.
+#[test]
+fn agents_per_uid_are_limited() {
+    let mut cfg = config();
+    cfg.agent_limits.per_uid = 2;
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let run = |r: &mut Rig, peer: Peer, name: &str| {
+        r.core.handle(peer, Request::AgentRun { name: name.into(), argv: vec!["true".into()] })
+    };
+    assert!(matches!(run(&mut r, ALICE, "one"), Response::Ok { .. }));
+    assert!(matches!(run(&mut r, ALICE, "two"), Response::Ok { .. }));
+    let over = run(&mut r, ALICE, "three");
+    assert!(
+        matches!(&over, Response::Rejected { message, .. } if message.contains("limit")),
+        "a third launch is refused: {over:?}"
+    );
+    // Another uid has its own count.
+    assert!(matches!(run(&mut r, ADMIN, "theirs"), Response::Ok { .. }));
+    // One of alice's stops: she may start another.
+    r.fake.w().units.get_mut(&UnitId::service("planarian-agent-one")).unwrap().observed =
+        Observed::Failed(planarian_schema::Reason::ExitCode(0));
+    assert!(matches!(run(&mut r, ALICE, "three"), Response::Ok { .. }), "a stopped agent frees its slot");
 }
