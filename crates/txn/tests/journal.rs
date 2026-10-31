@@ -308,6 +308,20 @@ fn deleted_record_breaks_the_chain_on_read() {
     assert!(!planarian_txn::journal::delete(&store, 40).unwrap(), "no such record");
 }
 
+/// §12c (C16): a damaged checkpoint is an Integrity failure, never a fresh
+/// start.
+#[test]
+fn damaged_checkpoint_is_integrity() {
+    let (store, mut j) = filled(6);
+    j.compact().unwrap();
+    drop(j);
+    let mut b = store.read_checkpoint().unwrap().expect("checkpoint");
+    let mid = b.len() / 2;
+    b[mid] ^= 0x20;
+    store.write_checkpoint(&b).unwrap();
+    assert!(matches!(Journal::open(store), Err(JournalError::Integrity(_))));
+}
+
 #[test]
 fn damaged_middle_record_is_not_a_torn_tail() {
     let (store, j) = filled(10);

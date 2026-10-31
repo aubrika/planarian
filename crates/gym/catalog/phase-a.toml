@@ -3035,6 +3035,29 @@ never = ["Activating"]
 terminal = "pending"
 caller = "user:1001"
 
+# C16 (§12c): a damaged checkpoint is Integrity, never Absent.
+[[fault]]
+id = "checkpoint-bad-crc"
+family = "failure-posture"
+summary = "The journal is compacted, then its checkpoint is damaged while the daemon is down (its CRC no longer matches). The daemon does not start from nothing: it reports an Integrity failure naming the journal."
+spec = ["§12c", "§12d", "C16"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" },
+  { raw = "wait", for = "1m" },
+  { raw = "force_compaction" },
+]
+inject = { raw = "corrupt_checkpoint" }
+after = [{ raw = "restart_process", process = "planariad" }]
+window = "2m"
+
+[fault.required_post]
+reports = ["JournalChainBroken"]
+posture = { class = "Integrity" }
+
 [[fault]]
 id = "release-refused-leaves-incident"
 family = "authority"

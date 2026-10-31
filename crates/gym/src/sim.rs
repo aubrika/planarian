@@ -13,6 +13,7 @@ use planarian_txn::journal::{Journal, JournalError};
 use planarian_txn::kernel::{CrashPoint, Kernel};
 use planarian_txn::ledger::{Entry, Ledger, Record};
 use planarian_txn::machine::tag;
+use planarian_txn::store::Store as _;
 use std::collections::{BTreeMap, BTreeSet};
 use toml::Value as T;
 
@@ -588,7 +589,7 @@ impl Sim {
         let j = match Journal::open(self.fake.store.clone()) {
             Ok(j) => j,
             Err(JournalError::Integrity(why)) => {
-                return self.integrity(format!("journal: the hash chain is broken: {why}"));
+                return self.integrity(format!("journal: integrity: {why}"));
             }
             Err(e) => panic!("journal: {e:?}"),
         };
@@ -1163,6 +1164,21 @@ impl Sim {
                 } else {
                     let _ = Journal::open(self.fake.store.clone()).map(|mut j| j.compact());
                 }
+            }
+            // §12c (C16): a checkpoint whose bytes were damaged while the
+            // daemon was down; its CRC no longer matches.
+            "corrupt_checkpoint" => {
+                self.kill_daemon();
+                let mut b = self
+                    .fake
+                    .store
+                    .read_checkpoint()
+                    .ok()
+                    .flatten()
+                    .ok_or_else(|| Unsupported("corrupt_checkpoint: no checkpoint".into()))?;
+                let mid = b.len() / 2;
+                b[mid] ^= 0x20;
+                self.fake.store.write_checkpoint(&b).map_err(|e| Unsupported(e.to_string()))?;
             }
             "force_compaction" => {
                 self.save_segment();

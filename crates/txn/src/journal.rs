@@ -256,19 +256,19 @@ impl<S: Store> Journal<S> {
             return Err(if legacy_frame(&bytes) {
                 JournalError::Legacy
             } else {
-                JournalError::Corrupt("checkpoint fails its CRC".into())
+                JournalError::Integrity("the checkpoint fails its CRC".into())
             });
         };
         let (seq, payload) = (f.seq, f.payload);
-        let ledger: Ledger =
-            serde_json::from_slice(payload).map_err(|e| JournalError::Corrupt(format!("checkpoint: {e}")))?;
+        let ledger: Ledger = serde_json::from_slice(payload)
+            .map_err(|e| JournalError::Integrity(format!("the checkpoint does not parse: {e}")))?;
         if ledger.last_seq != seq {
-            return Err(JournalError::Corrupt("checkpoint seq disagrees with its ledger".into()));
+            return Err(JournalError::Integrity("the checkpoint's seq disagrees with its ledger".into()));
         }
         // The proofs show `apply` keeps the ledger invariant; a ledger read
         // from disk is checked against it instead.
         if !ledger.well_formed() {
-            return Err(JournalError::Corrupt("checkpoint breaks the ledger invariant".into()));
+            return Err(JournalError::Integrity("the checkpoint breaks the ledger invariant".into()));
         }
         Ok(Some((seq, ledger, f.prev)))
     }
@@ -395,7 +395,11 @@ impl<S: Store> Journal<S> {
             {
                 self.apply_sentinel(&bytes);
             }
-            self.ledger.apply(entry)?;
+            // A retained, intact record the ledger refuses is damage, not a
+            // reason to start empty: Integrity, never Absent (§12c, C16).
+            self.ledger
+                .apply(entry)
+                .map_err(|e| JournalError::Integrity(format!("record {seq} is refused on replay: {e:?}")))?;
             self.head = chain(&f.prev, seq, payload);
             prev = Some(seq);
             self.offset += size as u64;

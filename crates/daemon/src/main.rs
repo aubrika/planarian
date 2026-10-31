@@ -76,7 +76,7 @@ fn integrity_failure(who: &str, what: &str) -> ! {
 
 fn journal_failure(who: &str, e: &JournalError) -> ! {
     match e {
-        JournalError::Integrity(why) => integrity_failure(who, &format!("journal: the hash chain is broken: {why}")),
+        JournalError::Integrity(why) => integrity_failure(who, &format!("journal: integrity: {why}")),
         JournalError::Legacy => {
             eprintln!(
                 "{who}: the journal under /var/lib/planarian/journal was written by an earlier Planarian (format 1, \
