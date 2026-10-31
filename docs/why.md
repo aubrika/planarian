@@ -48,7 +48,8 @@ Mark Burgess made the case for [“Computer Immunology”](https://www.usenix.or
 
 - Until Phase E, root can go around it. Planarian can detect and repair that, but it can’t prevent it.
 - If you start an AI agent yourself, instead of through Planarian's launcher, the system can't tell it apart from you: everything it does is recorded as yours, and it can do anything you can.
-- It doesn’t catch malicious software that works perfectly, and it doesn’t protect your files, only the system.
+- It can’t tell good software from bad. A harmful program that’s installed through your configuration and runs smoothly looks healthy to Planarian, because nothing is broken.
+- It doesn’t protect your files, only the system itself.
 - It doesn’t make agents smarter or more honest. It limits what they can do and records what they did.
 
 Every known way around a guarantee is listed in [bypasses.md](./bypasses.md), and everything the proofs take on trust is listed in [assumptions.md](./assumptions.md).
