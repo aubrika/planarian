@@ -417,7 +417,9 @@ pub open spec fn authorized_spec(t: Transition, f: DerivedFacts, a: Authorizatio
             ),
             _ => false,
         },
-        Actor::Agent(_) => false,
+        // The model holds nothing until Phase B defines its grants (§11):
+        // it is treated as an agent, never as the daemon.
+        Actor::Agent(_) | Actor::Model(_) => false,
         Actor::Unattributed => false,
         _ => match t {
             Transition::Resolve { .. } => false,
@@ -443,7 +445,7 @@ pub fn authorized(t: &Transition, facts: &DerivedFacts, authz: &Authorization, s
 {
     let uid = match &authz.actor {
         Actor::User { uid, .. } => *uid,
-        Actor::Agent(_) => return false,
+        Actor::Agent(_) | Actor::Model(_) => return false,
         Actor::Unattributed => return false,
         _ => {
             return match t {
