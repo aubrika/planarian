@@ -14,17 +14,19 @@ opens an incident and repairs it, deterministically, through one executor that
 runs every change as a journaled, revertible transaction. If Planarian itself
 is killed mid-change, a separate watchdog finishes or reverts the change.
 
-- Specification: [`docs/SPEC.md`](docs/SPEC.md) (v4.4)
+- Specification: [`docs/SPEC.md`](docs/SPEC.md) (v4.6)
 - What differs from the spec, and why: [`docs/deviations.md`](docs/deviations.md)
 - Fault catalog: [`crates/gym/catalog/phase-a.toml`](crates/gym/catalog/phase-a.toml)
 
 **Status: under construction.** This is experimental software that restarts
 services and rebuilds and activates your NixOS configuration on its own. Try
 it in a VM, or on a machine you can afford to break. Phase A (the
-deterministic core, NixOS 26.05) is close to its exit gate
-([`docs/ga-status.md`](docs/ga-status.md)); later phases are not started. No
-language model is involved. `policy::decide`, the journal state machine and
-the ledger are verified with Verus (`docs/verification.md`).
+deterministic core, NixOS 26.05) is being finished against SPEC v4.6; its
+exit gate is not called yet ([`docs/ga-status.md`](docs/ga-status.md)), and
+later phases are not started. No language model is involved.
+`policy::decide`, the journal state machine and the ledger are verified with
+Verus, and the transaction kernel's recovery rules are checked with Kani
+([`docs/verification.md`](docs/verification.md)).
 
 A prototype NixOS image with Planarian (a demo VM, a live USB stick and an
 installer) is described in [`docs/planarian-os.md`](docs/planarian-os.md).
@@ -85,7 +87,8 @@ simulate a crash with `sudo systemctl kill -s SEGV <service>`: within about
 15 s there should be an incident and a restart, and `planarian log` explains
 it. A plain `kill` or `systemctl stop` is different: Planarian takes that as
 something you meant, leaves the service stopped until the next boot, and says
-how to undo it (`planarian release <service>`). `ask "stop
+how to undo it (`planarian release <service>`). `planarian stop <service>`
+does the same with your name on it. `ask "stop
 <service> until I say"` stops it and keeps it stopped; `ask "start <service>
 again"` undoes that. The demo VM has fixture services and fault injection
 for the rest (`docs/planarian-os.md`).
@@ -106,9 +109,18 @@ something needs a person (a repair that keeps failing, the recovery
 interlock, or the daemon is unreachable). Its tooltip says what; clicking it
 opens the console.
 
+A change that only takes effect at boot (a kernel parameter, a driver) is
+published for the next boot only, with a "restart to finish" notice repeated
+daily. At that boot it is checked once before you log in; if it passes, it
+becomes the default, and it is kept once the canonical health checks still
+pass at the 10-minute checkpoint. If either check fails, the generation that
+published it is the default again.
+
 Other commands: `planarian incidents`, `planarian log -n 50`, `planarian undo`,
-`planarian gc`, `planarian diagnose <unit>`, `planarian cancel <txn>`,
-`planarian mark-good`, `planarian resolve <txn> --as-committed|--as-reverted|--manual-repaired`.
+`planarian restart <unit>`, `planarian override <unit>`, `planarian gc`,
+`planarian diagnose <unit>`, `planarian approve <hash>`, `planarian cancel <txn>`,
+`planarian ack [<unit>]`, `planarian mark-good`,
+`planarian resolve <txn> --as-committed|--as-reverted|--manual-repaired`.
 
 ### Watching your own services
 
@@ -137,7 +149,9 @@ transient service (`planarian-agent-<name>`) under a fresh dynamic uid, and
 Planarian lets it do exactly what you could do (an administrator's agent is
 an administrator), as you would over SSH: with no login session and no
 terminal, so it cannot approve changes itself. Everything it asks for is
-logged as that agent, acting for you. An agent you start yourself from a
+logged as that agent, acting for you. Its authority belongs to that one run:
+a second `agent run` under the name of an agent that is still running is
+refused. An agent you start yourself from a
 shell, outside `agent run`, is simply you, unattributed (`docs/bypasses.md`,
 X-10, X-11).
 
@@ -162,8 +176,9 @@ the bounds.
 - The daemon logs to the journal: `journalctl -u planariad -u planarian-recovery`.
   The executor log is `/var/lib/planarian/log/executor.jsonl`.
 - A signed health report is kept at `/var/lib/planarian/health-report.json`
-  (signature in `.sig`, public key in `health.pub`). It holds only unit
-  statuses and open incident kinds; it is not sent anywhere.
+  (signature in `.sig`, public key in `health.pub`). It holds only generation
+  numbers, unit statuses (without details), and incident kinds and states; it
+  is not sent anywhere.
 
 ## Development
 
