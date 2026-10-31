@@ -33,7 +33,7 @@ fn catalog() -> CatalogConfig {
 
 fn tables() -> Tables {
     Tables {
-        catalog: ["service-enable", "font-scale", "listen-address", "repair:reenable-predicted"]
+        catalog: ["service-enable", "font-scale", "listen-address", "repair:reenable-predicted", "repair:reapply"]
             .map(|s| ChangeId(s.into()))
             .into(),
         runtime_allowlist: ["font.scale", "wifi.network"].map(String::from).into(),

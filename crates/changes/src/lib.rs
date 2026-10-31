@@ -109,6 +109,21 @@ pub fn entries(cfg: &CatalogConfig) -> Vec<Entry> {
             repair: true,
         },
     ];
+    // §13 (P22): reapply a change committed earlier for the same target,
+    // whose assignments the override file no longer carries. Its arguments
+    // are the original change's id (`change`) and that change's arguments.
+    out.push(Entry {
+        id: ChangeId(REAPPLY.into()),
+        description: "Reapply a change committed earlier for the same unit".into(),
+        args: vec![one_of("change", &["service-enable".into(), "listen-address".into()])],
+        affected_modules: cfg
+            .services
+            .values()
+            .cloned()
+            .chain(cfg.listen_addresses.values().map(|l| l.option.clone()))
+            .collect(),
+        repair: true,
+    });
     if !cfg.font_scale_option.is_empty() {
         out.push(Entry {
             id: ChangeId("font-scale".into()),
@@ -225,9 +240,35 @@ pub fn handle(
             let v = permitted(&c.arg, arg_str(args, &c.arg)?, &c.permitted)?;
             a.insert(c.option.clone(), Value::Str(v.into()));
         }
+        REAPPLY => {
+            // Only the per-unit changes; never a repair of a repair.
+            let inner =
+                permitted("change", arg_str(args, "change")?, &["service-enable".into(), "listen-address".into()])?;
+            let mut rest = args.clone();
+            rest.remove("change");
+            return handle(cfg, &ChangeId(inner.into()), &rest);
+        }
         _ => return Err(CatalogError::NotInCatalog(change.clone())),
     }
     Ok(OverrideSet { assignments: a })
+}
+
+/// The catalog id of the reapply repair (§13, P22).
+pub const REAPPLY: &str = "repair:reapply";
+
+/// The unit a per-unit catalog change is for (its `service` argument).
+pub fn target_of(change: &ChangeId, args: &BTreeMap<String, Value>) -> Option<planarian_schema::UnitId> {
+    match (change.0.as_str(), args.get("service")) {
+        ("service-enable" | "listen-address" | "repair:reenable-predicted", Some(Value::Str(s))) => {
+            Some(planarian_schema::UnitId::service(s))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `live` still carries every assignment `set` makes.
+pub fn carried(live: &OverrideSet, set: &OverrideSet) -> bool {
+    set.assignments.iter().all(|(k, v)| live.assignments.get(k) == Some(v))
 }
 
 /// The `ApplyChange` that persists a runtime option (§12a write-back).
@@ -378,6 +419,28 @@ mod tests {
         kv.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
     }
 
+    /// P22: `repair:reapply` is in the catalog, does what the change it
+    /// names does, and names only per-unit changes (never itself).
+    #[test]
+    fn reapply_does_what_the_original_did() {
+        let c = cfg();
+        assert!(entries(&c).iter().any(|e| e.id.0 == REAPPLY && e.repair));
+        let orig = args(&[("service", Value::Str("gym-web".into())), ("addr", Value::Str("192.0.2.10".into()))]);
+        let want = handle(&c, &ChangeId("listen-address".into()), &orig).unwrap();
+        let mut a = orig.clone();
+        a.insert("change".into(), Value::Str("listen-address".into()));
+        assert_eq!(handle(&c, &ChangeId(REAPPLY.into()), &a).unwrap(), want);
+        a.insert("change".into(), Value::Str(REAPPLY.into()));
+        assert!(handle(&c, &ChangeId(REAPPLY.into()), &a).is_err(), "not a repair of a repair");
+        a.insert("change".into(), Value::Str("font-scale".into()));
+        assert!(handle(&c, &ChangeId(REAPPLY.into()), &a).is_err(), "only per-unit changes");
+        assert_eq!(
+            target_of(&ChangeId("listen-address".into()), &orig),
+            Some(planarian_schema::UnitId::service("gym-web"))
+        );
+        assert!(carried(&want, &want) && !carried(&OverrideSet::default(), &want));
+    }
+
     #[test]
     fn handlers_validate_and_assign() {
         let c = cfg();
@@ -417,7 +480,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(la.assignments["services.gym-web.listenAddress"], Value::Str("192.0.2.10".into()));
-        assert_eq!(entries(&c).len(), 7, "the six shipped kinds and one gym: choice");
+        assert_eq!(entries(&c).len(), 8, "the seven shipped kinds (repair:reapply since v4.6) and one gym: choice");
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub fn config() -> CoreConfig {
                     "font-scale",
                     "listen-address",
                     "repair:reenable-predicted",
+                    "repair:reapply",
                     "gym:security-fix",
                     "gym:kernel-param",
                     "gym:touch-core",
@@ -127,6 +128,7 @@ pub fn config() -> CoreConfig {
         fresh_boot: true,
         startup_grace: planarian_daemon::STARTUP_GRACE,
         posture: planarian_schema::Posture::Standard,
+        posture_decl: Default::default(),
         agent_limits: Default::default(),
     }
 }

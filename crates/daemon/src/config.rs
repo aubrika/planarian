@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub const CONFIG: &str = "/etc/planarian/config.json";
+/// The configuration of the generation this machine booted (§12d, P16).
+pub const BOOTED_CONFIG: &str = "/run/booted-system/etc/planarian/config.json";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -49,6 +51,9 @@ pub struct FileConfig {
     /// The failure posture (§12d). Phase A ships Standard.
     #[serde(default)]
     pub posture: planarian_schema::Posture,
+    /// `services.planarian.bootReadyTimeout`, seconds (§12d).
+    #[serde(default = "default_boot_ready_secs")]
+    pub boot_ready_timeout_secs: u64,
     pub journal_bytes: u64,
     /// The signed external desired-state source (§9 hook); none by default.
     #[serde(default)]
@@ -90,12 +95,55 @@ impl Default for FileConfig {
             startup_grace_secs: planarian_incident::STARTUP_GRACE.0 / 1000,
             journal_bytes: planarian_txn::store::DEFAULT_CAPACITY,
             posture: Default::default(),
+            boot_ready_timeout_secs: default_boot_ready_secs(),
             session_compositors: vec![],
             external_source: None,
             health_report_secs: default_health_secs(),
             allow_test_build: false,
             agent_limits: Default::default(),
         }
+    }
+}
+
+fn default_boot_ready_secs() -> u64 {
+    120
+}
+
+/// What the failure posture is, and what is waiting (§12d, P16). A
+/// generation switched live can strengthen the posture or shorten the
+/// timeout at once; a weaker declaration takes effect when it is booted,
+/// because the posture follows the booted generation until then.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PostureDecl {
+    /// What the running generation declares.
+    pub declared: planarian_schema::Posture,
+    pub declared_timeout_secs: u64,
+    /// What the booted generation declares, if it declares one.
+    pub booted: Option<(planarian_schema::Posture, u64)>,
+}
+
+impl PostureDecl {
+    pub fn of(current: &FileConfig, booted: Option<&FileConfig>) -> PostureDecl {
+        PostureDecl {
+            declared: current.posture,
+            declared_timeout_secs: current.boot_ready_timeout_secs,
+            booted: booted.map(|b| (b.posture, b.boot_ready_timeout_secs)),
+        }
+    }
+
+    /// The stronger of the two postures.
+    pub fn in_force(&self) -> planarian_schema::Posture {
+        self.booted.map_or(self.declared, |(p, _)| p.max(self.declared))
+    }
+
+    /// The shorter of the two timeouts.
+    pub fn timeout_in_force(&self) -> u64 {
+        self.booted.map_or(self.declared_timeout_secs, |(_, t)| t.min(self.declared_timeout_secs))
+    }
+
+    /// Whether a weaker declaration waits for the next boot.
+    pub fn weaker_waiting(&self) -> bool {
+        self.in_force() != self.declared || self.timeout_in_force() != self.declared_timeout_secs
     }
 }
 
@@ -196,5 +244,27 @@ mod tests {
         let back: FileConfig = serde_json::from_str(&j).unwrap();
         assert_eq!(back.max_tier, c.max_tier);
         assert!(serde_json::from_str::<FileConfig>("{}").is_ok(), "every field has a default");
+    }
+}
+
+#[cfg(test)]
+mod posture_tests {
+    use super::*;
+    use planarian_schema::Posture;
+
+    /// P16: lowering the posture or lengthening the timeout in a generation
+    /// switched live waits for the boot; raising or shortening does not.
+    #[test]
+    fn a_weaker_posture_waits_for_the_boot() {
+        let with = |p: Posture, t: u64| FileConfig { posture: p, boot_ready_timeout_secs: t, ..Default::default() };
+        let booted = with(Posture::Standard, 120);
+        let lower = PostureDecl::of(&with(Posture::Relaxed, 600), Some(&booted));
+        assert_eq!((lower.in_force(), lower.timeout_in_force()), (Posture::Standard, 120));
+        assert!(lower.weaker_waiting());
+        let higher = PostureDecl::of(&with(Posture::Guarded, 60), Some(&booted));
+        assert_eq!((higher.in_force(), higher.timeout_in_force()), (Posture::Guarded, 60));
+        assert!(!higher.weaker_waiting());
+        let fresh = PostureDecl::of(&with(Posture::Relaxed, 600), None);
+        assert_eq!(fresh.in_force(), Posture::Relaxed, "no booted declaration: the running one");
     }
 }

@@ -26,6 +26,8 @@ let
   principalUnits =
     lib.optional config.services.openssh.enable "sshd.service"
     ++ lib.optional (config.services.xserver.enable || config.services.displayManager.enable or false) "display-manager.service"
+    # P13: greetd is its own unit, not display-manager.service.
+    ++ lib.optional (config.services.greetd.enable or false) "greetd.service"
     ++ [ "user@.service" "getty@.service" "autovt@.service" ];
 
 
@@ -72,7 +74,8 @@ let
       if [ "$class" = integrity ]; then
         printf 'Match all\n  DenyUsers *\n' > /run/planarian/sshd/posture.conf
       else
-        printf 'Match all\n  AllowGroups ${cfg.adminGroup} wheel\n' > /run/planarian/sshd/posture.conf
+        # P14: Planarian's administrators (root and ${cfg.adminGroup}), not wheel.
+        printf 'Match all\n  AllowGroups ${cfg.adminGroup} root\n' > /run/planarian/sshd/posture.conf
       fi
       systemctl try-reload-or-restart sshd.service || true
     ''}
@@ -140,7 +143,13 @@ let
 
   check = pkgs.writeShellScript "planarian-posture-check" ''
     PATH=${lib.makeBinPath [ pkgs.coreutils config.systemd.package ]}
-    deadline=$(( $(date +%s) + ${toString cfg.bootReadyTimeout} ))
+    # P16: a longer timeout in a generation switched live waits for its
+    # boot: the shorter of this one's and the booted generation's.
+    t=${toString cfg.bootReadyTimeout}
+    b="$(cat /run/booted-system/etc/planarian/boot-ready-timeout 2>/dev/null || echo "$t")"
+    case "$b" in ""|*[!0-9]*) b="$t" ;; esac
+    [ "$b" -lt "$t" ] && t="$b"
+    deadline=$(( $(date +%s) + t ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
       systemctl is-active --quiet planarian-ready.target && exit 0
       sleep 2
@@ -197,6 +206,7 @@ in
       "planarian: the clock is set by unauthenticated NTP; authenticated time (NTS) is recommended: services.chrony.enable = true; services.chrony.enableNTS = true; (SPEC §12h).";
     environment.systemPackages = [ ack ];
     environment.etc."planarian/core.sha256".source = coreHash;
+    environment.etc."planarian/boot-ready-timeout".text = toString cfg.bootReadyTimeout;
 
     systemd.targets.planarian-ready = {
       description = "Planarian is ready";
@@ -274,7 +284,13 @@ in
 
     systemd.services.planarian-recovery = {
       environment.PLANARIAN_CORE_HASH = "/etc/planarian/core.sha256";
+      # P15: a crash-looping watchdog is Crashed, as planariad is: restarts
+      # within the budget skip the failed state, then OnFailure= fires.
+      onFailure = [ "planarian-failed@crashed.target" ];
+      startLimitBurst = 5;
+      startLimitIntervalSec = 300;
       serviceConfig = {
+        RestartMode = "direct";
         SuccessExitStatus = [ 78 ];
         RestartPreventExitStatus = [ 78 ];
         ExecStopPost = stopPost "planarian-recovery";

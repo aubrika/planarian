@@ -48,8 +48,11 @@ pub struct CoreConfig {
     pub fresh_boot: bool,
     /// The default startup grace (units may set their own).
     pub startup_grace: Millis,
-    /// The failure posture the generation declares (§12d); Phase A ships Standard.
+    /// The failure posture in force (§12d, P16: the stronger of the booted
+    /// and the running generation's); Phase A ships Standard.
     pub posture: Posture,
+    /// What each generation declares, for `planarian posture`.
+    pub posture_decl: crate::config::PostureDecl,
     /// Limits on launched agents (§12d, R05).
     pub agent_limits: planarian_schema::backend::AgentLimits,
 }
@@ -195,6 +198,8 @@ pub struct Core<B: Backends + Clone, S: Store> {
     prev_auto_restarts: BTreeMap<UnitId, u32>,
     /// The boot report runs on the first tick after boot (§10).
     boot_report_due: bool,
+    /// The last boot report this daemon ran, for `planarian report boot`.
+    last_boot_report: Option<(Timestamp, GenerationId, String)>,
     /// Quiet mode (§12f) and the notices it holds back.
     quiet: bool,
     quiet_queue: Vec<String>,
@@ -353,6 +358,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             prev_status: BTreeMap::new(),
             prev_auto_restarts: BTreeMap::new(),
             boot_report_due: fresh,
+            last_boot_report: None,
             quiet: false,
             quiet_queue: vec![],
             reprepare: vec![],
@@ -641,6 +647,40 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 )),
             }
         }
+    }
+
+    /// §13 (P22): for each unit, the catalog change last committed for it,
+    /// if the override file no longer carries what it set.
+    fn lost_changes(&self, l: &Ledger) -> BTreeMap<UnitId, (ChangeId, BTreeMap<String, Value>)> {
+        let Ok((live, _)) = self.ex.b.generations().read_overrides() else { return BTreeMap::new() };
+        let mut last: BTreeMap<UnitId, (ChangeId, BTreeMap<String, Value>)> = BTreeMap::new();
+        // Terminal records in id order: the last commit for a unit wins.
+        for t in l.terminal.values() {
+            let (TxnState::Committed, Transition::ApplyChange { change, args }) = (&t.state, &t.transition) else {
+                continue;
+            };
+            let (change, args) = if change.0 == planarian_changes::REAPPLY {
+                match args.get("change") {
+                    Some(Value::Str(c)) => {
+                        let mut a = args.clone();
+                        a.remove("change");
+                        (ChangeId(c.clone()), a)
+                    }
+                    _ => continue,
+                }
+            } else {
+                (change.clone(), args.clone())
+            };
+            if let Some(u) = planarian_changes::target_of(&change, &args) {
+                last.insert(u, (change, args));
+            }
+        }
+        let cat = &self.ex.cfg.catalog;
+        last.retain(|_, (c, a)| {
+            c.0 != "repair:reenable-predicted"
+                && planarian_changes::handle(cat, c, a).is_ok_and(|set| !planarian_changes::carried(&live, &set))
+        });
+        last
     }
 
     fn is_canonical(&self, u: &UnitId, defs: &UnitDefs) -> bool {
@@ -960,6 +1000,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         for u in &foreign {
             self.notice(format!("INTEGRITY: boot report: {u} runs, but this generation does not declare it"));
         }
+        let g = self.b.generations().current().unwrap_or_default();
+        let text = if foreign.is_empty() {
+            "clean: every running unit is declared by this generation".to_string()
+        } else {
+            format!("INTEGRITY: undeclared units: {}", foreign.join(", "))
+        };
+        self.last_boot_report = Some((self.b.clock().now(), g, text));
         (!foreign.is_empty()).then(|| format!("boot report: undeclared units: {}", foreign.join(", ")))
     }
 
@@ -1052,6 +1099,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     known_drivers: &self.asm.known_drivers,
                     current_planarian_built: false,
                     alternatives: &none,
+                    lost_changes: &BTreeMap::new(),
                 };
                 let root = diagnose::root_cause(&inc.target, &inputs);
                 let because = if root == inc.target { String::new() } else { format!(" (root cause: {root})") };
@@ -1313,6 +1361,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             known_drivers: &self.asm.known_drivers,
             current_planarian_built: l.live_tested == Some(current),
             alternatives: &alternatives,
+            lost_changes: &self.lost_changes(l),
         };
         // The deepest divergent unit below the target (§13 step 1), named
         // whenever it isn't the target itself.
@@ -2034,8 +2083,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
             }
             Request::MarkGood { accept_unconfirmed } => {
-                if !peer.admin {
-                    return Response::Error { message: "mark-good requires administrator authority".into() };
+                // §16 (K10): root at an interactive terminal, the terminal
+                // established by the daemon from the peer, as for approve.
+                if peer.uid != 0 || !peer.tty {
+                    return Response::Error {
+                        message: "mark-good requires root at an interactive terminal (Phase A)".into(),
+                    };
                 }
                 let (s, defs) = self.observe();
                 let failing: Vec<String> = defs
@@ -2075,6 +2128,30 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
             }
             Request::Console => Response::Console(Box::new(self.console())),
+            // §16 (P17): the last boot report, and the posture in force.
+            Request::ReportBoot => match &self.last_boot_report {
+                Some((at, g, text)) => Response::Ok {
+                    message: format!("boot report for generation {} at {}: {text}", g.0, render::when(*at)),
+                },
+                None => Response::Ok {
+                    message: "no boot report since planariad started (it runs once, on the first start after boot)"
+                        .into(),
+                },
+            },
+            Request::Posture => {
+                let d = &self.cfg.posture_decl;
+                let mut message = format!(
+                    "posture: {:?}, boot-ready timeout {} s (this generation declares {:?}, {} s)",
+                    self.cfg.posture,
+                    d.timeout_in_force(),
+                    d.declared,
+                    d.declared_timeout_secs
+                );
+                if d.weaker_waiting() {
+                    message.push_str("; the weaker declaration takes effect at the next boot");
+                }
+                Response::Ok { message }
+            }
             #[cfg(feature = "gym-hooks")]
             Request::GymPropose { transition, stale_digest, may_change } => {
                 let (s, defs) = self.observe();

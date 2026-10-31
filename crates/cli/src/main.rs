@@ -126,6 +126,8 @@ fn parse(args: &[String]) -> Result<(Request, bool), String> {
         ["agent", "run", name, "--", argv @ ..] if !argv.is_empty() => {
             Request::AgentRun { name: name.to_string(), argv: argv.iter().map(|s| s.to_string()).collect() }
         }
+        ["report", "boot"] => Request::ReportBoot,
+        ["posture"] => Request::Posture,
         ["ack"] => Request::Acknowledge { unit: None },
         ["ack", u] => Request::Acknowledge { unit: Some(unit(u)?) },
         ["mark-security-floor"] => Request::MarkSecurityFloor,

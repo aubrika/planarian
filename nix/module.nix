@@ -616,6 +616,7 @@ in
       startupGraceSecs = cfg.startupGrace;
       sessionCompositors = cfg.sessionCompositors;
       inherit (cfg) posture externalSource;
+      bootReadyTimeoutSecs = cfg.bootReadyTimeout;
       agentLimits = { inherit (cfg.agents.limits) tasksMax memoryMax perUid; };
       healthReportSecs = cfg.healthReport.interval;
     };

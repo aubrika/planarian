@@ -18,6 +18,12 @@ pkgs.testers.runNixOSTest {
     users.users.alice = { isNormalUser = true; uid = 1000; };
     users.users.admin = { isNormalUser = true; uid = 1001; extraGroups = [ "planarian-admin" ]; };
     environment.systemPackages = [ pkgs.python3 ];
+    # P16: the same machine with a weaker posture and a longer timeout,
+    # switched to live in the test.
+    specialisation.lower.configuration = {
+      services.planarian.posture = pkgs.lib.mkForce "Relaxed";
+      services.planarian.bootReadyTimeout = pkgs.lib.mkForce 600;
+    };
     virtualisation.diskSize = 8192;
     virtualisation.memorySize = 2048;
 
@@ -72,6 +78,46 @@ pkgs.testers.runNixOSTest {
         machine.succeed("systemctl reset-failed planariad.service")
         machine.succeed("systemctl start planariad.service")
         machine.wait_until_succeeds("test ! -e /run/planarian/alarm", timeout=120)
+
+    with subtest("Crashed: planarian-recovery crash-looping (P15)"):
+        for _ in range(8):
+            machine.succeed("systemctl kill --signal=SIGSEGV planarian-recovery.service || true")
+            machine.sleep(3)
+        machine.wait_until_succeeds("test -e /run/planarian/alarm", timeout=120)
+        assert alarm().startswith("crashed"), alarm()
+        machine.wait_until_fails("systemctl is-active gym-agent.service", timeout=60)
+        machine.succeed("systemctl reset-failed planarian-recovery.service")
+        machine.succeed("systemctl start planarian-recovery.service")
+        machine.succeed("planarian-ack")
+        machine.wait_until_succeeds("test ! -e /run/planarian/alarm", timeout=60)
+        machine.wait_for_unit("gym-agent.service")
+
+    with subtest("P14: under Absent, sshd admits Planarian's administrators, not wheel"):
+        machine.succeed("systemctl stop planariad.service")
+        machine.wait_until_succeeds("test -e /run/planarian/sshd/posture.conf", timeout=60)
+        machine.succeed("grep -q 'AllowGroups planarian-admin root' /run/planarian/sshd/posture.conf")
+        machine.fail("grep -q wheel /run/planarian/sshd/posture.conf")
+        machine.succeed("systemctl start planariad.service")
+        machine.wait_until_succeeds("test ! -e /run/planarian/alarm", timeout=120)
+        machine.wait_for_unit("gym-agent.service")
+
+    with subtest("P17: report boot and posture answer"):
+        print(machine.succeed("planarian report boot"))
+        out = machine.succeed("planarian posture")
+        assert out.strip().startswith("posture: Standard, boot-ready timeout 20 s"), out
+
+    with subtest("P16: a lowered posture switched live waits for the boot"):
+        machine.succeed("/run/current-system/specialisation/lower/bin/switch-to-configuration test")
+        machine.succeed("grep -q '\"posture\": *\"Relaxed\"' /etc/planarian/config.json || grep -q '\"posture\":\"Relaxed\"' /etc/planarian/config.json")
+        machine.succeed("systemctl restart planariad.service")
+        machine.wait_until_succeeds("test ! -e /run/planarian/alarm", timeout=120)
+        out = machine.succeed("planarian posture")
+        assert out.strip().startswith("posture: Standard, boot-ready timeout 20 s"), out
+        assert "declares Relaxed, 600 s" in out and "next boot" in out, out
+        machine.succeed("/run/booted-system/bin/switch-to-configuration test")
+        machine.succeed("systemctl restart planariad.service")
+        machine.wait_until_succeeds("test ! -e /run/planarian/alarm", timeout=120)
+        machine.wait_for_unit("gym-agent.service")
 
     with subtest("Integrity: an external desired-state document with an invalid signature"):
         machine.succeed("mkdir -p /var/lib/planarian/external")

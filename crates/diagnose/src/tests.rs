@@ -24,13 +24,21 @@ struct World {
     failed_since: BTreeMap<UnitId, Timestamp>,
     drivers: BTreeMap<UnitId, DriverRef>,
     alternatives: BTreeMap<String, Vec<Value>>,
+    lost: BTreeMap<UnitId, (ChangeId, BTreeMap<String, Value>)>,
 }
 
 impl World {
     fn new(defs: UnitDefs) -> World {
         let mut s = empty_state(1000);
         healthy(&mut s, &defs);
-        World { defs, s, failed_since: BTreeMap::new(), drivers: BTreeMap::new(), alternatives: BTreeMap::new() }
+        World {
+            defs,
+            s,
+            failed_since: BTreeMap::new(),
+            drivers: BTreeMap::new(),
+            alternatives: BTreeMap::new(),
+            lost: BTreeMap::new(),
+        }
     }
     fn fail(&mut self, u: &str, at: u64) {
         let id: UnitId = u.parse().unwrap();
@@ -45,6 +53,7 @@ impl World {
             known_drivers: &self.drivers,
             current_planarian_built: false,
             alternatives: &self.alternatives,
+            lost_changes: &self.lost,
         }
     }
 }
@@ -166,4 +175,30 @@ fn suppressed_root_is_never_a_target() {
     let app = UnitId::service("gym-app");
     observe(&mut w.s, &w.defs, &app, Observed::Bound, ProbeResult::Fail("x".into()));
     assert!(candidates(&incident(&app), &w.inputs()).iter().all(|c| c.target != UnitId::service("gym-db")));
+}
+
+/// P22 (§13): a failed unit whose committed change is gone from the
+/// override file gets `repair:reapply` with that change, after the restart.
+#[test]
+fn a_lost_change_is_reapplied() {
+    let mut w = World::new(defs([service("gym-web")]));
+    w.fail("service:gym-web", 10);
+    let web = UnitId::service("gym-web");
+    let orig: BTreeMap<String, Value> =
+        [("service".to_string(), Value::Str("gym-web".into())), ("addr".to_string(), Value::Str("192.0.2.10".into()))]
+            .into();
+    w.lost.insert(web.clone(), (ChangeId("listen-address".into()), orig));
+    let c = candidates(&incident(&web), &w.inputs());
+    assert_eq!(c[0].transition, Transition::RestartUnit(web.clone()));
+    let Transition::ApplyChange { change, args } = &c[1].transition else { panic!("{:?}", c[1]) };
+    assert_eq!(change.0, "repair:reapply");
+    assert_eq!(args.get("change"), Some(&Value::Str("listen-address".into())));
+    assert_eq!(args.get("addr"), Some(&Value::Str("192.0.2.10".into())));
+    // Nothing lost: no reapply.
+    w.lost.clear();
+    assert!(
+        candidates(&incident(&web), &w.inputs())
+            .iter()
+            .all(|c| !matches!(c.transition, Transition::ApplyChange { .. }))
+    );
 }

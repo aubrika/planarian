@@ -376,6 +376,10 @@ fn main() {
     real.logind.compositors = file.session_compositors.clone();
     real.runtime.wifi_permitted = file.catalog.wifi_networks.clone();
     real.nixos = real.nixos.with_budget(file.gc);
+    // §12d (P16): the posture follows the booted generation until a weaker
+    // declaration is booted.
+    let booted = planarian_daemon::config::FileConfig::load(Path::new(planarian_daemon::config::BOOTED_CONFIG)).ok();
+    let posture_decl = planarian_daemon::config::PostureDecl::of(&file, booted.as_ref());
     let core_cfg = CoreConfig {
         exec: ExecConfig {
             settings: file.settings(),
@@ -390,7 +394,8 @@ fn main() {
         runtime_options: file.runtime_options(),
         fresh_boot: fresh_boot(&paths.state, &boot),
         startup_grace: planarian_schema::Millis::secs(file.startup_grace_secs),
-        posture: file.posture,
+        posture: posture_decl.in_force(),
+        posture_decl,
         agent_limits: file.agent_limits.clone(),
     };
     let mut core = Core::start(journal, real, me.clone(), core_cfg);

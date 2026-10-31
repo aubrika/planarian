@@ -14,9 +14,15 @@ fn config() -> CoreConfig {
         exec: Config {
             settings: Settings::default(),
             tables: Tables {
-                catalog: ["service-enable", "font-scale", "listen-address", "repair:reenable-predicted"]
-                    .map(|s| ChangeId(s.into()))
-                    .into(),
+                catalog: [
+                    "service-enable",
+                    "font-scale",
+                    "listen-address",
+                    "repair:reenable-predicted",
+                    "repair:reapply",
+                ]
+                .map(|s| ChangeId(s.into()))
+                .into(),
                 runtime_allowlist: ["font.scale", "wifi.network"].map(String::from).into(),
                 option_sensitivity: vec![("services.openssh".into(), Sensitivities::of(&[Sensitivity::Security]))],
                 model_catalog: Default::default(),
@@ -42,6 +48,7 @@ fn config() -> CoreConfig {
         fresh_boot: true,
         startup_grace: planarian_incident::STARTUP_GRACE,
         posture: planarian_schema::Posture::Standard,
+        posture_decl: Default::default(),
         agent_limits: Default::default(),
     }
 }
@@ -994,4 +1001,64 @@ fn a_deferred_repair_is_deferred_in_fact() {
     r.ticks(4);
     assert_eq!(r.calls("restart(service:gym-web)"), 1);
     assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
+}
+
+/// K10 (§16): mark-good needs root at an interactive terminal, the
+/// terminal established by the daemon from the peer; an administrator
+/// without one, or a non-root administrator, is refused.
+#[test]
+fn mark_good_needs_root_at_a_terminal() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let refused =
+        |resp: &Response| matches!(resp, Response::Error { message } if message.contains("interactive terminal"));
+    let resp = r.core.handle(ADMIN, Request::MarkGood { accept_unconfirmed: false });
+    assert!(refused(&resp), "{resp:?}");
+    let resp = r.core.handle(Peer::new(1001, true).at_terminal(), Request::MarkGood { accept_unconfirmed: false });
+    assert!(refused(&resp), "{resp:?}");
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::MarkGood { accept_unconfirmed: false });
+    assert!(!refused(&resp), "{resp:?}");
+}
+
+/// P17 (§16): `report boot` prints the last boot report; `posture` prints
+/// the posture and timeout in force and says when a weaker declaration
+/// waits for the next boot (P16).
+#[test]
+fn report_boot_and_posture_answer() {
+    let mut cfg = config();
+    cfg.posture_decl = crate::config::PostureDecl {
+        declared: planarian_schema::Posture::Relaxed,
+        declared_timeout_secs: 600,
+        booted: Some((planarian_schema::Posture::Standard, 120)),
+    };
+    cfg.posture = cfg.posture_decl.in_force();
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let text = |resp: Response| match resp {
+        Response::Ok { message } => message,
+        other => panic!("{other:?}"),
+    };
+    let boot = text(r.core.handle(ALICE, Request::ReportBoot));
+    assert!(boot.contains("clean"), "{boot}");
+    let p = text(r.core.handle(ALICE, Request::Posture));
+    assert!(p.starts_with("posture: Standard, boot-ready timeout 120 s"), "{p}");
+    assert!(p.contains("declares Relaxed, 600 s") && p.contains("next boot"), "{p}");
+}
+
+/// P22: the daemon finds the change committed for a unit that the override
+/// file no longer carries (a hand edit took it out), for `repair:reapply`.
+#[test]
+fn a_committed_change_missing_from_the_overrides_is_lost() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let args: BTreeMap<String, Value> =
+        [("service".to_string(), Value::Str("gym-web".into())), ("addr".to_string(), Value::Str("127.0.0.1".into()))]
+            .into();
+    let resp = r.core.handle(ADMIN, Request::Apply { change: ChangeId("listen-address".into()), args: args.clone() });
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let l = r.core.ledger();
+    assert!(r.core.lost_changes(&l).is_empty(), "carried");
+    r.fake.w().overrides.assignments.remove("services.gym-web.listenAddress");
+    let lost = r.core.lost_changes(&l);
+    assert_eq!(lost.get(&UnitId::service("gym-web")), Some(&(ChangeId("listen-address".into()), args)));
 }
