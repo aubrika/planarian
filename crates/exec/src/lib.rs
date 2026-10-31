@@ -567,6 +567,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             },
             base_source: plan.staged.as_ref().map(|s| s.base_source),
             staged_source: plan.staged.as_ref().map(|s| s.staged_source),
+            candidate_nar: plan.built.as_ref().and_then(|b| b.nar),
             base_override: plan.base_override,
             candidate_override: plan.candidate_override,
             gc_root: plan.built.as_ref().map(|b| b.root.clone()),

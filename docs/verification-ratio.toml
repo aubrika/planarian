@@ -195,7 +195,7 @@ assumes = ["V1", "V2", "P3"]
 id = "I17"
 statement = "The set of principals holding administrator capability is never empty."
 phase = "A"
-tested = ["policy::i17_root_is_always_an_administrator", "gym en-i17-root-administers-without-the-group"]
+tested = ["gym en-i17-root-administers-without-the-group"]
 discharged = ["policy::is_administrator", "policy::i17_administrators_never_empty"]
 assumes = ["P8", "U2"]
 

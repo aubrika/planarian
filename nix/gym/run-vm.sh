@@ -22,12 +22,12 @@ for id in "${ids[@]}"; do
   if [ -n "$p" ] && [ -f "$p/verdict.json" ]; then cp "$p/verdict.json" "$out/$id.json"; else echo "{\"id\":\"$id\",\"result\":\"ERROR\",\"notes\":[\"the test did not run\"]}" > "$out/$id.json"; fi
 done
 catalog=${GYM_CATALOG:-crates/gym/catalog/phase-a.toml}
-# R12: exits nonzero on ERROR, FAIL or PARTIAL, and on an UNSUPPORTED the
-# catalog does not waive for the VM harness (`waive_unsupported.vm`).
-python3 - "$out" "$catalog" <<'PY'
-import json, sys, os, collections, tomllib
+# R12: the §15 harness contract (nix/gym/harness-contract.py): nonzero on
+# ERROR, FAIL or PARTIAL, and on an UNSUPPORTED must-pass or acceptance
+# entry without a waiver in docs/deviations.md.
+python3 - "$out" <<'PY'
+import json, sys, os, collections
 d = sys.argv[1]
-waived = {e["id"] for e in tomllib.load(open(sys.argv[2], "rb"))["fault"] if "vm" in e.get("waive_unsupported", {})}
 rs = [json.load(open(os.path.join(d, f))) for f in sorted(os.listdir(d))]
 t = collections.Counter(r["result"] for r in rs)
 for r in rs:
@@ -38,8 +38,5 @@ for r in rs:
 print()
 print(dict(t))
 print(f'cleared on the VM harness: {t["PASS"]} of {len(rs)} run')
-bad = [r["id"] for r in rs if not (r["result"] == "PASS" or (r["result"] == "UNSUPPORTED" and r["id"] in waived))]
-if bad:
-    print(f"not cleared ({len(bad)}): {' '.join(bad)}")
-    sys.exit(1)
 PY
+python3 "${GYM_CONTRACT:-nix/gym/harness-contract.py}" vm "$catalog" "${GYM_DEVIATIONS:-docs/deviations.md}" "$out"/*.json

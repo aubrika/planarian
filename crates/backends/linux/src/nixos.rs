@@ -39,10 +39,6 @@ pub struct Registry {
     pub next: u64,
     pub paths: BTreeMap<u64, String>,
     pub overrides: BTreeMap<u64, Hash>,
-    /// The NAR hash of each candidate this backend built, as the store
-    /// reported it at build time (C6).
-    #[serde(default)]
-    pub nar: BTreeMap<String, String>,
 }
 
 impl Registry {
@@ -200,6 +196,34 @@ pub fn nar_hash_of(json: &str, path: &str) -> Option<String> {
         _ => return None,
     };
     entry["narHash"].as_str().map(String::from)
+}
+
+/// A `sha256-<base64>` (SRI) hash as the 32 bytes it names; None for any
+/// other algorithm or a malformed value.
+pub fn sri_sha256(sri: &str) -> Option<Hash> {
+    let b64 = sri.strip_prefix("sha256-")?;
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let mut out = Vec::with_capacity(32);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in b64.bytes().take_while(|c| *c != b'=') {
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    out.try_into().ok().map(Hash)
 }
 
 fn store_nar_hash(path: &str) -> Option<String> {
@@ -787,11 +811,8 @@ impl GenerationBackend for Nixos {
         // reached (`/run/current-system` is resolved the same way).
         let path = std::fs::canonicalize(&printed).map(|p| p.to_string_lossy().into_owned()).unwrap_or(printed);
         let generation = self.with_registry(|r| r.id_for(&path))?;
-        if let Some(h) = store_nar_hash(&path) {
-            self.with_registry(|r| {
-                r.nar.insert(path.clone(), h);
-            })?;
-        }
+        // C6: the transaction carries this (`candidate_nar`) to verification.
+        let nar = store_nar_hash(&path).and_then(|h| sri_sha256(&h));
         // The candidate is not usable without its plan (rule 21, R10).
         let activation = match self.dry_activation(&StorePath(path.clone())) {
             Ok(a) => a,
@@ -800,7 +821,7 @@ impl GenerationBackend for Nixos {
                 return Err(o);
             }
         };
-        Ok(Built { generation, path: StorePath(path), root: root.to_string_lossy().into_owned(), activation })
+        Ok(Built { generation, path: StorePath(path), root: root.to_string_lossy().into_owned(), activation, nar })
     }
 
     fn dry_activation(&self, path: &StorePath) -> Result<ActivationPlan, Outcome> {
@@ -825,18 +846,17 @@ impl GenerationBackend for Nixos {
     }
 
     /// C6: the store path's contents still hash to what the store recorded
-    /// (`nix-store --verify-path`), and that is the NAR hash recorded when
-    /// this backend built it. Existence alone is not enough.
-    fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
+    /// (`nix-store --verify-path`), and that is the NAR hash the transaction
+    /// recorded when it built the candidate. Existence alone is not enough.
+    fn verify_candidate(&self, path: &StorePath, nar: Option<&Hash>) -> Result<bool, Outcome> {
         if !Path::new(&path.0).join("bin/switch-to-configuration").exists() {
             return Ok(false);
         }
         if !run(&["nix-store", "--verify-path", &path.0], NIX).ok() {
             return Ok(false);
         }
-        let recorded = self.with_registry(|r| r.nar.get(&path.0).cloned())?;
-        Ok(match recorded {
-            Some(want) => store_nar_hash(&path.0).is_some_and(|got| got == want),
+        Ok(match nar {
+            Some(want) => store_nar_hash(&path.0).and_then(|h| sri_sha256(&h)).is_some_and(|got| got == *want),
             // Not built here (a generation from outside Planarian): the
             // store's own record is the one --verify-path checked.
             None => true,
@@ -1243,6 +1263,16 @@ mod tests {
         assert!(n.age_out_roots_at(now).is_empty(), "recent: a build may still be waiting on it");
         assert_eq!(n.age_out_roots_at(now + PARKING_GRACE), vec!["a".to_string()]);
         assert!(std::fs::symlink_metadata(builds.join("a")).is_err());
+    }
+
+    /// C6: an SRI sha256 decodes to its 32 bytes; anything else is None.
+    #[test]
+    fn sri_hashes_decode() {
+        // sha256 of the empty string.
+        let h = sri_sha256("sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=").unwrap();
+        assert_eq!(h.to_hex(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert!(sri_sha256("sha512-AAAA").is_none());
+        assert!(sri_sha256("sha256-AAAA").is_none(), "too short");
     }
 
     /// C6: the NAR hash is read from either shape of `nix path-info --json`.

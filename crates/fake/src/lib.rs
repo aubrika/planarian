@@ -222,6 +222,8 @@ pub struct World {
     /// Fault injection (C6): the next candidate's store contents no longer
     /// hash to the NAR hash recorded when it was built.
     pub nar_mismatch: bool,
+    /// Each probe batch takes this long on the fake clock (P9's slow tick).
+    pub probe_batch_ms: u64,
     /// Every candidate's activation also restarts these (a user's audio,
     /// say), so it disturbs an active session (§12f).
     pub activation_restarts: BTreeSet<UnitId>,
@@ -258,6 +260,11 @@ pub struct World {
 }
 
 impl World {
+    /// The fake store's NAR hash of a path.
+    pub fn nar_of(path: &StorePath) -> Hash {
+        Hash::of(path.0.as_bytes())
+    }
+
     /// What switching from the current generation to `g` would do: the
     /// dry activation the real backend runs, from the two evaluations.
     pub fn dry_plan(&self, g: GenerationId) -> ActivationPlan {
@@ -799,7 +806,8 @@ impl GenerationBackend for Fake {
         let plan = w.dry_plan(g);
         let root = format!("/nix/var/nix/gcroots/planarian/builds/{}", eval.source.to_hex());
         w.gc_roots.insert(root.clone());
-        Ok(Built { generation: g, path: new.path, root, activation: plan })
+        let nar = Some(World::nar_of(&new.path));
+        Ok(Built { generation: g, path: new.path, root, activation: plan, nar })
     }
 
     fn dry_activation(&self, path: &StorePath) -> Result<ActivationPlan, Outcome> {
@@ -816,9 +824,12 @@ impl GenerationBackend for Fake {
         self.w().override_store.get(h).cloned().ok_or_else(|| Outcome::Failed("no override content".into()))
     }
 
-    fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
+    fn verify_candidate(&self, path: &StorePath, nar: Option<&Hash>) -> Result<bool, Outcome> {
         let mut w = self.w();
-        if std::mem::take(&mut w.nar_mismatch) {
+        // C6: the store's hash of the path now; `nar_mismatch` makes it
+        // differ from the one recorded at build, once.
+        let now = if std::mem::take(&mut w.nar_mismatch) { Hash::of(b"changed") } else { World::nar_of(path) };
+        if nar.is_some_and(|n| *n != now) {
             return Ok(false);
         }
         Ok(w.gens.values().any(|g| &g.path == path)
@@ -1055,6 +1066,8 @@ impl ProbeBackend for Fake {
     fn run_batch(&self, jobs: &[(UnitId, ProbeDef)]) -> Vec<ProbeResult> {
         let mut w = self.w();
         w.probe_batches += 1;
+        let slow = w.probe_batch_ms;
+        w.now = Timestamp(w.now.0 + slow);
         jobs.iter()
             .map(|(unit, p)| {
                 if let ProbeKind::FreeSpace { path, min_bytes, min_permille } = &p.kind {

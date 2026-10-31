@@ -60,6 +60,9 @@ pub struct Built {
     pub root: String,
     /// What switching to it would start, stop, restart and reload (dry-activate).
     pub activation: ActivationPlan,
+    /// Its NAR hash, as the store reported it at build time (C6).
+    #[serde(default)]
+    pub nar: Option<Hash>,
 }
 
 /// How a unit's main process last ended, as the supervisor reports it.
@@ -132,7 +135,10 @@ pub trait GenerationBackend {
     fn evaluate(&self, src: &StagedSource) -> Result<EvaluatedGeneration, Outcome>;
     /// Store-only; roots its own output.
     fn build(&self, eval: &EvaluatedGeneration) -> Result<Built, Outcome>;
-    fn verify_candidate(&self, path: &StorePath, expected: &Hash) -> Result<bool, Outcome>;
+    /// The path is a whole system, its contents still hash to what the store
+    /// recorded, and, when `nar` is given (the transaction built it), that is
+    /// the NAR hash recorded at build (§9 step 3, C6).
+    fn verify_candidate(&self, path: &StorePath, nar: Option<&Hash>) -> Result<bool, Outcome>;
     /// What switching from the running generation to an existing one would
     /// start, stop, restart and reload (its dry activation), for
     /// SwitchGeneration / Revert / Rollback (§11, R04). An activation that

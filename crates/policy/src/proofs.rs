@@ -318,4 +318,15 @@ pub proof fn i14_facts_caller_is_not_authority(a: Input, b: Input)
 {
 }
 
+/// I17 (A, given root exists): root holds the administrator capability
+/// whatever the group file says, so the set of principals holding it is
+/// never empty; no change to the group can empty it.
+pub proof fn i17_administrators_never_empty(in_admin_group: bool)
+    ensures
+        administrator_spec(Some(0u32), in_admin_group),
+        exists|uid: Option<u32>| #[trigger] administrator_spec(uid, false),
+{
+    assert(administrator_spec(Some(0u32), false));
+}
+
 } // verus!

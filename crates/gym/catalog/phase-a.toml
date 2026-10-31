@@ -1635,8 +1635,6 @@ spec = ["§10 storage", "§12b", "I3"]
 tags = []
 scoring = "repair"
 harness = ["fake", "vm"]
-# R12: the harness contract's waiver; any other UNSUPPORTED fails a run.
-waive_unsupported = { vm = "the test VM's store is the host's, shared under a tmpfs overlay: collecting garbage cannot free it" }
 intent = { kind = "none" }
 setup = [{ raw = "out_of_band_rebuild", edit = "create 12 throwaway generations", activate = false }]
 inject = { raw = "fill_fs", fs = "device:fs-nix", as_uid = 0, until = "below-threshold", with = "store-garbage" }
@@ -2031,7 +2029,6 @@ spec = ["§10 boot confirmation", "I1"]
 tags = []
 scoring = "repair"
 harness = ["vm"]
-waive_unsupported = { vm = "the test VM boots its kernel directly, so a kernel parameter in the boot entry never reaches it" }
 intent = { kind = "none" }
 setup = [
   { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" },

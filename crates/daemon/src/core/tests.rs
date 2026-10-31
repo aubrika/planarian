@@ -1100,3 +1100,18 @@ fn an_owner_edit_while_waiting_is_stale_when_the_window_opens() {
     assert_eq!(r.calls("activate_live"), 0, "never activated");
     assert!(r.core.notices.iter().any(|n| n.contains("not activated")), "{:?}", r.core.notices);
 }
+
+/// P9: a tick over the 500 ms budget is warned, once per slow tick, naming
+/// the probes that ran; a tick within it is not.
+#[test]
+fn a_slow_tick_is_warned() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    assert_eq!(r.core.slow_tick_warnings, 0);
+    r.fake.w().probe_batch_ms = 800;
+    r.ticks(1);
+    assert_eq!(r.core.slow_tick_warnings, 1);
+    r.fake.w().probe_batch_ms = 0;
+    r.ticks(2);
+    assert_eq!(r.core.slow_tick_warnings, 1);
+}

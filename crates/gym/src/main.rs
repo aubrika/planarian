@@ -209,6 +209,7 @@ fn main() {
         }
         "run" => {
             let mut unwaived_unsupported = vec![];
+            let waived = harness_waivers(&std::fs::read_to_string("docs/deviations.md").unwrap_or_default());
             let mut tally = std::collections::BTreeMap::new();
             let mut metrics = metrics::Metrics::default();
             for e in selected {
@@ -216,9 +217,14 @@ fn main() {
                 let r = run_entry(e);
                 metrics.add(e, r.result == Result_::Pass, r.result == Result_::Partial, r.sim.as_ref());
                 *tally.entry(format!("{:?}", r.result)).or_insert(0) += 1;
-                // R15: an UNSUPPORTED the catalog does not waive for this
-                // harness (`waive_unsupported.fake`) fails a strict run.
-                if r.result == Result_::Unsupported && e.get("waive_unsupported").and_then(|w| w.get("fake")).is_none()
+                // R15, the §15 harness contract: an UNSUPPORTED must-pass or
+                // acceptance entry fails a strict run unless docs/deviations.md
+                // waives it for the fake harness.
+                let gating = e.get("scoring").and_then(T::as_str) == Some("must-pass")
+                    || e.get("tags")
+                        .and_then(T::as_array)
+                        .is_some_and(|t| t.iter().any(|x| x.as_str() == Some("acceptance")));
+                if r.result == Result_::Unsupported && gating && !waived.contains(&(id.to_string(), "fake".to_string()))
                 {
                     unwaived_unsupported.push(id.to_string());
                 }
@@ -273,5 +279,41 @@ fn main() {
             eprintln!("unknown command {other}");
             std::process::exit(2);
         }
+    }
+}
+
+/// The "Harness waivers" table of docs/deviations.md (§15 harness
+/// contract): (entry, harness) pairs. nix/gym/harness-contract.py reads the
+/// same table for the VM runners.
+fn harness_waivers(deviations: &str) -> std::collections::BTreeSet<(String, String)> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut table = false;
+    for line in deviations.lines() {
+        if line.starts_with("## ") {
+            table = line.trim().starts_with("## Harness waivers");
+            continue;
+        }
+        if !table {
+            continue;
+        }
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        if let [_, entry, harness, ..] = cells.as_slice()
+            && let Some(id) = entry.strip_prefix('`').and_then(|x| x.strip_suffix('`'))
+        {
+            out.insert((id.to_string(), harness.to_string()));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod waiver_tests {
+    /// R15: only rows of the waiver table count, by entry and harness.
+    #[test]
+    fn harness_waivers_are_read_from_their_table() {
+        let doc = "# D\n| `elsewhere` | vm | no |\n## Harness waivers (§15)\n| Entry | Harness | Reason |\n| --- | --- | --- |\n| `a-b` | vm | why |\n## Next\n| `c` | fake | no |\n";
+        let w = super::harness_waivers(doc);
+        assert_eq!(w.len(), 1);
+        assert!(w.contains(&("a-b".to_string(), "vm".to_string())));
     }
 }

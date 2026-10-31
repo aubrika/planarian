@@ -433,8 +433,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
         let Some((cand, path)) = txn.candidate.clone() else {
             return self.reject(id, RejectReason::Other("no candidate".into()));
         };
-        let expected = txn.staged_source.unwrap_or(Hash::ZERO);
-        if self.host.generations().verify_candidate(&path, &expected) != Ok(true) {
+        let expected = txn.candidate_nar;
+        if self.host.generations().verify_candidate(&path, expected.as_ref()) != Ok(true) {
             return self.reject(id, RejectReason::Other("candidate failed verification".into()));
         }
         self.wait_built(id, "takes effect at boot")?;
@@ -583,8 +583,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
         let Some((cand, path)) = txn.candidate.clone() else {
             return self.reject(txn.id, RejectReason::Other("no candidate".into()));
         };
-        let expected = txn.staged_source.unwrap_or(Hash::ZERO);
-        match self.host.generations().verify_candidate(&path, &expected) {
+        let expected = txn.candidate_nar;
+        match self.host.generations().verify_candidate(&path, expected.as_ref()) {
             Ok(true) => {}
             _ => return self.reject(txn.id, RejectReason::Other("candidate failed verification".into())),
         }

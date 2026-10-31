@@ -158,6 +158,8 @@ pub struct Core<B: Backends + Clone, S: Store> {
     last: Option<(SystemState, UnitDefs)>,
     choices: BTreeMap<u32, Vec<intent::Match>>,
     incident_parked: BTreeMap<IncidentId, TxnId>,
+    /// Slow ticks warned (P9).
+    pub slow_tick_warnings: u64,
     /// §12a write-backs queued behind an active generation transaction,
     /// with their caller (P7). Submitted once none is live.
     writebacks: Vec<(Proposal, Authorization)>,
@@ -338,6 +340,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             last: None,
             choices: BTreeMap::new(),
             incident_parked: BTreeMap::new(),
+            slow_tick_warnings: 0,
             writebacks: vec![],
             confirm,
             manifest_gen: current,
@@ -1009,6 +1012,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     pub fn tick(&mut self) {
         let (s, defs) = self.observe();
         let now = s.observed_at;
+        // P9: a tick over its 500 ms budget is warned, with the probes that
+        // ran in it (they are the usual cause).
+        if let Some((took, ran)) = self.asm.slow_tick.take() {
+            eprintln!(
+                "planariad: warning: slow tick: {} ms (budget {} ms); probes run: {}",
+                took.0,
+                planarian_state::TICK_BUDGET.0,
+                if ran.is_empty() { "none".to_string() } else { ran.join(", ") }
+            );
+            self.slow_tick_warnings += 1;
+        }
 
         // §12f quiet mode: while foreground work holds in any session.
         let quiet = s.conditions.iter().any(|c| matches!(c, Condition::Foreground { .. }));
