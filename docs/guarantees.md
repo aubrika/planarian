@@ -16,7 +16,7 @@ assumptions in `assumptions.md`; the counts in `verification-ratio.toml`.
 | **d:a** | The verification ratio: proof obligations **d**ischarged to obligations **a**ssumed, per invariant and summed. |
 | **trust count, \|𝒯\|** | The number of `assumptions.md` entries plus every `external_body` and `assume` site in the verified crates. |
 
-Today (SPEC v4.6, re-accounted once for v4.5 as §17a allows): **d:a = 47:56, trust count = 37, internal-unproven count = 5.** The ratio counts proof
+Today (SPEC v4.6; re-accounted once for v4.5 as §17a allows, and re-baselined on 2026-10-31 when I9, I24 and I25 were accounted): **d:a = 47:62, trust count = 37, internal-unproven count = 5.** The ratio counts proof
 obligations, not the sets themselves, so it has its own name. In plain
 text, write V-base and T-base. (Until 2026-10-29 these were 0v, 0t,
 "0v:0t" and "the size of 0t"; the new names replace them everywhere,

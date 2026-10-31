@@ -85,8 +85,8 @@ pub fn parse_bypasses(text: &str) -> (BTreeMap<String, Vec<String>>, Vec<String>
         let cells: Vec<&str> = line.trim().trim_matches('|').split('|').map(str::trim).collect();
         let id = cells.first().copied().unwrap_or("");
         let (kind, width) = match id.split_once('-') {
-            Some(("B", n)) if n.parse::<u32>().is_ok() => ('B', 7),
-            Some(("X", n)) if n.parse::<u32>().is_ok() => ('X', 5),
+            Some(("B", n)) if n.parse::<u32>().is_ok() => ('B', 8),
+            Some(("X", n)) if n.parse::<u32>().is_ok() => ('X', 6),
             _ => continue,
         };
         if !seen.insert(id.to_string()) {
@@ -95,6 +95,17 @@ pub fn parse_bypasses(text: &str) -> (BTreeMap<String, Vec<String>>, Vec<String>
         if cells.len() != width {
             errors.push(format!("{BYPASSES}: {id} has {} cells, want {width}", cells.len()));
             continue;
+        }
+        // §17c: every row names the invariants it limits, or `all`, or `—`.
+        let invariants = cells[width - 1];
+        let named = invariants == "all"
+            || invariants == "—"
+            || invariants
+                .split(',')
+                .map(str::trim)
+                .all(|i| i.strip_prefix('I').is_some_and(|n| n.parse::<u32>().is_ok()));
+        if invariants.is_empty() || !named {
+            errors.push(format!("{BYPASSES}: {id}: invariants {invariants:?} is not a list of ids, `all` or `—`"));
         }
         if kind == 'X' {
             continue;
@@ -260,13 +271,15 @@ mod tests {
             assert!(errors.is_empty(), "{errors:?}");
             assert!(open.values().flatten().count() > 0);
         }
-        let row = |id: &str, sev: &str, status: &str| format!("| {id} | r | b | {sev} | {status} | m | A |\n");
+        let row = |id: &str, sev: &str, status: &str| format!("| {id} | r | b | {sev} | {status} | m | A | I1, I2 |\n");
         let bad = [
             row("B-1", "High", "Open") + &row("B-1", "Low", "Open"),
             row("B-2", "Severe", "Open"),
             row("B-3", "Low", "Done"),
             "| B-4 | r | b | Low | Open |\n".to_string(),
             "| X-1 | r | b | n |\n".to_string(),
+            "| B-7 | r | b | Low | Open | m | A | |\n".to_string(),
+            "| B-8 | r | b | Low | Open | m | A | everything |\n".to_string(),
         ];
         for text in bad {
             assert!(!parse_bypasses(&text).1.is_empty(), "accepted: {text}");

@@ -16,6 +16,7 @@ mod live;
 mod metrics;
 mod serve;
 mod sim;
+mod site;
 #[cfg(test)]
 mod tests;
 mod verification;
@@ -131,6 +132,9 @@ fn main() {
         let r = verification::run(args.iter().any(|a| a == "--write-baseline"), args.iter().any(|a| a == "--gate"));
         print!("{}", r.text);
         std::process::exit(if r.ok { 0 } else { 1 });
+    }
+    if args.first().map(String::as_str) == Some("site") {
+        std::process::exit(site::main(&args[1..]));
     }
     if args.first().map(String::as_str) == Some("vm") {
         // The VM harness's in-VM half (live.rs).

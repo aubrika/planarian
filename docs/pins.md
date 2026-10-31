@@ -11,3 +11,4 @@ Changes to pins happen only by PR (SPEC §17).
 | z3 (for Verus) | 4.16.0, shipped in the Verus release | `nix/verus.nix` |
 | Kani | `kani-verifier` 0.68.0 (CBMC 6.11.0, its own nightly-2026-08-21 toolchain), installed with `cargo install --locked kani-verifier` | not in the flake: `cargo kani` |
 | vstd | `0.0.0-2026-10-25-0158` from crates.io (the pinned Verus commit's) | `Cargo.toml` |
+| mdBook (the guarantees site, §17c) | 0.5.2, nixpkgs' at the pin above (`nix shell --inputs-from . nixpkgs#mdbook`) | `.github/workflows/site.yml` |
