@@ -173,6 +173,14 @@ let
   toId = s: if lib.hasInfix ":" s then s else "service:${s}";
   managed = lib.mapAttrsToList unitId cfg.units;
 
+  # §10 (S06): an edge to an external dependency must be one the diagnoser
+  # follows: Requires, or Diagnostic at its threshold (0.7) or above.
+  isExternal = to: lib.hasPrefix "external:" to || lib.hasPrefix "service:external:" to;
+  weakExternalEdges = lib.concatLists (lib.mapAttrsToList (name: u:
+    map (e: "${name} -> ${e.to} (${e.kind}${lib.optionalString (e.kind == "Diagnostic") " ${toString e.confidence}/1000"})")
+      (builtins.filter (e: isExternal e.to && !(e.kind == "Requires" || (e.kind == "Diagnostic" && e.confidence >= 700))) u.edges)
+  ) cfg.units);
+
   depId = d:
     if lib.hasSuffix ".service" d then "service:${lib.removeSuffix ".service" d}"
     else if lib.hasSuffix ".target" d then "target:${lib.removeSuffix ".target" d}"
@@ -506,6 +514,10 @@ in
       {
         assertion = !(cfg.package.testBuild or false) || cfg.testBuild;
         message = "services.planarian.package is the gym's test build (planarian-gym-hooks), which accepts fault injection over its socket; it is for the gym's VM tests only (SPEC §15).";
+      }
+      {
+        assertion = weakExternalEdges == [ ];
+        message = "services.planarian: an edge to an external dependency must be Requires, or Diagnostic with confidence at least 700 (the diagnoser's threshold), so an outage is diagnosed as one and never restarts a local unit (SPEC §10). Too weak: ${lib.concatStringsSep ", " weakExternalEdges}.";
       }
     ];
 
