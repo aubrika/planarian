@@ -123,7 +123,7 @@ fn root() -> Authorization {
 #[test]
 fn root_proposals_require_resubmission_by_an_independent_administrator() {
     let mut r = Rig::new();
-    let off = change("service-enable", &[("service", Value::Str("sshd".into())), ("enable", Value::Bool(false))]);
+    let off = change("service-enable", &[("service", Value::Str("sshd".into())), ("enabled", Value::Bool(false))]);
     let Submitted::Parked { approve, .. } = r.propose(off.clone(), root()) else { panic!("must ask") };
     let (state, defs) = r.observe();
     assert!(matches!(r.ex.approve(&approve, &root(), &state, &defs), Submitted::Rejected { .. }));
@@ -682,6 +682,10 @@ fn approval_consumption_write_failure_keeps_execution_parked() {
 fn stopped_override_has_the_same_effects_and_floor_as_a_stop() {
     let dm = UnitId::service("display-manager");
     let gs = UnitId::target("graphical-session");
+    let session_targets: Vec<UnitId> = [("1", 1001), ("2", 1002)]
+        .into_iter()
+        .map(|(id, uid)| UnitId { scope: Scope::User { uid, session: Some(id.into()) }, ..gs.clone() })
+        .collect();
     for caller in [admin(), user_authorization(Actor::user(1001), true)] {
         let mut expected = None;
         for kind in 0..3 {
@@ -707,8 +711,15 @@ fn stopped_override_has_the_same_effects_and_floor_as_a_stop() {
             assert!(matches!(result, Submitted::Parked { .. }), "{result:?}");
             let (facts, decision) = r.ex.last.clone().unwrap();
             assert_eq!(facts.disruption, Disruption::SessionLoss);
-            assert!(facts.affected_units.contains(&gs));
+            // The assembler instantiates the template for each graphical
+            // session. Both concrete dependents must carry the stop's risk.
+            assert!(facts.affected_units.contains(&dm));
+            for target in &session_targets {
+                assert!(facts.affected_units.contains(target), "{facts:?}");
+            }
+            assert!(!facts.affected_units.contains(&gs));
             assert!(facts.other_sessions_affected);
+            assert_eq!(facts.affected_sessions, vec!["1".to_string(), "2".to_string()]);
             let effect = (facts.affected_units, facts.sensitivity, facts.disruption, facts.recovery, decision);
             if let Some(ref wanted) = expected {
                 assert_eq!(&effect, wanted);
