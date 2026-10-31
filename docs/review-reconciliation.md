@@ -57,3 +57,45 @@ implementation it requires is listed as open or closed separately).
 | B-20 | A second `agent run` under a running agent's name rebinds its authority (I24) | open: registered and fixed first (rule 19(b)) |
 | — | Approval at a terminal had no effect on the VM harness (the `script` wrapper) | fixed in `b219d81`; VM confirmation pending |
 | — | Collected generations kept their build and `gen-<n>` GC roots, so collection freed nothing | fixed in `805cd1c` |
+
+## Closed since the reconciliation
+
+The tables above are the snapshot at `b219d81`. These have closed since,
+each with its acceptance case in the same commit (rule 19(d)); every case
+was checked to fail with its fix removed. Commits on `main` came before
+branch protection; the rest are in PR #2.
+
+| Id | Commit | Acceptance |
+| --- | --- | --- |
+| B-20 (I24) | `8231a07` (main) | `agent-name-collision` (fake, VM) |
+| R03 | `20d4f2c` (main) | `override-stopped-equals-stop` |
+| R08 | `4d27bce` (main) | `release-refused-leaves-incident` |
+| R10 | `c6347cb` (main) | `dry-activate-exit-nonzero`, `-timeout`, `-truncated` |
+| R09 | `443667e` | `unauthorized-change-does-no-work` |
+| R07 | `ff11187` | `degraded-unit-loses-a-probe` |
+| R02 (I25) | `af5bf42` | `floor-moves-via-watchdog`, `floor-moves-via-boot-only`, `revert-to-older-sets-no-floor` |
+| S07 (tokens), C21 | `0bb8783` | `approval-dies-with-daemon` (fake, VM), `reprepared-keeps-caller` |
+| S07 (I6's list) | `fa44baf` | kernel test `i6_generation_transactions_are_exclusive` |
+| I7 (C1, C17) | `d9e1ed2` | `approval_recorded_by` on `approve-at-terminal-runs` |
+| C14 | `ced94fa` | Verus lemma `agents_and_unattributed_are_refused` |
+| C16 | `7059f7d` | `checkpoint-bad-crc`; txn test `damaged_checkpoint_is_integrity` |
+| S03 | `6c8967e`, `edc849f`, `0251fb8` | `built-parking-expires`, `awaiting-boot-reminds-daily`; core test `an_expired_wait_reopens_its_incident` |
+| S05 | `cfe40ba` | `ssh-session-expects-no-desktop` |
+| S06 | `728cfe5` | module-eval: a 500/1000 edge rejected, 700/1000 accepted |
+| C3 | `fe94ffe` | `override-over-attested-refused` |
+| P23 | `8a0e523` | `residue-first-kill-teaches-stop` |
+| R01, S01 | `88a984a` | `crash-publishing-before-publish`, `crash-publishing-after-publish` |
+| S02 | `cd9a522`, `4e5cd1c` | `boot-only-admitted-not-confirmed`, `boot-only-repair-during-confirmation`, `boot-only-kernel-confirmed` |
+
+`4e5cd1c` also carries an owner decision (31 Oct) amending I6, §10 and §12
+Concurrency: unit and device repairs run while an admitted boot-only change
+awaits its confirmation, and a canonical unit that needed a repair in that
+window means the change is not confirmed.
+
+These cases run on the fake harness only unless marked; the VM catalog run
+of rule 19(f) is still to come.
+
+Still open from the tables above: R04, R05, R06, R11, R12, R13, R14 (the
+rest), R15 (the fake runner and `ci.yml`), R16 (`ga-status.md` waits for
+19(f)); S04 is docs only. Still open from §28 beyond R and S: C4, C6, P7, P8,
+P13–P18, P22, K10.
