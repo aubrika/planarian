@@ -491,6 +491,11 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 candidate: plan.cand_eval.as_ref().map(manifest_of),
                 base: manifest_of(&plan.base_eval),
                 pre: defs.keys().map(|u| (u.clone(), state.status(u, defs))).collect(),
+                pre_passing: defs
+                    .keys()
+                    .map(|u| (u.clone(), state.passing_readiness(u, defs)))
+                    .filter(|(_, p)| !p.is_empty())
+                    .collect(),
             },
         }
     }

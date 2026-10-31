@@ -121,6 +121,24 @@ impl SystemState {
             .collect()
     }
 
+    /// The applicable Readiness probes whose latest evidence is a fresh pass
+    /// (§9: what a change may not take away, whatever the unit's status).
+    pub fn passing_readiness(&self, id: &UnitId, defs: &UnitDefs) -> Vec<ProbeId> {
+        let (Some(def), Some((_, evidence))) = (defs.get(id), self.units.get(id)) else { return vec![] };
+        def.probes
+            .iter()
+            .filter(|p| p.role == ProbeRole::Readiness)
+            .filter(|p| {
+                evidence
+                    .iter()
+                    .filter(|e| e.probe == p.id)
+                    .max_by_key(|e| e.at)
+                    .is_some_and(|e| e.fresh_at(self.observed_at) && matches!(e.result, ProbeResult::Pass))
+            })
+            .map(|p| p.id.clone())
+            .collect()
+    }
+
     /// Status derivation, in the order §8 gives:
     /// Overridden; not expected; definite Failed; Unknown on stale or timed-out
     /// Readiness evidence; Running / Degraded from Active; otherwise from `Observed`.

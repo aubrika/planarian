@@ -124,6 +124,20 @@ impl<B: Backends> ExecHost<B> {
             }
             out.push(format!("{u} was Running before and is now {now:?}"));
         }
+        // Per probe (§9, R07): a Readiness probe that passed before passes
+        // now, for every unit that is still expected under these defs, so a
+        // unit already Degraded by one probe cannot lose another unnoticed.
+        for (u, passing) in &txn.check.pre_passing {
+            if !defs.contains_key(u) || !s.expected(u, defs) {
+                continue;
+            }
+            let failing = s.failing_readiness(u, defs);
+            let lost: Vec<&str> = passing.iter().filter(|p| failing.contains(p)).map(|p| p.0.as_str()).collect();
+            if lost.is_empty() || (phase == CheckPhase::Revert && space_only(u, s, defs)) {
+                continue;
+            }
+            out.push(format!("{u}: {} passed before and fails now", lost.join(", ")));
+        }
         out
     }
 }

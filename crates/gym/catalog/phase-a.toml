@@ -2882,6 +2882,30 @@ units = { "service:sshd" = "Running" }
 transition = "ApplyChange"
 refused_with = "Unauthorized"
 
+# R07 (§9): the post-check is per probe, not per unit status.
+[[fault]]
+id = "degraded-unit-loses-a-probe"
+family = "bad-generation"
+summary = "gym-web is already Degraded: its HTTP check fails (503) while its TCP check passes. A change then breaks gym-web's listen address, so the TCP check fails too. The check after activation compares each Readiness probe that passed before, not the unit's status, so Checking fails and the change is reverted."
+spec = ["§9 executor-owned post-check", "R07"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "set_persistent_knob", unit = "service:gym-web", knob = "health", value = 503 },
+  { raw = "wait", for = "1m" },
+]
+inject = { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" }
+window = "10m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Reverted"
+
 [[fault]]
 id = "release-refused-leaves-incident"
 family = "authority"

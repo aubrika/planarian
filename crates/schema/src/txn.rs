@@ -218,6 +218,10 @@ pub struct CheckContext {
     pub candidate: Option<Manifest>,
     pub base: Manifest,
     pub pre: std::collections::BTreeMap<UnitId, UnitStatus>,
+    /// Per unit, the Readiness probes passing before (§9, R07): each must
+    /// still pass after, whatever the unit's aggregate status was.
+    #[serde(default)]
+    pub pre_passing: std::collections::BTreeMap<UnitId, Vec<crate::ids::ProbeId>>,
 }
 
 impl Outcome {
