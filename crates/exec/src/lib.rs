@@ -1009,6 +1009,8 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     }
 }
 
+pub mod residue;
+
 #[cfg(kani)]
 mod kani;
 #[cfg(test)]

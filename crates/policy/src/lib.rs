@@ -996,12 +996,44 @@ pub fn authorization_of(actor: Actor) -> Authorization {
     Authorization { principal: actor.principal(), actor, capabilities: Capabilities::default() }
 }
 
+verus! {
+
+/// Who is an administrator in Phase A (§11): root, and the members of
+/// `planarian-admin` (`in_admin_group`, from the group file).
+pub open spec fn administrator_spec(uid: Option<u32>, in_admin_group: bool) -> bool {
+    in_admin_group || uid == Some(0u32)
+}
+
+pub fn is_administrator(uid: Option<u32>, in_admin_group: bool) -> (r: bool)
+    ensures
+        r == administrator_spec(uid, in_admin_group),
+{
+    in_admin_group || match uid {
+        Some(u) => u == 0,
+        None => false,
+    }
+}
+
+/// I17 (A, given root exists): root holds the administrator capability
+/// whatever the group file says, so the set of principals holding it is
+/// never empty; no change to the group can empty it.
+pub proof fn i17_administrators_never_empty(in_admin_group: bool)
+    ensures
+        administrator_spec(Some(0u32), in_admin_group),
+        exists|uid: Option<u32>| #[trigger] administrator_spec(uid, false),
+{
+    assert(administrator_spec(Some(0u32), false));
+}
+
+} // verus!
+
 /// Phase A's capability grants (§11): every user acts on their own scope and
 /// the user-controllable units; root and `planarian-admin` members are
-/// administrators and approvers. I17 holds because root always is.
+/// administrators and approvers. I17 holds because root always is
+/// (`is_administrator`, proved: `i17_administrators_never_empty`).
 pub fn user_authorization(actor: Actor, admin: bool) -> Authorization {
     use planarian_schema::Capability::*;
-    let admin = admin || actor.uid() == Some(0);
+    let admin = is_administrator(actor.uid(), admin);
     let caps = if admin {
         Capabilities::of(&[OwnScope, UserControllable, Administrator, Approve])
     } else {

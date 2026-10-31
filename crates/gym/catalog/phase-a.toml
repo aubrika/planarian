@@ -3924,6 +3924,54 @@ transition = "ApplyChange"
 never = ["Activating"]
 terminal = "pending"
 
+# I13: "A unit under an override is never a repair target while the override holds."
+[[fault]]
+id = "en-i13-overridden-unit-is-not-repaired"
+family = "english"
+summary = "An administrator stops gym-web until they say otherwise. For the next ten minutes gym-web stays stopped and under the override: no repair is proposed for it, and nothing restarts it."
+spec = ["I13"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "ask", phrase = "stop gym-web until I say", actor = "user:1001" }
+window = "10m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+terminal = "Committed"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+count = 0
+
+# I17: "The set of principals holding administrator capability is never empty."
+[[fault]]
+id = "en-i17-root-administers-without-the-group"
+family = "english"
+summary = "Nobody is left in planarian-admin, so the group grants no one administrator capability. Root still holds it: root's administrator-only change (gym-web's listen address) is authorized and commits."
+spec = ["I17"]
+tags = ["english"]
+scoring = "must-pass"
+# Fake only: on the VM, group membership is the real group file, and root's
+# peer is root's however the group reads.
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "127.0.0.1" }, source = "user", actor = "root:nogroup" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+
 # I21: "No transition that cannot be reversed ... executes below AskFirst, unless the loss falls only on the caller's own session."
 [[fault]]
 id = "en-i21-irreversible-asks-even-for-root"

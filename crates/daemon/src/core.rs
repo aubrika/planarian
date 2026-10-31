@@ -751,44 +751,40 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             let was_up = matches!(self.prev_status.get(u), Some(UnitStatus::Running | UnitStatus::Degraded(_)));
             let now_down = matches!(st, UnitStatus::Failed(_) | UnitStatus::Stopped);
             current.insert(u.clone(), st.clone());
-            if !(was_up && now_down)
-                || def.id.kind != UnitKind::Service
-                || self.touched.contains(u)
-                || self.generation_touched
-                || !s.expected(u, defs)
-                || def.edges.iter().any(|e| e.from == *u && e.kind == EdgeKind::Requires && crashed.contains(&e.to))
-            {
-                continue;
-            }
-            // A unit inactive (not failed) after running was stopped on
-            // request (`systemctl stop`), whatever its exit status; a failed
-            // one counts only if a termination signal ended it (a crash, a
-            // non-zero exit or the OOM killer is a fault).
-            let ended = self.b.units().ended_by(u);
-            let e = match (&st, ended) {
-                (_, Some(e)) if e.is_termination() => e,
-                (UnitStatus::Stopped, _) => Ending::Signal(15),
-                _ => continue,
+            // The decision is the pure classifier's (U3; Kani: exec::kani).
+            let facts = planarian_exec::residue::EndingFacts {
+                was_up,
+                now_down,
+                stopped_cleanly: st == UnitStatus::Stopped,
+                ended: if was_up && now_down { self.b.units().ended_by(u) } else { None },
+                service: def.id.kind == UnitKind::Service,
+                touched_by_planarian: self.touched.contains(u) || self.generation_touched,
+                expected: s.expected(u, defs),
+                requirement_crashed: def
+                    .edges
+                    .iter()
+                    .any(|e| e.from == *u && e.kind == EdgeKind::Requires && crashed.contains(&e.to)),
+                security: def.sensitivity.contains(Sensitivity::Security),
+                stops_are_faults: def.stops_are_faults,
+                systemd_restarts: def.systemd_restart.as_ref().is_some_and(|p| p.restart),
+                lenient,
             };
-            if def.sensitivity.contains(Sensitivity::Security) {
-                self.notice(format!(
+            use planarian_exec::residue::Residue;
+            match planarian_exec::residue::classify(&facts) {
+                Residue::NotAStop | Residue::Fault => {}
+                Residue::AlarmSecurity(e) => self.notice(format!(
                     "ALARM: {u}, which is security-sensitive, was stopped outside Planarian ({}); starting it again",
                     signal_name(e)
-                ));
-                continue;
-            }
-            // inferStops = false (B-11): never inferred as intent; a fault,
-            // which the incident manager repairs.
-            if def.stops_are_faults {
-                self.notice(format!(
+                )),
+                // inferStops = false (B-11): never inferred as intent; a
+                // fault, which the incident manager repairs.
+                Residue::AlarmMustRun(e) => self.notice(format!(
                     "ALARM: {u}, which must keep running, was stopped outside Planarian ({}); starting it again",
                     signal_name(e)
-                ));
-                continue;
-            }
-            let restartful = def.systemd_restart.as_ref().is_some_and(|p| p.restart);
-            if lenient && !restartful {
-                down.insert(u.clone(), e);
+                )),
+                Residue::Intended(e) => {
+                    down.insert(u.clone(), e);
+                }
             }
         }
         self.prev_status = current;

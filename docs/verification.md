@@ -57,11 +57,16 @@ path.
 
 Proved: `policy::decide` (I5, I11, I14-decide, I16-decide, I19, I21, I22),
 the `txn` kernel (I6, I12 conditional, I15, I23, write-ahead ordering) and
-the hash chain (I18). Property-tested, not proved (a deviation):
-`schema::digest`. **Still required in A, not yet done:** the residue
-classifier's Kani harnesses and the I17 proof in `policy` (the set of
-administrators is never empty). The Phase A gate is not called while
-either is still a unit test (SPEC §17a).
+the hash chain (I18), and I17 (`is_administrator` and
+`i17_administrators_never_empty`: root holds the capability whatever the
+group says, so the set of administrators is never empty). Checked by Kani:
+the residue classifier (`exec::residue::classify`, U3: a crash, a
+security-sensitive unit or Planarian's own stop is never taken as a
+person's stop), credited to I13. Property-tested, not proved (a
+deviation): `schema::digest`. Verus verifies 17 / 54 / 52 obligations in
+`schema` / `policy` / `txn`; global d:a 52:63, trust count 37. These two
+were the last proof obligations SPEC §17a requires in A; the gate itself is
+not called here.
 
 ## The trust count, the internal-unproven count and the bypass register (v4.5)
 

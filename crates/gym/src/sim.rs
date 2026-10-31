@@ -191,6 +191,9 @@ pub fn peer(actor: &str) -> Peer {
     }
     let p = match who {
         "root" => Peer::new(0, true),
+        // I17: root with no administrator group behind it (an emptied
+        // planarian-admin); root is an administrator all the same.
+        "root:nogroup" => Peer::new(0, false),
         "user:1001" => Peer::new(1001, true),
         a => Peer::new(a.strip_prefix("user:").and_then(|u| u.parse().ok()).unwrap_or(1000), false),
     };
