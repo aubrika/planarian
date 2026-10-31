@@ -185,10 +185,16 @@ pub fn sandbox_argv(argv: &[String], sb: &ProbeSandbox, timeout: Duration) -> Ve
     a
 }
 
-pub fn exec(argv: &[String], sb: &ProbeSandbox, timeout: Duration) -> ProbeResult {
+/// P10: what is read is bounded by the probe's `bytes_max` as well as the
+/// sandbox's `max_output`, whichever is smaller.
+fn read_limit(sb: &ProbeSandbox, bytes_max: usize) -> usize {
+    (sb.max_output as usize).min(bytes_max)
+}
+
+pub fn exec(argv: &[String], sb: &ProbeSandbox, timeout: Duration, bytes_max: usize) -> ProbeResult {
     let full = sandbox_argv(argv, sb, timeout);
     let refs: Vec<&str> = full.iter().map(String::as_str).collect();
-    let o = run_limited(&refs, timeout + Duration::from_secs(2), sb.max_output as usize);
+    let o = run_limited(&refs, timeout + Duration::from_secs(2), read_limit(sb, bytes_max));
     if o.timed_out {
         ProbeResult::Timeout
     } else if o.ok() {
@@ -202,13 +208,13 @@ pub fn exec(argv: &[String], sb: &ProbeSandbox, timeout: Duration) -> ProbeResul
 
 /// Calls `method` (`interface.Member`, no arguments) on `service` at `path` on
 /// the system bus; any reply passes. A missing name or an error reply fails.
-pub fn dbus(service: &str, path: &str, method: &str, timeout: Duration) -> ProbeResult {
+pub fn dbus(service: &str, path: &str, method: &str, timeout: Duration, bytes_max: usize) -> ProbeResult {
     let Some((iface, member)) = method.rsplit_once('.') else {
         return ProbeResult::Error(format!("method {method:?} is not interface.Member"));
     };
     let secs = format!("--timeout={}ms", timeout.as_millis().max(1));
     let argv = ["busctl", "--system", "--quiet", secs.as_str(), "call", service, path, iface, member];
-    let o = run_limited(&argv, timeout + Duration::from_secs(2), 4096);
+    let o = run_limited(&argv, timeout + Duration::from_secs(2), bytes_max);
     if o.timed_out {
         ProbeResult::Timeout
     } else if o.ok() {
@@ -252,8 +258,8 @@ fn run_one(p: &ProbeDef) -> ProbeResult {
     match &p.kind {
         ProbeKind::Tcp { addr } => tcp(addr, timeout),
         ProbeKind::Http { url, status } => http(url, *status, timeout, bytes_max),
-        ProbeKind::Exec { argv, sandbox } => exec(argv, sandbox, timeout),
-        ProbeKind::DBus { service, path, method } => dbus(service, path, method, timeout),
+        ProbeKind::Exec { argv, sandbox } => exec(argv, sandbox, timeout, bytes_max),
+        ProbeKind::DBus { service, path, method } => dbus(service, path, method, timeout, bytes_max),
         ProbeKind::FilePresent { path } => file_present(path),
         ProbeKind::FreeSpace { path, min_bytes, min_permille } => free_space(path, *min_bytes, *min_permille),
         ProbeKind::SystemdActive | ProbeKind::SessionTarget { .. } => {
@@ -314,6 +320,18 @@ impl ProbeBackend for Probes {
 
 #[cfg(test)]
 mod tests {
+    /// P10: an exec probe reads no more than its bytes_max, even under a
+    /// larger sandbox max_output; a dbus probe's cap is its bytes_max.
+    #[test]
+    fn every_reader_is_bounded_by_bytes_max() {
+        let sb = ProbeSandbox { uid: 0, caps: vec![], max_output: 65536, cpu_ms: 500, network: false };
+        assert_eq!(read_limit(&sb, 4096), 4096);
+        let small = ProbeSandbox { max_output: 1024, ..sb };
+        assert_eq!(read_limit(&small, 4096), 1024);
+        let o = run_limited(&["sh", "-c", "head -c 100000 /dev/zero"], Duration::from_secs(5), 4096);
+        assert!(o.stdout.len() <= 4096, "{}", o.stdout.len());
+    }
+
     use super::*;
     use std::net::TcpListener;
 

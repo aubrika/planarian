@@ -1062,3 +1062,41 @@ fn a_committed_change_missing_from_the_overrides_is_lost() {
     let lost = r.core.lost_changes(&l);
     assert_eq!(lost.get(&UnitId::service("gym-web")), Some(&(ChangeId("listen-address".into()), args)));
 }
+
+/// C2 (§9 step 6, I8): the owner edits their configuration while a change
+/// waits in Built for Foreground to end. When the window opens the change
+/// is checked again on its way into Activating: it is Stale, never
+/// activated, and a notice says to ask again.
+#[test]
+fn an_owner_edit_while_waiting_is_stale_when_the_window_opens() {
+    let mut r = Rig::new();
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: Timestamp(0),
+        active: true,
+        idle: false,
+    });
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    let mut args = BTreeMap::new();
+    args.insert("scale".to_string(), Value::Str("1.25".into()));
+    let resp = r.core.handle(ALICE.in_session("s1"), Request::Apply { change: ChangeId("font-scale".into()), args });
+    assert!(matches!(resp, Response::Done { state: TxnState::Built, .. }), "{resp:?}");
+
+    r.fake.w().owner_files.insert("configuration.nix".into(), "edited while it waited".into());
+    r.fake.w().foreground.clear();
+    r.ticks(4);
+    let l = r.core.ledger();
+    assert!(
+        l.terminal.values().any(|t| t.state == TxnState::Rejected(RejectReason::Stale)
+            && matches!(t.transition, Transition::ApplyChange { .. })),
+        "{:?}",
+        l.terminal
+    );
+    assert_eq!(r.calls("activate_live"), 0, "never activated");
+    assert!(r.core.notices.iter().any(|n| n.contains("not activated")), "{:?}", r.core.notices);
+}

@@ -560,7 +560,18 @@ fn main() {
     loop {
         // A steady stream of requests must not starve the repair loop.
         if Instant::now() >= next_tick {
+            let began = Instant::now();
             core.tick();
+            // P9: a tick that takes longer than its period delays repairs;
+            // say so, with how long it took.
+            let took = began.elapsed();
+            if took > TICK {
+                eprintln!(
+                    "planariad: warning: slow tick: {} ms (the tick is {} ms)",
+                    took.as_millis(),
+                    TICK.as_millis()
+                );
+            }
             next_tick = Instant::now() + TICK;
         }
         if let Some(why) = core.integrity.take() {

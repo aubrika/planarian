@@ -1178,7 +1178,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
             // §12f: an activation window opened for a waiting generation.
             if !busy {
-                for (id, r) in self.ex.activate_waiting(&s) {
+                for (id, r) in self.ex.activate_waiting(&s, &defs) {
                     // A repair that waited is an attempt once it runs.
                     let linked: Vec<IncidentId> =
                         self.incident_parked.iter().filter(|(_, t)| **t == id).map(|(i, _)| *i).collect();
@@ -1189,6 +1189,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         {
                             self.journal(Record::Incident(i));
                         }
+                    }
+                    if matches!(r, Submitted::Finished { state: TxnState::Rejected(RejectReason::Stale), .. }) {
+                        self.notice(format!(
+                            "transaction {}: not activated: the configuration, the override file or what the change would do changed while it waited; ask for it again",
+                            id.0
+                        ));
+                        continue;
                     }
                     self.notice(format!(
                         "transaction {}: activated now that nothing is in the way: {}",
