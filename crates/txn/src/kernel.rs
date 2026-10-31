@@ -61,16 +61,24 @@ pub enum RecoveryAction {
 /// deadline and its lease's grace period pass.
 pub fn should_take_over(
     state: &TxnState,
+    boot_only: bool,
     mine: bool,
     owner_alive: bool,
     now: Timestamp,
     deadline: Timestamp,
     renewed: Timestamp,
 ) -> bool {
-    let in_window = matches!(
-        state,
-        TxnState::Activating | TxnState::Checking | TxnState::Published | TxnState::Promoted | TxnState::Reverting
-    );
+    // A boot-only Promoted waits for the daemon's confirmation checkpoint
+    // (§12 crash table); the watchdog does not advance it.
+    let in_window = match state {
+        TxnState::Activating
+        | TxnState::Checking
+        | TxnState::Publishing
+        | TxnState::Published
+        | TxnState::Reverting => true,
+        TxnState::Promoted => !boot_only,
+        _ => false,
+    };
     if !in_window || mine {
         return false;
     }
@@ -644,6 +652,96 @@ impl<S: Store, H: Host> Kernel<S, H> {
         self.write_committed(txn)
     }
 
+    /// The transaction took the boot-only path (§12 step 7): its journal
+    /// path passed AwaitingBoot.
+    pub fn boot_only(&self, id: TxnId) -> bool {
+        self.journal.ledger().live.get(&id).is_some_and(|l| l.path.iter().any(|p| p == "AwaitingBoot"))
+    }
+
+    /// §10 admission of a boot-only candidate that booted and passed its
+    /// Readiness probes: it becomes the default and its override is
+    /// promoted; the transaction is Promoted (admitted, not confirmed) until
+    /// the 10-minute confirmation checkpoint of this boot.
+    fn admit_boot_only(&mut self, txn: &Transaction, cand: GenerationId) -> R<TxnState> {
+        let o = self.call(txn.id, "publish_boot", |h, op| h.generations().publish_boot(cand, op))?;
+        if !o.is_success() {
+            return self.withdraw_boot_only(txn, false, &format!("publish_boot: {o:?}"));
+        }
+        match self.swap_override(txn, txn.base_override, txn.candidate_override)? {
+            Swap::Done => {}
+            Swap::Failed(why) => return self.withdraw_boot_only(txn, false, &format!("promotion: {why}")),
+            Swap::ThirdParty => {
+                return self.recovery_failed(txn, "override changed by a third party during promotion");
+            }
+        }
+        self.advance(txn, TxnState::Promoted, "admitted at boot; confirmed at the 10-minute checkpoint")?;
+        Ok(TxnState::Promoted)
+    }
+
+    /// §10 confirmation, at the 10-minute checkpoint of the boot that
+    /// admitted a boot-only candidate (only the daemon calls this): the
+    /// candidate still runs and the canonical probes pass → bookkeeping and
+    /// Committed; otherwise it is withdrawn (§12 step 7).
+    pub fn confirm_boot_only(&mut self, id: TxnId, healthy: bool) -> R<TxnState> {
+        let l = self.live(id)?;
+        if self.held.get(&id) != Some(&l.txn.lease.epoch) {
+            return Err(KernelError::LostLease(id));
+        }
+        let txn = l.txn;
+        if txn.state != TxnState::Promoted || !self.boot_only(id) {
+            return Ok(txn.state);
+        }
+        let running = self.host.generations().last_booted().ok() == Self::candidate(&txn);
+        if healthy && running {
+            self.write_committed(&txn)
+        } else {
+            self.withdraw_boot_only(&txn, true, "not confirmed: canonical probes failed at the 10-minute checkpoint")
+        }
+    }
+
+    /// Withdraw an admitted or published boot-only candidate (§12 step 7):
+    /// the publishing generation is the boot default again and the base
+    /// override is restored; nothing is activated live, so the machine runs
+    /// the candidate until the next restart, which completes it.
+    fn withdraw_boot_only(&mut self, txn: &Transaction, promoted: bool, why: &str) -> R<TxnState> {
+        if self.live(txn.id)?.txn.state != TxnState::Reverting {
+            self.advance(txn, TxnState::Reverting, why)?;
+        }
+        let back = txn.base;
+        let o = self.call(txn.id, "publish_boot(publishing)", |h, op| h.generations().publish_boot(back, op))?;
+        if !o.is_success() {
+            return self.recovery_failed(txn, &format!("withdraw publish_boot: {o:?}"));
+        }
+        if promoted {
+            match self.swap_override(txn, txn.candidate_override, txn.base_override)? {
+                Swap::Done => {}
+                Swap::Failed(why) => return self.recovery_failed(txn, &format!("override restore: {why}")),
+                Swap::ThirdParty => return self.recovery_failed(txn, "override changed by a third party"),
+            }
+        }
+        self.advance(txn, TxnState::Reverted, why)?;
+        Ok(TxnState::Reverted)
+    }
+
+    /// A boot-only Promoted found at startup (§12 crash table). The same
+    /// boot (a daemon restart): leave it for this boot's checkpoint. A later
+    /// boot: the AwaitingBoot row, admission again: the candidate booted and
+    /// passes → still Promoted, confirmed at this boot's checkpoint;
+    /// otherwise withdrawn.
+    fn readmit_boot_only(&mut self, txn: &Transaction, same_boot: bool) -> R<TxnState> {
+        if same_boot {
+            return Ok(TxnState::Promoted);
+        }
+        let cand = Self::candidate(txn);
+        if self.host.generations().last_booted().ok() != cand {
+            return self.withdraw_boot_only(txn, true, "another generation booted before the change was confirmed");
+        }
+        match self.host.check(txn, CheckPhase::Candidate) {
+            Verdict::Pass => Ok(TxnState::Promoted),
+            Verdict::Fail(why) => self.withdraw_boot_only(txn, true, &why),
+        }
+    }
+
     /// The crash table's AwaitingBoot row (§12): no reboot since the one-shot
     /// entry was published (it is still pending), leave it; after a reboot,
     /// the candidate booted →
@@ -664,15 +762,11 @@ impl<S: Store, H: Host> Kernel<S, H> {
             self.advance(txn, TxnState::Reverted, "the boot-only candidate did not boot; the default entry did")?;
             return Ok(TxnState::Reverted);
         }
+        // §10 admission: Readiness probes once; pass → Promoted (admitted);
+        // fail → withdrawn, so the next boot falls back.
         match self.host.check(txn, CheckPhase::Candidate) {
-            Verdict::Pass => {
-                let o = self.call(txn.id, "publish_boot", |h, op| h.generations().publish_boot(cand, op))?;
-                if !o.is_success() {
-                    return self.revert_generation(txn, &format!("publish_boot: {o:?}"));
-                }
-                self.promote_and_commit(txn)
-            }
-            Verdict::Fail(why) => self.revert_generation(txn, &why),
+            Verdict::Pass => self.admit_boot_only(txn, cand),
+            Verdict::Fail(why) => self.withdraw_boot_only(txn, false, &why),
         }
     }
 
@@ -695,8 +789,12 @@ impl<S: Store, H: Host> Kernel<S, H> {
                 let _ = self.host.generations().record_override(cand, h);
             }
         }
+        // A boot-only candidate is never live_tested (§10); it is confirmed.
+        let boot_only = self.boot_only(txn.id);
         self.advance(txn, TxnState::Committed, "")?;
-        if let Some(cand) = Self::candidate(txn) {
+        if let Some(cand) = Self::candidate(txn)
+            && !boot_only
+        {
             self.record(Record::LiveTested(Some(cand)))?;
         }
         Ok(TxnState::Committed)
@@ -819,6 +917,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
     pub fn watchdog_should_take_over(&self, txn: &Transaction) -> bool {
         should_take_over(
             &txn.state,
+            self.boot_only(txn.id),
             txn.lease.owner == self.me,
             // An owner from an earlier boot is gone, whatever now holds its pid.
             txn.lease.owner.boot_id() == self.me.boot_id() && self.host.pid_alive(txn.lease.owner.pid()),
@@ -904,8 +1003,14 @@ impl<S: Store, H: Host> Kernel<S, H> {
 
     /// Take over (from `seen_epoch`) and run the crash-recovery table.
     pub fn recover(&mut self, id: TxnId, seen_epoch: u64) -> R<TxnState> {
+        let before = self.live(id)?.txn;
+        let same_boot = before.lease.owner.boot_id() == self.me.boot_id();
         if self.take_over(id, seen_epoch)?.is_none() {
             return Ok(TxnState::RecoveryFailed);
+        }
+        if before.state == TxnState::Promoted && self.boot_only(id) {
+            let txn = self.live(id)?.txn;
+            return self.readmit_boot_only(&txn, same_boot);
         }
         self.recover_steps(id)
     }

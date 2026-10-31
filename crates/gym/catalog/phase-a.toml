@@ -2583,18 +2583,45 @@ scoring = "must-pass"
 harness = ["fake"]
 intent = { kind = "none" }
 inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
-after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }]
-window = "5m"
+after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "12m" }]
+window = "15m"
 
 [fault.required_post]
 generation = "candidate"
 boot_default = "candidate"
 reports = ["RestartToFinish"]
+agrees = true
+known_good = "candidate"
+live_tested = "never"
 
 [[fault.required_post.txn]]
 transition = "ApplyChange"
-path = ["Built", "AwaitingBoot", "Promoted", "Committed"]
+path = ["Built", "Publishing", "AwaitingBoot", "Promoted", "Committed"]
 never = ["Activating"]
+
+# S02 (§10): admission and confirmation are two milestones.
+[[fault]]
+id = "boot-only-admitted-not-confirmed"
+family = "boot-only-change"
+summary = "A boot-only kernel change boots and is admitted (Promoted: the candidate is the default, its override promoted). sshd then fails and stays failed (repairs wait while the admitted change is unconfirmed), so the canonical probes fail at the 10-minute checkpoint: the change is withdrawn, never committed: Reverted, the publishing generation is the default again, the base override restored, and a notice says a restart completes it."
+spec = ["§10 boot confirmation", "§12 step 7", "S02"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "2m" }, { raw = "kill_unit", unit = "service:sshd", signal = "SIGKILL" }, { raw = "wait", for = "10m" }]
+window = "15m"
+
+[fault.required_post]
+boot_default = "base"
+notices_count = { match = "not confirmed (canonical probes were failing at the 10-minute checkpoint)", count = 1 }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["AwaitingBoot", "Promoted", "Reverting", "Reverted"]
+never = ["Committed", "Activating"]
+terminal = "Reverted"
 
 [[fault]]
 id = "boot-only-kernel-boot-fails"

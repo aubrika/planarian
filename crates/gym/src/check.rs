@@ -302,13 +302,19 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                     );
                 }
             }
+            // `true` (or "base"): still the base; "candidate": the candidate.
             "known_good" => {
-                if ledger.known_good != Some(e.base) {
-                    fail(&mut v, format!("{:?}", ledger.known_good));
+                let want = if val.as_str() == Some("candidate") { e.candidate } else { Some(e.base) };
+                if ledger.known_good != want {
+                    fail(&mut v, format!("{:?}, want {want:?}", ledger.known_good));
                 }
             }
+            // `true`: the candidate is live_tested; "never": it is not (§10:
+            // a boot-only candidate is confirmed, never live_tested).
             "live_tested" => {
-                if ledger.live_tested.is_none() || ledger.live_tested != e.candidate {
+                let never = val.as_str() == Some("never");
+                let is = ledger.live_tested.is_some() && ledger.live_tested == e.candidate;
+                if is == never {
                     fail(&mut v, format!("{:?} vs candidate {:?}", ledger.live_tested, e.candidate));
                 }
             }

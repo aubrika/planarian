@@ -294,7 +294,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let asm = Assembler::new(manifest.clone(), cfg.exec.canonical.clone());
         let now = b.clock().now();
         let last_booted = b.generations().last_booted().ok();
+        // §10: a boot-only change admitted at this boot is confirmed at its
+        // 10-minute checkpoint.
+        let admitted = ledger.live.values().any(|t| {
+            t.txn.state == TxnState::Promoted
+                && t.path.iter().any(|p| p == "AwaitingBoot")
+                && t.txn.candidate.as_ref().map(|(g, _)| *g) == Some(current)
+        });
         let confirm = match ledger.known_good {
+            _ if admitted => Some((current, now.plus(CONFIRM_AFTER))),
             None => Some((current, now.plus(CONFIRM_AFTER))),
             Some(_)
                 if ledger.live_tested.is_some()
@@ -1395,7 +1403,32 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             return;
         }
         self.confirm = None;
-        if s.generation == g && self.canonical_healthy(s, defs) {
+        let healthy = s.generation == g && self.canonical_healthy(s, defs);
+        // §10, §12 step 7: the admitted boot-only change commits, or is
+        // withdrawn, here and only here.
+        let admitted: Vec<TxnId> = self
+            .ledger()
+            .live
+            .values()
+            .filter(|t| t.txn.state == TxnState::Promoted && t.path.iter().any(|p| p == "AwaitingBoot"))
+            .map(|t| t.txn.id)
+            .collect();
+        for id in admitted {
+            match self.ex.kernel.confirm_boot_only(id, healthy) {
+                Ok(TxnState::Committed) => {}
+                Ok(TxnState::Reverted) => {
+                    let back = self.b.generations().boot_default().map(|d| d.0).unwrap_or_default();
+                    self.notice(format!(
+                        "transaction {}: not confirmed (canonical probes were failing at the 10-minute checkpoint); \
+                         generation {back} is the default again and a restart completes the withdrawal",
+                        id.0
+                    ))
+                }
+                Ok(other) => self.notice(format!("transaction {}: confirmation left it {other:?}", id.0)),
+                Err(e) => self.notice(format!("transaction {}: confirmation failed: {e:?}", id.0)),
+            }
+        }
+        if healthy {
             self.journal(Record::KnownGood(g));
             self.notice(format!("generation {} is now the boot-confirmed known-good baseline", g.0));
         } else {
