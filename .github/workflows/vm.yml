@@ -113,6 +113,17 @@ jobs:
             http2 = false
             extra-substituters = file:///tmp/nix-ci-cache
             extra-trusted-public-keys = ${{ needs.prebuild.outputs.key }}
+      # The test's inputs first (its driver and VMs), retried: a transfer from
+      # cache.nixos.org can break mid-file and its resumption fail with HTTP
+      # 416 (three times on 1 Nov). Only fetching and building is retried;
+      # the test itself runs once, in the next step.
+      - name: Fetch and build the test's inputs
+        run: |
+          for i in 1 2 3; do
+            nix build -L --no-link .#legacyPackages.x86_64-linux.gym-vm.${{ matrix.id }}.driver && exit 0
+            echo "attempt $i to fetch the test's inputs failed"; sleep 15
+          done
+          exit 1
       - run: nix build -L .#legacyPackages.x86_64-linux.gym-vm.${{ matrix.id }} -o verdict
       - name: Verdict
         run: |
@@ -153,6 +164,17 @@ jobs:
             http2 = false
             extra-substituters = file:///tmp/nix-ci-cache
             extra-trusted-public-keys = ${{ needs.prebuild.outputs.key }}
+      # The test's inputs first (its driver and VMs), retried: a transfer from
+      # cache.nixos.org can break mid-file and its resumption fail with HTTP
+      # 416 (three times on 1 Nov). Only fetching and building is retried;
+      # the test itself runs once, in the next step.
+      - name: Fetch and build the test's inputs
+        run: |
+          for i in 1 2 3; do
+            nix build -L --no-link .#legacyPackages.x86_64-linux.gym-vm.${{ matrix.id }}.driver && exit 0
+            echo "attempt $i to fetch the test's inputs failed"; sleep 15
+          done
+          exit 1
       - run: nix build -L .#legacyPackages.x86_64-linux.gym-vm.${{ matrix.id }} -o verdict
       - name: Verdict
         run: |
@@ -219,6 +241,17 @@ jobs:
             http2 = false
             extra-substituters = file:///tmp/nix-ci-cache
             extra-trusted-public-keys = ${{ needs.prebuild.outputs.key }}
+      # The test's inputs first (its driver and VMs), retried: a transfer from
+      # cache.nixos.org can break mid-file and its resumption fail with HTTP
+      # 416 (three times on 1 Nov). Only fetching and building is retried;
+      # the test itself runs once, in the next step.
+      - name: Fetch and build the test's inputs
+        run: |
+          for i in 1 2 3; do
+            nix build -L --no-link .#legacyPackages.x86_64-linux.gym-vm.${{ matrix.id }}.driver && exit 0
+            echo "attempt $i to fetch the test's inputs failed"; sleep 15
+          done
+          exit 1
       - run: nix build -L .#legacyPackages.x86_64-linux.gym-vm.${{ matrix.id }} -o verdict
       - name: Verdict
         run: |
