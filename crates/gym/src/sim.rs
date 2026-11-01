@@ -130,6 +130,8 @@ pub fn config() -> CoreConfig {
         posture: planarian_schema::Posture::Standard,
         posture_decl: Default::default(),
         agent_limits: Default::default(),
+        // As planariad: recoveries that may activate run after ready (#9).
+        defer_recovery: true,
     }
 }
 
@@ -632,6 +634,9 @@ impl Sim {
         let boot_id = self.boot_id();
         let mut core = Core::start(j, self.fake.clone(), OwnerId::Daemon { pid, boot_id }, cfg);
         core.admin_of = gym_admins();
+        // Ready is reached here in the fake (no unit ordering); then, as
+        // planariad does, the recoveries left until after ready.
+        core.finish_recovery();
         // The executor log of the earlier runs, as the daemon reads it back.
         core.remember(self.log.clone());
         self.core = Some(core);

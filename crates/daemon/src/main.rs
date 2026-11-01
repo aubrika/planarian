@@ -397,6 +397,7 @@ fn main() {
         posture: posture_decl.in_force(),
         posture_decl,
         agent_limits: file.agent_limits.clone(),
+        defer_recovery: true,
     };
     let mut core = Core::start(journal, real, me.clone(), core_cfg);
     // The user an agent acts for is an administrator as that user is now (§11).
@@ -543,6 +544,18 @@ fn main() {
     });
 
     eprintln!("planariad: started (pid {})", std::process::id());
+    // After ready (#9): recovering an interrupted generation change may run
+    // switch-to-configuration, which reloads or restarts units ordered after
+    // planarian-ready.target; before ready it would wait on this daemon's own
+    // start job. Read-only requests are answered from a snapshot meanwhile;
+    // the rest wait in the channel until it is done.
+    if let Some(what) = core.pending_recovery() {
+        if let Some(snap) = Snapshot::take(&mut core) {
+            *busy.lock().unwrap_or_else(|e| e.into_inner()) = Some((Busy { with: what, since: Instant::now() }, snap));
+        }
+        core.finish_recovery();
+        *busy.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
     let mut printed = 0u64;
     let mut next_tick = Instant::now();
     // One build at a time; later ones wait their turn.

@@ -1101,16 +1101,51 @@ impl<S: Store, H: Host> Kernel<S, H> {
     /// live watchdog holds, recover the rest, and journal what was found and done.
     /// Returns the transactions left to a live watchdog.
     pub fn reconcile(&mut self) -> R<Vec<TxnId>> {
+        Ok(self.reconcile_deferring(false)?.0)
+    }
+
+    /// As `reconcile`, but with `defer`, a generation transaction found in a
+    /// state whose recovery may run an activation (Activating, Checking,
+    /// Publishing, Published, Reverting) is only taken over: its recovery is
+    /// left to `finish_deferred`, which the daemon runs after ready, so an
+    /// activation that reloads a unit ordered after planarian-ready.target
+    /// does not wait on the daemon's own start (#9). The lease is this
+    /// handle's from here, so the watchdog does not take it while ready is
+    /// reached; the boot report and integrity checks still come before ready.
+    /// Returns the transactions left to a live watchdog, and those deferred.
+    pub fn reconcile_deferring(&mut self, defer: bool) -> R<(Vec<TxnId>, Vec<TxnId>)> {
         let live: Vec<LiveTxn> = self.journal.sync_ledger()?.live.values().cloned().collect();
         let mut found = vec![];
         let mut actions = vec![];
         let mut waiting = vec![];
+        let mut deferred = vec![];
         for l in live {
             found.push((l.txn.id, l.txn.state.clone()));
             let holder = &l.txn.lease.owner;
             if holder.is_watchdog() && self.host.pid_alive(holder.pid()) {
                 actions.push(format!("txn {}: held by the watchdog; waiting", l.txn.id.0));
                 waiting.push(l.txn.id);
+                continue;
+            }
+            let activates = matches!(
+                l.txn.state,
+                TxnState::Activating
+                    | TxnState::Checking
+                    | TxnState::Publishing
+                    | TxnState::Published
+                    | TxnState::Reverting
+            );
+            if defer && activates && l.txn.transition.changes_generation() {
+                if self.take_over(l.txn.id, l.txn.lease.epoch)?.is_none() {
+                    actions.push(format!("txn {}: found {}, takeover failed", l.txn.id.0, tag(&l.txn.state)));
+                    continue;
+                }
+                actions.push(format!(
+                    "txn {}: found {}, taken over; recovered after ready",
+                    l.txn.id.0,
+                    tag(&l.txn.state)
+                ));
+                deferred.push(l.txn.id);
                 continue;
             }
             let end = self.recover(l.txn.id, l.txn.lease.epoch)?;
@@ -1131,7 +1166,31 @@ impl<S: Store, H: Host> Kernel<S, H> {
             }
         }
         self.record(Record::Reconciliation(Reconciliation { by: self.me.clone(), found, actions }))?;
-        Ok(waiting)
+        Ok((waiting, deferred))
+    }
+
+    /// After ready: the recoveries `reconcile_deferring` left, with this
+    /// handle already holding their leases; journalled as one reconciliation.
+    pub fn finish_deferred(&mut self, ids: &[TxnId]) -> R<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut found = vec![];
+        let mut actions = vec![];
+        for &id in ids {
+            let Ok(l) = self.live(id) else {
+                actions.push(format!("txn {}: no longer live", id.0));
+                continue;
+            };
+            found.push((id, l.txn.state.clone()));
+            if l.txn.lease.owner != self.me {
+                actions.push(format!("txn {}: lease lost before recovery", id.0));
+                continue;
+            }
+            let end = self.recover_steps(id)?;
+            actions.push(format!("txn {}: found {}, now {} (after ready)", id.0, tag(&l.txn.state), tag(&end)));
+        }
+        self.record(Record::Reconciliation(Reconciliation { by: self.me.clone(), found, actions }))
     }
 }
 
