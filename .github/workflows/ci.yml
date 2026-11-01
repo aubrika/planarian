@@ -32,6 +32,8 @@ jobs:
         run: crates/gym/demo.sh --harness fake
       - name: Dependency boundaries
         run: bash nix/tests/boundaries.sh .
+      - name: Dependency boundaries catch a planted violation in each place (H9)
+        run: bash nix/tests/boundaries-test.sh .
       - name: Verification ratio d:a and the trust count (SPEC §17a; fails if either regresses)
         run: cargo run -q -p planarian-gym -- verification
 
