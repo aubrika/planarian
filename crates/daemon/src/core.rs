@@ -55,6 +55,10 @@ pub struct CoreConfig {
     pub posture_decl: crate::config::PostureDecl,
     /// Limits on launched agents (§12d, R05).
     pub agent_limits: planarian_schema::backend::AgentLimits,
+    /// Leave recoveries that may activate a generation until after ready
+    /// (`Core::finish_recovery`, #9): the daemon and the fake harness set it,
+    /// and call `finish_recovery` once ready.
+    pub defer_recovery: bool,
 }
 
 /// How long a generation's new declarations are named in incident reports (§15).
@@ -144,6 +148,8 @@ pub struct Core<B: Backends + Clone, S: Store> {
     pub admin_of: std::sync::Arc<dyn Fn(u32) -> bool + Send + Sync>,
     /// The agent behind the request being handled, for its log records.
     acting_agent: Option<String>,
+    /// Recoveries left by start until after ready (`finish_recovery`).
+    after_ready: Vec<TxnId>,
     pub ex: Executor<B, S>,
     pub b: B,
     pub asm: Assembler,
@@ -277,11 +283,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         ex.adopt_current();
         let mut notices = VecDeque::new();
         let terminal_before: BTreeSet<TxnId> = ex.kernel.journal.ledger().terminal.keys().copied().collect();
-        match ex.kernel.reconcile() {
-            Ok(waiting) if !waiting.is_empty() => {
-                notices.push_back(format!("waiting for the recovery watchdog to finish transaction(s) {waiting:?}"))
+        let mut deferred = vec![];
+        match ex.kernel.reconcile_deferring(cfg.defer_recovery) {
+            Ok((waiting, d)) => {
+                if !waiting.is_empty() {
+                    notices.push_back(format!("waiting for the recovery watchdog to finish transaction(s) {waiting:?}"))
+                }
+                deferred = d;
             }
-            Ok(_) => {}
             Err(e) => notices.push_back(format!("journal reconciliation failed: {e:?}")),
         }
         let ledger = ex.kernel.journal.ledger().clone();
@@ -334,6 +343,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             _ => None,
         };
         let mut core = Core {
+            after_ready: deferred,
             ex,
             b,
             asm,
@@ -475,6 +485,23 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         p.sort();
         p.dedup();
         p
+    }
+
+    /// What `finish_recovery` will do, for "busy with …"; None if nothing.
+    pub fn pending_recovery(&self) -> Option<String> {
+        match self.after_ready.as_slice() {
+            [] => None,
+            [one] => Some(format!("recovering transaction {} after the restart", one.0)),
+            many => Some(format!("recovering {} transactions after the restart", many.len())),
+        }
+    }
+
+    /// After ready: run the recoveries start left (`CoreConfig::defer_recovery`).
+    pub fn finish_recovery(&mut self) {
+        let ids = std::mem::take(&mut self.after_ready);
+        if let Err(e) = self.ex.kernel.finish_deferred(&ids) {
+            self.notice(format!("journal reconciliation after ready failed: {e:?}"));
+        }
     }
 
     /// Observe without acting (also used to answer requests).

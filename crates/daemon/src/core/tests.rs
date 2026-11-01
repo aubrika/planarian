@@ -50,6 +50,7 @@ fn config() -> CoreConfig {
         posture: planarian_schema::Posture::Standard,
         posture_decl: Default::default(),
         agent_limits: Default::default(),
+        defer_recovery: false,
     }
 }
 
@@ -393,6 +394,43 @@ fn ga_demo_crash_watchdog_then_reconcile() {
     let Response::Status(st) = core.handle(ADMIN, Request::Status) else { panic!() };
     let rec = st.reconciliation.unwrap().join("\n");
     assert!(rec.contains("the watchdog took over and finished it: Reverted"), "{rec}");
+    assert_eq!(r.fake.w().current, GenerationId(1));
+}
+
+/// #9: the daemon restarted with `defer_recovery` reaches ready before it
+/// reverts an interrupted activation; `finish_recovery` then reverts it.
+#[test]
+fn restart_reverts_an_interrupted_activation_after_ready() {
+    use planarian_txn::kernel::CrashPoint;
+    let mut r = Rig::new();
+    r.ticks(2);
+    r.core.ex.kernel.crash_at = Some(CrashPoint::State("Activating"));
+    let mut args = BTreeMap::new();
+    args.insert("service".to_string(), Value::Str("gym-web".into()));
+    args.insert("addr".to_string(), Value::Str("192.0.2.10".into()));
+    let resp = r.core.handle(ADMIN, Request::Apply { change: ChangeId("listen-address".into()), args });
+    assert!(matches!(resp, Response::Error { .. }), "killed mid-activation: {resp:?}");
+    r.fake.w().alive.remove(&100);
+    let calls = r.fake.w().calls.len();
+
+    r.fake.w().alive.insert(101);
+    let mut cfg = config();
+    cfg.defer_recovery = true;
+    let mut core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO },
+        cfg,
+    );
+    // Started (ready): nothing activated yet, the change still Activating.
+    assert_eq!(r.fake.w().calls.len(), calls, "no backend call before ready");
+    assert!(core.ledger().live.values().any(|l| l.txn.state == TxnState::Activating));
+    assert_eq!(core.pending_recovery().as_deref(), Some("recovering transaction 1 after the restart"));
+
+    core.finish_recovery();
+    assert_eq!(core.pending_recovery(), None);
+    assert!(core.ledger().live.is_empty());
+    assert!(core.ledger().terminal.values().any(|t| t.state == TxnState::Reverted));
     assert_eq!(r.fake.w().current, GenerationId(1));
 }
 

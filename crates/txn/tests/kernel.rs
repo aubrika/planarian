@@ -535,3 +535,54 @@ fn a_late_ack_from_the_old_owner_is_not_acked_twice() {
     let acks: Vec<_> = l.ops.iter().filter(|o| o.op == unacked[0]).filter_map(|o| o.ack.clone()).collect();
     assert_eq!(acks, vec![Outcome::Succeeded], "the old owner's ack stands");
 }
+
+/// #9: with `defer`, a restarted daemon that finds a generation change in
+/// Activating takes it over before ready but runs nothing; the activation
+/// that recovery may need (here the revert) runs only in `finish_deferred`,
+/// after ready. The watchdog leaves the taken-over lease alone meanwhile.
+#[test]
+fn deferred_recovery_runs_no_activation_before_ready() {
+    let rig = Rig::new();
+    let mut d = rig.daemon();
+    let id = d.prepare(bad_change(&rig)).unwrap();
+    d.crash_at = Some(CrashPoint::State("Activating"));
+    lost_or_crashed(d.run(id));
+    rig.kill(DAEMON);
+
+    let mut d2 = rig.daemon2();
+    let calls_before = rig.w().calls.len();
+    let (waiting, deferred) = d2.reconcile_deferring(true).unwrap();
+    assert!(waiting.is_empty());
+    assert_eq!(deferred, vec![id]);
+    assert_eq!(rig.w().calls.len(), calls_before, "nothing ran before ready");
+    let l = d2.journal.ledger().live.get(&id).cloned().expect("still live");
+    assert_eq!(l.txn.state, TxnState::Activating);
+    assert_eq!(l.txn.lease.owner, d2.me, "taken over before ready");
+    let text = d2.journal.ledger().last_reconciliation.clone().unwrap().actions.join("\n");
+    assert!(text.contains("taken over; recovered after ready"), "{text}");
+
+    // The watchdog sees a live owner holding a fresh lease and leaves it.
+    assert!(!rig.watchdog().watchdog_should_take_over(&l.txn));
+
+    d2.finish_deferred(&deferred).unwrap();
+    assert_eq!(state_of(&mut d2, id), TxnState::Reverted);
+    assert!(rig.w().calls[calls_before..].iter().any(|c| c.call == "activate_live(1)"), "the revert ran after ready");
+    let text = d2.journal.ledger().last_reconciliation.clone().unwrap().actions.join("\n");
+    assert!(text.contains("now Reverted (after ready)"), "{text}");
+}
+
+/// Without `defer` (the watchdog, and `reconcile`), recovery runs at once,
+/// as before.
+#[test]
+fn undeferred_reconcile_recovers_at_once() {
+    let rig = Rig::new();
+    let mut d = rig.daemon();
+    let id = d.prepare(bad_change(&rig)).unwrap();
+    d.crash_at = Some(CrashPoint::State("Activating"));
+    lost_or_crashed(d.run(id));
+    rig.kill(DAEMON);
+    let mut d2 = rig.daemon2();
+    let (_, deferred) = d2.reconcile_deferring(false).unwrap();
+    assert!(deferred.is_empty());
+    assert_eq!(state_of(&mut d2, id), TxnState::Reverted);
+}
