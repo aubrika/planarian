@@ -101,10 +101,19 @@ Concurrency: unit and device repairs run while an admitted boot-only change
 awaits its confirmation, and a canonical unit that needed a repair in that
 window means the change is not confirmed.
 
-These cases run on the fake harness only unless marked; the VM catalog run
-of rule 19(f) is still to come.
+Every case above that lists the VM harness passed in one whole-catalog run
+on one commit: "VM tests" run 110 on `6ad8521` (99 PASS, 2 waived
+UNSUPPORTED `repair` entries, 0 not cleared; `docs/ga-status.md`). The fake
+harness passes all 130 of its entries on the same commit (CI run 140).
 
-Still open from the tables above: R13's run (the code is in; the benchmark
-runs with the 19(f) VM run), R16 (`ga-status.md` waits for 19(f)); S04 is
-docs only. Beyond R and S, §28's items are closed (below). Still required in
-Phase A by §17a: the residue classifier's Kani harnesses and the I17 proof.
+| Found by the run | Commit | Case |
+| --- | --- | --- |
+| A takeover acked an op its fenced predecessor had just acked itself: `DuplicateOp`, the transaction left in flight (run 109, `crash-slow-worker-overlap`) | `6ad8521` | txn test `a_late_ack_from_the_old_owner_is_not_acked_twice`; the entry on VMs |
+| P9's warning fired on nearly every VM tick | `6ad8521` | core test `a_slow_tick_is_warned` (at most one a minute) |
+| Open, owner's decision: the restarted daemon's startup revert stalls 15 minutes (switch-to-configuration waiting on a unit ordered after `planarian-ready.target`) before the watchdog finishes it | — | `crash-slow-worker-overlap` passes after the stall |
+
+Still open, each in issue #7's lanes: R13's benchmark run (#8); §12f
+*Rollbacks*, P19, C18 (#9); C10, C19, P21, P24 and the R06/P10 remainders
+(#10); P11 and the module-eval assertions (#11); deviations and the closing
+run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
+proved; the residue classifier under Kani).
