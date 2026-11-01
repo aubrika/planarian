@@ -34,6 +34,7 @@ pub fn config() -> CoreConfig {
                     "font-scale",
                     "listen-address",
                     "repair:reenable-predicted",
+                    "repair:reapply",
                     "gym:security-fix",
                     "gym:kernel-param",
                     "gym:touch-core",
@@ -127,6 +128,8 @@ pub fn config() -> CoreConfig {
         fresh_boot: true,
         startup_grace: planarian_daemon::STARTUP_GRACE,
         posture: planarian_schema::Posture::Standard,
+        posture_decl: Default::default(),
+        agent_limits: Default::default(),
     }
 }
 
@@ -188,6 +191,9 @@ pub fn peer(actor: &str) -> Peer {
     }
     let p = match who {
         "root" => Peer::new(0, true),
+        // I17: root with no administrator group behind it (an emptied
+        // planarian-admin); root is an administrator all the same.
+        "root:nogroup" => Peer::new(0, false),
         "user:1001" => Peer::new(1001, true),
         a => Peer::new(a.strip_prefix("user:").and_then(|u| u.parse().ok()).unwrap_or(1000), false),
     };
@@ -1140,6 +1146,9 @@ impl Sim {
                 ("dry_activate", r @ ("exit-nonzero" | "timeout" | "truncated")) => {
                     self.fake.w().dry_activate_fails = Some(format!("dry activation: {r}"));
                 }
+                ("verify_candidate", "nar-mismatch") => {
+                    self.fake.w().nar_mismatch = true;
+                }
                 ("activate_live", "Failed") => {
                     let base = self.base;
                     self.fake.w().fail_activate.insert(base);
@@ -1309,6 +1318,13 @@ impl Sim {
                         let g = w.add_generation(&o);
                         w.boot_entries.insert(g);
                     }
+                } else if edit == "build-only NetworkManager store path" {
+                    // R04: equal manifests; only the network unit's store
+                    // path differs, which only a dry activation sees.
+                    let g = w.add_generation(&OverrideSet::default());
+                    let nm = UnitId::service("NetworkManager");
+                    w.gens.get_mut(&g).expect("added").eval.activation.restart.insert(nm);
+                    w.boot_entries.insert(g);
                 } else if edit.contains("gym-web ExecStart=/bin/false") {
                     let o = OverrideSet::default();
                     let g = w.add_generation(&o);

@@ -6,6 +6,13 @@
 #   listed under `tested` and not counted.
 # `assumes`: the docs/assumptions.md ids (V, P, G, U) the invariant rests on.
 #
+# `[verifier]`: what each crate's Verus run reports ("N verified, 0
+#   errors"). The Verus flake check (nix/tests/verus.nix) fails when its log
+#   disagrees, and the accounting cannot credit a crate with more distinct
+#   Verus obligations than that (R14). A discharged name must be a `proof
+#   fn`, a function with `ensures` inside `verus!`, or a `#[kani::proof]`
+#   harness; a function that is only present discharges nothing.
+#
 # `planarian-gym verification` checks that every name exists in the source
 # and every id in assumptions.md, prints the report, and fails if a ratio
 # fell or the trust count grew against [baseline] (the ratchet: every gate).
@@ -59,6 +66,11 @@ I8 = [1, 1]
 I9 = [0, 1]
 I24 = [0, 3]
 I25 = [0, 2]
+
+[verifier]
+schema = 17
+policy = 54
+txn = 52
 
 [[invariant]]
 id = "I1"
@@ -150,8 +162,11 @@ id = "I13"
 statement = "A unit under an override is never a repair target while the override holds."
 phase = "A"
 tested = ["incident tests", "gym intent-user-stops-service"]
-discharged = []
-assumes = ["P6"]
+# The residue classifier decides which inferred overrides exist (U3): its
+# Kani harnesses show a crash, a security unit or Planarian's own stop never
+# becomes one, so such a unit stays a repair target.
+discharged = ["exec::residue_security_is_never_intended", "exec::residue_crashes_are_faults", "exec::residue_is_inferred_only_where_allowed"]
+assumes = ["P6", "U3"]
 
 [[invariant]]
 id = "I14"
@@ -180,8 +195,8 @@ assumes = ["V1", "V2", "P3"]
 id = "I17"
 statement = "The set of principals holding administrator capability is never empty."
 phase = "A"
-tested = ["policy::i17_root_is_always_an_administrator"]
-discharged = []
+tested = ["gym en-i17-root-administers-without-the-group"]
+discharged = ["policy::is_administrator", "policy::i17_administrators_never_empty"]
 assumes = ["P8", "U2"]
 
 [[invariant]]

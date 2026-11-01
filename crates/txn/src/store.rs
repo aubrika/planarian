@@ -32,6 +32,12 @@ pub trait Store {
     /// The epoch backends fence on. Written before the journal's Takeover record.
     fn fence(&self, txn: TxnId) -> io::Result<Option<u64>>;
     fn set_fence(&self, txn: TxnId, epoch: u64) -> io::Result<()>;
+    /// A new transaction's fence, created exclusively (§9 step 4, C5): fails
+    /// with `AlreadyExists` if anything is already there for this id.
+    fn create_fence(&self, txn: TxnId, epoch: u64) -> io::Result<()>;
+    /// Removes the fence of every transaction `keep` rejects; returns them.
+    /// A transaction without a fence is never admitted, so this only narrows.
+    fn forget_fences<F: Fn(TxnId) -> bool>(&self, keep: F) -> io::Result<Vec<TxnId>>;
 }
 
 // ---------- In-memory ----------
@@ -195,6 +201,24 @@ impl Store for MemStore {
         self.inner().fences.insert(txn, epoch);
         Ok(())
     }
+
+    fn create_fence(&self, txn: TxnId, epoch: u64) -> io::Result<()> {
+        let mut i = self.inner();
+        if i.fences.contains_key(&txn) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("txn/{} exists", txn.0)));
+        }
+        i.fences.insert(txn, epoch);
+        Ok(())
+    }
+
+    fn forget_fences<F: Fn(TxnId) -> bool>(&self, keep: F) -> io::Result<Vec<TxnId>> {
+        let mut i = self.inner();
+        let gone: Vec<TxnId> = i.fences.keys().copied().filter(|t| !keep(*t)).collect();
+        for t in &gone {
+            i.fences.remove(t);
+        }
+        Ok(gone)
+    }
 }
 
 // ---------- On disk ----------
@@ -319,5 +343,37 @@ impl Store for FileStore {
         let d = self.txn_dir.join(txn.0.to_string());
         std::fs::create_dir_all(&d)?;
         self.replace_atomically(&d.join("lease"), format!("{epoch}\n").as_bytes())
+    }
+
+    fn create_fence(&self, txn: TxnId, epoch: u64) -> io::Result<()> {
+        std::fs::create_dir_all(&self.txn_dir)?;
+        let d = self.txn_dir.join(txn.0.to_string());
+        std::fs::create_dir(&d)?;
+        self.replace_atomically(&d.join("lease"), format!("{epoch}\n").as_bytes())
+    }
+
+    fn forget_fences<F: Fn(TxnId) -> bool>(&self, keep: F) -> io::Result<Vec<TxnId>> {
+        let entries = match std::fs::read_dir(&self.txn_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e),
+        };
+        let mut gone = vec![];
+        for e in entries {
+            let e = e?;
+            // Only the directories this store names; anything else is left.
+            let Some(id) = e.file_name().to_str().and_then(|n| n.parse::<u64>().ok()).map(TxnId) else {
+                continue;
+            };
+            if !keep(id) {
+                std::fs::remove_dir_all(e.path())?;
+                gone.push(id);
+            }
+        }
+        if !gone.is_empty() {
+            std::fs::File::open(&self.txn_dir)?.sync_all()?;
+        }
+        gone.sort();
+        Ok(gone)
     }
 }

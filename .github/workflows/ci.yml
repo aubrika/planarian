@@ -26,8 +26,8 @@ jobs:
       - name: clippy with the gym's fault-injection hooks
         run: cargo clippy -p planarian-daemon -p planarian-backend-linux --features planarian-daemon/gym-hooks -- -D warnings
       - run: cargo test --workspace
-      - name: Fault catalog, fake harness (fails on FAIL or PARTIAL)
-        run: cargo run -p planarian-gym -- run
+      - name: Fault catalog, fake harness (strict, R15; fails on FAIL, PARTIAL or an unwaived UNSUPPORTED)
+        run: cargo run -p planarian-gym -- run --strict
       - name: GA demonstration, fake harness
         run: crates/gym/demo.sh --harness fake
       - name: Dependency boundaries

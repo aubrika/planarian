@@ -155,6 +155,11 @@ pub struct Transaction {
     pub base_source: Option<Hash>,
     /// NAR hash of the candidate tree actually evaluated and built (§9).
     pub staged_source: Option<Hash>,
+    /// The candidate store path's NAR hash, as the store reported it when it
+    /// was built; `verify_candidate` checks the path against it (§9 step 3,
+    /// C6). None for a generation not built by this transaction.
+    #[serde(default)]
+    pub candidate_nar: Option<Hash>,
     pub base_override: Option<Hash>,
     pub candidate_override: Option<Hash>,
     /// `/nix/var/nix/gcroots/planarian/builds/<staged_source>`, adopted at Prepared (I3).

@@ -83,6 +83,7 @@ pub struct Parked {
 }
 
 /// Everything decided before a transaction exists.
+#[derive(Clone)]
 struct Plan {
     transition: Transition,
     facts: DerivedFacts,
@@ -94,6 +95,20 @@ struct Plan {
     candidate: Option<(GenerationId, StorePath)>,
     base_override: Option<Hash>,
     candidate_override: Option<Hash>,
+    /// An existing generation's dry activation (R04); a built candidate's
+    /// is in `built`.
+    existing_activation: Option<ActivationPlan>,
+    /// What derive and decide read, kept to do both again when the
+    /// transaction leaves Built (C2).
+    authz: Authorization,
+    live: OverrideSet,
+    cand_overrides: Option<OverrideSet>,
+}
+
+impl Plan {
+    fn activation(&self) -> Option<&ActivationPlan> {
+        self.built.as_ref().map(|b| &b.activation).or(self.existing_activation.as_ref())
+    }
 }
 
 pub struct Executor<B: Backends + Clone, S: Store> {
@@ -183,7 +198,13 @@ fn build_candidate<G: GenerationBackend>(
     };
     let staged = gens.stage(owner, &merged).map_err(|o| no_space("stage", o))?;
     let eval = gens.evaluate(&staged).map_err(|o| fail("evaluate", o))?;
-    let built = gens.build(&eval).map_err(|o| no_space("build", o))?;
+    let built = gens.build(&eval).map_err(|o| {
+        if outcome_msg(o.clone()).contains("dry activation") {
+            reject(RejectReason::ActivationUnknown, outcome_msg(o))
+        } else {
+            no_space("build", o)
+        }
+    })?;
     Ok(Candidate { staged, eval, built, merged })
 }
 
@@ -246,6 +267,8 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     /// recorded, so a later Rollback to it can restore it.
     pub fn adopt_current(&self) {
         let gens = self.b.generations();
+        // C4: a build root left by a build that crashed goes once it is old.
+        let _ = gens.age_out_build_roots();
         if let (Ok(g), Ok((set, hash))) = (gens.current(), gens.read_overrides())
             && gens.override_for(g).ok().flatten().is_none()
         {
@@ -337,6 +360,10 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             candidate: None,
             base_override: None,
             candidate_override: None,
+            existing_activation: None,
+            authz: authz.clone(),
+            live: live.clone(),
+            cand_overrides: None,
         };
 
         let mut cand_overrides: Option<OverrideSet> = None;
@@ -371,36 +398,16 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 cand_overrides = Some(merged);
             }
             Transition::SwitchGeneration(g) | Transition::Revert { to: g } => {
-                self.plan_existing(&mut plan, *g, live_hash)?;
+                cand_overrides = self.plan_existing(&mut plan, *g, live_hash)?;
             }
             Transition::Rollback => {
-                self.plan_existing(&mut plan, state.known_good, live_hash)?;
+                cand_overrides = self.plan_existing(&mut plan, state.known_good, live_hash)?;
             }
             _ => {}
         }
 
-        plan.facts = derive(&DeriveInput {
-            transition: &transition,
-            defs,
-            base: &base_eval,
-            candidate: plan.cand_eval.as_ref(),
-            activation: plan.built.as_ref().map(|b| &b.activation),
-            base_overrides: &live,
-            candidate_overrides: cand_overrides.as_ref(),
-            caller: authz.actor.clone(),
-            tables: &self.cfg.tables,
-            canonical: &self.cfg.canonical,
-        });
-        // §11: who else this reaches, and §12e: whether it goes below the floor.
-        let sessions = self.b.sessions().sessions().unwrap_or_default();
-        derive::session_facts(&mut plan.facts, &sessions);
-        derive::floor_fact(&mut plan.facts, &transition, state);
-        // §11: and whether a restart restores an unattributed stop.
-        let ended = match &transition {
-            Transition::RestartUnit(u) => self.b.units().ended_by(u),
-            _ => None,
-        };
-        derive::stop_fact(&mut plan.facts, &transition, state, defs, ended);
+        plan.cand_overrides = cand_overrides;
+        plan.facts = self.facts_of(&plan, state, defs);
 
         // §12 step 3: `expected` must refine the spec's prediction.
         let predicted = predict(&transition, state, defs);
@@ -409,35 +416,104 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             return Err(reject(RejectReason::Refinement, e));
         }
 
+        plan.decision = self.decision_of(&plan, state);
+        Ok(plan)
+    }
+
+    /// §11: the facts of a plan, from the current observation.
+    fn facts_of(&self, plan: &Plan, state: &SystemState, defs: &UnitDefs) -> DerivedFacts {
+        let transition = &plan.transition;
+        let mut facts = derive(&DeriveInput {
+            transition,
+            defs,
+            base: &plan.base_eval,
+            candidate: plan.cand_eval.as_ref(),
+            activation: plan.activation(),
+            base_overrides: &plan.live,
+            candidate_overrides: plan.cand_overrides.as_ref(),
+            caller: plan.authz.actor.clone(),
+            tables: &self.cfg.tables,
+            canonical: &self.cfg.canonical,
+        });
+        // §11: who else this reaches, and §12e: whether it goes below the floor.
+        let sessions = self.b.sessions().sessions().unwrap_or_default();
+        derive::session_facts(&mut facts, &sessions);
+        derive::floor_fact(&mut facts, transition, state);
+        // §11: and whether a restart restores an unattributed stop.
+        let ended = match transition {
+            Transition::RestartUnit(u) => self.b.units().ended_by(u),
+            _ => None,
+        };
+        derive::stop_fact(&mut facts, transition, state, defs, ended);
+        facts
+    }
+
+    fn decision_of(&self, plan: &Plan, state: &SystemState) -> Decision {
         let locked: Vec<String> =
             plan.cand_eval.as_ref().map(|e| e.locked.iter().cloned().collect()).unwrap_or_default();
-        plan.decision = decide(&Input {
-            transition: &transition,
+        decide(&Input {
+            transition: &plan.transition,
             facts: &plan.facts,
             known_good: state.known_good,
             live_tested: state.live_tested,
             cumulative: &self.session.cumulative,
-            authz,
+            authz: &plan.authz,
             settings: &self.cfg.settings,
             tables: &self.cfg.tables,
             locked: &locked,
             revert_to: None,
-        });
-        Ok(plan)
+        })
     }
 
-    fn plan_existing(&self, plan: &mut Plan, g: GenerationId, live_hash: Hash) -> Result<(), Submitted> {
+    /// C2 (§9 step 6, I8): a transaction leaving Built for Activating is
+    /// checked again as on the way in: the owner's source and the override
+    /// file are as it was built from, and the decision made again from the
+    /// facts derived now is the one it was admitted with. Otherwise it ends Rejected
+    /// (Stale) and is asked for again. `None` when it may go on.
+    fn revalidate(&mut self, id: TxnId, plan: &Plan, state: &SystemState, defs: &UnitDefs) -> Option<Submitted> {
+        let overrides_moved = plan
+            .base_override
+            .is_some_and(|b| self.b.generations().read_overrides().map(|(_, h)| h != b).unwrap_or(true));
+        let mut again = plan.clone();
+        again.facts = self.facts_of(&again, state, defs);
+        let redecided = self.decision_of(&again, state);
+        if !self.stale(plan) && !overrides_moved && redecided == plan.decision {
+            return None;
+        }
+        self.release(plan);
+        Some(match self.kernel.reject(id, RejectReason::Stale) {
+            Ok(end) => Submitted::Finished { txn: id, state: end, followup: None },
+            Err(e) => Self::kernel_error(e),
+        })
+    }
+
+    /// Equivalent effects, equivalent facts (§11, R04): an existing
+    /// generation's facts come from its dry activation and the override
+    /// content recorded for it, as a built candidate's do. Returns that
+    /// content, if one was recorded.
+    fn plan_existing(
+        &self,
+        plan: &mut Plan,
+        g: GenerationId,
+        live_hash: Hash,
+    ) -> Result<Option<OverrideSet>, Submitted> {
         let gens = self.b.generations();
         let fail = |o: Outcome| reject(RejectReason::Other("generation".into()), outcome_msg(o));
         let path = gens.path_of(g).map_err(fail)?;
         let eval = gens.evaluate_built(&path).map_err(fail)?;
-        plan.candidate = Some((g, path));
-        plan.cand_eval = Some(eval);
+        let activation =
+            gens.dry_activation(&path).map_err(|o| reject(RejectReason::ActivationUnknown, outcome_msg(o)))?;
+        let mut content = None;
         if let Some(h) = gens.override_for(g).map_err(fail)? {
+            // Without it the swap could not write it either.
+            content = Some(gens.override_content(&h).map_err(|o| reject(RejectReason::Precondition, outcome_msg(o)))?);
             plan.base_override = Some(live_hash);
             plan.candidate_override = Some(h);
         }
-        Ok(())
+        plan.candidate = Some((g, path));
+        plan.cand_eval = Some(eval);
+        plan.existing_activation = Some(activation);
+        Ok(content)
     }
 
     fn release(&self, plan: &Plan) {
@@ -491,6 +567,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             },
             base_source: plan.staged.as_ref().map(|s| s.base_source),
             staged_source: plan.staged.as_ref().map(|s| s.staged_source),
+            candidate_nar: plan.built.as_ref().and_then(|b| b.nar),
             base_override: plan.base_override,
             candidate_override: plan.candidate_override,
             gc_root: plan.built.as_ref().map(|b| b.root.clone()),
@@ -717,7 +794,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     /// Activate transactions waiting in `Built` whose window has opened: no
     /// foreground work, and the sessions idle (or the change does not disturb
     /// one). Returns what ran.
-    pub fn activate_waiting(&mut self, state: &SystemState) -> Vec<(TxnId, Submitted)> {
+    pub fn activate_waiting(&mut self, state: &SystemState, defs: &UnitDefs) -> Vec<(TxnId, Submitted)> {
         let foreground = state.conditions.iter().any(|c| matches!(c, Condition::Foreground { .. }));
         if foreground || self.waiting.is_empty() {
             return vec![];
@@ -733,6 +810,12 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         let mut out = vec![];
         for id in ready {
             if let Some((_, plan)) = self.waiting.remove(&id) {
+                // C2: the stale check, re-derive and re-decide on this path
+                // into Activating too.
+                if let Some(refused) = self.revalidate(id, &plan, state, defs) {
+                    out.push((id, refused));
+                    continue;
+                }
                 out.push((id, self.run(id, &plan)));
             }
         }
@@ -926,6 +1009,8 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         }
     }
 }
+
+pub mod residue;
 
 #[cfg(kani)]
 mod kani;

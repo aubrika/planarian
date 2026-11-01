@@ -575,6 +575,31 @@ decision = "Allow(AskFirst)"
 terminal = "Reverted"
 
 [[fault]]
+id = "switch-facts-from-dry-activation"
+family = "bad-generation-activated"
+summary = "A prebuilt generation has the running one's manifest, but its NetworkManager unit has a new store path. Switching to it has the facts its dry activation shows: NetworkManager restarts, so it is ConnectivityLoss and asked first, as the same switch built as a candidate would be. Nobody approves, so nothing changes (§11 equivalent effects, R04)."
+spec = ["§11", "R04"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the VM's prebuilt generations come from its own specialisations,
+# none of which changes only a store path; the executor test covers Rollback.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "out_of_band_rebuild", edit = "build-only NetworkManager store path", activate = false }]
+inject = { transition = "SwitchGeneration", generation = "prebuilt", source = "user", actor = "user:1001" }
+window = "5m"
+
+[fault.required_post]
+generation = "base"
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "SwitchGeneration"
+decision = "Allow(AskFirst)"
+facts = { disruption = "ConnectivityLoss" }
+affected_includes = ["service:NetworkManager"]
+
+[[fault]]
 id = "gen-override-only-change"
 family = "bad-generation-activated"
 summary = "A font-scale change touches only overrides.nix. The evaluated output differs from base, Stale is never raised (no owner edit happened), and the change commits."
@@ -1141,6 +1166,32 @@ status_seen = { "service:gym-web" = ["Unknown"] }
 target = "service:gym-web"
 kind = "diagnostic"
 first_candidate = "reobserve:gym-web-tcp"
+
+# R06 (§10 probe contract): a probe's timeout bounds the whole probe, and a
+# straggler never holds the batch.
+[[fault]]
+id = "probe-trickling-endpoint"
+family = "probe-timeout-service-healthy"
+summary = "gym-web's /health sends one byte every 2 s and never finishes, so a per-read timeout would never fire. Its 10 s timeout bounds the whole probe: Timeout, Unknown, never Failed, and gym-web is not restarted. Meanwhile the loop keeps ticking: gym-cache crashes and is repaired."
+spec = ["§10 probe contract", "R06"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { raw = "set_knob", unit = "service:gym-web", knob = "health_trickle", value = "2s" }
+after = [{ raw = "wait", for = "45s" }, { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGSEGV" }, { raw = "wait", for = "2m" }]
+window = "4m"
+
+[fault.required_post]
+no_txn_on = ["service:gym-web"]
+status_never = { "service:gym-web" = ["Failed"] }
+status_seen = { "service:gym-web" = ["Unknown"] }
+units = { "service:gym-cache" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-cache"
+terminal = "Committed"
 
 [[fault]]
 id = "probe-diagnostic-stale-healthy"
@@ -2829,6 +2880,28 @@ not_started = ["service:gym-agent"]
 reports = ["PostureLifted"]
 invariants = ["I20"]
 
+# R05 (§12d, I20): agents the launcher created are stopped by the posture.
+[[fault]]
+id = "posture-stops-launched-agents"
+family = "failure-posture"
+summary = "An administrator launches an agent with `planarian agent run` (in planarian-agents.slice). planariad then crash-loops past its restart budget: planarian-failed@Crashed stops the agents' slice as a whole, so the launched agent stops too, not only the declared agent units."
+spec = ["§12d", "I20", "R05"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "agent_run", name = "launched", as = "user:1001", argv = ["/run/current-system/sw/bin/sleep", "infinity"] }, { raw = "wait", for = "10s" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGSEGV", repeat = "past-budget" }
+after = [{ raw = "wait", for = "30s" }]
+window = "4m"
+
+[fault.required_post]
+posture = { class = "Crashed", target_reached = "planarian-failed@Crashed.target", responses = ["disable_agents"] }
+invariants = ["I20"]
+
+[fault.required_post.unit_after_failure]
+"service:planarian-agent-launched" = "Stopped"
+
 [[fault]]
 id = "posture-crashed-budget"
 family = "failure-posture"
@@ -3125,7 +3198,31 @@ generation = "base"
 
 [[fault.required_post.txn]]
 transition = "ApplyChange"
-refused_with = 'Other("build")'
+refused_with = 'ActivationUnknown'
+
+[[fault]]
+id = "candidate-nar-mismatch-refused"
+family = "bad-generation"
+summary = "A display-scale candidate's store contents no longer hash to the NAR hash recorded when it was built. It is refused before activation: verification checks the hash, not that the path exists (§9 step 3, C6)."
+spec = ["§9 step 3", "C6"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: corrupting a store path on the VM would corrupt the host's
+# store, which the test VM shares; the backend test covers the real check.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "verify_candidate", result = "nar-mismatch" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "3m"
+
+[fault.required_post]
+generation = "base"
+override_source = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+terminal = 'Rejected(Other("candidate failed verification"))'
 
 [[fault]]
 id = "dry-activate-timeout"
@@ -3147,7 +3244,7 @@ generation = "base"
 
 [[fault.required_post.txn]]
 transition = "ApplyChange"
-refused_with = 'Other("build")'
+refused_with = 'ActivationUnknown'
 
 [[fault]]
 id = "dry-activate-truncated"
@@ -3169,7 +3266,7 @@ generation = "base"
 
 [[fault.required_post.txn]]
 transition = "ApplyChange"
-refused_with = 'Other("build")'
+refused_with = 'ActivationUnknown'
 
 # R03 (§11, rule 20): equivalent effects, equivalent facts.
 [[fault]]
@@ -3824,6 +3921,54 @@ transition = "ApplyChange"
 never = ["Activating"]
 terminal = "pending"
 
+# I13: "A unit under an override is never a repair target while the override holds."
+[[fault]]
+id = "en-i13-overridden-unit-is-not-repaired"
+family = "english"
+summary = "An administrator stops gym-web until they say otherwise. For the next ten minutes gym-web stays stopped and under the override: no repair is proposed for it, and nothing restarts it."
+spec = ["I13"]
+tags = ["english"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "ask", phrase = "stop gym-web until I say", actor = "user:1001" }
+window = "10m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+terminal = "Committed"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+count = 0
+
+# I17: "The set of principals holding administrator capability is never empty."
+[[fault]]
+id = "en-i17-root-administers-without-the-group"
+family = "english"
+summary = "Nobody is left in planarian-admin, so the group grants no one administrator capability. Root still holds it: root's administrator-only change (gym-web's listen address) is authorized and commits."
+spec = ["I17"]
+tags = ["english"]
+scoring = "must-pass"
+# Fake only: on the VM, group membership is the real group file, and root's
+# peer is root's however the group reads.
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "127.0.0.1" }, source = "user", actor = "root:nogroup" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+
 # I21: "No transition that cannot be reversed ... executes below AskFirst, unless the loss falls only on the caller's own session."
 [[fault]]
 id = "en-i21-irreversible-asks-even-for-root"
@@ -3887,13 +4032,13 @@ refused_with = "Unauthorized"
 [[fault]]
 id = "en-i23-third-party-override-kept"
 family = "english"
-summary = "Between a change's boot entry being published and its override promotion, a third party rewrites the override file. Planarian does not overwrite it: the third party's file stands, and the change does not commit (it stops at RecoveryFailed for a person to resolve). Before it, a runtime restart of gym-web wrote no boot entry."
+summary = "Between a change's boot entry being published and its override promotion, a third party rewrites the override file. Planarian does not overwrite it: the third party's file stands, and the change does not commit (it stops at RecoveryFailed for a person to resolve). Before it, a runtime restart of gym-web wrote no boot entry. On the VM the third party is a cooperating writer: it holds the lock on planarian/ across the daemon's compare-and-swap and replaces the file before letting go, so the swap waits and then sees the edit (R11)."
 spec = ["I23"]
 tags = ["english"]
 scoring = "must-pass"
-# Fake only: on the VM the gap between Published and promotion is too short
-# for the harness's watcher to land an edit in it.
-harness = ["fake"]
+# On the VM the daemon pauses before its swap (gym hook), the writer takes
+# the lock there and the daemon goes on into it.
+harness = ["fake", "vm"]
 intent = { kind = "none" }
 setup = [
   { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" },

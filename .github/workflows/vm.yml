@@ -148,9 +148,8 @@ jobs:
       - name: Verdict
         run: |
           cat verdict/verdict.json
-          # UNSUPPORTED only where the test VM cannot run the entry by design
-          # (docs/ga-status.md); anywhere else it is a harness regression.
-          jq -e --arg id '${{ matrix.id }}' '.result == "PASS" or (.result == "UNSUPPORTED" and ($id == "storage-nix-full-gc" or $id == "desktop-boot-fails-rollback"))' verdict/verdict.json
+          # R12: the §15 harness contract (waivers are docs/deviations.md rows).
+          python3 nix/gym/harness-contract.py vm crates/gym/catalog/phase-a.toml docs/deviations.md verdict/verdict.json
           jq -r '"\(.id): \(.result)"' verdict/verdict.json >> "$GITHUB_STEP_SUMMARY"
       # Best effort: the verdict is in the log above too, and a private
       # repository's artifact storage is small (the evidence is not uploaded).

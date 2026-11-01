@@ -441,3 +441,55 @@ fn erased_middle_header_is_an_integrity_failure() {
     s.write_at(offs[2], &[0u8; 16]).unwrap();
     assert!(matches!(Journal::open(s), Err(JournalError::Integrity(_))));
 }
+
+/// C5: a transaction's fence is created exclusively at `Prepared`, a fence
+/// with no record (a prepare that died before journaling) is swept on open,
+/// and terminal transactions' fences go at the next checkpoint while live
+/// ones stay.
+#[test]
+fn txn_fences_are_exclusive_and_swept_after_checkpoint() {
+    let rig = Rig::new();
+    let mut d = rig.daemon();
+    let a = d.prepare(good_change()).unwrap();
+    d.run(a).unwrap();
+    let b = d.prepare(change("held")).unwrap();
+    assert_eq!(rig.store.fence(a).unwrap(), Some(1), "terminal, not yet checkpointed");
+    assert!(rig.store.create_fence(b, 1).is_err(), "a prepared id is never created again");
+
+    // An orphan past next_txn: the prepare that made it died.
+    let orphan = TxnId(b.0 + 1);
+    rig.store.create_fence(orphan, 1).unwrap();
+    let mut j = Journal::open(rig.store.clone()).unwrap();
+    assert_eq!(rig.store.fence(orphan).unwrap(), None, "swept on open");
+    assert_eq!(rig.store.fence(a).unwrap(), Some(1), "open keeps recorded ids");
+
+    j.compact().unwrap();
+    assert_eq!(rig.store.fence(a).unwrap(), None, "terminal: gone after the checkpoint");
+    assert_eq!(rig.store.fence(b).unwrap(), Some(1), "live: kept");
+    // The next prepare gets a fresh id and a fresh fence.
+    let c = d.prepare(change("next")).unwrap();
+    assert!(c.0 > b.0);
+    assert_eq!(rig.store.fence(c).unwrap(), Some(1));
+    // Something already at the next id: the prepare is refused, not merged.
+    rig.store.create_fence(TxnId(c.0 + 1), 7).unwrap();
+    assert!(d.prepare(change("collides")).is_err());
+    assert_eq!(rig.store.fence(TxnId(c.0 + 1)).unwrap(), Some(7), "left as found");
+}
+
+/// The same on disk: `txn/<id>/` by exclusive `mkdir`, removed by the sweep,
+/// and nothing in `txn/` that is not a transaction id is touched.
+#[test]
+fn file_store_txn_dirs_are_exclusive() {
+    let dir = tempfile::tempdir().unwrap();
+    let (jdir, tdir) = (dir.path().join("journal"), dir.path().join("txn"));
+    let store = FileStore::open(&jdir, &tdir, 1 << 20).unwrap();
+    store.create_fence(TxnId(5), 1).unwrap();
+    assert_eq!(store.create_fence(TxnId(5), 1).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    store.set_fence(TxnId(5), 2).unwrap();
+    assert_eq!(store.fence(TxnId(5)).unwrap(), Some(2), "takeover rewrites the lease");
+    store.create_fence(TxnId(6), 1).unwrap();
+    std::fs::write(tdir.join("README"), "not a txn").unwrap();
+    assert_eq!(store.forget_fences(|t| t == TxnId(6)).unwrap(), vec![TxnId(5)]);
+    assert!(!tdir.join("5").exists());
+    assert!(tdir.join("6/lease").exists() && tdir.join("README").exists());
+}

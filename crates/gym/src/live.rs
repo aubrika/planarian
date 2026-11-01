@@ -177,7 +177,7 @@ pub fn plan(entry: &T) -> Plan {
                         None => "unsupported: a timed kill with no request before it".into(),
                     }
                 }
-                "edit_owner_source" | "block_network" | "fill_fs" | "kill_unit" => {
+                "edit_owner_source" | "block_network" | "fill_fs" | "kill_unit" | "edit_override_file" => {
                     p.watched.insert(i, state.to_string());
                     "armed".into()
                 }
@@ -489,6 +489,7 @@ fn begin(entry: &T) {
     let dir = run_dir();
     let p = plan(entry);
     write_json(&dir.join("plan.json"), &p);
+    let _ = std::fs::remove_file(dir.join("third-party-override"));
     let deadline = Instant::now() + Duration::from_secs(1200);
     loop {
         if let Some(r) = console() {
@@ -622,7 +623,9 @@ fn posture_snapshot() -> (BTreeSet<String>, BTreeSet<String>) {
     if sh("journalctl -q -t planarian-posture -p alert --no-pager | grep -q 'failure class'") {
         r.insert("notify_admins".into());
     }
-    if sh("systemctl is-active --quiet gym-agent.service") {
+    // The declared agent, and any the launcher created (in their slice, R05).
+    let launched = "systemctl list-units --no-legend --state=active,activating 'planarian-agent-*.service' | grep -q .";
+    if sh("systemctl is-active --quiet gym-agent.service") || sh(launched) {
         r.insert("agents_running".into());
     } else {
         r.insert("disable_agents".into());
@@ -746,7 +749,8 @@ fn request_as(actor: &str, req: &Request) -> Result<(), String> {
         let cmd = format!(
             "uid=$(systemctl show -p UID --value {unit}); gid=$(systemctl show -p GID --value {unit}); \
              [ -n \"$uid\" ] && [ \"$uid\" != \"[not set]\" ] || exit 1; \
-             sh -c 'echo $$ > /sys/fs/cgroup/system.slice/{unit}.service/cgroup.procs && \
+             cg=$(systemctl show -p ControlGroup --value {unit}); [ -n \"$cg\" ] || exit 1; \
+             sh -c 'echo $$ > /sys/fs/cgroup'\"$cg\"'/cgroup.procs && \
              exec setpriv --reuid=$0 --regid=$1 --clear-groups {exe} vm request --json \"$2\"' \"$uid\" \"$gid\" '{q}'"
         );
         return if sh(&cmd) { Ok(()) } else { Err(format!("request as {actor} failed")) };
@@ -791,6 +795,9 @@ fn pause_call(state: &str) -> Option<&'static str> {
     match state {
         "Staged" | "Built" => Some("build"),
         "Checking" => Some("publish_boot"),
+        // Promotion's compare-and-swap (§9 step 4): the daemon waits before
+        // taking the lock on planarian/.
+        "Published" => Some("swap_override"),
         _ => None,
     }
 }
@@ -1373,6 +1380,48 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                  [ $n -gt 0 ] && fallocate -l $n {path}/.gym-fill || dd if=/dev/zero of={path}/.gym-fill bs=1M 2>/dev/null; true"
             ));
         }
+        // I23 (R11): a cooperating writer. At the daemon's pause before its
+        // compare-and-swap, it takes the lock on planarian/ (flock(1)), lets
+        // the daemon go on, and replaces the file before letting go: the
+        // daemon's swap waits for the lock and then sees the edit.
+        "edit_override_file" => {
+            let dir = cfg.owner.join("planarian");
+            let mut set = OverrideSet::default();
+            set.assignments.insert("gym.thirdParty".into(), Value::Bool(true));
+            let staged = PathBuf::from(RUN).join("third-party.nix");
+            std::fs::write(&staged, planarian_changes::render(&set)).map_err(|e| e.to_string())?;
+            let held = PathBuf::from(RUN).join("override-lock-held");
+            let _ = std::fs::remove_file(&held);
+            let d = dir.display();
+            let mut writer = Command::new("flock")
+                .arg(dir.as_os_str())
+                .args(["sh", "-c"])
+                .arg(format!(
+                    "touch {h} && sleep 3 && cp {staged} {d}/.gym-third-party && mv {d}/.gym-third-party {d}/overrides.nix",
+                    h = held.display(),
+                    staged = staged.display()
+                ))
+                .spawn()
+                .map_err(|e| format!("flock: {e}"))?;
+            let until = Instant::now() + Duration::from_secs(30);
+            while !held.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !held.exists() {
+                let _ = writer.kill();
+                return Err("the cooperating writer never took the lock".into());
+            }
+            // Let the paused daemon go on while the lock is held.
+            sh(&format!("rm -f {HOOKS_DIR}/paused-*"));
+            let ok = writer.wait().map(|s| s.success()).unwrap_or(false);
+            if !ok {
+                return Err("the cooperating writer failed".into());
+            }
+            if let Ok((_, h)) = Backends::generations(&real(cfg)).read_overrides() {
+                let _ = std::fs::write(PathBuf::from(RUN).join("third-party-override"), h.to_hex());
+            }
+            eprintln!("gym: a cooperating writer replaced {d}/overrides.nix under the lock");
+        }
         "edit_owner_source" => {
             let root = cfg.owner.display().to_string();
             let path = get("path");
@@ -1622,7 +1671,9 @@ fn evidence() -> Evidence {
         overrides_empty: g.read_overrides().map(|(o, _)| o.assignments.is_empty()).unwrap_or(true),
         override_hash: g.read_overrides().ok().map(|(_, h)| h),
         agreement: None,
-        third_party_override: None,
+        third_party_override: std::fs::read_to_string(dir.join("third-party-override"))
+            .ok()
+            .and_then(|h| Hash::from_hex(h.trim())),
         ledger,
         journal_replays,
         log,

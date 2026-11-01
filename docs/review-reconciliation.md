@@ -24,18 +24,18 @@ implementation it requires is listed as open or closed separately).
 | R01 | Boot-only publication has an uncovered crash window | open | `kernel.rs` publishes the one-shot while the transaction says `Built`; no `Publishing` state exists | §28: `TxnState::Publishing`, crash-table row |
 | R02 | Security-floor advancement is outside durable commit | open | the floor is derived in `exec` after `Committed`, not in the kernel's commit; the watchdog and boot-only paths skip it | I25 |
 | R03 | A stopped override erases the disruption it causes | open | `derive.rs`: `SetOverride` sets `disruption = None` and narrows affected units to the unit | §11 equivalent effects |
-| R04 | Existing-generation operations omit activation consequences | open | `SwitchGeneration`/`Rollback`/`Revert` derive no activation plan or override diff | §11 equivalent effects |
-| R05 | Launcher-created agents are outside failure-posture enforcement | open | `start_agent` units are not in `agentUnits` and have no readiness ordering | §12d `planarian-agents.slice` |
-| R06 | Probe timeouts do not bound total execution time | open | `probe.rs`: DNS resolution outside the deadline; the batch joins every thread | §10 whole-probe deadline |
+| R04 | Existing-generation operations omit activation consequences | closed | `plan_existing` takes the target's dry activation and its recorded override content; a dry activation without a plan is `ActivationUnknown` | §11 equivalent effects |
+| R05 | Launcher-created agents are outside failure-posture enforcement | closed | `start_agent` units run in `planarian-agents.slice`, ordered after `planarian-ready.target`, refused while a failure class is raised, limited per unit and per uid; the posture stops the slice | §12d `planarian-agents.slice` |
+| R06 | Probe timeouts do not bound total execution time | closed | `probe.rs`: resolution, connect and every read share one deadline; the batch returns by its allowance and a straggler is `Timeout` | §10 whole-probe deadline |
 | R07 | Already-degraded units can lose more health without blocking commit | open | `host.rs`'s check compares unit status, skips units not Running before | §9 per-probe post-check |
 | R08 | Rejected release requests still replenish repair budgets | open | `core.rs`: `LiftOverride` calls `incidents.human_acted` whatever the result | §13 |
 | R09 | Unauthorized callers can reach expensive prebuild work | open | `user_submit` queues `prebuild_job` before `decide` runs | §12 admission before work |
 | R10 | Failed dry activation is accepted as usable risk evidence | open | `nixos.rs` parses `dry-activate` output without checking its exit or timeout | §9 step 3, rule 21 |
-| R11 | Override replacement is check-then-rename, not compare-and-swap | open | `swap_override` compares then renames, unlocked | I23 under `flock`; X-12 |
-| R12 | The VM catalog runner exits 0 after total build failure | open | `nix/gym/run-vm.sh` ends with an unconditional summary | §15 harness contract |
-| R13 | The benchmark cannot establish the full invisibility claim | open | `bench.nix` samples two MainPIDs; p99 is the engine's one-second minimum | §15, §21 |
-| R14 | The verification ratchet can inflate counts or lose coverage | partly | `b219d81`-era `verification.rs` requires an English entry per proved invariant (e49c37a); duplicates, removed baseline invariants and textual name checks remain | §17a accounting checks |
-| R15 | Unsupported regressions can remain green | partly | VM catalog jobs accept UNSUPPORTED only for two named entries (b219d81); the fake runner and `ci.yml` still accept it | §15 harness contract |
+| R11 | Override replacement is check-then-rename, not compare-and-swap | closed | `swap_override` compares and renames under an exclusive `flock` on `planarian/`; promote, restore and collect under `profile.lock`; `txn/<id>/` by exclusive `mkdir`, swept after the checkpoint; the override store pruned (C5) | I23 under `flock`; X-12 |
+| R12 | The VM catalog runner exits 0 after total build failure | closed | `run-vm.sh` and `vm.yml` apply `nix/gym/harness-contract.py`: nonzero on ERROR, FAIL, PARTIAL, and on an UNSUPPORTED must-pass or acceptance entry without a waiver row in `docs/deviations.md` ("Harness waivers") naming entry and harness | §15 harness contract |
+| R13 | The benchmark cannot establish the full invisibility claim | closed in code, run pending | idle from cgroup accounting over every Planarian service and op unit (CPUUsageNSec; RSS and wakeups of every process in them); p99 from MangoHud's per-frame log only, no fallback | §15, §21 |
+| R14 | The verification ratchet can inflate counts or lose coverage | closed | duplicate invariants and obligations rejected; a baseline invariant must still be accounted; a discharged name must be a `proof fn`, a function with `ensures` inside `verus!` or a `#[kani::proof]` harness; `[verifier]` counts tie the Verus obligations to the Verus run, which fails on a mismatch | §17a accounting checks |
+| R15 | Unsupported regressions can remain green | closed | `ci.yml` runs the fake catalog `--strict`, which applies the same rule and the same `docs/deviations.md` table to the fake harness | §15 harness contract |
 | R16 | Gate and bypass documentation lag the implementation | partly | the register was reconciled through B-19/X-11 (cae89a9 … 805cd1c); `ga-status.md`, `guarantees.md`, `AGENTS.md` still lag | rule 19(c) sweep |
 
 ## Specification decisions (S)
@@ -86,16 +86,34 @@ branch protection; the rest are in PR #2.
 | P23 | `8a0e523` | `residue-first-kill-teaches-stop` |
 | R01, S01 | `88a984a` | `crash-publishing-before-publish`, `crash-publishing-after-publish` |
 | S02 | `cd9a522`, `4e5cd1c` | `boot-only-admitted-not-confirmed`, `boot-only-repair-during-confirmation`, `boot-only-kernel-confirmed` |
+| R06 | `48c3907` | `probe-trickling-endpoint` (VM); backend tests `trickling_http_has_one_total_deadline`, `a_stalled_resolver_is_inside_the_deadline`, `a_wedged_probe_does_not_hold_the_batch` |
+| R05 | `7bfe155` | `posture-stops-launched-agents` (VM); backend test `no_agent_starts_while_a_failure_class_is_raised`; core test `agents_per_uid_are_limited` |
+| C6, C4 | `8079c64` | `candidate-nar-mismatch-refused`; backend tests `old_build_roots_age_out`, `nar_hash_from_both_json_shapes` |
+| P7, P8 | `905a06d`, `b077335` | core tests `a_write_back_queues_behind_a_generation_transaction`, `a_deferred_repair_is_deferred_in_fact` |
+| P13–P17, P22, K10 | `9abea74`, `999ac42` | vm-posture subtests P14–P17; core tests `mark_good_needs_root_at_a_terminal`, `report_boot_and_posture_answer`, `a_committed_change_missing_from_the_overrides_is_lost`; `a_weaker_posture_waits_for_the_boot`, `a_lost_change_is_reapplied`, `reapply_does_what_the_original_did` (P18 already shipped) |
+| C2, P9, P10, D4 | `ed1c15d` | core test `an_owner_edit_while_waiting_is_stale_when_the_window_opens`; `every_reader_is_bounded_by_bytes_max`; C22 and R09's bound verified unchanged |
+| R12, R14, R15, R13 | `62fb19e`, waivers moved to `docs/deviations.md` after the owner's review | `the_accounting_checks_bite`; run-vm.sh's verdict logic exercised on a sample; the Verus check's count comparison |
+| R04 | `5d9d986` | `switch-facts-from-dry-activation`; exec tests `rollback_facts_come_from_the_dry_activation`, `an_existing_generation_without_a_plan_is_refused`; `dry-activate-*` now refused with `ActivationUnknown` |
+| R11, C5 | `867ffc1` | `en-i23-third-party-override-kept` (now also VM); backend tests `the_override_swap_waits_for_the_directory_lock`, `the_override_store_is_pruned`; txn tests `txn_fences_are_exclusive_and_swept_after_checkpoint`, `file_store_txn_dirs_are_exclusive` |
 
 `4e5cd1c` also carries an owner decision (31 Oct) amending I6, §10 and §12
 Concurrency: unit and device repairs run while an admitted boot-only change
 awaits its confirmation, and a canonical unit that needed a repair in that
 window means the change is not confirmed.
 
-These cases run on the fake harness only unless marked; the VM catalog run
-of rule 19(f) is still to come.
+Every case above that lists the VM harness passed in one whole-catalog run
+on one commit: "VM tests" run 110 on `6ad8521` (99 PASS, 2 waived
+UNSUPPORTED `repair` entries, 0 not cleared; `docs/ga-status.md`). The fake
+harness passes all 130 of its entries on the same commit (CI run 140).
 
-Still open from the tables above: R04, R05, R06, R11, R12, R13, R14 (the
-rest), R15 (the fake runner and `ci.yml`), R16 (`ga-status.md` waits for
-19(f)); S04 is docs only. Still open from §28 beyond R and S: C4, C6, P7, P8,
-P13–P18, P22, K10.
+| Found by the run | Commit | Case |
+| --- | --- | --- |
+| A takeover acked an op its fenced predecessor had just acked itself: `DuplicateOp`, the transaction left in flight (run 109, `crash-slow-worker-overlap`) | `6ad8521` | txn test `a_late_ack_from_the_old_owner_is_not_acked_twice`; the entry on VMs |
+| P9's warning fired on nearly every VM tick | `6ad8521` | core test `a_slow_tick_is_warned` (at most one a minute) |
+| Open, owner's decision: the restarted daemon's startup revert stalls 15 minutes (switch-to-configuration waiting on a unit ordered after `planarian-ready.target`) before the watchdog finishes it | — | `crash-slow-worker-overlap` passes after the stall |
+
+Still open, each in issue #7's lanes: R13's benchmark run (#8); §12f
+*Rollbacks*, P19, C18 (#9); C10, C19, P21, P24 and the R06/P10 remainders
+(#10); P11 and the module-eval assertions (#11); deviations and the closing
+run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
+proved; the residue classifier under Kani).

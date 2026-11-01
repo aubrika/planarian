@@ -155,6 +155,9 @@ pub enum RejectReason {
     ApprovalExpired,
     /// The transition's precondition does not hold (§12 step 5, C3).
     Precondition,
+    /// The dry activation failed, timed out or was cut short: what the
+    /// change would start, stop or restart is unknown (§9 step 3, R10, R04).
+    ActivationUnknown,
     Other(String),
 }
 

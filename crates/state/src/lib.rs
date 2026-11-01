@@ -77,6 +77,9 @@ pub struct Assembler {
     pub on_battery: bool,
     /// Ticks that went over budget (logged by the daemon).
     pub slow_ticks: u64,
+    /// The last tick over budget, if the daemon has not reported it yet:
+    /// how long it took and the probes that ran in it (P9).
+    pub slow_tick: Option<(Millis, Vec<String>)>,
 }
 
 impl Assembler {
@@ -420,6 +423,7 @@ impl Assembler {
         for ((unit, p), r) in batch.into_iter().zip(results) {
             local.push((unit, p, r));
         }
+        let ran: Vec<String> = local.iter().map(|(u, p, _)| format!("{u}/{}", p.id.0)).collect();
         for (unit, p, result) in local {
             let key = (unit.clone(), p.id.clone());
             self.on_demand.remove(&key);
@@ -442,8 +446,10 @@ impl Assembler {
         let generation = b.generations().current().unwrap_or(ctx.known_good);
         let resources = b.inventory().resources().unwrap_or_default();
         let finished = b.clock().now();
-        if finished.0.saturating_sub(started.0) > TICK_BUDGET.0 {
+        let took = finished.0.saturating_sub(started.0);
+        if took > TICK_BUDGET.0 {
             self.slow_ticks += 1;
+            self.slow_tick = Some((Millis(took), ran));
         }
         SystemState {
             generation,

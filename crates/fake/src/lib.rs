@@ -219,6 +219,14 @@ pub struct World {
     pub agent_instances: BTreeMap<String, InstanceId>,
     /// The next build's dry activation fails this way (R10).
     pub dry_activate_fails: Option<String>,
+    /// Fault injection (C6): the next candidate's store contents no longer
+    /// hash to the NAR hash recorded when it was built.
+    pub nar_mismatch: bool,
+    /// Each probe batch takes this long on the fake clock (P9's slow tick).
+    pub probe_batch_ms: u64,
+    /// Every candidate's activation also restarts these (a user's audio,
+    /// say), so it disturbs an active session (§12f).
+    pub activation_restarts: BTreeSet<UnitId>,
     pub next_instance: u64,
     pub third_party_override: Option<Hash>,
     /// Units planted outside the generation (the boot report finds them).
@@ -252,6 +260,50 @@ pub struct World {
 }
 
 impl World {
+    /// The fake store's NAR hash of a path.
+    pub fn nar_of(path: &StorePath) -> Hash {
+        Hash::of(path.0.as_bytes())
+    }
+
+    /// What switching from the current generation to `g` would do: the
+    /// dry activation the real backend runs, from the two evaluations.
+    pub fn dry_plan(&self, g: GenerationId) -> ActivationPlan {
+        let cur = &self.gens[&self.current];
+        let new = &self.gens[&g];
+        let mut plan = new.eval.activation.clone();
+        if g != self.current {
+            plan.restart.extend(self.activation_restarts.iter().cloned());
+        }
+        for u in new.eval.units.keys() {
+            match cur.eval.units.get(u) {
+                None => {
+                    plan.start.insert(u.clone());
+                }
+                Some(old) if old != &new.eval.units[u] || new.broken.contains(u) != cur.broken.contains(u) => {
+                    plan.restart.insert(u.clone());
+                }
+                _ => {}
+            }
+        }
+        for (k, v) in &new.eval.options {
+            if cur.eval.options.get(k) != Some(v) {
+                // An option change restarts the services of its module (`services.<name>.…`).
+                if let Some(svc) = k.strip_prefix("services.").and_then(|r| r.split('.').next()) {
+                    let id = UnitId::service(svc);
+                    if new.eval.units.contains_key(&id) {
+                        plan.restart.insert(id);
+                    }
+                }
+            }
+        }
+        for u in cur.eval.units.keys() {
+            if !new.eval.units.contains_key(u) {
+                plan.stop.insert(u.clone());
+            }
+        }
+        plan
+    }
+
     fn key(id: &UnitId) -> UnitId {
         let mut k = id.clone();
         if let Scope::User { uid, .. } = k.scope {
@@ -618,7 +670,12 @@ impl UnitBackend for Fake {
         Ok(self.w().units.keys().cloned().collect())
     }
 
-    fn start_agent(&self, name: &str, _argv: &[String]) -> Result<InstanceId, Outcome> {
+    fn start_agent(
+        &self,
+        name: &str,
+        _argv: &[String],
+        _limits: &planarian_schema::backend::AgentLimits,
+    ) -> Result<InstanceId, Outcome> {
         let mut w = self.w();
         let now = w.now;
         let id = UnitId::service(&format!("planarian-agent-{name}"));
@@ -745,43 +802,36 @@ impl GenerationBackend for Fake {
                 g
             }
         };
-        let cur = w.gens[&w.current].clone();
         let new = w.gens[&g].clone();
-        let mut plan = new.eval.activation.clone();
-        for u in new.eval.units.keys() {
-            match cur.eval.units.get(u) {
-                None => {
-                    plan.start.insert(u.clone());
-                }
-                Some(old) if old != &new.eval.units[u] || new.broken.contains(u) != cur.broken.contains(u) => {
-                    plan.restart.insert(u.clone());
-                }
-                _ => {}
-            }
-        }
-        for (k, v) in &new.eval.options {
-            if cur.eval.options.get(k) != Some(v) {
-                // An option change restarts the services of its module (`services.<name>.…`).
-                if let Some(svc) = k.strip_prefix("services.").and_then(|r| r.split('.').next()) {
-                    let id = UnitId::service(svc);
-                    if new.eval.units.contains_key(&id) {
-                        plan.restart.insert(id);
-                    }
-                }
-            }
-        }
-        for u in cur.eval.units.keys() {
-            if !new.eval.units.contains_key(u) {
-                plan.stop.insert(u.clone());
-            }
-        }
+        let plan = w.dry_plan(g);
         let root = format!("/nix/var/nix/gcroots/planarian/builds/{}", eval.source.to_hex());
         w.gc_roots.insert(root.clone());
-        Ok(Built { generation: g, path: new.path, root, activation: plan })
+        let nar = Some(World::nar_of(&new.path));
+        Ok(Built { generation: g, path: new.path, root, activation: plan, nar })
     }
 
-    fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
-        let w = self.w();
+    fn dry_activation(&self, path: &StorePath) -> Result<ActivationPlan, Outcome> {
+        let mut w = self.w();
+        if let Some(why) = w.dry_activate_fails.take() {
+            return Err(Outcome::Failed(why));
+        }
+        let g = w.gens.iter().find(|(_, x)| &x.path == path).map(|(g, _)| *g);
+        let g = g.ok_or_else(|| Outcome::Failed("unknown store path".into()))?;
+        Ok(w.dry_plan(g))
+    }
+
+    fn override_content(&self, h: &Hash) -> Result<OverrideSet, Outcome> {
+        self.w().override_store.get(h).cloned().ok_or_else(|| Outcome::Failed("no override content".into()))
+    }
+
+    fn verify_candidate(&self, path: &StorePath, nar: Option<&Hash>) -> Result<bool, Outcome> {
+        let mut w = self.w();
+        // C6: the store's hash of the path now; `nar_mismatch` makes it
+        // differ from the one recorded at build, once.
+        let now = if std::mem::take(&mut w.nar_mismatch) { Hash::of(b"changed") } else { World::nar_of(path) };
+        if nar.is_some_and(|n| *n != now) {
+            return Ok(false);
+        }
         Ok(w.gens.values().any(|g| &g.path == path)
             && !w.collected.iter().any(|c| w.gens.get(c).is_some_and(|g| &g.path == path)))
     }
@@ -1016,6 +1066,8 @@ impl ProbeBackend for Fake {
     fn run_batch(&self, jobs: &[(UnitId, ProbeDef)]) -> Vec<ProbeResult> {
         let mut w = self.w();
         w.probe_batches += 1;
+        let slow = w.probe_batch_ms;
+        w.now = Timestamp(w.now.0 + slow);
         jobs.iter()
             .map(|(unit, p)| {
                 if let ProbeKind::FreeSpace { path, min_bytes, min_permille } = &p.kind {

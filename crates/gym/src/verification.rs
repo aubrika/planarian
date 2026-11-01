@@ -39,13 +39,73 @@ fn source(krate: &str) -> Vec<String> {
     v
 }
 
-/// `fn name` appears in the crate (a proof fn, a verified fn, a Kani harness).
-fn defined(krate: &str, name: &str) -> bool {
+/// What discharges an obligation (§17a, R14): a Verus `proof fn` or a
+/// function verified against its `ensures`, inside `verus!`; or a Kani
+/// harness (`#[kani::proof]`). A name that is only present (a plain
+/// function, a test, a comment) discharges nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Discharge {
+    Verus,
+    Kani,
+}
+
+pub fn discharge_in(files: &[String], name: &str) -> Option<Discharge> {
     let pat = format!("fn {name}");
-    source(krate).iter().any(|f| {
-        f.match_indices(&pat)
-            .any(|(i, _)| f[i + pat.len()..].chars().next().is_some_and(|c| c == '(' || c == '<' || c.is_whitespace()))
-    })
+    for f in files {
+        for (i, _) in f.match_indices(&pat) {
+            let after = &f[i + pat.len()..];
+            if !after.chars().next().is_some_and(|c| c == '(' || c == '<') {
+                continue;
+            }
+            let line_start = f[..i].rfind('\n').map_or(0, |n| n + 1);
+            // The attributes directly above the function, and only those.
+            let attrs: Vec<&str> =
+                f[..line_start].lines().rev().map(str::trim_start).take_while(|l| l.starts_with("#[")).collect();
+            if attrs.iter().any(|l| l.starts_with("#[kani::proof")) {
+                return Some(Discharge::Kani);
+            }
+            if !f[..i].contains("verus!") {
+                continue;
+            }
+            let head = &after[..after.find('{').unwrap_or(after.len())];
+            if f[line_start..i].contains("proof ") || head.contains("ensures") {
+                return Some(Discharge::Verus);
+            }
+        }
+    }
+    None
+}
+
+fn discharge(krate: &str, name: &str) -> Option<Discharge> {
+    discharge_in(&source(krate), name)
+}
+
+/// R14's structural checks on the accounting, apart from the source: no
+/// invariant listed twice, no obligation listed twice under one invariant,
+/// and every invariant of the baseline still accounted.
+pub fn structure_errors(doc: &T) -> Vec<String> {
+    let mut errors = vec![];
+    let mut seen = std::collections::BTreeSet::new();
+    for inv in doc.get("invariant").and_then(T::as_array).into_iter().flatten() {
+        let id = inv.get("id").and_then(T::as_str).unwrap_or("?");
+        if !seen.insert(id.to_string()) {
+            errors.push(format!("{id} is accounted twice"));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for n in inv.get("discharged").and_then(T::as_array).into_iter().flatten().filter_map(T::as_str) {
+            if !names.insert(n) {
+                errors.push(format!("{id}: {n} is listed twice"));
+            }
+        }
+    }
+    if let Some(bp) = doc.get("baseline").and_then(|b| b.get("per_invariant")).and_then(T::as_table) {
+        for id in bp.keys() {
+            if !seen.contains(id) {
+                errors.push(format!("{id} is in the baseline but no longer accounted (a removed invariant fails)"));
+            }
+        }
+    }
+    errors
 }
 
 /// `external_body` attributes and `assume(` calls in the verified crates
@@ -142,6 +202,8 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
     let trust_ids = ids.len() - internal;
     let trust_count = trust_ids + trust_sites();
 
+    errors.extend(structure_errors(&doc));
+    let mut used: BTreeMap<(String, Discharge), std::collections::BTreeSet<String>> = BTreeMap::new();
     let mut lines = vec![];
     let mut per: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     let (mut d_sum, mut a_sum) = (0usize, 0usize);
@@ -152,9 +214,13 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
         let assumes: Vec<&str> =
             inv.get("assumes").and_then(T::as_array).into_iter().flatten().filter_map(T::as_str).collect();
         for n in &names {
-            match n.split_once("::") {
-                Some((k, f)) if defined(k, f) => {}
-                _ => errors.push(format!("{id}: {n} is not defined in the source")),
+            match n.split_once("::").map(|(k, f)| (k, discharge(k, f))) {
+                Some((k, Some(d))) => {
+                    used.entry((k.to_string(), d)).or_default().insert(n.to_string());
+                }
+                _ => errors.push(format!(
+                    "{id}: {n} is not a proof fn, a verified fn with ensures, or a Kani harness in the source"
+                )),
             }
         }
         for a in &assumes {
@@ -172,6 +238,27 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
             if a == 0 { "-".into() } else { format!("{:.2}", d as f64 / a as f64) },
             if d == 0 { format!("; {phase}: tested, not proved") } else { String::new() }
         ));
+    }
+
+    // R14: tied to the verifier's output. `[verifier]` records what the
+    // Verus run reports per crate ("N verified"); the Verus flake check
+    // fails when its log disagrees. No crate can be credited with more
+    // distinct Verus obligations than its run verifies.
+    let verifier = doc.get("verifier").and_then(T::as_table);
+    if verifier.is_none() {
+        errors.push("no [verifier] counts: obligations are not tied to the verifier's output".into());
+    }
+    for ((k, d), names) in &used {
+        if *d != Discharge::Verus {
+            continue;
+        }
+        let verified = verifier.and_then(|v| v.get(k.as_str())).and_then(T::as_integer).unwrap_or(0) as usize;
+        if names.len() > verified {
+            errors.push(format!(
+                "{k}: {} distinct Verus obligations credited, but its Verus run verifies {verified}",
+                names.len()
+            ));
+        }
     }
 
     // §17a: every proved invariant has a catalog entry written from its
@@ -260,7 +347,34 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_bypasses;
+    use super::*;
+
+    /// R14's gym mutations: a removed invariant, a duplicated obligation and
+    /// a renamed proof function each fail; a plain function or a test of the
+    /// same name discharges nothing.
+    #[test]
+    fn the_accounting_checks_bite() {
+        let doc = |t: &str| toml::from_str::<T>(t).unwrap();
+        let ok = doc("[[invariant]]\nid = \"I1\"\ndischarged = [\"txn::a\"]\n[baseline.per_invariant]\nI1 = [1, 0]\n");
+        assert!(structure_errors(&ok).is_empty());
+        let removed = doc("[[invariant]]\nid = \"I2\"\n[baseline.per_invariant]\nI1 = [1, 0]\n");
+        assert!(!structure_errors(&removed).is_empty(), "a removed invariant");
+        let dup = doc("[[invariant]]\nid = \"I1\"\ndischarged = [\"txn::a\", \"txn::a\"]\n");
+        assert!(!structure_errors(&dup).is_empty(), "a duplicated obligation");
+        let twice = doc("[[invariant]]\nid = \"I1\"\n[[invariant]]\nid = \"I1\"\n");
+        assert!(!structure_errors(&twice).is_empty(), "an invariant twice");
+
+        let src = vec![
+            "verus! {\n    pub proof fn lemma_a(x: u8)\n        ensures x == x,\n    {}\n    pub fn decide(x: u8) -> (r: u8)\n        ensures r == x,\n    { x }\n    fn helper(x: u8) -> u8 { x }\n}\n#[kani::proof]\nfn harness_b() {}\n#[test]\nfn lemma_c() {}\n// fn lemma_d()\n".to_string(),
+        ];
+        assert_eq!(discharge_in(&src, "lemma_a"), Some(Discharge::Verus));
+        assert_eq!(discharge_in(&src, "decide"), Some(Discharge::Verus), "verified against its ensures");
+        assert_eq!(discharge_in(&src, "harness_b"), Some(Discharge::Kani));
+        assert_eq!(discharge_in(&src, "helper"), None, "a plain function");
+        assert_eq!(discharge_in(&src, "lemma_c"), None, "a test");
+        assert_eq!(discharge_in(&src, "lemma_d"), None, "a comment");
+        assert_eq!(discharge_in(&src, "lemma_renamed"), None, "a renamed proof function");
+    }
 
     #[test]
     fn the_register_parses_and_its_checks_bite() {

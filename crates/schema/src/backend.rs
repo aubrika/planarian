@@ -60,6 +60,9 @@ pub struct Built {
     pub root: String,
     /// What switching to it would start, stop, restart and reload (dry-activate).
     pub activation: ActivationPlan,
+    /// Its NAR hash, as the store reported it at build time (C6).
+    #[serde(default)]
+    pub nar: Option<Hash>,
 }
 
 /// How a unit's main process last ended, as the supervisor reports it.
@@ -102,7 +105,7 @@ pub trait UnitBackend {
     /// Start an agent (§11, §16): the transient unit `planarian-agent-<name>`,
     /// under a dynamic uid of its own. Returns the started unit's instance
     /// (its InvocationID), read back once it has started (I24).
-    fn start_agent(&self, _name: &str, _argv: &[String]) -> Result<InstanceId, Outcome> {
+    fn start_agent(&self, _name: &str, _argv: &[String], _limits: &AgentLimits) -> Result<InstanceId, Outcome> {
         Err(Outcome::Failed("this backend cannot start agents".into()))
     }
     /// Whether an agent's unit under this name is loaded and running (I24:
@@ -132,7 +135,17 @@ pub trait GenerationBackend {
     fn evaluate(&self, src: &StagedSource) -> Result<EvaluatedGeneration, Outcome>;
     /// Store-only; roots its own output.
     fn build(&self, eval: &EvaluatedGeneration) -> Result<Built, Outcome>;
-    fn verify_candidate(&self, path: &StorePath, expected: &Hash) -> Result<bool, Outcome>;
+    /// The path is a whole system, its contents still hash to what the store
+    /// recorded, and, when `nar` is given (the transaction built it), that is
+    /// the NAR hash recorded at build (§9 step 3, C6).
+    fn verify_candidate(&self, path: &StorePath, nar: Option<&Hash>) -> Result<bool, Outcome>;
+    /// What switching from the running generation to an existing one would
+    /// start, stop, restart and reload (its dry activation), for
+    /// SwitchGeneration / Revert / Rollback (§11, R04). An activation that
+    /// failed, timed out or was cut short is an error, never a smaller plan.
+    fn dry_activation(&self, _path: &StorePath) -> Result<ActivationPlan, Outcome> {
+        Err(Outcome::Unknown("this backend has no dry activation".into()))
+    }
     fn pending_jobs(&self) -> Result<Vec<JobId>, Outcome>;
     /// `None`: the backend cannot say whether work tagged with `op` exists.
     fn jobs_tagged(&self, op: &OpId) -> Result<Option<Vec<JobId>>, Outcome>;
@@ -177,9 +190,19 @@ pub trait GenerationBackend {
     fn remember_override(&self, set: &OverrideSet) -> Result<Hash, Outcome>;
     /// The override content recorded for a generation when it was committed.
     fn override_for(&self, g: GenerationId) -> Result<Option<Hash>, Outcome>;
+    /// The override content `remember_override` kept under this hash.
+    fn override_content(&self, _h: &Hash) -> Result<OverrideSet, Outcome> {
+        Err(Outcome::Unknown("this backend keeps no override content".into()))
+    }
     fn record_override(&self, g: GenerationId, hash: &Hash) -> Result<(), Outcome>;
     /// Remove a GC root symlink this backend created.
     fn release_root(&self, root: &str) -> bool;
+    /// Remove build roots no transaction can still use: older than the
+    /// longest a candidate may wait (§12f), a crashed build's included.
+    /// At startup and before every collection (§9 step 5, C4). Returns them.
+    fn age_out_build_roots(&self) -> Vec<String> {
+        vec![]
+    }
     /// Collect generations under the §12b bounds (`gc::plan`), never touching
     /// `protect` (I3), then collect store garbage. Mutating.
     fn collect_garbage(&self, protect: &[GenerationId], emergency: bool, op: &OpId) -> Outcome;
@@ -345,4 +368,25 @@ impl InstanceId {
 /// The unit an agent runs in (§11, §16).
 pub fn agent_unit(name: &str) -> String {
     format!("planarian-agent-{name}")
+}
+
+/// The slice every launched agent runs in (§12d, R05): the posture stops it
+/// as a whole.
+pub const AGENTS_SLICE: &str = "planarian-agents.slice";
+
+/// Limits on launched agents (`services.planarian.agents.limits`, §12d).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLimits {
+    /// Per launch: systemd `TasksMax=` and `MemoryMax=`.
+    pub tasks_max: u32,
+    pub memory_max: String,
+    /// Agents one uid may have running at once.
+    pub per_uid: u32,
+}
+
+impl Default for AgentLimits {
+    fn default() -> AgentLimits {
+        AgentLimits { tasks_max: 512, memory_max: "4G".into(), per_uid: 4 }
+    }
 }

@@ -28,6 +28,10 @@ use std::time::Duration;
 
 const NIX: Duration = Duration::from_secs(30 * 60);
 const QUICK: Duration = Duration::from_secs(30);
+/// Twice §12f's 24 h bound on parking in `Built`: a remembered override or a
+/// build root is never removed while a transaction that made it can still
+/// use it.
+const PARKING_GRACE: Duration = Duration::from_secs(48 * 3600);
 pub const ACTIVATION: Duration = Duration::from_secs(16 * 60);
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -180,6 +184,51 @@ fn closure_bytes(paths: &[&str]) -> Result<u64, Outcome> {
         return Err(err(&o));
     }
     closure_bytes_of(&o.stdout).ok_or_else(|| Outcome::Failed("nix path-info: unexpected output".into()))
+}
+
+/// The `narHash` of `path` in `nix path-info --json` output, in either of
+/// its shapes.
+pub fn nar_hash_of(json: &str, path: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let entry = match &v {
+        serde_json::Value::Object(m) => m.get(path)?,
+        serde_json::Value::Array(a) => a.iter().find(|x| x["path"].as_str() == Some(path))?,
+        _ => return None,
+    };
+    entry["narHash"].as_str().map(String::from)
+}
+
+/// A `sha256-<base64>` (SRI) hash as the 32 bytes it names; None for any
+/// other algorithm or a malformed value.
+pub fn sri_sha256(sri: &str) -> Option<Hash> {
+    let b64 = sri.strip_prefix("sha256-")?;
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let mut out = Vec::with_capacity(32);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in b64.bytes().take_while(|c| *c != b'=') {
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    out.try_into().ok().map(Hash)
+}
+
+fn store_nar_hash(path: &str) -> Option<String> {
+    let o = nix(&["path-info", "--json", path], QUICK);
+    if o.ok() { nar_hash_of(&o.stdout, path) } else { None }
 }
 
 /// Sum `narSize` over the paths `nix path-info --json` lists, in either of
@@ -369,6 +418,26 @@ impl Nixos {
         }
     }
 
+    /// Build roots older than `PARKING_GRACE` (by the link's own time): no
+    /// transaction can still be waiting on them, so they are a crashed or
+    /// abandoned build's (C4).
+    fn age_out_roots_at(&self, now: std::time::SystemTime) -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(self.paths.gcroots.join("builds")) else { return vec![] };
+        let mut gone = vec![];
+        for e in rd.flatten() {
+            let old = std::fs::symlink_metadata(e.path())
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= PARKING_GRACE);
+            if old && std::fs::remove_file(e.path()).is_ok() {
+                gone.push(e.file_name().to_string_lossy().into_owned());
+            }
+        }
+        gone.sort();
+        gone
+    }
+
     /// Plan over profile numbers. Protected generations are the profile
     /// entries whose store path is a protected generation's.
     fn plan_profile(
@@ -527,6 +596,66 @@ impl Nixos {
         format!("planarian-op-{}-{}-{}", op.txn.0, op.epoch, op.seq)
     }
 
+    /// §9 step 4 (I23, R11): an exclusive `flock` on a directory, held until
+    /// the returned handle drops. The directory itself is locked, so nothing
+    /// is added to the owner's tree. Cooperating writers take the same lock;
+    /// one that does not is outside I23 (`docs/bypasses.md`, X-12).
+    fn lock_dir(dir: &Path) -> std::io::Result<std::fs::File> {
+        let d = std::fs::File::open(dir)?;
+        rustix::fs::flock(&d, rustix::fs::FlockOperation::LockExclusive)?;
+        Ok(d)
+    }
+
+    /// Promote, restore and collect (the system profile and boot menu) are
+    /// serialized across the daemon and the watchdog (§28, C5).
+    fn lock_profile(&self) -> Result<std::fs::File, Outcome> {
+        std::fs::create_dir_all(&self.paths.state).map_err(|e| Outcome::Failed(e.to_string()))?;
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.paths.state.join("profile.lock"))
+            .map_err(|e| Outcome::Failed(e.to_string()))?;
+        rustix::fs::flock(&f, rustix::fs::FlockOperation::LockExclusive).map_err(|e| Outcome::Failed(e.to_string()))?;
+        Ok(f)
+    }
+
+    /// The content-addressed override store keeps what a generation still in
+    /// the profile or protected references, the live file's content, and
+    /// anything remembered within `PARKING_GRACE` (a transaction still in
+    /// flight has remembered its base and candidate but recorded neither).
+    /// Everything else goes (§28, C5). Returns the pruned hashes.
+    fn prune_override_store(&self, keep_gens: &[GenerationId], now: std::time::SystemTime) -> Vec<String> {
+        let mut keep: BTreeSet<String> = BTreeSet::new();
+        if let Ok(reg) = self.with_registry(|r| r.overrides.clone()) {
+            for g in keep_gens {
+                if let Some(h) = reg.get(&g.0) {
+                    keep.insert(h.to_hex());
+                }
+            }
+        }
+        if let Ok(t) = std::fs::read_to_string(self.override_file(&self.paths.owner)) {
+            keep.insert(sha(&t).to_hex());
+        }
+        let Ok(entries) = std::fs::read_dir(self.store_dir()) else { return vec![] };
+        let mut gone = vec![];
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(hex) = name.strip_suffix(".nix") else { continue };
+            let recent = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_none_or(|age| age < PARKING_GRACE);
+            if !keep.contains(hex) && !recent && std::fs::remove_file(e.path()).is_ok() {
+                gone.push(hex.to_string());
+            }
+        }
+        gone.sort();
+        gone
+    }
+
     fn write_atomically(target: &Path, text: &str) -> std::io::Result<()> {
         use std::io::Write;
         let dir = target.parent().expect("has a parent");
@@ -682,12 +811,26 @@ impl GenerationBackend for Nixos {
         // reached (`/run/current-system` is resolved the same way).
         let path = std::fs::canonicalize(&printed).map(|p| p.to_string_lossy().into_owned()).unwrap_or(printed);
         let generation = self.with_registry(|r| r.id_for(&path))?;
+        // C6: the transaction carries this (`candidate_nar`) to verification.
+        let nar = store_nar_hash(&path).and_then(|h| sri_sha256(&h));
+        // The candidate is not usable without its plan (rule 21, R10).
+        let activation = match self.dry_activation(&StorePath(path.clone())) {
+            Ok(a) => a,
+            Err(o) => {
+                let _ = std::fs::remove_file(&root);
+                return Err(o);
+            }
+        };
+        Ok(Built { generation, path: StorePath(path), root: root.to_string_lossy().into_owned(), activation, nar })
+    }
+
+    fn dry_activation(&self, path: &StorePath) -> Result<ActivationPlan, Outcome> {
+        let path = &path.0;
         let dry = run(&[&format!("{path}/bin/switch-to-configuration"), "dry-activate"], Duration::from_secs(120));
         // The plan is the risk evidence (§9 step 3): a dry activation that
         // failed, timed out or was cut short yields none, never a smaller one
-        // (rule 21, R10). The candidate is not usable.
+        // (rule 21, R10).
         if let Some(why) = dry_activate_failure(&dry) {
-            let _ = std::fs::remove_file(&root);
             return Err(Outcome::Failed(why));
         }
         let mut activation = parse_dry_activate(&format!("{}\n{}", dry.stdout, dry.stderr));
@@ -699,11 +842,25 @@ impl GenerationBackend for Nixos {
             std::fs::read_to_string(format!("{path}/kernel-params")).ok()
                 != std::fs::read_to_string("/run/current-system/kernel-params").ok()
         };
-        Ok(Built { generation, path: StorePath(path), root: root.to_string_lossy().into_owned(), activation })
+        Ok(activation)
     }
 
-    fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
-        Ok(Path::new(&path.0).join("bin/switch-to-configuration").exists())
+    /// C6: the store path's contents still hash to what the store recorded
+    /// (`nix-store --verify-path`), and that is the NAR hash the transaction
+    /// recorded when it built the candidate. Existence alone is not enough.
+    fn verify_candidate(&self, path: &StorePath, nar: Option<&Hash>) -> Result<bool, Outcome> {
+        if !Path::new(&path.0).join("bin/switch-to-configuration").exists() {
+            return Ok(false);
+        }
+        if !run(&["nix-store", "--verify-path", &path.0], NIX).ok() {
+            return Ok(false);
+        }
+        Ok(match nar {
+            Some(want) => store_nar_hash(&path.0).and_then(|h| sri_sha256(&h)).is_some_and(|got| got == *want),
+            // Not built here (a generation from outside Planarian): the
+            // store's own record is the one --verify-path checked.
+            None => true,
+        })
     }
 
     fn pending_jobs(&self) -> Result<Vec<JobId>, Outcome> {
@@ -768,6 +925,10 @@ impl GenerationBackend for Nixos {
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
         }
+        let _lock = match self.lock_profile() {
+            Ok(l) => l,
+            Err(o) => return o,
+        };
         let path = match self.path_of(g) {
             Ok(p) => p,
             Err(o) => return o,
@@ -818,6 +979,10 @@ impl GenerationBackend for Nixos {
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
         }
+        let _lock = match self.lock_profile() {
+            Ok(l) => l,
+            Err(o) => return o,
+        };
         let (Ok(path), Ok(kept)) = (self.path_of(g), self.path_of(keep)) else {
             return Outcome::Failed("unknown generation".into());
         };
@@ -890,10 +1055,18 @@ impl GenerationBackend for Nixos {
     }
 
     fn swap_override(&self, from: &Hash, to: &Hash, op: &OpId) -> Outcome {
+        #[cfg(feature = "gym-hooks")]
+        crate::gym::pause_point("swap_override");
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
         }
         let live = self.override_file(&self.paths.owner);
+        // Compare and rename under one lock: a cooperating writer cannot land
+        // between the two (I23).
+        let _lock = match Self::lock_dir(live.parent().expect("has a parent")) {
+            Ok(l) => l,
+            Err(e) => return Outcome::Failed(format!("cannot lock planarian/: {e}")),
+        };
         let current = match std::fs::read_to_string(&live) {
             Ok(t) => sha(&t),
             Err(e) => return Outcome::Failed(e.to_string()),
@@ -952,6 +1125,15 @@ impl GenerationBackend for Nixos {
         self.with_registry(|r| r.overrides.get(&g.0).copied())
     }
 
+    fn override_content(&self, h: &Hash) -> Result<OverrideSet, Outcome> {
+        let p = self.store_dir().join(format!("{}.nix", h.to_hex()));
+        let text = std::fs::read_to_string(&p).map_err(|e| Outcome::Failed(format!("{}: {e}", p.display())))?;
+        if sha(&text) != *h {
+            return Err(Outcome::Failed(format!("{}: content does not match its hash", p.display())));
+        }
+        parse_overrides(&text).ok_or_else(|| Outcome::Failed(format!("{}: not a rendered override set", p.display())))
+    }
+
     fn record_override(&self, g: GenerationId, hash: &Hash) -> Result<(), Outcome> {
         self.with_registry(|r| {
             r.overrides.insert(g.0, *hash);
@@ -970,10 +1152,18 @@ impl GenerationBackend for Nixos {
         Path::new(root).starts_with(&self.paths.gcroots) && std::fs::remove_file(root).is_ok()
     }
 
+    fn age_out_build_roots(&self) -> Vec<String> {
+        self.age_out_roots_at(std::time::SystemTime::now())
+    }
+
     fn collect_garbage(&self, protect: &[GenerationId], emergency: bool, op: &OpId) -> Outcome {
         if !admitted(&self.paths.txn_dir(), op) {
             return Outcome::fenced();
         }
+        let _lock = match self.lock_profile() {
+            Ok(l) => l,
+            Err(o) => return o,
+        };
         let (plan, gens) = match self.plan_profile(protect, emergency) {
             Ok(p) => p,
             Err(o) => return o,
@@ -1008,6 +1198,18 @@ impl GenerationBackend for Nixos {
             }
         }
         self.prune_roots(&gens, protect);
+        self.age_out_roots_at(std::time::SystemTime::now());
+        let kept: Vec<GenerationId> = self
+            .profile_generations()
+            .iter()
+            .filter_map(|(_, p)| {
+                self.with_registry(|r| r.paths.iter().find(|(_, q)| *q == p).map(|(id, _)| GenerationId(*id)))
+                    .ok()
+                    .flatten()
+            })
+            .chain(protect.iter().copied())
+            .collect();
+        self.prune_override_store(&kept, std::time::SystemTime::now());
         let o = run(&["nix-store", "--gc"], NIX);
         if !o.ok() {
             return err(&o);
@@ -1045,6 +1247,115 @@ mod tests {
         assert!(std::fs::symlink_metadata(builds.join("b")).is_ok(), "pending: still the build's");
         assert!(std::fs::symlink_metadata(paths.gcroots.join("gen-5")).is_err(), "no longer protected");
         assert!(std::fs::symlink_metadata(paths.gcroots.join("gen-6")).is_ok(), "protected");
+    }
+
+    /// C4: a build root older than the longest a candidate may wait goes,
+    /// whoever left it (a crashed build's included); a recent one stays.
+    #[test]
+    fn old_build_roots_age_out() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths { gcroots: d.path().join("gcroots"), ..Default::default() };
+        let builds = paths.gcroots.join("builds");
+        std::fs::create_dir_all(&builds).unwrap();
+        std::os::unix::fs::symlink("/nix/store/aaa-crashed", builds.join("a")).unwrap();
+        let n = Nixos::new(paths);
+        let now = std::time::SystemTime::now();
+        assert!(n.age_out_roots_at(now).is_empty(), "recent: a build may still be waiting on it");
+        assert_eq!(n.age_out_roots_at(now + PARKING_GRACE), vec!["a".to_string()]);
+        assert!(std::fs::symlink_metadata(builds.join("a")).is_err());
+    }
+
+    /// C6: an SRI sha256 decodes to its 32 bytes; anything else is None.
+    #[test]
+    fn sri_hashes_decode() {
+        // sha256 of the empty string.
+        let h = sri_sha256("sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=").unwrap();
+        assert_eq!(h.to_hex(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert!(sri_sha256("sha512-AAAA").is_none());
+        assert!(sri_sha256("sha256-AAAA").is_none(), "too short");
+    }
+
+    /// C6: the NAR hash is read from either shape of `nix path-info --json`.
+    #[test]
+    fn nar_hash_from_both_json_shapes() {
+        let p = "/nix/store/aaa-system";
+        let object = r#"{"/nix/store/aaa-system": {"narHash": "sha256-AAA", "narSize": 1}}"#;
+        let array = r#"[{"path": "/nix/store/aaa-system", "narHash": "sha256-AAA"}]"#;
+        assert_eq!(nar_hash_of(object, p).as_deref(), Some("sha256-AAA"));
+        assert_eq!(nar_hash_of(array, p).as_deref(), Some("sha256-AAA"));
+        assert_eq!(nar_hash_of(array, "/nix/store/bbb"), None);
+    }
+
+    fn override_rig() -> (tempfile::TempDir, Nixos, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let owner = d.path().join("owner");
+        std::fs::create_dir_all(owner.join("planarian")).unwrap();
+        let live = owner.join("planarian/overrides.nix");
+        std::fs::write(&live, render(&OverrideSet::default())).unwrap();
+        let paths = Paths { state: d.path().join("state"), owner, ..Default::default() };
+        let lease = paths.txn_dir().join("9");
+        std::fs::create_dir_all(&lease).unwrap();
+        std::fs::write(lease.join("lease"), "1\n").unwrap();
+        (d, Nixos::new(paths), live)
+    }
+
+    /// I23 (R11): the compare and the rename are one step under the lock on
+    /// `planarian/`. A cooperating writer holding it, which replaces the file
+    /// before letting go, is seen: the swap fails and its edit stays.
+    #[test]
+    fn the_override_swap_waits_for_the_directory_lock() {
+        let (_d, n, live) = override_rig();
+        let from = sha(&std::fs::read_to_string(&live).unwrap());
+        let mut set = OverrideSet::default();
+        set.assignments.insert("a.b".into(), Value::Bool(true));
+        let to = n.remember_override(&set).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let live = live.clone();
+            std::thread::spawn(move || {
+                let _l = Nixos::lock_dir(live.parent().unwrap()).unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::write(&live, "# the owner's edit\n{ }\n").unwrap();
+            })
+        };
+        held_rx.recv().unwrap();
+        let op = OpId { txn: TxnId(9), epoch: 1, seq: 1 };
+        let o = n.swap_override(&from, &to, &op);
+        writer.join().unwrap();
+        assert!(matches!(o, Outcome::Failed(ref m) if m.contains("changed by someone else")), "{o:?}");
+        assert_eq!(std::fs::read_to_string(&live).unwrap(), "# the owner's edit\n{ }\n");
+        // Unlocked and unchanged: the swap goes through.
+        let from = sha(&std::fs::read_to_string(&live).unwrap());
+        std::fs::write(n.store_dir().join(format!("{}.nix", from.to_hex())), std::fs::read(&live).unwrap()).unwrap();
+        assert_eq!(n.swap_override(&from, &to, &op), Outcome::Succeeded);
+        assert_eq!(sha(&std::fs::read_to_string(&live).unwrap()), to);
+    }
+
+    /// C5: the override store keeps what a kept generation references, the
+    /// live content and anything recent; the rest is pruned.
+    #[test]
+    fn the_override_store_is_pruned() {
+        let (_d, n, live) = override_rig();
+        let remember = |k: &str| {
+            let mut s = OverrideSet::default();
+            s.assignments.insert(k.into(), Value::Bool(true));
+            n.remember_override(&s).unwrap().to_hex()
+        };
+        let (kept, dropped, gone) = (remember("kept"), remember("dropped"), remember("orphan"));
+        let live_hex = sha(&std::fs::read_to_string(&live).unwrap()).to_hex();
+        std::fs::write(n.store_dir().join(format!("{live_hex}.nix")), std::fs::read(&live).unwrap()).unwrap();
+        n.record_override(GenerationId(1), &Hash::from_hex(&kept).unwrap()).unwrap();
+        n.record_override(GenerationId(2), &Hash::from_hex(&dropped).unwrap()).unwrap();
+        let now = std::time::SystemTime::now();
+        assert!(n.prune_override_store(&[GenerationId(1)], now).is_empty(), "all recent: kept");
+        let later = now + PARKING_GRACE + Duration::from_secs(60);
+        let mut want = vec![dropped, gone];
+        want.sort();
+        assert_eq!(n.prune_override_store(&[GenerationId(1)], later), want);
+        for h in [&kept, &live_hex] {
+            assert!(n.store_dir().join(format!("{h}.nix")).exists(), "{h} kept");
+        }
     }
 
     #[test]

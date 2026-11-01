@@ -33,7 +33,7 @@ fn catalog() -> CatalogConfig {
 
 fn tables() -> Tables {
     Tables {
-        catalog: ["service-enable", "font-scale", "listen-address", "repair:reenable-predicted"]
+        catalog: ["service-enable", "font-scale", "listen-address", "repair:reenable-predicted", "repair:reapply"]
             .map(|s| ChangeId(s.into()))
             .into(),
         runtime_allowlist: ["font.scale", "wifi.network"].map(String::from).into(),
@@ -656,4 +656,47 @@ fn an_attested_override_is_replaced_only_by_its_holder() {
     assert!(why.contains("set by uid 1000"), "{why}");
     *s.overrides.last_mut().unwrap() = held(Attribution::Inferred);
     assert!(unmet(&set, &s, &defs, &Actor::user(1001)).is_none(), "an inferred override may be replaced");
+}
+
+/// R04 (§11 equivalent effects): a rollback between vetted generations whose
+/// manifests are equal, but whose network unit differs in its store path,
+/// has the facts its dry activation shows: NetworkManager restarts, so it is
+/// ConnectivityLoss, as the same switch built as a candidate would be.
+#[test]
+fn rollback_facts_come_from_the_dry_activation() {
+    let mut r = Rig::new();
+    let nm = UnitId::service("NetworkManager");
+    {
+        let mut w = r.fake.w();
+        let g2 = w.add_generation(&OverrideSet::default());
+        assert_eq!(manifest_of(&w.gens[&g2].eval), manifest_of(&w.gens[&GenerationId(1)].eval), "equal manifests");
+        // Only the dry activation sees the network unit's new store path.
+        w.gens.get_mut(&GenerationId(1)).unwrap().eval.activation.restart.insert(nm.clone());
+        w.boot_entries.insert(g2);
+        w.boot_default = g2;
+        w.current = g2;
+    }
+    let s = r.propose(Transition::Rollback, admin());
+    let facts = match &s {
+        Submitted::Parked { facts, .. } => facts.clone(),
+        other => panic!("a ConnectivityLoss rollback is asked first: {other:?}"),
+    };
+    assert_eq!(facts.disruption, Disruption::ConnectivityLoss);
+    assert!(facts.affected_units.contains(&nm));
+}
+
+/// R04 and rule 21: an existing generation whose dry activation fails has no
+/// plan, so the switch is refused as ActivationUnknown, never run blind.
+#[test]
+fn an_existing_generation_without_a_plan_is_refused() {
+    let mut r = Rig::new();
+    {
+        let mut w = r.fake.w();
+        let g2 = w.add_generation(&OverrideSet::default());
+        w.boot_entries.insert(g2);
+        w.dry_activate_fails = Some("dry activation: timeout".into());
+    }
+    let s = r.propose(Transition::SwitchGeneration(GenerationId(2)), admin());
+    assert!(matches!(s, Submitted::Rejected { reason: RejectReason::ActivationUnknown, .. }), "{s:?}");
+    assert_eq!(r.fake.w().current, GenerationId(1));
 }

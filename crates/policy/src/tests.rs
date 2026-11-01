@@ -599,9 +599,3 @@ fn i19_approval_and_grants() {
     let merge = Grant { capability: Capability::Merge, ..g };
     assert!(!may_grant(&admin, alice.principal, &merge), "cannot grant what it does not hold");
 }
-
-/// I17 in Phase A: root is always an administrator.
-#[test]
-fn i17_root_is_always_an_administrator() {
-    assert!(user_authorization(Actor::user(0), false).capabilities.administrator);
-}

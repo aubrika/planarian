@@ -14,9 +14,15 @@ fn config() -> CoreConfig {
         exec: Config {
             settings: Settings::default(),
             tables: Tables {
-                catalog: ["service-enable", "font-scale", "listen-address", "repair:reenable-predicted"]
-                    .map(|s| ChangeId(s.into()))
-                    .into(),
+                catalog: [
+                    "service-enable",
+                    "font-scale",
+                    "listen-address",
+                    "repair:reenable-predicted",
+                    "repair:reapply",
+                ]
+                .map(|s| ChangeId(s.into()))
+                .into(),
                 runtime_allowlist: ["font.scale", "wifi.network"].map(String::from).into(),
                 option_sensitivity: vec![("services.openssh".into(), Sensitivities::of(&[Sensitivity::Security]))],
                 model_catalog: Default::default(),
@@ -42,6 +48,8 @@ fn config() -> CoreConfig {
         fresh_boot: true,
         startup_grace: planarian_incident::STARTUP_GRACE,
         posture: planarian_schema::Posture::Standard,
+        posture_decl: Default::default(),
+        agent_limits: Default::default(),
     }
 }
 
@@ -843,9 +851,11 @@ fn external_desired_state_joins_with_provenance() {
 }
 
 /// §12f, I12 (S03): a repair that has to wait in Built for an activation
-/// window is not an attempt: the incident waits with it, and when the wait
-/// expires the change is Cancelled(Daemon) and the incident reopens with its
-/// budget intact.
+/// window (its activation would restart a busy session's audio) is not an
+/// attempt: the incident waits with it, and when the wait expires the change
+/// is Cancelled(Daemon) and the incident reopens with its budget intact.
+/// (Under Foreground the same repair would be deferred before it is
+/// proposed, P8.)
 #[test]
 fn an_expired_wait_reopens_its_incident() {
     let mut cfg = config();
@@ -863,7 +873,11 @@ fn an_expired_wait_reopens_its_incident() {
         idle: false,
         created: now,
     });
-    r.fake.w().foreground.insert("s1".into());
+    r.fake.w().activation_restarts.insert(UnitId {
+        kind: UnitKind::Service,
+        name: "pipewire".into(),
+        scope: Scope::User { uid: 1000, session: None },
+    });
     r.fake.w().units.get_mut(&UnitId::service("gym-web")).unwrap().observed = Observed::Absent;
     r.ticks(20);
     let waiting = |r: &mut Rig| {
@@ -883,4 +897,226 @@ fn an_expired_wait_reopens_its_incident() {
     let again = waiting(&mut r);
     assert!(again.len() == 1 && again != first, "the reopened incident proposes the repair again: {again:?}");
     assert_eq!(budget(&r), Some(planarian_incident::BUDGET));
+}
+
+/// §12d (R05): one uid may have only so many agents running at once; a
+/// launch over the limit is refused, and one that has stopped frees its slot.
+#[test]
+fn agents_per_uid_are_limited() {
+    let mut cfg = config();
+    cfg.agent_limits.per_uid = 2;
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let run = |r: &mut Rig, peer: Peer, name: &str| {
+        r.core.handle(peer, Request::AgentRun { name: name.into(), argv: vec!["true".into()] })
+    };
+    assert!(matches!(run(&mut r, ALICE, "one"), Response::Ok { .. }));
+    assert!(matches!(run(&mut r, ALICE, "two"), Response::Ok { .. }));
+    let over = run(&mut r, ALICE, "three");
+    assert!(
+        matches!(&over, Response::Rejected { message, .. } if message.contains("limit")),
+        "a third launch is refused: {over:?}"
+    );
+    // Another uid has its own count.
+    assert!(matches!(run(&mut r, ADMIN, "theirs"), Response::Ok { .. }));
+    // One of alice's stops: she may start another.
+    r.fake.w().units.get_mut(&UnitId::service("planarian-agent-one")).unwrap().observed =
+        Observed::Failed(planarian_schema::Reason::ExitCode(0));
+    assert!(matches!(run(&mut r, ALICE, "three"), Response::Ok { .. }), "a stopped agent frees its slot");
+}
+
+/// P7 (§12a): a write-back issued while a generation transaction is active
+/// (here one waiting in Built while Foreground holds) is queued, not
+/// refused; it is submitted, with the same caller, once that transaction is
+/// terminal, and commits. Nothing says it failed.
+#[test]
+fn a_write_back_queues_behind_a_generation_transaction() {
+    let mut r = Rig::new();
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: Timestamp(0),
+        active: true,
+        idle: false,
+    });
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    let mut args = BTreeMap::new();
+    args.insert("scale".to_string(), Value::Str("1.25".into()));
+    let resp = r.core.handle(ALICE.in_session("s1"), Request::Apply { change: ChangeId("font-scale".into()), args });
+    assert!(matches!(resp, Response::Done { state: TxnState::Built, .. }), "{resp:?}");
+
+    let authz = r.core.authz(&ALICE.in_session("s1"));
+    let (s, defs) = r.core.observe();
+    let t = Transition::SetRuntimeOption { path: "font.scale".into(), value: Value::Str("1.5".into()) };
+    let p = r.core.proposal(t, &s, &defs, Source::User, "bigger".into());
+    let res = r.core.submit(p, authz, &s, &defs);
+    assert!(matches!(res, Submitted::Finished { state: TxnState::Committed, .. }), "{res:?}");
+    assert_eq!(r.core.writebacks.len(), 1, "queued behind the waiting generation");
+
+    r.fake.w().foreground.clear();
+    r.ticks(6);
+    assert!(r.core.writebacks.is_empty());
+    let l = r.core.ledger();
+    assert!(!l.live.values().any(|t| t.txn.transition.changes_generation()));
+    let applied: Vec<_> = l
+        .terminal
+        .values()
+        .filter(|t| matches!(t.transition, Transition::ApplyChange { .. }))
+        .map(|t| t.state.clone())
+        .collect();
+    assert_eq!(applied, vec![TxnState::Committed, TxnState::Committed], "the change, then the write-back");
+    assert!(!r.core.notices.iter().any(|n| n.contains("will not survive")), "{:?}", r.core.notices);
+}
+
+/// P8 (§12f): while Foreground holds, a repair the foreground work does not
+/// depend on is deferred in fact: never attempted, no budget or backoff
+/// spent. It runs once quiet mode ends.
+#[test]
+fn a_deferred_repair_is_deferred_in_fact() {
+    let mut r = Rig::new();
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: Timestamp(0),
+        active: true,
+        idle: false,
+    });
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    let web = UnitId::service("gym-web");
+    r.fake.w().signal(&web, 11);
+    r.ticks(30);
+    assert_eq!(r.calls("restart(service:gym-web)"), 0, "deferred while the game runs");
+    let i = r.core.incidents.active_for(&web).expect("an incident is open").clone();
+    assert!(i.attempts.is_empty(), "no budget spent: {:?}", i.attempts);
+
+    r.fake.w().foreground.clear();
+    r.ticks(4);
+    assert_eq!(r.calls("restart(service:gym-web)"), 1);
+    assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
+}
+
+/// K10 (§16): mark-good needs root at an interactive terminal, the
+/// terminal established by the daemon from the peer; an administrator
+/// without one, or a non-root administrator, is refused.
+#[test]
+fn mark_good_needs_root_at_a_terminal() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let refused =
+        |resp: &Response| matches!(resp, Response::Error { message } if message.contains("interactive terminal"));
+    let resp = r.core.handle(ADMIN, Request::MarkGood { accept_unconfirmed: false });
+    assert!(refused(&resp), "{resp:?}");
+    let resp = r.core.handle(Peer::new(1001, true).at_terminal(), Request::MarkGood { accept_unconfirmed: false });
+    assert!(refused(&resp), "{resp:?}");
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::MarkGood { accept_unconfirmed: false });
+    assert!(!refused(&resp), "{resp:?}");
+}
+
+/// P17 (§16): `report boot` prints the last boot report; `posture` prints
+/// the posture and timeout in force and says when a weaker declaration
+/// waits for the next boot (P16).
+#[test]
+fn report_boot_and_posture_answer() {
+    let mut cfg = config();
+    cfg.posture_decl = crate::config::PostureDecl {
+        declared: planarian_schema::Posture::Relaxed,
+        declared_timeout_secs: 600,
+        booted: Some((planarian_schema::Posture::Standard, 120)),
+    };
+    cfg.posture = cfg.posture_decl.in_force();
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let text = |resp: Response| match resp {
+        Response::Ok { message } => message,
+        other => panic!("{other:?}"),
+    };
+    let boot = text(r.core.handle(ALICE, Request::ReportBoot));
+    assert!(boot.contains("clean"), "{boot}");
+    let p = text(r.core.handle(ALICE, Request::Posture));
+    assert!(p.starts_with("posture: Standard, boot-ready timeout 120 s"), "{p}");
+    assert!(p.contains("declares Relaxed, 600 s") && p.contains("next boot"), "{p}");
+}
+
+/// P22: the daemon finds the change committed for a unit that the override
+/// file no longer carries (a hand edit took it out), for `repair:reapply`.
+#[test]
+fn a_committed_change_missing_from_the_overrides_is_lost() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let args: BTreeMap<String, Value> =
+        [("service".to_string(), Value::Str("gym-web".into())), ("addr".to_string(), Value::Str("127.0.0.1".into()))]
+            .into();
+    let resp = r.core.handle(ADMIN, Request::Apply { change: ChangeId("listen-address".into()), args: args.clone() });
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let l = r.core.ledger();
+    assert!(r.core.lost_changes(&l).is_empty(), "carried");
+    r.fake.w().overrides.assignments.remove("services.gym-web.listenAddress");
+    let lost = r.core.lost_changes(&l);
+    assert_eq!(lost.get(&UnitId::service("gym-web")), Some(&(ChangeId("listen-address".into()), args)));
+}
+
+/// C2 (§9 step 6, I8): the owner edits their configuration while a change
+/// waits in Built for Foreground to end. When the window opens the change
+/// is checked again on its way into Activating: it is Stale, never
+/// activated, and a notice says to ask again.
+#[test]
+fn an_owner_edit_while_waiting_is_stale_when_the_window_opens() {
+    let mut r = Rig::new();
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: Timestamp(0),
+        active: true,
+        idle: false,
+    });
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    let mut args = BTreeMap::new();
+    args.insert("scale".to_string(), Value::Str("1.25".into()));
+    let resp = r.core.handle(ALICE.in_session("s1"), Request::Apply { change: ChangeId("font-scale".into()), args });
+    assert!(matches!(resp, Response::Done { state: TxnState::Built, .. }), "{resp:?}");
+
+    r.fake.w().owner_files.insert("configuration.nix".into(), "edited while it waited".into());
+    r.fake.w().foreground.clear();
+    r.ticks(4);
+    let l = r.core.ledger();
+    assert!(
+        l.terminal.values().any(|t| t.state == TxnState::Rejected(RejectReason::Stale)
+            && matches!(t.transition, Transition::ApplyChange { .. })),
+        "{:?}",
+        l.terminal
+    );
+    assert_eq!(r.calls("activate_live"), 0, "never activated");
+    assert!(r.core.notices.iter().any(|n| n.contains("not activated")), "{:?}", r.core.notices);
+}
+
+/// P9: a tick over the 500 ms budget is warned, naming the probes that ran,
+/// at most once a minute; a tick within it is not.
+#[test]
+fn a_slow_tick_is_warned() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    assert_eq!(r.core.slow_tick_warnings, 0);
+    r.fake.w().probe_batch_ms = 800;
+    r.ticks(1);
+    assert_eq!(r.core.slow_tick_warnings, 1);
+    // Every tick slow for half a minute: no second warning yet.
+    r.ticks(5);
+    assert_eq!(r.core.slow_tick_warnings, 1, "at most one a minute");
+    r.ticks(10);
+    assert_eq!(r.core.slow_tick_warnings, 2);
+    r.fake.w().probe_batch_ms = 0;
+    r.ticks(20);
+    assert_eq!(r.core.slow_tick_warnings, 2);
 }

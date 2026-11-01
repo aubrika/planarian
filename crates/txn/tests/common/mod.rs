@@ -148,6 +148,7 @@ pub fn txn(transition: Transition, caller: Actor) -> Transaction {
         },
         base_source: None,
         staged_source: None,
+        candidate_nar: None,
         base_override: None,
         candidate_override: None,
         gc_root: None,

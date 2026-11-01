@@ -320,6 +320,12 @@ in
       description = "The flake output that is this machine.";
     };
 
+    agents.limits = {
+      tasksMax = mkOption { type = types.ints.positive; default = 512; description = "TasksMax= for each agent `planarian agent run` launches (§12d)."; };
+      memoryMax = mkOption { type = types.str; default = "4G"; description = "MemoryMax= for each launched agent (§12d)."; };
+      perUid = mkOption { type = types.ints.positive; default = 4; description = "Agents one user may have running at once (§12d); a launch over it is refused."; };
+    };
+
     sessionCompositors = mkOption {
       type = types.listOf types.str;
       default = [ ];
@@ -610,6 +616,8 @@ in
       startupGraceSecs = cfg.startupGrace;
       sessionCompositors = cfg.sessionCompositors;
       inherit (cfg) posture externalSource;
+      bootReadyTimeoutSecs = cfg.bootReadyTimeout;
+      agentLimits = { inherit (cfg.agents.limits) tasksMax memoryMax perUid; };
       healthReportSecs = cfg.healthReport.interval;
     };
 
@@ -626,7 +634,7 @@ in
       before = [ "planariad.service" ];
       restartIfChanged = false;
       stopIfChanged = false;
-      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux ];
+      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux pkgs.getent ];
       environment.PLANARIAN_CONFIG = "/etc/planarian/config.json";
       serviceConfig = {
         # On btrfs the journal is rewritten in place: mark its directory
@@ -675,7 +683,7 @@ in
       after = [ "planarian-recovery.service" ];
       restartIfChanged = false;
       stopIfChanged = false;
-      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux pkgs.kmod ]
+      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux pkgs.kmod pkgs.getent ]
         ++ lib.optional config.networking.networkmanager.enable config.networking.networkmanager.package;
       environment.PLANARIAN_CONFIG = "/etc/planarian/config.json";
       serviceConfig = {

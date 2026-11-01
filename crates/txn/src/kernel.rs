@@ -377,8 +377,14 @@ impl<S: Store, H: Host> Kernel<S, H> {
                     renewed: self.host.boot_now(),
                     jobs: vec![],
                 };
-                j.store().set_fence(id, 1)?;
-                j.append(now, Record::Prepared(Box::new(txn))).map(|_| id)
+                // Exclusive: an id is never prepared twice (C5).
+                j.store().create_fence(id, 1)?;
+                let r = j.append(now, Record::Prepared(Box::new(txn))).map(|_| id);
+                if r.is_err() {
+                    // No record names it; take the fence back.
+                    let _ = j.store().forget_fences(|t| t != id);
+                }
+                r
             })?
             .map_err(KernelError::from)
             .inspect(|id| {
@@ -427,8 +433,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
         let Some((cand, path)) = txn.candidate.clone() else {
             return self.reject(id, RejectReason::Other("no candidate".into()));
         };
-        let expected = txn.staged_source.unwrap_or(Hash::ZERO);
-        if self.host.generations().verify_candidate(&path, &expected) != Ok(true) {
+        let expected = txn.candidate_nar;
+        if self.host.generations().verify_candidate(&path, expected.as_ref()) != Ok(true) {
             return self.reject(id, RejectReason::Other("candidate failed verification".into()));
         }
         self.wait_built(id, "takes effect at boot")?;
@@ -577,8 +583,8 @@ impl<S: Store, H: Host> Kernel<S, H> {
         let Some((cand, path)) = txn.candidate.clone() else {
             return self.reject(txn.id, RejectReason::Other("no candidate".into()));
         };
-        let expected = txn.staged_source.unwrap_or(Hash::ZERO);
-        match self.host.generations().verify_candidate(&path, &expected) {
+        let expected = txn.candidate_nar;
+        match self.host.generations().verify_candidate(&path, expected.as_ref()) {
             Ok(true) => {}
             _ => return self.reject(txn.id, RejectReason::Other("candidate failed verification".into())),
         }
@@ -993,10 +999,32 @@ impl<S: Store, H: Host> Kernel<S, H> {
         if !self.wait_gone(&jobs)? {
             return Ok(Err(format!("jobs still pending after {}s drain", JOB_DRAIN.0 / 1000)));
         }
-        for op in unacked {
-            self.record(Record::OpAck { op, outcome: Outcome::Unknown("superseded by takeover".into()) })?;
-        }
+        self.supersede_unacked(&unacked)?;
         Ok(Ok(()))
+    }
+
+    /// Acknowledge, as superseded by the takeover, each of `ops` that is
+    /// still unacknowledged. Decided under the journal's lock: the old owner,
+    /// fenced but not necessarily dead, may have journaled its own ack since
+    /// the takeover (its call returned just then), and that one stands
+    /// (run 109's `crash-slow-worker-overlap`: a second ack was `DuplicateOp`
+    /// and left the transaction in flight).
+    pub fn supersede_unacked(&mut self, ops: &[OpId]) -> R<()> {
+        for op in ops {
+            let now = self.host.now();
+            let ack = Record::OpAck { op: *op, outcome: Outcome::Unknown("superseded by takeover".into()) };
+            let appended = self.journal.locked(|j| {
+                let still = j.ledger().live.get(&op.txn).is_some_and(|l| l.unacked_ops().any(|o| o.op == *op));
+                if still { j.append(now, ack.clone()).map(|_| true) } else { Ok(false) }
+            })?;
+            match appended {
+                Ok(_) => {}
+                // A full journal: the sentinel path, as for any record.
+                Err(JournalError::Full) => self.record(ack)?,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
     }
 
     // ---------- Recovery ----------

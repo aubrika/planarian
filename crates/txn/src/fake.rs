@@ -139,7 +139,7 @@ impl GenerationBackend for FakeHost {
         Err(Outcome::Failed("fake: building is exec's concern".into()))
     }
 
-    fn verify_candidate(&self, path: &StorePath, _expected: &Hash) -> Result<bool, Outcome> {
+    fn verify_candidate(&self, path: &StorePath, _nar: Option<&Hash>) -> Result<bool, Outcome> {
         Ok(self.w().generations.values().any(|p| p == path))
     }
 

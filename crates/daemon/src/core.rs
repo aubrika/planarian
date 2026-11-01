@@ -48,8 +48,13 @@ pub struct CoreConfig {
     pub fresh_boot: bool,
     /// The default startup grace (units may set their own).
     pub startup_grace: Millis,
-    /// The failure posture the generation declares (§12d); Phase A ships Standard.
+    /// The failure posture in force (§12d, P16: the stronger of the booted
+    /// and the running generation's); Phase A ships Standard.
     pub posture: Posture,
+    /// What each generation declares, for `planarian posture`.
+    pub posture_decl: crate::config::PostureDecl,
+    /// Limits on launched agents (§12d, R05).
+    pub agent_limits: planarian_schema::backend::AgentLimits,
 }
 
 /// How long a generation's new declarations are named in incident reports (§15).
@@ -153,6 +158,13 @@ pub struct Core<B: Backends + Clone, S: Store> {
     last: Option<(SystemState, UnitDefs)>,
     choices: BTreeMap<u32, Vec<intent::Match>>,
     incident_parked: BTreeMap<IncidentId, TxnId>,
+    /// Slow ticks warned (P9), and when the last warning was.
+    pub slow_tick_warnings: u64,
+    last_slow_warning: Option<Timestamp>,
+    slow_ticks_unwarned: u64,
+    /// §12a write-backs queued behind an active generation transaction,
+    /// with their caller (P7). Submitted once none is live.
+    writebacks: Vec<(Proposal, Authorization)>,
     confirm: Option<(GenerationId, Timestamp)>,
     manifest_gen: GenerationId,
     /// The running generation's manifest, before the external source joins it.
@@ -190,6 +202,8 @@ pub struct Core<B: Backends + Clone, S: Store> {
     prev_auto_restarts: BTreeMap<UnitId, u32>,
     /// The boot report runs on the first tick after boot (§10).
     boot_report_due: bool,
+    /// The last boot report this daemon ran, for `planarian report boot`.
+    last_boot_report: Option<(Timestamp, GenerationId, String)>,
     /// Quiet mode (§12f) and the notices it holds back.
     quiet: bool,
     quiet_queue: Vec<String>,
@@ -239,6 +253,9 @@ impl Resume {
         }
     }
 }
+
+/// P9: a slow tick is warned at most this often (the count rides along).
+pub const SLOW_TICK_WARN_EVERY: Millis = Millis::secs(60);
 
 /// How often the daemon checks the §12b collection bounds.
 pub const GC_CHECK: Millis = Millis(3600 * 1000);
@@ -328,6 +345,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             last: None,
             choices: BTreeMap::new(),
             incident_parked: BTreeMap::new(),
+            slow_tick_warnings: 0,
+            last_slow_warning: None,
+            slow_ticks_unwarned: 0,
+            writebacks: vec![],
             confirm,
             manifest_gen: current,
             gen_manifest: manifest,
@@ -347,6 +368,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             prev_status: BTreeMap::new(),
             prev_auto_restarts: BTreeMap::new(),
             boot_report_due: fresh,
+            last_boot_report: None,
             quiet: false,
             quiet_queue: vec![],
             reprepare: vec![],
@@ -502,7 +524,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let pre = s.digest();
         let policy = self.ex.policy_version();
         let caller = authz.actor.clone();
-        let mut result = self.ex.submit(p.clone(), authz.clone(), s, defs);
+        let result = self.ex.submit(p.clone(), authz.clone(), s, defs);
         if let Some((facts, _)) = self.ex.last.clone() {
             self.touched.extend(facts.affected_units.iter().cloned());
             // §11: the affected sessions are notified either way.
@@ -599,12 +621,33 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.log.push(record);
         }
         // §12a: the runtime change is in effect; persist it in the background.
-        if let Submitted::Finished { followup: Some(wb), .. } = &mut result {
-            let mut wb = wb.clone();
+        if let Submitted::Finished { followup: Some(wb), .. } = &result {
+            self.writebacks.push((wb.clone(), authz.clone()));
+            self.flush_writebacks();
+        }
+        result
+    }
+
+    /// A generation transaction is live, in any state (I6: one waiting in
+    /// `Built` counts).
+    fn generation_active(&mut self) -> bool {
+        self.ledger().live.values().any(|t| t.txn.transition.changes_generation())
+    }
+
+    /// §12a (P7): submit the queued write-backs, unless a generation
+    /// transaction is active: then they stay queued, which is not a failure
+    /// and gives no notice. One refused as busy goes back on the queue.
+    fn flush_writebacks(&mut self) {
+        while !self.writebacks.is_empty() && !self.generation_active() {
+            let (mut wb, authz) = self.writebacks.remove(0);
             let (s2, d2) = self.observe();
             wb.observed = s2.digest();
             match self.ex.submit(wb.clone(), authz.clone(), &s2, &d2) {
                 Submitted::Finished { state: TxnState::Committed, .. } => {}
+                Submitted::Rejected { reason: RejectReason::Other(w), .. } if w == "busy" => {
+                    self.writebacks.insert(0, (wb, authz));
+                    return;
+                }
                 Submitted::Parked { approve, .. } => {
                     self.notice(format!("saving the setting needs approval: planarian approve {approve}"))
                 }
@@ -614,7 +657,40 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 )),
             }
         }
-        result
+    }
+
+    /// §13 (P22): for each unit, the catalog change last committed for it,
+    /// if the override file no longer carries what it set.
+    fn lost_changes(&self, l: &Ledger) -> BTreeMap<UnitId, (ChangeId, BTreeMap<String, Value>)> {
+        let Ok((live, _)) = self.ex.b.generations().read_overrides() else { return BTreeMap::new() };
+        let mut last: BTreeMap<UnitId, (ChangeId, BTreeMap<String, Value>)> = BTreeMap::new();
+        // Terminal records in id order: the last commit for a unit wins.
+        for t in l.terminal.values() {
+            let (TxnState::Committed, Transition::ApplyChange { change, args }) = (&t.state, &t.transition) else {
+                continue;
+            };
+            let (change, args) = if change.0 == planarian_changes::REAPPLY {
+                match args.get("change") {
+                    Some(Value::Str(c)) => {
+                        let mut a = args.clone();
+                        a.remove("change");
+                        (ChangeId(c.clone()), a)
+                    }
+                    _ => continue,
+                }
+            } else {
+                (change.clone(), args.clone())
+            };
+            if let Some(u) = planarian_changes::target_of(&change, &args) {
+                last.insert(u, (change, args));
+            }
+        }
+        let cat = &self.ex.cfg.catalog;
+        last.retain(|_, (c, a)| {
+            c.0 != "repair:reenable-predicted"
+                && planarian_changes::handle(cat, c, a).is_ok_and(|set| !planarian_changes::carried(&live, &set))
+        });
+        last
     }
 
     fn is_canonical(&self, u: &UnitId, defs: &UnitDefs) -> bool {
@@ -685,44 +761,40 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             let was_up = matches!(self.prev_status.get(u), Some(UnitStatus::Running | UnitStatus::Degraded(_)));
             let now_down = matches!(st, UnitStatus::Failed(_) | UnitStatus::Stopped);
             current.insert(u.clone(), st.clone());
-            if !(was_up && now_down)
-                || def.id.kind != UnitKind::Service
-                || self.touched.contains(u)
-                || self.generation_touched
-                || !s.expected(u, defs)
-                || def.edges.iter().any(|e| e.from == *u && e.kind == EdgeKind::Requires && crashed.contains(&e.to))
-            {
-                continue;
-            }
-            // A unit inactive (not failed) after running was stopped on
-            // request (`systemctl stop`), whatever its exit status; a failed
-            // one counts only if a termination signal ended it (a crash, a
-            // non-zero exit or the OOM killer is a fault).
-            let ended = self.b.units().ended_by(u);
-            let e = match (&st, ended) {
-                (_, Some(e)) if e.is_termination() => e,
-                (UnitStatus::Stopped, _) => Ending::Signal(15),
-                _ => continue,
+            // The decision is the pure classifier's (U3; Kani: exec::kani).
+            let facts = planarian_exec::residue::EndingFacts {
+                was_up,
+                now_down,
+                stopped_cleanly: st == UnitStatus::Stopped,
+                ended: if was_up && now_down { self.b.units().ended_by(u) } else { None },
+                service: def.id.kind == UnitKind::Service,
+                touched_by_planarian: self.touched.contains(u) || self.generation_touched,
+                expected: s.expected(u, defs),
+                requirement_crashed: def
+                    .edges
+                    .iter()
+                    .any(|e| e.from == *u && e.kind == EdgeKind::Requires && crashed.contains(&e.to)),
+                security: def.sensitivity.contains(Sensitivity::Security),
+                stops_are_faults: def.stops_are_faults,
+                systemd_restarts: def.systemd_restart.as_ref().is_some_and(|p| p.restart),
+                lenient,
             };
-            if def.sensitivity.contains(Sensitivity::Security) {
-                self.notice(format!(
+            use planarian_exec::residue::Residue;
+            match planarian_exec::residue::classify(&facts) {
+                Residue::NotAStop | Residue::Fault => {}
+                Residue::AlarmSecurity(e) => self.notice(format!(
                     "ALARM: {u}, which is security-sensitive, was stopped outside Planarian ({}); starting it again",
                     signal_name(e)
-                ));
-                continue;
-            }
-            // inferStops = false (B-11): never inferred as intent; a fault,
-            // which the incident manager repairs.
-            if def.stops_are_faults {
-                self.notice(format!(
+                )),
+                // inferStops = false (B-11): never inferred as intent; a
+                // fault, which the incident manager repairs.
+                Residue::AlarmMustRun(e) => self.notice(format!(
                     "ALARM: {u}, which must keep running, was stopped outside Planarian ({}); starting it again",
                     signal_name(e)
-                ));
-                continue;
-            }
-            let restartful = def.systemd_restart.as_ref().is_some_and(|p| p.restart);
-            if lenient && !restartful {
-                down.insert(u.clone(), e);
+                )),
+                Residue::Intended(e) => {
+                    down.insert(u.clone(), e);
+                }
             }
         }
         self.prev_status = current;
@@ -934,12 +1006,37 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         for u in &foreign {
             self.notice(format!("INTEGRITY: boot report: {u} runs, but this generation does not declare it"));
         }
+        let g = self.b.generations().current().unwrap_or_default();
+        let text = if foreign.is_empty() {
+            "clean: every running unit is declared by this generation".to_string()
+        } else {
+            format!("INTEGRITY: undeclared units: {}", foreign.join(", "))
+        };
+        self.last_boot_report = Some((self.b.clock().now(), g, text));
         (!foreign.is_empty()).then(|| format!("boot report: undeclared units: {}", foreign.join(", ")))
     }
 
     pub fn tick(&mut self) {
         let (s, defs) = self.observe();
         let now = s.observed_at;
+        // P9: a tick over its 500 ms budget is warned, with the probes that
+        // ran in it (they are the usual cause).
+        // At most one warning a minute, counting the slow ticks between.
+        if let Some((took, ran)) = self.asm.slow_tick.take() {
+            self.slow_ticks_unwarned += 1;
+            if self.last_slow_warning.is_none_or(|t| now.0 >= t.0 + SLOW_TICK_WARN_EVERY.0) {
+                eprintln!(
+                    "planariad: warning: slow tick: {} ms (budget {} ms; {} slow tick(s) since the last warning); probes run: {}",
+                    took.0,
+                    planarian_state::TICK_BUDGET.0,
+                    self.slow_ticks_unwarned,
+                    if ran.is_empty() { "none".to_string() } else { ran.join(", ") }
+                );
+                self.slow_tick_warnings += 1;
+                self.slow_ticks_unwarned = 0;
+                self.last_slow_warning = Some(now);
+            }
+        }
 
         // §12f quiet mode: while foreground work holds in any session.
         let quiet = s.conditions.iter().any(|c| matches!(c, Condition::Foreground { .. }));
@@ -1026,6 +1123,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     known_drivers: &self.asm.known_drivers,
                     current_planarian_built: false,
                     alternatives: &none,
+                    lost_changes: &BTreeMap::new(),
                 };
                 let root = diagnose::root_cause(&inc.target, &inputs);
                 let because = if root == inc.target { String::new() } else { format!(" (root cause: {root})") };
@@ -1104,7 +1202,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
             // §12f: an activation window opened for a waiting generation.
             if !busy {
-                for (id, r) in self.ex.activate_waiting(&s) {
+                for (id, r) in self.ex.activate_waiting(&s, &defs) {
                     // A repair that waited is an attempt once it runs.
                     let linked: Vec<IncidentId> =
                         self.incident_parked.iter().filter(|(_, t)| **t == id).map(|(i, _)| *i).collect();
@@ -1115,6 +1213,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         {
                             self.journal(Record::Incident(i));
                         }
+                    }
+                    if matches!(r, Submitted::Finished { state: TxnState::Rejected(RejectReason::Stale), .. }) {
+                        self.notice(format!(
+                            "transaction {}: not activated: the configuration, the override file or what the change would do changed while it waited; ask for it again",
+                            id.0
+                        ));
+                        continue;
                     }
                     self.notice(format!(
                         "transaction {}: activated now that nothing is in the way: {}",
@@ -1128,6 +1233,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 self.next_gc_check = now.plus(GC_CHECK);
                 self.collect_if_over(&s, &defs);
             }
+        }
+
+        // §12a: write-backs that waited for a generation transaction.
+        if !l.interlocked() {
+            self.flush_writebacks();
         }
 
         for t in self.ex.expire() {
@@ -1251,8 +1361,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let parked = self.ex.parked.clone();
         let ex = &self.ex;
         self.incident_parked.retain(|_, t| parked.contains_key(t) || ex.is_waiting(*t));
-        let Some(inc) =
-            self.incidents.actionable(now).into_iter().find(|i| !self.incident_parked.contains_key(&i.id)).cloned()
+        // §12f (P8): in quiet mode a deferred repair is deferred in fact: the
+        // loop skips it, so its budget and backoff do not advance.
+        let quiet = self.quiet;
+        let Some(inc) = self
+            .incidents
+            .actionable(now)
+            .into_iter()
+            .filter(|i| !quiet || foreground_depends_on(&i.target, defs))
+            .find(|i| !self.incident_parked.contains_key(&i.id))
+            .cloned()
         else {
             return;
         };
@@ -1274,6 +1392,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             known_drivers: &self.asm.known_drivers,
             current_planarian_built: l.live_tested == Some(current),
             alternatives: &alternatives,
+            lost_changes: &self.lost_changes(l),
         };
         // The deepest divergent unit below the target (§13 step 1), named
         // whenever it isn't the target itself.
@@ -1882,7 +2001,26 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         },
                     };
                 }
-                match self.b.units().start_agent(&name, &argv) {
+                // §12d (R05): a per-uid limit on agents running at once.
+                let limit = self.cfg.agent_limits.per_uid;
+                let mine = self
+                    .ledger()
+                    .agents
+                    .iter()
+                    .filter(|(n, _, by)| *by == peer.uid && self.b.units().agent_running(n))
+                    .map(|(n, _, _)| n.clone())
+                    .collect::<BTreeSet<_>>();
+                if mine.len() as u32 >= limit {
+                    return Response::Rejected {
+                        reason: "Unauthorized".into(),
+                        message: format!(
+                            "uid {} already runs {} agent(s), the limit (services.planarian.agents.limits.perUid = {limit})",
+                            peer.uid,
+                            mine.len()
+                        ),
+                    };
+                }
+                match self.b.units().start_agent(&name, &argv, &self.cfg.agent_limits) {
                     Ok(instance) => {
                         // Journaled once it has started, with the instance it
                         // started as: a failed start binds nothing (I24).
@@ -1976,8 +2114,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
             }
             Request::MarkGood { accept_unconfirmed } => {
-                if !peer.admin {
-                    return Response::Error { message: "mark-good requires administrator authority".into() };
+                // §16 (K10): root at an interactive terminal, the terminal
+                // established by the daemon from the peer, as for approve.
+                if peer.uid != 0 || !peer.tty {
+                    return Response::Error {
+                        message: "mark-good requires root at an interactive terminal (Phase A)".into(),
+                    };
                 }
                 let (s, defs) = self.observe();
                 let failing: Vec<String> = defs
@@ -2017,6 +2159,30 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
             }
             Request::Console => Response::Console(Box::new(self.console())),
+            // §16 (P17): the last boot report, and the posture in force.
+            Request::ReportBoot => match &self.last_boot_report {
+                Some((at, g, text)) => Response::Ok {
+                    message: format!("boot report for generation {} at {}: {text}", g.0, render::when(*at)),
+                },
+                None => Response::Ok {
+                    message: "no boot report since planariad started (it runs once, on the first start after boot)"
+                        .into(),
+                },
+            },
+            Request::Posture => {
+                let d = &self.cfg.posture_decl;
+                let mut message = format!(
+                    "posture: {:?}, boot-ready timeout {} s (this generation declares {:?}, {} s)",
+                    self.cfg.posture,
+                    d.timeout_in_force(),
+                    d.declared,
+                    d.declared_timeout_secs
+                );
+                if d.weaker_waiting() {
+                    message.push_str("; the weaker declaration takes effect at the next boot");
+                }
+                Response::Ok { message }
+            }
             #[cfg(feature = "gym-hooks")]
             Request::GymPropose { transition, stale_digest, may_change } => {
                 let (s, defs) = self.observe();
@@ -2097,6 +2263,19 @@ fn signal_name(e: Ending) -> String {
         Ending::Exited(n) => format!("exit status {n}"),
         Ending::OomKill => "the OOM killer".into(),
     }
+}
+
+/// §12f: units foreground work plausibly depends on, whose repairs quiet
+/// mode does not defer: a user's own units (audio), devices (sound, GPU,
+/// input, network cards), and units whose restart drops a session or the
+/// network (compositor, display manager, network, Bluetooth).
+fn foreground_depends_on(u: &UnitId, defs: &UnitDefs) -> bool {
+    matches!(u.scope, Scope::User { .. })
+        || u.kind == UnitKind::Device
+        || u.name.contains("bluetooth")
+        || defs
+            .get(u)
+            .is_some_and(|d| matches!(d.restart_disruption, Disruption::SessionLoss | Disruption::ConnectivityLoss))
 }
 
 /// Notices quiet mode never holds back (§12f): alarms, integrity findings,

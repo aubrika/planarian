@@ -77,6 +77,11 @@ pub enum Request {
     },
     /// Everything the read-only console shows (§16a), in one answer.
     Console,
+    /// `planarian report boot` (§16): the last boot report.
+    ReportBoot,
+    /// `planarian posture` (§16, §12d): the posture and timeout in force,
+    /// and whether a weaker declaration waits for the next boot.
+    Posture,
     /// The gym's VM harness: submit `transition` as a proposal from the
     /// caller, optionally with a stale digest or a narrowed `may_change`.
     /// Answered only by a daemon built with `gym-hooks`.

@@ -30,6 +30,9 @@ pub struct Inputs<'a> {
     /// For each runtime option a unit names as its repair (`runtime_repair`),
     /// the other values available now (for Wi-Fi: known networks in range).
     pub alternatives: &'a BTreeMap<String, Vec<Value>>,
+    /// For a unit, the catalog change last committed for it whose
+    /// assignments the override file no longer carries (§13, P22).
+    pub lost_changes: &'a BTreeMap<UnitId, (ChangeId, BTreeMap<String, Value>)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,6 +231,19 @@ pub fn candidates(incident: &Incident, i: &Inputs<'_>) -> Vec<Candidate> {
             )),
             _ => {}
         },
+    }
+
+    // §13 (P22): the change committed for this unit is gone from the
+    // override file: put it back.
+    if divergent(def.desired.status, &status)
+        && let Some((change, args)) = i.lost_changes.get(&root)
+    {
+        let mut a = args.clone();
+        a.insert("change".into(), Value::Str(change.0.clone()));
+        out.push((
+            Transition::ApplyChange { change: ChangeId("repair:reapply".into()), args: a },
+            format!("{root} is {status:?} and the change {} committed for it is no longer applied{via}", change.0),
+        ));
     }
 
     if i.current_planarian_built && i.state.generation != i.state.known_good {

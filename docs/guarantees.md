@@ -89,11 +89,11 @@ invariants counts for both (47 counts, 45 distinct obligations).
 | **I10** | **A change that alters a canonical probe never runs below AskFirst.** | **Proved** (decide half) | `i10_canonical_probe_changes_ask` | V1, U1 | 1:2 |
 | **I11** | **A session's combined effect is judged at least as strictly as any single step of it.** | **Proved** | `i11_non_routine_session_asks`, `i11_session_only_raises` | V1, V2 | 2:2 |
 | **I12** | **Every transaction reaches a terminal state; RecoveryFailed alerts and sets the interlock.** | **Proved, conditional** on G1–G4 | `i12_steps_terminate`, `i12_terminal_always_reachable`, `terminal_is_final`, `refusal_only_before_mutation`, `apply`, `recovery_table_follows_the_state_machine` (Kani), `watchdog_takes_over_only_when_it_should` (Kani), `step_allowed`, `add_interlock` | G1–G4, P1, P4, P7, V5 | 9:8 |
-| I13 | A unit under an override is never a repair target while the override holds. | Tested | — | P6 | 0:1 |
+| **I13** | **A unit under an override is never a repair target while the override holds.** | **Partly proved** (the residue classifier, Kani; the incident manager by test) | `residue_security_is_never_intended`, `residue_crashes_are_faults`, `residue_is_inferred_only_where_allowed` (Kani) | P6, U3 | 3:2 |
 | **I14** | **Policy facts come from the evaluated generation, never from the proposal.** | **Proved** (decide half) | `i14_facts_caller_is_not_authority`; `decide` takes no `Proposal` at all | U1, V3 | 1:2 |
 | **I15** | **One owner per transaction; a stale epoch is refused; only the lease holder advances the journal.** | **Proved** | `validate`, `takeover_fences_out_the_previous_owner` (Kani) | P4, P7 | 2:2 |
 | **I16** | **No automatic revert, rollback or boot fallback goes below the security floor; going below needs an administrator.** | **Proved** (decide; bootloader by test) | `i16_below_floor_needs_administrator`, `administrator_class_only_on_ask_first` | V1, V2, P3 | 2:3 |
-| I17 | There is always at least one administrator. | Tested | (`i17_root_is_always_an_administrator` is a unit test) | P8 | 0:1 |
+| **I17** | **There is always at least one administrator.** | **Proved** (given root exists) | `is_administrator`, `i17_administrators_never_empty` | P8, U2 | 2:2 |
 | **I18** | **Every journal record commits to its predecessor's hash; a broken chain is detected on read.** | **Proved** (trusting SHA-256) | `follows`, `verify`, `next_link`, `appending_keeps_the_chain`, `an_edited_record_breaks_the_chain` | P5, P4 | 5:2 |
 | **I19** | **No principal approves its own proposal or grants itself a capability it lacks.** | **Proved** | `i19_no_self_approval`, `may_approve`, `may_grant` | V1 | 3:1 |
 | I20 | No agent starts while planarian-ready.target is not reached, in every failure posture. | Tested | — | P6, P8 | 0:2 |
@@ -308,7 +308,7 @@ none is proved yet.
   the evaluated generation (U1). `exec` enters Verus in Phase C; today it
   has Kani on its pure decisions and property tests that crash the kernel
   at each of 15 points.
-- **Tested-only invariants:** I1–I4, I7, I13, I17, I20 (I13 and I17 now have proof targets: SPEC §17a).
+- **Tested-only invariants:** I1–I4, I7, I20. I13 is partly proved (the residue classifier, by Kani; the incident manager's refusal to target an overridden unit by test) and I17 is proved (v4.6).
 - **`schema::digest`** is property-tested, not proved.
 - **Every proved obligation now counts.** Fourteen counted toward
   nothing at GA. Four were mapped to I6 and I12, and the other ten

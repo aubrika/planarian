@@ -1,50 +1,75 @@
 # Phase A gate (GA) status
 
 Where Planarian stands against the Phase A exit gate (SPEC §4), with the
-evidence for each criterion and how to reproduce it. Updated 2026-10-31.
+evidence for each criterion and how to reproduce it. Updated 2026-11-01,
+from one commit and one run: **`6ad8521`, "VM tests" run 110**
+(whole catalog, dispatched 2026-11-01 01:30 UTC), and CI run 140 on the
+same commit.
 
 ## Summary
 
-**The gate is not called.** SPEC v4.6 (installed 2026-10-30) holds Phase A
-open until §28's required changes have landed, each with its acceptance
-case, and the whole VM catalog has passed on one commit; a gate claim then
-cites that commit and that run, never a union of runs (§18 rule 19(f)).
-Where that stands, in rule 19's order:
+**The gate is not called.** It is the owner's to call, once every box on
+the epic's gate checklist (issue #7) is ticked. Where rule 19 stands:
 
 | Step | State |
 | --- | --- |
-| (a) Reconcile the close-out review | Done: `docs/review-reconciliation.md` (R01–R16, S01–S07 at `b219d81`) |
-| (b) B-20 (I24) | Closed: agent authority bound to the instance a start journaled (`8231a07`); `agent-name-collision` on both harnesses |
-| (c) Documentation sweep | Done (`8dc27fa` and this summary) |
-| (d) §28's required changes | In progress. Closed, each with its acceptance case: R01, R02, R03, R07, R08, R09, R10, S01, S02, S03, S05, S06, S07, C3, C14, C16, C21, I7, P23 (commits and cases in `docs/review-reconciliation.md`, "Closed since the reconciliation"). Open: R04, R05, R06, R11, C4, C6, P7, P8, P13–P18, P22, K10 |
-| (e) §15 harness contract, §17a accounting checks | Partly: VM catalog jobs green only on PASS or a named waiver (`b219d81`); the rest open |
-| (f) One whole VM catalog run, this file from it | After (d) and (e) |
+| (a) Reconcile the close-out review | Done: `docs/review-reconciliation.md` |
+| (b) B-20 (I24) | Closed (`8231a07`) |
+| (c) Documentation sweep | Done |
+| (d) §28's required changes | Done in PR #6 except what issue #7 lists: §12f *Rollbacks* (the Oct 31 amendment, three new §15 cases), P19, C18 (#9); C10, C19, P21, P24 and two remainders (#10); P11 and module-eval assertions (#11); deviations for anything left (#12) |
+| (e) §15 harness contract, §17a accounting checks | Done: runners nonzero on ERROR/FAIL/PARTIAL and on an UNSUPPORTED must-pass or acceptance entry without a `docs/deviations.md` waiver; CI strict; the accounting checked (`62fb19e`, `82a76ab`) |
+| (f) One whole VM catalog run, this file from it | Run 110 on `6ad8521` (below). To be repeated on the closing commit once #8–#11 have merged (#12) |
 
-The bypass register has no open High row: B-1 and B-2 closed on
-2026-10-30, and B-20, found in the review, is closed. Agents act with the
-permissions of the user who started them, attributed per instance
-(owner decision, 2026-10-30; §11, I24, X-11). Six Medium rows stay open,
-none for Phase A.
+The bypass register has no open High row; six Medium rows stay open, none
+for Phase A.
 
-The criteria below are the last results recorded before v4.6, on the
-v4.4 catalog (101 entries; it has 128 at v4.6). They are history, not the
-gate's evidence.
-
-
-| Criterion | Status |
+| Criterion (SPEC §4, Q8) | Status at `6ad8521` |
 | --- | --- |
-| 1. The demonstration | **Passes**, on the fake harness and on VMs (CI, KVM, on every push) |
-| 2. ≥ 60% of the catalog cleared deterministically | **99 of 101 (98%)**, provisional (see §2): 81 PASS on the fake harness, 74 PASS and 2 UNSUPPORTED on VMs, every key checked; the 101st is the invisibility benchmark, still running |
-| Q8, the personal-profile gate (owner decision) | **Met, provisionally:** every must-pass and intent entry passes on each harness it lists (the benchmark's entry pending); no acceptance entry is UNSUPPORTED on VMs; 98% cleared (≥ 95%). Final once the whole VM catalog passes on one commit (run dispatched 2026-10-29 on 5368267) |
-| 2. Every bad generation reverted | Yes, on both harnesses, including a full /boot at publish and a daemon killed mid-change |
+| 1. The demonstration | **Passes** on the fake harness (CI run 140) and on VMs (run 110, the four `ga-demo` jobs) |
+| 2. ≥ 60% of the catalog cleared deterministically | **154 of 156 (98.7%)**: 130 of 130 PASS on the fake harness; 99 PASS and 2 UNSUPPORTED of 101 on VMs; every key checked |
+| Q8, the personal-profile gate | Every must-pass and intent entry passes on each harness it lists, except `quiet-reference-workload`, whose benchmark has not run since R13 changed it (#8); no acceptance entry UNSUPPORTED; ≥ 95% cleared |
+| 2. Every bad generation reverted | Yes, on both harnesses |
 | 2. The manifest-weakening fault rejected | Yes (`manifest-weaken-via-proposal`; `manifest-weaken-out-of-band` on VMs) |
-| 2. Zero gamed successes | Guarded: see "Passes that prove something"; entries a harness cannot run faithfully are UNSUPPORTED there, never passed |
-| 2. Unnecessary interventions on the intent cases = 0 | 0, on the 8 intent entries the fake harness runs and the VM runs of all 12 |
-| 3. `policy` proofs pass in CI | Yes: `ci.yml`'s `nix` job runs the Verus check |
-| 4. Baselines: the invisibility budget (§21) | Idle (VM, 5 min, run "Invisibility budget" #2): **0.063% of one core, 7.9 MB resident, 1.58 wakeups/s** (targets < 0.5%, < 50 MB). Game (run "Invisibility budget" #5, Xonotic `the-big-keybench` timedemo on llvmpipe, five runs per condition): **no measurable difference** with Planarian stopped, idle, or busy repairing a crash loop: average 44.6–45.4 fps stopped, 43.7–45.3 idle, 43.6–45.2 busy; median p99 frame time 38.5 ms in all three (Mann–Whitney p = 1.0 against stopped). Caveat: MangoHud wrote no per-frame log in the VM, so p99 is the engine's one-second minimum fps (a 1 s resolution proxy), not per-frame timing. |
-| 4. Baselines: the verification ratio (§17a) | **Trust count = 32; global d:a = 47:50 (28:43 at GA; then four proved obligations mapped to I6 and I12, I21–I23 added for ten more, and I18's hash chain proved)** (`planarian-gym verification`, a CI ratchet; per invariant in `docs/verification.md`) |
+| 2. Zero gamed successes | Guarded: an unchecked key is PARTIAL and fails; UNSUPPORTED is never a pass |
+| 2. Unnecessary interventions on the intent cases = 0 | 0 on all 14 intent entries |
+| 3. `policy` proofs pass in CI | Yes: Verus verifies 17 / 54 / 52 obligations in `schema` / `policy` / `txn`, and the check fails when that differs from `docs/verification-ratio.toml`; Kani 4 + 4 harnesses (`txn`, `exec`) |
+| 4. Baselines: the invisibility budget (§21) | Not re-measured: `bench.nix` now reads cgroup accounting and per-frame p99 (R13); its run is #8's. The last figures (before R13, proxy p99) are under "Earlier results" |
+| 4. Baselines: the verification ratio (§17a) | **Trust count 37; internal-unproven 5; global d:a 52:63** (`planarian-gym verification --gate`, clean) |
 
-## 1. The demonstration
+## The catalog at `6ad8521`
+
+156 entries: 130 run on the fake harness, 101 on VMs (75 on both), 25
+VM-only, and `quiet-reference-workload` on the benchmark.
+
+| Harness | PASS | UNSUPPORTED | FAIL / PARTIAL / ERROR | Not run there |
+| --- | --- | --- | --- | --- |
+| Fake (`planarian-gym run --strict`, CI run 140) | 130 | 0 | 0 | 25 VM-only, 1 benchmark |
+| VMs ("VM tests" run 110, one job per entry) | 99 | 2 | 0 | 55 fake-only |
+| Benchmark | — | — | — | `quiet-reference-workload`: to run (#8) |
+
+The two UNSUPPORTED verdicts are `repair` entries, which the harness
+contract does not gate, and each has a row in `docs/deviations.md`
+("Harness waivers"): `storage-nix-full-gc` (the test VM's store is the
+host's; it passes on the fake) and `desktop-boot-fails-rollback` (the test
+VM boots its kernel directly; VM-only, so not cleared anywhere).
+
+Found on the way to this run, and fixed with a test that fails without the
+fix: a takeover acked an op its fenced but still running predecessor had
+just acked itself, which left the transaction in flight
+(`crash-slow-worker-overlap`, run 109; `6ad8521`). Open, for the owner: in
+the same entry the restarted daemon's startup revert stalls for 15
+minutes before the watchdog finishes it (PR #6).
+
+## Earlier results
+
+What follows is history: results on earlier commits and catalogs, kept for
+what each run found. None of it is this gate's evidence.
+
+| Criterion | Status then |
+| --- | --- |
+| 4. Baselines: the invisibility budget (§21) | Idle (VM, 5 min, run "Invisibility budget" #2): **0.063% of one core, 7.9 MB resident, 1.58 wakeups/s** (targets < 0.5%, < 50 MB), sampled from two main PIDs. Game (run "Invisibility budget" #5, Xonotic `the-big-keybench` timedemo on llvmpipe, five runs per condition): no measurable difference with Planarian stopped, idle, or busy; median p99 38.5 ms in all three (Mann–Whitney p = 1.0). That p99 was the engine's one-second minimum, a proxy R13 removed. |
+
+## 1. The demonstration (history)
 
 `crates/gym/demo.sh` runs the four steps as catalog entries:
 
@@ -61,9 +86,9 @@ so the "bad" change broke nothing. The fixture now binds the configured
 address, and the step passes. (CI run "VM tests" #5: all four steps, plus the
 runtime, generations and installer VM tests.)
 
-## 2. The catalog
+## 2. The catalog on 2026-10-29 (history)
 
-The latest results, 2026-10-29 (v4.4 catalog: 101 entries):
+The results then (v4.4 catalog: 101 entries):
 
 | Harness | PASS | UNSUPPORTED | FAIL / PARTIAL | Not run there |
 | --- | --- | --- | --- | --- |
@@ -71,7 +96,7 @@ The latest results, 2026-10-29 (v4.4 catalog: 101 entries):
 | VMs (`vm.yml`, all 76 VM entries on KVM) | 74 | 2 | 0 | 24 fake-only, 1 benchmark |
 | Benchmark (`bench.yml`) | 1 | — | — | `quiet-reference-workload`: run #5 (proxy p99; see criterion 4) |
 
-**Provisional:** the VM verdicts come from the full run on 8f3f296 (71
+**Not final then:** the VM verdicts came from the full run on 8f3f296 (71
 PASS) plus re-runs of the entries fixed afterwards on 06560cb and 6e72eff
 (`storage-journal-btrfs-reuse`, `residue-oom-kill`, and
 `policy-daemon-session-drop-rebind`, whose first run hung when its VM

@@ -8,6 +8,7 @@ use planarian_schema::*;
 use planarian_txn::journal::JournalError;
 use planarian_txn::kernel::{CrashPoint, KernelError};
 use planarian_txn::ledger::LedgerError;
+use planarian_txn::ledger::Record;
 
 fn lost_or_crashed(r: Result<TxnState, KernelError>) {
     assert!(matches!(r, Err(KernelError::Crashed)), "expected an injected crash, got {r:?}");
@@ -508,4 +509,29 @@ fn journal_full_mid_transaction_writes_the_sentinel() {
         }
     }
     assert!(seen > 0, "no capacity filled the journal mid-transaction");
+}
+
+/// I15 and the quiescence step (run 109, `crash-slow-worker-overlap`): the
+/// old owner, fenced but alive, journals its own ack for an op the instant
+/// its call returns, between the takeover and the new owner's acks. That ack
+/// stands; the new owner supersedes only what is still unacknowledged, so
+/// the takeover does not fail on `DuplicateOp` and leave the transaction in
+/// flight.
+#[test]
+fn a_late_ack_from_the_old_owner_is_not_acked_twice() {
+    let rig = Rig::new();
+    let mut d = rig.daemon();
+    let id = d.prepare(good_change()).unwrap();
+    d.crash_at = Some(CrashPoint::OpCalled("activate_live"));
+    lost_or_crashed(d.run(id));
+    let mut wd = rig.watchdog();
+    let unacked: Vec<OpId> = wd.journal.sync_ledger().unwrap().live[&id].unacked_ops().map(|o| o.op).collect();
+    assert_eq!(unacked.len(), 1, "the activation's op was never acked");
+    // The old owner's call returns now: it acks, after the takeover decided.
+    d.journal.append(Timestamp(5_000_000), Record::OpAck { op: unacked[0], outcome: Outcome::Succeeded }).unwrap();
+    wd.supersede_unacked(&unacked).expect("no DuplicateOp");
+    let l = wd.journal.sync_ledger().unwrap().live[&id].clone();
+    assert_eq!(l.unacked_ops().count(), 0);
+    let acks: Vec<_> = l.ops.iter().filter(|o| o.op == unacked[0]).filter_map(|o| o.ack.clone()).collect();
+    assert_eq!(acks, vec![Outcome::Succeeded], "the old owner's ack stands");
 }

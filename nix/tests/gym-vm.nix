@@ -63,7 +63,8 @@ let
     # A gym fixture service: listens on a port (HTTP for --http) and honours
     # knobs in /var/lib/gym-knobs/<name>/: fail_on_start, fail_after,
     # health (HTTP status), health_delay (answer late), probe_delay (answer
-    # late; the harness also drops packets to the port, so connecting stalls).
+    # late; the harness also drops packets to the port, so connecting stalls),
+    # health_trickle (send one byte per interval and never finish, R06).
     import http.server, os, socketserver, sys, threading, time, json
     name, port = sys.argv[1], int(sys.argv[2])
     http_mode = "--http" in sys.argv
@@ -108,6 +109,13 @@ let
     threading.Thread(target=fail_after, daemon=True).start()
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            t = secs(knob("health_trickle"))
+            if t:
+                try:
+                    for _ in range(600):
+                        self.wfile.write(b"H"); self.wfile.flush(); time.sleep(t)
+                except OSError: pass
+                return
             d = secs(knob("health_delay") or knob("probe_delay"))
             if d: time.sleep(d)
             code = int(knob("health") or 200)
