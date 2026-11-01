@@ -130,7 +130,10 @@ pkgs.testers.runNixOSTest {
             machine.succeed("systemd-run --unit=bench-crasher ${pkgs.runtimeShell} -c "
                             "'while true; do ${pkgs.coreutils}/bin/sleep 30; ${pkgs.systemd}/bin/systemctl kill --signal=SIGSEGV bench-svc; done'")
         _, log = machine.execute(
-            f"MANGOHUD_CONFIG=no_display,autostart_log=1,output_folder={out} "
+            # Not no_display: it turns MangoHud's logging off with the HUD
+            # (no per-frame log in any run, bench run 41334477890).
+            # fps_only keeps the drawn HUD to one number in every condition.
+            f"MANGOHUD_CONFIG=fps_only,autostart_log=1,output_folder={out} "
             f"timeout -s INT {limit} xvfb-run -a -s '-screen 0 320x240x24' mangohud --dlsym {game} "
             f"-nosound -benchmark {demo.removesuffix('.dem')} +exec effects-low.cfg +vid_fullscreen 0 "
             f"+vid_width 320 +vid_height 240 2>&1 | tail -n 40")
