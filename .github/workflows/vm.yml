@@ -31,11 +31,14 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  # Build Planarian once (the gym's test build and the release package) and
-  # hand it to every VM job as a binary cache, instead of each job compiling
-  # it again (about 3 of its 4 build minutes; #8). The signing key is made
-  # here for this run and never leaves this job; its public half is the job's
-  # output, which each VM job trusts for this run's cache only.
+  # Build the gym's test build of Planarian once and hand it to every gym VM
+  # job as a binary cache, instead of each job compiling it again (about 3
+  # of its 4 build minutes; #8). The release package is left to the vm and
+  # firecracker jobs (push and dispatch only): its checkPhase builds and runs
+  # the test suite, which held this job, and so every gym job, 12.7 min. The
+  # signing key is made here for this run and never leaves this job; its
+  # public half is the job's output, which each VM job trusts for this run's
+  # cache only.
   prebuild:
     runs-on: ubuntu-24.04
     outputs:
@@ -47,7 +50,7 @@ jobs:
           extra_nix_config: trusted-users = root runner
       - id: cache
         run: |
-          attrs=".#legacyPackages.x86_64-linux.gym-hooks .#packages.x86_64-linux.planarian"
+          attrs=".#legacyPackages.x86_64-linux.gym-hooks"
           nix build -L --no-link $attrs
           paths=$(nix path-info $attrs)
           sk="$RUNNER_TEMP/ci.sk"
@@ -63,7 +66,6 @@ jobs:
           key: nix-ci-${{ github.run_id }}
 
   vm:
-    needs: prebuild
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     strategy:
@@ -76,17 +78,9 @@ jobs:
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
-      # Planarian from the prebuild job's signed cache (a miss builds it).
-      - uses: actions/cache/restore@v4
-        with:
-          path: /tmp/nix-ci-cache
-          key: nix-ci-${{ github.run_id }}
       - uses: cachix/install-nix-action@v31
         with:
-          extra_nix_config: |
-            system-features = nixos-test benchmark big-parallel kvm
-            extra-substituters = file:///tmp/nix-ci-cache
-            extra-trusted-public-keys = ${{ needs.prebuild.outputs.key }}
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
       - run: nix build -L .#checks.x86_64-linux.${{ matrix.check }}
 
   ga-demo:
@@ -162,7 +156,6 @@ jobs:
   # The Firecracker microVM target (SPEC §4, Phase A): non-gating, allowed to
   # stay red. Boots Planarian under Firecracker and checks one repair.
   firecracker:
-    needs: prebuild
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     continue-on-error: true
@@ -172,17 +165,7 @@ jobs:
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
-      # Planarian from the prebuild job's signed cache (a miss builds it).
-      - uses: actions/cache/restore@v4
-        with:
-          path: /tmp/nix-ci-cache
-          key: nix-ci-${{ github.run_id }}
       - uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: |
-            system-features = nixos-test benchmark big-parallel kvm
-            extra-substituters = file:///tmp/nix-ci-cache
-            extra-trusted-public-keys = ${{ needs.prebuild.outputs.key }}
       - run: nix build -L .#firecracker-target -o fc
       - run: fc/bin/run-firecracker-target
 
