@@ -81,6 +81,9 @@
           nixpkgs.lib.genAttrs ids (id: import ./nix/tests/gym-vm.nix { inherit pkgs self id; });
         # The invisibility budget (§21): run on demand (it downloads Xonotic).
         bench.invisibility = import ./nix/tests/bench.nix { inherit pkgs self; };
+        # The gym's test build, as gym-vm.nix makes it: vm.yml builds it once
+        # and the VM jobs substitute it (the same derivation).
+        gym-hooks = pkgs.callPackage ./nix/package.nix { gymHooks = true; };
       });
 
       templates.default = {
