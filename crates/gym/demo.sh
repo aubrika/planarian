@@ -8,7 +8,7 @@
 #   4. restart the daemon; it reconciles the
 #      journal and explains what happened     crash-daemon-restart-reconciles
 #
-# Each step is a catalog entry in catalog/phase-a.toml, scored on its
+# Each step is a catalog entry in catalog/phase-a/, scored on its
 # required_post. Pass/fail never comes from the absence of errors (§18.4).
 # The reconciliation record from step 4 is printed at the end.
 #
@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-catalog="$root/crates/gym/catalog/phase-a.toml"
+catalog="$root/crates/gym/catalog/phase-a"
 steps=(
   svc-killed
   svc-misconfig-listen-address

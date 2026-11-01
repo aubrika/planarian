@@ -21,7 +21,7 @@ for id in "${ids[@]}"; do
   p=$(nix build --no-link --print-out-paths --option system-features "$features" "$flake#legacyPackages.$sys.gym-vm.$id" 2>/dev/null || true)
   if [ -n "$p" ] && [ -f "$p/verdict.json" ]; then cp "$p/verdict.json" "$out/$id.json"; else echo "{\"id\":\"$id\",\"result\":\"ERROR\",\"notes\":[\"the test did not run\"]}" > "$out/$id.json"; fi
 done
-catalog=${GYM_CATALOG:-crates/gym/catalog/phase-a.toml}
+catalog=${GYM_CATALOG:-crates/gym/catalog/phase-a}
 # R12: the §15 harness contract (nix/gym/harness-contract.py): nonzero on
 # ERROR, FAIL or PARTIAL, and on an UNSUPPORTED must-pass or acceptance
 # entry without a waiver in docs/deviations.md.

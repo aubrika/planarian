@@ -1,0 +1,195 @@
+# Family: failure-posture (catalog entries; format in 00-format.toml)
+
+# §12d, I20 (v4.4): the failure posture, one entry per class input. VM only:
+# the responses are systemd's (nix/posture.nix).
+[[fault]]
+id = "posture-absent-masked"
+family = "failure-posture"
+summary = "planariad is masked and the machine rebooted. planarian-ready.target times out; Standard's Absent responses apply; the agent stand-in never starts; unmasking and a clean ready lifts them."
+spec = ["§12d", "I20", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "mask_unit", unit = "service:planariad" }]
+inject = { raw = "reboot" }
+after = [
+  { raw = "wait", for = "90s" },
+  { raw = "unmask_unit", unit = "service:planariad", actor = "root" },
+  { raw = "restart_process", process = "planariad" },
+]
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Absent", target_reached = "planarian-failed@Absent.target", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"], not = ["restrict_login", "halt_to_recovery", "alarm_dismissable"] }
+not_started = ["service:gym-agent"]
+reports = ["PostureLifted"]
+invariants = ["I20"]
+
+# R05 (§12d, I20): agents the launcher created are stopped by the posture.
+[[fault]]
+id = "posture-stops-launched-agents"
+family = "failure-posture"
+summary = "An administrator launches an agent with `planarian agent run` (in planarian-agents.slice). planariad then crash-loops past its restart budget: planarian-failed@Crashed stops the agents' slice as a whole, so the launched agent stops too, not only the declared agent units."
+spec = ["§12d", "I20", "R05"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "agent_run", name = "launched", as = "user:1001", argv = ["/run/current-system/sw/bin/sleep", "infinity"] }, { raw = "wait", for = "10s" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGSEGV", repeat = "past-budget" }
+after = [{ raw = "wait", for = "30s" }]
+window = "4m"
+
+[fault.required_post]
+posture = { class = "Crashed", target_reached = "planarian-failed@Crashed.target", responses = ["disable_agents"] }
+invariants = ["I20"]
+
+[fault.required_post.unit_after_failure]
+"service:planarian-agent-launched" = "Stopped"
+
+[[fault]]
+id = "posture-crashed-budget"
+family = "failure-posture"
+summary = "planariad reaches ready, then is killed until its restart budget is spent. OnFailure= reaches planarian-failed@Crashed; responses as Absent; agents stop; an administrator's acknowledgement is journaled with identity."
+spec = ["§12d", "I20", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "release", process = "gym-agent" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGSEGV", repeat = "past-budget" }
+after = [
+  { raw = "wait", for = "30s" },
+  { raw = "ack_alarm", actor = "user:1001" },
+  { raw = "restart_process", process = "planariad" },
+]
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Crashed", target_reached = "planarian-failed@Crashed.target", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"], not = ["restrict_login"] }
+reports = ["AlarmAcknowledged(user:1001)"]
+invariants = ["I20"]
+
+# Agents that were running when the monitor failed are stopped, not merely not started.
+[fault.required_post.unit_after_failure]
+"service:gym-agent" = "Stopped"
+
+[[fault]]
+id = "posture-integrity-core-hash"
+family = "failure-posture"
+summary = "The recorded core hash no longer matches its signature (I2). planarian-recovery's independent check fails the boot as Integrity: tamper alarm, notify, no agents, remote access off; local login proceeds with the warning. Only an administrator clears it."
+spec = ["§12d", "I2", "I20", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# VM only: the responses are systemd's (catalog review G18).
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "corrupt_core_hash" }]
+inject = { raw = "reboot" }
+after = [
+  { raw = "ack_alarm", actor = "user:1000" },
+  { raw = "ack_alarm", actor = "user:1001" },
+]
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Integrity", target_reached = "planarian-failed@Integrity.target", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"], not = ["halt_to_recovery"] }
+not_started = ["service:gym-agent"]
+# alice's acknowledgement is refused; the admin's clears it.
+reports = ["Unauthorized", "AlarmAcknowledged(user:1001)"]
+invariants = ["I2", "I20"]
+
+[[fault]]
+id = "posture-integrity-core-script"
+family = "failure-posture"
+summary = "One posture script (planarian-ack), not planariad, no longer matches its line in the core-hash record. planarian-recovery checks every Planarian binary and script, so the boot fails as Integrity all the same (B-12)."
+spec = ["§12d", "I2", "B-12"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "corrupt_core_hash", file = "planarian-ack" }]
+inject = { raw = "reboot" }
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Integrity", target_reached = "planarian-failed@Integrity.target" }
+invariants = ["I2"]
+
+[[fault]]
+id = "posture-integrity-journal-chain"
+family = "failure-posture"
+summary = "A record in the hash-chained journal is altered while the machine is off. The boot report finds the broken chain (I18): Integrity responses, as above."
+spec = ["§12c", "§12d", "§10 boot report", "I18", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# VM only: the responses are systemd's; journal-record-edited is the fake's half (G18).
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ transition = "RestartUnit", unit = "service:gym-web", source = "user", actor = "user:1001" }]
+inject = { raw = "break_journal_chain", record = "middle", when = "powered-off" }
+after = [{ raw = "reboot" }, { raw = "ack_alarm", actor = "user:1001" }]
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Integrity", target_reached = "planarian-failed@Integrity.target", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"] }
+reports = ["BootReport(JournalChainBroken)"]
+invariants = ["I18", "I20"]
+
+[[fault]]
+id = "posture-integrity-undeclared-early-unit"
+family = "failure-posture"
+summary = "A unit outside the generation's closure is planted to start before planarian-ready. The boot report names it and Integrity responses apply. (Phase A's boot report checks units only, and planariad stops on the finding rather than opening an incident: catalog review G18.)"
+spec = ["§10 boot report", "§12d", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "plant_early_unit", unit = "service:gym-planted" }]
+inject = { raw = "reboot" }
+window = "5m"
+
+[fault.required_post]
+posture = { class = "Integrity", target_reached = "planarian-failed@Integrity.target", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"] }
+reports = ["BootReport(UndeclaredEarly: service:gym-planted)"]
+
+# C16 (§12c): a damaged checkpoint is Integrity, never Absent.
+[[fault]]
+id = "checkpoint-bad-crc"
+family = "failure-posture"
+summary = "The journal is compacted, then its checkpoint is damaged while the daemon is down (its CRC no longer matches). The daemon does not start from nothing: it reports an Integrity failure naming the journal."
+spec = ["§12c", "§12d", "C16"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" },
+  { raw = "wait", for = "1m" },
+  { raw = "force_compaction" },
+]
+inject = { raw = "corrupt_checkpoint" }
+after = [{ raw = "restart_process", process = "planariad" }]
+window = "2m"
+
+[fault.required_post]
+reports = ["JournalChainBroken"]
+posture = { class = "Integrity" }
+
+# B-13 (Low).
+[[fault]]
+id = "test-build-is-integrity"
+family = "failure-posture"
+summary = "The test build (gym-hooks, which accepts fault injection over its socket) starts with a configuration that does not allow it, as it would anywhere outside the gym's VM tests. planariad refuses to run: an Integrity failure, with exactly the Integrity responses and no agent started. (The module refuses such a configuration at evaluation; checks.module-eval covers that.)"
+spec = ["§12d", "§15 test builds", "B-13"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { raw = "plant_test_build" }
+window = "3m"
+
+[fault.required_post]
+posture = { class = "Integrity", responses = ["alarm", "notify_admins", "disable_agents", "restrict_remote"], not = ["halt_to_recovery"] }
+not_started = ["service:gym-agent"]

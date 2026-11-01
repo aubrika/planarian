@@ -1,0 +1,97 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: driver-unbound
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "drv-unbound-audio"
+family = "driver-unbound"
+summary = "snd_hda_intel is unbound from the sound card; alice's pipewire degrades. The root cause is the device, not pipewire; the driver is rebound, and pipewire then recovers."
+spec = ["§1 root-cause example", "§12 DeviceOp"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { raw = "unbind_driver", device = "device:snd-hda0" }
+window = "5m"
+
+[fault.required_post]
+units = { "device:snd-hda0" = "Bound", "service@1000:pipewire" = "Running" }
+generation = "base"
+may_change = ["device:snd-hda0", "service@1000:pipewire", "service@1000:wireplumber"]
+others_unchanged = true
+
+[[fault.required_post.incident]]
+target = "device:snd-hda0"
+root_of = ["service@1000:pipewire"]
+
+[[fault.required_post.txn]]
+transition = "BindDriver"
+target = "device:snd-hda0"
+source = "diagnoser"
+decision = "Allow(Tested)"
+terminal = "Committed"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service@1000:pipewire"
+before_unit_running = "device:snd-hda0"
+count = 0
+
+[[fault]]
+id = "drv-unbound-nic-asks"
+family = "driver-unbound"
+summary = "virtio_net is unbound from net-gym0. Rebinding a NIC has ConnectivityLoss disruption, so the daemon's BindDriver is parked AskFirst; after a TTY approval it runs."
+spec = ["§11 global floors", "§12 step 4"]
+tags = []
+scoring = "repair"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { raw = "unbind_driver", device = "device:net-gym0" }
+after = [
+  { raw = "wait", for = { journal = "Prepared" } },
+  { raw = "wait", for = "30s" },
+  { raw = "approve_pending", actor = "root", via = "tty" },
+]
+window = "5m"
+
+[fault.required_post]
+units = { "device:net-gym0" = "Bound" }
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "BindDriver"
+target = "device:net-gym0"
+source = "diagnoser"
+decision = "Allow(AskFirst)"
+terminal = "Committed"
+not_activated_before = "approval"
+
+[[fault]]
+id = "drv-bind-fails-restores-previous"
+family = "driver-unbound"
+summary = "An admin binds the sound card to vfio-pci; probes fail; the transaction unbinds it, rebinds snd_hda_intel, and makes no attempt at a generation rollback."
+spec = ["§12 DeviceOp gym case"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { transition = "BindDriver", device = "device:snd-hda0", driver = "vfio-pci", source = "user", actor = "user:1001" }
+window = "5m"
+
+[fault.required_post]
+units = { "device:snd-hda0" = "Bound" }
+bound_driver = { "device:snd-hda0" = "snd_hda_intel" }
+generation = "base"
+boot_default = "base"
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "BindDriver"
+target = "device:snd-hda0"
+terminal = "Reverted"
+path = ["Prepared", "Activating", "Checking", "Reverting", "Reverted"]
+
+[[fault.required_post.txn]]
+transition = "Revert"
+count = 0

@@ -1,0 +1,168 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: unattributed-residue (§11, owner decision Q5) — Standard posture
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "residue-kill9-service"
+family = "unattributed-residue"
+summary = "A raw kill -9 of gym-web (Restart=no, not Security-sensitive). Under Standard it is accepted until next boot as an inferred, unattributed override, with a notice and an undo. No restart."
+spec = ["§11 unattributed residue", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "an unattributed stop under Standard is inferred as intended" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", by = "Unattributed", attribution = "Inferred", until = "NextBoot" }]
+reports = ["InferredOverride", "Undo"]
+no_txn_on = ["service:gym-web"]
+
+# P23 (§16): the first raw stop caught as the residue teaches the attributed form.
+[[fault]]
+id = "residue-first-kill-teaches-stop"
+family = "unattributed-residue"
+summary = "A user's first raw kill -9 of gym-web is caught as the unattributed residue; its notice names planarian stop service:gym-web as the attributed way. A later raw stop of gym-db is inferred the same way, without the lesson again."
+spec = ["§16 stopping", "§11 unattributed residue", "P23"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake"]
+intent = { kind = "no-intervention", because = "unattributed stops under Standard are inferred as intended" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+after = [{ raw = "wait", for = "1m" }, { raw = "stop_unit_out_of_band", unit = "service:gym-db", actor = "root" }, { raw = "wait", for = "1m" }]
+window = "3m"
+
+[fault.required_post]
+overrides = [
+  { unit = "service:gym-web", by = "Unattributed", attribution = "Inferred", until = "NextBoot" },
+  { unit = "service:gym-db", by = "Unattributed", attribution = "Inferred", until = "NextBoot" },
+  { unit = "service:gym-app", by = "Unattributed", attribution = "Inferred", until = "NextBoot" },
+]
+reports = ["InferredOverride", "Undo"]
+notices_count = [
+  { match = "Next time, planarian stop service:gym-web does the same", count = 1 },
+  { match = "Next time, planarian stop", count = 1 },
+  { match = "service:gym-db: stopped outside Planarian", count = 1 },
+]
+
+[[fault]]
+id = "residue-kill9-undo"
+family = "unattributed-residue"
+summary = "Continuation: alice uses the offered undo. The inferred override is lifted by an authorized principal and gym-web is started."
+spec = ["§11 unattributed residue"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }, { raw = "wait", for = "30s" }]
+inject = { raw = "cli", argv = ["release", "service:gym-web"], actor = "user:1001" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+overrides = []
+
+[[fault.required_post.txn]]
+transition = "LiftOverride"
+caller = "user:1001"
+
+[[fault]]
+id = "residue-kill9-security"
+family = "unattributed-residue"
+summary = "A raw kill -9 of sshd (Security-sensitive) is a fault under every posture: alarmed, never inferred, and back up: restored by Planarian on its own (§11; catalog-review G16, decided 2026-10-29), or by systemd where its Restart= does it first (NixOS's sshd), which is then alarmed from systemd's restart count."
+spec = ["§11 unattributed residue", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "kill_unit", unit = "service:sshd", signal = "SIGKILL" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+overrides = []
+reports = ["alarm"]
+
+[[fault]]
+id = "residue-oom-kill"
+family = "unattributed-residue"
+summary = "gym-web is driven past MemoryMax and the kernel kills it (Result=oom-kill). OOM kills are always faults: restarted, no inferred override."
+spec = ["§11 unattributed residue", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "oom", unit = "service:gym-web" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+overrides = []
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+
+# §11 (v4.4; G16 decided 2026-10-29). Drafted as residue-stop-firewall; the
+# gym VM runs without the NixOS firewall, so sshd stands in for it.
+[[fault]]
+id = "residue-stop-security-unit"
+family = "unattributed-residue"
+summary = "Root stops sshd (Security-sensitive) with systemctl stop outside Planarian. An unattributed stop of a Security unit is never taken as intended: it is restored on its own and alarmed."
+spec = ["§11 unattributed residue", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "stop_unit_out_of_band", unit = "service:sshd", actor = "root" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+overrides = []
+reports = ["alarm"]
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:sshd"
+decision = "Allow(Runtime)"
+
+# B-11 (Medium).
+[[fault]]
+id = "residue-infer-stops-false"
+family = "unattributed-residue"
+summary = "A raw kill -9 of gym-backup, whose manifest sets inferStops = false, under Standard: never taken as intended; alarmed and started again, as a fault."
+spec = ["§11 unattributed residue", "B-11"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "kill_unit", unit = "service:gym-backup", signal = "SIGKILL" }
+window = "3m"
+
+[fault.required_post]
+units = { "service:gym-backup" = "Running" }
+overrides = []
+reports = ["alarm"]
+
+[[fault]]
+id = "residue-inferred-listed-until-ack"
+family = "unattributed-residue"
+summary = "An inferred override (gym-web killed under Standard) is listed until a user acknowledges it with `planarian ack`; acknowledging stops the listing and does not lift the override."
+spec = ["§11 unattributed residue", "B-11"]
+tags = ["acceptance", "bypass"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "an unattributed stop under Standard is inferred as intended" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGKILL" }
+after = [{ raw = "wait", for = "1m" }, { raw = "cli", argv = ["ack"], actor = "user:1000" }]
+window = "3m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", by = "Unattributed", attribution = "Inferred", until = "NextBoot" }]
+inferred_listed = []
+reports = ["InferredOverride"]
+no_txn_on = ["service:gym-web"]

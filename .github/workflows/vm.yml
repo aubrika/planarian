@@ -2,8 +2,9 @@
 # gym's fault catalog on real VMs (one NixOS test per entry). Linux runners
 # have KVM once /dev/kvm is opened to the runner user.
 #
-# A push runs the VM checks, the GA demonstration and the gym smoke entries
-# (a newer push cancels them); the whole catalog is one job per VM entry (94
+# A push to main runs the VM checks, the GA demonstration and the gym smoke
+# entries; a pull request runs the gym smoke entries only. A newer push
+# cancels either. The whole catalog is one job per VM entry (94
 # at v4.6, several hundred runner minutes), so it runs only by hand (Actions →
 # VM tests → Run workflow → catalog).
 name: VM tests
@@ -12,6 +13,8 @@ on:
   push:
     branches: [main]
     paths-ignore: ["docs/**", "**.md"]
+  pull_request:
+    paths-ignore: ["docs/**"]
   workflow_dispatch:
     inputs:
       catalog:
@@ -25,10 +28,45 @@ on:
 
 concurrency:
   group: vm-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
+  # Build the gym's test build of Planarian once and hand it to every gym VM
+  # job as a binary cache, instead of each job compiling it again (about 3
+  # of its 4 build minutes; #8). The release package is left to the vm and
+  # firecracker jobs (push and dispatch only): its checkPhase builds and runs
+  # the test suite, which held this job, and so every gym job, 12.7 min. The
+  # signing key is made here for this run and never leaves this job; its
+  # public half is the job's output, which each VM job trusts for this run's
+  # cache only.
+  prebuild:
+    runs-on: ubuntu-24.04
+    outputs:
+      key: ${{ steps.cache.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: trusted-users = root runner
+      - id: cache
+        run: |
+          attrs=".#legacyPackages.x86_64-linux.gym-hooks"
+          nix build -L --no-link $attrs
+          paths=$(nix path-info $attrs)
+          sk="$RUNNER_TEMP/ci.sk"
+          nix key generate-secret --key-name "planarian-ci-${{ github.run_id }}" > "$sk"
+          nix store sign --key-file "$sk" $paths
+          echo "key=$(nix key convert-secret-to-public < "$sk")" >> "$GITHUB_OUTPUT"
+          rm -f "$sk"
+          nix copy --to "file:///tmp/nix-ci-cache?compression=zstd" $paths
+          du -sh /tmp/nix-ci-cache
+      - uses: actions/cache/save@v4
+        with:
+          path: /tmp/nix-ci-cache
+          key: nix-ci-${{ github.run_id }}
+
   vm:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -46,6 +84,8 @@ jobs:
       - run: nix build -L .#checks.x86_64-linux.${{ matrix.check }}
 
   ga-demo:
+    needs: prebuild
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -57,9 +97,17 @@ jobs:
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      # Planarian from the prebuild job's signed cache (a miss builds it).
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/nix-ci-cache
+          key: nix-ci-${{ github.run_id }}
       - uses: cachix/install-nix-action@v31
         with:
-          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
+            extra-substituters = file:///tmp/nix-ci-cache
+            extra-trusted-public-keys = ${{ needs.prebuild.outputs.key }}
       - run: nix build -L .#legacyPackages.x86_64-linux.gym-vm.${{ matrix.id }} -o verdict
       - name: Verdict
         run: |
@@ -70,6 +118,7 @@ jobs:
   # timed into a change (the pause handshake, a PATH-dependent fault), a
   # user session with a device and its root cause, and a real /boot.
   gym-smoke:
+    needs: prebuild
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -87,9 +136,17 @@ jobs:
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      # Planarian from the prebuild job's signed cache (a miss builds it).
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/nix-ci-cache
+          key: nix-ci-${{ github.run_id }}
       - uses: cachix/install-nix-action@v31
         with:
-          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
+            extra-substituters = file:///tmp/nix-ci-cache
+            extra-trusted-public-keys = ${{ needs.prebuild.outputs.key }}
       - run: nix build -L .#legacyPackages.x86_64-linux.gym-vm.${{ matrix.id }} -o verdict
       - name: Verdict
         run: |
@@ -99,6 +156,7 @@ jobs:
   # The Firecracker microVM target (SPEC §4, Phase A): non-gating, allowed to
   # stay red. Boots Planarian under Firecracker and checks one repair.
   firecracker:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
@@ -122,10 +180,10 @@ jobs:
         env:
           ONLY: ${{ inputs.ids }}
         run: |
-          python3 -c 'import json, os, tomllib; d = tomllib.load(open("crates/gym/catalog/phase-a.toml", "rb")); only = os.environ["ONLY"].split(); print("ids=" + json.dumps([e["id"] for e in d["fault"] if "vm" in e.get("harness", []) and (not only or e["id"] in only)]))' >> "$GITHUB_OUTPUT"
+          python3 -c 'import json, os, tomllib; c = "crates/gym/catalog/phase-a"; d = tomllib.loads("\n".join(open(os.path.join(c, f)).read() for f in sorted(os.listdir(c)) if f.endswith(".toml"))); only = os.environ["ONLY"].split(); print("ids=" + json.dumps([e["id"] for e in d["fault"] if "vm" in e.get("harness", []) and (not only or e["id"] in only)]))' >> "$GITHUB_OUTPUT"
 
   catalog:
-    needs: catalog-ids
+    needs: [catalog-ids, prebuild]
     runs-on: ubuntu-24.04
     # An entry's window is at most an hour; a VM that never wakes from
     # suspend must not hold a runner for six.
@@ -141,15 +199,23 @@ jobs:
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      # Planarian from the prebuild job's signed cache (a miss builds it).
+      - uses: actions/cache/restore@v4
+        with:
+          path: /tmp/nix-ci-cache
+          key: nix-ci-${{ github.run_id }}
       - uses: cachix/install-nix-action@v31
         with:
-          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
+            extra-substituters = file:///tmp/nix-ci-cache
+            extra-trusted-public-keys = ${{ needs.prebuild.outputs.key }}
       - run: nix build -L .#legacyPackages.x86_64-linux.gym-vm.${{ matrix.id }} -o verdict
       - name: Verdict
         run: |
           cat verdict/verdict.json
           # R12: the §15 harness contract (waivers are docs/deviations.md rows).
-          python3 nix/gym/harness-contract.py vm crates/gym/catalog/phase-a.toml docs/deviations.md verdict/verdict.json
+          python3 nix/gym/harness-contract.py vm crates/gym/catalog/phase-a docs/deviations.md verdict/verdict.json
           jq -r '"\(.id): \(.result)"' verdict/verdict.json >> "$GITHUB_STEP_SUMMARY"
       # Best effort: the verdict is in the log above too, and a private
       # repository's artifact storage is small (the evidence is not uploaded).

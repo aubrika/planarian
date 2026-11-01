@@ -1,0 +1,74 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: external-config-edit-during-build
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "stale-owner-edit-during-build"
+family = "external-config-edit-during-build"
+summary = "During the build, the owner edits a tracked file without committing it. The transaction is Rejected(Stale), never activated, and its GC root is released."
+spec = ["§9 step 6", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "edit_owner_source", path = "configuration.nix", tracked = true, when = { journal = "Staged" } }
+window = "15m"
+
+[fault.required_post]
+generation = "base"
+override_source = "base"
+gc_root_released = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+change = "font-scale"
+terminal = "Rejected(Stale)"
+never = ["Activating"]
+
+[[fault]]
+id = "stale-untracked-file-ignored"
+family = "external-config-edit-during-build"
+summary = "During the build, the owner adds an untracked file to the flake. Untracked files are not visible to Nix: no Stale, and the file is reported."
+spec = ["§9 step 1"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "edit_owner_source", path = "scratch.nix", tracked = false, when = { journal = "Staged" } }
+window = "15m"
+
+[fault.required_post]
+generation = "candidate"
+reports = ["UntrackedExcluded"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+never = ["Rejected(Stale)"]
+
+[[fault]]
+id = "gc-during-approval"
+family = "external-config-edit-during-build"
+summary = "Garbage collection runs while an AskFirst change waits for approval. The candidate survives (its build root is protected), and after approval verify_candidate passes."
+spec = ["§9 step 5", "I3"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "wait", for = { journal = "Prepared" } },
+]
+inject = { transition = "CollectGarbage", emergency = false, source = "user", actor = "user:1001" }
+after = [{ raw = "approve_pending", actor = "root", via = "tty" }]
+window = "20m"
+
+[fault.required_post]
+generation = "candidate"
+gc_protected = ["candidate", "known_good", "base"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"

@@ -1,0 +1,46 @@
+# Family: authorization (catalog entries; format in 00-format.toml)
+
+[[fault]]
+id = "authz-nonadmin-stops-network-other-session"
+family = "authorization"
+summary = "bob, at the seat, stops the gym network interface (made user-controllable for this case, G11) while alice has a session open. The derived facts say it reaches another uid's session; it asks, and alice's session is notified."
+spec = ["§11 floors", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "set_setting", key = "userControllable", value = ["device:net-gym0"] },
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "session_login", uid = 1002, session = "s2", seat = "seat0" },
+]
+inject = { raw = "cli", argv = ["stop", "device:net-gym0"], actor = "user:1002@s2" }
+window = "2m"
+
+[fault.required_post]
+notified_sessions = ["s1"]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+decision = "Allow(AskFirst)"
+facts = { other_sessions_affected = true }
+terminal = "pending"
+
+# Review finding 2 (2026-10-29): a catalog change stages the owner's tree as
+# it is now, which can hold edits the running generation does not have.
+[[fault]]
+id = "catalog-change-carries-unbuilt-owner-edit"
+family = "authorization"
+summary = "An administrator has edited the owner's configuration to enable a service but not rebuilt. alice then asks for a user-controllable change (font scale). The candidate would also bring the new service, which the override does not explain, so the change is Security-sensitive: it waits for approval instead of activating on its own."
+spec = ["§9 derived facts", "I14", "§11"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "edit_owner_source", path = "configuration.nix", enables = "gym-bad-payload", actor = "user:1001" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "10m"
+
+[fault.required_post]
+generation = "base"
+reports = ["NeedsApproval"]

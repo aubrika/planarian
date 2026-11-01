@@ -1,0 +1,119 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: probe-timeout-service-healthy
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "probe-delayed-healthy"
+family = "probe-timeout-service-healthy"
+summary = "gym-web's /health answers after 15 s, past the 10 s timeout, while the service is fine. The status is Unknown, never Failed. After three Unknowns a diagnostic incident re-observes through the Tcp probe and does not restart."
+spec = ["§10 evidence", "§8 status derivation"]
+tags = []
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "probe timed out; service is healthy" }
+inject = { raw = "set_knob", unit = "service:gym-web", knob = "health_delay", value = "15s" }
+window = "10m"
+
+[fault.required_post]
+no_txn_on = ["service:gym-web"]
+status_never = { "service:gym-web" = ["Failed"] }
+status_seen = { "service:gym-web" = ["Unknown"] }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+kind = "diagnostic"
+first_candidate = "reobserve:gym-web-tcp"
+
+# R06 (§10 probe contract): a probe's timeout bounds the whole probe, and a
+# straggler never holds the batch.
+[[fault]]
+id = "probe-trickling-endpoint"
+family = "probe-timeout-service-healthy"
+summary = "gym-web's /health sends one byte every 2 s and never finishes, so a per-read timeout would never fire. Its 10 s timeout bounds the whole probe: Timeout, Unknown, never Failed, and gym-web is not restarted. Meanwhile the loop keeps ticking: gym-cache crashes and is repaired."
+spec = ["§10 probe contract", "R06"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+inject = { raw = "set_knob", unit = "service:gym-web", knob = "health_trickle", value = "2s" }
+after = [{ raw = "wait", for = "45s" }, { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGSEGV" }, { raw = "wait", for = "2m" }]
+window = "4m"
+
+[fault.required_post]
+no_txn_on = ["service:gym-web"]
+status_never = { "service:gym-web" = ["Failed"] }
+status_seen = { "service:gym-web" = ["Unknown"] }
+units = { "service:gym-cache" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-cache"
+terminal = "Committed"
+
+[[fault]]
+id = "probe-diagnostic-stale-healthy"
+family = "probe-timeout-service-healthy"
+summary = "The evidence of the audio tone probe (Diagnostic, OnDemand) expires on a healthy machine. Status stays Running and no incident opens."
+spec = ["§10 evidence", "I4", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "only Diagnostic evidence is stale" }
+setup = [
+  { raw = "greeter_login", uid = 1000 },
+  { raw = "cli", argv = ["diagnose", "service@1000:pipewire", "--probe", "tone-playback"], actor = "user:1000" },
+]
+inject = { raw = "wait", for = "stale_after+1m" }
+window = "5m"
+
+[fault.required_post]
+units = { "service@1000:pipewire" = "Running" }
+no_autonomous_txn = true
+no_incident_on = ["service@1000:pipewire"]
+
+[[fault]]
+id = "probe-failed-beats-stale"
+family = "probe-timeout-service-healthy"
+summary = "gym-web's Http probe is made stale, then the process is killed: status is Failed, not Unknown. gym-app's probe is stale at the same time and its status is Unknown."
+spec = ["§8 status derivation", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "set_knob", unit = "service:gym-web", knob = "health_delay", value = "60s" },
+  { raw = "set_knob", unit = "service:gym-app", knob = "probe_delay", value = "60s" },
+  { raw = "wait", for = "stale_after" },
+]
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }
+window = "2m"
+
+[fault.required_post]
+status_seen = { "service:gym-web" = ["Failed"], "service:gym-app" = ["Unknown"] }
+status_never = { "service:gym-app" = ["Failed"] }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+kind = "repair"
+
+[[fault]]
+id = "probe-http-503-degraded"
+family = "probe-timeout-service-healthy"
+summary = "gym-web is active, but /health returns 503: the status is Degraded, an incident opens, and a restart clears the runtime fault."
+spec = ["§10 probe contract gym case"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "set_knob", unit = "service:gym-web", knob = "health", value = 503 }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+status_seen = { "service:gym-web" = ["Degraded"] }
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+terminal = "Committed"

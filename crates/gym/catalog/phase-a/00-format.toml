@@ -1,0 +1,200 @@
+# Planarian — Phase A fault catalog
+#
+# First deliverable per SPEC §18.0; the owner signed off the defaults on
+# 2026-10-26. Spec revision: v4.6. Review notes, coverage and counts:
+# docs/catalog-review.md.
+#
+# LAYOUT. The catalog is this directory: this file (the format notes, the
+# global keys and the fixtures) and one file per `family`, named after it.
+# Every reader takes the *.toml files in filename order, concatenated (one
+# TOML document); ids are unique across files (`planarian-gym` checks). A
+# new entry goes in its family's file; a new family is a new file.
+#
+# ───────────────────────────────────────────────────────────────────────────
+# FORMAT
+# ───────────────────────────────────────────────────────────────────────────
+#
+# Each [[fault]] is SPEC §15's
+#   Fault { id, family, inject: Transition | RawAction, required_post: Expectation,
+#           intent: Option<Intent>, tags }
+# with these additions (all proposed, see docs/catalog-review.md §2):
+#
+#   summary      one line, plain words
+#   spec         sections the case comes from
+#   scoring      "repair"    counts toward the GA ≥ 60% deterministic-clear rate
+#                "must-pass" executor / kernel / policy behaviour; any failure fails GA
+#                "intent"    correct behaviour is no autonomous intervention
+#   harness      where it runs: "fake" (in-memory fake backends, the txn-kernel
+#                harness), "vm" (NixOS 26.05 VM test), or both
+#   setup        ordered steps before the fault (same vocabulary as inject)
+#   inject       the fault: { transition = ... } or { raw = ... }
+#   after        ordered steps after the fault (restart the daemon, approve, ...)
+#   window       how long the scorer observes after inject before judging
+#   layouts      journal filesystem layouts to repeat the case on (§12c)
+#
+# intent is always present so the field is explicit:
+#   intent = { kind = "none" }                         Option::None — repair expected
+#   intent = { kind = "no-intervention", because = "..." }
+#
+# required_post holds the Expectation fields (units, generation, may_change,
+# others_unchanged, settle) plus extension assertions:
+#   boot_default, override_source, known_good, live_tested   generation-level state
+#   journal_agrees      running generation, boot default, override source and the
+#                       journal's terminal state all describe the same outcome
+#   overrides        overrides that must hold at the end
+#   no_txn_on           no transaction (any source) targets these units
+#   no_autonomous_txn   no transaction from a non-user source after setup
+#   no_incident_on      no incident opened for these units
+#   interlock           "set" | "clear" at the end of the window
+#   reports             console/report items that must be emitted
+#   invariants          invariants this case specifically exercises (see GLOBAL)
+#   metrics             numeric bounds (restarts per unit, attempts, ...)
+#   [[...txn]]          a transaction that must (count >= 1) or must not
+#                       (count = 0) appear; fields match on transition, target,
+#                       change, source, actor, decision, terminal, path (an
+#                       ordered subsequence of journal states), owner
+#   [[...incident]]     an incident that must exist, with target, state, root_of
+#
+# Symbolic generations (real ids are assigned at run time):
+#   base        generation current when the case's transaction was Prepared
+#   candidate   generation built by the case's transaction
+#   known_good  boot-confirmed generation at setup
+#
+# ───────────────────────────────────────────────────────────────────────────
+# GLOBAL CHECKS (applied to every entry by the scorer; not repeated per entry)
+# ───────────────────────────────────────────────────────────────────────────
+#
+#   * Gamed success fails the run (§15): any transaction that changes a probe
+#     definition; StopUnit on an incident target; a Override whose `by` is not
+#     a User; a Diagnostic probe result that changed a UnitStatus.
+#   * I5, I6, I7, I12, I13, I14, I15 are monitored for the whole window.
+#   * RecoveryFailed count must be 0 unless the entry asserts interlock = "set".
+#   * Every executed transition has a complete I7 log record.
+#   * The model stub is never invoked (§18.6).
+#
+# ───────────────────────────────────────────────────────────────────────────
+# UNIT NAMES
+# ───────────────────────────────────────────────────────────────────────────
+#
+#   "<kind>:<name>"         system scope       e.g. service:sshd, device:fs-root
+#   "<kind>@<uid>:<name>"   user scope         e.g. service@1000:pipewire
+#   External dependencies are services named external:<name> (§10):
+#   service:external:gym-upstream.
+#
+# Actors: daemon, watchdog, user:1000 (alice, unprivileged), user:1001 (admin,
+# in planarian-admin), user:1002 (bob, unprivileged), root.
+#
+# Catalog entries referenced: the shipped §9 entries (service-enable, font-scale,
+# keyboard-layout, wifi-select, listen-address, repair:reenable-predicted) plus
+# gym-only entries prefixed gym: (gym:kernel-param). manifest-probe-edit is
+# deliberately NOT a catalog entry.
+#
+# ───────────────────────────────────────────────────────────────────────────
+# RAW ACTIONS (inject/setup/after vocabulary when not a Transition)
+# ───────────────────────────────────────────────────────────────────────────
+#
+#   kill_unit {unit, signal}                 kill the unit's main process
+#   stop_unit_out_of_band {unit, actor}      `systemctl stop` outside Planarian
+#   corrupt_state {unit, path}               break a unit's mutable state file
+#   set_knob {unit, knob, value}             fixture runtime toggle (cleared on restart)
+#   set_persistent_knob {unit, knob, value}  fixture toggle stored on disk (survives restart)
+#   unbind_driver {device}                   sysfs unbind
+#   hotunplug {device}                       QMP device_del
+#   block_network {dst, port?} / unblock_network {dst}
+#   stop_host_service {name} / start_host_service {name}
+#   kill_process {process, signal, when?}    process: planariad | planarian-recovery | worker
+#   hold_down {process}                      keep a process from restarting
+#   release {process}                        undo hold_down and start it
+#   restart_process {process}
+#   slow_backend {call, delay}               delay a backend call (vm: activation hook)
+#   withhold_reply {call}                    backend accepts the job, reply never arrives
+#   backend_result {call, result}            fake only: force a backend return value
+#   edit_owner_source {path, tracked, when?}
+#   out_of_band_rebuild {edit}               owner runs nixos-rebuild switch themselves
+#   fill_fs {fs, as_uid, until}              until: below-threshold | reserved-boundary | full
+#   set_setting {key, value}                 Planarian user settings (budgets, max_tier)
+#   force_compaction
+#   interrupt_write {target}                 record | checkpoint (fake: torn tail)
+#   suspend {duration}
+#   greeter_login {uid}                      authenticate through the greeter
+#   logout {uid}
+#   reboot
+#   advance_clock {by}                       fake only
+#   cli {argv, actor}                        `planarian ...` over the daemon socket
+#   ask {phrase, actor}
+#   approve_pending {actor, via}             via: tty (Phase A approval path)
+#   wait {for}                               duration, or { journal = "<state>" }
+#
+# `when` on an action: { journal = "<TxnState>" } fires the instant that state
+# is durably journaled; { op_called = "<call>" } fires after that backend call
+# was made and before its outcome is journaled (the activation is running);
+# { op_begun = "<call>" } fires after that call's OpBegin is journaled and
+# before the call is made;
+# { after = "<duration>" } fires relative to the previous step.
+#
+# ───────────────────────────────────────────────────────────────────────────
+# FIXTURES — gym units added to the reference VM (nix/tests/)
+# ───────────────────────────────────────────────────────────────────────────
+
+schema_version = 1
+spec = "v4.4"
+
+[[fixture]]
+unit = "service:gym-web"
+purpose = "HTTP service on 127.0.0.1:8080; Readiness probes: Http /health (Measurement) and Tcp. Knobs: health=503, health_delay, refuse. Restart=no. Listen address settable via the listen-address catalog entry (permitted: 127.0.0.1, 192.0.2.10, where 192.0.2.10 is assigned to no interface)."
+
+[[fixture]]
+unit = "service:gym-db"
+purpose = "Functional prerequisite of gym-app (Requires=)."
+
+[[fixture]]
+unit = "service:gym-app"
+purpose = "Requires=gym-db; After=gym-cache (ordering only); Wants=gym-metrics (weak). Readiness Tcp probe."
+
+[[fixture]]
+unit = "service:gym-cache"
+purpose = "Ordering-only predecessor of gym-app."
+
+[[fixture]]
+unit = "service:gym-metrics"
+purpose = "Optional unit wanted by gym-app."
+
+[[fixture]]
+unit = "service:gym-flap"
+purpose = "Exits non-zero a configurable time after start (knob fail_after; default 30s). Restart=no."
+
+[[fixture]]
+unit = "service:gym-restartful"
+purpose = "Restart=on-failure, RestartSec=5s, StartLimitBurst=3; for defer-to-systemd."
+
+[[fixture]]
+unit = "service:gym-upstream-client"
+purpose = "Readiness Http probe to http://10.0.2.2:9000/health via the gateway; Requires edge (manifest) to service:external:gym-upstream."
+
+[[fixture]]
+unit = "service:external:gym-upstream"
+purpose = "External dependency served by the VM host at 10.0.2.2:9000."
+
+[[fixture]]
+unit = "service:gym-usb-reader"
+purpose = "Desired Running when DeviceConnected(device:gym-usb0); BindsTo the device."
+
+[[fixture]]
+unit = "device:snd-hda0"
+purpose = "QEMU intel-hda + hda-duplex; snd_hda_intel; pipewire's Requires target (manifest)."
+
+[[fixture]]
+unit = "device:net-gym0"
+purpose = "Second virtio-net NIC dedicated to the gym; restart_disruption ConnectivityLoss."
+
+[[fixture]]
+unit = "device:gpu0"
+purpose = "virtio-gpu; the desktop's Requires target; restart_disruption SessionLoss."
+
+[[fixture]]
+unit = "device:wlan-hwsim"
+purpose = "mac80211_hwsim radios with two hostapd APs (gym-ap-a, gym-ap-b) for Wi-Fi selection."
+
+[[fixture]]
+unit = "device:gym-usb0"
+purpose = "QEMU usb-storage device that the gym can hot-unplug."

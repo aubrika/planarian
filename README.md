@@ -16,7 +16,7 @@ is killed mid-change, a separate watchdog finishes or reverts the change.
 
 - Specification: [`docs/SPEC.md`](docs/SPEC.md) (v4.6)
 - What differs from the spec, and why: [`docs/deviations.md`](docs/deviations.md)
-- Fault catalog: [`crates/gym/catalog/phase-a.toml`](crates/gym/catalog/phase-a.toml)
+- Fault catalog: [`crates/gym/catalog/phase-a/`](crates/gym/catalog/phase-a) (one file per family; format in `00-format.toml`)
 
 **Status: under construction.** This is experimental software that restarts
 services and rebuilds and activates your NixOS configuration on its own. Try

@@ -15,7 +15,7 @@ pub const HISTORY: &str = "docs/spec-history.md";
 pub const RATIO: &str = "docs/verification-ratio.toml";
 pub const ASSUMPTIONS: &str = "docs/assumptions.md";
 pub const BYPASSES: &str = "docs/bypasses.md";
-pub const CATALOG: &str = "crates/gym/catalog/phase-a.toml";
+pub const CATALOG: &str = crate::catalog::DIR;
 /// The crates Verus checks: a function there is a verified fn.
 const VERIFIED: &[&str] = &["policy", "schema", "txn"];
 
@@ -70,7 +70,7 @@ impl Sources {
             ratio: read(RATIO)?,
             assumptions: read(ASSUMPTIONS)?,
             bypasses: read(BYPASSES)?,
-            catalog: read(CATALOG)?,
+            catalog: crate::catalog::read_text(&root.join(CATALOG))?,
             results: match results {
                 Some(p) => Some(std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?),
                 None => None,

@@ -1,0 +1,71 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: revert-fails  (RecoveryFailed path)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "revert-fails"
+family = "revert-fails"
+summary = "Bad candidate, while an environmental fault (sshd's port blocked) makes the revert probes fail too. Result: RecoveryFailed, an alert, and the interlock, which blocks autonomous repair of a later unrelated fault until an admin resolves it."
+spec = ["§12 step 7", "§12c interlock"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "block_network", dst = "127.0.0.1", port = 22, when = { journal = "Activating" } },
+  { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" },
+]
+inject = { raw = "wait", for = { journal = "RecoveryFailed" } }
+after = [
+  { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGSEGV" },
+  { raw = "wait", for = "3m" },
+  { raw = "unblock_network", dst = "127.0.0.1" },
+  { raw = "cli", argv = ["resolve", "<txn>", "--manual-repaired"], actor = "user:1001" },
+]
+window = "15m"
+
+[fault.required_post]
+units = { "service:gym-cache" = "Running" }
+interlock = "clear"
+reports = ["RecoveryFailed", "alert"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "RecoveryFailed"
+
+# No autonomous repair of gym-cache while the interlock held.
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-cache"
+source = "diagnoser"
+while_interlock = "set"
+count = 0
+
+[[fault]]
+id = "revert-fails-interlock-survives-compaction"
+family = "revert-fails"
+summary = "A failed revert, then forced compaction, then both processes restart. Autonomous mutation stays blocked until the resolution is durably recorded."
+spec = ["§12c checkpoint"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "backend_result", call = "activate_live", generation = "revert_to", result = "Failed" },
+  { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" },
+  { raw = "wait", for = { journal = "RecoveryFailed" } },
+]
+inject = { raw = "force_compaction" }
+after = [
+  { raw = "restart_process", process = "planariad" },
+  { raw = "restart_process", process = "planarian-recovery" },
+  { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGSEGV" },
+  { raw = "wait", for = "3m" },
+]
+window = "10m"
+
+[fault.required_post]
+interlock = "set"
+units = { "service:gym-cache" = "Failed" }
+no_autonomous_txn = true
+replay_equivalent = true

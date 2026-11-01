@@ -1,0 +1,378 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: daemon-killed  (Activating, Checking, Reverting per §15; plus
+# Published, Promoted per the v4-review acceptance list)
+#
+# Unless stated, the daemon is held down after the kill so the watchdog owns
+# recovery. "good" candidate = font-scale 1.25; "bad" = listen-address 192.0.2.10.
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "crash-activating-bad"
+family = "daemon-killed"
+summary = "planariad is killed during Activating of a bad candidate; the watchdog takes the lease, fences, confirms quiescence, and reverts."
+spec = ["§12 crash-recovery table", "§4 GA(1)"]
+tags = ["ga-demo", "acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+generation = "base"
+boot_default = "base"
+override_source = "base"
+journal_agrees = true
+invariants = ["I6", "I12", "I15"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Reverted"
+owner = "watchdog"
+lease_epoch_min = 2
+
+[[fault]]
+id = "crash-activating-good"
+family = "daemon-killed"
+summary = "planariad is killed during Activating of a good candidate. The watchdog sees the candidate active, goes to Checking, the probes pass, and it runs the entire commit path."
+spec = ["§12 watchdog"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "activate_live" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+override_source = "candidate"
+journal_agrees = true
+invariants = ["I6", "I12", "I15"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+owner = "watchdog"
+path = ["Activating", "Checking", "Published", "Promoted", "Committed"]
+
+[[fault]]
+id = "crash-checking"
+family = "daemon-killed"
+summary = "planariad is killed during Checking; the watchdog re-runs the probes itself before committing."
+spec = ["§12 crash-recovery table"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Checking" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+override_source = "candidate"
+journal_agrees = true
+watchdog_probed_before_commit = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+owner = "watchdog"
+
+[[fault]]
+id = "crash-published"
+family = "daemon-killed"
+summary = "The daemon stays down after Published; the watchdog promotes the override by hash comparison and commits."
+spec = ["§12 step 8", "§9 step 4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Published" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+override_source = "candidate"
+journal_agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+owner = "watchdog"
+path = ["Published", "Promoted", "Committed"]
+
+[[fault]]
+id = "crash-promoted"
+family = "daemon-killed"
+summary = "The daemon stays down after Promoted; the watchdog writes Committed."
+spec = ["§12 crash-recovery table"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Promoted" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+override_source = "candidate"
+journal_agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+owner = "watchdog"
+
+[[fault]]
+id = "crash-reverting"
+family = "daemon-killed"
+summary = "planariad is killed during Reverting of a bad candidate; the watchdog re-runs the idempotent revert steps."
+spec = ["§12 crash-recovery table"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Reverting" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+generation = "base"
+boot_default = "base"
+override_source = "base"
+journal_agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Reverted"
+owner = "watchdog"
+
+[[fault]]
+id = "crash-daemon-restart-reconciles"
+family = "daemon-killed"
+summary = "GA demo tail: after the watchdog has reverted (crash-activating-bad), planariad restarts and writes a reconciliation record whose account of what happened matches the journal."
+spec = ["§12 daemon restart reconciliation", "§4 GA(1)"]
+tags = ["ga-demo"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+after = [
+  { raw = "hold_down", process = "planariad" },
+  { raw = "wait", for = { journal = "Reverted" } },
+  { raw = "release", process = "planariad" },
+]
+window = "20m"
+
+[fault.required_post]
+generation = "base"
+journal_agrees = true
+# Killed right after Activating was journaled and before the activation ran:
+# the candidate never became active, and the record must say so.
+reconciliation = { found = "Reverted", owner = "watchdog", daemon_action = "none", explains = ["killed-during-Activating", "watchdog-reverted", "why:candidate not active"] }
+
+[[fault]]
+id = "crash-slow-worker-overlap"
+family = "daemon-killed"
+summary = "The daemon is killed and immediately restarted while a deliberately slow activation worker survives. The new owner fences it, so activation and revert never overlap and the old owner can never commit."
+spec = ["§12 ownership and fencing", "I6", "I15", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "slow_backend", call = "activate_live", delay = "120s" },
+  { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" },
+]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+after = [{ raw = "restart_process", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+generation = "base"
+journal_agrees = true
+invariants = ["I6", "I15"]
+no_overlap = ["activate_live(candidate)", "activate_live(revert_to)"]
+stale_owner_commit = false
+
+[[fault]]
+id = "crash-withheld-job-reply"
+family = "daemon-killed"
+summary = "The backend accepts an activation job but its reply is withheld, and the owner is killed before the job id is journaled. Recovery must discover the job by its OpId, or fence it, before making any conflicting mutation."
+spec = ["§12 OpId"]
+tags = []
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "withhold_reply", call = "activate_live" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "activate_live" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "10m"
+
+[fault.required_post]
+journal_agrees = true
+invariants = ["I6", "I15"]
+quiescence_includes_tagged_jobs = true
+no_overlap = ["activate_live(candidate)", "activate_live(revert_to)"]
+
+[[fault]]
+id = "crash-job-outlives-drain"
+family = "daemon-killed"
+summary = "An old backend job outlives the 60 s drain. The takeover ends in RecoveryFailed with the interlock set, and no overlapping mutation happens."
+spec = ["§12 confirmed quiescence"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  # Longer than the window: the job still holds on when the run is judged
+  # (its activation, at the end of the delay, would come after).
+  { raw = "slow_backend", call = "activate_live", delay = "1800s", uncancellable = true },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "activate_live" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+# Held down for min(window/2, 300 s) while the watchdog recovers alone; it
+# finished at about 150 s in VM run 110 (last action 154 s), so 8m leaves
+# 240 s for that phase (#8 window review).
+window = "8m"
+
+[fault.required_post]
+interlock = "set"
+reports = ["RecoveryFailed", "alert"]
+no_overlap = ["activate_live(candidate)", "activate_live(revert_to)"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "RecoveryFailed"
+
+[[fault]]
+id = "crash-jobs-tagged-unknown"
+family = "daemon-killed"
+summary = "jobs_tagged returns None for an unacknowledged OpId (the backend cannot say). Recovery writes RecoveryFailed instead of proceeding."
+spec = ["§12 OpId"]
+tags = []
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "backend_result", call = "jobs_tagged", result = "None" },
+  { raw = "withhold_reply", call = "activate_live" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "activate_live" } }
+window = "5m"
+
+[fault.required_post]
+interlock = "set"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "RecoveryFailed"
+
+[[fault]]
+id = "crash-simultaneous-takeover"
+family = "daemon-killed"
+summary = "The daemon and the watchdog try to take over at the same moment; exactly one wins the flock and the other backs off."
+spec = ["§12 lease transfer"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Checking" } }
+after = [{ raw = "restart_process", process = "planariad", aligned_with = "watchdog-tick" }]
+# The takeover settles within seconds (VM run 110: committed at +2 s); 5m
+# still spans many watchdog periods and lease renewals (#8 window review).
+window = "5m"
+
+[fault.required_post]
+journal_agrees = true
+invariants = ["I15"]
+lease_epochs_strictly_increasing = true
+owners_per_epoch_max = 1
+
+[[fault]]
+id = "crash-runtime-rollback"
+family = "daemon-killed"
+summary = "Killed during Checking of a Runtime-tier Rollback; it recovers as a generation operation (serialized, owned, publish_boot, override restored) and completes. (Killed before the activation took effect, the crash table reverts instead, which is also correct.)"
+spec = ["§12 execution table: Rollback", "§12 gym cases"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+  { raw = "wait", for = { journal = "Committed" } },
+  { transition = "Rollback", source = "user", actor = "user:1001" },
+]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Checking" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "20m"
+
+[fault.required_post]
+generation = "known_good"
+boot_default = "known_good"
+override_source = "known_good"
+journal_agrees = true
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+decision = "Allow(Runtime)"
+recovery = "RevertGeneration"
+terminal = "Committed"
+owner = "watchdog"
+
+[[fault]]
+id = "crash-stop-and-suppress"
+family = "daemon-killed"
+summary = "Killed during a user's StopAndSuppress. It recovers as a unit operation: the override (journaled before the stop) holds, the unit is not restarted, and no generation rollback is attempted."
+spec = ["§12 execution table", "§14 stopping"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "ask", phrase = "stop gym-web until I say", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Activating" } }
+after = [{ raw = "hold_down", process = "planariad" }]
+window = "10m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+recovery = "ReobserveOnly"
+terminal = "Committed"
+
+[[fault.required_post.txn]]
+transition = "Revert"
+count = 0
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+count = 0

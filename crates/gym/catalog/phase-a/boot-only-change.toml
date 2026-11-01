@@ -1,0 +1,187 @@
+# Family: boot-only-change (catalog entries; format in 00-format.toml)
+
+# S03 (§12f, I12): AwaitingBoot is unbounded, reported as waiting, and
+# its notice repeats daily.
+[[fault]]
+id = "awaiting-boot-reminds-daily"
+family = "boot-only-change"
+summary = "A kernel parameter change takes the boot-only path and nobody restarts for two and a half days. It stays AwaitingBoot (no limit applies, nothing is cancelled), the 'restart to finish' notice is repeated once a day, and at the eventual restart it is confirmed and commits."
+spec = ["§12f", "I12", "S03"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = "60h" }, { raw = "reboot" }]
+window = "61h"
+
+[fault.required_post]
+generation = "candidate"
+reports = ["RestartToFinish"]
+notices_count = { match = "is still waiting for a restart", count = 2 }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["AwaitingBoot", "Promoted", "Committed"]
+terminal = "Committed"
+
+# R01 (§12 step 7, crash table): Publishing precedes the first boot mutation.
+[[fault]]
+id = "crash-publishing-before-publish"
+family = "boot-only-change"
+summary = "planariad is killed after journaling OpBegin(publish_boot_once) for a boot-only kernel change, before the call. On restart the Publishing row asks the boot loader: nothing is armed, so the change is Rejected(Interrupted) and not prepared again. After a reboot the machine runs the publishing generation, and boot selection, roots, overrides and the journal agree."
+spec = ["§12 step 7", "§12 crash table", "R01"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_begun = "publish_boot_once" } }
+after = [{ raw = "restart_process", process = "planariad" }, { raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "2m" }]
+window = "5m"
+
+[fault.required_post]
+generation = "base"
+boot_default = "base"
+agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Built", "Publishing", "Rejected"]
+terminal = "Rejected(Interrupted)"
+count = 1
+
+[[fault]]
+id = "crash-publishing-after-publish"
+family = "boot-only-change"
+summary = "planariad is killed after publish_boot_once armed the one-shot entry, before its outcome was journaled. On restart the Publishing row asks the boot loader: the entry is armed, so the change is AwaitingBoot. The reboot boots the candidate, it is admitted and committed, and boot selection, roots, overrides and the journal agree."
+spec = ["§12 step 7", "§12 crash table", "R01"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }]
+inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "publish_boot_once" } }
+after = [{ raw = "restart_process", process = "planariad" }, { raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "12m" }]
+window = "15m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Publishing", "AwaitingBoot", "Promoted", "Committed"]
+terminal = "Committed"
+
+[[fault]]
+id = "boot-only-kernel-confirmed"
+family = "boot-only-change"
+summary = "A kernel parameter change takes the boot-only path: published as a one-shot next-boot entry, AwaitingBoot, a 'restart to finish' notice, the base still the default. At the next boot it is confirmed, becomes the default, and commits."
+spec = ["§12 step 7", "§12f", "§10 boot confirmation", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "12m" }]
+window = "15m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+reports = ["RestartToFinish"]
+agrees = true
+known_good = "candidate"
+live_tested = "never"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Built", "Publishing", "AwaitingBoot", "Promoted", "Committed"]
+never = ["Activating"]
+
+# S02 (§10): admission and confirmation are two milestones.
+[[fault]]
+id = "boot-only-admitted-not-confirmed"
+family = "boot-only-change"
+summary = "A boot-only kernel change boots and is admitted (Promoted: the candidate is the default, its override promoted). sshd then crashes; repairs run while the admitted change is unconfirmed, so sshd is restarted at once, but a canonical unit that needed a repair counts against the change: at the 10-minute checkpoint it is withdrawn, never committed: Reverted, the publishing generation is the default again, the base override restored, and a notice names sshd and says a restart completes it."
+spec = ["§10 boot confirmation", "§12 step 7", "S02", "I6"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "2m" }, { raw = "kill_unit", unit = "service:sshd", signal = "SIGKILL" }, { raw = "wait", for = "10m" }]
+window = "15m"
+
+[fault.required_post]
+boot_default = "base"
+units = { "service:sshd" = "Running" }
+notices_count = { match = "not confirmed (service:sshd needed a repair before the 10-minute checkpoint)", count = 1 }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["AwaitingBoot", "Promoted", "Reverting", "Reverted"]
+never = ["Committed", "Activating"]
+terminal = "Reverted"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:sshd"
+terminal = "Committed"
+while_admitted = true
+
+# I6 (owner decision, 31 Oct): repairs run while an admitted boot-only
+# change waits for its confirmation.
+[[fault]]
+id = "boot-only-repair-during-confirmation"
+family = "boot-only-change"
+summary = "A boot-only kernel change boots and is admitted. Two minutes later gym-web (not canonical) crashes: it is repaired at once, without waiting for the 10-minute checkpoint, and the change is still confirmed and committed there."
+spec = ["§10 boot confirmation", "I6"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }, { raw = "wait", for = "2m" }, { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }, { raw = "wait", for = "10m" }]
+window = "15m"
+
+[fault.required_post]
+generation = "candidate"
+boot_default = "candidate"
+units = { "service:gym-web" = "Running" }
+agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["AwaitingBoot", "Promoted", "Committed"]
+terminal = "Committed"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+terminal = "Committed"
+while_admitted = true
+
+[[fault]]
+id = "boot-only-kernel-boot-fails"
+family = "boot-only-change"
+summary = "The same change, but the one-shot boot fails; the boot loader falls back to the default (the base), and the transaction is Reverted."
+spec = ["§12 step 7", "§12f", "I1", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "fail_boot" }]
+inject = { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" }
+after = [{ raw = "wait", for = "1m" }, { raw = "reboot" }]
+window = "5m"
+
+[fault.required_post]
+generation = "base"
+boot_default = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["AwaitingBoot", "Reverted"]

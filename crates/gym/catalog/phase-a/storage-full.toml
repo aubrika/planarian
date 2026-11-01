@@ -1,0 +1,223 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: storage-full
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "storage-nix-full-gc"
+family = "storage-full"
+summary = "The Nix store filesystem drops below max(2 GB, 5%) while old generations exist. CollectGarbage runs first, and the protected set is untouched."
+spec = ["§10 storage", "§12b", "I3"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "out_of_band_rebuild", edit = "create 12 throwaway generations", activate = false }]
+inject = { raw = "fill_fs", fs = "device:fs-nix", as_uid = 0, until = "below-threshold", with = "store-garbage" }
+window = "10m"
+
+[fault.required_post]
+units = { "device:fs-nix" = "Running" }
+gc_protected = ["known_good", "base", "previous"]
+
+[[fault.required_post.txn]]
+transition = "CollectGarbage"
+source = "diagnoser"
+decision = "Allow(Runtime)"
+terminal = "Committed"
+
+[[fault]]
+id = "storage-budget-unsatisfiable"
+family = "storage-full"
+summary = "The generation budget is set below the size of the protected set. GC collects everything unprotected, reports BudgetUnsatisfiable with the shortfall, and never touches the protected set."
+spec = ["§12b"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "set_setting", key = "gc.generation_budget_percent", value = 0.1 }]
+inject = { transition = "CollectGarbage", emergency = false, source = "user", actor = "user:1001" }
+window = "5m"
+
+[fault.required_post]
+reports = ["BudgetUnsatisfiable"]
+gc_protected = ["known_good", "base", "previous"]
+
+[[fault]]
+id = "gc-retain-all-generations"
+family = "storage-full"
+summary = "With services.planarian.gc.retainAllGenerations set and the generation budget far below what the generations use, four display-scale changes leave old generations behind; garbage collection then collects none of them (the full history stays), and reports the budget as unsatisfiable rather than enforcing it."
+spec = ["§12b", "I21"]
+tags = []
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "set_setting", key = "gc.retain_all", value = true },
+  { raw = "set_setting", key = "gc.generation_budget_percent", value = 0.1 },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.5 }, source = "user", actor = "user:1000" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 0.75 }, source = "user", actor = "user:1000" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" },
+]
+inject = { transition = "CollectGarbage", emergency = false, source = "user", actor = "user:1001" }
+window = "5m"
+
+[fault.required_post]
+collected_none = true
+reports = ["BudgetUnsatisfiable"]
+
+[[fault.required_post.txn]]
+transition = "CollectGarbage"
+decision = "Allow(Runtime)"
+terminal = "Committed"
+
+[[fault]]
+id = "storage-journal-fs-full"
+family = "storage-full"
+summary = "The journal filesystem is filled to the reserved-block boundary as the daemon's uid. Either emergency collection is recorded and executed, or mutation stops with an explicit NoSpace or RecoveryFailed. A journal record is never lost or misread."
+spec = ["§12c", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+layouts = ["ext4", "btrfs", "zfs"]
+intent = { kind = "none" }
+inject = { raw = "fill_fs", fs = "device:fs-journal", as_uid = "planariad", until = "reserved-boundary" }
+# A repair needs journal records, and compaction writes a new segment:
+# both with the filesystem full.
+after = [
+  { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" },
+  { raw = "force_compaction" },
+]
+window = "10m"
+
+[fault.required_post]
+one_of = [
+  { txn = { transition = "CollectGarbage", emergency = true, terminal = "Committed" } },
+  { reports = ["NoSpace"] },
+  { interlock = "set" },
+]
+journal_readable = true
+replay_equivalent = true
+
+[[fault]]
+id = "storage-journal-btrfs-reuse"
+family = "storage-full"
+summary = "storage-journal-fs-full again on btrfs, after a snapshot and after 1000 journal wraparounds (nodatacow reuse)."
+spec = ["§12c gym cases"]
+tags = []
+scoring = "must-pass"
+harness = ["vm"]
+layouts = ["btrfs"]
+intent = { kind = "none" }
+setup = [
+  { raw = "cli", argv = ["internal", "snapshot", "journal-volume"], actor = "root" },
+  { raw = "cli", argv = ["internal", "journal-churn", "--wraps", "1000"], actor = "root" },
+]
+inject = { raw = "fill_fs", fs = "device:fs-journal", as_uid = "planariad", until = "reserved-boundary" }
+window = "10m"
+
+[fault.required_post]
+one_of = [
+  { txn = { transition = "CollectGarbage", emergency = true, terminal = "Committed" } },
+  { reports = ["NoSpace"] },
+  { interlock = "set" },
+]
+journal_readable = true
+
+[[fault]]
+id = "storage-enospc-during-build"
+family = "storage-full"
+summary = "The Nix store fills during build: Rejected(NoSpace), a storage incident opens, and the original change is not retried until that incident closes."
+spec = ["§12c ENOSPC by state"]
+tags = []
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "fill_fs", fs = "device:fs-nix", as_uid = 0, until = "full", when = { journal = "Staged" } }
+window = "10m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Rejected(NoSpace)"
+
+[[fault.required_post.incident]]
+target = "device:fs-nix"
+
+[[fault]]
+id = "storage-boot-full-publish"
+family = "storage-full"
+summary = "/boot is full when publish_boot runs. This is treated as a Checking failure, so the change reverts, and the candidate is never the only boot entry."
+spec = ["§12c /boot"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "fill_fs", fs = "device:fs-boot", as_uid = 0, until = "full", when = { journal = "Checking" } }
+window = "15m"
+
+[fault.required_post]
+generation = "base"
+boot_default = "base"
+override_source = "base"
+journal_agrees = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Reverted"
+
+[[fault]]
+id = "journal-compaction-preserves-state"
+family = "storage-full"
+summary = "Compaction is forced while an Explicit override is live and an incident's budget is exhausted, then both processes crash and restart. Both survive, and replay from checkpoint plus tail equals replay from full history."
+spec = ["§12c checkpoint"]
+tags = []
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "ask", phrase = "stop gym-web until I say", actor = "user:1001" },
+  { raw = "set_persistent_knob", unit = "service:gym-flap", knob = "fail_after", value = "5s" },
+  { raw = "wait", for = "8m" },
+]
+inject = { raw = "force_compaction" }
+after = [
+  { raw = "kill_process", process = "planariad", signal = "SIGKILL" },
+  { raw = "kill_process", process = "planarian-recovery", signal = "SIGKILL" },
+]
+window = "10m"
+
+[fault.required_post]
+overrides = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
+replay_equivalent = true
+
+[[fault.required_post.incident]]
+target = "service:gym-flap"
+state = "Cooldown"
+budget_left = 0
+
+[[fault]]
+id = "journal-torn-write"
+family = "storage-full"
+summary = "A record write is interrupted, and separately a checkpoint write. A torn tail is truncated and never interpreted as a transition; a torn checkpoint never replaces the old one."
+spec = ["§12c format"]
+tags = []
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
+inject = { raw = "interrupt_write", target = "record", when = { journal = "Checking" } }
+after = [
+  { raw = "interrupt_write", target = "checkpoint" },
+  { raw = "restart_process", process = "planariad" },
+]
+window = "10m"
+
+[fault.required_post]
+journal_readable = true
+replay_equivalent = true
+journal_agrees = true

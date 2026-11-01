@@ -16,11 +16,11 @@
 
 let
   lib = pkgs.lib;
-  catalog = ../../crates/gym/catalog/phase-a.toml;
+  catalog = ../../crates/gym/catalog/phase-a;
   gymPkg = pkgs.callPackage ../package.nix { gymHooks = true; };
   # The journal's filesystem: btrfs for an entry whose layouts ask for it
   # (and not ext4), else ext4.
-  layouts = (lib.findFirst (e: e.id == id) { } (builtins.fromTOML (builtins.readFile catalog)).fault).layouts or [ ];
+  layouts = (lib.findFirst (e: e.id == id) { } (import ../gym/catalog.nix catalog).fault).layouts or [ ];
   journalFs = if layouts != [ ] && !(builtins.elem "ext4" layouts) && builtins.elem "btrfs" layouts then "btrfs" else "ext4";
   # A third-party flake input's source at two revisions (store paths).
   modulesOld = builtins.path { path = ./gym-modules-old; name = "gym-modules"; };
@@ -581,8 +581,10 @@ let
             machine.succeed(f"mkdir -p /var/lib/gym-run && {gym} judge --id {ID} || true")
         else:
             print(machine.succeed(f"{gym} begin --id {ID} 2>&1"))
-            import tomllib
-            entry = next(e for e in tomllib.load(open("${catalog}", "rb"))["fault"] if e["id"] == ID)
+            import os, tomllib
+            cat = "${catalog}"
+            text = "\n".join(open(os.path.join(cat, f)).read() for f in sorted(os.listdir(cat)) if f.endswith(".toml"))
+            entry = next(e for e in tomllib.loads(text)["fault"] if e["id"] == ID)
             steps = []
             for k in ("setup", "inject", "after"):
                 v = entry.get(k, [])
