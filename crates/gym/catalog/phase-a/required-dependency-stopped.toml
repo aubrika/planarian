@@ -1,0 +1,62 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: required-dependency-stopped
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "dep-required-stopped"
+family = "required-dependency-stopped"
+summary = "root stops gym-db out of band; systemd stops gym-app with it (Requires=). v4.4 (owner decision Q5): the unattributed residue. Under Standard both are taken as intended until the next boot (gym-app linked to gym-db), nothing is restarted, and the notice offers the undo."
+spec = ["§11 unattributed residue", "§13 diagnoser step 1"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "an unattributed stop under Standard is inferred as intended" }
+inject = { raw = "stop_unit_out_of_band", unit = "service:gym-db", actor = "root" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-db" = "Overridden", "service:gym-app" = "Overridden" }
+overrides = [
+  { unit = "service:gym-db", until = "NextBoot", by = "Unattributed", attribution = "Inferred" },
+  { unit = "service:gym-app", until = "NextBoot", by = "Unattributed", attribution = "Inferred" },
+]
+reports = ["InferredOverride", "Undo"]
+no_txn_on = ["service:gym-db", "service:gym-app"]
+no_autonomous_txn = true
+
+[[fault]]
+id = "dep-required-stopped-guarded"
+family = "required-dependency-stopped"
+summary = "As dep-required-stopped, under the Guarded posture, where an unattributed stop is not inferred as intended (§11; Phase A repairs it, without the ask window). Root cause is gym-db: it is repaired first, then gym-app."
+spec = ["§11 unattributed residue", "§13 diagnoser step 1"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "set_setting", key = "posture", value = "Guarded" }]
+inject = { raw = "stop_unit_out_of_band", unit = "service:gym-db", actor = "root" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-db" = "Running", "service:gym-app" = "Running" }
+may_change = ["service:gym-db", "service:gym-app"]
+others_unchanged = true
+overrides = []
+reports = ["OutOfBandStopHint"]
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-db"
+source = "diagnoser"
+terminal = "Committed"
+
+[[fault.required_post.incident]]
+target = "service:gym-db"
+root_of = ["service:gym-app"]
+
+# Ordering check: gym-app is never restarted while gym-db is not Running.
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-app"
+before_unit_running = "service:gym-db"
+count = 0

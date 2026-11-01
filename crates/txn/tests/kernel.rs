@@ -1,5 +1,5 @@
 //! Kernel behaviour on the fake harness. Test names follow the
-//! `crates/gym/catalog/phase-a.toml` entries they exercise.
+//! `crates/gym/catalog/phase-a/` entries they exercise.
 
 mod common;
 

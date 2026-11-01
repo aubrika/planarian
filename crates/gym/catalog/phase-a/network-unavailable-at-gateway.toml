@@ -1,0 +1,75 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: network-unavailable-at-gateway  (driver fine)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "net-gateway-down"
+family = "network-unavailable-at-gateway"
+summary = "Traffic to the gateway is dropped while the NIC driver and NetworkManager are fine. Every probe on the way times out, which is Unknown, never Failed (§10): nothing local is restarted or rebound and no repair is attempted, but Planarian says it can't reach the upstream. When the block lifts, the client is Running again."
+spec = ["§10 external dependencies", "§10 probe contract: a Timeout yields Unknown"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "block_network", dst = "10.0.2.2" }
+after = [
+  { raw = "wait", for = "5m" },
+  { raw = "unblock_network", dst = "10.0.2.2" },
+]
+window = "15m"
+
+[fault.required_post]
+units = { "service:gym-upstream-client" = "Running" }
+status_seen = { "service:external:gym-upstream" = "Unknown", "service:gym-upstream-client" = "Unknown" }
+no_txn_on = ["service:gym-upstream-client", "service:external:gym-upstream", "service:NetworkManager", "device:net-gym0"]
+reports = ["ExternalDependencyUnreachable"]
+
+[[fault]]
+id = "net-upstream-down"
+family = "network-unavailable-at-gateway"
+summary = "The upstream host is up but its service is stopped: connections are refused, a definite failure. The incident targets service:external:gym-upstream, named as the client's root cause; nothing local is restarted. When the service is back, the incident closes."
+spec = ["§10 external dependencies (gym case: the external dependency is down)"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "stop_host_service", name = "gym-upstream" }
+after = [
+  { raw = "wait", for = "5m" },
+  { raw = "start_host_service", name = "gym-upstream" },
+]
+window = "15m"
+
+[fault.required_post]
+units = { "service:gym-upstream-client" = "Running" }
+no_txn_on = ["service:gym-upstream-client", "service:NetworkManager", "device:net-gym0"]
+reports = ["ExternalDependencyDown"]
+
+[[fault.required_post.incident]]
+target = "service:external:gym-upstream"
+root_of = ["service:gym-upstream-client"]
+state = "Closed"
+
+[[fault]]
+id = "net-external-dependency-down"
+family = "network-unavailable-at-gateway"
+summary = "The upstream service on the host stops while the gateway is reachable. The incident targets the external unit; there is no local restart."
+spec = ["§10 probe contract gym case"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "stop_host_service", name = "gym-upstream" }
+after = [
+  { raw = "wait", for = "5m" },
+  { raw = "start_host_service", name = "gym-upstream" },
+]
+window = "15m"
+
+[fault.required_post]
+units = { "service:gym-upstream-client" = "Running" }
+no_txn_on = ["service:gym-upstream-client"]
+
+[[fault.required_post.incident]]
+target = "service:external:gym-upstream"
+root_of = ["service:gym-upstream-client"]

@@ -1,0 +1,49 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: flapping-service
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "flap-30s"
+family = "flapping-service"
+summary = "gym-flap fails 30 s after every restart. Three attempts with 10 s / 60 s / 300 s backoff, then a 1 h cooldown. No restart loop."
+spec = ["§13 lifecycle"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "set_persistent_knob", unit = "service:gym-flap", knob = "fail_after", value = "30s" }
+window = "20m"
+
+[fault.required_post]
+reports = ["Flapping"]
+metrics = { restarts_max = { "service:gym-flap" = 3 }, attempt_gaps_min = ["10s", "60s", "300s"] }
+
+[[fault.required_post.incident]]
+target = "service:gym-flap"
+state = "Cooldown"
+
+[[fault]]
+id = "flap-regression-escalates"
+family = "flapping-service"
+summary = "gym-flap fails 6 min after each restart, just past the 5 min stabilization. Each failure closes and then regresses the incident, and at the third regression it escalates with a 1 h hold."
+spec = ["§13 Regressed"]
+tags = []
+scoring = "repair"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { raw = "set_persistent_knob", unit = "service:gym-flap", knob = "fail_after", value = "6m" }
+window = "50m"
+
+[fault.required_post]
+reports = ["Escalated"]
+
+[[fault.required_post.incident]]
+target = "service:gym-flap"
+state = "Escalated"
+regressed_count = 3
+
+[[fault.required_post.txn]]
+target = "service:gym-flap"
+source = "diagnoser"
+while_incident = "Escalated"
+count = 0

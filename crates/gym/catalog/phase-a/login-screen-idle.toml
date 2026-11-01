@@ -1,0 +1,76 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: login-screen-idle  (autologin off)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "login-greeter-idle"
+family = "login-screen-idle"
+summary = "Boot to the greeter with autologin off and leave it idle for 10 min. SessionEstablished never holds, so graphical-session gets no incident."
+spec = ["§9 graphical-session", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["vm"]
+intent = { kind = "no-intervention", because = "nobody has logged in" }
+setup = [{ raw = "reboot" }]
+inject = { raw = "wait", for = "10m" }
+window = "10m"
+
+[fault.required_post]
+units = { "service:display-manager" = "Running" }
+no_incident_on = ["target:graphical-session"]
+no_autonomous_txn = true
+
+[[fault]]
+id = "user-unit-after-logout"
+family = "login-screen-idle"
+summary = "alice logs out and her pipewire stops. A user unit is desired only while its session exists, so no incident opens."
+spec = ["§10 user-scoped units"]
+tags = ["extra"]
+scoring = "intent"
+harness = ["vm"]
+intent = { kind = "no-intervention", because = "the session ended" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { raw = "logout", uid = 1000 }
+window = "5m"
+
+[fault.required_post]
+no_incident_on = ["service@1000:pipewire", "target:graphical-session"]
+no_autonomous_txn = true
+
+[[fault]]
+id = "cond-device-unplugged"
+family = "login-screen-idle"
+summary = "gym-usb0 is hot-unplugged, so gym-usb-reader (desired only under DeviceConnected) stops, and no incident opens."
+spec = ["§8 Condition::DeviceConnected"]
+tags = ["extra"]
+scoring = "intent"
+harness = ["vm"]
+intent = { kind = "no-intervention", because = "its condition no longer holds" }
+inject = { raw = "hotunplug", device = "device:gym-usb0" }
+window = "5m"
+
+[fault.required_post]
+no_incident_on = ["service:gym-usb-reader", "device:gym-usb0"]
+no_autonomous_txn = true
+
+[[fault]]
+id = "session-logout-one-of-two"
+family = "login-screen-idle"
+summary = "alice logs out of one of her two sessions. Her user services (pipewire) keep running; no incident, no transaction."
+spec = ["§10 user-scoped units", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake"]
+intent = { kind = "no-intervention", because = "the uid still has a session" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "session_login", uid = 1000, session = "s2", seat = "seat0" },
+  { raw = "wait", for = "2m" },
+]
+inject = { raw = "session_logout", session = "s2" }
+window = "3m"
+
+[fault.required_post]
+units = { "service@1000:pipewire" = "Running" }
+no_incident_on = ["service@1000:pipewire"]
+no_autonomous_txn = true

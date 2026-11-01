@@ -1,0 +1,23 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: suspend-resume
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "suspend-resume"
+family = "suspend-resume"
+summary = "S3 suspend for 2 min, then resume. Evidence goes stale while suspended (Unknown, not Failed), nothing is restarted, and everything is Running within settle."
+spec = ["§10 evidence"]
+tags = []
+scoring = "intent"
+# The fake only (docs/deviations.md): QEMU never woke the test VM from S3
+# or from suspend-to-idle with an RTC alarm.
+harness = ["fake"]
+intent = { kind = "no-intervention", because = "a suspend is not a fault" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { raw = "suspend", duration = "2m" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running", "service@1000:pipewire" = "Running", "service:NetworkManager" = "Running" }
+no_autonomous_txn = true
+others_unchanged = true

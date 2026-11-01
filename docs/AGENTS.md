@@ -28,7 +28,7 @@ Instructions to coding agents working on Planarian. Source of truth: SPEC §18 (
 
 ## Status
 
-- [x] 0. Phase A fault catalog: `crates/gym/catalog/phase-a.toml`. Owner accepted the defaults 2026-10-26.
+- [x] 0. Phase A fault catalog: `crates/gym/catalog/phase-a/` (one file per family since issue #8). Owner accepted the defaults 2026-10-26.
 - [x] 1. GA demonstration: `crates/gym/demo.sh --harness fake` passes all four steps.
 - Build order (item 3), all implemented: `schema`, `txn`, `policy`, `state`, the real backends (`crates/backends/linux`), `exec`, `watchdog`, `changes`, `incident`, `diagnose`, `gym`, `intent`, `cli`, `daemon`, and the read-only console (`crates/console`, §16a) and status indicator (`crates/tray`).
 - Packaging: `flake.nix` (package, `nixosModules.default`/`reference`, template, checks), `nix/module.nix`, `nix/reference.nix`.

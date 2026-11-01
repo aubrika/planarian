@@ -1,0 +1,117 @@
+# Family: bad-generation (catalog entries; format in 00-format.toml)
+
+# B-20 (High), I24.
+# R08 (§13): rejection must not grant an indirect control capability.
+[[fault]]
+id = "dry-activate-exit-nonzero"
+family = "bad-generation"
+summary = "The dry activation of a display-scale change exits nonzero. Its plan is unknown, never smaller: the build fails, nothing is activated, and the running generation stays (rule 21, R10)."
+spec = ["§9 step 3", "§18 rule 21", "R10"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the VM's dry activation is the real switch-to-configuration,
+# with no hook to make it fail; the backend's own test covers the three cases.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "dry_activate", result = "exit-nonzero" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "3m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = 'ActivationUnknown'
+
+[[fault]]
+id = "candidate-nar-mismatch-refused"
+family = "bad-generation"
+summary = "A display-scale candidate's store contents no longer hash to the NAR hash recorded when it was built. It is refused before activation: verification checks the hash, not that the path exists (§9 step 3, C6)."
+spec = ["§9 step 3", "C6"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: corrupting a store path on the VM would corrupt the host's
+# store, which the test VM shares; the backend test covers the real check.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "verify_candidate", result = "nar-mismatch" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "3m"
+
+[fault.required_post]
+generation = "base"
+override_source = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+terminal = 'Rejected(Other("candidate failed verification"))'
+
+[[fault]]
+id = "dry-activate-timeout"
+family = "bad-generation"
+summary = "The dry activation of a display-scale change times out. Its plan is unknown, never smaller: the build fails, nothing is activated, and the running generation stays (rule 21, R10)."
+spec = ["§9 step 3", "§18 rule 21", "R10"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the VM's dry activation is the real switch-to-configuration,
+# with no hook to make it fail; the backend's own test covers the three cases.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "dry_activate", result = "timeout" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "3m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = 'ActivationUnknown'
+
+[[fault]]
+id = "dry-activate-truncated"
+family = "bad-generation"
+summary = "The dry activation of a display-scale change emits more output than is read (truncated). Its plan is unknown, never smaller: the build fails, nothing is activated, and the running generation stays (rule 21, R10)."
+spec = ["§9 step 3", "§18 rule 21", "R10"]
+tags = ["acceptance"]
+scoring = "must-pass"
+# Fake only: the VM's dry activation is the real switch-to-configuration,
+# with no hook to make it fail; the backend's own test covers the three cases.
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "dry_activate", result = "truncated" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }
+window = "3m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+refused_with = 'ActivationUnknown'
+
+# R07 (§9): the post-check is per probe, not per unit status.
+[[fault]]
+id = "degraded-unit-loses-a-probe"
+family = "bad-generation"
+summary = "gym-web is already Degraded: its HTTP check fails (503) while its TCP check passes. A change then breaks gym-web's listen address, so the TCP check fails too. The check after activation compares each Readiness probe that passed before, not the unit's status, so Checking fails and the change is reverted."
+spec = ["§9 executor-owned post-check", "R07"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "set_persistent_knob", unit = "service:gym-web", knob = "health", value = 503 },
+  { raw = "wait", for = "1m" },
+]
+inject = { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" }
+window = "10m"
+
+[fault.required_post]
+generation = "base"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Reverted"

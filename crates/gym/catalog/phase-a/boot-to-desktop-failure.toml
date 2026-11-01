@@ -1,0 +1,110 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: boot-to-desktop-failure
+# ═══════════════════════════════════════════════════════════════════════════
+
+# S05 (§10): only a seated session carries a graphical expectation.
+[[fault]]
+id = "ssh-session-expects-no-desktop"
+family = "boot-to-desktop-failure"
+summary = "alice logs in over SSH only (a user session with no seat) and stays for 5 min. Her user services are desired, but no compositor is expected: graphical-session has no instance for that session and no incident opens."
+spec = ["§10 conditions", "S05"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { raw = "session_login", uid = 1000, session = "ssh1" }
+after = [{ raw = "wait", for = "5m" }]
+window = "6m"
+
+[fault.required_post]
+no_incident_on = ["target:graphical-session"]
+units = { "service@1000:pipewire" = "Running" }
+
+[[fault]]
+id = "desktop-auth-ok-compositor-fails"
+family = "boot-to-desktop-failure"
+summary = "alice authenticates at the greeter, but her compositor never reaches graphical-session.target, and an incident opens within 60 s of the session's creation plus one tick."
+spec = ["§9 graphical-session", "§10 SessionEstablished", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "set_persistent_knob", unit = "service@1000:cosmic-comp", knob = "exec_fail", value = true }]
+inject = { raw = "greeter_login", uid = 1000 }
+window = "5m"
+
+[[fault.required_post.incident]]
+target = "target:graphical-session"
+opened_within = "65s"
+session_bound = 1000
+
+[[fault]]
+id = "desktop-second-user-deadline"
+family = "boot-to-desktop-failure"
+summary = "alice's desktop fails; bob logs in 50 s later. alice's 60 s deadline still fires on time, because it is bound to her session id."
+spec = ["§10 conditions"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "set_persistent_knob", unit = "service@1000:cosmic-comp", knob = "exec_fail", value = true }]
+inject = { raw = "greeter_login", uid = 1000 }
+after = [{ raw = "greeter_login", uid = 1002, when = { after = "50s" } }]
+window = "5m"
+
+[[fault.required_post.incident]]
+target = "target:graphical-session"
+opened_within = "65s"
+session_bound = 1000
+
+[[fault]]
+id = "desktop-boot-fails-rollback"
+family = "boot-to-desktop-failure"
+summary = "A committed change that touches only boot (a kernel parameter) becomes live_tested but not known_good. After a reboot the greeter fails; the boot is not confirmed, Rollback goes to known_good, and after a second reboot the desktop works."
+spec = ["§10 boot confirmation", "I1"]
+tags = []
+scoring = "repair"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "gym:kernel-param", args = { param = "virtio_gpu.modeset=0" }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty" },
+  { raw = "wait", for = { journal = "Committed" } },
+]
+inject = { raw = "reboot" }
+after = [
+  { raw = "wait", for = { journal = "Committed", transition = "Rollback" } },
+  { raw = "reboot" },
+]
+window = "30m"
+
+[fault.required_post]
+units = { "service:display-manager" = "Running" }
+generation = "known_good"
+boot_default = "known_good"
+known_good = "unchanged"
+reports = ["NotBootConfirmed"]
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+source = "diagnoser"
+terminal = "Committed"
+
+[[fault]]
+id = "session-second-compositor-fails"
+family = "boot-to-desktop-failure"
+summary = "alice has two graphical sessions. The compositor in the second never runs; an incident opens for that session only, though her user manager's graphical-session.target is already reached."
+spec = ["§9 per-session compositor probe", "§10 conditions", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "session_login", uid = 1000, session = "s1", seat = "seat0" }]
+inject = { raw = "session_login", uid = 1000, session = "s2", seat = "seat0", compositor = "fails" }
+window = "5m"
+
+[fault.required_post]
+no_incident_on = ["target@1000/s1:graphical-session"]
+
+[[fault.required_post.incident]]
+target = "target@1000/s2:graphical-session"

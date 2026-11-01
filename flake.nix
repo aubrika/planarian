@@ -75,7 +75,7 @@
       legacyPackages = forAll (pkgs: {
         gym-vm =
           let
-            entries = (builtins.fromTOML (builtins.readFile ./crates/gym/catalog/phase-a.toml)).fault;
+            entries = (import ./nix/gym/catalog.nix ./crates/gym/catalog/phase-a).fault;
             ids = map (e: e.id) (builtins.filter (e: builtins.elem "vm" (e.harness or [ ])) entries);
           in
           nixpkgs.lib.genAttrs ids (id: import ./nix/tests/gym-vm.nix { inherit pkgs self id; });

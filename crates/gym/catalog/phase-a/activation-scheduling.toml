@@ -1,0 +1,120 @@
+# Family: activation-scheduling (catalog entries; format in 00-format.toml)
+
+[[fault]]
+id = "quiet-staged-update-foreground"
+family = "activation-scheduling"
+summary = "alice changes her font scale while a game holds Foreground in her session. The verified candidate waits in Built; once Foreground ends it activates in that window and commits."
+spec = ["§12f", "I6", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "foreground", session = "s1", on = true },
+]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" }
+after = [{ raw = "wait", for = "3m" }, { raw = "foreground", session = "s1", on = false }]
+window = "5m"
+
+[fault.required_post]
+reports = ["WaitsForWindow"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Built", "Activating", "Committed"]
+terminal = "Committed"
+
+# S03 (§12f, I12): parking in Built is bounded at 24 h.
+[[fault]]
+id = "built-parking-expires"
+family = "activation-scheduling"
+summary = "alice changes her font scale while a game holds Foreground in her session, and the game never lets go. After a day in Built the change is Cancelled by the daemon, with one notice naming it and how to issue it again; it never activates, even once the game ends."
+spec = ["§12f", "I12", "S03"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "foreground", session = "s1", on = true },
+]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" }
+after = [{ raw = "wait", for = "25h" }, { raw = "foreground", session = "s1", on = false }, { raw = "wait", for = "5m" }]
+window = "26h"
+
+[fault.required_post]
+reports = ["WaitsForWindow"]
+notices_count = { match = "waited a day in Built", count = 1 }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+path = ["Built", "Cancelled"]
+terminal = "Cancelled"
+
+# C21 (§12): re-prepared transactions keep their original caller and source.
+[[fault]]
+id = "reprepared-keeps-caller"
+family = "activation-scheduling"
+summary = "alice changes her font scale while a game holds Foreground in her session, so it waits in Built. The daemon restarts: the change is prepared again as alice's, in her session (not the daemon's), and commits once Foreground ends."
+spec = ["§12", "§12f", "C21"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "foreground", session = "s1", on = true },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" },
+  { raw = "wait", for = "1m" },
+]
+inject = { raw = "restart_process", process = "planariad" }
+after = [{ raw = "wait", for = "2m" }, { raw = "foreground", session = "s1", on = false }]
+window = "5m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+caller = "user:1000@s1"
+source = "user"
+
+[[fault]]
+id = "quiet-repair-not-deferred"
+family = "activation-scheduling"
+summary = "While a game holds Foreground, alice's PipeWire crashes. Repairs of what foreground work depends on are not deferred: it is repaired at once, with exactly one notice."
+spec = ["§12f quiet mode"]
+tags = ["acceptance"]
+scoring = "repair"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "foreground", session = "s1", on = true },
+  { raw = "wait", for = "1m" },
+]
+inject = { raw = "kill_unit", unit = "service@1000:pipewire", signal = "SIGSEGV" }
+window = "2m"
+
+[fault.required_post]
+units = { "service@1000:pipewire" = "Running" }
+notices_count = { match = "pipewire", count = 1 }
+
+# §21 (v4.4): the invisibility budget; owner decision Q7 (Xonotic timedemo, MangoHud).
+[[fault]]
+id = "quiet-reference-workload"
+family = "activation-scheduling"
+summary = "The invisibility-budget benchmark (§21): the reference game runs while a GC, a staged update and a non-urgent fault are queued. p99 frame time and input latency match the Planarian-stopped baseline; each deferred item runs in its window afterward; a PipeWire crash mid-run is repaired with one notice."
+spec = ["§12f", "§21 invisibility budget"]
+tags = ["acceptance", "benchmark"]
+scoring = "must-pass"
+# Run by legacyPackages.bench.invisibility (nix/tests/bench.nix; .github/workflows/bench.yml),
+# not by the gym runner: see deviations.md.
+harness = ["bench"]
+intent = { kind = "none" }
+setup = [{ raw = "session_login", uid = 1000, session = "s1", seat = "seat0" }]
+inject = { raw = "workload", name = "reference-game", queue = ["gc", "staged-update", "fault:gym-metrics"], mid_run = { raw = "kill_unit", unit = "service@1000:pipewire", signal = "SIGSEGV" } }
+window = "20m"
+
+[fault.required_post]
+metrics = { frame_time_p99 = "no significant difference vs baseline", deferred_items_ran = 3 }
+notices_count = { match = "pipewire", count = 1 }

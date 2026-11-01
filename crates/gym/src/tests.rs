@@ -12,7 +12,7 @@ use planarian_txn::ledger::{Entry, Record};
 use toml::Value as T;
 
 fn catalog() -> Vec<T> {
-    load(concat!(env!("CARGO_MANIFEST_DIR"), "/catalog/phase-a.toml"))
+    load(concat!(env!("CARGO_MANIFEST_DIR"), "/catalog/phase-a"))
 }
 
 /// Run `id`, require PASS, and return its evidence and required_post.

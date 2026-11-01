@@ -1,0 +1,50 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: ordering-only-predecessor-stopped  (must NOT be treated as cause)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "dep-ordering-only-stopped"
+family = "ordering-only-predecessor-stopped"
+summary = "gym-cache (After= of gym-app only) is killed. gym-app stays healthy and is never touched; gym-cache is its own incident."
+spec = ["§8 EdgeKind::Ordering", "§13"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "kill_unit", unit = "service:gym-cache", signal = "SIGSEGV" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-cache" = "Running", "service:gym-app" = "Running" }
+may_change = ["service:gym-cache"]
+others_unchanged = true
+no_txn_on = ["service:gym-app"]
+no_incident_on = ["service:gym-app"]
+
+[[fault.required_post.incident]]
+target = "service:gym-cache"
+root_of = []
+
+[[fault]]
+id = "dep-wants-optional-failed"
+family = "ordering-only-predecessor-stopped"
+summary = "gym-metrics (Wants= of gym-app) fails persistently while gym-app stays healthy: at most one incident, on gym-metrics, and gym-app is never named as caused by it."
+spec = ["§8 EdgeKind::Wants", "§13", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "set_persistent_knob", unit = "service:gym-metrics", knob = "fail_on_start", value = true }]
+inject = { raw = "kill_unit", unit = "service:gym-metrics", signal = "SIGSEGV" }
+window = "10m"
+
+[fault.required_post]
+units = { "service:gym-app" = "Running" }
+others_unchanged = true
+no_txn_on = ["service:gym-app"]
+no_incident_on = ["service:gym-app"]
+metrics = { incidents_max = 1 }
+
+[[fault.required_post.incident]]
+target = "service:gym-metrics"
+root_of = []

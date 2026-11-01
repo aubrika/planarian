@@ -1,6 +1,6 @@
 # Phase A fault catalog: owner review packet
 
-Covers `crates/gym/catalog/phase-a.toml` (SPEC §18.0) and, from §5 on, the v4.4 draft `crates/gym/catalog/phase-a-v4.4-draft.toml`. Per §18.0, work stops here until the owner signs off.
+Covers the Phase A catalog, `crates/gym/catalog/phase-a/` (one file per family since issue #8; SPEC §18.0) and, from §5 on, the v4.4 draft `crates/gym/catalog/phase-a-v4.4-draft.toml`. Per §18.0, work stops here until the owner signs off.
 
 At sign-off (2026-10-26) the catalog had 71 entries: 46 `must-pass`, 16 `repair`, 9 `intent`; 54 ran on the fake-backend harness and 61 on the NixOS VM. Sections 5–11 cover what v4.4, v4.5 and v4.6 added; the current counts are in §11.
 

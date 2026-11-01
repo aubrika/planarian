@@ -19,7 +19,7 @@ use toml::Value as T;
 const RATIO: &str = "docs/verification-ratio.toml";
 const ASSUMPTIONS: &str = "docs/assumptions.md";
 const BYPASSES: &str = "docs/bypasses.md";
-const CATALOG: &str = "crates/gym/catalog/phase-a.toml";
+const CATALOG: &str = crate::catalog::DIR;
 const VERIFIED: &[&str] = &["crates/policy/src", "crates/schema/src", "crates/txn/src"];
 
 fn rust_files(dir: &Path, out: &mut Vec<String>) {
@@ -263,7 +263,7 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
 
     // §17a: every proved invariant has a catalog entry written from its
     // English (tag `english`), so a wrong specification shows up as a failure.
-    let english: Vec<String> = std::fs::read_to_string(CATALOG)
+    let english: Vec<String> = crate::catalog::read_text(Path::new(CATALOG))
         .ok()
         .and_then(|t| toml::from_str::<T>(&t).ok())
         .and_then(|d| d.get("fault").and_then(T::as_array).cloned())

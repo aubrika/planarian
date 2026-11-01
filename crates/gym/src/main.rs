@@ -9,6 +9,7 @@
 //! logic against the in-memory machine (`planarian-fake`). The VM harness is
 //! the flake's NixOS tests (`nix flake check`, `checks.vm-runtime`).
 
+mod catalog;
 mod check;
 mod conformance;
 mod evidence;
@@ -24,7 +25,7 @@ mod verification;
 use sim::Sim;
 use toml::Value as T;
 
-const DEFAULT_CATALOG: &str = "crates/gym/catalog/phase-a.toml";
+const DEFAULT_CATALOG: &str = catalog::DIR;
 
 /// The catalog being run, for entries that run others (the conformance matrix).
 static CATALOG: std::sync::OnceLock<Vec<T>> = std::sync::OnceLock::new();
@@ -114,16 +115,12 @@ fn run_entry(entry: &T) -> Run {
     Run { result, notes, sim: Some(sim) }
 }
 
+/// The catalog's entries (a directory or one file), ids unique; exits 2 if not.
 fn load(path: &str) -> Vec<T> {
-    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
-        eprintln!("{path}: {e}");
+    catalog::entries(std::path::Path::new(path)).unwrap_or_else(|e| {
+        eprintln!("{e}");
         std::process::exit(2)
-    });
-    let doc: T = toml::from_str(&text).unwrap_or_else(|e| {
-        eprintln!("{path}: {e}");
-        std::process::exit(2)
-    });
-    doc.get("fault").and_then(T::as_array).cloned().unwrap_or_default()
+    })
 }
 
 fn main() {
