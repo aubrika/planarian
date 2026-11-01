@@ -40,13 +40,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
-      - name: Package, module evaluation, boundaries, Verus proofs
+      - name: Package, module evaluation, boundaries, Verus proofs, the demo VM (H8)
         run: >
           nix build -L
           .#checks.x86_64-linux.package
           .#checks.x86_64-linux.module-eval
           .#checks.x86_64-linux.boundaries
           .#checks.x86_64-linux.verus
+          .#checks.x86_64-linux.demo-vm
 
   kani:
     runs-on: ubuntu-24.04

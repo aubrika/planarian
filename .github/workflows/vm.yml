@@ -2,8 +2,9 @@
 # gym's fault catalog on real VMs (one NixOS test per entry). Linux runners
 # have KVM once /dev/kvm is opened to the runner user.
 #
-# A push runs the VM checks, the GA demonstration and the gym smoke entries
-# (a newer push cancels them); the whole catalog is one job per VM entry (94
+# A push to main runs the VM checks, the GA demonstration and the gym smoke
+# entries; a pull request runs the gym smoke entries only. A newer push
+# cancels either. The whole catalog is one job per VM entry (94
 # at v4.6, several hundred runner minutes), so it runs only by hand (Actions →
 # VM tests → Run workflow → catalog).
 name: VM tests
@@ -12,6 +13,8 @@ on:
   push:
     branches: [main]
     paths-ignore: ["docs/**", "**.md"]
+  pull_request:
+    paths-ignore: ["docs/**"]
   workflow_dispatch:
     inputs:
       catalog:
@@ -25,10 +28,11 @@ on:
 
 concurrency:
   group: vm-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   vm:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -46,6 +50,7 @@ jobs:
       - run: nix build -L .#checks.x86_64-linux.${{ matrix.check }}
 
   ga-demo:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -99,6 +104,7 @@ jobs:
   # The Firecracker microVM target (SPEC §4, Phase A): non-gating, allowed to
   # stay red. Boots Planarian under Firecracker and checks one repair.
   firecracker:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
