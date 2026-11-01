@@ -1101,8 +1101,8 @@ fn an_owner_edit_while_waiting_is_stale_when_the_window_opens() {
     assert!(r.core.notices.iter().any(|n| n.contains("not activated")), "{:?}", r.core.notices);
 }
 
-/// P9: a tick over the 500 ms budget is warned, once per slow tick, naming
-/// the probes that ran; a tick within it is not.
+/// P9: a tick over the 500 ms budget is warned, naming the probes that ran,
+/// at most once a minute; a tick within it is not.
 #[test]
 fn a_slow_tick_is_warned() {
     let mut r = Rig::new();
@@ -1111,7 +1111,12 @@ fn a_slow_tick_is_warned() {
     r.fake.w().probe_batch_ms = 800;
     r.ticks(1);
     assert_eq!(r.core.slow_tick_warnings, 1);
+    // Every tick slow for half a minute: no second warning yet.
+    r.ticks(5);
+    assert_eq!(r.core.slow_tick_warnings, 1, "at most one a minute");
+    r.ticks(10);
+    assert_eq!(r.core.slow_tick_warnings, 2);
     r.fake.w().probe_batch_ms = 0;
-    r.ticks(2);
-    assert_eq!(r.core.slow_tick_warnings, 1);
+    r.ticks(20);
+    assert_eq!(r.core.slow_tick_warnings, 2);
 }

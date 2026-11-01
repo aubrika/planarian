@@ -999,10 +999,32 @@ impl<S: Store, H: Host> Kernel<S, H> {
         if !self.wait_gone(&jobs)? {
             return Ok(Err(format!("jobs still pending after {}s drain", JOB_DRAIN.0 / 1000)));
         }
-        for op in unacked {
-            self.record(Record::OpAck { op, outcome: Outcome::Unknown("superseded by takeover".into()) })?;
-        }
+        self.supersede_unacked(&unacked)?;
         Ok(Ok(()))
+    }
+
+    /// Acknowledge, as superseded by the takeover, each of `ops` that is
+    /// still unacknowledged. Decided under the journal's lock: the old owner,
+    /// fenced but not necessarily dead, may have journaled its own ack since
+    /// the takeover (its call returned just then), and that one stands
+    /// (run 109's `crash-slow-worker-overlap`: a second ack was `DuplicateOp`
+    /// and left the transaction in flight).
+    pub fn supersede_unacked(&mut self, ops: &[OpId]) -> R<()> {
+        for op in ops {
+            let now = self.host.now();
+            let ack = Record::OpAck { op: *op, outcome: Outcome::Unknown("superseded by takeover".into()) };
+            let appended = self.journal.locked(|j| {
+                let still = j.ledger().live.get(&op.txn).is_some_and(|l| l.unacked_ops().any(|o| o.op == *op));
+                if still { j.append(now, ack.clone()).map(|_| true) } else { Ok(false) }
+            })?;
+            match appended {
+                Ok(_) => {}
+                // A full journal: the sentinel path, as for any record.
+                Err(JournalError::Full) => self.record(ack)?,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
     }
 
     // ---------- Recovery ----------

@@ -158,8 +158,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     last: Option<(SystemState, UnitDefs)>,
     choices: BTreeMap<u32, Vec<intent::Match>>,
     incident_parked: BTreeMap<IncidentId, TxnId>,
-    /// Slow ticks warned (P9).
+    /// Slow ticks warned (P9), and when the last warning was.
     pub slow_tick_warnings: u64,
+    last_slow_warning: Option<Timestamp>,
+    slow_ticks_unwarned: u64,
     /// §12a write-backs queued behind an active generation transaction,
     /// with their caller (P7). Submitted once none is live.
     writebacks: Vec<(Proposal, Authorization)>,
@@ -252,6 +254,9 @@ impl Resume {
     }
 }
 
+/// P9: a slow tick is warned at most this often (the count rides along).
+pub const SLOW_TICK_WARN_EVERY: Millis = Millis::secs(60);
+
 /// How often the daemon checks the §12b collection bounds.
 pub const GC_CHECK: Millis = Millis(3600 * 1000);
 
@@ -341,6 +346,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             choices: BTreeMap::new(),
             incident_parked: BTreeMap::new(),
             slow_tick_warnings: 0,
+            last_slow_warning: None,
+            slow_ticks_unwarned: 0,
             writebacks: vec![],
             confirm,
             manifest_gen: current,
@@ -1014,14 +1021,21 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let now = s.observed_at;
         // P9: a tick over its 500 ms budget is warned, with the probes that
         // ran in it (they are the usual cause).
+        // At most one warning a minute, counting the slow ticks between.
         if let Some((took, ran)) = self.asm.slow_tick.take() {
-            eprintln!(
-                "planariad: warning: slow tick: {} ms (budget {} ms); probes run: {}",
-                took.0,
-                planarian_state::TICK_BUDGET.0,
-                if ran.is_empty() { "none".to_string() } else { ran.join(", ") }
-            );
-            self.slow_tick_warnings += 1;
+            self.slow_ticks_unwarned += 1;
+            if self.last_slow_warning.is_none_or(|t| now.0 >= t.0 + SLOW_TICK_WARN_EVERY.0) {
+                eprintln!(
+                    "planariad: warning: slow tick: {} ms (budget {} ms; {} slow tick(s) since the last warning); probes run: {}",
+                    took.0,
+                    planarian_state::TICK_BUDGET.0,
+                    self.slow_ticks_unwarned,
+                    if ran.is_empty() { "none".to_string() } else { ran.join(", ") }
+                );
+                self.slow_tick_warnings += 1;
+                self.slow_ticks_unwarned = 0;
+                self.last_slow_warning = Some(now);
+            }
         }
 
         // §12f quiet mode: while foreground work holds in any session.
