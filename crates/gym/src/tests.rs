@@ -254,3 +254,56 @@ fn vm_plan_refuses_what_the_gym_vm_cannot_be() {
     // `internal wifi-connect` is the harness's own; the others do not exist.
     assert!(!unsupported("policy-daemon-wifi-runtime"));
 }
+
+/// K4: en-i6's judge holds the repair out of every exclusive state of I6's
+/// list, not only `Activating`: a restart prepared while the change sits in
+/// any one of them fails it.
+#[test]
+fn repair_prepared_in_each_exclusive_state() {
+    let (e, post) = passing("en-i6-repair-waits-for-activation");
+    let en = e.entries.as_ref().expect("entries");
+    let change = en
+        .iter()
+        .find_map(|x| match &x.record {
+            Record::Prepared(p) if matches!(p.transition, Transition::ApplyChange { .. }) => Some(p.id),
+            _ => None,
+        })
+        .expect("the change");
+    let advance = en
+        .iter()
+        .find(|x| matches!(&x.record, Record::Advance { txn, .. } if *txn == change))
+        .cloned()
+        .expect("an advance of the change");
+    let repair = en
+        .iter()
+        .position(|x| matches!(&x.record, Record::Prepared(p) if matches!(p.transition, Transition::RestartUnit(_))))
+        .expect("the repair");
+    for state in [
+        TxnState::Activating,
+        TxnState::Checking,
+        TxnState::Publishing,
+        TxnState::Published,
+        TxnState::Promoted,
+        TxnState::Reverting,
+    ] {
+        let mut e = e.clone();
+        let mut held = advance.clone();
+        if let Record::Advance { to, .. } = &mut held.record {
+            *to = state.clone();
+        }
+        entries(&mut e).insert(repair, held);
+        fails(&e, &post, "prepared while ApplyChange was");
+    }
+    // A boot-only Promoted is not exclusive: repairs may run during it.
+    let mut e = e.clone();
+    // Each lands just before the repair, so AwaitingBoot then Promoted.
+    for to in [TxnState::Promoted, TxnState::AwaitingBoot] {
+        let mut held = advance.clone();
+        if let Record::Advance { to: t, .. } = &mut held.record {
+            *t = to;
+        }
+        entries(&mut e).insert(repair, held);
+    }
+    let v = judge(&e, &post);
+    assert!(!v.failures.iter().any(|f| f.contains("prepared while")), "{:?}", v.failures);
+}

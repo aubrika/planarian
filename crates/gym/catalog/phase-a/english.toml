@@ -45,13 +45,14 @@ window = "5m"
 [fault.required_post]
 units = { "service:gym-web" = "Running" }
 
-# No restart prepared while the change was Activating. Afterwards either a
-# restart repairs gym-web, or the activation itself starts it again (on the
-# VM, switch-to-configuration starts failed units).
+# No restart prepared while the change was in any exclusive state (I6's
+# list: Activating, Checking, Publishing, Published, Promoted, Reverting).
+# Afterwards either a restart repairs gym-web, or the activation itself
+# starts it again (on the VM, switch-to-configuration starts failed units).
 [[fault.required_post.txn]]
 transition = "RestartUnit"
 target = "service:gym-web"
-not_during = { transition = "ApplyChange", state = "Activating" }
+not_during = { transition = "ApplyChange", state = "exclusive" }
 
 # I8: "...an approval token bound to the concrete candidate, re-validated immediately before execution."
 [[fault]]
