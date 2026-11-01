@@ -1,0 +1,55 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: service-misconfigured
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "svc-misconfig-state-file"
+family = "service-misconfigured"
+summary = "gym-web's mutable state file is corrupted, so it fails on every start. Restarting cannot fix it: three attempts with backoff, then escalation with a report. Phase B upgrades required_post to Running."
+spec = ["§13 budgets", "§1 escalate"]
+tags = ["phase-b-upgrade"]
+scoring = "repair"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "corrupt_state", unit = "service:gym-web", path = "/var/lib/gym-web/state.json" }]
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }
+window = "10m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Failed" }
+generation = "base"
+others_unchanged = true
+reports = ["DiagnoserExhausted"]
+metrics = { restarts_max = { "service:gym-web" = 3 }, attempt_gaps_min = ["10s", "60s"] }
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+state = "Cooldown"
+
+[[fault]]
+id = "svc-misconfig-listen-address"
+family = "service-misconfigured"
+summary = "The user sets gym-web's listen address to 192.0.2.10, a permitted value that no interface holds. The change is applied as a transaction, the probes fail, and the change is reverted."
+spec = ["§9", "§12 GenerationOp", "§4 GA(1)"]
+tags = ["ga-demo", "bad-generation"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "listen-address", args = { service = "gym-web", addr = "192.0.2.10" }, source = "user", actor = "user:1001" }
+window = "15m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+generation = "base"
+boot_default = "base"
+override_source = "base"
+known_good = "unchanged"
+journal_agrees = true
+others_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+change = "listen-address"
+decision = "Allow(Tested)"
+terminal = "Reverted"
+path = ["Prepared", "Activating", "Checking", "Reverting", "Reverted"]

@@ -75,12 +75,15 @@
       legacyPackages = forAll (pkgs: {
         gym-vm =
           let
-            entries = (builtins.fromTOML (builtins.readFile ./crates/gym/catalog/phase-a.toml)).fault;
+            entries = (import ./nix/gym/catalog.nix ./crates/gym/catalog/phase-a).fault;
             ids = map (e: e.id) (builtins.filter (e: builtins.elem "vm" (e.harness or [ ])) entries);
           in
           nixpkgs.lib.genAttrs ids (id: import ./nix/tests/gym-vm.nix { inherit pkgs self id; });
         # The invisibility budget (§21): run on demand (it downloads Xonotic).
         bench.invisibility = import ./nix/tests/bench.nix { inherit pkgs self; };
+        # The gym's test build, as gym-vm.nix makes it: vm.yml builds it once
+        # and the VM jobs substitute it (the same derivation).
+        gym-hooks = pkgs.callPackage ./nix/package.nix { gymHooks = true; };
       });
 
       templates.default = {

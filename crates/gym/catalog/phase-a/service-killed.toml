@@ -1,0 +1,79 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: service-killed
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "svc-killed"
+family = "service-killed"
+summary = "gym-web is SIGKILLed; it has no Restart=; the diagnoser restarts it."
+spec = ["§13", "§15", "§4 GA(1)"]
+tags = ["ga-demo"]
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "kill_unit", unit = "service:gym-web", signal = "SIGSEGV" }
+window = "7m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+may_change = ["service:gym-web"]
+others_unchanged = true
+settle = { ready = "service:gym-web", timeout = "60s" }
+metrics = { restarts_max = { "service:gym-web" = 1 } }
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-web"
+source = "diagnoser"
+decision = "Allow(Runtime)"
+terminal = "Committed"
+path = ["Prepared", "Activating", "Checking", "Committed"]
+
+[[fault.required_post.incident]]
+target = "service:gym-web"
+state = "Closed"
+
+[[fault]]
+id = "svc-killed-defer-to-systemd"
+family = "service-killed"
+summary = "gym-restartful is killed; systemd restarts it itself; Planarian does not act."
+spec = ["§13 defer to systemd"]
+tags = []
+scoring = "intent"
+harness = ["vm"]
+intent = { kind = "no-intervention", because = "systemd's own Restart= is within StartLimitBurst" }
+inject = { raw = "kill_unit", unit = "service:gym-restartful", signal = "SIGKILL" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:gym-restartful" = "Running" }
+others_unchanged = true
+no_txn_on = ["service:gym-restartful"]
+
+[[fault]]
+id = "svc-killed-user-scope"
+family = "service-killed"
+summary = "alice's pipewire is killed while her session is up; the user-scoped unit is restarted."
+spec = ["§10 user-scoped units"]
+tags = []
+scoring = "repair"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "greeter_login", uid = 1000 },
+  { raw = "wait", for = "30s" },
+]
+inject = { raw = "kill_unit", unit = "service@1000:pipewire", signal = "SIGSEGV" }
+window = "5m"
+
+[fault.required_post]
+units = { "service@1000:pipewire" = "Running" }
+may_change = ["service@1000:pipewire", "service@1000:wireplumber"]
+others_unchanged = true
+settle = { ready = "service@1000:pipewire", timeout = "60s" }
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service@1000:pipewire"
+source = "diagnoser"
+terminal = "Committed"

@@ -1171,7 +1171,10 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             .unwrap_or_default()
     );
     // I6: none of the matching transactions was prepared while another
-    // transaction was in a state (none at all passes).
+    // transaction was in a state (none at all passes). `state = "exclusive"`
+    // is I6's whole list (`TxnState::is_exclusive`: Activating, Checking,
+    // Publishing, Published, Promoted, Reverting), less a boot-only
+    // Promoted, during which repairs may run (K4).
     if let Some(during) = spec.get("not_during").and_then(T::as_table) {
         match &e.entries {
             None => v.unchecked.push(format!("{label}: not_during (journal history)")),
@@ -1182,11 +1185,20 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
                     all.iter().filter(|x| transition_name(&x.transition) == other).map(|x| x.id).collect();
                 let mine: BTreeSet<TxnId> = matching.iter().map(|x| x.id).collect();
                 let mut inside: BTreeSet<TxnId> = BTreeSet::new();
+                let mut boot_only: BTreeSet<TxnId> = BTreeSet::new();
                 let mut saw_state = false;
                 for x in en {
                     match &x.record {
                         Record::Advance { txn, to, .. } if others.contains(txn) => {
-                            if state_name(to) == state {
+                            if *to == TxnState::AwaitingBoot {
+                                boot_only.insert(*txn);
+                            }
+                            let held = if state == "exclusive" {
+                                to.is_exclusive() && !(*to == TxnState::Promoted && boot_only.contains(txn))
+                            } else {
+                                state_name(to) == state
+                            };
+                            if held {
                                 inside.insert(*txn);
                                 saw_state = true;
                             } else {

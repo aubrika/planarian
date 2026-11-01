@@ -32,6 +32,8 @@ jobs:
         run: crates/gym/demo.sh --harness fake
       - name: Dependency boundaries
         run: bash nix/tests/boundaries.sh .
+      - name: Dependency boundaries catch a planted violation in each place (H9)
+        run: bash nix/tests/boundaries-test.sh .
       - name: Verification ratio d:a and the trust count (SPEC §17a; fails if either regresses)
         run: cargo run -q -p planarian-gym -- verification
 
@@ -40,13 +42,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
-      - name: Package, module evaluation, boundaries, Verus proofs
+      - name: Package, module evaluation, boundaries, Verus proofs, the demo VM (H8)
         run: >
           nix build -L
           .#checks.x86_64-linux.package
           .#checks.x86_64-linux.module-eval
           .#checks.x86_64-linux.boundaries
           .#checks.x86_64-linux.verus
+          .#checks.x86_64-linux.demo-vm
 
   kani:
     runs-on: ubuntu-24.04

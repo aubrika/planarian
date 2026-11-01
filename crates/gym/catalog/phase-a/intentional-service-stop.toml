@@ -1,0 +1,184 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: intentional-service-stop
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "intent-user-stops-service"
+family = "intentional-service-stop"
+summary = "An admin asks to stop gym-web until they say otherwise. It stays stopped. The override is journaled before the stop, so there is no window in which a repair can race it."
+spec = ["§14 stopping", "I13", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "the user stopped it on purpose" }
+setup = [{ raw = "ask", phrase = "stop gym-web until I say", actor = "user:1001" }]
+inject = { raw = "wait", for = "10m" }
+window = "10m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", until = "Explicit", by = "user:1001" }]
+no_autonomous_txn = true
+journal_order = ["Override(service:gym-web)", "stop(service:gym-web)"]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+source = "intent"
+terminal = "Committed"
+
+[[fault]]
+id = "intent-cli-stop-rewritten"
+family = "intentional-service-stop"
+summary = "An admin issues StopUnit through the CLI; it is rewritten to StopAndSuppress { until: NextBoot }, with a notice."
+spec = ["§14 stopping"]
+tags = []
+scoring = "intent"
+harness = ["fake", "vm"]
+intent = { kind = "no-intervention", because = "the user stopped it on purpose" }
+setup = [{ raw = "cli", argv = ["stop", "service:gym-web"], actor = "user:1001" }]
+inject = { raw = "wait", for = "5m" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Overridden" }
+overrides = [{ unit = "service:gym-web", until = "NextBoot", by = "user:1001" }]
+no_autonomous_txn = true
+reports = ["StopRewrittenNotice"]
+
+[[fault]]
+id = "intent-start-again-repairs"
+family = "intentional-service-stop"
+summary = "After a user stop, \"start gym-web again\" lifts the override, and the unit is desired Running again and repaired."
+spec = ["§14 stopping"]
+tags = []
+scoring = "repair"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [
+  { raw = "ask", phrase = "stop gym-web until I say", actor = "user:1001" },
+  { raw = "wait", for = "1m" },
+]
+inject = { raw = "ask", phrase = "start gym-web again", actor = "user:1001" }
+window = "5m"
+
+[fault.required_post]
+units = { "service:gym-web" = "Running" }
+overrides = []
+
+[[fault.required_post.txn]]
+transition = "LiftOverride"
+target = "service:gym-web"
+terminal = "Committed"
+
+[[fault]]
+id = "authz-unprivileged-override-security"
+family = "intentional-service-stop"
+summary = "alice tries to override sshd, a system Security unit. It is held as AskFirst for an administrator; sshd stays up meanwhile."
+spec = ["§11 authorization", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "cli", argv = ["override", "service:sshd", "--stop"], actor = "user:1000" }
+window = "1m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+overrides = []
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+decision = "Allow(AskFirst)"
+approver_class = "Administrator"
+terminal = "pending"
+
+[[fault]]
+id = "authz-forged-actor-overwritten"
+family = "intentional-service-stop"
+summary = "alice submits a SetOverride for her own pipewire with by = Daemon. SO_PEERCRED overwrites the actor to user:1000; the override is allowed and attributed to her."
+spec = ["§11 caller identity", "I14"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { transition = "SetOverride", unit = "service@1000:pipewire", until = "Explicit", reason = "test", by = "daemon", source = "user", actor = "user:1000" }
+window = "1m"
+
+[fault.required_post]
+overrides = [{ unit = "service@1000:pipewire", until = "Explicit", by = "user:1000" }]
+
+# C3 (§12 step 5): preconditions are the executor's.
+[[fault]]
+id = "override-over-attested-refused"
+family = "intentional-service-stop"
+summary = "alice stops her own pipewire with an override. An administrator then sets a different override on the same unit: Rejected(Precondition), naming alice as the holder; her override stands."
+spec = ["§12 step 5", "§11", "C3"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "greeter_login", uid = 1000 },
+  { transition = "SetOverride", unit = "service@1000:pipewire", desired = "Stopped", until = "Explicit", reason = "mine", source = "user", actor = "user:1000" },
+  { raw = "wait", for = "30s" },
+]
+inject = { transition = "SetOverride", unit = "service@1000:pipewire", desired = "LeaveAlone", until = "Explicit", reason = "admin's", source = "user", actor = "user:1001" }
+window = "1m"
+
+[fault.required_post]
+overrides = [{ unit = "service@1000:pipewire", until = "Explicit", by = "user:1000" }]
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+caller = "user:1001"
+refused_with = "Precondition"
+reject_detail = "set by uid 1000"
+
+[[fault]]
+id = "authz-unprivileged-stop-unauthorized"
+family = "intentional-service-stop"
+summary = "alice tries to stop gym-db, a system unit that is neither Security-sensitive nor user-controllable: Reject(Unauthorized), whatever max_tier says."
+spec = ["§11 authorization", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { raw = "cli", argv = ["stop", "service:gym-db"], actor = "user:1000" }
+window = "1m"
+
+[fault.required_post]
+units = { "service:gym-db" = "Running" }
+reports = ["Unauthorized"]
+
+[[fault.required_post.txn]]
+transition = "StopAndSuppress"
+decision = "Reject(Unauthorized)"
+
+[[fault]]
+id = "authz-user-overrides-firewall"
+family = "intentional-service-stop"
+summary = "From her session, alice overrides the firewall (sshd's stand-in in the fake: a Security unit) to stopped. Held for an administrator; it stays up. alice cannot approve her own request (I19); root at a terminal approves, and the override holds, attested and attributed to alice."
+spec = ["§11 authorization", "§11 approval", "I19", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "session_login", uid = 1000, session = "s1", seat = "seat0" }]
+inject = { raw = "cli", argv = ["override", "service:sshd", "--stop"], actor = "user:1000@s1" }
+after = [
+  { raw = "approve_pending", actor = "user:1000", via = "tty" },
+  { raw = "wait", for = "30s" },
+  { raw = "approve_pending", actor = "root", via = "tty" },
+]
+window = "3m"
+
+[fault.required_post]
+overrides = [{ unit = "service:sshd", until = "Explicit", by = "user:1000@s1", attribution = "Attested" }]
+invariants = ["I19"]
+
+[[fault.required_post.txn]]
+transition = "SetOverride"
+decision = "Allow(AskFirst)"
+approver_class = "Administrator"
+terminal = "Committed"

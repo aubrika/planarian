@@ -1,0 +1,20 @@
+# Family: assumptions (catalog entries; format in 00-format.toml)
+
+# §17a, AGENTS.md 12 (v4.4): the fake as a second implementation of every
+# docs/assumptions.md entry (crates/gym/src/conformance.rs).
+[[fault]]
+id = "fake-assumptions-conformance"
+family = "assumptions"
+summary = "The transaction kernel against the fake backend, once per docs/assumptions.md entry and injected outcome. Each run must satisfy the entry's contract and reach a terminal state (I12)."
+spec = ["§17a", "§18.12", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+matrix = { assumption = "docs/assumptions.md#all", outcome = ["Partial", "Unknown", "Fenced"] }
+inject = { raw = "backend_result", call = "<assumption>", result = "<outcome>" }
+window = "10m"
+
+[fault.required_post]
+invariants = ["I6", "I12", "I15"]
+reports = ["AssumptionHeld(<assumption>)"]

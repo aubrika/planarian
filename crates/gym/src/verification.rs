@@ -19,7 +19,7 @@ use toml::Value as T;
 const RATIO: &str = "docs/verification-ratio.toml";
 const ASSUMPTIONS: &str = "docs/assumptions.md";
 const BYPASSES: &str = "docs/bypasses.md";
-const CATALOG: &str = "crates/gym/catalog/phase-a.toml";
+const CATALOG: &str = crate::catalog::DIR;
 const VERIFIED: &[&str] = &["crates/policy/src", "crates/schema/src", "crates/txn/src"];
 
 fn rust_files(dir: &Path, out: &mut Vec<String>) {
@@ -141,7 +141,21 @@ pub fn parse_bypasses(text: &str) -> (BTreeMap<String, Vec<String>>, Vec<String>
     let mut open: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut errors = vec![];
     let mut seen = std::collections::BTreeSet::new();
+    // §17b (D13): three tables, Open, Closed and Accepted, each once and in
+    // that order; a row is held to the table it sits in.
+    const TABLES: [&str; 3] = ["Open", "Closed", "Accepted"];
+    let mut table: Option<&str> = None;
+    let mut tables: Vec<&str> = vec![];
     for line in text.lines() {
+        if let Some(h) = line.strip_prefix("## ") {
+            let h = h.trim();
+            table = TABLES.iter().copied().find(|t| *t == h);
+            match table {
+                Some(t) => tables.push(t),
+                None => errors.push(format!("{BYPASSES}: section {h:?} is not one of Open, Closed, Accepted")),
+            }
+            continue;
+        }
         let cells: Vec<&str> = line.trim().trim_matches('|').split('|').map(str::trim).collect();
         let id = cells.first().copied().unwrap_or("");
         let (kind, width) = match id.split_once('-') {
@@ -149,6 +163,12 @@ pub fn parse_bypasses(text: &str) -> (BTreeMap<String, Vec<String>>, Vec<String>
             Some(("X", n)) if n.parse::<u32>().is_ok() => ('X', 6),
             _ => continue,
         };
+        let want = if kind == 'X' { "Accepted" } else { "Open or Closed" };
+        match (kind, table) {
+            (_, None) => errors.push(format!("{BYPASSES}: {id} is outside the Open, Closed and Accepted tables")),
+            ('X', Some("Accepted")) | ('B', Some("Open" | "Closed")) => {}
+            (_, Some(t)) => errors.push(format!("{BYPASSES}: {id} is in {t}; a {kind}- row belongs in {want}")),
+        }
         if !seen.insert(id.to_string()) {
             errors.push(format!("{BYPASSES}: {id} appears twice (ids are never reused)"));
         }
@@ -174,11 +194,22 @@ pub fn parse_bypasses(text: &str) -> (BTreeMap<String, Vec<String>>, Vec<String>
         if !matches!(severity, "High" | "Medium" | "Low") {
             errors.push(format!("{BYPASSES}: {id}: severity {severity:?} is not High, Medium or Low"));
         }
+        let closed = status.starts_with("Closed (") && status.ends_with(')');
         if status.starts_with("Open") {
             open.entry(severity.to_string()).or_default().push(id.to_string());
-        } else if !(status.starts_with("Closed (") && status.ends_with(')')) {
+        } else if !closed {
             errors.push(format!("{BYPASSES}: {id}: status {status:?} is neither Open… nor Closed (<commit>)"));
         }
+        match table {
+            Some("Open") if closed => errors.push(format!("{BYPASSES}: {id} is Closed but left in Open")),
+            Some("Closed") if status.starts_with("Open") => {
+                errors.push(format!("{BYPASSES}: {id} is Open but sits in Closed"))
+            }
+            _ => {}
+        }
+    }
+    if tables != TABLES {
+        errors.push(format!("{BYPASSES}: tables {tables:?}; want Open, Closed, Accepted, each once, in that order"));
     }
     (open, errors)
 }
@@ -263,7 +294,7 @@ pub fn run(write_baseline: bool, gate: bool) -> Report {
 
     // §17a: every proved invariant has a catalog entry written from its
     // English (tag `english`), so a wrong specification shows up as a failure.
-    let english: Vec<String> = std::fs::read_to_string(CATALOG)
+    let english: Vec<String> = crate::catalog::read_text(Path::new(CATALOG))
         .ok()
         .and_then(|t| toml::from_str::<T>(&t).ok())
         .and_then(|d| d.get("fault").and_then(T::as_array).cloned())
@@ -386,21 +417,35 @@ mod tests {
             assert!(open.values().flatten().count() > 0);
         }
         let row = |id: &str, sev: &str, status: &str| format!("| {id} | r | b | {sev} | {status} | m | A | I1, I2 |\n");
+        let x = "| X-1 | r | b | n | E | all |\n";
+        // A register with the given rows in Open, Closed and Accepted.
+        let reg = |o: &str, c: &str, a: &str| format!("## Open\n{o}\n## Closed\n{c}\n## Accepted\n{a}");
         let bad = [
-            row("B-1", "High", "Open") + &row("B-1", "Low", "Open"),
-            row("B-2", "Severe", "Open"),
-            row("B-3", "Low", "Done"),
-            "| B-4 | r | b | Low | Open |\n".to_string(),
-            "| X-1 | r | b | n |\n".to_string(),
-            "| B-7 | r | b | Low | Open | m | A | |\n".to_string(),
-            "| B-8 | r | b | Low | Open | m | A | everything |\n".to_string(),
+            reg(&(row("B-1", "High", "Open") + &row("B-1", "Low", "Open")), "", x),
+            reg(&row("B-2", "Severe", "Open"), "", x),
+            reg(&row("B-3", "Low", "Done"), "", x),
+            reg("| B-4 | r | b | Low | Open |\n", "", x),
+            reg("", "", "| X-1 | r | b | n |\n"),
+            reg("| B-7 | r | b | Low | Open | m | A | |\n", "", x),
+            reg("| B-8 | r | b | Low | Open | m | A | everything |\n", "", x),
+            // D13: a Closed row left in Open, an Open row in Closed, rows in
+            // the wrong kind of table or in none, and the tables themselves.
+            reg(&row("B-9", "Low", "Closed (abc123)"), "", x),
+            reg("", &row("B-9", "Low", "Open (v4.6)"), x),
+            reg(&row("B-9", "Low", "Open"), "", &(row("B-10", "Low", "Closed (abc123)") + x)),
+            reg(x, "", ""),
+            row("B-9", "Low", "Open") + &reg("", "", x),
+            format!("## Open\n## Accepted\n{x}"),
+            format!("## Closed\n## Open\n## Accepted\n{x}"),
+            reg("", "", x) + "## Open\n",
+            reg("", "", x) + "## Withdrawn\n",
         ];
         for text in bad {
             assert!(!parse_bypasses(&text).1.is_empty(), "accepted: {text}");
         }
         let (open, errors) =
-            parse_bypasses(&(row("B-5", "High", "Open (v4.5)") + &row("B-6", "Low", "Closed (abc123)")));
-        assert!(errors.is_empty());
+            parse_bypasses(&reg(&row("B-5", "High", "Open (v4.5)"), &row("B-6", "Low", "Closed (abc123)"), x));
+        assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(open.get("High").map(Vec::len), Some(1));
         assert_eq!(open.get("Low"), None);
     }

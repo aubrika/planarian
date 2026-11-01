@@ -1,0 +1,21 @@
+# Family: journal-integrity (catalog entries; format in 00-format.toml)
+
+# §12c, I18 (v4.4): a retained record edited on disk.
+[[fault]]
+id = "journal-record-edited"
+family = "journal-integrity"
+summary = "A retained journal record is edited on disk while the daemon runs. The next read detects the broken chain as an Integrity failure; no transaction is taken from the edited record."
+spec = ["§12c", "I18", "§15 v4.4"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "RestartUnit", unit = "service:gym-web", source = "user", actor = "user:1001" }]
+inject = { raw = "break_journal_chain", record = "retained" }
+after = [{ raw = "restart_process", process = "planariad" }]
+window = "3m"
+
+[fault.required_post]
+posture = { class = "Integrity", target_reached = "planarian-failed@Integrity.target" }
+reports = ["JournalChainBroken"]
+invariants = ["I18"]

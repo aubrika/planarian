@@ -1,0 +1,172 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Policy acceptance cases (§15 v4-review list; not a §15 family)
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "policy-daemon-session-drop-rebind"
+family = "policy"
+summary = "virtio-gpu is unbound during alice's session; the diagnoser proposes BindDriver on gpu0. Its disruption is SessionLoss and the proposer is not the session owner, so it is AskFirst, parked and surfaced, and does not run."
+spec = ["§11 global floors", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "greeter_login", uid = 1000 }]
+inject = { raw = "unbind_driver", device = "device:gpu0" }
+window = "5m"
+
+[fault.required_post]
+reports = ["AwaitingApproval", "DisruptionSessionLoss"]
+
+[[fault.required_post.txn]]
+transition = "BindDriver"
+target = "device:gpu0"
+source = "diagnoser"
+decision = "Allow(AskFirst)"
+never = ["Activating"]
+
+[[fault]]
+id = "policy-daemon-wifi-runtime"
+family = "policy"
+summary = "The selected AP (gym-ap-a) goes away while gym-ap-b is known. The diagnoser's SetRuntimeOption Wi-Fi selection has ConnectivityLoss disruption, so it is AskFirst and does not run."
+spec = ["§11 global floors", "§12a", "§15 v4-review"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ raw = "cli", argv = ["internal", "wifi-connect", "gym-ap-a"], actor = "root" }]
+inject = { raw = "stop_host_service", name = "hostapd-gym-ap-a" }
+window = "5m"
+
+[[fault.required_post.txn]]
+transition = "SetRuntimeOption"
+path_option = "wifi.network"
+source = "diagnoser"
+decision = "Allow(AskFirst)"
+never = ["Activating"]
+
+[[fault]]
+id = "policy-stale-digest"
+family = "policy"
+summary = "A proposal carries an observed digest from before a state change. It is rejected as Stale, and the current digest is returned."
+spec = ["§12 step 1"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "RestartUnit", unit = "service:gym-web", observed = "previous-digest", source = "user", actor = "user:1001" }
+window = "1m"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+decision = "Reject(Stale)"
+returns_current_digest = true
+
+[[fault]]
+id = "policy-refinement-violation"
+family = "policy"
+summary = "A proposal's expectation broadens may_change beyond what spec.predict() allows, and the refinement check rejects it."
+spec = ["§12 step 3"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+inject = { transition = "RestartUnit", unit = "service:gym-web", expected = { may_change = ["service:gym-web", "service:sshd"] }, source = "user", actor = "user:1001" }
+window = "1m"
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+decision = "Reject(Refinement)"
+never = ["Prepared"]
+
+[[fault]]
+id = "approval-token-invalidated"
+family = "policy"
+summary = "A token is issued for a parked AskFirst change, then the policy version changes. Re-validation invalidates the token and re-requests approval, and replaying the old token is refused."
+spec = ["§12 step 4", "I8"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty", hold_token = true },
+  { raw = "backend_result", call = "policy_version", result = "bumped" },
+]
+inject = { raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }
+after = [{ raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }]
+window = "5m"
+
+[fault.required_post]
+reports = ["ApprovalInvalidated", "TokenReplayRefused"]
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+never = ["Activating"]
+
+[[fault]]
+id = "approval-token-expired"
+family = "policy"
+summary = "A parked AskFirst change gets no approval for 24 h. It ends Rejected, its GC root is released, and any waiting incident reopens."
+spec = ["§12 steps 4–5"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" }]
+inject = { raw = "advance_clock", by = "24h1m" }
+window = "1m"
+
+[fault.required_post]
+gc_root_released = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal_prefix = "Rejected"
+
+# B-7 (Medium). Fake only: a VM cannot advance CLOCK_BOOTTIME by 24 h
+# (deviations.md, owner decision 2026-10-29).
+[[fault]]
+id = "token-wall-clock-moved-back"
+family = "policy"
+summary = "An approval token is held, then the wall clock is moved back 48 h and 24 h pass. The token still expires 24 h after issue, timed on CLOCK_BOOTTIME (§12h): presenting it is refused and the parked change ends Rejected."
+spec = ["§12h", "I8", "B-7"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" },
+  { raw = "approve_pending", actor = "root", via = "tty", hold_token = true },
+  { raw = "set_wall_clock", by = "-48h" },
+]
+inject = { raw = "advance_clock", by = "24h1m" }
+after = [{ raw = "cli", argv = ["internal", "present-token", "<held>"], actor = "root" }]
+window = "1m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal_prefix = "Rejected"
+never = ["Activating"]
+
+# B-3 (Medium).
+[[fault]]
+id = "approve-needs-real-terminal"
+family = "policy"
+summary = "Root approves a pending AskFirst change from a process with no controlling terminal (a new session, as a service would be). The daemon reads the terminal from the peer's pidfd, finds none, and refuses: the change is still waiting at the end. The request carries no terminal field to claim."
+spec = ["§11 approval", "§16 CLI", "B-3", "I14"]
+tags = ["acceptance", "bypass"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+setup = [{ transition = "ApplyChange", change = "service-enable", args = { service = "sshd", enabled = false }, source = "user", actor = "user:1001" }]
+inject = { raw = "approve_pending", actor = "root", via = "no-tty" }
+window = "2m"
+
+[fault.required_post]
+units = { "service:sshd" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "pending"
+never = ["Activating"]

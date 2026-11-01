@@ -1,0 +1,59 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Family: manifest-weakens-probe
+# ═══════════════════════════════════════════════════════════════════════════
+
+[[fault]]
+id = "manifest-weaken-via-proposal"
+family = "manifest-weakens-probe"
+summary = "A proposal tries to raise sshd's canonical probe timeout to 600 s and mark it Diagnostic. No catalog entry can express that, so it is rejected and never executed."
+spec = ["I10", "§11 reject", "§4 GA(2)"]
+tags = ["ga-gate"]
+scoring = "must-pass"
+harness = ["fake", "vm"]
+intent = { kind = "none" }
+inject = { transition = "ApplyChange", change = "manifest-probe-edit", args = { unit = "sshd", probe = "sshd-tcp", timeout = "600s", role = "Diagnostic" }, source = "user", actor = "user:1001" }
+window = "2m"
+
+[fault.required_post]
+generation = "base"
+probe_definitions_unchanged = true
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+decision_in = ["Reject(NotInCatalog)", "Reject(ProbeTamper)"]
+never = ["Activating"]
+
+[[fault]]
+id = "manifest-weaken-out-of-band"
+family = "manifest-weakens-probe"
+summary = "The owner weakens sshd's probe in their own config and rebuilds outside Planarian. Canonical probes are still evaluated from the core package, so a later sshd fault is still detected."
+spec = ["I10"]
+tags = []
+scoring = "must-pass"
+harness = ["vm"]
+intent = { kind = "none" }
+setup = [{ raw = "out_of_band_rebuild", edit = "services.planarian.units.sshd.probes.sshd-tcp.timeout = 600s", activate = true }]
+inject = { raw = "block_network", dst = "127.0.0.1", port = 22 }
+window = "3m"
+
+[fault.required_post]
+status_seen = { "service:sshd" = ["Degraded"] }
+canonical_probe_source = "core"
+
+[[fault]]
+id = "core-target-rejected"
+family = "manifest-weakens-probe"
+summary = "A candidate whose evaluated unit file for planariad differs from the running one is rejected as CoreTarget, under any approval."
+spec = ["§12 self-protection", "Principle 1"]
+tags = ["extra"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [{ raw = "backend_result", call = "evaluate", result = "planariad-unit-changed" }]
+inject = { transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1001" }
+window = "1m"
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+decision = "Reject(CoreTarget)"
+never = ["Activating"]
