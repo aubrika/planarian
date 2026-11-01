@@ -1710,6 +1710,40 @@ fn needs_full_window(post: &T) -> bool {
     })
 }
 
+/// #9: a stalled activation fails the entry, whatever else it judges (a
+/// 15-minute startup stall once passed a 20-minute window unnoticed): an
+/// activation unit that ran into its start timeout, or one still activating
+/// at the end for longer than the entry's own slow_backend delay plus 300 s.
+fn stalls(entry: &T, failures: &mut Vec<String>) {
+    let timed_out = sh_out(
+        "journalctl -b --no-pager -o cat -u 'planarian-op-*' 2>/dev/null | grep -F 'start operation timed out' || true",
+    );
+    if let Some(line) = timed_out.lines().next() {
+        failures.push(format!("harness: an activation unit hit its start timeout ({}): a stall", line.trim()));
+    }
+    let deliberate = entry
+        .get("setup")
+        .and_then(T::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|st| st.get("raw").and_then(T::as_str) == Some("slow_backend"))
+        .filter_map(|st| st.get("delay").and_then(crate::sim::dur))
+        .map(|d| d.0 / 1000)
+        .max()
+        .unwrap_or(0);
+    let limit = deliberate + 300;
+    let stuck = sh_out(&format!(
+        "now=$(awk '{{printf \"%d\", $1}}' /proc/uptime); \
+         for u in $(systemctl list-units --plain --no-legend --state=activating 'planarian-op-*' | awk '{{print $1}}'); do \
+           t=$(systemctl show -P InactiveExitTimestampMonotonic \"$u\"); age=$((now - t / 1000000)); \
+           [ \"$age\" -gt {limit} ] && echo \"$u activating for $age s\"; \
+         done; true"
+    ));
+    if let Some(line) = stuck.lines().next() {
+        failures.push(format!("harness: {} (allowed {limit} s): a stall", line.trim()));
+    }
+}
+
 /// Wait the window (ending early once the entry passes, if nothing in it
 /// could still turn), then judge.
 fn judge(entry: &T) -> i32 {
@@ -1747,6 +1781,7 @@ fn judge(entry: &T) -> i32 {
         }
         std::thread::sleep(Duration::from_secs(20));
     }
+    stalls(entry, &mut v.failures);
     sh("systemctl stop gym-sampler 2>/dev/null; true");
     // A run the sampler never saw proves nothing.
     if unsupported.is_empty() && e.seen_status.is_empty() {
