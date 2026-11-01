@@ -12,7 +12,10 @@ scoring = "repair"
 harness = ["fake", "vm"]
 intent = { kind = "none" }
 inject = { raw = "set_persistent_knob", unit = "service:gym-flap", knob = "fail_after", value = "30s" }
-window = "20m"
+# The third attempt and the cooldown come at about 170 s (VM run 110), the
+# boot-confirmed baseline at about 600 s; 15m covers both, and a fourth
+# attempt (a loop) would show within one more 300 s backoff (#8 window review).
+window = "15m"
 
 [fault.required_post]
 reports = ["Flapping"]

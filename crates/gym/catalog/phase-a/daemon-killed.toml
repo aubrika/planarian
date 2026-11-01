@@ -253,7 +253,10 @@ setup = [
 ]
 inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { op_called = "activate_live" } }
 after = [{ raw = "hold_down", process = "planariad" }]
-window = "10m"
+# Held down for min(window/2, 300 s) while the watchdog recovers alone; it
+# finished at about 150 s in VM run 110 (last action 154 s), so 8m leaves
+# 240 s for that phase (#8 window review).
+window = "8m"
 
 [fault.required_post]
 interlock = "set"
@@ -300,7 +303,9 @@ intent = { kind = "none" }
 setup = [{ transition = "ApplyChange", change = "font-scale", args = { scale = 1.25 }, source = "user", actor = "user:1000" }]
 inject = { raw = "kill_process", process = "planariad", signal = "SIGKILL", when = { journal = "Checking" } }
 after = [{ raw = "restart_process", process = "planariad", aligned_with = "watchdog-tick" }]
-window = "10m"
+# The takeover settles within seconds (VM run 110: committed at +2 s); 5m
+# still spans many watchdog periods and lease renewals (#8 window review).
+window = "5m"
 
 [fault.required_post]
 journal_agrees = true
