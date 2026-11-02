@@ -53,7 +53,14 @@ pkgs.testers.runNixOSTest {
     systemd.services.nw-quiet = {
       wantedBy = [ "multi-user.target" ];
       after = [ "planarian-netwatch.service" ];
-      serviceConfig = { Type = "simple"; Restart = "no"; ExecStart = "${pkgs.coreutils}/bin/sleep infinity"; };
+      serviceConfig = {
+        Type = "simple";
+        Restart = "no";
+        # /run/nw-quiet-slow: seconds its start takes, so the daemon's restart
+        # (which lifts the hold) cannot outrun the check that the hold is up.
+        ExecStartPre = "${pkgs.bash}/bin/bash -c 'sleep $(cat /run/nw-quiet-slow 2>/dev/null || echo 0)'";
+        ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+      };
     };
     systemd.services.nw-legacy = oneshot
       "${ipt} -A OUTPUT -d 203.0.113.79 -j DROP"
@@ -61,7 +68,7 @@ pkgs.testers.runNixOSTest {
     systemd.services.nw-nft = oneshot
       "${nft} 'add table inet nwnft; add chain inet nwnft out { type filter hook output priority 0; }; add rule inet nwnft out ip daddr 203.0.113.80 drop'"
       "${nft} delete table inet nwnft";
-    # Declared with no tag so the daemon restarts nw-quiet after (f).
+    # Declared with no tag so the daemon restarts nw-quiet after each kill.
     services.planarian.units.nw-quiet = { };
   };
 
@@ -89,6 +96,25 @@ pkgs.testers.runNixOSTest {
         lines = footprint(unit)
         assert fresh(stamp(lines)), (unit, lines, uptime())
         return lines
+
+    def watch_fresh():
+        machine.wait_until_succeeds(
+            f"grep -q '^attached ' {FP}/.watch && t=$(awk '{{print $2}}' {FP}/.watch) && [ $(( $(cut -d. -f1 /proc/uptime) - t )) -le 30 ]", timeout=60)
+
+    def quiet_is_held():
+        # nw-quiet steers nothing; whatever holds it is the watch's state.
+        machine.succeed("echo 30 > /run/nw-quiet-slow")
+        machine.succeed(f"grep -qx 'protecting no' {FP}/nw-quiet")
+        machine.succeed("systemctl kill --signal=SIGKILL nw-quiet.service")
+        machine.wait_until_succeeds("systemctl is-active planarian-hold@nw-quiet.service", timeout=30)
+        machine.succeed("nft list table inet planarian-hold")
+        machine.succeed("test -e /run/planarian/hold/nw-quiet")
+
+    def quiet_back_and_lifted():
+        machine.wait_until_succeeds("systemctl is-active nw-quiet.service", timeout=120)
+        machine.wait_until_fails("systemctl is-active planarian-hold@nw-quiet.service", timeout=120)
+        machine.fail("test -e /run/planarian/hold/nw-quiet")
+        machine.succeed("rm -f /run/nw-quiet-slow")
 
     machine.wait_for_unit("planarian-ready.target")
     machine.wait_for_unit("planarian-netwatch.service")
@@ -141,16 +167,37 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds(
             f"t=$(awk '{{print $2}}' {FP}/.watch); [ $(( $(cut -d. -f1 /proc/uptime) - t )) -gt 30 ]", timeout=90)
         # nw-quiet's footprint still says `protecting no`; only staleness can hold it.
-        machine.succeed(f"grep -qx 'protecting no' {FP}/nw-quiet")
-        machine.succeed("systemctl kill --signal=SIGKILL nw-quiet.service")
-        machine.wait_until_succeeds("systemctl is-active planarian-hold@nw-quiet.service", timeout=30)
-        machine.succeed("nft list table inet planarian-hold")
-        machine.succeed("test -e /run/planarian/hold/nw-quiet")
+        quiet_is_held()
         # The watch resumes; once nw-quiet is back, its hold lifts.
         machine.succeed("systemctl kill --signal=SIGCONT planarian-netwatch.service")
-        machine.wait_until_succeeds(f"t=$(awk '{{print $2}}' {FP}/.watch); [ $(( $(cut -d. -f1 /proc/uptime) - t )) -le 30 ]", timeout=60)
-        machine.wait_until_succeeds("systemctl is-active nw-quiet.service", timeout=120)
-        machine.wait_until_fails("systemctl is-active planarian-hold@nw-quiet.service", timeout=120)
-        machine.fail("test -e /run/planarian/hold/nw-quiet")
+        watch_fresh()
+        quiet_back_and_lifted()
+
+    with subtest("(h) a stopped watch reads failed, and a failing tool that was not protecting is held"):
+        machine.succeed("systemctl stop planarian-netwatch.service")
+        machine.succeed(f"grep -q '^failed' {FP}/.watch")
+        quiet_is_held()
+        machine.succeed("systemctl start planarian-netwatch.service")
+        watch_fresh()
+        quiet_back_and_lifted()
+
+    with subtest("(i) steering made while the watch was down is unattributed after it re-attaches, and holds"):
+        # Made by root from the test driver, outside any unit, while netwatch
+        # is stopped: on attach, netwatch finds a default route it never saw
+        # made and no claim covers (contract: `.unattributed`, reason
+        # `pre-attach <object>`, until the object is gone).
+        machine.succeed("systemctl stop planarian-netwatch.service")
+        machine.succeed("${ip} link add nwgap0 type dummy && ${ip} link set nwgap0 up && ${ip} route add default dev nwgap0 metric 4001")
+        machine.succeed("systemctl start planarian-netwatch.service")
+        watch_fresh()
+        machine.wait_until_succeeds(f"grep -q 'pre-attach' {FP}/.unattributed", timeout=30)
+        # The claims survived the re-attach; nw-quiet is fresh and still `protecting no`.
+        protecting("nw-route", "yes")
+        protecting("nw-quiet", "no")
+        quiet_is_held()
+        # The object gone, the unattributed change no longer stands.
+        machine.succeed("${ip} link delete nwgap0")
+        machine.wait_until_fails(f"test -e {FP}/.unattributed", timeout=30)
+        quiet_back_and_lifted()
   '';
 }
