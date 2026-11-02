@@ -235,6 +235,13 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// Set by the daemon while a deferred change builds elsewhere: what, and since when.
     pub building: Option<(String, Timestamp)>,
     deferred: Option<(PrebuildJob<B::Gens>, Resume)>,
+    /// The hash of the core-hash record the running generation installs
+    /// (`/etc/planarian/core.sha256`, I2), for `SystemState.core_hash` and
+    /// so for `digest()` (P19). Read when the daemon names the record
+    /// (`set_core_hash_record`) and again whenever the running generation
+    /// changes; zero where no record exists (tests, the fake harness).
+    core_hash: Hash,
+    core_hash_record: Option<std::path::PathBuf>,
 }
 
 /// How to finish a request whose slow part ran elsewhere.
@@ -343,6 +350,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             _ => None,
         };
         let mut core = Core {
+            core_hash: Hash::ZERO,
+            core_hash_record: None,
             after_ready: deferred,
             ex,
             b,
@@ -457,6 +466,30 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         self.ex.kernel.journal.sync_ledger().cloned().unwrap_or_default()
     }
 
+    /// P19: the record the running generation installs, for the state's
+    /// `core_hash`; read now and on every generation change.
+    pub fn set_core_hash_record(&mut self, record: std::path::PathBuf) {
+        self.core_hash_record = Some(record);
+        self.read_core_hash();
+    }
+
+    /// The core hash the observed state carries (P19).
+    pub fn core_hash(&self) -> Hash {
+        self.core_hash
+    }
+
+    /// An unreadable record (not a missing one) keeps the value already
+    /// held and says so: nothing is derived from a failed read (rule 21).
+    fn read_core_hash(&mut self) {
+        let Some(record) = self.core_hash_record.clone() else { return };
+        match crate::config::core_hash(&record) {
+            Ok(h) => self.core_hash = h,
+            Err(e) => {
+                self.notice(format!("the core hash record could not be read ({e}); the state keeps the last one read"))
+            }
+        }
+    }
+
     fn context(&self, l: &Ledger, current: GenerationId) -> Context {
         let now = self.b.clock().now();
         Context {
@@ -465,7 +498,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             accepted_baseline: l.accepted_baseline,
             overrides: l.overrides.iter().filter(|s| s.holds_at(now)).cloned().collect(),
             security_floor: l.security_floor,
-            core_hash: Hash::ZERO,
+            core_hash: self.core_hash,
         }
     }
 
@@ -519,6 +552,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             // that is a person's stop (§11 residue).
             self.generation_touched = true;
             self.note_declarations(Some(prev), current, true);
+            // P19: a switch may install another core record.
+            self.read_core_hash();
         }
         let ctx = self.context(&l, current);
         let protect = self.protect(&l, current);
