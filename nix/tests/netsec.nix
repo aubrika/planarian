@@ -93,6 +93,9 @@ pkgs.testers.runNixOSTest {
     # with the owner): the same with no entry at all, once §12d says what
     # happens to an undeclared network tool (held; repaired or not).
     services.planarian.units.gym-vpn-untagged = { };
+    # The shared fixture's templated network tool (gym-tpl@, instance a),
+    # declared with no tag so the daemon restarts it, as gym-vpn-untagged.
+    services.planarian.units."gym-tpl@a" = { };
     # Something on loopback to reach while held.
     systemd.services.local-web = {
       wantedBy = [ "multi-user.target" ];
@@ -273,5 +276,19 @@ pkgs.testers.runNixOSTest {
         after = int(machine.succeed(asked).strip() or 0)
         assert after == before, f"the restart asked: {before} -> {after}"
         machine.succeed("rm -f /run/wireguard-gym-slow")
+
+    with subtest("a templated tool's instance holds as planarian-hold@<instance>, and the restart lifts it (%N)"):
+        machine.wait_for_unit("gym-tpl@a.service")
+        # OnFailure= comes from the template's drop-in, with %N filled in per instance.
+        machine.succeed("systemctl show -p OnFailure gym-tpl@a.service | grep -qF 'planarian-hold@gym-tpl@a.service'")
+        machine.succeed("nft list table inet gymtpl_a")
+        machine.succeed("echo 30 > /run/gym-tpl-a-slow")
+        machine.succeed("systemctl kill --signal=SIGKILL gym-tpl@a.service")
+        machine.wait_until_fails(lan_ok(), timeout=20)
+        held_for("gym-tpl@a")
+        machine.wait_until_succeeds("systemctl is-active gym-tpl@a.service", timeout=120)
+        machine.wait_until_succeeds(lan_ok(), timeout=60)
+        not_held("gym-tpl@a")
+        machine.succeed("rm -f /run/gym-tpl-a-slow")
   '';
 }
