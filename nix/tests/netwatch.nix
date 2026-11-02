@@ -126,6 +126,41 @@ pkgs.testers.runNixOSTest {
         '';
       };
     };
+    # (q) OpenVPN's default (`dev tun`): TUNSETIFF with an empty name, so
+    # the kernel names the device itself (tun%d resolves at registration).
+    # The helper writes the name it got to /run/nw-tunauto.name and routes
+    # 0/1 and 128/1 over it at metric 60.
+    systemd.services.nw-tunauto = {
+      wantedBy = [ "multi-user.target" ];
+      after = [ "planarian-netwatch.service" "nw-tun.service" ];
+      path = [ pkgs.iproute2 ];
+      serviceConfig = {
+        Type = "simple";
+        Restart = "no";
+        ExecStart = pkgs.writers.writePython3 "nw-tunauto-holder" { } ''
+          import fcntl
+          import signal
+          import struct
+          import subprocess
+
+          TUNSETIFF = 0x400454CA
+          IFF_TUN, IFF_NO_PI = 0x0001, 0x1000
+          fd = open("/dev/net/tun", "r+b", buffering=0)
+          req = struct.pack("16sH", b"", IFF_TUN | IFF_NO_PI)
+          got = fcntl.ioctl(fd, TUNSETIFF, req)
+          name = got[:16].split(b"\0")[0].decode()
+          for cmd in (["link", "set", name, "up"],
+                      ["route", "add", "0.0.0.0/1", "dev", name,
+                       "metric", "60"],
+                      ["route", "add", "128.0.0.0/1", "dev", name,
+                       "metric", "60"]):
+              subprocess.run(["ip"] + cmd, check=True)
+          with open("/run/nw-tunauto.name", "w") as f:
+              f.write(name)
+          signal.pause()
+        '';
+      };
+    };
     # (p) A setup unit makes a persistent tun (`ip tuntap add`, ioctl) and
     # routes nothing; a second unit routes 0/1 and 128/1 over it (metric 50,
     # beside tun0's). Both count: the creator's interface carries the
@@ -218,7 +253,7 @@ pkgs.testers.runNixOSTest {
 
     machine.wait_for_unit("planarian-ready.target")
     machine.wait_for_unit("planarian-netwatch.service")
-    for u in ["nw-route", "nw-quiet", "nw-sockopt", "nw-nft", "nw-hostwg", "nw-tun", "nw-tunsetup", "nw-tunroute"]:
+    for u in ["nw-route", "nw-quiet", "nw-sockopt", "nw-nft", "nw-hostwg", "nw-tun", "nw-tunsetup", "nw-tunroute", "nw-tunauto"]:
         machine.wait_for_unit(f"{u}.service")
 
     with subtest("(a) the watch is attached, with a fresh CLOCK_BOOTTIME stamp"):
@@ -369,6 +404,14 @@ pkgs.testers.runNixOSTest {
         assert "iface nwtap0" in protecting("nw-tunsetup", "yes")
         protecting("nw-tunroute", "yes")
         machine.fail(f"test -e {FP}/.unattributed")
+
+    with subtest("(q) a tun the kernel named (OpenVPN's default, tun%d): protecting, under its real name"):
+        machine.wait_until_succeeds("test -s /run/nw-tunauto.name", timeout=60)
+        name = machine.succeed("cat /run/nw-tunauto.name").strip()
+        assert name.startswith("tun") and "%" not in name, name
+        lines = protecting("nw-tunauto", "yes")
+        assert f"iface {name}" in lines, (name, lines)
+        machine.fail(f"grep -rq 'tun%d' {FP}")
 
     with subtest("(f) a stopped watch goes stale, and a failing tool that was not protecting is held"):
         # Stopped, not killed: a killed watcher may be restarted at once, and
