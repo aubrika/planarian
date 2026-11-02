@@ -16,10 +16,15 @@ pub const BOOTED_CONFIG: &str = "/run/booted-system/etc/planarian/config.json";
 pub const CORE_HASH_RECORD: &str = "/etc/planarian/core.sha256";
 
 /// `SystemState.core_hash` (P19): the hash of the recorded core-hash file's
-/// bytes. Zero when there is no record (a development build); a damaged
-/// record is the watchdog's integrity finding, not this.
-pub fn core_hash(record: &std::path::Path) -> planarian_schema::Hash {
-    std::fs::read(record).map(|b| planarian_schema::Hash::of(&b)).unwrap_or(planarian_schema::Hash::ZERO)
+/// bytes. Zero only when there is no record (a development build); any
+/// other read failure is an error, never a value (§18 rule 21). A damaged
+/// record is the watchdog's integrity finding (I2), not this.
+pub fn core_hash(record: &std::path::Path) -> Result<planarian_schema::Hash, String> {
+    match std::fs::read(record) {
+        Ok(b) => Ok(planarian_schema::Hash::of(&b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(planarian_schema::Hash::ZERO),
+        Err(e) => Err(format!("{}: {e}", record.display())),
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

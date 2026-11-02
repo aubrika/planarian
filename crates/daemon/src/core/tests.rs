@@ -1161,23 +1161,25 @@ fn a_slow_tick_is_warned() {
 
 /// P19: `SystemState.core_hash` is the recorded core hash, not zero, so
 /// `digest()` covers it: a proposal observed under one record is stale
-/// under another.
+/// under another. The record is read again when the running generation
+/// changes; only a missing record is zero, and an unreadable one keeps the
+/// last value read and says so (rule 21).
 #[test]
 fn the_state_carries_the_recorded_core_hash() {
     let dir = std::env::temp_dir().join(format!("planarian-core-hash-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let record = dir.join("core.sha256");
     std::fs::write(&record, "00ab /run/current-system/sw/bin/planariad\n").unwrap();
-    let recorded = crate::config::core_hash(&record);
-    assert_eq!(recorded, Hash::of(&std::fs::read(&record).unwrap()));
-    assert_eq!(crate::config::core_hash(&dir.join("absent")), Hash::ZERO, "no record: zero");
-    std::fs::remove_dir_all(&dir).unwrap();
+    let recorded = Hash::of(&std::fs::read(&record).unwrap());
+    assert_eq!(crate::config::core_hash(&record), Ok(recorded));
+    assert_eq!(crate::config::core_hash(&dir.join("absent")), Ok(Hash::ZERO), "no record: zero");
+    assert!(crate::config::core_hash(&dir).is_err(), "unreadable (a directory): an error, not zero");
 
     let mut r = Rig::new();
     r.ticks(2);
     let (before, _) = r.core.observe();
     assert_eq!(before.core_hash, Hash::ZERO);
-    r.core.core_hash = recorded;
+    r.core.set_core_hash_record(record.clone());
     let (s, defs) = r.core.observe();
     assert_eq!(s.core_hash, recorded, "the state carries the record's hash");
     assert_ne!(s.digest(), before.digest(), "the digest covers it");
@@ -1188,4 +1190,19 @@ fn the_state_carries_the_recorded_core_hash() {
     p.observed = before.digest();
     let got = r.core.ex.submit(p, authorization_of(Actor::Daemon), &s, &defs);
     assert!(matches!(got, Submitted::Rejected { reason: RejectReason::Stale, .. }), "{got:?}");
+
+    // A switch outside Planarian installs another record: read again.
+    std::fs::write(&record, "00cd /run/current-system/sw/bin/planariad\n").unwrap();
+    let (same_gen, _) = r.core.observe();
+    assert_eq!(same_gen.core_hash, recorded, "not re-read without a generation change");
+    let running = r.fake.w().current;
+    r.fake.w().current = GenerationId(running.0 + 1);
+    let (switched, _) = r.core.observe();
+    assert_eq!(switched.core_hash, Hash::of(&std::fs::read(&record).unwrap()), "re-read on the switch");
+
+    // Unreadable: the last value read stays, with a notice.
+    r.core.set_core_hash_record(dir.clone());
+    assert_eq!(r.core.core_hash(), switched.core_hash);
+    assert!(r.core.notices.iter().any(|n| n.contains("core hash record could not be read")), "{:?}", r.core.notices);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
