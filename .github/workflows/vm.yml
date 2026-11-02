@@ -73,7 +73,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        check: [vm-runtime, vm-generations, vm-posture, installer, vm-netwatch]
+        check: [vm-runtime, vm-generations, vm-posture, installer, vm-netwatch, vm-netsec]
     steps:
       - uses: actions/checkout@v4
       - name: Enable KVM
