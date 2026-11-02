@@ -131,3 +131,15 @@ Still open, each in issue #7's lanes: §12f
 (#10); P11 and the module-eval assertions (#11); deviations and the closing
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
 proved; the residue classifier under Kani).
+
+## Reviewer: C10 acceptance test (#10), 2 Nov
+
+Written from §11's global floors only (`review/lane-change-path-c10`).
+`crates/exec/src/tests.rs::each_disruption_keeps_its_own_floor`: a seated
+administrator's Rollback restarts a ConnectivityLoss unit (no floor for a
+local caller) and a DataInterruption unit (AskFirst unless it is the caller's
+own session). On `main` it commits without asking: `max` over `Disruption`'s
+order keeps ConnectivityLoss and the DataInterruption floor is lost. The
+control (the ConnectivityLoss unit alone) runs on `main` and must keep
+running. The test asserts the decision (Parked), not the representation of
+the combined disruption.
