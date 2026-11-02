@@ -1467,6 +1467,7 @@ fn a_held_unit_crash_holds_restarts_at_once_and_lifts() {
     assert!(r.fake.w().held.contains(&sshd), "OnFailure= held it");
     r.ticks(1);
     assert!(r.core.ledger().holds().contains(&sshd), "journaled");
+    assert!(r.core.observe().0.holds.contains(&sshd), "in the observed state, for derive");
     assert_eq!(alarms(&r), 1, "{:?}", r.core.notices);
     r.ticks(10);
     assert!(r.core.ex.parked.is_empty(), "restarted without asking: {:?}", r.core.notices);

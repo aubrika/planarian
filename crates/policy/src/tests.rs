@@ -18,6 +18,7 @@ fn state() -> SystemState {
         conditions: Default::default(),
         resources: Default::default(),
         core_hash: Hash::ZERO,
+        holds: Default::default(),
         observed_at: Timestamp(0),
     }
 }

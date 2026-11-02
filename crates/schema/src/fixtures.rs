@@ -62,6 +62,7 @@ pub fn empty_state(now: u64) -> SystemState {
         conditions: BTreeSet::new(),
         resources: Resources::default(),
         core_hash: Hash::ZERO,
+        holds: Default::default(),
         observed_at: Timestamp(now),
     }
 }

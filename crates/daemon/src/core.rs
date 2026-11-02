@@ -594,7 +594,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         } else {
             self.cfg.exec.settings.max_tier
         };
-        let s = self.asm.observe(&self.b, &ctx);
+        let mut s = self.asm.observe(&self.b, &ctx);
+        // §12d: what is held now, the journal's and the host's (fail closed:
+        // either one holding is held).
+        s.holds = l.holds();
+        if let Ok(h) = self.b.units().held() {
+            s.holds.extend(h);
+        }
         let mut defs = self.asm.defs();
         // §12d: each network-security unit's hold unit, known (so releasing
         // it derives the held unit's sensitivity) but never expected.
