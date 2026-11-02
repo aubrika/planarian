@@ -131,7 +131,19 @@ pub fn run(export: &Path, object: &Path, dir: &Path) -> Result<(), String> {
     let root = Path::new("/sys/fs/cgroup");
     let mut cgroups = read_cgroups(root).0;
     let mut ifnames = read_ifnames();
-    let mut tracker = Tracker::default();
+    // §12d, on every attach: reconcile what was claimed before with what
+    // stands now; anything steering nobody claims was made unwatched.
+    let mut name = |i: u32| {
+        if !ifnames.contains_key(&i) {
+            ifnames = read_ifnames();
+        }
+        ifnames.get(&i).cloned()
+    };
+    let (standing, virtual_ifaces) = match crate::snapshot::standing(&mut name) {
+        Ok(s) => s,
+        Err(e) => return fail(format!("snapshot: {e}")),
+    };
+    let mut tracker = Tracker::attach(&crate::read_claims(dir), &standing, &virtual_ifaces);
     let mut lost_seen = 0u64;
     let mut next_tick = Instant::now();
     while !stop.load(Ordering::Relaxed) {
@@ -173,7 +185,7 @@ pub fn run(export: &Path, object: &Path, dir: &Path) -> Result<(), String> {
             let running;
             (cgroups, running) = read_cgroups(root);
             let view = tracker.view(WatchState::Attached { at: now }, &expand_tools(&tools, &running), now);
-            if let Err(e) = crate::write(dir, &view) {
+            if let Err(e) = crate::write_state(dir, &tracker.claims()).and_then(|()| crate::write(dir, &view)) {
                 return fail(format!("write {}: {e}", dir.display()));
             }
         }

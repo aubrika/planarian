@@ -20,6 +20,7 @@ const RTM_DELRULE: u16 = 33;
 const IFLA_IFNAME: u16 = 3;
 const RTA_DST: u16 = 1;
 const RTA_OIF: u16 = 4;
+const RTA_PRIORITY: u16 = 6;
 const RTA_TABLE: u16 = 15;
 const FRA_PRIORITY: u16 = 6;
 const FRA_TABLE: u16 = 15;
@@ -127,11 +128,15 @@ pub fn parse(ev: &Event, owner: &Owner, ifname: &mut dyn FnMut(u32) -> Option<St
                 let get = |t: u16| a.iter().find(|(x, _)| *x == t).map(|(_, v)| *v);
                 let table = get(RTA_TABLE).and_then(|v| u32_at(v, 0)).unwrap_or(table as u32);
                 let dst = get(RTA_DST).map(hex).unwrap_or_default();
-                let iface = get(RTA_OIF).and_then(|v| u32_at(v, 0)).and_then(ifname);
+                let oif = get(RTA_OIF).and_then(|v| u32_at(v, 0));
+                let metric = get(RTA_PRIORITY).and_then(|v| u32_at(v, 0)).unwrap_or(0);
+                let iface = oif.and_then(ifname);
                 // §12d: a default or all-covering route (a /0, or the two /1
                 // halves OpenVPN's redirect-gateway uses), in any table.
                 let steers = dst_len <= 1;
-                let object = format!("route {family} {table} {dst}/{dst_len}");
+                // Two default routes (the uplink's, a tunnel's) differ by their
+                // output interface and metric: the key carries both.
+                let object = format!("route {family} {table} {dst}/{dst_len} oif {} metric {metric}", oif.unwrap_or(0));
                 Parsed::Changes(vec![change(ChangeKind::Route, object, iface, steers, ty == RTM_DELROUTE)])
             }
             RTM_NEWRULE | RTM_DELRULE => {
@@ -146,13 +151,12 @@ pub fn parse(ev: &Event, owner: &Owner, ifname: &mut dyn FnMut(u32) -> Option<St
                 let get = |t: u16| a.iter().find(|(x, _)| *x == t).and_then(|(_, v)| u32_at(v, 0));
                 // A rule that sends all traffic (no source or destination
                 // selector) to another table catches all of it (wg-quick's
-                // `not fwmark … lookup …`).
-                let steers = dst_len == 0 && src_len == 0 && action == FR_ACT_TO_TBL;
-                let object = format!(
-                    "rule {family} {} {}",
-                    get(FRA_PRIORITY).unwrap_or(0),
-                    get(FRA_TABLE).unwrap_or(b.get(NLMSG_HDRLEN + 4).copied().unwrap_or(0) as u32)
-                );
+                // `not fwmark … lookup …`). Sending it to the kernel's own
+                // tables (local 255, main 254, default 253: the rules every
+                // system starts with) redirects nothing.
+                let table = get(FRA_TABLE).unwrap_or(b.get(NLMSG_HDRLEN + 4).copied().unwrap_or(0) as u32);
+                let steers = dst_len == 0 && src_len == 0 && action == FR_ACT_TO_TBL && !matches!(table, 253..=255);
+                let object = format!("rule {family} {} {table}", get(FRA_PRIORITY).unwrap_or(0));
                 Parsed::Changes(vec![change(ChangeKind::Rule, object, None, steers, ty == RTM_DELRULE)])
             }
             // GET requests, addresses, neighbours, qdiscs: nothing that steers.

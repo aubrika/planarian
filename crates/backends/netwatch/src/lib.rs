@@ -52,16 +52,44 @@
 //! - `unattributed`: a change charged here that the kernel could not fully
 //!   attribute, or a lost event that touched it.
 //!
-//! On attach, netwatch writes `protecting no` (and `at`) for every name in
-//! `/etc/planarian/export.json`'s top-level `networkTools`. A name ending in
-//! `@` is a template: it is written per instance as instances start. A file
-//! is kept across the unit's stop, and replaced by a fresh footprint when
-//! the unit comes back.
+//! **On every attach** (boot or restart of the watch; coordinator, Nov 2,
+//! from the reviewer's #38 finding 3c), in this order, so a restart never
+//! downgrades a footprint and a change made while nobody watched fails
+//! closed ([`Tracker::attach`]):
+//! 1. **Load** the claims kept before: `.state` (netwatch's own record, a
+//!    dot-file the hold does not read), or, if it is gone, the footprint
+//!    files' `iface` lines. A claim whose object (interface, route, rule,
+//!    table) still stands is kept, so a footprint that was `protecting
+//!    yes` still is; a claim whose object is gone is dropped.
+//! 2. **Snapshot** what stands now through netlink dumps: links, routes and
+//!    rules (IPv4 and IPv6), nftables tables, and legacy tables
+//!    (`/proc/net/*_tables_names`).
+//! 3. **Unclaimed steering** found standing is recorded in `.unattributed`
+//!    as `pre-attach <object>`: it was made while nobody watched. It clears
+//!    only when its object is gone (an interface's routes go with it). A
+//!    default route over a physical interface no unit created (the
+//!    machine's uplink: no link kind) is not "an interface it created" and
+//!    is not recorded; one over a virtual link (dummy, wireguard, tun, …)
+//!    or over no interface is. At boot the watch starts before
+//!    `network-pre.target` with `/run` fresh, so nothing is unclaimed.
+//! 4. Only then, `protecting no` (and `at`) for every name in
+//!    `/etc/planarian/export.json`'s top-level `networkTools` with no claim.
+//!    A name ending in `@` is a template: it is written per instance as
+//!    instances start. A file is kept across the unit's stop, and replaced
+//!    by a fresh footprint when the unit comes back.
+//!
+//! The probes attach before the snapshot is taken, so a change racing it is
+//! seen as an event too (applying it twice changes nothing).
 //!
 //! **Protecting** means the footprint includes, now: an interface the unit
-//! created that carries a default or all-covering route; a policy rule that
-//! catches all traffic; DNS servers on its interface; the system proxy; or
-//! firewall rules that drop or redirect traffic ([`Tracker`]).
+//! created that carries a default or all-covering route (a `/0` or `/1`, in
+//! any table, whoever added the route); a policy rule that catches all
+//! traffic (no selectors, to a table other than the kernel's local, main and
+//! default); DNS servers on its interface; the system proxy; or firewall
+//! rules that drop or redirect traffic ([`Tracker`]). Fail closed where the
+//! kernel's messages are not read in full: any nftables batch or legacy
+//! table change (`nf_setsockopt`) from a unit counts as firewall rules that
+//! steer, and the unit's own default route counts whatever its interface.
 //!
 //! **The hold's order.** When a network tool fails, it is held unless all of
 //! these pass: (1) no unexpired release; (2) `.watch` is `attached` and
@@ -77,9 +105,11 @@ pub mod host;
 pub mod loader;
 mod model;
 pub mod parse;
+#[cfg(feature = "loader")]
+pub mod snapshot;
 
-pub use contract::{AHEAD_SECS, CLOCK, DIR, FRESH_SECS, TICK_SECS, file_name, read, write};
-pub use model::{Change, ChangeKind, Endpoint, Footprint, FootprintView, Owner, Proto, Tracker, WatchState};
+pub use contract::{AHEAD_SECS, CLOCK, DIR, FRESH_SECS, TICK_SECS, file_name, read, read_claims, write, write_state};
+pub use model::{Change, ChangeKind, Claims, Endpoint, Footprint, FootprintView, Owner, Proto, Tracker, WatchState};
 
 #[cfg(test)]
 mod tests;

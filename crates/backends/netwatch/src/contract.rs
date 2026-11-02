@@ -19,6 +19,9 @@ pub const AHEAD_SECS: u64 = 5;
 pub const TICK_SECS: u64 = 5;
 
 const WATCH: &str = ".watch";
+/// netwatch's own record of who claimed what, across its restarts (a
+/// dot-file: the hold reads only `.watch` and `.unattributed`).
+const STATE: &str = ".state";
 const UNATTRIBUTED: &str = ".unattributed";
 
 /// The file name of a unit's footprint: systemd's `%N` (the unit name with
@@ -159,4 +162,19 @@ pub fn read(dir: &Path) -> FootprintView {
         }
     }
     view
+}
+
+/// Keep the tracker's claims in `dir/.state`, atomically.
+pub fn write_state(dir: &Path, claims: &crate::Claims) -> io::Result<()> {
+    let json = serde_json::to_string(claims).map_err(io::Error::other)?;
+    put(dir, STATE, &json)
+}
+
+/// The claims kept before a restart: `.state` if it reads, else the
+/// footprint files' `iface` lines (`Tracker::claims_from_files`).
+pub fn read_claims(dir: &Path) -> crate::Claims {
+    std::fs::read_to_string(dir.join(STATE))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| crate::Tracker::claims_from_files(&read(dir)))
 }

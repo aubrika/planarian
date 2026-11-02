@@ -248,6 +248,12 @@ mod parsing {
         assert!(c.kind == ChangeKind::Rule && c.steers, "{c:?}");
         b[1] = 24; // a rule for one destination prefix does not catch all
         assert!(!one(parse(&msg(HOOK_RTNETLINK, 32, 0x400, &b), &owner(), &mut names)).steers);
+        // The kernel's own rules (to local, main, default) redirect nothing.
+        for table in [253u32, 254, 255] {
+            let mut k = vec![2u8, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+            k.extend(attr(15, &table.to_ne_bytes()));
+            assert!(!one(parse(&msg(HOOK_RTNETLINK, 32, 0x400, &k), &owner(), &mut names)).steers, "table {table}");
+        }
     }
 
     #[test]
@@ -351,4 +357,142 @@ fn the_protecting_set() {
     assert!(set.contains(&vpn) && !set.contains(&quiet), "{set:?}");
     let all = FootprintView::default().protecting(&[vpn.clone(), quiet.clone()], NOW);
     assert_eq!(all.len(), 2, "nothing known: every tool counts");
+}
+
+/// §12d, the watch restarted (coordinator, Nov 2; the reviewer's #38 3c).
+mod restart {
+    use super::*;
+
+    fn vpn() -> UnitId {
+        UnitId::service("wg-quick-wg0")
+    }
+
+    /// The links something created (wg0 is a wireguard link).
+    fn virt() -> std::collections::BTreeSet<String> {
+        ["wg0".to_string()].into()
+    }
+
+    /// What the kernel holds: wg0, and a default route over it.
+    fn standing() -> Vec<Change> {
+        vec![
+            change(Owner::Unattributed, ChangeKind::Interface, "wg0", Some("wg0"), false),
+            change(Owner::Unattributed, ChangeKind::Route, "route 2 254 /0 oif 7 metric 0", Some("wg0"), true),
+        ]
+    }
+
+    fn before() -> Tracker {
+        let mut t = Tracker::default();
+        t.apply(&change(unit(&vpn()), ChangeKind::Interface, "wg0", Some("wg0"), false));
+        t.apply(&change(unit(&vpn()), ChangeKind::Route, "route 2 254 /0 oif 7 metric 0", Some("wg0"), true));
+        t
+    }
+
+    #[test]
+    fn a_restart_keeps_a_protecting_footprint() {
+        let t = Tracker::attach(&before().claims(), &standing(), &virt());
+        let v = t.view(ATTACHED, &[vpn()], NOW);
+        assert!(v.units["wg-quick-wg0"].protecting, "{v:?}");
+        assert!(v.unattributed.is_empty(), "everything standing is claimed: {v:?}");
+    }
+
+    /// With `.state` gone, the footprint files' `iface` lines still claim
+    /// the interface, and the standing default route over it protects.
+    #[test]
+    fn a_restart_from_the_files_alone_keeps_it_too() {
+        let files = before().view(ATTACHED, &[vpn()], NOW);
+        let t = Tracker::attach(&Tracker::claims_from_files(&files), &standing(), &virt());
+        let v = t.view(ATTACHED, &[vpn()], NOW);
+        assert!(v.units["wg-quick-wg0"].protecting && v.unattributed.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn an_object_made_in_the_gap_is_unattributed_until_it_is_gone() {
+        let mut now = standing();
+        let gap = change(Owner::Unattributed, ChangeKind::Rule, "rule 2 100 51820", None, true);
+        now.push(gap.clone());
+        let mut t = Tracker::attach(&before().claims(), &now, &virt());
+        let v = t.view(ATTACHED, &[vpn()], NOW);
+        assert!(v.unattributed.iter().any(|r| r.starts_with("pre-attach") && r.contains("rule 2 100 51820")), "{v:?}");
+        // Removed (by anyone): the marker clears.
+        t.apply(&Change { removed: true, owner: unit(&UnitId::service("someone-else")), ..gap });
+        assert!(t.view(ATTACHED, &[vpn()], NOW).unattributed.is_empty());
+    }
+
+    #[test]
+    fn a_claim_whose_object_is_gone_is_dropped() {
+        // wg0 and its route went away while nobody watched.
+        let t = Tracker::attach(&before().claims(), &[], &virt());
+        let v = t.view(ATTACHED, &[vpn()], NOW);
+        assert!(!v.units["wg-quick-wg0"].protecting && v.unattributed.is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn a_clean_boot_has_no_marker() {
+        let t = Tracker::attach(&Claims::default(), &[], &virt());
+        let v = t.view(ATTACHED, &[vpn()], NOW);
+        assert!(v.unattributed.is_empty() && !v.units["wg-quick-wg0"].protecting, "{v:?}");
+        // But steering found at boot with no claims (the /run files lost)
+        // is unattributed.
+        let t = Tracker::attach(&Claims::default(), &standing(), &virt());
+        assert!(!t.view(ATTACHED, &[vpn()], NOW).unattributed.is_empty());
+    }
+
+    /// A route removed by another unit drops the claim of the unit that
+    /// added it (removal is global).
+    #[test]
+    fn removal_is_global() {
+        let mut t = before();
+        t.apply(&Change {
+            removed: true,
+            ..change(
+                unit(&UnitId::service("other")),
+                ChangeKind::Route,
+                "route 2 254 /0 oif 7 metric 0",
+                Some("wg0"),
+                true,
+            )
+        });
+        assert!(!t.footprint(&vpn(), NOW).protecting);
+    }
+
+    /// The machine's own uplink: a default route over a physical NIC that no
+    /// unit created is not pre-attach steering (it would hold every failure).
+    #[test]
+    fn the_uplinks_default_route_is_not_unattributed() {
+        let uplink = vec![
+            change(Owner::Unattributed, ChangeKind::Interface, "eth0", Some("eth0"), false),
+            change(Owner::Unattributed, ChangeKind::Route, "route 2 254 /0 oif 7 metric 0", Some("eth0"), true),
+        ];
+        let t = Tracker::attach(&Claims::default(), &uplink, &virt());
+        assert!(t.view(ATTACHED, &[vpn()], NOW).unattributed.is_empty());
+    }
+
+    /// The reviewer's (i): steering made in the gap over a tunnel nobody
+    /// claims is unattributed, and clears when the tunnel is deleted (the
+    /// kernel drops its routes without a message for each).
+    #[test]
+    fn deleting_a_gap_tunnel_clears_its_routes() {
+        let gap = vec![
+            change(Owner::Unattributed, ChangeKind::Interface, "wg0", Some("wg0"), false),
+            change(Owner::Unattributed, ChangeKind::Route, "route 2 254 /0 oif 7 metric 0", Some("wg0"), true),
+        ];
+        let mut t = Tracker::attach(&Claims::default(), &gap, &virt());
+        assert!(!t.view(ATTACHED, &[vpn()], NOW).unattributed.is_empty(), "made unwatched");
+        t.apply(&Change {
+            removed: true,
+            ..change(Owner::Unattributed, ChangeKind::Interface, "wg0", Some("wg0"), false)
+        });
+        assert!(t.view(ATTACHED, &[vpn()], NOW).unattributed.is_empty(), "the tunnel and its route are gone");
+        // And a unit's own route claims over its deleted tunnel go too.
+        let mut b = before();
+        b.apply(&Change { removed: true, ..change(unit(&vpn()), ChangeKind::Interface, "wg0", Some("wg0"), false) });
+        assert!(!b.footprint(&vpn(), NOW).protecting);
+    }
+
+    #[test]
+    fn claims_round_trip_as_json() {
+        let c = before().claims();
+        let back: Claims = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+    }
 }

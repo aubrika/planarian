@@ -2309,6 +2309,7 @@ dependencies = [
  "aya",
  "aya-obj",
  "planarian-schema",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "signal-hook",

@@ -147,11 +147,51 @@ pub struct Tracker {
     /// A lost event could not be placed: everything counts as unattributed
     /// until the watch restarts (which re-reads the kernel's state).
     lost_unplaced: bool,
+    /// Steering objects found standing on attach that no footprint claimed:
+    /// made while nobody watched (§12d, fail closed). Each clears when its
+    /// object is removed.
+    pre_attach: BTreeMap<(ChangeKind, String), Option<String>>,
+    /// Steering routes found standing on attach over an interface a unit
+    /// claims (object → interface): they protect through that interface.
+    route_through: BTreeMap<String, String>,
+}
+
+/// The tracker's claims, as `.state` keeps them across a restart of the
+/// watch (a dot-file the hold does not read).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claims {
+    /// (unit, kind, object, iface, steers)
+    pub objects: Vec<(UnitId, ChangeKind, String, Option<String>, bool)>,
+    pub endpoints: Vec<(UnitId, Endpoint)>,
+    pub unattributed_units: Vec<UnitId>,
 }
 
 impl Tracker {
     pub fn apply(&mut self, c: &Change) {
         let key = (c.kind, c.object.clone());
+        if c.removed {
+            // An object gone is gone for everyone who claimed it, whoever
+            // removed it (and a pre-attach one clears with it).
+            for s in self.units.values_mut() {
+                s.objects.remove(&key);
+            }
+            self.unattributed.remove(&key);
+            self.pre_attach.remove(&key);
+            if c.kind == ChangeKind::Route {
+                self.route_through.remove(&c.object);
+            }
+            if c.kind == ChangeKind::Interface {
+                // The kernel drops an interface's routes with it, without a
+                // message for each: drop every claim on a route through it.
+                let gone = Some(c.object.clone());
+                for s in self.units.values_mut() {
+                    s.objects.retain(|(k, _), (i, _)| !(*k == ChangeKind::Route && *i == gone));
+                }
+                self.route_through.retain(|_, i| Some(i.clone()) != gone);
+                self.pre_attach.retain(|(k, _), i| !(*k == ChangeKind::Route && *i == gone));
+            }
+            return;
+        }
         match &c.owner {
             Owner::Unattributed => {
                 if c.removed || !c.steers {
@@ -169,6 +209,109 @@ impl Tracker {
                 }
             }
         }
+    }
+
+    /// What `.state` keeps.
+    pub fn claims(&self) -> Claims {
+        let mut c = Claims::default();
+        for (u, s) in &self.units {
+            for ((k, o), (i, steers)) in &s.objects {
+                c.objects.push((u.clone(), *k, o.clone(), i.clone(), *steers));
+            }
+            c.endpoints.extend(s.endpoints.iter().map(|e| (u.clone(), *e)));
+            if s.unattributed {
+                c.unattributed_units.push(u.clone());
+            }
+        }
+        c
+    }
+
+    /// §12d, on every attach (boot or restart): start from the claims kept
+    /// before (`.state`, or the footprint files' `iface` lines when it is
+    /// gone), keep each claim whose object still stands in `standing` (a
+    /// snapshot of the kernel's steering state, as changes), drop the rest,
+    /// and record every standing steering object nobody claims as
+    /// pre-attach: it was made while nobody watched. A restart therefore
+    /// never downgrades a footprint, and a change made in the gap fails
+    /// closed until its object is gone.
+    ///
+    /// `virtual_ifaces` are the standing links that something created (they
+    /// have a link kind: dummy, wireguard, tun, …). An unclaimed steering
+    /// route counts as pre-attach only over one of those, or over no
+    /// interface: a default route over a physical NIC no unit created (the
+    /// machine's own uplink) is not "an interface it created" (§12d).
+    pub fn attach(previous: &Claims, standing: &[Change], virtual_ifaces: &BTreeSet<String>) -> Tracker {
+        let present: BTreeMap<(ChangeKind, String), &Change> =
+            standing.iter().map(|c| ((c.kind, c.object.clone()), c)).collect();
+        let mut t = Tracker::default();
+        for (u, k, o, i, steers) in &previous.objects {
+            if present.contains_key(&(*k, o.clone())) {
+                t.apply(&Change {
+                    owner: Owner::Unit(u.clone()),
+                    kind: *k,
+                    object: o.clone(),
+                    iface: i.clone(),
+                    steers: *steers,
+                    removed: false,
+                });
+            }
+        }
+        for (u, e) in &previous.endpoints {
+            t.add_endpoint(u, *e);
+        }
+        for u in &previous.unattributed_units {
+            t.lost(Some(u));
+        }
+        let claimed: BTreeSet<(ChangeKind, String)> =
+            t.units.values().flat_map(|s| s.objects.keys().cloned()).collect();
+        for (key, c) in &present {
+            if c.steers && !claimed.contains(key) {
+                t.pre_attach.insert(key.clone(), c.iface.clone());
+            }
+        }
+        // An unclaimed steering route over an interface a unit claims is
+        // that unit's (it carries the unit's traffic), not pre-attach.
+        let claimed_ifaces: BTreeSet<String> = t
+            .units
+            .values()
+            .flat_map(|s| s.objects.iter())
+            .filter(|((k, _), _)| *k == ChangeKind::Interface)
+            .map(|((_, n), _)| n.clone())
+            .collect();
+        t.pre_attach.retain(|key, _| {
+            let iface = present[key].iface.as_ref();
+            !(key.0 == ChangeKind::Route
+                && iface.is_some_and(|i| claimed_ifaces.contains(i) || !virtual_ifaces.contains(i)))
+        });
+        // Routes over a claimed interface still steer through it.
+        for c in standing {
+            if c.kind == ChangeKind::Route
+                && c.steers
+                && !claimed.contains(&(c.kind, c.object.clone()))
+                && let Some(i) = &c.iface
+                && claimed_ifaces.contains(i)
+            {
+                t.route_through.insert(c.object.clone(), i.clone());
+            }
+        }
+        t
+    }
+
+    /// The claims the footprint files carry (each `iface` line), for an
+    /// attach when `.state` is gone.
+    pub fn claims_from_files(view: &FootprintView) -> Claims {
+        let mut c = Claims::default();
+        for (name, f) in &view.units {
+            let u = UnitId::service(name);
+            for i in &f.ifaces {
+                c.objects.push((u.clone(), ChangeKind::Interface, i.clone(), Some(i.clone()), false));
+            }
+            c.endpoints.extend(f.endpoints.iter().map(|e| (u.clone(), *e)));
+            if f.unattributed {
+                c.unattributed_units.push(u);
+            }
+        }
+        c
     }
 
     pub fn add_endpoint(&mut self, unit: &UnitId, e: Endpoint) {
@@ -216,6 +359,7 @@ impl Tracker {
             .flat_map(|s| s.objects.iter())
             .filter(|((k, _), (_, steers))| *k == ChangeKind::Route && *steers)
             .filter_map(|(_, (iface, _))| iface.clone())
+            .chain(self.route_through.values().cloned())
             .collect()
     }
 
@@ -225,6 +369,7 @@ impl Tracker {
         let units = tools.iter().map(|u| (crate::file_name(u), self.footprint(u, now))).collect();
         let mut why: Vec<String> =
             self.unattributed.iter().map(|(k, o)| format!("{k:?} {o}: no unit made it")).collect();
+        why.extend(self.pre_attach.keys().map(|(k, o)| format!("pre-attach {k:?} {o}")));
         if self.lost_unplaced {
             why.push("an event was lost and could not be placed".into());
         }
