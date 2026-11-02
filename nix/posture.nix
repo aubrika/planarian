@@ -330,7 +330,14 @@ let
         #    confirmed within the window (`at`): hold. Only a fresh watch, no
         #    standing unattributed change, and a fresh `protecting no` skip.
         w="$footprint/.watch"
-        fresh() { case "''${1:-}" in ""|*[!0-9]*) return 1 ;; esac; [ $(( $(date +%s) - $1 )) -le 30 ]; }
+        # Timestamps are CLOCK_BOOTTIME seconds (/proc/uptime's first field),
+        # so a stepped wall clock cannot make one fresh. Fresh: at most 30 s
+        # old, and not more than 5 s ahead.
+        fresh() {
+          case "''${1:-}" in ""|*[!0-9]*) return 1 ;; esac
+          now=$(cut -d. -f1 /proc/uptime); age=$(( now - $1 ))
+          [ "$age" -le 30 ] && [ "$age" -ge -5 ]
+        }
         state=missing; ts=""
         [ -f "$w" ] && read -r state ts < "$w"
         if [ "$state" = attached ] && ! fresh "$ts"; then
@@ -440,13 +447,6 @@ in
       default = [ ];
       example = [ "my-assistant.service" ];
       description = "Units that run an agent principal (§11). They start only after planarian-ready.target and are stopped by every failure class (I20).";
-    };
-    ownUnits = mkOption {
-      type = types.listOf types.str;
-      readOnly = true;
-      internal = true;
-      default = [ "planariad" "planarian-recovery" "planarian-respond@" "planarian-posture-check" "planarian-posture-lift" "planarian-hold@" ];
-      description = "The system services this module itself declares (module-eval checks each exists): not classified as network tools, since their failures have their own posture (§12d).";
     };
     holdAllowsOwnInterface = mkOption {
       type = types.bool;

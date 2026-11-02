@@ -106,7 +106,7 @@ let
     ++ map (i: "wg-quick-${i}") (lib.attrNames (config.networking.wg-quick.interfaces or { }));
   # The set this module declares (posture.nix), not a name prefix: a
   # foreign `planarian-*` unit is classified like any other.
-  ownUnits = name: builtins.elem name cfg.ownUnits;
+  ownUnits = name: builtins.elem name (import ./own-units.nix);
   netCaps = [ "CAP_NET_ADMIN" "CAP_NET_RAW" ];
   words = v:
     if builtins.isList v then lib.concatMap words v
