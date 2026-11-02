@@ -45,6 +45,18 @@ fn already_failed(s: &SystemState, defs: &UnitDefs, u: &UnitId) -> bool {
         && matches!(s.status(u, defs), UnitStatus::Failed(_) | UnitStatus::Stopped | UnitStatus::Absent)
 }
 
+/// §11, §12d: whether `u`'s traffic is held now, in the observation `s`
+/// (lane-daemon's ledger `holds`, reconciled with `/run/planarian/hold/`).
+/// §11 waives the RestartUnit row's escalations because "its traffic is
+/// held", so the waiver reads the hold itself, not the footprint that leads
+/// to it: §12d fails closed toward applying a hold, and with this a missing
+/// or stale footprint buys a waiver only once traffic is in fact blocked.
+/// STUB: `false` until lane-daemon carries the active holds in `SystemState`;
+/// then read `s` here and nowhere else.
+fn hold_in_place(_s: &SystemState, _u: &UnitId) -> bool {
+    false
+}
+
 fn unit_facts<'a>(
     units: impl IntoIterator<Item = &'a UnitId>,
     defs: &UnitDefs,
@@ -238,7 +250,18 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         f.touches_core = f.sensitivity.contains(Sensitivity::Core);
     };
     match i.transition {
-        Transition::RestartUnit(u) => unit_op(&mut f, u, Recovery::Idempotent),
+        Transition::RestartUnit(u) => {
+            unit_op(&mut f, u, Recovery::Idempotent);
+            // §11 (owner decision, Nov 2): restarting an already-failed unit
+            // waives the RestartUnit row's External escalation (policy reads
+            // this; Security still escalates). The same reading as the
+            // disruption rule: current observation, Unknown is not failed.
+            f.restarts_failed_unit = already_failed(i.state, i.defs, u);
+            // §11, §12d (owner decision, Nov 2): a failed unit whose traffic
+            // is held: its restart only ends an outage, and waives both
+            // escalations of the RestartUnit row.
+            f.restarts_held_unit = f.restarts_failed_unit && hold_in_place(i.state, u);
+        }
         Transition::StopUnit(u) | Transition::StopAndSuppress { unit: u, .. } => {
             unit_op(&mut f, u, Recovery::Revertible)
         }
@@ -264,7 +287,16 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         Transition::BindDriver { device, .. } => unit_op(&mut f, device, Recovery::Revertible),
         Transition::SetRuntimeOption { path, .. } => {
             f.sensitivity = i.tables.option_sensitivity(&format!("runtime.{path}"));
-            f.disruption = if path == "wifi.network" {
+            // §11, §12a (owner decision, Nov 2): Wi-Fi selection's
+            // ConnectivityLoss is its providing unit's (NetworkManager's),
+            // and none while that unit has already failed. The providing
+            // units are those whose manifest entry names this option as its
+            // `runtime_repair`; with none declared, the loss stays (fail
+            // closed), and every one of them must have failed.
+            let providers: Vec<&UnitId> =
+                i.defs.values().filter(|d| d.runtime_repair.as_deref() == Some(path.as_str())).map(|d| &d.id).collect();
+            let provider_failed = !providers.is_empty() && providers.iter().all(|u| already_failed(i.state, i.defs, u));
+            f.disruption = if path == "wifi.network" && !provider_failed {
                 Disruptions::of(Disruption::ConnectivityLoss)
             } else {
                 Disruptions::default()
