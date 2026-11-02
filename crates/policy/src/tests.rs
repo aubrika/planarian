@@ -56,6 +56,7 @@ fn facts(
         restarts_failed_unit: false,
         removes_sensitivity: Default::default(),
         removes: Default::default(),
+        removes_each: Default::default(),
         restarts_held_unit: false,
         other_sessions_affected: flags & 32 != 0,
         affected_sessions: if flags & 64 != 0 { vec!["s1".into()] } else { vec![] },
@@ -811,4 +812,39 @@ fn i19_approval_and_grants() {
     assert!(!may_grant(&admin, admin.principal, &g), "own proposal");
     let merge = Grant { capability: Capability::Merge, ..g };
     assert!(!may_grant(&admin, alice.principal, &merge), "cannot grant what it does not hold");
+}
+
+/// I14 (#37 review): the policy reads `removes_sensitivity`, never the units
+/// behind it or their own sensitivities, which are for the display (§16). A
+/// Rollback's decision is the same whatever `removes` and `removes_each` hold.
+#[test]
+fn removed_units_and_their_own_sensitivities_do_not_move_a_decision() {
+    let st = state();
+    let tb = tables();
+    let locked: Vec<String> = vec![];
+    for authz in [user(0, true, true, true), user(1000, false, true, true)] {
+        let run = |removes: Vec<UnitId>, each: Vec<Sensitivities>| {
+            let mut f = facts(&[Sensitivity::Security], Disruptions::default(), Recovery::Revertible, 0, None);
+            f.removes_sensitivity = Sensitivities::of(&[Sensitivity::Security]);
+            f.removes = removes;
+            f.removes_each = each;
+            decide(&Input {
+                transition: &Transition::Rollback,
+                facts: &f,
+                known_good: st.known_good,
+                live_tested: st.live_tested,
+                cumulative: &ConfigDiff::default(),
+                authz: &authz,
+                settings: &Settings::default(),
+                tables: &tb,
+                locked: &locked,
+                revert_to: None,
+            })
+        };
+        let sshd = UnitId::service("sshd");
+        let base = run(vec![], vec![]);
+        assert_eq!(run(vec![sshd.clone()], vec![]), base, "a record from before `removes_each`");
+        assert_eq!(run(vec![sshd.clone()], vec![Sensitivities::of(&[Sensitivity::Security])]), base);
+        assert_eq!(run(vec![sshd], vec![Sensitivities::default()]), base, "a unit's own does not narrow it");
+    }
 }

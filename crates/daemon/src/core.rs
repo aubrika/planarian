@@ -862,6 +862,53 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         applied
     }
 
+    /// The response to a submission; one parked for approval says, in one
+    /// line, what it would change (§16 *Approvals show the change*).
+    fn respond(&self, r: &Submitted) -> Response {
+        let mut resp = render::response(r);
+        if let Response::NeedsApproval { txn, why, .. } = &mut resp
+            && let Some(p) = self.ex.parked.get(txn)
+            && let Some(sum) = self.approval_diff(*txn, &p.proposal.transition, &p.facts).summary()
+        {
+            *why = if why.is_empty() { sum } else { format!("{why}; {sum}") };
+        }
+        resp
+    }
+
+    /// §16 *Approvals show the change*: built from the derived facts (from
+    /// the evaluated generations), never from the proposal.
+    fn approval_diff(&self, txn: TxnId, t: &Transition, f: &DerivedFacts) -> planarian_ipc::ApprovalDiff {
+        // The options, from the evaluated generations (§16): the one the
+        // transaction runs on against its candidate. A generation built
+        // outside Planarian has no recorded override, so the override diff
+        // alone would show nothing it changes. If either evaluation cannot be
+        // read, the core's override diff from the facts stands.
+        let evaluated = self.evaluated_diff(txn);
+        let options = evaluated.as_ref().or(f.config_diff.as_ref());
+        // The units it would remove or stop: derive's `removes`, the same set
+        // as `removes_sensitivity` (§11 Rollback row), each with its own.
+        let (removed, each_known) = crate::approval::removed(f);
+        crate::approval::diff(t, options, evaluated.is_some(), &removed, each_known, &self.ex.cfg.tables)
+    }
+
+    /// Every option whose value differs between a live generation
+    /// transaction's base and its candidate, as both evaluate.
+    fn evaluated_diff(&self, txn: TxnId) -> Option<ConfigDiff> {
+        let live = self.ex.kernel.journal.ledger().live.get(&txn)?;
+        let (_, cand_path) = live.txn.candidate.as_ref()?;
+        let gens = self.b.generations();
+        let base = gens.path_of(live.txn.base).and_then(|p| gens.evaluate_built(&p)).ok()?;
+        let cand = gens.evaluate_built(cand_path).ok()?;
+        let mut d = ConfigDiff::default();
+        for k in base.options.keys().chain(cand.options.keys()) {
+            let (old, new) = (base.options.get(k), cand.options.get(k));
+            if old != new {
+                d.options.insert(k.clone(), (old.cloned(), new.cloned()));
+            }
+        }
+        Some(d)
+    }
+
     /// A generation transaction is live, in any state (I6: one waiting in
     /// `Built` counts).
     fn generation_active(&mut self) -> bool {
@@ -1766,8 +1813,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     }
                     Submitted::Parked { txn, approve, facts } => {
                         self.incident_parked.insert(inc.id, txn);
+                        let changes = self
+                            .approval_diff(txn, &c.transition, &facts)
+                            .summary()
+                            .map(|s| format!("; {s}"))
+                            .unwrap_or_default();
                         self.notice(format!(
-                            "{}: {} needs approval ({}): planarian approve {approve}",
+                            "{}: {} needs approval ({}{changes}): planarian approve {approve}",
                             inc.target,
                             render::transition(&c.transition),
                             render::facts_summary(&facts)
@@ -1907,8 +1959,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let (s, defs) = self.observe();
         let p = self.proposal(t, &s, &defs, source, reason);
         let authz = self.authz(&peer);
+        let t = p.transition.clone();
         let r = self.submit(p, authz, &s, &defs);
-        let mut resp = render::response(&r);
+        // §16: the notice shows what a generation change waiting for
+        // approval would change.
+        if let Submitted::Parked { txn, approve, facts } = &r
+            && let Some(changes) = self.approval_diff(*txn, &t, facts).summary()
+        {
+            self.notice(format!(
+                "{} needs approval ({}; {changes}): planarian approve {approve}",
+                render::transition(&t),
+                render::facts_summary(facts)
+            ));
+        }
+        let mut resp = self.respond(&r);
         // Who may approve it (§11): an administrator, when the class says so.
         if let (Response::NeedsApproval { txn, why, .. }, Submitted::Parked { .. }) = (&mut resp, &r)
             && self.ex.parked.get(txn).is_some_and(|p| p.class == ApproverClass::Administrator)
@@ -1940,6 +2004,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 approve: p.bound_to,
                 what: render::transition(&p.proposal.transition),
                 facts: p.facts.clone(),
+                diff: self.approval_diff(p.txn, &p.proposal.transition, &p.facts),
                 // Shown to people: the boot-clock issue time on the wall clock.
                 issued: Timestamp(
                     self.b.clock().now().0.saturating_sub(self.b.clock().boot_now().0.saturating_sub(p.issued.0)),
@@ -2419,7 +2484,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     };
                     self.awaiting_post.push(rec);
                 }
-                render::response(&r)
+                self.respond(&r)
             }
             Request::Cancel { txn } => {
                 let Some(p) = self.ex.parked.get(&txn) else {
@@ -2431,7 +2496,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     };
                 }
                 let r = self.ex.cancel(txn, Actor::user(peer.uid));
-                render::response(&r)
+                self.respond(&r)
             }
             Request::Resolve { txn, resolution } => self.user_submit(
                 Transition::Resolve { txn, resolution },
@@ -2551,7 +2616,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
                 let authz = self.authz(&peer);
                 let r = self.submit(p, authz, &s, &defs);
-                render::response(&r)
+                self.respond(&r)
             }
             #[cfg(feature = "gym-hooks")]
             Request::GymCompact => match self.ex.kernel.journal.compact() {
