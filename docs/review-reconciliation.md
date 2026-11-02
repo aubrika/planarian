@@ -132,6 +132,26 @@ Still open, each in issue #7's lanes: §12f
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
 proved; the residue classifier under Kani).
 
+## Reviewer: P21 acceptance tests (#10), 2 Nov
+
+Written from §17a (the assumptions the proofs rely on include "the journal's
+fsync is durable"), §18.12 (`fake-assumptions-conformance`: the fake is a
+second implementation of each, and the matrix covers each mutating call under
+Partial, Unknown and Fenced) and §12 (the journal is "fsync'd"), on
+`review/lane-change-path-p21`.
+
+- `crates/gym/src/tests.rs::the_conformance_matrix_covers_unbind_and_cancel`:
+  `MATRIX` has `unbind` and `cancel`, and `conformance::injected` passes for
+  each under every outcome (it already fails if the entry never makes the
+  call). On `main`: "unbind is not in the conformance matrix".
+- `crates/txn/tests/memstore_sync.rs`: `MemStore::crash()` (power loss) keeps
+  exactly what the last `sync` covered: an unsynced write is gone, a synced one
+  survives, a journal-appended record survives and replays. On `main`: does
+  not compile (no `crash`; `sync` is a no-op).
+
+Not tested, by nature: `conformance.rs`'s comment that no fake-harness entry
+makes `cancel` or `unbind` must go once the matrix covers them.
+
 ## lane-nix (#11): reconciliation, 2 Nov
 
 Read #11 and its owner decision (P24, 1 Nov), this file, `nix/module.nix`,
@@ -272,6 +292,12 @@ manifest. Controls: an identical manifest does not; the fields already covered
 | Id | Status | What closes it | Case |
 | --- | --- | --- | --- |
 | C19 | closed by this PR | `derive.rs` `touches_manifest` compares every entry whole (canonical probes left to `touches_canonical`), system and user scope, and an added or removed entry; it had compared only `edges`, `sensitivity`, `restart_disruption`, `synonyms` and user probes of units present in both | reviewer's `crates/exec/src/derive_c19_tests.rs` (4 of 6 fail on `main`; all pass); fake verdicts unchanged |
+
+### lane-change-path: P21 (#10), 2 Nov
+
+| Id | Status | What closes it | Case |
+| --- | --- | --- | --- |
+| P21 | closed by this PR | `MemStore` keeps an undo log of log writes since the last `sync`: `sync` makes them durable, the new `crash()` (a power loss) undoes them, so the fake's "Journal fsync is durable" contract can fail. `conformance::MATRIX` adds `unbind` (`drv-bind-fails-restores-previous`: a failed bind's revert) and `cancel` (`crash-job-outlives-drain`: an unanswered activation's jobs), each under Partial, Unknown and Fenced; the comment that no fake entry makes them is corrected. The fake's `unbind` and `cancel` already honoured `World::inject` (`fake/src/lib.rs`), so `crates/fake` is unchanged | reviewer's `crates/txn/tests/memstore_sync.rs` (did not compile on `main`) and gym test `the_conformance_matrix_covers_unbind_and_cancel` (failed on `main`); both pass |
 
 ## lane-nix: #35 part 1, network security fails closed (2 Nov)
 
