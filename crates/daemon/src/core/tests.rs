@@ -1276,3 +1276,49 @@ fn a_withdrawn_parked_change_forgets_its_agent() {
     r.ticks(1);
     assert!(r.core.parked_agents.is_empty(), "{:?}", r.core.parked_agents);
 }
+
+/// #24 review: an approved change that cannot run on the same tick (here it
+/// waits in Built while Foreground holds) still has its proposer's agent in
+/// its approval record: the record is written in the approval's own call,
+/// before any tick prunes.
+#[test]
+fn an_approved_change_that_waits_keeps_its_agent() {
+    let mut cfg = config();
+    cfg.exec
+        .tables
+        .option_sensitivity
+        .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
+    let mut r = Rig::with(cfg);
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: Timestamp(0),
+        active: true,
+        idle: false,
+    });
+    r.ticks(2);
+    let font = Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.25".into()))].into(),
+    };
+    let resp = r.core.handle(ALICE, font);
+    let Response::NeedsApproval { txn, approve, .. } = resp else { panic!("{resp:?}") };
+    // As if an agent of alice's had asked (the agent path sets this entry).
+    r.core.parked_agents.insert(txn, Some("helper".into()));
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    assert!(matches!(resp, Response::Done { state: TxnState::Built, .. }), "waits for its window: {resp:?}");
+    r.ticks(3);
+    let rec = r
+        .core
+        .log
+        .iter()
+        .find(|x| x.approver.is_some() && matches!(x.result, Submitted::Finished { txn: t, .. } if t == txn))
+        .expect("the approved execution's record");
+    assert_eq!(rec.agent.as_deref(), Some("helper"));
+    assert!(r.core.parked_agents.is_empty());
+}

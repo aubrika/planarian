@@ -1078,6 +1078,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     pub fn tick(&mut self) {
         // I7's agent for an approval is needed only while the change is
         // parked; a cancelled, expired, invalidated or refused one leaves.
+        // An approved one leaves `ex.parked` only inside `Executor::approve`,
+        // and the Approve handler writes its record in the same call, so
+        // the record never misses its agent (a slow build is deferred before
+        // `approve`, while the change is still parked).
         let parked = &self.ex.parked;
         self.parked_agents.retain(|t, _| parked.contains_key(t));
         let (s, defs) = self.observe();
@@ -2128,6 +2132,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 let parked = self.ex.parked.values().find(|p| p.bound_to == hash).cloned();
                 let (pre, policy) = (s.digest(), self.ex.policy_version());
                 let r = self.ex.approve(&hash, &approver, &s, &defs);
+                // Re-bound and asked again under a new id (§12 step 4): the
+                // proposer's agent goes with it.
+                if let (Some(pk), Submitted::Parked { txn: again, .. }) = (&parked, &r)
+                    && *again != pk.txn
+                    && let Some(agent) = self.parked_agents.remove(&pk.txn)
+                {
+                    self.parked_agents.insert(*again, agent);
+                }
                 // I7: the approved execution writes its own log record; an
                 // approval passes §12 step 6 here, not at submission (C18).
                 if let (Some(pk), Submitted::Finished { txn, .. }) = (parked, &r) {
