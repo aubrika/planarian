@@ -526,7 +526,7 @@ in
     systemd.packages = [ holdDropinPackage ];
     environment.etc = lib.listToAttrs (map (u: {
       name = "planarian/hold/${u}.allow";
-      value.text = lib.concatMapStrings (a: "${a.proto} ${a.addr} ${toString a.port}\n") cfg.units.${u}.holdAllow;
+      value.text = lib.concatMapStrings (a: "${a.protocol} ${a.address} ${toString a.port}\n") cfg.units.${u}.holdAllow;
     }) (builtins.filter (u: cfg.units ? ${u}) cfg.holdUnits));
     systemd.services."planarian-hold@" = {
       description = "Planarian: hold network traffic while %i has failed";

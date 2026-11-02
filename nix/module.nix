@@ -78,7 +78,10 @@ let
     else [ "Routine" ];
   # §12d: a network-security unit's failure holds the machine's traffic:
   # its sensitivity holds both Security and External, or it is the firewall.
-  holdsTraffic = name: u:
+  # The one rule: it feeds the export's `holds` (computed, never settable)
+  # and the OnFailure= hold; the owner's pending decision on which units it
+  # names changes only this function and its module-eval assertion.
+  isNetworkSecurity = name: u:
     u.kind == "service" && u.scope == "system"
     && ((builtins.elem "Security" u.sensitivity && builtins.elem "External" u.sensitivity)
         || builtins.elem name [ "firewall" "nftables" ]);
@@ -163,13 +166,13 @@ let
       holdAllow = mkOption {
         type = types.listOf (types.submodule {
           options = {
-            addr = mkOption { type = types.str; description = "An IPv4 or IPv6 address (a literal: nothing resolves names while traffic is held)."; };
+            address = mkOption { type = types.str; description = "An IPv4 or IPv6 address (a literal: nothing resolves names while traffic is held)."; };
             port = mkOption { type = types.port; };
-            proto = mkOption { type = types.enum [ "tcp" "udp" ]; default = "udp"; };
+            protocol = mkOption { type = types.enum [ "tcp" "udp" ]; default = "udp"; };
           };
         });
         default = [ ];
-        example = [ { addr = "198.51.100.7"; port = 51820; } ];
+        example = [ { address = "198.51.100.7"; port = 51820; } ];
         description = ''
           For a network-security unit (§12d): the endpoints it needs to
           reconnect while its traffic is held, e.g. a WireGuard peer. Every
@@ -289,8 +292,8 @@ let
     runtime_repair = u.runtimeRepair;
     # §12d: whether its failure holds the machine's traffic, and what the
     # hold still lets it reach.
-    holds = holdsTraffic name u;
-    hold_allow = map (a: { inherit (a) addr port proto; }) u.holdAllow;
+    holds = isNetworkSecurity name u;
+    hold_allow = map (a: { inherit (a) address port protocol; }) u.holdAllow;
     stops_are_faults = !u.inferStops;
   };
 
@@ -575,7 +578,7 @@ in
     };
 
     services.planarian.holdUnits = lib.unique (
-      lib.attrNames (lib.filterAttrs holdsTraffic cfg.units)
+      lib.attrNames (lib.filterAttrs isNetworkSecurity cfg.units)
       ++ lib.optional (config.networking.firewall.enable && !config.networking.nftables.enable) "firewall"
       ++ lib.optional config.networking.nftables.enable "nftables");
 

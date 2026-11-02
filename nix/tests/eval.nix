@@ -39,7 +39,7 @@ let
         systemd.services.gym-vpn = { wantedBy = [ "multi-user.target" ]; script = "sleep infinity"; };
         services.planarian.units.gym-vpn = {
           sensitivity = [ "Security" "External" ];
-          holdAllow = [ { addr = "192.0.2.7"; port = 51820; } ];
+          holdAllow = [ { address = "192.0.2.7"; port = 51820; } ];
         };
         services.planarian.units.gym-app.probes = [
           { id = "gym-app-tcp"; type = "tcp"; addr = "127.0.0.1:8081"; establishes = "gym-app accepts connections"; }
@@ -126,8 +126,10 @@ let
     (check (pkgs.lib.hasInfix "Include /run/planarian/sshd/*.conf" cfg.services.openssh.extraConfig) "sshd includes the posture's drop-in, so the restriction takes effect (§12d, P14)")
     (check (cfg.networking.firewall.enable && builtins.sort builtins.lessThan hold.holdUnits == [ "firewall" "gym-vpn" "nftables" ]) "the network-security units are those with Security and External, and the firewall (§12d)")
     (check (hold.holdDropins."firewall.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@firewall.service\n") "the firewall's failure applies the hold (§12d)")
-    (check (vpn.holds && vpn.hold_allow == [ { addr = "192.0.2.7"; port = 51820; proto = "udp"; } ]) "a network-security unit exports holds and its holdAllow (§9, §12d)")
+    (check (vpn.holds && vpn.hold_allow == [ { address = "192.0.2.7"; port = 51820; protocol = "udp"; } ]) "a network-security unit exports holds and its holdAllow (§9, §12d)")
     (check (builtins.all (u: builtins.elem u.id [ "service:gym-vpn" "service:firewall" "service:nftables" ] == u.holds) export.units) "exactly the network-security units hold traffic: not sshd, not any other Security unit (§12d)")
+    (check (builtins.all (u: u.holds == (pkgs.lib.hasPrefix "service:" u.id && (builtins.elem "Security" u.sensitivity && builtins.elem "External" u.sensitivity || builtins.elem u.id [ "service:firewall" "service:nftables" ]))) export.units && builtins.all (u: !u.holds) export.userUnits) "every exported unit's holds is the rule, computed: Security and External, or the firewall (§12d)")
+    (check (!(sys.options.services.planarian.units.type.getSubOptions [ ] ? holds)) "holds is not a manifest option, so no unit can opt out of the hold (§12d)")
     (check (hold.holdDropins."gym-vpn.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@gym-vpn.service\n") "a network-security unit's failure applies the hold through OnFailure= (§12d)")
     (check (!(cfg.systemd.services.gym-vpn ? onFailure) || !(builtins.elem "planarian-hold@gym-vpn.service" cfg.systemd.services.gym-vpn.onFailure)) "the OnFailure= is a drop-in, not a unit definition (no stub for an undefined unit)")
     (check (pkgs.lib.hasInfix "ExecStartPost=" nftDropin && pkgs.lib.hasInfix "ExecReload=" nftDropin && pkgs.lib.hasInfix " reapply" nftDropin) "a hold is re-applied after nftables.service starts or reloads, which may flush every table (§12d)")

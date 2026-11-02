@@ -212,7 +212,7 @@ let
           };
           services.planarian.units.wireguard-gym = {
             sensitivity = [ "Security" "External" ];
-            holdAllow = [ { addr = wg.endpoint; port = wg.port; proto = "udp"; } ];
+            holdAllow = [ { address = wg.endpoint; port = wg.port; protocol = "udp"; } ];
             probes = [ { id = "wg0-carries-traffic"; type = "tcp"; addr = "${wg.upstream.addr}:9000"; establishes = "the tunnel carries traffic to the upstream"; } ];
           };
         }; }
