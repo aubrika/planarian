@@ -441,6 +441,68 @@ mod loader_checks {
     }
 }
 
+/// A unit's cgroup is recorded as it is made, and kept after it goes, so
+/// a oneshot that exits at once is still charged with its change.
+#[cfg(feature = "loader")]
+mod cgroups {
+    use crate::cgroups::Cgroups;
+    use planarian_schema::UnitId;
+    use std::os::unix::fs::MetadataExt;
+
+    fn ino(p: &std::path::Path) -> u64 {
+        std::fs::metadata(p).unwrap().ino()
+    }
+
+    #[test]
+    fn a_oneshot_that_exits_stays_attributed() {
+        let d = tempfile::tempdir().unwrap();
+        let slice = d.path().join("system.slice");
+        std::fs::create_dir(&slice).unwrap();
+        let mut c = Cgroups::new(d.path());
+        let unit = slice.join("nw-sockopt.service");
+        std::fs::create_dir(&unit).unwrap();
+        let id = ino(&unit);
+        c.drain(); // the loop drains before it reads the ring buffer
+        std::fs::remove_dir(&unit).unwrap(); // the oneshot exited
+        let running = c.walk(); // a tick's walk does not forget it
+        assert!(!running.contains("nw-sockopt"));
+        assert_eq!(c.unit(id), Some(UnitId::service("nw-sockopt")));
+    }
+
+    #[test]
+    fn a_unit_in_a_new_slice_is_found() {
+        let d = tempfile::tempdir().unwrap();
+        let slice = d.path().join("system.slice");
+        std::fs::create_dir(&slice).unwrap();
+        let mut c = Cgroups::new(d.path());
+        let tpl = slice.join("system-nw\\x2dtpl.slice");
+        std::fs::create_dir(&tpl).unwrap();
+        // Made before the new slice is watched: found by the scan on watch.
+        let a = tpl.join("nw-tpl@a.service");
+        std::fs::create_dir(&a).unwrap();
+        let ida = ino(&a);
+        c.drain();
+        // Made after: found by the slice's own watch.
+        let b = tpl.join("nw-tpl@b.service");
+        std::fs::create_dir(&b).unwrap();
+        let idb = ino(&b);
+        c.drain();
+        std::fs::remove_dir(&a).unwrap();
+        std::fs::remove_dir(&b).unwrap();
+        assert_eq!(c.unit(ida), Some(UnitId::service("nw-tpl@a")));
+        assert_eq!(c.unit(idb), Some(UnitId::service("nw-tpl@b")));
+    }
+
+    /// Made and gone before netwatch saw it: unknown (unattributed).
+    #[test]
+    fn a_cgroup_never_seen_is_unknown() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("system.slice")).unwrap();
+        let mut c = Cgroups::new(d.path());
+        assert_eq!(c.unit(424242), None);
+    }
+}
+
 mod host {
     use crate::host::{expand_tools, network_tools, unit_of_cgroup};
     use planarian_schema::UnitId;
@@ -462,6 +524,16 @@ mod host {
         assert_eq!(unit_of_cgroup("/user.slice/user-1000.slice/session-2.scope"), None);
         assert_eq!(unit_of_cgroup("/"), None);
         assert_eq!(unit_of_cgroup("/system.slice/foo.slice"), None);
+        // How systemd places a template's instances: in the template's slice.
+        assert_eq!(
+            unit_of_cgroup("/system.slice/system-openvpn.slice/openvpn@work.service"),
+            Some(UnitId::service("openvpn@work"))
+        );
+        assert_eq!(
+            unit_of_cgroup("system.slice/system-nw\\x2dtpl.slice/nw-tpl@a.service/payload"),
+            Some(UnitId::service("nw-tpl@a"))
+        );
+        assert_eq!(unit_of_cgroup("/system.slice/system-openvpn.slice"), None);
     }
 
     #[test]

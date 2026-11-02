@@ -13,15 +13,19 @@ pub fn network_tools(export_json: &str) -> Option<Vec<String>> {
     v.get("networkTools")?.as_array()?.iter().map(|t| t.as_str().map(str::to_string)).collect()
 }
 
-/// The unit a cgroup path belongs to: the `<name>.service` directly under
-/// `system.slice` (a service's own sub-cgroups are its own). `None` for user
-/// sessions, the root, slices: changes from there are unattributed.
+/// The unit a cgroup path belongs to: the first `<name>.service` under
+/// `system.slice`, past any slices (a template's instances sit in its own
+/// slice; a service's sub-cgroups are its own). `None` for user sessions,
+/// the root, slices: changes from there are unattributed.
 pub fn unit_of_cgroup(rel: &str) -> Option<UnitId> {
     let mut parts = rel.trim_start_matches('/').split('/');
     if parts.next()? != "system.slice" {
         return None;
     }
-    let svc = parts.next()?.strip_suffix(".service")?;
+    // A template's instances sit in the template's own slice
+    // (`system.slice/system-openvpn.slice/openvpn@work.service`): skip
+    // slices; the first service below them is the unit.
+    let svc = parts.find(|p| !p.ends_with(".slice"))?.strip_suffix(".service")?;
     (!svc.is_empty()).then(|| UnitId::service(svc))
 }
 

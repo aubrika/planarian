@@ -95,6 +95,17 @@
 //! or found at attach; one over a virtual link, or over none, that nobody can
 //! be charged with is unattributed (fail closed).
 //!
+//! **Attribution.** The kernel reports each change with the sender's
+//! cgroup id; the unit is the first `<name>.service` under `system.slice`,
+//! past any slices (a template's instances sit in the template's slice).
+//! systemd makes a unit's cgroup before its first process starts, so
+//! netwatch records ids as cgroups are made (inotify on `system.slice` and
+//! the slices under it, waking the loop at once) and keeps them after the
+//! cgroup goes (ids are not reused within a boot): a oneshot that changes
+//! something and exits at once is still charged with it. A cgroup made and
+//! gone before netwatch saw it at all leaves the change unattributed
+//! (`.unattributed`: fail closed).
+//!
 //! **Starting** (coordinator, Nov 2). Whatever happens, `.watch` is
 //! written before systemd hears `READY=1`, and systemd hears it once, so
 //! boot never waits on the start timeout and the hold already reads the
@@ -129,6 +140,8 @@
 //! [`FootprintView::protecting_now`] is (2) to (6); the release is the
 //! hold's own.
 
+#[cfg(feature = "loader")]
+pub mod cgroups;
 mod contract;
 pub mod ebpf;
 pub mod host;
