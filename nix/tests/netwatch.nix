@@ -44,6 +44,9 @@ pkgs.testers.runNixOSTest {
     # that would hold every network tool's failure).
     networking.firewall.enable = true;
     networking.nftables.enable = true;
+    # (o)/(p) create tun devices: load the driver at boot rather than rely
+    # on /dev/net/tun's autoload.
+    boot.kernelModules = [ "tun" ];
     virtualisation.memorySize = 2048;
     environment.systemPackages = [ pkgs.iproute2 pkgs.iptables pkgs.nftables ];
 
@@ -85,6 +88,61 @@ pkgs.testers.runNixOSTest {
             print("setsockopt IPT_SO_SET_REPLACE:", name)
       '')
       "${pkgs.coreutils}/bin/true";
+    # A host VPN's interface named wg0 (a dummy: the name is what matters)
+    # carrying a default route: protecting, for (n).
+    systemd.services.nw-hostwg = oneshot
+      (pkgs.writeShellScript "nw-hostwg-up" ''
+        ${ip} link add wg0 type dummy
+        ${ip} link set wg0 up
+        ${ip} route add default dev wg0 metric 4002
+      '')
+      "${ip} link delete wg0";
+    # (o) OpenVPN's way: the unit opens /dev/net/tun itself (ioctl
+    # TUNSETIFF, no netlink), holds it, and routes the all-covering pair 0/1
+    # and 128/1 over tun0. The test needs no IPv4 egress on this node.
+    systemd.services.nw-tun = {
+      wantedBy = [ "multi-user.target" ];
+      after = [ "planarian-netwatch.service" ];
+      path = [ pkgs.iproute2 ];
+      serviceConfig = {
+        Type = "simple";
+        Restart = "no";
+        ExecStart = pkgs.writers.writePython3 "nw-tun-holder" { } ''
+          import fcntl
+          import signal
+          import struct
+          import subprocess
+
+          TUNSETIFF = 0x400454CA
+          IFF_TUN, IFF_NO_PI = 0x0001, 0x1000
+          fd = open("/dev/net/tun", "r+b", buffering=0)
+          req = struct.pack("16sH", b"tun0", IFF_TUN | IFF_NO_PI)
+          fcntl.ioctl(fd, TUNSETIFF, req)
+          for cmd in (["link", "set", "tun0", "up"],
+                      ["route", "add", "0.0.0.0/1", "dev", "tun0"],
+                      ["route", "add", "128.0.0.0/1", "dev", "tun0"]):
+              subprocess.run(["ip"] + cmd, check=True)
+          signal.pause()
+        '';
+      };
+    };
+    # (p) A setup unit makes a persistent tun (`ip tuntap add`, ioctl) and
+    # routes nothing; a second unit routes 0/1 and 128/1 over it (metric 50,
+    # beside tun0's). Both count: the creator's interface carries the
+    # routes, and the router steers over a virtual interface.
+    systemd.services.nw-tunsetup = oneshot
+      "${ip} tuntap add dev nwtap0 mode tun"
+      "${ip} tuntap del dev nwtap0 mode tun";
+    systemd.services.nw-tunroute = (oneshot
+      (pkgs.writeShellScript "nw-tunroute-up" ''
+        ${ip} link set nwtap0 up
+        ${ip} route add 0.0.0.0/1 dev nwtap0 metric 50
+        ${ip} route add 128.0.0.0/1 dev nwtap0 metric 50
+      '')
+      "${ip} route flush dev nwtap0") // {
+        after = [ "planarian-netwatch.service" "nw-tunsetup.service" ];
+        requires = [ "nw-tunsetup.service" ];
+      };
     systemd.services.nw-nft = oneshot
       "${nft} 'add table inet nwnft; add chain inet nwnft out { type filter hook output priority 0; }; add rule inet nwnft out ip daddr 203.0.113.80 drop'"
       "${nft} delete table inet nwnft";
@@ -160,7 +218,7 @@ pkgs.testers.runNixOSTest {
 
     machine.wait_for_unit("planarian-ready.target")
     machine.wait_for_unit("planarian-netwatch.service")
-    for u in ["nw-route", "nw-quiet", "nw-sockopt", "nw-nft"]:
+    for u in ["nw-route", "nw-quiet", "nw-sockopt", "nw-nft", "nw-hostwg", "nw-tun", "nw-tunsetup", "nw-tunroute"]:
         machine.wait_for_unit(f"{u}.service")
 
     with subtest("(a) the watch is attached, with a fresh CLOCK_BOOTTIME stamp"):
@@ -205,10 +263,23 @@ pkgs.testers.runNixOSTest {
             else:
                 units.append(f"{t}.service")
         assert "nw-tpl@a.service" in units, units
+        # A unit the systemd initrd also runs (the export's
+        # networkToolsInitrd, names or templates) that last started there,
+        # before the switch to userspace, did not start in stage 2: whatever
+        # it left steering is caught at attach as pre-attach. Exempt only
+        # then; one restarted in stage 2 is checked like any other.
+        initrd = set(export.get("networkToolsInitrd", []))
+        userspace = int(machine.succeed("systemctl show -P UserspaceTimestampMonotonic").strip() or 0)
+        assert userspace > 0, "no UserspaceTimestampMonotonic"
+        def in_initrd(u):
+            n = u.removesuffix(".service")
+            return n in initrd or ("@" in n and n.split("@")[0] + "@" in initrd)
         early = []
         for u in units:
             began = mono(u, "InactiveExitTimestampMonotonic")
             if began and began < ready:
+                if in_initrd(u) and began < userspace:
+                    continue
                 early.append((u, began, ready))
         assert not early, f"started before the watch was ready: {early}"
         machine.fail(f"grep -rq 'pre-attach' {FP}")
@@ -250,6 +321,54 @@ pkgs.testers.runNixOSTest {
         for u in ["nw-route", "nw-sockopt", "nw-nft"]:
             protecting(u, "yes")
         assert "iface nwdummy0" in footprint("nw-route")
+
+    with subtest("(n) other network namespaces are not the host's: same-named wg0, routes, a moved interface"):
+        # §12d: protecting is about "how traffic leaves the machine", the host
+        # netns. The driver's commands run in backdoor.service, a network
+        # tool here, so whatever netwatch takes from them is charged to it.
+        protecting("nw-hostwg", "yes")
+        assert "iface wg0" in footprint("nw-hostwg")
+        protecting("backdoor", "no")
+        machine.succeed("${ip} netns add nwns")
+        # Fail-open guard: a wg0 made and deleted in another netns leaves the
+        # host VPN's wg0 claim (and its route) alone.
+        machine.succeed("${ip} -n nwns link add wg0 type dummy && ${ip} -n nwns link set wg0 up")
+        machine.succeed("${ip} -n nwns link del wg0")
+        # Spurious-hold guard: a default route inside the netns is not host
+        # steering.
+        machine.succeed("${ip} -n nwns link add nsd0 type dummy && ${ip} -n nwns link set nsd0 up")
+        machine.succeed("${ip} -n nwns route add default dev nsd0")
+        machine.sleep(12)
+        lines = protecting("nw-hostwg", "yes")
+        assert "iface wg0" in lines, lines
+        protecting("backdoor", "no")
+        machine.fail(f"test -e {FP}/.unattributed")
+        # A virtual interface made in the netns and moved into the host is
+        # host steering once a default route uses it: charged to whoever
+        # moved it, or unattributed; never read as a physical NIC.
+        machine.succeed("${ip} -n nwns link add nwmove0 type dummy && ${ip} -n nwns link set nwmove0 netns 1")
+        machine.succeed("${ip} link set nwmove0 up && ${ip} route add default dev nwmove0 metric 4003")
+        machine.wait_until_succeeds(
+            f"grep -qx 'protecting yes' {FP}/backdoor || test -e {FP}/.unattributed", timeout=30)
+        machine.succeed("${ip} link del nwmove0 && ${ip} netns del nwns")
+        machine.wait_until_succeeds(f"grep -qx 'protecting no' {FP}/backdoor && ! test -e {FP}/.unattributed", timeout=30)
+        protecting("nw-hostwg", "yes")
+
+    with subtest("(o) a tun the unit opened itself (as OpenVPN does), carrying /1 routes: protecting"):
+        # §12d: "an interface it created that carries a default or
+        # all-covering route", however it was created: here by ioctl on
+        # /dev/net/tun, which netlink never sees.
+        machine.succeed("test -d /sys/devices/virtual/net/tun0")
+        lines = protecting("nw-tun", "yes")
+        assert "iface tun0" in lines, lines
+        machine.fail(f"test -e {FP}/.unattributed")
+
+    with subtest("(p) one unit makes a persistent tun, another routes over it: both protecting"):
+        machine.succeed("test -d /sys/devices/virtual/net/nwtap0")
+        machine.succeed("${ip} route show 0.0.0.0/1 | grep -q 'dev nwtap0'")
+        assert "iface nwtap0" in protecting("nw-tunsetup", "yes")
+        protecting("nw-tunroute", "yes")
+        machine.fail(f"test -e {FP}/.unattributed")
 
     with subtest("(f) a stopped watch goes stale, and a failing tool that was not protecting is held"):
         # Stopped, not killed: a killed watcher may be restarted at once, and

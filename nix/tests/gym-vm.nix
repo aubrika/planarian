@@ -543,7 +543,7 @@ let
     # configuration, and gym-owner's script carries these facts: a cycle.
     # The daemon reads them from the running generation's export.json.
     { services.planarian.export = let e = c.services.planarian.export; in
-        removeAttrs e [ "networkTools" "networkToolsUnordered" ] // { units = map (u: removeAttrs u [ "network_tool" ]) e.units; }; }
+        removeAttrs e [ "networkTools" "networkToolsUnordered" "networkToolsInitrd" ] // { units = map (u: removeAttrs u [ "network_tool" ]) e.units; }; }
     (map (p: let path = lib.splitString "." p; in lib.setAttrByPath path (lib.attrByPath path null c)) optionPaths);
 
   shim = pkgs.writeText "flake.nix" ''
