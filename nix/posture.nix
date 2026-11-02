@@ -207,12 +207,17 @@ let
         [ -n "$uid" ] && is_admin "$uid" || continue
         scope="$(loginctl show-session "$s" -p Scope --value 2>/dev/null)"
         [ -n "$scope" ] || continue
-        for d in $(find /sys/fs/cgroup -type d -name "$scope" 2>/dev/null); do
-          pids="$pids$(find "$d" -name cgroup.procs -exec cat {} + 2>/dev/null | tr '\n' ' ')"
+        # Bounded: a session scope sits at user.slice/user-UID.slice/, and
+        # at most 4096 of its processes are taken. Beyond either bound the
+        # rest are not taken, i.e. held (fail closed).
+        for d in $(find /sys/fs/cgroup -maxdepth 4 -type d -name "$scope" 2>/dev/null | head -n 4); do
+          pids="$pids$(find "$d" -maxdepth 8 -name cgroup.procs -exec cat {} + 2>/dev/null | head -n 4096 | tr '\n' ' ')"
         done
       done
       ss -tunpH state established 2>/dev/null | awk -v pids="$pids" '
-        function split_ap(s, r,  i) { i = match(s, /:[0-9]+$/); r[1] = substr(s, 1, i - 1); r[2] = substr(s, i + 1); gsub(/^\[|\]$/, "", r[1]); sub(/%.*/, "", r[1]) }
+        # An IPv4 peer of a dual-stack socket shows as [::ffff:a.b.c.d]; on
+        # the wire it is IPv4, so it is matched as IPv4.
+        function split_ap(s, r,  i) { i = match(s, /:[0-9]+$/); r[1] = substr(s, 1, i - 1); r[2] = substr(s, i + 1); gsub(/^\[|\]$/, "", r[1]); sub(/%.*/, "", r[1]); if (r[1] ~ /^::ffff:[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) sub(/^::ffff:/, "", r[1]) }
         {
           ok = 0; line = $0
           while (match(line, /pid=[0-9]+/)) { p = substr(line, RSTART + 4, RLENGTH - 4); if (index(pids, " " p " ")) ok = 1; line = substr(line, RSTART + RLENGTH) }
@@ -542,6 +547,10 @@ in
     }) (builtins.filter (u: cfg.units ? ${u}) cfg.holdUnits));
     systemd.services."planarian-hold@" = {
       description = "Planarian: hold network traffic while %i has failed";
+      # An activation (a repair rollback, `undo`) must not stop and start a
+      # running hold: that would open traffic while the unit is still down.
+      restartIfChanged = false;
+      stopIfChanged = false;
       unitConfig.DefaultDependencies = false;
       serviceConfig = {
         Type = "oneshot";
@@ -549,6 +558,9 @@ in
         ExecCondition = "${hold} released %i";
         ExecStart = "${hold} apply %i";
         ExecStop = "${hold} lift %i";
+        # Rebuild the table in place (after a flush), never lifting it: a
+        # restart would run lift then apply, passing traffic between them.
+        ExecReload = "${hold} reapply";
       };
     };
   }

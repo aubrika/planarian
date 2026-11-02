@@ -307,6 +307,7 @@ let
     # hold still lets it reach.
     holds = isNetworkSecurity name u;
     hold_allow = map (a: { inherit (a) address port protocol; }) u.holdAllow;
+    hold_interfaces = u.holdInterfaces;
     stops_are_faults = !u.inferStops;
   };
 
@@ -739,7 +740,8 @@ in
       after = [ "planarian-recovery.service" ];
       restartIfChanged = false;
       stopIfChanged = false;
-      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux pkgs.kmod pkgs.getent ]
+      # nftables: the daemon checks the hold's table each tick (§12d).
+      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux pkgs.kmod pkgs.getent pkgs.nftables ]
         ++ lib.optional config.networking.networkmanager.enable config.networking.networkmanager.package;
       environment.PLANARIAN_CONFIG = "/etc/planarian/config.json";
       serviceConfig = {
