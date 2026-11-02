@@ -138,6 +138,9 @@ pub struct Call {
     pub fenced: bool,
 }
 
+/// The op a call outside any transaction is recorded under (the hold).
+const NO_OP: OpId = OpId { txn: TxnId(0), epoch: 0, seq: 0 };
+
 #[derive(Debug, Default)]
 pub struct World {
     pub now: Timestamp,
@@ -219,6 +222,16 @@ pub struct World {
     pub agent_instances: BTreeMap<String, InstanceId>,
     /// The next build's dry activation fails this way (R10).
     pub dry_activate_fails: Option<String>,
+    /// §12d: network-security units whose failure holds traffic, as systemd's
+    /// `OnFailure=` on them starts `planarian-hold@<unit>` (nix/posture.nix).
+    pub hold_on_failure: BTreeSet<UnitId>,
+    /// The units whose traffic is held now (`/run/planarian/hold`).
+    pub held: BTreeSet<UnitId>,
+    /// Released holds and until when (`None`: the next boot), as the
+    /// `/run/planarian/hold-released` marker the hold script honours.
+    pub hold_released: BTreeMap<UnitId, Option<Timestamp>>,
+    /// Fault injection: the next hold or lift fails this way.
+    pub hold_fails: Option<String>,
     /// Fault injection (C6): the next candidate's store contents no longer
     /// hash to the NAR hash recorded when it was built.
     pub nar_mismatch: bool,
@@ -453,6 +466,20 @@ impl World {
         self.current = g;
     }
 
+    /// §12d, `OnFailure=`: a failed network-security unit's traffic is held,
+    /// unless an unexpired release marks it.
+    pub fn on_failure_holds(&mut self) {
+        let now = self.now;
+        let failed: Vec<UnitId> = self
+            .hold_on_failure
+            .iter()
+            .filter(|u| self.units.get(*u).is_some_and(|s| matches!(s.observed, Observed::Failed(_))))
+            .filter(|u| !self.hold_released.get(*u).is_some_and(|t| t.is_none_or(|t| t > now)))
+            .cloned()
+            .collect();
+        self.held.extend(failed);
+    }
+
     /// Advance time-driven behaviour to `now`.
     pub fn advance_to(&mut self, now: Timestamp) {
         self.now = now;
@@ -497,6 +524,7 @@ impl World {
                 }
             }
         }
+        self.on_failure_holds();
     }
 
     /// `systemctl stop` outside Planarian: systemd also stops every unit that
@@ -538,6 +566,7 @@ impl World {
                 sim.failed_at = Some(now);
             }
         }
+        self.on_failure_holds();
     }
 
     /// The kernel's OOM killer ends the unit (`Result=oom-kill`).
@@ -694,6 +723,46 @@ impl UnitBackend for Fake {
         let w = self.w();
         let id = UnitId::service(&format!("planarian-agent-{name}"));
         w.units.get(&World::key(&id)).is_some_and(|u| matches!(u.observed, Observed::Active))
+    }
+
+    fn hold(&self, unit: &UnitId) -> Outcome {
+        let mut w = self.w();
+        if let Some(why) = w.hold_fails.take() {
+            return Outcome::Failed(why);
+        }
+        let now = w.now;
+        // A posture response carries no op (docs/bypasses.md): op 0.
+        w.calls.push(Call { call: format!("hold({unit})"), op: NO_OP, at: now, fenced: false });
+        // The script honours an unexpired release (nix/posture.nix).
+        if !w.hold_released.get(unit).is_some_and(|t| t.is_none_or(|t| t > now)) {
+            w.held.insert(unit.clone());
+        }
+        Outcome::Succeeded
+    }
+
+    fn lift_hold(&self, unit: &UnitId) -> Outcome {
+        let mut w = self.w();
+        if let Some(why) = w.hold_fails.take() {
+            return Outcome::Failed(why);
+        }
+        let now = w.now;
+        w.calls.push(Call { call: format!("lift_hold({unit})"), op: NO_OP, at: now, fenced: false });
+        w.held.remove(unit);
+        Outcome::Succeeded
+    }
+
+    fn held(&self) -> Result<BTreeSet<UnitId>, Outcome> {
+        Ok(self.w().held.clone())
+    }
+
+    fn release_hold(&self, unit: &UnitId, until: Option<Timestamp>) -> Outcome {
+        self.w().hold_released.insert(unit.clone(), until);
+        self.lift_hold(unit)
+    }
+
+    fn end_release(&self, unit: &UnitId) -> Outcome {
+        self.w().hold_released.remove(unit);
+        Outcome::Succeeded
     }
 
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome {

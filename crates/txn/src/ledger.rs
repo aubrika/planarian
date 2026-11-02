@@ -112,6 +112,28 @@ pub enum Record {
         by: Actor,
     },
     Reconciliation(Reconciliation),
+    /// §12d *Network security fails closed*: the unit's traffic is held,
+    /// journaled before the call (write-ahead). A failure posture response,
+    /// not a transaction (docs/bypasses.md).
+    HoldApplied {
+        unit: UnitId,
+        by: HoldBy,
+    },
+    /// The hold is lifted: the unit is Running and its Readiness probes
+    /// pass, or an attested release. Journaled before the call.
+    HoldLifted {
+        unit: UnitId,
+        reason: String,
+    },
+}
+
+/// Who applied a hold: systemd's `OnFailure=` (seen by the daemon) or the
+/// daemon itself, for a stop outside Planarian that is not attributed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum HoldBy {
+    OnFailure,
+    Daemon,
 }
 
 /// What a restarted owner found and did (§12 daemon restart reconciliation).
@@ -209,6 +231,12 @@ pub struct Ledger {
     /// it). A peer is matched by its instance, never its name (I24).
     #[serde(default)]
     pub agents: Vec<(String, [u8; 16], u32)>,
+    /// §12d: every hold applied (`true`) and lifted (`false`), in order; the
+    /// current holds are `holds()`. Append-only, so the fold needs no
+    /// comparison of units (and no new trusted helper). A journal from before
+    /// holds replays to none.
+    #[serde(default)]
+    pub hold_events: Vec<(UnitId, bool)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -933,6 +961,8 @@ impl Ledger {
             },
             Record::Reconciliation(r) => self.last_reconciliation = Some(r),
             Record::AgentStarted { name, instance, by } => self.agents.push((name, instance, by)),
+            Record::HoldApplied { unit, .. } => self.hold_events.push((unit, true)),
+            Record::HoldLifted { unit, .. } => self.hold_events.push((unit, false)),
         }
     }
 
@@ -1372,6 +1402,21 @@ impl Ledger {
     /// Who started the last instance under `name`, for a refusal's message.
     pub fn agent_owner(&self, name: &str) -> Option<u32> {
         self.agents.iter().rev().find(|(n, _, _)| n == name).map(|(_, _, by)| *by)
+    }
+
+    /// §12d: the units whose traffic the journal says is held now: the
+    /// last event for each is an apply. The recovery source of truth after a
+    /// restart (the daemon reconciles it with the host, failing closed).
+    pub fn holds(&self) -> std::collections::BTreeSet<UnitId> {
+        let mut held = std::collections::BTreeSet::new();
+        for (u, on) in &self.hold_events {
+            if *on {
+                held.insert(u.clone());
+            } else {
+                held.remove(u);
+            }
+        }
+        held
     }
 }
 

@@ -11,6 +11,7 @@
 pub mod cmd;
 #[cfg(feature = "gym-hooks")]
 pub mod gym;
+pub mod hold;
 pub mod logind;
 pub mod nixos;
 pub mod probe;
