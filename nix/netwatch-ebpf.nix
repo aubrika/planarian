@@ -17,6 +17,8 @@ let
   rustcLlvm = lib.versions.major (rustc.llvm.version or rustc.llvmPackages.llvm.version);
   linkerLlvm = lib.versions.major (lib.findFirst (d: lib.hasPrefix "llvm-" (d.name or "")) { version = "none"; } (bpf-linker.buildInputs ++ bpf-linker.nativeBuildInputs)).version;
 in
+assert lib.assertMsg (sections != [ ])
+  "netwatch-ebpf: name the loader's program sections, so a missing program fails the build";
 assert lib.assertMsg (rustcLlvm == linkerLlvm)
   "netwatch-ebpf: rustc's LLVM (${rustcLlvm}) and bpf-linker's (${linkerLlvm}) differ; the eBPF object would be broken";
 stdenv.mkDerivation {

@@ -328,9 +328,11 @@ let
         # 2. Is the failed network tool a network-security unit, i.e. was it
         #    protecting traffic (§12d)? Its kernel-attributed footprint says.
         #    Fail closed: a watch heartbeat missing, failed or older than 30 s;
-        #    no footprint (netwatch writes `protecting no` for every network
-        #    tool once it attaches, so a missing file was never seen by a
-        #    healthy watch); `protecting yes`; or a change the kernel could
+        #    no footprint (netwatch keeps the footprints it has across its own
+        #    restarts, charges steering it finds on attach but did not see
+        #    made to .unattributed, and writes `protecting no` only for a
+        #    network tool with no claim, so a missing file was never seen by
+        #    a healthy watch); `protecting yes`; or a change the kernel could
         #    not attribute, here or anywhere (.unattributed); a footprint not
         #    confirmed within the window (`at`): hold. Only a fresh watch, no
         #    standing unattributed change, and a fresh `protecting no` skip.
