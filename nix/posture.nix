@@ -376,11 +376,12 @@ let
   # systemd.services entry would define a stub unit.
   holdDropins = lib.listToAttrs (map (u: {
     name = "${u}.service.d/50-planarian-hold.conf";
-    value = "[Unit]\nOnFailure=planarian-hold@${u}.service\n";
+    # %N: the failed unit's name, per instance for a template's drop-in.
+    value = "[Unit]\nOnFailure=planarian-hold@%N.service\n";
   }) cfg.holdUnits) // {
     "nftables.service.d/50-planarian-hold.conf" = "[Service]\nExecStartPost=${hold} reapply\nExecReload=${hold} reapply\n";
   };
-  holdDropinPackage = pkgs.runCommand "planarian-hold-dropins" { } (lib.concatStrings (lib.mapAttrsToList (n: t: ''
+  holdDropinPackage = pkgs.runCommand "planarian-hold-dropins" { passthru.planarianHoldDropins = true; } (lib.concatStrings (lib.mapAttrsToList (n: t: ''
     mkdir -p "$out/etc/systemd/system/$(dirname ${lib.escapeShellArg n})"
     printf '%s' ${lib.escapeShellArg t} > "$out/etc/systemd/system/"${lib.escapeShellArg n}
   '') holdDropins));

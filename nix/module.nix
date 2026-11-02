@@ -47,7 +47,11 @@ let
             (builtins.attrNames os))
         (lib.filter isEnabled (builtins.attrNames options.services));
       unitPaths = lib.concatMap (u: drvs (u.path or [ ])) (builtins.attrValues config.systemd.services);
-      roots = lib.concatMap drvs (config.environment.systemPackages ++ config.systemd.packages)
+      # The hold's drop-ins (§12d) are Planarian's own text files, no
+      # package; they are computed from every service's configuration, which
+      # may read this set (a cycle), so they are left out by their marker.
+      roots = lib.concatMap drvs (config.environment.systemPackages
+          ++ builtins.filter (p: !(p.planarianHoldDropins or false)) config.systemd.packages)
         ++ fromServices ++ unitPaths
         ++ drvs config.boot.kernelPackages.kernel ++ drvs config.hardware.firmware;
       item = p: let k = ok p.outPath; in if k == null then [ ] else [ { key = k; pkg = p; } ];
@@ -88,9 +92,14 @@ let
   # tool. Whether a network tool is a network-security unit is decided at
   # runtime, from its kernel-attributed footprint (the hold's condition).
   #
-  # Not classified: templates and their instances (`foo@`, `foo@bar`), whose
-  # names cannot be a hold's instance; and Planarian's own units, whose failures have their own
-  # posture (Absent, Crashed, Integrity; §12d) and which change no routing.
+  # Templates (`openvpn@`) and their instances are classified like any unit
+  # (a template's configuration is every instance's): the hold's instance is
+  # the failed unit's own name, `@` included, which systemd's instance
+  # syntax allows (`planarian-hold@openvpn@office.service`), filled in per
+  # instance by `%N` in the OnFailure= drop-in. Not classified: Planarian's
+  # own units, whose failures have their own posture (Absent, Crashed,
+  # Integrity; §12d) and which change no routing.
+
   netdevUnits =
     lib.optional (config.systemd.network.enable && config.systemd.network.netdevs != { }) "systemd-networkd"
     ++ map (i: "wireguard-${i}") (lib.attrNames (config.networking.wireguard.interfaces or { }))
@@ -120,7 +129,7 @@ let
     || (root && (bounding == null || grants bounding netCaps))
     || lib.any (d: lib.hasInfix "/dev/net/tun" d || lib.hasInfix "/dev/ppp" d) devices;
   isNetworkTool = name:
-    if lib.hasInfix "@" name || ownUnits name || !(config.systemd.services ? ${name}) then false
+    if ownUnits name || !(config.systemd.services ? ${name}) then false
     else let r = builtins.tryEval (builtins.deepSeq (isNetworkToolUnchecked name) (isNetworkToolUnchecked name)); in
       !r.success || r.value;
   # The build-time half of "network-security unit" (§12d); the runtime half

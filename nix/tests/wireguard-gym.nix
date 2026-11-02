@@ -43,7 +43,15 @@ in
           "${pkgs.bash}/bin/bash -c '! test -e /run/wireguard-gym-broken'"
           "${pkgs.bash}/bin/bash -c 'sleep $(cat /run/wireguard-gym-slow 2>/dev/null || echo 0)'"
         ];
-        ExecStart = "${pkgs.wireguard-go}/bin/wireguard-go -f wg0";
+        # A VPN daemon that exits on its own has failed, whatever its exit
+        # status (wireguard-go exits cleanly when wg0 is deleted): the unit
+        # exits 1, so OnFailure= fires. A stop kills the whole unit and is
+        # clean.
+        ExecStart = pkgs.writeShellScript "wireguard-gym" ''
+          ${pkgs.wireguard-go}/bin/wireguard-go -f wg0
+          echo "wireguard-go exited (status $?)" >&2
+          exit 1
+        '';
         ExecStartPost = pkgs.writeShellScript "wireguard-gym-up" ''
           for _ in $(seq 100); do [ -S /var/run/wireguard/wg0.sock ] && break; sleep 0.1; done
           wg set wg0 private-key ${pkgs.writeText "wg-machine.key" keys.machine.priv} \
