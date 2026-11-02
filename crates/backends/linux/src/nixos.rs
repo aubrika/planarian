@@ -1427,6 +1427,9 @@ mod tests {
                 startup_grace: None,
                 runtime_repair: None,
                 stops_are_faults: false,
+                holds: false,
+                hold_allow: vec![],
+                hold_interfaces: vec![],
             }],
             ..Default::default()
         };

@@ -566,3 +566,30 @@ fn a_journal_written_by_todays_types_still_opens() {
     assert_eq!(reopened.ledger(), &written);
     assert_eq!(reopened.ledger().last_seq, entries.len() as u64);
 }
+
+/// §12d (#35): the journal's holds. Applied and lifted per unit, last event
+/// wins; they survive a reopen and a compaction (the daemon's recovery
+/// source of truth); a journal written before holds replays to none.
+#[test]
+fn holds_replay_and_survive_compaction() {
+    use planarian_txn::ledger::HoldBy;
+    let wg = UnitId::service("wireguard-gym");
+    let fw = UnitId::service("firewall");
+    let store = MemStore::new(1 << 20);
+    let mut j = Journal::open(store.clone()).unwrap();
+    assert!(j.ledger().holds().is_empty(), "no hold records: none");
+    j.append(Timestamp(1), Record::HoldApplied { unit: wg.clone(), by: HoldBy::OnFailure }).unwrap();
+    j.append(Timestamp(2), Record::HoldApplied { unit: fw.clone(), by: HoldBy::Daemon }).unwrap();
+    j.append(Timestamp(3), Record::HoldLifted { unit: fw.clone(), reason: "Running, Readiness passes".into() })
+        .unwrap();
+    assert_eq!(j.ledger().holds(), [wg.clone()].into());
+    j.compact().unwrap();
+    let reopened = Journal::open(store).unwrap();
+    assert_eq!(reopened.ledger().holds(), [wg.clone()].into(), "after a compaction and a reopen");
+
+    // An old checkpoint without the field reads back as no holds.
+    let mut v = serde_json::to_value(planarian_txn::ledger::Ledger::default()).unwrap();
+    v.as_object_mut().unwrap().remove("hold_events");
+    let old: planarian_txn::ledger::Ledger = serde_json::from_value(v).unwrap();
+    assert!(old.holds().is_empty());
+}

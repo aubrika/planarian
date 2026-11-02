@@ -76,6 +76,17 @@ let
     if securityUnit name then [ "Security" ]
     else if builtins.elem name [ "NetworkManager" "wpa_supplicant" "systemd-networkd" ] then [ "External" ]
     else [ "Routine" ];
+  # §12d: a network-security unit's failure holds the machine's traffic:
+  # its sensitivity holds both Security and External, or it is the firewall.
+  # The one rule: it feeds the export's `holds` (computed, never settable)
+  # and the OnFailure= hold; the owner's pending decision on which units it
+  # names changes only this function and its module-eval assertion.
+  isNetworkSecurity = name: u:
+    u.kind == "service" && u.scope == "system"
+    && ((builtins.elem "Security" u.sensitivity && builtins.elem "External" u.sensitivity)
+        # The one interim name, §12d's "or the firewall", pending the
+        # owner's classifier, which replaces this whole body (coordinator, Nov 2).
+        || builtins.elem name [ "firewall" "nftables" ]);
   defaultDisruption = name:
     if builtins.elem name [ "display-manager" "greetd" "graphical-session" ] then "SessionLoss"
     else if builtins.elem name [ "NetworkManager" "systemd-networkd" "wpa_supplicant" ] then "ConnectivityLoss"
@@ -152,6 +163,33 @@ let
           for units whose absence is harm whoever caused it (backup, sync, the
           desktop's own units): such a stop is a fault, restarted and alarmed
           (§11). Security-sensitive units are always treated so.
+        '';
+      };
+      holdAllow = mkOption {
+        type = types.listOf (types.submodule {
+          options = {
+            address = mkOption { type = types.str; description = "An IPv4 or IPv6 address (a literal: nothing resolves names while traffic is held)."; };
+            port = mkOption { type = types.port; };
+            protocol = mkOption { type = types.enum [ "tcp" "udp" ]; default = "udp"; };
+          };
+        });
+        default = [ ];
+        example = [ { address = "198.51.100.7"; port = 51820; } ];
+        description = ''
+          For a network-security unit (§12d): the endpoints it needs to
+          reconnect while its traffic is held, e.g. a WireGuard peer. Every
+          other connection is refused until the unit is back.
+        '';
+      };
+      holdInterfaces = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "wg0" ];
+        description = ''
+          For a network-security unit (§12d): its own network interfaces
+          (a tunnel's). Traffic over them passes the hold, as a kill switch
+          lets the tunnel itself through (owner decision, Nov 2), so a
+          Readiness probe across the tunnel can pass and lift the hold.
         '';
       };
       runtimeRepair = mkOption {
@@ -265,6 +303,11 @@ let
     systemd_restart = if u.scope == "system" && u.kind == "service" then restartJSON name else null;
     startup_grace = if u.startupGrace == null then null else u.startupGrace * 1000;
     runtime_repair = u.runtimeRepair;
+    # §12d: whether its failure holds the machine's traffic, and what the
+    # hold still lets it reach.
+    holds = isNetworkSecurity name u;
+    hold_allow = map (a: { inherit (a) address port protocol; }) u.holdAllow;
+    hold_interfaces = u.holdInterfaces;
     stops_are_faults = !u.inferStops;
   };
 
@@ -548,6 +591,12 @@ in
         (mkDefault { scope = "user"; edges = [ { to = "service@0:pipewire"; kind = "Requires"; } ]; });
     };
 
+    services.planarian.holdUnits = lib.unique (
+      lib.attrNames (lib.filterAttrs isNetworkSecurity cfg.units)
+      # The firewall, by name: the same interim name as in isNetworkSecurity.
+      ++ lib.optional (config.networking.firewall.enable && !config.networking.nftables.enable) "firewall"
+      ++ lib.optional config.networking.nftables.enable "nftables");
+
     services.planarian.export = {
       units = unitsOf "system";
       userUnits = unitsOf "user";
@@ -691,7 +740,8 @@ in
       after = [ "planarian-recovery.service" ];
       restartIfChanged = false;
       stopIfChanged = false;
-      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux pkgs.kmod pkgs.getent ]
+      # nftables: the daemon checks the hold's table each tick (§12d).
+      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux pkgs.kmod pkgs.getent pkgs.nftables ]
         ++ lib.optional config.networking.networkmanager.enable config.networking.networkmanager.package;
       environment.PLANARIAN_CONFIG = "/etc/planarian/config.json";
       serviceConfig = {

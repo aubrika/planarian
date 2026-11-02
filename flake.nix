@@ -96,6 +96,8 @@
         module-eval = import ./nix/tests/eval.nix { inherit pkgs self nixpkgs; };
         vm-runtime = import ./nix/tests/vm.nix { inherit pkgs self; };
         vm-posture = import ./nix/tests/posture.nix { inherit pkgs self; };
+        # §12d network security fails closed (#35; reviewer's case).
+        vm-netsec = import ./nix/tests/netsec.nix { inherit pkgs self; };
         vm-generations = import ./nix/tests/vm-generations.nix { inherit pkgs self; };
         installer = import ./nix/tests/installer.nix { inherit pkgs self nixpkgs; };
         # The demo VM (`nix run .#vm-text`) builds.

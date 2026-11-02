@@ -21,6 +21,12 @@ let
   # The journal's filesystem: btrfs for an entry whose layouts ask for it
   # (and not ext4), else ext4.
   layouts = (lib.findFirst (e: e.id == id) { } (import ../gym/catalog.nix catalog).fault).layouts or [ ];
+  # §12d "Network security fails closed": the WireGuard fixture, for the
+  # netsec-* entries only, so no other entry gains a watched unit. The test
+  # driver numbers nodes alphabetically on vlan 1: machine is 192.168.1.1,
+  # upstream 192.168.1.2.
+  netsec = lib.hasPrefix "netsec-" id;
+  wireguardGym = import ./wireguard-gym.nix { inherit pkgs lib; };
   journalFs = if layouts != [ ] && !(builtins.elem "ext4" layouts) && builtins.elem "btrfs" layouts then "btrfs" else "ext4";
   # A third-party flake input's source at two revisions (store paths).
   modulesOld = builtins.path { path = ./gym-modules-old; name = "gym-modules"; };
@@ -162,7 +168,9 @@ let
         facts = facts (if n == "base" then config else config.specialisation.${n}.configuration);
       }) candidates));
     in {
-    imports = [ self.nixosModules.default self.nixosModules.reference ./gym-payload.nix ];
+    imports = [ self.nixosModules.default self.nixosModules.reference ./gym-payload.nix
+      { config = lib.mkIf netsec (wireguardGym.machine { endpoint = "192.168.1.2"; }); }
+    ];
 
     options.services.gym-web.listenAddress = lib.mkOption { type = lib.types.str; default = "127.0.0.1"; };
     options.services.gym-extra.enable = lib.mkEnableOption "gym-extra";
@@ -558,6 +566,7 @@ let
       name = "gym-${id}";
       nodes.machine = machineModule;
       nodes.upstream = { pkgs, ... }: {
+        imports = lib.optional netsec wireguardGym.peer;
         networking.interfaces.eth1.ipv4.addresses = lib.mkAfter [ { address = "10.0.2.2"; prefixLength = 32; } ];
         environment.etc.health.text = "ok\n";
         networking.firewall.enable = false;

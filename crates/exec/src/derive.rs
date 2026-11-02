@@ -51,10 +51,9 @@ fn already_failed(s: &SystemState, defs: &UnitDefs, u: &UnitId) -> bool {
 /// held", so the waiver reads the hold itself, not the footprint that leads
 /// to it: §12d fails closed toward applying a hold, and with this a missing
 /// or stale footprint buys a waiver only once traffic is in fact blocked.
-/// STUB: `false` until lane-daemon carries the active holds in `SystemState`;
-/// then read `s` here and nowhere else.
-fn hold_in_place(_s: &SystemState, _u: &UnitId) -> bool {
-    false
+/// `SystemState.holds`: the journal's holds and the host's, their union.
+fn hold_in_place(s: &SystemState, u: &UnitId) -> bool {
+    s.holds.contains(u)
 }
 
 fn unit_facts<'a>(

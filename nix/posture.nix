@@ -164,6 +164,198 @@ let
     systemctl start --no-block planarian-failed@absent.target
   '';
 
+  # §12d "Network security fails closed": the hold. `apply <unit>` holds the
+  # machine's traffic for a failed network-security unit; `lift <unit>` ends
+  # that unit's hold; `reapply` rebuilds the table (after nftables.service
+  # starts or reloads, which may flush every table); `released <unit>` is the
+  # ExecCondition that skips a hold an administrator released.
+  #
+  # The table drops all traffic in and out except loopback, address
+  # assignment (DHCP, DHCPv6, ICMPv6 neighbour and router discovery), the held
+  # units' holdAllow endpoints and their own interfaces (a tunnel's traffic is
+  # protected; owner decision, Nov 2), and the established connections of
+  # administrator sessions. Those are taken when the hold is applied: every
+  # socket held by a process in the scope of a logind session whose user is
+  # root or in the administrators' group, matched by its exact addresses and
+  # ports. New connections are refused for the whole hold, so no
+  # administrator session can begin after the snapshot: the snapshot is the
+  # whole set (coordinator, Nov 2). Root-owned daemons and an administrator's
+  # processes outside a session scope are not sessions, and are held.
+  # Tuples rather than conntrack marks: a flow that predates the hold may
+  # have no conntrack entry to mark (no rule needed tracking before).
+  hold = pkgs.writeShellScript "planarian-hold" ''
+    set -u
+    PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep pkgs.gawk pkgs.nftables pkgs.iproute2 pkgs.findutils pkgs.getent config.systemd.package ]}
+    dir=/run/planarian/hold
+    released=/run/planarian/hold-released
+    mkdir -p "$dir" "$released"
+    cmd="$1"; unit="''${2:-}"
+    log() { echo "planarian-hold: $*"; }
+
+    is_admin() {
+      [ "$1" = 0 ] && return 0
+      name="$(getent passwd "$1" | cut -d: -f1)"
+      [ -n "$name" ] && id -nG "$name" 2>/dev/null | tr ' ' '\n' | grep -qx ${lib.escapeShellArg cfg.adminGroup}
+    }
+
+    # Administrator sessions' sockets, as nft set elements, added to the
+    # ones a previous apply took (a second hold takes the union).
+    snapshot() {
+      pids=" "
+      for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+        uid="$(loginctl show-session "$s" -p User --value 2>/dev/null)"
+        [ -n "$uid" ] && is_admin "$uid" || continue
+        scope="$(loginctl show-session "$s" -p Scope --value 2>/dev/null)"
+        [ -n "$scope" ] || continue
+        # Bounded: a session scope sits at user.slice/user-UID.slice/, and
+        # at most 4096 of its processes are taken. Beyond either bound the
+        # rest are not taken, i.e. held (fail closed).
+        for d in $(find /sys/fs/cgroup -maxdepth 4 -type d -name "$scope" 2>/dev/null | head -n 4); do
+          pids="$pids$(find "$d" -maxdepth 8 -name cgroup.procs -exec cat {} + 2>/dev/null | head -n 4096 | tr '\n' ' ')"
+        done
+      done
+      ss -tunpH state established 2>/dev/null | awk -v pids="$pids" '
+        # An IPv4 peer of a dual-stack socket shows as [::ffff:a.b.c.d]; on
+        # the wire it is IPv4, so it is matched as IPv4.
+        function split_ap(s, r,  i) { i = match(s, /:[0-9]+$/); r[1] = substr(s, 1, i - 1); r[2] = substr(s, i + 1); gsub(/^\[|\]$/, "", r[1]); sub(/%.*/, "", r[1]); if (r[1] ~ /^::ffff:[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) sub(/^::ffff:/, "", r[1]) }
+        {
+          ok = 0; line = $0
+          while (match(line, /pid=[0-9]+/)) { p = substr(line, RSTART + 4, RLENGTH - 4); if (index(pids, " " p " ")) ok = 1; line = substr(line, RSTART + RLENGTH) }
+          if (!ok) next
+          split_ap($4, l); split_ap($5, r)
+          fam = (index(l[1], ":") ? 6 : 4)
+          print fam, $1, l[1], l[2], r[1], r[2]
+        }' >> "$dir/.admin"
+      sort -u -o "$dir/.admin" "$dir/.admin"
+    }
+
+    build() {
+      units="$(ls "$dir" 2>/dev/null)"
+      if [ -z "$units" ]; then
+        nft delete table inet planarian-hold 2>/dev/null
+        rm -f "$dir/.admin"
+        return 0
+      fi
+      a4=""; a6=""; i4=""; o4=""; i6=""; o6=""; ifs=""
+      for u in $units; do
+        f=/etc/planarian/hold/$u.allow
+        [ -f "$f" ] || continue
+        while read -r proto addr port; do
+          if [ "$proto" = iface ]; then ifs="$ifs \"$addr\","; continue; fi
+          [ -n "$port" ] || continue
+          case "$addr" in *:*) a6="$a6 $proto . $addr . $port," ;; *) a4="$a4 $proto . $addr . $port," ;; esac
+        done < "$f"
+      done
+      if [ -f "$dir/.admin" ]; then
+        while read -r fam proto la lp ra rp; do
+          if [ "$fam" = 6 ]; then
+            i6="$i6 $proto . $ra . $rp . $la . $lp,"; o6="$o6 $proto . $la . $lp . $ra . $rp,"
+          else
+            i4="$i4 $proto . $ra . $rp . $la . $lp,"; o4="$o4 $proto . $la . $lp . $ra . $rp,"
+          fi
+        done < "$dir/.admin"
+      fi
+      el() { [ -n "$1" ] && echo "elements = { $1 }"; }
+      nft -f - <<NFT
+    table inet planarian-hold
+    delete table inet planarian-hold
+    table inet planarian-hold {
+      set allow4 { type inet_proto . ipv4_addr . inet_service; $(el "$a4") }
+      set allow6 { type inet_proto . ipv6_addr . inet_service; $(el "$a6") }
+      set admin_in4 { type inet_proto . ipv4_addr . inet_service . ipv4_addr . inet_service; $(el "$i4") }
+      set admin_out4 { type inet_proto . ipv4_addr . inet_service . ipv4_addr . inet_service; $(el "$o4") }
+      set admin_in6 { type inet_proto . ipv6_addr . inet_service . ipv6_addr . inet_service; $(el "$i6") }
+      set admin_out6 { type inet_proto . ipv6_addr . inet_service . ipv6_addr . inet_service; $(el "$o6") }
+      set ifaces { type ifname; $(el "$ifs") }
+      chain input {
+        type filter hook input priority -300; policy drop;
+        iif lo accept
+        iifname @ifaces accept
+        udp sport 67 udp dport 68 accept
+        udp sport 547 udp dport 546 accept
+        icmpv6 type { nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } accept
+        meta l4proto . ip saddr . th sport @allow4 accept
+        meta l4proto . ip6 saddr . th sport @allow6 accept
+        meta l4proto . ip saddr . th sport . ip daddr . th dport @admin_in4 accept
+        meta l4proto . ip6 saddr . th sport . ip6 daddr . th dport @admin_in6 accept
+      }
+      chain output {
+        type filter hook output priority -300; policy drop;
+        oif lo accept
+        oifname @ifaces accept
+        udp sport 68 udp dport 67 accept
+        udp sport 546 udp dport 547 accept
+        icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
+        meta l4proto . ip daddr . th dport @allow4 accept
+        meta l4proto . ip6 daddr . th dport @allow6 accept
+        meta l4proto . ip saddr . th sport . ip daddr . th dport @admin_out4 accept
+        meta l4proto . ip6 saddr . th sport . ip6 daddr . th dport @admin_out6 accept
+      }
+      chain forward {
+        type filter hook forward priority -300; policy drop;
+      }
+    }
+    NFT
+    }
+
+    # Fail closed: when the full table does not load (and a hold stands),
+    # hold everything but loopback rather than nothing. apply, lift (other
+    # holds may stand) and reapply (after a flush) all go through it.
+    build_or_lock() {
+      build && return 0
+      log "the hold table did not load; holding all traffic but loopback"
+      nft -f - <<NFT
+    table inet planarian-hold
+    delete table inet planarian-hold
+    table inet planarian-hold {
+      chain input { type filter hook input priority -300; policy drop; iif lo accept; }
+      chain output { type filter hook output priority -300; policy drop; oif lo accept; }
+      chain forward { type filter hook forward priority -300; policy drop; }
+    }
+    NFT
+    }
+
+    case "$cmd" in
+      released)
+        # ExecCondition: exit 1 skips the hold while an unexpired release
+        # stands (the marker holds a Unix time, or `boot`; /run never
+        # survives a reboot). Anything else is no release: hold.
+        m="$released/$unit"
+        [ -f "$m" ] || exit 0
+        t="$(head -n1 "$m")"
+        if [ "$t" = boot ] || { case "$t" in ""|*[!0-9]*) false ;; esac && [ "$t" -gt "$(date +%s)" ]; }; then
+          log "hold on $unit not applied: released until $t"
+          exit 1
+        fi
+        exit 0 ;;
+      apply)
+        touch "$dir/$unit"
+        snapshot
+        build_or_lock && log "traffic held: $unit has failed" ;;
+      lift)
+        rm -f "$dir/$unit"
+        build_or_lock && log "hold on $unit lifted" ;;
+      reapply)
+        build_or_lock ;;
+      *) echo "usage: planarian-hold apply|lift|released UNIT | reapply" >&2; exit 2 ;;
+    esac
+  '';
+
+  # §12d: the OnFailure= hold on each network-security unit, and the
+  # re-application after nftables.service (re)loads, as drop-ins. A drop-in
+  # for a unit this system does not define is inert, where a
+  # systemd.services entry would define a stub unit.
+  holdDropins = lib.listToAttrs (map (u: {
+    name = "${u}.service.d/50-planarian-hold.conf";
+    value = "[Unit]\nOnFailure=planarian-hold@${u}.service\n";
+  }) cfg.holdUnits) // {
+    "nftables.service.d/50-planarian-hold.conf" = "[Service]\nExecStartPost=${hold} reapply\nExecReload=${hold} reapply\n";
+  };
+  holdDropinPackage = pkgs.runCommand "planarian-hold-dropins" { } (lib.concatStrings (lib.mapAttrsToList (n: t: ''
+    mkdir -p "$out/etc/systemd/system/$(dirname ${lib.escapeShellArg n})"
+    printf '%s' ${lib.escapeShellArg t} > "$out/etc/systemd/system/"${lib.escapeShellArg n}
+  '') holdDropins));
+
   # I2 in A-D (§12d, B-12): every Planarian binary and script this
   # generation installs, hashed at build. The watchdog checks each against
   # the record; any mismatch is an Integrity failure. (Signatures in E.)
@@ -177,6 +369,7 @@ let
     "${stopPost "planariad"}"
     "${stopPost "planarian-recovery"}"
     "${check}"
+    "${hold}"
   ];
   coreHash = pkgs.runCommand "planarian-core-hash" { } ''
     for f in ${lib.escapeShellArgs coreFiles}; do
@@ -196,6 +389,24 @@ in
       default = [ ];
       example = [ "my-assistant.service" ];
       description = "Units that run an agent principal (§11). They start only after planarian-ready.target and are stopped by every failure class (I20).";
+    };
+    holdAllowsOwnInterface = mkOption {
+      type = types.bool;
+      default = true;
+      internal = true;
+      description = "Whether a hold passes traffic over the held units' own interfaces (`holdInterfaces`), as a kill switch does: the tunnel's own traffic is protected traffic (owner decision, Nov 2; §12d).";
+    };
+    holdUnits = mkOption {
+      type = types.listOf types.str;
+      readOnly = true;
+      internal = true;
+      description = "The network-security units (§12d): a failure of any holds the machine's traffic.";
+    };
+    holdDropins = mkOption {
+      type = types.attrsOf types.str;
+      readOnly = true;
+      internal = true;
+      description = "The hold's systemd drop-ins, by path under /etc/systemd/system (for module-eval).";
     };
     adminGroup = mkOption {
       type = types.str;
@@ -325,6 +536,35 @@ in
     systemd.services = lib.genAttrs (map (lib.removeSuffix ".service") principalUnits) (_: {
       after = [ "planarian-ready.target" ];
     });
+  }
+  {
+    # §12d "Network security fails closed": the hold unit, its drop-ins
+    # and each held unit's holdAllow endpoints.
+    services.planarian.holdDropins = holdDropins;
+    systemd.packages = [ holdDropinPackage ];
+    environment.etc = lib.listToAttrs (map (u: {
+      name = "planarian/hold/${u}.allow";
+      value.text = lib.concatMapStrings (a: "${a.protocol} ${a.address} ${toString a.port}\n") cfg.units.${u}.holdAllow
+        + lib.optionalString cfg.holdAllowsOwnInterface (lib.concatMapStrings (i: "iface ${i}\n") cfg.units.${u}.holdInterfaces);
+    }) (builtins.filter (u: cfg.units ? ${u}) cfg.holdUnits));
+    systemd.services."planarian-hold@" = {
+      description = "Planarian: hold network traffic while %i has failed";
+      # An activation (a repair rollback, `undo`) must not stop and start a
+      # running hold: that would open traffic while the unit is still down.
+      restartIfChanged = false;
+      stopIfChanged = false;
+      unitConfig.DefaultDependencies = false;
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecCondition = "${hold} released %i";
+        ExecStart = "${hold} apply %i";
+        ExecStop = "${hold} lift %i";
+        # Rebuild the table in place (after a flush), never lifting it: a
+        # restart would run lift then apply, passing traffic between them.
+        ExecReload = "${hold} reapply";
+      };
+    };
   }
   {
     # The launched agents' slice (§12d, R05): `planarian agent run` puts

@@ -48,6 +48,9 @@ pub fn unit(id: &str, sens: &[Sensitivity], disruption: Disruption, probes: Vec<
         startup_grace: None,
         runtime_repair: None,
         stops_are_faults: false,
+        holds: false,
+        hold_allow: vec![],
+        hold_interfaces: vec![],
     }
 }
 

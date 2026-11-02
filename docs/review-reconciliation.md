@@ -299,6 +299,25 @@ manifest. Controls: an identical manifest does not; the fields already covered
 | --- | --- | --- | --- |
 | P21 | closed by this PR | `MemStore` keeps an undo log of log writes since the last `sync`: `sync` makes them durable, the new `crash()` (a power loss) undoes them, so the fake's "Journal fsync is durable" contract can fail. `conformance::MATRIX` adds `unbind` (`drv-bind-fails-restores-previous`: a failed bind's revert) and `cancel` (`crash-job-outlives-drain`: an unanswered activation's jobs), each under Partial, Unknown and Fenced; the comment that no fake entry makes them is corrected. The fake's `unbind` and `cancel` already honoured `World::inject` (`fake/src/lib.rs`), so `crates/fake` is unchanged | reviewer's `crates/txn/tests/memstore_sync.rs` (did not compile on `main`) and gym test `the_conformance_matrix_covers_unbind_and_cancel` (failed on `main`); both pass |
 
+## lane-daemon: #35 part 1, network security fails closed (§12d, the daemon's half), 2 Nov
+
+Built on lane-nix's `lane-nix/network-hold` (#36, `3530716`: the hold unit and
+script, `OnFailure=`, the export's `holds`/`hold_allow`, and the reviewer's
+`vm-netsec`) and #34 (`2ab358b`: §12d's text, `restarts_held_unit` in
+policy). Grants (coordinator, Nov 2): the hold calls in `schema::backend`,
+`backends/linux` and the fake; the `HoldApplied`/`HoldLifted` records and the
+fold in `crates/txn`; `UnitDef.holds`/`hold_allow`/`hold_interfaces`; the
+interim `restarts_held_unit` rule in derive; `vm.yml`'s `vm-netsec` line.
+
+| Item | At the base | Work |
+| --- | --- | --- |
+| The daemon knows which units hold | `UnitDef` had no such field; the export carried `holds` | `UnitDef.holds`, `hold_allow`, `hold_interfaces` (serde default; read straight from the export) |
+| A held unit restarts at once | policy reads `restarts_held_unit`; derive always set it `false` | `derive::stop_fact`: `holds && no override && (already failed \|\| an unattributed stop)`, marked INTERIM (B-21) |
+| Apply, alarm, lift, notify | nothing in the daemon | `Core::network_holds` each tick, before incidents open: journal `HoldApplied` (`OnFailure` if the host already holds it, else `Daemon`, then `hold`), alarm once; journal `HoldLifted` and `lift_hold` once Running with every Readiness probe passing; when repair has given up, the hold stays and administrators are told once |
+| The hold survives planariad | — | `Ledger::holds()`, from an append-only `hold_events` log (no new trusted helper), is the source of truth; reconciled with the host's `held` each tick, failing closed |
+| `planarian hold release` | — | an attested `Override` on `planarian-hold@<unit>` through the executor; the hold unit has a never-expected def carrying the held unit's sensitivity, so a non-administrator's release is AskFirst with an Administrator approver; on commit, journal `HoldLifted` and write the release marker (`boot` by default) |
+| Bypass register | — | X-13 (accepted): a posture response without `Prepared` or a lease; I15, I21 |
+
 ## Reviewer: §12f *Rollbacks* acceptance cases (#9), 2 Nov
 
 Written from §12f (*Rollbacks*, *Quiet mode*), §11 global floors and §13
@@ -395,3 +414,17 @@ view) to this task.
 | Shown in `planarian approve`, the console and the notice; structured for agents | not shown anywhere; `Pending` had `facts` only | `Pending.diff` (serde default); `planarian approve [--json]` lists pending changes with their diffs (read-only, no TTY or root); `approve <hash>` prints the diff above its result; `status` and the console's banner show it; the notice and the `NeedsApproval` response carry a one-line summary (`ApprovalDiff::summary`) |
 | The units it would remove or stop | not in `DerivedFacts`; `removes_sensitivity` is #34's | `removes` is filled from `facts.removes` once #34's derive change lands (coordinator, Nov 2); empty until then |
 | Journal compatibility of `removes` (#37 review at `f7e2dc3`) | main journals `DerivedFacts.removes: Vec<UnitId>` (since 4bb9c99) inside `Prepared`; `f7e2dc3` changed it to `Vec<(UnitId, Sensitivities)>`, so a record main wrote would not decode. No journaled type uses `deny_unknown_fields` | `removes` keeps main's form; `#[serde(default)] removes_each: Vec<Sensitivities>` runs parallel to it, filled by `removed_units` from the decision's lookup. The display takes `removes_each[i]` when the lengths match, else `removes_sensitivity` for each with a note (`approval::removed`). Literal fixtures of main's form, `DerivedFacts` and a whole `Prepared` record, decode; policy test `removed_units_and_their_own_sensitivities_do_not_move_a_decision` (I14). `approval_diff`'s unused `defs` is gone |
+
+## lane-nix: #35 part 1, network security fails closed (2 Nov)
+
+Read #35 and §12d on #34's branch (`ccr-c64ddb68-a5g3k5`), `nix/module.nix`, `nix/posture.nix`, the gym VM, and the pinned nixpkgs nftables, firewall, sshd and wg-quick modules. Design approved by the coordinator (2 Nov); interface sent to lane-daemon.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| Which units | The shipped table gives VPN units (`wg-quick-*`, `wireguard-*`, `openvpn-*`, `tailscaled`, `strongswan`) `Security` only, so by §12d's rule ("Security and External") no unit is a network-security unit by default but the firewall | raised with the coordinator; the module keys on the rule; the shipped default is unchanged pending that decision |
+| The table | `flushRuleset` is off by default in the pinned nftables module, but when set every reload flushes every table, the hold's included | `planarian-hold@<unit>` (core script, in `coreFiles`) builds `table inet planarian-hold`, priority raw, policy drop; re-applied by a drop-in on nftables.service's ExecStartPost and ExecReload |
+| Administrator sessions | `meta skuid` would keep every SSH session (sshd's accepted sockets are root's) and every root daemon | snapshot at apply: sockets of processes in the scope of a logind session of root or `planarian-admin`, matched by exact tuples (a flow from before the hold may have no conntrack entry to mark). New connections are refused, so the snapshot is the whole set |
+| OnFailure= | `systemd.services.<x>.onFailure` would define a stub unit for a declared unit the system does not define (P13's lesson) | drop-ins in a package, `<unit>.service.d/50-planarian-hold.conf`, inert for an undefined unit |
+| WireGuard fixture | NixOS's wg-quick units are oneshots: nothing to kill, and a kill would not fail them | `wireguard-gym`, a wireguard-go daemon unit to the upstream node, for `netsec-*` entries only (no other entry gains a watched unit) |
+| Owner decisions (2 Nov, through the coordinator) | The tunnel's own traffic passes the hold (a kill switch's default), so a Readiness probe across the tunnel can lift it. Which units hold: a classifier of units whose failure would expose unprotected traffic or endanger privacy, design pending; no name list | `holdAllowsOwnInterface` on by default (internal), per-unit `holdInterfaces`; the fixture's probe crosses the tunnel again. `isNetworkSecurity` stays the one switch for the classifier; until then the fixture is tagged Security and External explicitly |
+| Review of #36 (2 Nov) | An activation (a repair rollback, `undo`) would stop and start running holds; B-21 described the shipped rule as pending; a dual-stack sshd shows IPv4 peers as `::ffff:a.b.c.d`, so administrators' IPv4 flows were filed as IPv6 and cut; the session-scope walk was unbounded | `planarian-hold@` has `restartIfChanged`/`stopIfChanged` false (module-eval); B-21 restated as the interim rule; mapped addresses are matched as IPv4 (netns-tested); the walk is bounded (depth 4 for the scope, 4 scopes, 4096 processes: beyond them, held) |
