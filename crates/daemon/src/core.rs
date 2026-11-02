@@ -140,6 +140,25 @@ pub struct LogRecord {
     /// The agent that sent the request, acting for `caller` (§11).
     #[serde(default)]
     pub agent: Option<String>,
+    /// §12 step 6 (C18): the transaction touches user data and no snapshot
+    /// was taken, because Phase A has no snapshot backend; it continued.
+    #[serde(default)]
+    pub no_snapshot: bool,
+    /// I7: an approved execution names who approved it and the `bound_to`
+    /// of the token used; a submission parked for approval carries the
+    /// `bound_to` it waits on.
+    #[serde(default)]
+    pub approver: Option<Actor>,
+    #[serde(default)]
+    pub bound_to: Option<Hash>,
+}
+
+/// §12 step 6 (C18): a transaction that got past step 5 (it ran, or waits
+/// for its activation window) with `UserData` among its sensitivities,
+/// where snapshots are unsupported (always, in Phase A: no snapshot backend
+/// is wired), logs `NoSnapshot` and continues.
+fn no_snapshot(result: &Submitted, facts: Option<&DerivedFacts>) -> bool {
+    matches!(result, Submitted::Finished { .. }) && facts.is_some_and(|f| f.sensitivity.contains(Sensitivity::UserData))
 }
 
 pub struct Core<B: Backends + Clone, S: Store> {
@@ -235,6 +254,9 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// Set by the daemon while a deferred change builds elsewhere: what, and since when.
     pub building: Option<(String, Timestamp)>,
     deferred: Option<(PrebuildJob<B::Gens>, Resume)>,
+    /// The agent behind each change parked for approval, for the approved
+    /// execution's log record (I7).
+    parked_agents: BTreeMap<TxnId, Option<String>>,
 }
 
 /// How to finish a request whose slow part ran elsewhere.
@@ -343,6 +365,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             _ => None,
         };
         let mut core = Core {
+            parked_agents: BTreeMap::new(),
             after_ready: deferred,
             ex,
             b,
@@ -626,8 +649,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             ),
             None => (vec![], String::new()),
         };
+        if let Submitted::Parked { txn, .. } = &result {
+            self.parked_agents.insert(*txn, self.acting_agent.clone());
+        }
         let record = LogRecord {
             at: now,
+            no_snapshot: no_snapshot(&result, facts.as_ref()),
+            approver: None,
+            bound_to: match &result {
+                Submitted::Parked { approve, .. } => Some(*approve),
+                _ => None,
+            },
             proposal: p,
             caller,
             pre_digest: pre,
@@ -1044,6 +1076,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     pub fn tick(&mut self) {
+        // I7's agent for an approval is needed only while the change is
+        // parked; a cancelled, expired, invalidated or refused one leaves.
+        // An approved one leaves `ex.parked` only inside `Executor::approve`,
+        // and the Approve handler writes its record in the same call, so
+        // the record never misses its agent (a slow build is deferred before
+        // `approve`, while the change is still parked).
+        let parked = &self.ex.parked;
+        self.parked_agents.retain(|t, _| parked.contains_key(t));
         let (s, defs) = self.observe();
         let now = s.observed_at;
         // P9: a tick over its 500 ms budget is warned, with the probes that
@@ -2089,7 +2129,69 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
                 let (s, defs) = self.observe();
                 let approver = self.authz(&peer);
+                let parked = self.ex.parked.values().find(|p| p.bound_to == hash).cloned();
+                let (pre, policy) = (s.digest(), self.ex.policy_version());
                 let r = self.ex.approve(&hash, &approver, &s, &defs);
+                // Re-bound and asked again under a new id (§12 step 4): the
+                // proposer's agent goes with it.
+                if let (Some(pk), Submitted::Parked { txn: again, .. }) = (&parked, &r)
+                    && *again != pk.txn
+                    && let Some(agent) = self.parked_agents.remove(&pk.txn)
+                {
+                    self.parked_agents.insert(*again, agent);
+                }
+                // I7: the approved execution writes its own log record; an
+                // approval passes §12 step 6 here, not at submission (C18).
+                if let (Some(pk), Submitted::Finished { txn, .. }) = (parked, &r) {
+                    let l = self.ledger();
+                    // The proposer's agent, not whoever is acting now.
+                    let agent = self.parked_agents.remove(&pk.txn).flatten();
+                    let rec = if *txn == pk.txn {
+                        LogRecord {
+                            at: self.b.clock().now(),
+                            no_snapshot: no_snapshot(&r, Some(&pk.facts)),
+                            approver: Some(approver.actor.clone()),
+                            bound_to: Some(hash),
+                            proposal: pk.proposal,
+                            caller: pk.authz.actor,
+                            pre_digest: pre,
+                            policy,
+                            result: r.clone(),
+                            facts: Some(pk.facts),
+                            decision: Some(Decision::Allow { tier: Tier::AskFirst, approver: pk.class }),
+                            post_digest: None,
+                            path: l.path(*txn).map(<[String]>::to_vec).unwrap_or_default(),
+                            why: l.terminal.get(txn).map(|x| x.why.clone()).unwrap_or_default(),
+                            agent,
+                        }
+                    } else {
+                        // Re-bound (§12 step 4), and the fresh decision no
+                        // longer asks: it ran as an ordinary submission under
+                        // a new id, approved by nobody. Log it as one, with the
+                        // new plan's facts and decision.
+                        let (facts, decision) = self.ex.last.clone().unzip();
+                        let mut proposal = pk.proposal;
+                        proposal.observed = pre;
+                        LogRecord {
+                            at: self.b.clock().now(),
+                            no_snapshot: no_snapshot(&r, facts.as_ref()),
+                            approver: None,
+                            bound_to: None,
+                            proposal,
+                            caller: pk.authz.actor,
+                            pre_digest: pre,
+                            policy,
+                            result: r.clone(),
+                            facts,
+                            decision,
+                            post_digest: None,
+                            path: l.path(*txn).map(<[String]>::to_vec).unwrap_or_default(),
+                            why: l.terminal.get(txn).map(|x| x.why.clone()).unwrap_or_default(),
+                            agent,
+                        }
+                    };
+                    self.awaiting_post.push(rec);
+                }
                 render::response(&r)
             }
             Request::Cancel { txn } => {
