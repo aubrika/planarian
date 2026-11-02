@@ -36,7 +36,7 @@ fn tables() -> Tables {
 
 fn facts(
     sens: &[Sensitivity],
-    disruption: Disruption,
+    disruption: Disruptions,
     recovery: Recovery,
     flags: u8,
     diff: Option<&str>,
@@ -120,6 +120,38 @@ fn callers() -> Vec<Authorization> {
     ]
 }
 
+/// C10: a seated administrator's change that drops connectivity *and* interrupts a
+/// data service on a session that is not theirs meets the DataInterruption
+/// floor. Folded to the larger single value (ConnectivityLoss), the seated
+/// caller was spared it.
+#[test]
+fn c10_two_disruptions_meet_both_floors() {
+    let st = state();
+    let tb = tables();
+    let locked: Vec<String> = vec![];
+    let mut both = Disruptions::of(Disruption::ConnectivityLoss);
+    both.insert(Disruption::DataInterruption);
+    // Authorized for the restart, so only the floors decide.
+    let seated = user(0, true, true, true);
+    for (d, must_ask) in [(Disruptions::of(Disruption::ConnectivityLoss), false), (both, true)] {
+        let f = facts(&[Sensitivity::Routine], d, Recovery::Revertible, 0, None);
+        let r = decide(&Input {
+            transition: &Transition::RestartUnit(UnitId::service("gym-db")),
+            facts: &f,
+            known_good: st.known_good,
+            live_tested: st.live_tested,
+            cumulative: &ConfigDiff::default(),
+            authz: &seated,
+            settings: &Settings::default(),
+            tables: &tb,
+            locked: &locked,
+            revert_to: None,
+        });
+        let asks = matches!(r, Decision::Allow { tier: Tier::AskFirst, .. } | Decision::Reject(_));
+        assert_eq!(asks, must_ask, "{d:?}: {r:?}");
+    }
+}
+
 fn ask(class: ApproverClass) -> Decision {
     Decision::Allow { tier: Tier::AskFirst, approver: class }
 }
@@ -140,12 +172,20 @@ fn grid(mut f: impl FnMut(&Transition, &DerivedFacts, &Authorization, &Session, 
         &[Sensitivity::External, Sensitivity::UserData],
         &[Sensitivity::Core],
     ];
+    // Each kind alone, and the two pairs C10 found folding to one floor.
+    let two = |a, b| {
+        let mut s = Disruptions::of(a);
+        s.insert(b);
+        s
+    };
     let disruptions = [
-        Disruption::None,
-        Disruption::Brief,
-        Disruption::SessionLoss,
-        Disruption::DataInterruption,
-        Disruption::ConnectivityLoss,
+        Disruptions::of(Disruption::None),
+        Disruptions::of(Disruption::Brief),
+        Disruptions::of(Disruption::SessionLoss),
+        Disruptions::of(Disruption::DataInterruption),
+        Disruptions::of(Disruption::ConnectivityLoss),
+        two(Disruption::ConnectivityLoss, Disruption::DataInterruption),
+        two(Disruption::SessionLoss, Disruption::ConnectivityLoss),
     ];
     let recoveries = [Recovery::Idempotent, Recovery::Revertible, Recovery::NonReversible];
     let diffs = [None, Some("fonts.scale"), Some("services.openssh.enable"), Some("services.locked")];
@@ -261,11 +301,9 @@ fn floors_and_canonical_probes() {
         let own = session.is_some_and(|s| f.affected_sessions == vec![s]);
         let must_ask = f.recovery == Recovery::NonReversible
             || f.touches_canonical_probe
-            || (matches!(f.disruption, Disruption::SessionLoss | Disruption::DataInterruption) && !(is_user && own))
-            || (f.disruption == Disruption::ConnectivityLoss && !seat)
-            || (f.other_sessions_affected
-                && matches!(f.disruption, Disruption::SessionLoss | Disruption::ConnectivityLoss)
-                && !admin);
+            || ((f.disruption.session_loss || f.disruption.data_interruption) && !(is_user && own))
+            || (f.disruption.connectivity_loss && !seat)
+            || (f.other_sessions_affected && (f.disruption.session_loss || f.disruption.connectivity_loss) && !admin);
         for d in &decisions {
             if must_ask {
                 assert!(
@@ -306,7 +344,7 @@ fn i14_actor_field_is_not_authority() {
     let tb = tables();
     let settings = Settings::default();
     let alice = user(1000, false, true, true);
-    let mut f = facts(&[Sensitivity::Security], Disruption::None, Recovery::Revertible, 0, None);
+    let mut f = facts(&[Sensitivity::Security], Disruptions::of(Disruption::None), Recovery::Revertible, 0, None);
     f.caller = alice.actor.clone();
     for claimed in [Actor::Daemon, Actor::user(0), Actor::Watchdog] {
         let t = Transition::SetOverride(Override {
@@ -353,7 +391,7 @@ fn one(t: Transition, f: DerivedFacts, a: Authorization) -> Decision {
 fn catalog_policy_cases() {
     let alice = user(1000, false, true, true);
     let admin = user(0, true, true, true);
-    let routine = || facts(&[Sensitivity::Routine], Disruption::Brief, Recovery::Idempotent, 0, None);
+    let routine = || facts(&[Sensitivity::Routine], Disruptions::of(Disruption::Brief), Recovery::Idempotent, 0, None);
 
     // authz-unprivileged-override-security: held for an administrator.
     let sup = Transition::SetOverride(Override {
@@ -368,14 +406,18 @@ fn catalog_policy_cases() {
     assert_eq!(
         one(
             sup.clone(),
-            facts(&[Sensitivity::Security], Disruption::None, Recovery::Revertible, 0, None),
+            facts(&[Sensitivity::Security], Disruptions::of(Disruption::None), Recovery::Revertible, 0, None),
             alice.clone()
         ),
         ask(ApproverClass::Administrator)
     );
     // An administrator may override a Security unit at Runtime (§11 table).
     assert_eq!(
-        one(sup, facts(&[Sensitivity::Security], Disruption::None, Recovery::Revertible, 0, None), admin.clone()),
+        one(
+            sup,
+            facts(&[Sensitivity::Security], Disruptions::of(Disruption::None), Recovery::Revertible, 0, None),
+            admin.clone()
+        ),
         at(Tier::Runtime)
     );
     // authz-unprivileged-stop-unauthorized: gym-db is neither Security nor user-controllable.
@@ -415,7 +457,7 @@ fn catalog_policy_cases() {
     assert_eq!(
         one(
             bind,
-            facts(&[Sensitivity::Routine], Disruption::SessionLoss, Recovery::Revertible, 0, None),
+            facts(&[Sensitivity::Routine], Disruptions::of(Disruption::SessionLoss), Recovery::Revertible, 0, None),
             authorization_of(Actor::Daemon)
         ),
         ask(ApproverClass::AnyApprover)
@@ -425,7 +467,13 @@ fn catalog_policy_cases() {
     assert_eq!(
         one(
             wifi.clone(),
-            facts(&[Sensitivity::Routine], Disruption::ConnectivityLoss, Recovery::Revertible, 0, None),
+            facts(
+                &[Sensitivity::Routine],
+                Disruptions::of(Disruption::ConnectivityLoss),
+                Recovery::Revertible,
+                0,
+                None
+            ),
             authorization_of(Actor::Daemon)
         ),
         ask(ApproverClass::AnyApprover)
@@ -434,7 +482,13 @@ fn catalog_policy_cases() {
     assert_eq!(
         one(
             wifi,
-            facts(&[Sensitivity::Routine], Disruption::ConnectivityLoss, Recovery::Revertible, 0, None),
+            facts(
+                &[Sensitivity::Routine],
+                Disruptions::of(Disruption::ConnectivityLoss),
+                Recovery::Revertible,
+                0,
+                None
+            ),
             alice.clone()
         ),
         at(Tier::Runtime)
@@ -443,7 +497,13 @@ fn catalog_policy_cases() {
     assert_eq!(
         one(
             Transition::SetRuntimeOption { path: "wifi.network".into(), value: Value::Str("gym-ap-b".into()) },
-            facts(&[Sensitivity::Routine], Disruption::ConnectivityLoss, Recovery::Revertible, 0, None),
+            facts(
+                &[Sensitivity::Routine],
+                Disruptions::of(Disruption::ConnectivityLoss),
+                Recovery::Revertible,
+                0,
+                None
+            ),
             user(1000, false, false, true)
         ),
         ask(ApproverClass::AnyApprover)
@@ -457,7 +517,13 @@ fn catalog_policy_cases() {
     assert_eq!(
         one(
             net.clone(),
-            facts(&[Sensitivity::Routine], Disruption::ConnectivityLoss, Recovery::Revertible, 32, None),
+            facts(
+                &[Sensitivity::Routine],
+                Disruptions::of(Disruption::ConnectivityLoss),
+                Recovery::Revertible,
+                32,
+                None
+            ),
             alice.clone()
         ),
         ask(ApproverClass::AnyApprover)
@@ -465,13 +531,20 @@ fn catalog_policy_cases() {
     assert_eq!(
         one(
             net,
-            facts(&[Sensitivity::Routine], Disruption::ConnectivityLoss, Recovery::Revertible, 32, None),
+            facts(
+                &[Sensitivity::Routine],
+                Disruptions::of(Disruption::ConnectivityLoss),
+                Recovery::Revertible,
+                32,
+                None
+            ),
             admin.clone()
         ),
         at(Tier::Runtime)
     );
     // Own session is per session: alice dropping her own session s1 runs; another of hers asks.
-    let mut drop_s1 = facts(&[Sensitivity::Routine], Disruption::SessionLoss, Recovery::Revertible, 64, None);
+    let mut drop_s1 =
+        facts(&[Sensitivity::Routine], Disruptions::of(Disruption::SessionLoss), Recovery::Revertible, 64, None);
     let restart_pw = Transition::RestartUnit(UnitId::service("pipewire"));
     assert_eq!(one(restart_pw.clone(), drop_s1.clone(), alice.clone()), at(Tier::Runtime));
     drop_s1.affected_sessions = vec!["s2".into()];
@@ -480,7 +553,7 @@ fn catalog_policy_cases() {
     assert_eq!(
         one(
             Transition::Rollback,
-            facts(&[Sensitivity::Routine], Disruption::Brief, Recovery::Revertible, 16, None),
+            facts(&[Sensitivity::Routine], Disruptions::of(Disruption::Brief), Recovery::Revertible, 16, None),
             admin.clone()
         ),
         ask(ApproverClass::Administrator)
@@ -489,7 +562,11 @@ fn catalog_policy_cases() {
     // manifest-weaken-via-proposal: no such catalog entry.
     let weaken = Transition::ApplyChange { change: ChangeId("manifest-probe-edit".into()), args: Default::default() };
     assert_eq!(
-        one(weaken, facts(&[Sensitivity::Security], Disruption::None, Recovery::Revertible, 3, None), admin.clone()),
+        one(
+            weaken,
+            facts(&[Sensitivity::Security], Disruptions::of(Disruption::None), Recovery::Revertible, 3, None),
+            admin.clone()
+        ),
         Decision::Reject(RejectReason::NotInCatalog)
     );
     // core-target-rejected, under any caller.
@@ -497,7 +574,7 @@ fn catalog_policy_cases() {
     assert_eq!(
         one(
             font.clone(),
-            facts(&[Sensitivity::Routine], Disruption::None, Recovery::Revertible, 8, None),
+            facts(&[Sensitivity::Routine], Disruptions::of(Disruption::None), Recovery::Revertible, 8, None),
             admin.clone()
         ),
         Decision::Reject(RejectReason::CoreTarget)
@@ -506,7 +583,13 @@ fn catalog_policy_cases() {
     assert_eq!(
         one(
             font.clone(),
-            facts(&[Sensitivity::Routine], Disruption::None, Recovery::Revertible, 0, Some("fonts.scale")),
+            facts(
+                &[Sensitivity::Routine],
+                Disruptions::of(Disruption::None),
+                Recovery::Revertible,
+                0,
+                Some("fonts.scale")
+            ),
             alice.clone()
         ),
         at(Tier::Tested)
@@ -518,7 +601,7 @@ fn catalog_policy_cases() {
             disable.clone(),
             facts(
                 &[Sensitivity::Security],
-                Disruption::Brief,
+                Disruptions::of(Disruption::Brief),
                 Recovery::Revertible,
                 4,
                 Some("services.openssh.enable")
@@ -532,7 +615,13 @@ fn catalog_policy_cases() {
     assert_eq!(
         one(
             font,
-            facts(&[Sensitivity::Routine], Disruption::None, Recovery::Revertible, 0, Some("services.locked")),
+            facts(
+                &[Sensitivity::Routine],
+                Disruptions::of(Disruption::None),
+                Recovery::Revertible,
+                0,
+                Some("services.locked")
+            ),
             admin.clone()
         ),
         Decision::Reject(RejectReason::LockedOption)

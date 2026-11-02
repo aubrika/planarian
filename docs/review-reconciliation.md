@@ -33,7 +33,7 @@ implementation it requires is listed as open or closed separately).
 | R10 | Failed dry activation is accepted as usable risk evidence | open | `nixos.rs` parses `dry-activate` output without checking its exit or timeout | §9 step 3, rule 21 |
 | R11 | Override replacement is check-then-rename, not compare-and-swap | closed | `swap_override` compares and renames under an exclusive `flock` on `planarian/`; promote, restore and collect under `profile.lock`; `txn/<id>/` by exclusive `mkdir`, swept after the checkpoint; the override store pruned (C5) | I23 under `flock`; X-12 |
 | R12 | The VM catalog runner exits 0 after total build failure | closed | `run-vm.sh` and `vm.yml` apply `nix/gym/harness-contract.py`: nonzero on ERROR, FAIL, PARTIAL, and on an UNSUPPORTED must-pass or acceptance entry without a waiver row in `docs/deviations.md` ("Harness waivers") naming entry and harness | §15 harness contract |
-| R13 | The benchmark cannot establish the full invisibility claim | closed in code, run pending | idle from cgroup accounting over every Planarian service and op unit (CPUUsageNSec; RSS and wakeups of every process in them); p99 from MangoHud's per-frame log only, no fallback | §15, §21 |
+| R13 | The benchmark cannot establish the full invisibility claim | closed: bench run 41338935488 (below) | idle from cgroup accounting over every Planarian service and op unit (CPUUsageNSec; RSS and wakeups of every process in them); p99 from MangoHud's per-frame log only, no fallback | §15, §21 |
 | R14 | The verification ratchet can inflate counts or lose coverage | closed | duplicate invariants and obligations rejected; a baseline invariant must still be accounted; a discharged name must be a `proof fn`, a function with `ensures` inside `verus!` or a `#[kani::proof]` harness; `[verifier]` counts tie the Verus obligations to the Verus run, which fails on a mismatch | §17a accounting checks |
 | R15 | Unsupported regressions can remain green | closed | `ci.yml` runs the fake catalog `--strict`, which applies the same rule and the same `docs/deviations.md` table to the fake harness | §15 harness contract |
 | R16 | Gate and bypass documentation lag the implementation | partly | the register was reconciled through B-19/X-11 (cae89a9 … 805cd1c); `ga-status.md`, `guarantees.md`, `AGENTS.md` still lag | rule 19(c) sweep |
@@ -110,9 +110,23 @@ harness passes all 130 of its entries on the same commit (CI run 140).
 | --- | --- | --- |
 | A takeover acked an op its fenced predecessor had just acked itself: `DuplicateOp`, the transaction left in flight (run 109, `crash-slow-worker-overlap`) | `6ad8521` | txn test `a_late_ack_from_the_old_owner_is_not_acked_twice`; the entry on VMs |
 | P9's warning fired on nearly every VM tick | `6ad8521` | core test `a_slow_tick_is_warned` (at most one a minute) |
-| Open, owner's decision: the restarted daemon's startup revert stalls 15 minutes (switch-to-configuration waiting on a unit ordered after `planarian-ready.target`) before the watchdog finishes it | — | `crash-slow-worker-overlap` passes after the stall |
+| The restarted daemon's startup revert stalled 15 minutes: switch-to-configuration reloaded sshd, ordered after `planarian-ready.target`, which waited on `planariad`'s own start (`systemctl list-jobs`, VM run 41288596484). Activation recoveries now run just after ready (owner decision, Nov 1; §12 and §10 amended) | #14 (`a018b08`, `21d4a8d`); the guard and windows in #15 | kernel `deferred_recovery_runs_no_activation_before_ready`, core `restart_reverts_an_interrupted_activation_after_ready`; the VM judge fails a stalled activation (shown failing on `main` without the fix, VM run 41355934489); `crash-slow-worker-overlap` reaches ready 0.3 s after the restart |
 
-Still open, each in issue #7's lanes: R13's benchmark run (#8); §12f
+**R13, the invisibility bench** (`bench.invisibility`, run 41338935488 on
+`4585982`, after MangoHud's `no_display` was found to switch off its per-frame
+log). Idle, over five minutes, across every Planarian service's cgroup: CPU
+0.403% of one core (target < 0.5%), resident 12.4 MB (target < 50 MB),
+cgroup memory 16.5 MB, 1.55 wakeups/s. The game: Xonotic's timedemo,
+software-rendered (llvmpipe), five runs per condition, interleaved, each run's
+p99 from MangoHud's per-frame log (about 35,660 frames each). Median p99:
+stopped 43.24 ms, idle 43.57 ms, busy 43.77 ms. Two-sided Mann-Whitney U
+against stopped: idle p = 0.42, busy p = 0.22. Neither is significant at
+alpha 0.01, so no measurable interference. Idle CPU is inside the target by about
+20%; the earlier run with the same accounting (41334477890, whose game half
+recorded no frames) measured 0.284%, so it varies run to run. `ga-status.md` takes these figures in #12's
+closing rewrite.
+
+Still open, each in issue #7's lanes: §12f
 *Rollbacks*, P19, C18 (#9); C10, C19, P21, P24 and the R06/P10 remainders
 (#10); P11 and the module-eval assertions (#11); deviations and the closing
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17

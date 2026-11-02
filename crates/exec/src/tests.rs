@@ -681,7 +681,7 @@ fn rollback_facts_come_from_the_dry_activation() {
         Submitted::Parked { facts, .. } => facts.clone(),
         other => panic!("a ConnectivityLoss rollback is asked first: {other:?}"),
     };
-    assert_eq!(facts.disruption, Disruption::ConnectivityLoss);
+    assert_eq!(facts.disruption, Disruptions::of(Disruption::ConnectivityLoss));
     assert!(facts.affected_units.contains(&nm));
 }
 
