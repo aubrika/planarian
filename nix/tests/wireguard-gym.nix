@@ -62,6 +62,30 @@ in
         '';
       };
     };
+    # A templated network tool (§12d: templates are classified like any
+    # unit), instantiated as gym-tpl@a: its failure holds as
+    # planarian-hold@gym-tpl@a. Root with no bounding set, so a network
+    # tool; its start adds a firewall table that drops 203.0.113.78 (no test
+    # traffic), so netwatch sees it protecting traffic. Restart=no.
+    # Markers: /run/gym-tpl-<instance>-slow (seconds its start takes) and
+    # /run/gym-tpl-<instance>-broken (its start fails).
+    systemd.services."gym-tpl@" = {
+      description = "Gym templated network tool %i";
+      path = [ pkgs.nftables pkgs.coreutils ];
+      serviceConfig = {
+        Type = "simple";
+        Restart = "no";
+        ExecStartPre = [
+          "${pkgs.bash}/bin/bash -c '! test -e /run/gym-tpl-%i-broken'"
+          "${pkgs.bash}/bin/bash -c 'sleep $(cat /run/gym-tpl-%i-slow 2>/dev/null || echo 0)'"
+        ];
+        ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+        ExecStartPost = "${pkgs.nftables}/bin/nft 'add table inet gymtpl_%i; add chain inet gymtpl_%i out { type filter hook output priority 0; }; add rule inet gymtpl_%i out ip daddr 203.0.113.78 drop'";
+        ExecStopPost = "-${pkgs.nftables}/bin/nft delete table inet gymtpl_%i";
+      };
+    };
+    systemd.targets.multi-user.wants = [ "gym-tpl@a.service" ];
+
     services.planarian.units.wireguard-gym = {
       sensitivity = [ "Security" "External" ];
       holdAllow = [ { address = endpoint; inherit port; protocol = "udp"; } ];
