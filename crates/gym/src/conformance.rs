@@ -130,6 +130,8 @@ pub fn contracts() -> Vec<(&'static str, Result<(), String>)> {
         let mut j = Journal::open(store.clone()).expect("open");
         j.append(Timestamp(1), Record::KnownGood(GenerationId(7))).expect("append");
         drop(j);
+        // A power loss: only what a sync covered is left (P21).
+        store.crash();
         match Journal::open(store) {
             Ok(j) if j.ledger().known_good == Some(GenerationId(7)) => Ok(()),
             Ok(_) => Err("the synced record is gone".into()),
