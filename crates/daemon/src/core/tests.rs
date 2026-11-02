@@ -1416,6 +1416,370 @@ fn a_rebound_approval_that_no_longer_asks_is_logged_as_a_submission() {
     assert!(r.core.parked_agents.is_empty());
 }
 
+// ---------- §12d network security fails closed (#35 part 1) ----------
+
+/// sshd as a network-security unit (interim: the module's `holds`), with the
+/// fake's OnFailure= stand-in holding it when it fails.
+fn rig_with_held_sshd(holds: bool) -> Rig {
+    let store = MemStore::new(8 << 20);
+    let fake = gym_world(store.clone());
+    let sshd = UnitId::service("sshd");
+    {
+        let mut w = fake.w();
+        for g in w.gens.values_mut() {
+            if let Some(d) = g.eval.units.get_mut(&sshd) {
+                d.holds = holds;
+            }
+        }
+        if let Some(d) = w.base_units.get_mut(&sshd) {
+            d.holds = holds;
+        }
+        if holds {
+            w.hold_on_failure.insert(sshd);
+        }
+        w.alive.insert(100);
+    }
+    let mut j = Journal::open(store).unwrap();
+    j.append(fake.w().now, Record::KnownGood(GenerationId(1))).unwrap();
+    let core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config());
+    let mut r = Rig { fake, core };
+    r.ticks(2);
+    r
+}
+
+fn alarms(r: &Rig) -> usize {
+    r.core
+        .notices
+        .iter()
+        .filter(|n| n.contains("stopped unexpectedly. Network traffic is blocked until it is back."))
+        .count()
+}
+
+/// §12d: a crash holds traffic (OnFailure=), the daemon journals it, alarms
+/// once and restarts the unit at once (`restarts_held_unit`, §11), and lifts
+/// the hold once it is Running and its Readiness probes pass. Without the
+/// hold, the same crash of a Security unit asks.
+#[test]
+fn a_held_unit_crash_holds_restarts_at_once_and_lifts() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().signal(&sshd, 11);
+    assert!(r.fake.w().held.contains(&sshd), "OnFailure= held it");
+    r.ticks(1);
+    assert!(r.core.ledger().holds().contains(&sshd), "journaled");
+    assert!(r.core.observe().0.holds.contains(&sshd), "in the observed state, for derive");
+    assert_eq!(alarms(&r), 1, "{:?}", r.core.notices);
+    r.ticks(10);
+    assert!(r.core.ex.parked.is_empty(), "restarted without asking: {:?}", r.core.notices);
+    assert_eq!(r.status("service:sshd"), UnitStatus::Running);
+    assert!(!r.fake.w().held.contains(&sshd), "lifted once back");
+    assert!(!r.core.ledger().holds().contains(&sshd));
+    assert_eq!(alarms(&r), 1, "one alarm: {:?}", r.core.notices);
+
+    // Not a network-security unit: the same crash of a Security unit asks.
+    let mut r = rig_with_held_sshd(false);
+    r.fake.w().signal(&sshd, 11);
+    r.ticks(10);
+    assert!(
+        r.core.ex.parked.values().any(|p| p.proposal.transition == Transition::RestartUnit(sshd.clone())),
+        "asks: {:?}",
+        r.core.notices
+    );
+    assert!(r.core.ledger().holds().is_empty() && alarms(&r) == 0);
+}
+
+/// §12d: a stop outside Planarian that is not attributed is the daemon's to
+/// hold (systemd's OnFailure= does not fire on a clean stop); `planarian
+/// stop`, an attested override, holds nothing.
+#[test]
+fn an_unattributed_stop_is_held_by_the_daemon_and_an_attested_one_is_not() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().stop_out_of_band(&sshd);
+    assert!(!r.fake.w().held.contains(&sshd), "OnFailure= does not fire");
+    r.ticks(1);
+    assert!(r.fake.w().calls.iter().any(|c| c.call == "hold(service:sshd)"), "the daemon held it");
+    assert!(r.core.ledger().holds().contains(&sshd));
+    r.ticks(10);
+    assert_eq!(r.status("service:sshd"), UnitStatus::Running);
+    assert!(!r.fake.w().held.contains(&sshd) && r.core.ledger().holds().is_empty(), "lifted");
+
+    let mut r = rig_with_held_sshd(true);
+    let resp = r.core.handle(ADMIN, Request::Stop { unit: sshd.clone() });
+    assert!(matches!(resp, Response::Done { .. }), "{resp:?}");
+    r.ticks(5);
+    assert!(r.fake.w().held.is_empty() && r.core.ledger().holds().is_empty(), "an attested stop holds nothing");
+    assert_eq!(alarms(&r), 0);
+}
+
+/// §12d: repair fails every attempt: the hold stays, administrators are
+/// notified once, and a restart of planariad keeps it (the journal's holds
+/// are the source of truth; a disagreement with the host fails closed).
+#[test]
+fn a_failed_repair_keeps_the_hold_and_notifies_across_a_restart() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().units.get_mut(&sshd).unwrap().fail_on_start = true;
+    r.fake.w().signal(&sshd, 11);
+    r.ticks(200);
+    assert!(r.fake.w().held.contains(&sshd), "the hold stays");
+    let told: Vec<&String> =
+        r.core.notices.iter().filter(|n| n.contains("service:sshd") && n.contains("needs a person")).collect();
+    assert!(!told.is_empty(), "{:?}", r.core.notices);
+    assert!(r.core.notices.iter().any(|n| n.contains("administrator") && n.contains("hold release")));
+
+    // The host loses its hold state (as if /run were cleared); the daemon
+    // restarts; the journal's hold puts it back.
+    r.fake.w().held.clear();
+    let store = r.fake.store.clone();
+    r.fake.w().alive.insert(101);
+    r.core = Core::start(
+        Journal::open(store).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO },
+        config(),
+    );
+    r.ticks(2);
+    assert!(r.fake.w().held.contains(&sshd), "held again: fail closed");
+    assert_eq!(alarms(&r), 0, "no new alarm for the same hold");
+}
+
+/// §12d: `planarian hold release` is an attested override on the hold
+/// unit. A non-administrator's release asks for an administrator and holds;
+/// an administrator's lifts it and marks the release (until the next boot
+/// by default).
+#[test]
+fn hold_release_needs_an_administrator() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().units.get_mut(&sshd).unwrap().fail_on_start = true;
+    r.fake.w().signal(&sshd, 11);
+    r.ticks(2);
+    assert!(r.fake.w().held.contains(&sshd));
+
+    let release = || Request::HoldRelease { unit: UnitId::service("sshd"), until: Until::NextBoot };
+    let resp = r.core.handle(ALICE, release());
+    let Response::NeedsApproval { why, .. } = &resp else { panic!("asks: {resp:?}") };
+    let text = format!("{resp:?} {why}").to_lowercase();
+    assert!(text.contains("administrator"), "{text}");
+    r.ticks(2);
+    assert!(r.fake.w().held.contains(&sshd), "still held while it asks");
+
+    let resp = r.core.handle(ADMIN, release());
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert!(!r.fake.w().held.contains(&sshd), "lifted");
+    assert_eq!(r.fake.w().hold_released.get(&sshd), Some(&None), "released until the next boot");
+    r.ticks(5);
+    assert!(!r.fake.w().held.contains(&sshd), "not held again while released, though still failed");
+
+    let resp = r.core.handle(ADMIN, Request::HoldRelease { unit: UnitId::service("gym-web"), until: Until::NextBoot });
+    assert!(matches!(resp, Response::Error { .. }), "no hold to release: {resp:?}");
+}
+
+/// §12d (#36 review): anything else flushing the ruleset removes the hold's
+/// table and would fail open. While a hold is active the daemon checks the
+/// table each tick and, if it is gone, journals, alarms and re-applies it.
+#[test]
+fn a_flushed_hold_table_is_put_back() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().units.get_mut(&sshd).unwrap().fail_on_start = true;
+    r.fake.w().signal(&sshd, 11);
+    r.ticks(2);
+    let applied = |r: &mut Rig| {
+        r.core
+            .ex
+            .kernel
+            .journal
+            .segment()
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(&e.record, Record::HoldApplied { unit, .. } if *unit == UnitId::service("sshd")))
+            .count()
+    };
+    let before = applied(&mut r);
+    assert!(before >= 1);
+    r.fake.w().hold_table_flushed = true;
+    r.ticks(1);
+    assert!(r.fake.w().calls.iter().any(|c| c.call == "reapply_hold(service:sshd)"), "re-applied");
+    assert!(!r.fake.w().hold_table_flushed);
+    assert_eq!(applied(&mut r), before + 1, "journaled");
+    assert!(r.core.notices.iter().any(|n| n.contains("removed from the firewall")), "{:?}", r.core.notices);
+    r.ticks(2);
+    assert_eq!(applied(&mut r), before + 1, "once, while the table stays");
+}
+
+/// §12d: a hold table that cannot be checked (planariad has no `nft`, say)
+/// alarms once and is checked again each tick; nothing is re-applied blind.
+#[test]
+fn an_uncheckable_hold_table_alarms_once_and_is_checked_again() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().units.get_mut(&sshd).unwrap().fail_on_start = true;
+    r.fake.w().signal(&sshd, 11);
+    r.ticks(2);
+    r.fake.w().hold_table_unreadable = true;
+    r.ticks(5);
+    let reapplied = |r: &Rig| r.fake.w().calls.iter().filter(|c| c.call == "reapply_hold(service:sshd)").count();
+    assert_eq!(reapplied(&r), 0, "not re-applied blind");
+    let alarms = r.core.notices.iter().filter(|n| n.contains("could not be checked")).count();
+    assert_eq!(alarms, 1, "{:?}", r.core.notices);
+    // Checkable again and missing: re-applied, with its own alarm and
+    // `HoldApplied` (review of #40 at d147ec6).
+    let applied = |r: &mut Rig| {
+        let seg = r.core.ex.kernel.journal.segment().unwrap();
+        seg.iter().filter(|e| matches!(&e.record, Record::HoldApplied { unit, .. } if *unit == sshd)).count()
+    };
+    let before = applied(&mut r);
+    r.fake.w().hold_table_unreadable = false;
+    r.fake.w().hold_table_flushed = true;
+    r.ticks(1);
+    assert_eq!(reapplied(&r), 1);
+    assert!(!r.fake.w().hold_table_flushed);
+    assert_eq!(applied(&mut r), before + 1, "journaled");
+    assert!(r.core.notices.iter().any(|n| n.contains("removed from the firewall")), "{:?}", r.core.notices);
+}
+
+/// §12d: a re-apply that fails is retried with backoff while the hold stands
+/// and the table is missing; the alarm and `HoldApplied` come once.
+#[test]
+fn a_failed_reapply_is_retried_with_backoff() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().units.get_mut(&sshd).unwrap().fail_on_start = true;
+    r.fake.w().signal(&sshd, 11);
+    r.ticks(2);
+    r.fake.w().hold_reapply_fails = true;
+    r.fake.w().hold_table_flushed = true;
+    r.ticks(1);
+    let reapplied = |r: &Rig| r.fake.w().calls.iter().filter(|c| c.call == "reapply_hold(service:sshd)").count();
+    assert_eq!(reapplied(&r), 1);
+    // Retried, but not every tick: the waits double from 10 s.
+    for _ in 0..(120_000 / planarian_state::TICK.0) {
+        r.ticks(1);
+    }
+    let tries = reapplied(&r);
+    assert!(tries > 1, "retried: {tries}");
+    assert!(tries < 2 + (120_000 / planarian_state::TICK.0) as usize / 2, "with backoff: {tries}");
+    let alarms = r.core.notices.iter().filter(|n| n.contains("removed from the firewall")).count();
+    assert_eq!(alarms, 1, "one alarm: {:?}", r.core.notices);
+    // It loads: held again, and no more retries.
+    r.fake.w().hold_reapply_fails = false;
+    for _ in 0..(300_000 / planarian_state::TICK.0) {
+        r.ticks(1);
+    }
+    assert!(!r.fake.w().hold_table_flushed, "held again");
+    let after = reapplied(&r);
+    r.ticks(20);
+    assert_eq!(reapplied(&r), after, "no retry once the table is back");
+}
+
+/// §16 *Approvals show the change*: a pending generation change carries the
+/// diff the core computed (option, old, new, sensitivity), and its response
+/// says what it changes. The diff is base override → candidate override,
+/// both fixed by hash at Prepared, so it can differ at approval only if the
+/// override file changed: then the approval does not apply (Stale, §12
+/// step 4) and nothing runs. Any other change in the re-derived facts
+/// re-binds and asks again (`a_rebound_approval_that_no_longer_asks_…`
+/// covers a re-bind; the binding hashes the facts, `config_diff` included).
+#[test]
+fn an_approval_shows_its_diff_and_a_changed_diff_does_not_apply() {
+    let mut cfg = config();
+    cfg.exec
+        .tables
+        .option_sensitivity
+        .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let font = Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.25".into()))].into(),
+    };
+    let resp = r.core.handle(ALICE, font);
+    let Response::NeedsApproval { approve, why, .. } = resp else { panic!("{resp:?}") };
+    assert!(why.contains("changes 1 option"), "the response says what it changes: {why}");
+    let Response::Status(st) = r.core.handle(ALICE, Request::Status) else { panic!() };
+    let p = st.pending.iter().find(|p| p.approve == approve).expect("pending");
+    assert_eq!(p.diff.options.len(), 1);
+    let o = &p.diff.options[0];
+    assert_eq!(o.path, "planarian.reference.fontScale");
+    assert_eq!(o.new, Some(Value::Str("1.25".into())));
+    assert!(o.sensitivity.contains(Sensitivity::UserData));
+    assert!(p.diff.lines()[0].starts_with("planarian.reference.fontScale"), "{:?}", p.diff.lines());
+
+    // The live override file now holds another value for that option: the
+    // diff re-derived at approval would differ from the one shown.
+    r.fake.w().overrides.assignments.insert("planarian.reference.fontScale".into(), Value::Str("1.1".into()));
+    let before = r.fake.w().current;
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Stale"), "does not apply: {resp:?}");
+    assert_eq!(r.fake.w().current, before, "nothing ran");
+    let Response::Status(st) = r.core.handle(ALICE, Request::Status) else { panic!() };
+    assert!(st.pending.iter().all(|p| p.approve != approve), "the old approval is gone");
+}
+
+/// #35, §16 *Approvals show the change* and §11's Rollback row (owner
+/// decisions, Nov 2), written from the spec before the change (reviewer's
+/// case). The known-good generation lacks sshd (`services.openssh.enable =
+/// false`); the running one has it. A Rollback to known-good would remove a
+/// Security-sensitive unit, so it asks; and what is asked shows the change:
+/// "each option added, removed or changed, with its old and new value and its
+/// sensitivity … and the units it would remove or stop", in the text the
+/// caller and the notice get, and as structured data on the pending approval
+/// (`PendingApproval.diff`, what `planarian approve --json` prints).
+#[test]
+fn a_rollback_that_removes_a_security_unit_asks_and_shows_the_change() {
+    let store = MemStore::new(8 << 20);
+    let fake = gym_world(store.clone());
+    fake.w().alive.insert(100);
+    let without_ssh = OverrideSet { assignments: [("services.openssh.enable".to_string(), Value::Bool(false))].into() };
+    let known_good = {
+        let mut w = fake.w();
+        let g = w.add_generation(&without_ssh);
+        w.boot_entries.insert(g);
+        w.override_store.insert(planarian_fake::World::override_hash_of(&without_ssh), without_ssh.clone());
+        g
+    };
+    assert_ne!(known_good, fake.w().current);
+    let mut j = Journal::open(store).unwrap();
+    j.append(fake.w().now, Record::KnownGood(known_good)).unwrap();
+    let mut r =
+        Rig { core: Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config()), fake };
+    r.ticks(2);
+    assert_eq!(r.status("service:sshd"), UnitStatus::Running, "sshd runs now");
+
+    let resp = r.core.user_submit(Transition::Rollback, ADMIN, Source::User, "roll back".into());
+    let Response::NeedsApproval { approve, what, why, .. } = resp else {
+        panic!("a rollback that removes sshd (Security) asks: {resp:?}");
+    };
+    assert_eq!(r.status("service:sshd"), UnitStatus::Running, "nothing ran before approval");
+
+    // The text the caller gets, and the notice.
+    let text = format!("{what}\n{why}");
+    for (needle, what_for) in [
+        ("sshd", "the unit it would remove"),
+        ("services.openssh.enable", "the option it would change"),
+        ("Security", "the option's sensitivity"),
+    ] {
+        assert!(text.contains(needle), "the approval text names {what_for} ({needle}): {text}");
+    }
+    assert!(text.contains("true") && text.contains("false"), "old and new value: {text}");
+    let notice = r.core.notices.iter().rev().find(|n| n.contains("services.openssh.enable"));
+    assert!(notice.is_some_and(|n| n.contains("sshd")), "the notice shows the change: {:?}", r.core.notices);
+
+    // The structured diff on the pending approval.
+    let Response::Status(st) = r.core.handle(ADMIN, Request::Status) else { panic!("status") };
+    let pending = st.pending.iter().find(|p| p.approve == approve).expect("the pending approval");
+    assert!(pending.facts.removes_sensitivity.security, "derived: it removes a Security unit");
+    let json = serde_json::to_value(pending).unwrap();
+    let diff =
+        json.get("diff").filter(|d| !d.is_null()).unwrap_or_else(|| panic!("a `diff` on the pending approval: {json}"));
+    let diff_text = diff.to_string();
+    for needle in ["services.openssh.enable", "sshd", "Security"] {
+        assert!(diff_text.contains(needle), "the structured diff carries {needle}: {diff_text}");
+    }
+}
+
 fn seated_session(r: &mut Rig, idle: bool) {
     r.fake.w().sessions.push(planarian_schema::SessionInfo {
         id: "s1".into(),
@@ -1801,110 +2165,4 @@ fn an_ordinary_submission_prepares_nothing_again() {
     let l = r.core.ledger();
     let t = &l.live.values().find(|t| t.txn.id == waiting).expect("live").txn;
     assert_eq!(t.prepared_again_from, None);
-}
-
-/// §16 *Approvals show the change*: a pending generation change carries the
-/// diff the core computed (option, old, new, sensitivity), and its response
-/// says what it changes. The diff is base override → candidate override,
-/// both fixed by hash at Prepared, so it can differ at approval only if the
-/// override file changed: then the approval does not apply (Stale, §12
-/// step 4) and nothing runs. Any other change in the re-derived facts
-/// re-binds and asks again (`a_rebound_approval_that_no_longer_asks_…`
-/// covers a re-bind; the binding hashes the facts, `config_diff` included).
-#[test]
-fn an_approval_shows_its_diff_and_a_changed_diff_does_not_apply() {
-    let mut cfg = config();
-    cfg.exec
-        .tables
-        .option_sensitivity
-        .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
-    let mut r = Rig::with(cfg);
-    r.ticks(2);
-    let font = Request::Apply {
-        change: ChangeId("font-scale".into()),
-        args: [("scale".to_string(), Value::Str("1.25".into()))].into(),
-    };
-    let resp = r.core.handle(ALICE, font);
-    let Response::NeedsApproval { approve, why, .. } = resp else { panic!("{resp:?}") };
-    assert!(why.contains("changes 1 option"), "the response says what it changes: {why}");
-    let Response::Status(st) = r.core.handle(ALICE, Request::Status) else { panic!() };
-    let p = st.pending.iter().find(|p| p.approve == approve).expect("pending");
-    assert_eq!(p.diff.options.len(), 1);
-    let o = &p.diff.options[0];
-    assert_eq!(o.path, "planarian.reference.fontScale");
-    assert_eq!(o.new, Some(Value::Str("1.25".into())));
-    assert!(o.sensitivity.contains(Sensitivity::UserData));
-    assert!(p.diff.lines()[0].starts_with("planarian.reference.fontScale"), "{:?}", p.diff.lines());
-
-    // The live override file now holds another value for that option: the
-    // diff re-derived at approval would differ from the one shown.
-    r.fake.w().overrides.assignments.insert("planarian.reference.fontScale".into(), Value::Str("1.1".into()));
-    let before = r.fake.w().current;
-    let resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
-    assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Stale"), "does not apply: {resp:?}");
-    assert_eq!(r.fake.w().current, before, "nothing ran");
-    let Response::Status(st) = r.core.handle(ALICE, Request::Status) else { panic!() };
-    assert!(st.pending.iter().all(|p| p.approve != approve), "the old approval is gone");
-}
-
-/// #35, §16 *Approvals show the change* and §11's Rollback row (owner
-/// decisions, Nov 2), written from the spec before the change (reviewer's
-/// case). The known-good generation lacks sshd (`services.openssh.enable =
-/// false`); the running one has it. A Rollback to known-good would remove a
-/// Security-sensitive unit, so it asks; and what is asked shows the change:
-/// "each option added, removed or changed, with its old and new value and its
-/// sensitivity … and the units it would remove or stop", in the text the
-/// caller and the notice get, and as structured data on the pending approval
-/// (`PendingApproval.diff`, what `planarian approve --json` prints).
-#[test]
-fn a_rollback_that_removes_a_security_unit_asks_and_shows_the_change() {
-    let store = MemStore::new(8 << 20);
-    let fake = gym_world(store.clone());
-    fake.w().alive.insert(100);
-    let without_ssh = OverrideSet { assignments: [("services.openssh.enable".to_string(), Value::Bool(false))].into() };
-    let known_good = {
-        let mut w = fake.w();
-        let g = w.add_generation(&without_ssh);
-        w.boot_entries.insert(g);
-        w.override_store.insert(planarian_fake::World::override_hash_of(&without_ssh), without_ssh.clone());
-        g
-    };
-    assert_ne!(known_good, fake.w().current);
-    let mut j = Journal::open(store).unwrap();
-    j.append(fake.w().now, Record::KnownGood(known_good)).unwrap();
-    let mut r =
-        Rig { core: Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config()), fake };
-    r.ticks(2);
-    assert_eq!(r.status("service:sshd"), UnitStatus::Running, "sshd runs now");
-
-    let resp = r.core.user_submit(Transition::Rollback, ADMIN, Source::User, "roll back".into());
-    let Response::NeedsApproval { approve, what, why, .. } = resp else {
-        panic!("a rollback that removes sshd (Security) asks: {resp:?}");
-    };
-    assert_eq!(r.status("service:sshd"), UnitStatus::Running, "nothing ran before approval");
-
-    // The text the caller gets, and the notice.
-    let text = format!("{what}\n{why}");
-    for (needle, what_for) in [
-        ("sshd", "the unit it would remove"),
-        ("services.openssh.enable", "the option it would change"),
-        ("Security", "the option's sensitivity"),
-    ] {
-        assert!(text.contains(needle), "the approval text names {what_for} ({needle}): {text}");
-    }
-    assert!(text.contains("true") && text.contains("false"), "old and new value: {text}");
-    let notice = r.core.notices.iter().rev().find(|n| n.contains("services.openssh.enable"));
-    assert!(notice.is_some_and(|n| n.contains("sshd")), "the notice shows the change: {:?}", r.core.notices);
-
-    // The structured diff on the pending approval.
-    let Response::Status(st) = r.core.handle(ADMIN, Request::Status) else { panic!("status") };
-    let pending = st.pending.iter().find(|p| p.approve == approve).expect("the pending approval");
-    assert!(pending.facts.removes_sensitivity.security, "derived: it removes a Security unit");
-    let json = serde_json::to_value(pending).unwrap();
-    let diff =
-        json.get("diff").filter(|d| !d.is_null()).unwrap_or_else(|| panic!("a `diff` on the pending approval: {json}"));
-    let diff_text = diff.to_string();
-    for needle in ["services.openssh.enable", "sshd", "Security"] {
-        assert!(diff_text.contains(needle), "the structured diff carries {needle}: {diff_text}");
-    }
 }

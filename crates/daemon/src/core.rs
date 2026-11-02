@@ -66,6 +66,10 @@ pub const NEW_DECLARATIONS_FOR: Millis = Millis::secs(24 * 3600);
 
 /// How often the running daemon re-reads its journal's hash chain (I18).
 pub const CHAIN_CHECK_EVERY: Millis = Millis::secs(3600);
+/// §12d: the first and the longest wait between re-applies of a hold whose
+/// firewall table is missing.
+pub const HOLD_RETRY_MIN: Millis = Millis::secs(10);
+pub const HOLD_RETRY_MAX: Millis = Millis::secs(300);
 
 /// The caller of a request, from `SO_PEERCRED`, group membership and logind.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -234,6 +238,17 @@ pub struct Core<B: Backends + Clone, S: Store> {
     quiet_queue: Vec<String>,
     /// Waiting generations interrupted by a restart, to prepare again (§12f).
     reprepare: Vec<(TxnId, Transition)>,
+    /// §12d: the hold's firewall table was there at the last check (or no
+    /// hold was active). The alarm is raised once, on the change to missing
+    /// or uncheckable.
+    hold_table_seen: bool,
+    /// §12d: this episode's "removed" alarm and `HoldApplied` are written
+    /// (separately from the "could not be checked" one, so an episode that
+    /// starts uncheckable still journals the re-apply).
+    hold_missing_noted: bool,
+    /// §12d: while the table is missing, the next re-apply (boot clock) and
+    /// the wait after it, doubling to `HOLD_RETRY_MAX`.
+    hold_retry: Option<(Timestamp, Millis)>,
     /// Generation transactions withdrawn from `Built` for a rollback about to
     /// run (§12f, I6; owner decision, Nov 2), with when each began waiting,
     /// to prepare again once no generation transaction is active.
@@ -268,6 +283,11 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// The agent behind each change parked for approval, for the approved
     /// execution's log record (I7).
     parked_agents: BTreeMap<TxnId, Option<String>>,
+    /// §12d: held units whose hold an attested release lifted, until the
+    /// release ends; and held units whose failed repair administrators have
+    /// been told about (once per hold).
+    hold_released: BTreeSet<UnitId>,
+    hold_notified: BTreeSet<UnitId>,
 }
 
 /// How to finish a request whose slow part ran elsewhere.
@@ -400,6 +420,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             core_hash: Hash::ZERO,
             core_hash_record: None,
             parked_agents: BTreeMap::new(),
+            hold_released: BTreeSet::new(),
+            hold_notified: BTreeSet::new(),
             after_ready: deferred,
             ex,
             b,
@@ -439,6 +461,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             quiet: false,
             quiet_queue: vec![],
             reprepare: vec![],
+            hold_table_seen: true,
+            hold_missing_noted: false,
+            hold_retry: None,
             withdrawn: vec![],
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
@@ -614,8 +639,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         } else {
             self.cfg.exec.settings.max_tier
         };
-        let s = self.asm.observe(&self.b, &ctx);
-        let defs = self.asm.defs();
+        let mut s = self.asm.observe(&self.b, &ctx);
+        // §12d: what is held now, the journal's and the host's (fail closed:
+        // either one holding is held).
+        s.holds = l.holds();
+        if let Ok(h) = self.b.units().held() {
+            s.holds.extend(h);
+        }
+        let mut defs = self.asm.defs();
+        // §12d: each network-security unit's hold unit, known (so releasing
+        // it derives the held unit's sensitivity) but never expected.
+        let holds: Vec<UnitDef> = crate::hold::network_security(&defs).map(crate::hold::hold_def).collect();
+        for d in holds {
+            defs.entry(d.id.clone()).or_insert(d);
+        }
         self.last = Some((s.clone(), defs.clone()));
         if !self.awaiting_post.is_empty() {
             let digest = s.digest();
@@ -765,6 +802,164 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.flush_writebacks();
         }
         result
+    }
+
+    /// §12d *Network security fails closed*, each tick. The journal's holds
+    /// (`Ledger::holds`) are the source of truth after a restart; they are
+    /// reconciled with the host's (`held`), and any disagreement keeps the
+    /// hold (fail closed).
+    /// Returns whether it applied a hold the observed state does not show.
+    fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {
+        use crate::hold;
+        use planarian_txn::ledger::HoldBy;
+        let units: Vec<UnitId> = hold::network_security(defs).map(|d| d.id.clone()).collect();
+        if units.is_empty() {
+            return false;
+        }
+        let mut applied = false;
+        let journaled = self.ledger().holds();
+        let host = self.b.units().held();
+        // Anything else flushing the ruleset removes the hold's table while
+        // the units stay held: put it back (journal, alarm, re-apply).
+        let mut holding = journaled.clone();
+        if let Ok(h) = &host {
+            holding.extend(h.iter().cloned());
+        }
+        if holding.is_empty() {
+            self.hold_table_seen = true;
+            self.hold_missing_noted = false;
+            self.hold_retry = None;
+        } else {
+            self.hold_table(&holding, &units);
+        }
+        for u in units {
+            let in_journal = journaled.contains(&u);
+            // None: the host cannot say; a failed unit is then held again
+            // (the call is idempotent).
+            let on_host = host.as_ref().ok().map(|h| h.contains(&u));
+            // An attested release (an override on the hold unit) lifts it
+            // until the release ends.
+            if s.override_of(&hold::hold_unit(&u)).is_some() {
+                if in_journal {
+                    self.journal(Record::HoldLifted {
+                        unit: u.clone(),
+                        reason: "released by an attested override".into(),
+                    });
+                }
+                self.hold_released.insert(u);
+                continue;
+            }
+            if self.hold_released.remove(&u) {
+                // The release ended: the hold script's marker goes; a unit
+                // still failed is held again below.
+                let _ = self.b.units().end_release(&u);
+            }
+            if hold::failed(s, defs, &u) {
+                if !in_journal {
+                    // systemd's OnFailure= already holds a crash or a kill;
+                    // a stop outside Planarian is the daemon's to hold.
+                    let by = if on_host == Some(true) { HoldBy::OnFailure } else { HoldBy::Daemon };
+                    self.journal(Record::HoldApplied { unit: u.clone(), by });
+                    self.notice(hold::alarm(&u));
+                }
+                if on_host != Some(true) {
+                    match self.b.units().hold(&u) {
+                        o @ (Outcome::Failed(_) | Outcome::Unknown(_)) => {
+                            self.notice(format!("ALARM: {u}: its traffic could not be held ({o:?})"))
+                        }
+                        _ => applied |= !s.holds.contains(&u),
+                    }
+                }
+                // Repair failed: the hold stays, and administrators hear of it once.
+                let given_up = self.incidents.active_for(&u).is_some_and(|i| {
+                    matches!(i.state, IncidentState::Cooldown { .. } | IncidentState::Escalated { .. })
+                });
+                if given_up && self.hold_notified.insert(u.clone()) {
+                    self.notice(format!(
+                        "ALARM: {u}: repair failed; its network traffic stays blocked. It needs a person: an administrator can fix it, or lift the hold with `planarian hold release {}`",
+                        u.name
+                    ));
+                }
+            } else if in_journal || on_host == Some(true) {
+                if !in_journal {
+                    // OnFailure= held it while the daemon was not looking.
+                    self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::OnFailure });
+                }
+                if hold::back(s, defs, &u) {
+                    self.journal(Record::HoldLifted {
+                        unit: u.clone(),
+                        reason: "Running, and its Readiness probes pass".into(),
+                    });
+                    match self.b.units().lift_hold(&u) {
+                        o @ (Outcome::Failed(_) | Outcome::Unknown(_)) => {
+                            self.notice(format!("{u}: the hold could not be lifted ({o:?}); its traffic stays blocked"))
+                        }
+                        _ => {
+                            self.hold_notified.remove(&u);
+                            self.notice(format!("{u} is back; network traffic flows again"));
+                        }
+                    }
+                }
+            }
+        }
+        applied
+    }
+
+    /// §12d: the hold's table, while a hold stands. Missing: alarm once, then
+    /// re-apply (a reload, which never lifts; `HoldApplied` journaled
+    /// first), and retry with backoff until a check finds it. Uncheckable:
+    /// alarm once and check again next tick; nothing is re-applied blind.
+    fn hold_table(&mut self, holding: &BTreeSet<UnitId>, units: &[UnitId]) {
+        use planarian_txn::ledger::HoldBy;
+        let present = self.b.units().hold_table_present();
+        let held: Vec<UnitId> = holding.iter().filter(|u| units.contains(u)).cloned().collect();
+        match &present {
+            Ok(true) => {
+                self.hold_table_seen = true;
+                self.hold_missing_noted = false;
+                self.hold_retry = None;
+                return;
+            }
+            Err(o) => {
+                if self.hold_table_seen {
+                    for u in &held {
+                        self.notice(format!(
+                            "ALARM: {u}: the network hold's firewall table could not be checked ({o:?}); checking again"
+                        ));
+                    }
+                }
+                self.hold_table_seen = false;
+                return;
+            }
+            Ok(false) => {}
+        }
+        let now = self.b.clock().boot_now();
+        let first = !self.hold_missing_noted;
+        if !first && self.hold_retry.is_some_and(|(next, _)| now < next) {
+            return;
+        }
+        self.hold_missing_noted = true;
+        for u in &held {
+            if first {
+                self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::Daemon });
+                self.notice(format!("ALARM: {u}: the network hold was removed from the firewall; re-applying it"));
+            }
+            if let o @ (Outcome::Failed(_) | Outcome::Unknown(_)) = self.b.units().reapply_hold(u)
+                && first
+            {
+                self.notice(format!("ALARM: {u}: its traffic could not be held again ({o:?}); retrying"));
+            }
+        }
+        self.hold_table_seen = false;
+        if matches!(self.b.units().hold_table_present(), Ok(true)) {
+            self.hold_table_seen = true;
+            self.hold_missing_noted = false;
+            self.hold_retry = None;
+        } else {
+            let wait =
+                self.hold_retry.map_or(HOLD_RETRY_MIN, |(_, w)| Millis(w.0.saturating_mul(2).min(HOLD_RETRY_MAX.0)));
+            self.hold_retry = Some((Timestamp(now.0.saturating_add(wait.0)), wait));
+        }
     }
 
     /// Prepare again transactions interrupted before they mutated (by a
@@ -1354,6 +1549,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 return;
             }
         }
+
+        // §12d: the hold is in place before the incident opens; a hold the
+        // daemon just applied is in the state the repair is derived from.
+        let (s, defs) = if self.network_holds(&s, &defs) { self.observe() } else { (s, defs) };
 
         for inc in self.incidents.tick(now, &s, &defs) {
             if matches!(inc.state, IncidentState::Escalated { .. }) && inc.attempts.is_empty() {
@@ -1946,7 +2145,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 render::facts_summary(facts)
             ));
         }
-        self.respond(&r)
+        let mut resp = self.respond(&r);
+        // Who may approve it (§11): an administrator, when the class says so.
+        if let (Response::NeedsApproval { txn, why, .. }, Submitted::Parked { .. }) = (&mut resp, &r)
+            && self.ex.parked.get(txn).is_some_and(|p| p.class == ApproverClass::Administrator)
+        {
+            why.push_str("; an administrator must approve it");
+        }
+        resp
     }
 
     fn status(&mut self) -> StatusReport {
@@ -2179,6 +2385,41 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 // `by` is overwritten from the caller's credentials by the executor (§11).
                 let s = Override::attested(unit, desired, until, "from the CLI".into(), Actor::user(peer.uid));
                 self.user_submit(Transition::SetOverride(s), peer, Source::User, "from the CLI".into())
+            }
+            Request::HoldRelease { unit, until } => {
+                // §12d: an attested override on the hold unit, through the
+                // executor like any override, so the hold unit's sensitivity
+                // (the held unit's) decides: administrator authority, or
+                // AskFirst with an Administrator approver (§11).
+                let hold = crate::hold::hold_unit(&unit);
+                let (_, defs) = self.observe();
+                if !defs.contains_key(&hold) {
+                    return Response::Error {
+                        message: format!("{unit} is not a network-security unit; there is no hold to release"),
+                    };
+                }
+                let reason = format!("planarian hold release {}", unit.name);
+                let o = Override::attested(
+                    hold,
+                    OverrideDesired::Stopped,
+                    until.clone(),
+                    reason.clone(),
+                    Actor::user(peer.uid),
+                );
+                let r = self.user_submit(Transition::SetOverride(o), peer.clone(), Source::User, reason);
+                if matches!(&r, Response::Done { state: TxnState::Committed, .. }) {
+                    // The executor stopped the hold unit; the marker keeps a
+                    // new failure from holding again until the release ends.
+                    if self.ledger().holds().contains(&unit) {
+                        self.journal(Record::HoldLifted {
+                            unit: unit.clone(),
+                            reason: format!("released by uid {}", peer.uid),
+                        });
+                    }
+                    let _ = self.b.units().release_hold(&unit, crate::hold::release_until(&until));
+                    self.hold_released.insert(unit);
+                }
+                r
             }
             Request::LiftOverride { unit } => {
                 let r = self.user_submit(

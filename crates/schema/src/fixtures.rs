@@ -35,6 +35,9 @@ pub fn service(name: &str) -> UnitDef {
         startup_grace: None,
         runtime_repair: None,
         stops_are_faults: false,
+        holds: false,
+        hold_allow: vec![],
+        hold_interfaces: vec![],
     }
 }
 
@@ -59,6 +62,7 @@ pub fn empty_state(now: u64) -> SystemState {
         conditions: BTreeSet::new(),
         resources: Resources::default(),
         core_hash: Hash::ZERO,
+        holds: Default::default(),
         observed_at: Timestamp(now),
     }
 }
