@@ -6,9 +6,22 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# The aya loader and the `netwatch` binary (Linux, root). The model and the
+# file contract need neither, so the fake depends on this crate without it.
+loader = ["dep:aya", "dep:rustix"]
+
 [dependencies]
 planarian-schema.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+aya = { version = "0.13", optional = true, default-features = false }
+rustix = { workspace = true, optional = true, features = ["event"] }
+
+[[bin]]
+name = "planarian-netwatch"
+path = "src/main.rs"
+required-features = ["loader"]
 
 [dev-dependencies]
 tempfile.workspace = true
