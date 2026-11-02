@@ -129,15 +129,11 @@ pub proof fn i11_session_only_raises(a: Input, b: Input)
 pub proof fn global_floors(i: Input)
     ensures
         i.facts.recovery == Recovery::NonReversible ==> asks_or_rejects(decide_spec(i)),
-        ((i.facts.disruption == Disruption::SessionLoss || i.facts.disruption == Disruption::DataInterruption)
-            && !(is_user(i.authz.actor) && own_session(i.authz.actor, *i.facts))) ==> asks_or_rejects(
-            decide_spec(i),
-        ),
-        (i.facts.disruption == Disruption::ConnectivityLoss && !is_local(i.authz.actor)) ==> asks_or_rejects(
-            decide_spec(i),
-        ),
-        (i.facts.other_sessions_affected && (i.facts.disruption == Disruption::SessionLoss || i.facts.disruption
-            == Disruption::ConnectivityLoss) && !is_admin(*i.authz)) ==> asks_or_rejects(decide_spec(i)),
+        ((i.facts.disruption.session_loss || i.facts.disruption.data_interruption) && !(is_user(i.authz.actor)
+            && own_session(i.authz.actor, *i.facts))) ==> asks_or_rejects(decide_spec(i)),
+        (i.facts.disruption.connectivity_loss && !is_local(i.authz.actor)) ==> asks_or_rejects(decide_spec(i)),
+        (i.facts.other_sessions_affected && (i.facts.disruption.session_loss
+            || i.facts.disruption.connectivity_loss) && !is_admin(*i.authz)) ==> asks_or_rejects(decide_spec(i)),
 {
 }
 
@@ -146,7 +142,7 @@ pub proof fn global_floors(i: Input)
 /// are not known.
 pub proof fn own_session_is_per_session(i: Input)
     requires
-        i.facts.disruption == Disruption::SessionLoss,
+        i.facts.disruption.session_loss,
         i.facts.affected_sessions@.len() != 1 || match i.authz.actor {
             Actor::User { session, .. } => match session {
                 Some(s) => i.facts.affected_sessions@[0]@ != s@,
