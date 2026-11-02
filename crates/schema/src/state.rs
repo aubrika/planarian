@@ -167,7 +167,9 @@ impl SystemState {
                 Some(e) if e.fresh_at(self.observed_at) => match &e.result {
                     ProbeResult::Pass => {}
                     ProbeResult::Fail(_) => failed.push(probe.id.clone()),
-                    ProbeResult::Timeout | ProbeResult::Error(_) => return UnitStatus::Unknown,
+                    ProbeResult::Timeout | ProbeResult::Abandoned | ProbeResult::Error(_) => {
+                        return UnitStatus::Unknown;
+                    }
                 },
                 _ => return UnitStatus::Unknown,
             }
@@ -432,7 +434,12 @@ mod tests {
         }
 
         fn result() -> impl Strategy<Value = ProbeResult> {
-            prop_oneof![Just(ProbeResult::Pass), Just(ProbeResult::Timeout), "[xy]{1,2}".prop_map(ProbeResult::Fail)]
+            prop_oneof![
+                Just(ProbeResult::Pass),
+                Just(ProbeResult::Timeout),
+                Just(ProbeResult::Abandoned),
+                "[xy]{1,2}".prop_map(ProbeResult::Fail)
+            ]
         }
 
         prop_compose! {
