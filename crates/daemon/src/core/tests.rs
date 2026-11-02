@@ -1682,3 +1682,44 @@ fn a_repair_prepared_again_keeps_its_incident() {
         .expect("prepared again, and waiting");
     assert_eq!(r.core.incident_parked.get(&incident), Some(&again.txn.id), "linked to its incident");
 }
+
+/// §12f *Rollbacks*: a change withdrawn for a rollback is "prepared again
+/// once the rollback is terminal". That promise must survive the daemon
+/// restarting in between (a rollback to an older generation may itself
+/// restart planariad): after the restart, the withdrawn update is prepared
+/// again, not lost behind its "set aside" notice. (Reviewer's case.)
+#[test]
+fn a_withdrawn_update_is_prepared_again_after_a_restart() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    r.fake.w().activation_restarts.clear();
+    let resp = r.core.handle(ADMIN, Request::Undo);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert!(r.core.notices.iter().any(|n| n.contains("set aside for a rollback")), "{:?}", r.core.notices);
+    let l = r.core.ledger();
+    assert_eq!(l.terminal.get(&waiting).map(|t| t.state.clone()), Some(TxnState::Rejected(RejectReason::Interrupted)));
+
+    // The daemon restarts before its next tick: a new process on the same
+    // journal, with the executor log of the earlier run (as `main` passes it).
+    let log = r.core.log.clone();
+    r.fake.w().alive.remove(&100);
+    r.fake.w().alive.insert(101);
+    let mut core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO },
+        config(),
+    );
+    core.remember(log);
+    r.core = core;
+    r.ticks(3);
+
+    let l = r.core.ledger();
+    let again = l
+        .terminal
+        .iter()
+        .map(|(id, t)| (*id, t.transition.clone(), t.state.clone()))
+        .chain(l.live.values().map(|t| (t.txn.id, t.txn.transition.clone(), t.txn.state.clone())))
+        .any(|(id, t, _)| id > waiting && matches!(t, Transition::ApplyChange { .. }));
+    assert!(again, "the withdrawn update was not prepared again after the restart; notices: {:?}", r.core.notices);
+}
