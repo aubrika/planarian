@@ -32,6 +32,8 @@ let
     # display-manager.service that the alias link merely overwrites.
     ++ (if config.services.greetd.enable or false then [ "greetd.service" ]
         else lib.optional (config.services.xserver.enable || config.services.displayManager.enable or false) "display-manager.service")
+    # The template: greetd's module disables its autovt@tty1 instance, and
+    # ordering a disabled instance does nothing.
     ++ [ "user@.service" "getty@.service" "autovt@.service" ];
 
 
