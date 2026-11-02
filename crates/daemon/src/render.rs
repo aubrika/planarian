@@ -100,6 +100,7 @@ pub fn evidence(s: &SystemState, u: &UnitId) -> String {
             ProbeResult::Pass => "pass".to_string(),
             ProbeResult::Fail(m) => format!("FAIL ({m})"),
             ProbeResult::Timeout => "timeout".to_string(),
+            ProbeResult::Abandoned => "abandoned at the batch deadline".to_string(),
             ProbeResult::Error(m) => format!("error ({m})"),
         };
         let stale = if e.fresh_at(s.observed_at) { "" } else { ", stale" };

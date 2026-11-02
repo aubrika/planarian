@@ -146,6 +146,28 @@ Read #11 and its owner decision (P24, 1 Nov), this file, `nix/module.nix`,
 | P24 | `wireplumber` is in `userControllable.units` and has a canonical probe, but no default unit, so nothing watches it | declare it per the owner decision; assert in module-eval |
 | posture comment | `posture.nix` said in-budget restarts keep planariad activating, so the target stays up. Run 41288596484 shows otherwise: each SIGSEGV in vm-posture logs `Stopped target Planarian is ready` with no `OnFailure=`; in crash-slow-worker-overlap the SIGKILL drops the target and a restart of the restarting unit raises Absent through `ExecStopPost` (result `success`) | comment corrected; ordering unchanged (I20; any change is the coordinator's) |
 
+## Reviewer: P11 module-eval case (#11), 2 Nov
+
+Written from §9 ("`Exec` probes … are flagged") and the coordinator's key
+decision (each exported probe carries `flagged = true` iff its kind is Exec,
+the key absent otherwise), on `review/lane-nix-p11`. `nix/tests/eval.nix`
+gives `gym-db` an Exec probe and asserts: an Exec probe is exported (so the
+check is not vacuous); every exported Exec probe has `flagged = true`; no
+other exported probe has the key. On `main`: the build throws "every exported
+Exec probe carries flagged = true".
+
+lane-nix, P11 (2 Nov): `probeJSON` in `nix/module.nix` adds `flagged = true`
+to an exported probe whose type is `exec`, and nothing to the others. The
+reviewer's case above fails on `main` ("every exported Exec probe carries
+flagged = true") and passes with it. No Rust reader denies unknown fields, so
+`Export` and `ProbeDef` read the key as before; the gym VMs' own Exec probes
+(`snd-hda0-driven`, `pipewire-has-a-card`, `wifi-associated`) carry it on
+real machines.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P11, scope (review 5731300056) | P11 flags the export only. §9's "flagged in the console and the journal" is still open: neither shows an Exec probe today. The Rust readers are to show it from `ProbeKind::Exec`, not from the `flagged` key | no code in P11; open for the console and daemon lanes |
+
 | Item | Found | Doing |
 | --- | --- | --- |
 | P24 (lane-nix, 2 Nov) | Pinned nixpkgs: `services.pipewire.wireplumber.enable` defaults to `services.pipewire.enable`; the user unit `wireplumber.service` carries `BindsTo=pipewire.service` (and `Alias=pipewire-session-manager.service`). The gym VMs already declare wireplumber with that edge, at normal priority, so the module's `mkDefault` leaves them as they were | `nix/module.nix` declares `wireplumber` (`scope = "user"`, `Requires` on `service@0:pipewire`) when PipeWire and WirePlumber are both enabled. module-eval: present in the reference configuration with the edge, absent with WirePlumber off. Fails on `main` |

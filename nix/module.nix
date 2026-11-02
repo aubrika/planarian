@@ -238,7 +238,9 @@ let
       start_limit_burst = let b = svc.unitConfig.StartLimitBurst or 5; in if builtins.isString b then lib.toInt b else b;
     };
 
-  probeJSON = p: {
+  # §9 (P11): an Exec probe runs an arbitrary command, so it is flagged
+  # wherever the manifest is read; typed probes carry no `flagged` key.
+  probeJSON = p: lib.optionalAttrs (p.type == "exec") { flagged = true; } // {
     inherit (p) id role cost establishes;
     kind = {
       tcp = { Tcp = { inherit (p) addr; }; };
