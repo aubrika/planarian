@@ -11,6 +11,8 @@ pub const HOOK_NFNETLINK: u32 = 2;
 pub const HOOK_GENL: u32 = 3;
 /// `nfnetlink_rcv_batch`: an nftables batch (its header is the batch's).
 pub const HOOK_NFBATCH: u32 = 4;
+/// `nf_setsockopt`: a legacy table change; `data` is `pf` then the option.
+pub const HOOK_SOCKOPT: u32 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {

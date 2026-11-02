@@ -2307,6 +2307,7 @@ name = "planarian-backend-netwatch"
 version = "0.0.0"
 dependencies = [
  "aya",
+ "aya-obj",
  "planarian-schema",
  "rustix 1.1.5",
  "serde",

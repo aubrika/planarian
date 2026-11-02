@@ -4,7 +4,7 @@
 //! is reported as [`Parsed::Unreadable`], which marks the sender's
 //! footprint `unattributed` (fail closed).
 
-use crate::ebpf::{Event, HOOK_GENL, HOOK_NFBATCH, HOOK_NFNETLINK, HOOK_RTNETLINK};
+use crate::ebpf::{Event, HOOK_GENL, HOOK_NFBATCH, HOOK_NFNETLINK, HOOK_RTNETLINK, HOOK_SOCKOPT};
 use crate::model::{Change, ChangeKind, Owner};
 
 const NLM_F_CREATE: u16 = 0x400;
@@ -69,6 +69,19 @@ fn cstr(b: &[u8]) -> String {
 /// The changes in `ev`, made by `owner`. `ifname` names an interface index.
 pub fn parse(ev: &Event, owner: &Owner, ifname: &dyn Fn(u32) -> Option<String>) -> Parsed {
     let b = &ev.data;
+    if ev.hook == HOOK_SOCKOPT {
+        // A legacy table replaced (or its counters set) through setsockopt:
+        // fail closed, like an nftables batch. The object names the family.
+        let pf = b.first().copied().unwrap_or(0);
+        return Parsed::Changes(vec![Change {
+            owner: owner.clone(),
+            kind: ChangeKind::Firewall,
+            object: format!("legacy tables pf {pf}"),
+            iface: None,
+            steers: true,
+            removed: false,
+        }]);
+    }
     let (Some(ty), Some(flags)) = (u16_at(b, 4), u16_at(b, 6)) else {
         return Parsed::Unreadable("no netlink header".into());
     };

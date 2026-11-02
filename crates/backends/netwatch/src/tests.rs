@@ -275,3 +275,34 @@ mod parsing {
         assert_eq!(crate::ebpf::EVENT_SIZE, 8 + 4 + 4 + 4 + 4 + 512);
     }
 }
+
+mod sockopt {
+    use crate::ebpf::{Event, HOOK_SOCKOPT};
+    use crate::model::{ChangeKind, Owner};
+    use crate::parse::{Parsed, parse};
+    use planarian_schema::UnitId;
+
+    /// Legacy iptables (`nf_setsockopt`): any call from a unit is a steering
+    /// firewall change (fail closed).
+    #[test]
+    fn a_legacy_table_change_is_a_steering_firewall_change() {
+        let mut data = vec![2u8, 0, 0, 0];
+        data.extend(64i32.to_ne_bytes()); // IPT_SO_SET_REPLACE
+        let ev = Event { cgroup: 1, tgid: 2, hook: HOOK_SOCKOPT, len: 8, data };
+        let owner = Owner::Unit(UnitId::service("gym-netd"));
+        match parse(&ev, &owner, &|_| None) {
+            Parsed::Changes(c) => assert!(c.len() == 1 && c[0].kind == ChangeKind::Firewall && c[0].steers, "{c:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[cfg(feature = "loader")]
+mod loader_checks {
+    /// An empty or foreign object is refused before the kernel is asked.
+    #[test]
+    fn an_object_without_the_programs_is_refused() {
+        assert!(crate::loader::check_object(&[]).unwrap_err().contains("not an eBPF object"));
+        assert!(crate::loader::check_object(b"\x7fELF not really").is_err());
+    }
+}

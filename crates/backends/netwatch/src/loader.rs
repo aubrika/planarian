@@ -6,13 +6,24 @@ use std::path::Path;
 
 /// The probes and the kernel functions they attach to.
 /// nftables sends its changes as a batch, which `nfnetlink_rcv_batch`
-/// dispatches itself, never through `nfnetlink_rcv_msg`: hence the fourth.
-pub const PROBES: [(&str, &str); 4] = [
+/// dispatches itself, never through `nfnetlink_rcv_msg`; legacy iptables
+/// and its kin use `setsockopt`, all through `nf_setsockopt`.
+pub const PROBES: [(&str, &str); 5] = [
     ("rtnetlink", "rtnetlink_rcv_msg"),
     ("nfnetlink", "nfnetlink_rcv_msg"),
     ("nfbatch", "nfnetlink_rcv_batch"),
+    ("sockopt", "nf_setsockopt"),
     ("genl", "genl_rcv_msg"),
 ];
+
+/// Refuse an object that lacks any of the [`PROBES`] (checked on the ELF,
+/// before the kernel is asked): a missing program must never pass as an
+/// attached watch.
+pub fn check_object(bytes: &[u8]) -> Result<(), String> {
+    let obj = aya_obj::Object::parse(bytes).map_err(|e| format!("not an eBPF object: {e}"))?;
+    let missing: Vec<&str> = PROBES.iter().map(|(p, _)| *p).filter(|p| !obj.programs.contains_key(*p)).collect();
+    if missing.is_empty() { Ok(()) } else { Err(format!("the object lacks {}", missing.join(", "))) }
+}
 
 /// `<prefix>/share/planarian/netwatch.bpf.o`, next to the running binary.
 pub fn default_object() -> String {
@@ -25,7 +36,9 @@ pub fn default_object() -> String {
 
 /// Load the object and attach every probe; any failure is an error.
 pub fn load(object: &Path) -> Result<Ebpf, String> {
-    let mut ebpf = Ebpf::load_file(object).map_err(|e| format!("load {}: {e}", object.display()))?;
+    let bytes = std::fs::read(object).map_err(|e| format!("read {}: {e}", object.display()))?;
+    check_object(&bytes)?;
+    let mut ebpf = Ebpf::load(&bytes).map_err(|e| format!("load {}: {e}", object.display()))?;
     let btf = Btf::from_sys_fs().map_err(|e| format!("kernel BTF: {e}"))?;
     for (prog, func) in PROBES {
         let p: &mut FEntry = ebpf
