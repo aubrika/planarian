@@ -76,9 +76,21 @@ pub fn retry<T>(
 /// attached watch.
 pub fn check_object(bytes: &[u8]) -> Result<(), String> {
     let obj = aya_obj::Object::parse(bytes).map_err(|e| format!("not an eBPF object: {e}"))?;
-    let missing: Vec<&str> = PROBES.iter().map(|(p, _, _)| *p).filter(|p| !obj.programs.contains_key(*p)).collect();
+    let mut missing: Vec<&str> = PROBES.iter().map(|(p, _, _)| *p).filter(|p| !obj.programs.contains_key(*p)).collect();
+    // The netns offsets the loader sets (an object from before them would
+    // read every netns as 0: everything unattributed). Their names are in
+    // the ELF string table, NUL-terminated.
+    for g in NETNS_GLOBALS {
+        let name = [g.as_bytes(), b"\0"].concat();
+        if !bytes.windows(name.len()).any(|w| w == name) {
+            missing.push(g);
+        }
+    }
     if missing.is_empty() { Ok(()) } else { Err(format!("the object lacks {}", missing.join(", "))) }
 }
+
+/// The globals the loader sets from the kernel's BTF before load.
+pub const NETNS_GLOBALS: [&str; 3] = ["NETNS_SKB_SK", "NETNS_SK_NET", "NETNS_NET_INUM"];
 
 /// `<prefix>/share/planarian/netwatch.bpf.o`, next to the running binary.
 pub fn default_object() -> String {
@@ -100,7 +112,15 @@ pub fn read_object(object: &Path) -> Result<Vec<u8>, Start> {
 /// an unusable object; anything the kernel refuses is [`Start::Kernel`].
 pub fn load_bytes(bytes: &[u8]) -> Result<Ebpf, Start> {
     let kernel = |what: String| Start::Kernel(what);
-    let mut ebpf = Ebpf::load(bytes).map_err(|e| kernel(format!("load the object: {e}")))?;
+    // Where the probes find a request's netns on this kernel (no CO-RE).
+    let raw = std::fs::read("/sys/kernel/btf/vmlinux").map_err(|e| kernel(format!("kernel BTF: {e}")))?;
+    let off = crate::btf::Btf::parse(&raw).and_then(|b| crate::btf::NetnsOffsets::from_btf(&b)).map_err(kernel)?;
+    let mut ebpf = aya::EbpfLoader::new()
+        .set_global(NETNS_GLOBALS[0], &off.skb_sk, true)
+        .set_global(NETNS_GLOBALS[1], &off.sk_net, true)
+        .set_global(NETNS_GLOBALS[2], &off.net_inum, true)
+        .load(bytes)
+        .map_err(|e| kernel(format!("load the object: {e}")))?;
     let btf = Btf::from_sys_fs().map_err(|e| kernel(format!("kernel BTF: {e}")))?;
     for (prog, func, kind) in PROBES {
         let p = ebpf.program_mut(prog).ok_or_else(|| Start::Unusable(format!("no program {prog} in the object")))?;
@@ -191,8 +211,8 @@ pub fn notify_ready(socket: Option<&Path>) {
 
 pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> Result<(), String> {
     use crate::host::{boottime_secs, expand_tools, network_tools, read_ifnames};
-    use crate::parse::{Parsed, parse};
-    use crate::{Owner, Tracker, WatchState};
+    use crate::parse::take;
+    use crate::{Tracker, WatchState};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -210,6 +230,15 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         Some(t) => t,
         None => {
             let why = format!("{}: no networkTools", export.display());
+            tell(&why);
+            return Err(why);
+        }
+    };
+    // Changes count only in this netns, the host's (crate docs, "Namespaces").
+    let own_netns = match std::fs::metadata("/proc/self/ns/net") {
+        Ok(m) => std::os::unix::fs::MetadataExt::ino(&m) as u32,
+        Err(e) => {
+            let why = format!("/proc/self/ns/net: {e}");
             tell(&why);
             return Err(why);
         }
@@ -285,19 +314,13 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                 tracker.lost(None);
                 continue;
             };
-            let unit = cgroups.unit(ev.cgroup);
-            let owner = unit.clone().map(Owner::Unit).unwrap_or(Owner::Unattributed);
             let mut name = |i: u32| {
                 if !ifnames.contains_key(&i) {
                     ifnames = read_ifnames();
                 }
                 ifnames.get(&i).cloned()
             };
-            match parse(&ev, &owner, &mut name) {
-                Parsed::Nothing => {}
-                Parsed::Changes(cs) => cs.iter().for_each(|c| tracker.apply(c)),
-                Parsed::Unreadable(_) => tracker.lost(unit.as_ref()),
-            }
+            take(&mut tracker, &ev, own_netns, || cgroups.unit(ev.cgroup), &mut name);
         }
         // Events the ring buffer had no room for: a loss nothing can place.
         if let Ok(n) = lost_map.get(&0, 0)

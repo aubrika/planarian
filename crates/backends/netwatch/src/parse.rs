@@ -67,6 +67,70 @@ fn cstr(b: &[u8]) -> String {
     String::from_utf8_lossy(b.split(|c| *c == 0).next().unwrap_or(&[])).into_owned()
 }
 
+const RTM_SETLINK: u16 = 19;
+const IFINFOMSG_LEN: usize = 16;
+const IFLA_NET_NS_PID: u16 = 19;
+const IFLA_NET_NS_FD: u16 = 28;
+const IFLA_TARGET_NETNSID: u16 = 46;
+
+/// Which network namespace a request acts on, against netwatch's own
+/// (crate docs, "Namespaces").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// This one: the host's.
+    Host,
+    /// Another (a container's, a `PrivateNetwork=` service's): how traffic
+    /// leaves the machine is not changed there. Ignored.
+    Elsewhere,
+    /// Could not tell, or a request elsewhere that may reach into this
+    /// one (a link moved by netns pid or fd, or one aimed at a netns id):
+    /// a loss nothing can place (`.unattributed`, fail closed).
+    Unknown,
+}
+
+pub fn scope(ev: &Event, own: u32) -> Scope {
+    if ev.netns == 0 {
+        return Scope::Unknown;
+    }
+    if ev.netns == own {
+        return Scope::Host;
+    }
+    if ev.hook == HOOK_RTNETLINK && matches!(ev.nlmsg_type(), Some(RTM_NEWLINK | RTM_SETLINK)) {
+        let reaches = |a: &[(u16, &[u8])]| {
+            a.iter().any(|(t, _)| matches!(*t, IFLA_NET_NS_PID | IFLA_NET_NS_FD | IFLA_TARGET_NETNSID))
+        };
+        match attrs(&ev.data, NLMSG_HDRLEN + IFINFOMSG_LEN) {
+            Some(a) if !reaches(&a) && !ev.truncated() => {}
+            _ => return Scope::Unknown,
+        }
+    }
+    Scope::Elsewhere
+}
+
+/// One event as the loop takes it: ignored if it acts in another netns, a
+/// loss nothing can place if the netns is unknown, else parsed and applied
+/// to `t` for the unit `unit()` finds (unattributed if none).
+pub fn take(
+    t: &mut crate::Tracker,
+    ev: &Event,
+    own_netns: u32,
+    unit: impl FnOnce() -> Option<planarian_schema::UnitId>,
+    ifname: &mut dyn FnMut(u32) -> Option<String>,
+) {
+    match scope(ev, own_netns) {
+        Scope::Elsewhere => return,
+        Scope::Unknown => return t.lost(None),
+        Scope::Host => {}
+    }
+    let unit = unit();
+    let owner = unit.clone().map(Owner::Unit).unwrap_or(Owner::Unattributed);
+    match parse(ev, &owner, ifname) {
+        Parsed::Nothing => {}
+        Parsed::Changes(cs) => cs.iter().for_each(|c| t.apply(c)),
+        Parsed::Unreadable(_) => t.lost(unit.as_ref()),
+    }
+}
+
 /// The changes in `ev`, made by `owner`. `ifname` names an interface index.
 pub fn parse(ev: &Event, owner: &Owner, ifname: &mut dyn FnMut(u32) -> Option<String>) -> Parsed {
     let b = &ev.data;

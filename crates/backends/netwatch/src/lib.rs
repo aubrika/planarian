@@ -110,6 +110,21 @@
 //! gone before netwatch saw it at all leaves the change unattributed
 //! (`.unattributed`: fail closed).
 //!
+//! **Namespaces** (reviewer, #42). How traffic leaves the machine is the
+//! host netns's business, so only requests that act in netwatch's own netns
+//! (`/proc/self/ns/net`; the unit runs in the host's) count. Each probe
+//! reports the netns the request acts on: the kernel's own `sock_net(skb->
+//! sk)` for netlink, the socket's for `setsockopt`. Rust eBPF has no CO-RE,
+//! so the loader reads where `sk_buff.sk`, `sock.__sk_common.skc_net.net`
+//! and `net.ns.inum` are from the running kernel's BTF and sets them in the
+//! object before load (an object without those globals is unusable). A
+//! container's or a `PrivateNetwork=` service's own interfaces, routes and
+//! firewall are ignored, so a container's `wg0` going away leaves the host
+//! VPN's `wg0` claim standing. Fail closed: a netns the probe could not
+//! read, or a link message elsewhere that may reach into the host (moved
+//! by `IFLA_NET_NS_PID`/`_FD`, or aimed by `IFLA_TARGET_NETNSID`), is a loss
+//! nothing can place (`.unattributed`, until the next attach).
+//!
 //! **Starting** (coordinator, Nov 2). Whatever happens, `.watch` is
 //! written before systemd hears `READY=1`, and systemd hears it once, so
 //! boot never waits on the start timeout and the hold already reads the
@@ -144,6 +159,7 @@
 //! [`FootprintView::protecting_now`] is (2) to (6); the release is the
 //! hold's own.
 
+pub mod btf;
 #[cfg(feature = "loader")]
 pub mod cgroups;
 mod contract;

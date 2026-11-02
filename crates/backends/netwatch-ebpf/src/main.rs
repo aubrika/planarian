@@ -35,7 +35,61 @@ pub struct Event {
     pub len: u32,
     /// How many bytes of it are in `data`.
     pub captured: u32,
+    /// The inode of the network namespace the request acts on (the kernel's
+    /// own `sock_net(skb->sk)`, or the socket's for `setsockopt`); 0 when
+    /// it could not be read (userspace fails closed).
+    pub netns: u32,
+    pub _pad: u32,
     pub data: [u8; CAP],
+}
+
+/// Where a request's netns is, set by the loader from the running kernel's
+/// BTF before load (Rust eBPF has no CO-RE): `skb->sk`, then
+/// `sk->__sk_common.skc_net.net`, then `net->ns.inum`. `NETNS_SKB_SK` 0
+/// means "not set": every netns reads as 0.
+#[unsafe(no_mangle)]
+static NETNS_SKB_SK: u32 = 0;
+#[unsafe(no_mangle)]
+static NETNS_SK_NET: u32 = 0;
+#[unsafe(no_mangle)]
+static NETNS_NET_INUM: u32 = 0;
+
+#[inline(always)]
+fn read_ptr(p: *const u8, off: u32) -> *const u8 {
+    if p.is_null() {
+        return core::ptr::null();
+    }
+    let mut b = [0u8; 8];
+    match unsafe { bpf_probe_read_kernel_buf(p.wrapping_add(off as usize), &mut b) } {
+        Ok(()) => u64::from_ne_bytes(b) as usize as *const u8,
+        Err(_) => core::ptr::null(),
+    }
+}
+
+/// The netns inode of socket `sk`, or 0.
+#[inline(always)]
+fn netns_of_sock(sk: *const u8) -> u32 {
+    let (sk_net, inum) = unsafe { (core::ptr::read_volatile(&NETNS_SK_NET), core::ptr::read_volatile(&NETNS_NET_INUM)) };
+    let net = read_ptr(sk, sk_net);
+    if net.is_null() {
+        return 0;
+    }
+    let mut b = [0u8; 4];
+    match unsafe { bpf_probe_read_kernel_buf(net.wrapping_add(inum as usize), &mut b) } {
+        Ok(()) => u32::from_ne_bytes(b),
+        Err(_) => 0,
+    }
+}
+
+/// The netns a netlink request acts on: that of the kernel socket it
+/// arrived on (`skb->sk`), as the receive functions themselves take it.
+#[inline(always)]
+fn netns_of_skb(skb: *const u8) -> u32 {
+    let off = unsafe { core::ptr::read_volatile(&NETNS_SKB_SK) };
+    if off == 0 {
+        return 0;
+    }
+    netns_of_sock(read_ptr(skb, off))
 }
 
 /// 256 KiB of events; an overflow is reported by userspace as a lost event.
@@ -53,7 +107,7 @@ static LOST: aya_ebpf::maps::Array<u64> = aya_ebpf::maps::Array::with_max_entrie
 /// capture, which userspace reads as unreadable: the sender is marked
 /// unattributed (fail closed).
 #[inline(always)]
-fn report(nlh: *const u8, hook: u32) -> u32 {
+fn report(skb: *const u8, nlh: *const u8, hook: u32) -> u32 {
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
         if let Some(n) = LOST.get_ptr_mut(0) {
             unsafe { *n += 1 };
@@ -65,6 +119,8 @@ fn report(nlh: *const u8, hook: u32) -> u32 {
         (*ev).cgroup = bpf_get_current_cgroup_id();
         (*ev).tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).hook = hook;
+        (*ev).netns = netns_of_skb(skb);
+        (*ev)._pad = 0;
         let mut len = [0u8; 4];
         let _ = bpf_probe_read_kernel_buf(nlh, &mut len);
         let len = u32::from_ne_bytes(len);
@@ -80,7 +136,7 @@ fn report(nlh: *const u8, hook: u32) -> u32 {
 
 #[fentry(function = "rtnetlink_rcv_msg")]
 pub fn rtnetlink(ctx: FEntryContext) -> u32 {
-    report(ctx.arg(1), HOOK_RTNETLINK)
+    report(ctx.arg(0), ctx.arg(1), HOOK_RTNETLINK)
 }
 
 /// nfnetlink is a module on NixOS kernels (CONFIG_NETFILTER_NETLINK=m), so
@@ -89,14 +145,14 @@ pub fn rtnetlink(ctx: FEntryContext) -> u32 {
 /// it at boot). It still runs in the sender's context.
 #[kprobe(function = "nfnetlink_rcv_msg")]
 pub fn nfnetlink(ctx: ProbeContext) -> u32 {
-    report(ctx.arg(1).unwrap_or(core::ptr::null()), HOOK_NFNETLINK)
+    report(ctx.arg(0).unwrap_or(core::ptr::null()), ctx.arg(1).unwrap_or(core::ptr::null()), HOOK_NFNETLINK)
 }
 
 /// nftables batches bypass `nfnetlink_rcv_msg`: `nfnetlink_rcv_batch(skb,
 /// nlh, subsys_id, genid)` sees each one (its `nlh` is the batch's first).
 #[kprobe(function = "nfnetlink_rcv_batch")]
 pub fn nfbatch(ctx: ProbeContext) -> u32 {
-    report(ctx.arg(1).unwrap_or(core::ptr::null()), HOOK_NFBATCH)
+    report(ctx.arg(0).unwrap_or(core::ptr::null()), ctx.arg(1).unwrap_or(core::ptr::null()), HOOK_NFBATCH)
 }
 
 /// Legacy iptables, ip6tables, arptables and ebtables change their tables
@@ -105,6 +161,7 @@ pub fn nfbatch(ctx: ProbeContext) -> u32 {
 /// and the option (`val`) in `data[4..8]`; there is no message.
 #[fentry(function = "nf_setsockopt")]
 pub fn sockopt(ctx: FEntryContext) -> u32 {
+    let sk: *const u8 = ctx.arg(0);
     let pf: u8 = ctx.arg(1);
     let val: i32 = ctx.arg(2);
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
@@ -118,6 +175,8 @@ pub fn sockopt(ctx: FEntryContext) -> u32 {
         (*ev).cgroup = bpf_get_current_cgroup_id();
         (*ev).tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).hook = HOOK_SOCKOPT;
+        (*ev).netns = netns_of_sock(sk);
+        (*ev)._pad = 0;
         (*ev).len = 8;
         (*ev).captured = 8;
         (*ev).data[0] = pf;
@@ -133,7 +192,7 @@ pub fn sockopt(ctx: FEntryContext) -> u32 {
 
 #[fentry(function = "genl_rcv_msg")]
 pub fn genl(ctx: FEntryContext) -> u32 {
-    report(ctx.arg(1), HOOK_GENL)
+    report(ctx.arg(0), ctx.arg(1), HOOK_GENL)
 }
 
 #[cfg(not(test))]

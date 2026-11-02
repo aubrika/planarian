@@ -73,7 +73,8 @@ fn changes(hook: u32, msgs: Vec<Vec<u8>>, ifname: &mut dyn FnMut(u32) -> Option<
             let f = u16::from_ne_bytes([m[6], m[7]]) | NLM_F_CREATE;
             m[6..8].copy_from_slice(&f.to_ne_bytes());
         }
-        let ev = Event { cgroup: 0, tgid: 0, hook, len: m.len() as u32, data: m };
+        // Dumped from netwatch's own netns: parsed directly, never scoped.
+        let ev = Event { cgroup: 0, tgid: 0, hook, len: m.len() as u32, netns: 0, data: m };
         match parse(&ev, &Owner::Unattributed, ifname) {
             Parsed::Changes(c) => out.extend(c),
             Parsed::Nothing => {}

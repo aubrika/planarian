@@ -185,8 +185,11 @@ mod parsing {
         d.extend(flags.to_ne_bytes());
         d.extend([0u8; 8]);
         d.extend(body);
-        Event { cgroup: 1, tgid: 2, hook, len: d.len() as u32, data: d }
+        Event { cgroup: 1, tgid: 2, hook, len: d.len() as u32, netns: HOST, data: d }
     }
+
+    /// The host's netns inode in these tests (init_net's is 0xF0000000).
+    pub const HOST: u32 = 0xF000_0000;
 
     fn owner() -> Owner {
         Owner::Unit(UnitId::service("wg-quick-wg0"))
@@ -281,7 +284,7 @@ mod parsing {
 
     #[test]
     fn the_event_layout_matches_the_kernel_side() {
-        assert_eq!(crate::ebpf::EVENT_SIZE, 8 + 4 + 4 + 4 + 4 + 512);
+        assert_eq!(crate::ebpf::EVENT_SIZE, 8 + 4 + 4 + 4 + 4 + 4 + 4 + 512);
     }
 }
 
@@ -297,7 +300,7 @@ mod sockopt {
     fn a_legacy_table_change_is_a_steering_firewall_change() {
         let mut data = vec![2u8, 0, 0, 0];
         data.extend(64i32.to_ne_bytes()); // IPT_SO_SET_REPLACE
-        let ev = Event { cgroup: 1, tgid: 2, hook: HOOK_SOCKOPT, len: 8, data };
+        let ev = Event { cgroup: 1, tgid: 2, hook: HOOK_SOCKOPT, len: 8, netns: 0xF000_0000, data };
         let owner = Owner::Unit(UnitId::service("gym-netd"));
         match parse(&ev, &owner, &mut |_| None) {
             Parsed::Changes(c) => assert!(c.len() == 1 && c[0].kind == ChangeKind::Firewall && c[0].steers, "{c:?}"),
@@ -806,5 +809,162 @@ mod physical_nic {
         // Unclaimed (the files lost): still not pre-attach.
         let t = Tracker::attach(&Claims::default(), &standing, &physical);
         assert!(t.view(ATTACHED, &[nm()], NOW).unattributed.is_empty());
+    }
+}
+
+/// The BTF reader finds the netns offsets on the kernel this runs on (when
+/// it has BTF), and refuses what is not BTF.
+mod btf {
+    use crate::btf::{Btf, NetnsOffsets};
+
+    #[test]
+    fn the_running_kernels_netns_offsets_resolve() {
+        let Ok(bytes) = std::fs::read("/sys/kernel/btf/vmlinux") else { return };
+        let btf = Btf::parse(&bytes).unwrap();
+        let o = NetnsOffsets::from_btf(&btf).unwrap();
+        eprintln!("{o:?}");
+        assert!(o.skb_sk > 0 && o.skb_sk < 256, "{o:?}");
+        assert!(o.sk_net < 256 && o.net_inum < 1024, "{o:?}");
+    }
+
+    #[test]
+    fn what_is_not_btf_is_refused() {
+        assert!(Btf::parse(b"").is_err());
+        assert!(Btf::parse(b"\x7fELF....................").is_err());
+        let mut short = vec![0x9f, 0xeb, 1, 0, 24, 0, 0, 0];
+        short.extend([0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(Btf::parse(&short).is_err(), "a section past the end");
+    }
+}
+
+/// Namespaces (crate docs): only changes in netwatch's own netns, the
+/// host's, count. The reviewer's case on #42: a container's own `wg0`
+/// going away must not take the host VPN's claim with it.
+mod namespaces {
+    use crate::ebpf::{Event, HOOK_RTNETLINK, HOOK_SOCKOPT};
+    use crate::parse::{Scope, scope, take};
+    use crate::{Tracker, WatchState};
+    use planarian_schema::UnitId;
+
+    const HOST: u32 = 0xF000_0000;
+    const CONTAINER: u32 = 0xF000_1234;
+    const NOW: u64 = 100;
+
+    fn attr(ty: u16, v: &[u8]) -> Vec<u8> {
+        let mut a = ((4 + v.len()) as u16).to_ne_bytes().to_vec();
+        a.extend(ty.to_ne_bytes());
+        a.extend(v);
+        while !a.len().is_multiple_of(4) {
+            a.push(0);
+        }
+        a
+    }
+
+    fn msg(netns: u32, ty: u16, flags: u16, body: &[u8]) -> Event {
+        let mut d = ((16 + body.len()) as u32).to_ne_bytes().to_vec();
+        d.extend(ty.to_ne_bytes());
+        d.extend(flags.to_ne_bytes());
+        d.extend([0u8; 8]);
+        d.extend(body);
+        Event { cgroup: 1, tgid: 2, hook: HOOK_RTNETLINK, len: d.len() as u32, netns, data: d }
+    }
+
+    fn new_link(name: &str) -> Vec<u8> {
+        let mut b = vec![0u8; 16];
+        b.extend(attr(3, format!("{name}\0").as_bytes()));
+        b
+    }
+
+    fn del_link(index: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 16];
+        b[4..8].copy_from_slice(&index.to_ne_bytes());
+        b
+    }
+
+    fn default_route(oif: u32) -> Vec<u8> {
+        let mut b = vec![2u8, 0, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0];
+        b.extend(attr(4, &oif.to_ne_bytes()));
+        b
+    }
+
+    /// Index 7 is `wg0` on the host; the container's `wg0` may share it.
+    fn names(i: u32) -> Option<String> {
+        (i == 7).then(|| "wg0".to_string())
+    }
+
+    fn vpn() -> UnitId {
+        UnitId::service("wg-quick-wg0")
+    }
+
+    /// The host VPN made `wg0` and the default route through it.
+    fn host_vpn() -> Tracker {
+        let mut t = Tracker::default();
+        take(&mut t, &msg(HOST, 16, 0x400 | 0x1, &new_link("wg0")), HOST, || Some(vpn()), &mut names);
+        take(&mut t, &msg(HOST, 24, 0x400, &default_route(7)), HOST, || Some(vpn()), &mut names);
+        assert!(t.view(WatchState::Attached { at: NOW }, &[vpn()], NOW).protecting_now("wg-quick-wg0", NOW));
+        t
+    }
+
+    fn clean(t: &Tracker) -> bool {
+        t.view(WatchState::Attached { at: NOW }, &[vpn()], NOW).unattributed.is_empty()
+    }
+
+    #[test]
+    fn a_containers_wg0_going_leaves_the_host_vpn_protecting() {
+        let mut t = host_vpn();
+        // The container's `wg-quick down`: its wg0 (same index) and route go.
+        take(&mut t, &msg(CONTAINER, 25, 0, &default_route(7)), HOST, || None, &mut names);
+        take(&mut t, &msg(CONTAINER, 17, 0x1, &del_link(7)), HOST, || None, &mut names);
+        let v = t.view(WatchState::Attached { at: NOW }, &[vpn()], NOW);
+        assert_eq!(v.units["wg-quick-wg0"].ifaces, ["wg0".to_string()].into(), "the host claim stands");
+        assert!(v.protecting_now("wg-quick-wg0", NOW));
+        assert!(clean(&t));
+        // The same removal on the host does take it.
+        take(&mut t, &msg(HOST, 17, 0x1, &del_link(7)), HOST, || None, &mut names);
+        assert!(t.view(WatchState::Attached { at: NOW }, &[vpn()], NOW).units["wg-quick-wg0"].ifaces.is_empty());
+    }
+
+    /// A container's own default route and firewall are not host steering:
+    /// nothing is unattributed while it runs.
+    #[test]
+    fn a_containers_own_steering_holds_nothing() {
+        let mut t = Tracker::default();
+        take(&mut t, &msg(CONTAINER, 16, 0x400 | 0x1, &new_link("eth0")), HOST, || None, &mut names);
+        take(&mut t, &msg(CONTAINER, 24, 0x400, &default_route(7)), HOST, || None, &mut names);
+        let sockopt = Event {
+            cgroup: 1,
+            tgid: 2,
+            hook: HOOK_SOCKOPT,
+            len: 8,
+            netns: CONTAINER,
+            data: vec![2, 0, 0, 0, 64, 0, 0, 0],
+        };
+        take(&mut t, &sockopt, HOST, || None, &mut names);
+        assert!(clean(&t));
+    }
+
+    /// The probe could not read the netns: fail closed, and never apply it
+    /// (so it cannot remove a host claim either).
+    #[test]
+    fn an_unknown_netns_fails_closed() {
+        let mut t = host_vpn();
+        take(&mut t, &msg(0, 17, 0x1, &del_link(7)), HOST, || None, &mut names);
+        assert!(!clean(&t));
+        let v = t.view(WatchState::Attached { at: NOW }, &[vpn()], NOW);
+        assert_eq!(v.units["wg-quick-wg0"].ifaces, ["wg0".to_string()].into());
+    }
+
+    /// A link message elsewhere that may reach into the host (moved by
+    /// netns pid or fd, or aimed at a netns id) is unattributed.
+    #[test]
+    fn a_link_moved_from_elsewhere_is_unattributed() {
+        for ty in [19u16, 28, 46] {
+            let mut body = new_link("wg1");
+            body.extend(attr(ty, &1u32.to_ne_bytes()));
+            assert_eq!(scope(&msg(CONTAINER, 16, 0x1, &body), HOST), Scope::Unknown, "attr {ty}");
+            assert_eq!(scope(&msg(CONTAINER, 19, 0x1, &body), HOST), Scope::Unknown, "RTM_SETLINK, attr {ty}");
+        }
+        assert_eq!(scope(&msg(CONTAINER, 16, 0x1, &new_link("wg1")), HOST), Scope::Elsewhere);
+        assert_eq!(scope(&msg(HOST, 16, 0x1, &new_link("wg1")), HOST), Scope::Host);
     }
 }

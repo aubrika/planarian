@@ -1,10 +1,11 @@
 //! The event the eBPF program reports (`crates/backends/netwatch-ebpf`,
 //! `Event`): `#[repr(C)] { cgroup: u64, tgid: u32, hook: u32, len: u32,
-//! captured: u32, data: [u8; CAPTURE] }`, native-endian. Parsed by hand: no
+//! captured: u32, netns: u32, _pad: u32, data: [u8; CAPTURE] }`,
+//! native-endian. Parsed by hand: no
 //! unsafe, and a short buffer is an error rather than a misread.
 
 pub const CAPTURE: usize = 512;
-pub const EVENT_SIZE: usize = 8 + 4 * 4 + CAPTURE;
+pub const EVENT_SIZE: usize = 8 + 4 * 6 + CAPTURE;
 
 pub const HOOK_RTNETLINK: u32 = 1;
 pub const HOOK_NFNETLINK: u32 = 2;
@@ -21,6 +22,9 @@ pub struct Event {
     pub hook: u32,
     /// The message's own length.
     pub len: u32,
+    /// The inode of the network namespace the request acts on; 0 if the
+    /// probe could not read it.
+    pub netns: u32,
     /// The captured bytes of it (`captured` long).
     pub data: Vec<u8>,
 }
@@ -37,7 +41,8 @@ impl Event {
             tgid: u32_at(8),
             hook: u32_at(12),
             len: u32_at(16),
-            data: b[24..24 + captured].to_vec(),
+            netns: u32_at(24),
+            data: b[32..32 + captured].to_vec(),
         })
     }
 
