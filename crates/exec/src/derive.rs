@@ -31,9 +31,11 @@ fn unit_facts<'a>(
     units: impl IntoIterator<Item = &'a UnitId>,
     defs: &UnitDefs,
     services: &BTreeMap<String, Sensitivities>,
-) -> (Sensitivities, Disruption) {
+) -> (Sensitivities, Disruptions) {
     let mut sens = Sensitivities::default();
-    let mut disruption = Disruption::None;
+    // C10 (§11): every kind any unit carries, not the `max` of them. The
+    // floors are not ordered, so a fold would drop one.
+    let mut disruption = Disruptions::default();
     for u in units {
         // Fail closed (§11 sensitivity completeness, B-5): a unit with no
         // sensitivity entry, or none in the manifest at all, is not taken
@@ -43,7 +45,7 @@ fn unit_facts<'a>(
         match defs.get(u) {
             Some(d) => {
                 sens = sens.union(if empty(&d.sensitivity) { &unknown } else { &d.sensitivity });
-                disruption = disruption.max(d.restart_disruption);
+                disruption.insert(d.restart_disruption);
             }
             // A user-scope unit runs with that user's rights only; an
             // undeclared one stays Routine (deviations.md).
@@ -151,7 +153,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         f.affected_units = unit_set(one(u));
         let (s, d) = unit_facts(&f.affected_units, i.defs, &i.base.services);
         f.sensitivity = s;
-        f.disruption = Disruptions::of(d);
+        f.disruption = d;
         f.recovery = recovery;
         f.touches_core = f.sensitivity.contains(Sensitivity::Core);
     };
@@ -215,7 +217,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             services.extend(cand.services.iter().map(|(k, v)| (k.clone(), *v)));
             let (s, d) = unit_facts(&affected, &all_defs, &services);
             f.sensitivity = s.union(&i.tables.diff_sensitivity(&config));
-            f.disruption = Disruptions::of(d);
+            f.disruption = d;
             f.touches_manifest = touches_manifest(&base_m, &cand_m, &config);
             f.touches_canonical_probe = touches_canonical(&base_m, &cand_m, i.canonical);
             f.changes_desired = changes_desired(&base_m, &cand_m);
