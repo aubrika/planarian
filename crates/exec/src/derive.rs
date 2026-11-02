@@ -168,6 +168,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         touches_core: false,
         below_security_floor: false,
         restores_unattributed_stop: false,
+        restarts_failed_unit: false,
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
         caller: i.caller.clone(),

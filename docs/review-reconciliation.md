@@ -168,6 +168,35 @@ real machines.
 | --- | --- | --- |
 | P11, scope (review 5731300056) | P11 flags the export only. §9's "flagged in the console and the journal" is still open: neither shows an Exec probe today. The Rust readers are to show it from `ProbeKind::Exec`, not from the `flagged` key | no code in P11; open for the console and daemon lanes |
 
+## lane-daemon (#9), reconciled 2026-11-02 at `47caca7`
+
+| Id | At `47caca7` | Evidence at head | Work |
+| --- | --- | --- | --- |
+| §12f *Rollbacks* | open, partly | `exec::schedule` parks any generation candidate in `Built` while `Foreground` holds, and a session-disturbing one whose source is not User/Intent while a session is in use: a diagnoser `Rollback` is parked in both cases, which §12f forbids. User/Intent rollbacks already skip the idle-session wait, but still wait under `Foreground`. `Core::repair_one` already skips, under quiet mode, incidents whose target fails `foreground_depends_on` (P8), so an unrelated repair rollback is not submitted and its budget does not advance. The §11 session-loss floor (`policy` AskFirst) is applied before `schedule`, so a repair rollback that ends a session is already parked for approval, not run. `Reverting` runs inside `Kernel::run` and is never deferred. A repair rollback submitted while another generation transaction is live (one waiting in `Built` counts, I6) is refused `busy` by the ledger, not held | one PR: `schedule` treats a diagnoser `Rollback` as a repair; the repair loop holds a generation repair while a generation transaction is live; the three acceptance cases |
+| P19 | open | `Core::context` sets `core_hash: Hash::ZERO`; the record exists (`nix/posture.nix` installs `/etc/planarian/core.sha256`, which `planarian-recovery` checks) but `planariad` never read it | filled from the record: `config::core_hash`, set by `main.rs` after `Core::start`; core test `the_state_carries_the_recorded_core_hash` |
+| C18 | open | no `SnapshotBackend` is wired in Phase A (the trait exists in `schema::backend`; nothing implements or calls it), so every `UserData` transaction meets the unsupported case; nothing records `NoSnapshot`. Step 6 sits between `Kernel::prepare` and the run, in `exec::submit`/`approve`; `schedule` is the point both reach | one PR, in the daemon's executor log (`LogRecord`) |
+
+## lane-change-path (#10), reconciled 2026-11-02 at `47caca7`
+
+Owner decisions in force (issue #10 comments, 1 Nov): R06 follows §10 as
+written, with one `ProbeResult` variant allowed in `crates/schema`; P24
+declares wireplumber (lane-nix, #11).
+
+| Id | Status at `47caca7` | Evidence | Crosses lanes |
+| --- | --- | --- | --- |
+| C10 | open | `exec/src/derive.rs:46` folds `restart_disruption` with `max`; `Disruption`'s `Ord` (`schema/src/unit.rs:128`) ranks ConnectivityLoss over DataInterruption and DataInterruption over SessionLoss, so ConnectivityLoss + DataInterruption keeps only ConnectivityLoss and a seated user escapes the DataInterruption floor (§11) | yes: `DerivedFacts.disruption` is one `Disruption` in `schema/src/transition.rs:173` and in SPEC §5 (`pub disruption: Disruption`); read by `policy` (floors in `lib.rs` and the Verus `proofs.rs`), `daemon/src/render.rs`, `gym/src/metrics.rs`, `tray`, `txn` tests |
+| C19 | open | `touches_manifest` (`derive.rs:104`) compares `edges`, `sensitivity`, `restart_disruption`, `synonyms` and User probes of units present in both; not `desired`, `systemd_restart`, `startup_grace`, `runtime_repair`, `stops_are_faults`, added or removed units, nor `user_units` at all | no |
+| P21 | open | `gym/src/conformance.rs:20-21` says `cancel` and `unbind` are made by no fake-harness entry, and the matrix omits them; the "Journal fsync is durable" contract cannot fail because `MemStore::sync` (`txn/src/store.rs:167`) is a no-op and a drop loses nothing unsynced. The fake's `cancel` and `unbind` already honour `World::inject` (`fake/src/lib.rs:919`, `:1057`) | yes: `conformance.rs` is in `crates/gym`, `MemStore` in `crates/txn` |
+| R06 remainder | open | `run_batch_with` (`backends/linux/src/probe.rs:271`) maps a straggler to `ProbeResult::Timeout`; §10 says "recorded `Unknown` and abandoned" | yes: a new variant breaks the exhaustive match in `daemon/src/render.rs:99`, and `daemon/src/core.rs:1189`, `:1325` match `Timeout \| Error(_)` and must also take it |
+| P24 | decided | `share/canonical.json:81` keeps `wireplumber`; the declaration is lane-nix's (`nix/module.nix`) | lane-nix |
+| P10 remainder | open | `SideEffects::Measurement { per }` is read nowhere; the scheduler's `interval` (`state/src/lib.rs:174`) ignores it. §10 binds it to the cadence scheduler only; runs on request (`request`, `reprobe`, Checking's fresh assembler) are not rate-limited (reviewer, #18) | no |
+
+## lane-nix: P24, 2 Nov
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P24 (lane-nix, 2 Nov) | Pinned nixpkgs: `services.pipewire.wireplumber.enable` defaults to `services.pipewire.enable`; the user unit `wireplumber.service` carries `BindsTo=pipewire.service` (and `Alias=pipewire-session-manager.service`). The gym VMs already declare wireplumber with that edge, at normal priority, so the module's `mkDefault` leaves them as they were | `nix/module.nix` declares `wireplumber` (`scope = "user"`, `Requires` on `service@0:pipewire`) when PipeWire and WirePlumber are both enabled. module-eval: present in the reference configuration with the edge, absent with WirePlumber off. Fails on `main` |
+
 ## Reviewer: C10 acceptance test (#10), 2 Nov
 
 Written from §11's global floors only (`review/lane-change-path-c10`).
