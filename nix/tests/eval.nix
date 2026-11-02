@@ -174,4 +174,32 @@ let
   ];
 in
 assert builtins.all (x: x) checks;
-pkgs.writeText "planarian-module-eval.json" (builtins.toJSON export)
+# §12d: the hold fails closed when its table will not load. The real built
+# script, its root (/run/planarian) moved into the build directory and a
+# stub nft first on its PATH that fails the first load (the full table) and
+# records the next: `reapply` (after a flush) must then load the lock that
+# holds everything but loopback.
+pkgs.runCommand "planarian-module-eval.json" {
+  export = builtins.toJSON export;
+  passAsFile = [ "export" ];
+  nativeBuildInputs = [ pkgs.gnused ];
+} ''
+  root=$PWD/run stub=$PWD/stub
+  mkdir -p $root/hold $stub
+  cat > $stub/nft <<STUB
+  #!${pkgs.runtimeShell}
+  n=\$(cat $stub/count 2>/dev/null || echo 0); n=\$((n + 1)); echo \$n > $stub/count
+  if [ "\$*" = "-f -" ]; then cat > $stub/load.\$n; [ \$n -ge 2 ] && exit 0; exit 1; fi
+  exit 0
+  STUB
+  chmod +x $stub/nft
+  sed -e "s|/run/planarian|$root|g" -e "s|^PATH=|PATH=$stub:|" ${builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart)} > hold
+  chmod +x hold
+  touch $root/hold/u
+  ./hold reapply
+  grep -q 'set allow4' $stub/load.1 || { echo "reapply did not try the full table first" >&2; exit 1; }
+  grep -q 'iif lo accept' $stub/load.2 && grep -q 'policy drop' $stub/load.2 && ! grep -q 'set allow4' $stub/load.2 \
+    || { echo "reapply did not fall back to the lock" >&2; exit 1; }
+  echo "ok: reapply with a failing table load holds everything but loopback"
+  cp $exportPath $out
+''
