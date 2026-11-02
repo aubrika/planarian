@@ -215,6 +215,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     quiet_queue: Vec<String>,
     /// Waiting generations interrupted by a restart, to prepare again (§12f).
     reprepare: Vec<(TxnId, Transition)>,
+    /// Generation transactions withdrawn for a repair rollback before they
+    /// mutated (§12f, I6; owner decision, Nov 2), to prepare again once no
+    /// generation transaction is active.
+    withdrawn: Vec<(TxnId, Transition)>,
     /// From the executor log of earlier runs: each transaction's proposal and
     /// caller, so one prepared again keeps its source and caller (§12, C21).
     pub earlier: BTreeMap<TxnId, (Proposal, Actor)>,
@@ -382,6 +386,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             quiet: false,
             quiet_queue: vec![],
             reprepare: vec![],
+            withdrawn: vec![],
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
             generation_touched: false,
@@ -653,6 +658,64 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.flush_writebacks();
         }
         result
+    }
+
+    /// Prepare again transactions interrupted before they mutated (by a
+    /// restart, or withdrawn for a repair rollback).
+    fn prepare_again(&mut self, list: Vec<(TxnId, Transition)>, why: &str, s: &SystemState, defs: &UnitDefs) {
+        for (id, t) in list {
+            // Its original source and caller (C21), so floors that depend on
+            // who asked (the own-session exemption) still apply; the daemon's
+            // own only when no record of it survives.
+            let (source, authz) = match self.earlier.get(&id).cloned() {
+                Some((p, caller @ Actor::User { .. })) => {
+                    let admin = caller.uid().is_some_and(|u| (self.admin_of)(u));
+                    (p.source, user_authorization(caller, admin))
+                }
+                Some((p, caller)) => (p.source, authorization_of(caller)),
+                None => (Source::Maintenance, authorization_of(Actor::Daemon)),
+            };
+            let p = self.proposal(t.clone(), s, defs, source, format!("prepared again {why}"));
+            let r = self.submit(p, authz, s, defs);
+            self.notice(format!("{}: prepared again {why}: {}", render::transition(&t), render::submitted_short(&r)));
+        }
+    }
+
+    /// §12f, I6 (owner decision, Nov 2): a repair rollback pre-empts every
+    /// generation transaction that has not mutated yet (waiting in `Built`
+    /// for its window, or parked for approval): each is `Rejected(Interrupted)`
+    /// and prepared again, with its original source and caller, once the
+    /// repair is terminal. One past `Built` is never withdrawn; the repair
+    /// loop does not run while it is active, so the incident waits for it
+    /// with its budget unchanged.
+    fn withdraw_for_repair(&mut self) {
+        let ids: Vec<(TxnId, Transition)> = self
+            .ledger()
+            .live
+            .values()
+            .filter(|t| t.txn.transition.changes_generation() && t.txn.state.is_pre_mutation())
+            .map(|t| (t.txn.id, t.txn.transition.clone()))
+            .collect();
+        for (id, t) in ids {
+            if self.ex.kernel.reject(id, RejectReason::Interrupted).is_err() {
+                continue;
+            }
+            self.ex.parked.remove(&id);
+            if !self.earlier.contains_key(&id) {
+                let asked = self.log.iter().chain(&self.awaiting_post).find(|r| {
+                    matches!(r.result, Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if txn == id)
+                });
+                if let Some(r) = asked {
+                    self.earlier.insert(id, (r.proposal.clone(), r.caller.clone()));
+                }
+            }
+            self.notice(format!(
+                "{}: set aside for a repair rollback (transaction {}); it will be prepared again once the repair is done",
+                render::transition(&t),
+                id.0
+            ));
+            self.withdrawn.push((id, t));
+        }
     }
 
     /// A generation transaction is live, in any state (I6: one waiting in
@@ -1082,25 +1145,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             return;
         }
 
-        for (id, t) in std::mem::take(&mut self.reprepare) {
-            // Its original source and caller (C21), so floors that depend on
-            // who asked (the own-session exemption) still apply; the daemon's
-            // own only when no record of it survives.
-            let (source, authz) = match self.earlier.get(&id).cloned() {
-                Some((p, caller @ Actor::User { .. })) => {
-                    let admin = caller.uid().is_some_and(|u| (self.admin_of)(u));
-                    (p.source, user_authorization(caller, admin))
-                }
-                Some((p, caller)) => (p.source, authorization_of(caller)),
-                None => (Source::Maintenance, authorization_of(Actor::Daemon)),
-            };
-            let p = self.proposal(t.clone(), &s, &defs, source, "prepared again after a restart".into());
-            let r = self.submit(p, authz, &s, &defs);
-            self.notice(format!(
-                "{}: prepared again after a restart: {}",
-                render::transition(&t),
-                render::submitted_short(&r)
-            ));
+        let again = std::mem::take(&mut self.reprepare);
+        self.prepare_again(again, "after a restart", &s, &defs);
+        // §12f: what a repair rollback withdrew, once that repair is terminal.
+        if !self.withdrawn.is_empty() && !self.generation_active() {
+            let again = std::mem::take(&mut self.withdrawn);
+            self.prepare_again(again, "after the repair rollback", &s, &defs);
         }
 
         // §11: stops nobody attributed, before anything treats them as faults.
@@ -1482,6 +1532,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         "{}: it was stopped, not crashed, so I'm starting it again; to keep it stopped: planarian override {}",
                         c.target, c.target
                     ));
+                }
+                if c.transition == Transition::Rollback {
+                    self.withdraw_for_repair();
                 }
                 let p = self.proposal(
                     c.transition.clone(),

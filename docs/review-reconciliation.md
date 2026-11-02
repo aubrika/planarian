@@ -165,3 +165,21 @@ rollback runs at once") cannot pass as written without a decision; on the
 fake today the chain does not even reach the Rollback, because the in-place
 Wi-Fi repair parks at AskFirst. The case is written to the literal English
 (runs during Foreground, no approval step) pending that decision.
+
+## lane-daemon: §12f *Rollbacks* (#9), 2 Nov
+
+Built against the owner's decisions of 2 Nov (PR #22) and the reviewer's
+cases above, at `main` `f470cc1`.
+
+| Rule | Change | Evidence |
+| --- | --- | --- |
+| A User/Intent `Rollback` runs at once, also under `Foreground` | `exec::schedule`: a `Rollback` from User, Intent or the diagnoser never waits in `Built`; the §11 floors were applied before it, so one may still be parked for approval | core test `a_rollback_never_waits_for_a_window` (fails on `main`) |
+| A diagnoser `Rollback` is a repair, never parked in `Built` | the same | the same test; `rollback-repair-session-loss-asks` (AskFirst, pending) |
+| Under `Foreground`, an unrelated repair rollback is not submitted, budget unchanged | unchanged: `repair_one` already filters by `foreground_depends_on` | `rollback-repair-foreground-unrelated` |
+| I6: a repair rollback withdraws a generation transaction that has not mutated, prepared again once the repair is terminal; one past `Built` is waited for | `Core::withdraw_for_repair`: `Kernel::reject(id, Interrupted)` on each pre-mutation generation transaction (waiting in `Built`, or parked for approval), with its proposal and caller kept; `prepare_again` once no generation transaction is live. The repair loop already does not run while a transaction is past `Built`, so the incident waits with its budget held. `activate_waiting` drops a withdrawn one. No `crates/txn` change | core test `a_repair_rollback_withdraws_a_waiting_update` (fails on `main`) |
+| `Reverting` never deferred | unchanged (`Kernel::run`) | — |
+
+`rollback-repair-foreground-dependency` stays FAIL until lane-change-path's
+derive change (§11: a unit already failed contributes no disruption) lands:
+the Wi-Fi repair chain still parks at the ConnectivityLoss floor before it
+reaches the Rollback. The case is not edited.

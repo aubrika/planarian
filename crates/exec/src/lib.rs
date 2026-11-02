@@ -748,7 +748,12 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     /// §12f: a generation candidate that takes effect only at boot takes the
     /// boot-only path; one that would disturb a session, or any while
     /// foreground work holds, waits in `Built` for an activation window
-    /// (`activate_waiting`); everything else runs now.
+    /// (`activate_waiting`); everything else runs now. A `Rollback` never
+    /// waits: one the user or an Intent asks for is its own window, also
+    /// under `Foreground`, and the diagnoser's is a repair (owner decisions,
+    /// Oct 31 and Nov 2). The §11 floors were applied before this, so either
+    /// may already be parked for approval; quiet mode's deferral of an
+    /// unrelated repair rollback is the repair loop's (it is not submitted).
     fn schedule(&mut self, id: TxnId, plan: Plan, source: &Source, state: &SystemState) -> Submitted {
         if !plan.transition.changes_generation() {
             return self.run(id, &plan);
@@ -761,8 +766,10 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         }
         let foreground = state.conditions.iter().any(|c| matches!(c, Condition::Foreground { .. }));
         let user_asked = matches!(source, Source::User | Source::Intent { .. });
+        let rollback = matches!(plan.transition, Transition::Rollback)
+            && matches!(source, Source::User | Source::Intent { .. } | Source::Diagnoser { .. });
         let disturbs = plan.built.as_ref().is_some_and(|b| self.disturbs_a_session(&b.activation));
-        if foreground || (disturbs && !user_asked && !self.sessions_idle()) {
+        if !rollback && (foreground || (disturbs && !user_asked && !self.sessions_idle())) {
             let why = if foreground { "waiting: foreground work holds" } else { "waiting: a session is in use" };
             return match self.kernel.wait_built(id, why) {
                 Ok(end) => {
@@ -796,6 +803,9 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     /// one). Returns what ran.
     pub fn activate_waiting(&mut self, state: &SystemState, defs: &UnitDefs) -> Vec<(TxnId, Submitted)> {
         let foreground = state.conditions.iter().any(|c| matches!(c, Condition::Foreground { .. }));
+        // One withdrawn for a repair rollback (§12f, I6) is terminal already.
+        let live = &self.kernel.journal.ledger().live;
+        self.waiting.retain(|id, _| live.contains_key(id));
         if foreground || self.waiting.is_empty() {
             return vec![];
         }
