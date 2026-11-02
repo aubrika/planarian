@@ -638,6 +638,13 @@ in
       unitConfig.DefaultDependencies = false;
       restartIfChanged = false;
       serviceConfig = {
+        # Ready (READY=1) once attached, snapshotted and its first files
+        # written, so "before the firewall and networking" means something;
+        # on a failed attach it writes `.watch failed` and notifies or exits
+        # promptly. Bounded, so boot never stalls on it.
+        Type = "notify";
+        NotifyAccess = "main";
+        TimeoutStartSec = 30;
         ExecStart = "${cfg.package}/bin/planarian-netwatch --export /etc/planarian/export.json --object ${cfg.package}/share/planarian/netwatch.bpf.o --dir /run/planarian/footprint";
         Restart = "always";
         RestartSec = 1;
