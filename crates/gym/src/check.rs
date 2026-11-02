@@ -1256,6 +1256,7 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
         if spec.get("before_unit_running").is_some()
             || spec.get("while_interlock").is_some()
             || spec.get("while_incident").is_some()
+            || spec.get("while_foreground").is_some()
         {
             conditional_none(e, spec, &label, v);
         } else if !matching.is_empty() {
@@ -1614,6 +1615,17 @@ fn conditional_none(e: &Evidence, spec: &T, label: &str, v: &mut Verdict) {
             }
         }
     }
+    if let Some(session) = s("while_foreground") {
+        let Some(spans) = foreground_spans(e, session) else {
+            v.unchecked.push(format!("{label} (foreground steps)"));
+            return;
+        };
+        for r in &went {
+            if spans.iter().any(|(a, b)| *a <= r.at && r.at < *b) {
+                v.failures.push(format!("{label}: proposed at {} ms while Foreground held in {session}", r.at.0));
+            }
+        }
+    }
     if s("while_interlock") == Some("set") || s("while_incident").is_some() {
         let Some(en) = e.entries.as_ref() else {
             v.unchecked.push(format!("{label} (journal history)"));
@@ -1660,6 +1672,37 @@ fn conditional_none(e: &Evidence, spec: &T, label: &str, v: &mut Verdict) {
     }
 }
 
+/// When Foreground held in `session` ("any": in some session), from the
+/// entry's own `foreground` steps; an unended span runs to the end.
+fn foreground_spans(e: &Evidence, session: &str) -> Option<Vec<(Timestamp, Timestamp)>> {
+    let steps = e.foreground.as_ref()?;
+    let mut held: BTreeSet<&str> = BTreeSet::new();
+    let mut spans = vec![];
+    let mut since: Option<Timestamp> = None;
+    for (at, s, on) in steps {
+        if session != "any" && s != session {
+            continue;
+        }
+        if *on {
+            held.insert(s);
+        } else {
+            held.remove(s.as_str());
+        }
+        match (held.is_empty(), since) {
+            (false, None) => since = Some(*at),
+            (true, Some(t0)) => {
+                spans.push((t0, *at));
+                since = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(t0) = since {
+        spans.push((t0, Timestamp(u64::MAX)));
+    }
+    Some(spans)
+}
+
 fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
     let Some(target) = spec.get("target").and_then(T::as_str) else { return };
     let id = unit(target);
@@ -1696,6 +1739,37 @@ fn check_incident(e: &Evidence, spec: &T, v: &mut Verdict) {
         && last.budget_left as i64 != n
     {
         v.failures.push(format!("{label}: budget {}", last.budget_left));
+    }
+    // §12f, §13: a deferred incident's budget does not advance while
+    // Foreground holds: every version journaled inside a span has the budget
+    // the incident had when the span began (or when it opened inside it).
+    if let Some(session) = spec.get("budget_steady_while_foreground").and_then(T::as_str) {
+        match (foreground_spans(e, session), &e.entries) {
+            (Some(spans), Some(en)) => {
+                for (a, b) in spans {
+                    let mut at_start: Option<u8> = None;
+                    for x in en {
+                        let Record::Incident(i) = &x.record else { continue };
+                        if !same_unit(&id, &i.target) {
+                            continue;
+                        }
+                        if x.at < a {
+                            at_start = Some(i.budget_left);
+                        } else if x.at < b {
+                            match at_start {
+                                None => at_start = Some(i.budget_left),
+                                Some(n) if n != i.budget_left => v.failures.push(format!(
+                                    "{label}: budget {n} → {} at {} ms while Foreground held",
+                                    i.budget_left, x.at.0
+                                )),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            _ => v.unchecked.push(format!("{label}: budget_steady_while_foreground (journal, foreground steps)")),
+        }
     }
     if let Some(k) = spec.get("kind").and_then(T::as_str) {
         let want = if k == "diagnostic" { IncidentKind::Diagnostic } else { IncidentKind::Repair };

@@ -117,3 +117,37 @@ Still open, each in issue #7's lanes: R13's benchmark run (#8); §12f
 (#10); P11 and the module-eval assertions (#11); deviations and the closing
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
 proved; the residue classifier under Kani).
+
+## Reviewer: §12f *Rollbacks* acceptance cases (#9), 2 Nov
+
+Written from §12f (*Rollbacks*, *Quiet mode*), §11 global floors and §13
+ordering only, before the builder's code (`review/lane-daemon-12f-rollbacks`).
+
+| Case | On `main` | Why |
+| --- | --- | --- |
+| `rollback-repair-foreground-dependency` | FAIL | no Rollback runs: the Wi-Fi repair chain parks at its first step (below) |
+| `rollback-repair-foreground-unrelated` | PASS | the repair loop already skips non-dependency incidents under quiet mode; the case guards it |
+| `rollback-repair-session-loss-asks` | PASS | the Rollback is already AskFirst/SessionLoss and pending; the case guards it against a "repair skips the floors" regression |
+
+Test vocabulary these needed, added on the review branch (it crosses into
+lane-gym's `crates/gym/src/**` and lane-change-path's `crates/fake/**`;
+the coordinator decides whether it stays there):
+
+- `break_in_generation {unit, generation, switch_restarts?}` (fake only): a
+  committed generation's flaw that shows once it is live; restarts cannot fix
+  it, a switch away from that generation does.
+- fixture `service:gym-printer` (Routine, Brief): a unit no foreground work
+  depends on.
+- `[[txn]] count = 0` with `while_foreground = "<session>"`, and incident
+  `budget_steady_while_foreground`. Both shown to bite: added to
+  `quiet-repair-not-deferred` (a repair that is not deferred), both fail.
+
+Open, for the owner: under §11, a diagnoser-proposed change with
+ConnectivityLoss is AskFirst ("a `SetRuntimeOption` Wi-Fi change proposed by
+the diagnoser ... ask"), and §12f says the floors apply to a repair rollback.
+A Rollback that restarts NetworkManager is ConnectivityLoss (§11's own gym
+case). So the English of `rollback-repair-foreground-dependency` ("the
+rollback runs at once") cannot pass as written without a decision; on the
+fake today the chain does not even reach the Rollback, because the in-place
+Wi-Fi repair parks at AskFirst. The case is written to the literal English
+(runs during Foreground, no approval step) pending that decision.

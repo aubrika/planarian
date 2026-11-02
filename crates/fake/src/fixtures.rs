@@ -183,6 +183,13 @@ pub fn gym_units() -> UnitDefs {
         vec![user_probe("gym-backup-active", ProbeKind::SystemdActive)],
     );
     backup.stops_are_faults = true;
+    // A print service (§12f gym cases): nothing foreground work depends on.
+    let printer = unit(
+        "service:gym-printer",
+        r,
+        Disruption::Brief,
+        vec![user_probe("gym-printer-active", ProbeKind::SystemdActive)],
+    );
 
     [
         web,
@@ -203,6 +210,7 @@ pub fn gym_units() -> UnitDefs {
         gpu,
         wlan,
         backup,
+        printer,
         fs("fs-root"),
         fs("fs-nix"),
         fs("fs-boot"),
