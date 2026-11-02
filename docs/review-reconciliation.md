@@ -131,3 +131,24 @@ Still open, each in issue #7's lanes: §12f
 (#10); P11 and the module-eval assertions (#11); deviations and the closing
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
 proved; the residue classifier under Kani).
+
+## Reviewer: P13 and SSH-group module-eval cases (#11), 2 Nov
+
+Written from §12d ("ordered before every unit that admits a principal: the
+display manager (whichever unit NixOS uses for it …)"; "*Restrict remote
+access to administrators* means Planarian's administrators (root and
+`planarian-admin`), not `wheel`"), on `review/lane-nix-p13-sshgroup`. The
+pinned nixpkgs greetd module always aliases `display-manager.service` to
+`greetd.service`. Checks in `nix/tests/eval.nix`:
+
+- reference configuration (greetd): greetd is the DM (non-vacuous);
+  `greetd.service` is after `planarian-ready.target`; no ExecStart-less
+  `display-manager` unit is defined beside the alias. On `main` the last one
+  FAILS (the posture defines a stub `display-manager.service`).
+- the same configuration with SDDM instead: `display-manager.service` is a
+  real unit and is after the target. Passes on `main` (guard).
+- SSH: the `planarian-respond@` script writes at least one `AllowGroups` line;
+  every such line is `AllowGroups planarian-admin root` and never names
+  `wheel` (read from the script, IFD); sshd's `extraConfig` includes
+  `/run/planarian/sshd/*.conf`. Passes on `main` (guard); a mutation writing
+  `wheel` fails it.
