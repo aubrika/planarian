@@ -196,3 +196,28 @@ declares wireplumber (lane-nix, #11).
 | Item | Found | Doing |
 | --- | --- | --- |
 | P24 (lane-nix, 2 Nov) | Pinned nixpkgs: `services.pipewire.wireplumber.enable` defaults to `services.pipewire.enable`; the user unit `wireplumber.service` carries `BindsTo=pipewire.service` (and `Alias=pipewire-session-manager.service`). The gym VMs already declare wireplumber with that edge, at normal priority, so the module's `mkDefault` leaves them as they were | `nix/module.nix` declares `wireplumber` (`scope = "user"`, `Requires` on `service@0:pipewire`) when PipeWire and WirePlumber are both enabled. module-eval: present in the reference configuration with the edge, absent with WirePlumber off. Fails on `main` |
+
+## Reviewer: P13 and SSH-group module-eval cases (#11), 2 Nov
+
+Written from §12d ("ordered before every unit that admits a principal: the
+display manager (whichever unit NixOS uses for it …)"; "*Restrict remote
+access to administrators* means Planarian's administrators (root and
+`planarian-admin`), not `wheel`"), on `review/lane-nix-p13-sshgroup`. The
+pinned nixpkgs greetd module always aliases `display-manager.service` to
+`greetd.service`. Checks in `nix/tests/eval.nix`:
+
+- reference configuration (greetd): greetd is the DM (non-vacuous);
+  `greetd.service` is after `planarian-ready.target`; no ExecStart-less
+  `display-manager` unit is defined beside the alias. On `main` the last one
+  FAILS (the posture defines a stub `display-manager.service`).
+- the same configuration with SDDM instead: `display-manager.service` is a
+  real unit and is after the target. Passes on `main` (guard).
+- SSH: the `planarian-respond@` script writes at least one `AllowGroups` line;
+  every such line is `AllowGroups planarian-admin root` and never names
+  `wheel` (read from the script, IFD); sshd's `extraConfig` includes
+  `/run/planarian/sshd/*.conf`. Passes on `main` (guard); a mutation writing
+  `wheel` fails it.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P13, module-eval (lane-nix, 2 Nov) | As reconciled above: with greetd on, `principalUnits` listed both `display-manager.service` and `greetd.service`, so the posture defined an `ExecStart`-less `display-manager.service`; the built tree came out right only because systemd-lib's alias `ln -sfn` runs after the unit links | `nix/posture.nix` orders `greetd.service` when greetd is enabled, else `display-manager.service` when NixOS runs one. The reviewer's case passes unedited: greetd ordered, no stub beside the alias, SDDM's `display-manager.service` ordered, and the SSH group (`AllowGroups planarian-admin root`, never `wheel`; the drop-in included) asserted. The module-eval assertions task closes with it |
