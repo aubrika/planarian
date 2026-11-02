@@ -11,6 +11,21 @@ use std::path::{Path, PathBuf};
 pub const CONFIG: &str = "/etc/planarian/config.json";
 /// The configuration of the generation this machine booted (§12d, P16).
 pub const BOOTED_CONFIG: &str = "/run/booted-system/etc/planarian/config.json";
+/// The running generation's record of its core files' hashes (I2, §12d),
+/// the one `planarian-recovery` checks; `PLANARIAN_CORE_HASH` overrides it.
+pub const CORE_HASH_RECORD: &str = "/etc/planarian/core.sha256";
+
+/// `SystemState.core_hash` (P19): the hash of the recorded core-hash file's
+/// bytes. Zero only when there is no record (a development build); any
+/// other read failure is an error, never a value (§18 rule 21). A damaged
+/// record is the watchdog's integrity finding (I2), not this.
+pub fn core_hash(record: &std::path::Path) -> Result<planarian_schema::Hash, String> {
+    match std::fs::read(record) {
+        Ok(b) => Ok(planarian_schema::Hash::of(&b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(planarian_schema::Hash::ZERO),
+        Err(e) => Err(format!("{}: {e}", record.display())),
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]

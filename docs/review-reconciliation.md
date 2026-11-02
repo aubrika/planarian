@@ -165,3 +165,33 @@ Read #11 and its owner decision (P24, 1 Nov), this file, `nix/module.nix`,
 | module-eval | Asserts neither the greetd ordering, the posture's SSH group, nor the Exec flag. The SSH rule lives in the `respond` script (`AllowGroups ${adminGroup} root`), reachable at eval only through the script's text | the three assertions (reviewer's case first) |
 | P24 | `wireplumber` is in `userControllable.units` and has a canonical probe, but no default unit, so nothing watches it | declare it per the owner decision; assert in module-eval |
 | posture comment | `posture.nix` said in-budget restarts keep planariad activating, so the target stays up. Run 41288596484 shows otherwise: each SIGSEGV in vm-posture logs `Stopped target Planarian is ready` with no `OnFailure=`; in crash-slow-worker-overlap the SIGKILL drops the target and a restart of the restarting unit raises Absent through `ExecStopPost` (result `success`) | comment corrected; ordering unchanged (I20; any change is the coordinator's) |
+
+## Reviewer: P11 module-eval case (#11), 2 Nov
+
+Written from §9 ("`Exec` probes … are flagged") and the coordinator's key
+decision (each exported probe carries `flagged = true` iff its kind is Exec,
+the key absent otherwise), on `review/lane-nix-p11`. `nix/tests/eval.nix`
+gives `gym-db` an Exec probe and asserts: an Exec probe is exported (so the
+check is not vacuous); every exported Exec probe has `flagged = true`; no
+other exported probe has the key. On `main`: the build throws "every exported
+Exec probe carries flagged = true".
+
+lane-nix, P11 (2 Nov): `probeJSON` in `nix/module.nix` adds `flagged = true`
+to an exported probe whose type is `exec`, and nothing to the others. The
+reviewer's case above fails on `main` ("every exported Exec probe carries
+flagged = true") and passes with it. No Rust reader denies unknown fields, so
+`Export` and `ProbeDef` read the key as before; the gym VMs' own Exec probes
+(`snd-hda0-driven`, `pipewire-has-a-card`, `wifi-associated`) carry it on
+real machines.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P11, scope (review 5731300056) | P11 flags the export only. §9's "flagged in the console and the journal" is still open: neither shows an Exec probe today. The Rust readers are to show it from `ProbeKind::Exec`, not from the `flagged` key | no code in P11; open for the console and daemon lanes |
+
+## lane-daemon (#9), reconciled 2026-11-02 at `47caca7`
+
+| Id | At `47caca7` | Evidence at head | Work |
+| --- | --- | --- | --- |
+| §12f *Rollbacks* | open, partly | `exec::schedule` parks any generation candidate in `Built` while `Foreground` holds, and a session-disturbing one whose source is not User/Intent while a session is in use: a diagnoser `Rollback` is parked in both cases, which §12f forbids. User/Intent rollbacks already skip the idle-session wait, but still wait under `Foreground`. `Core::repair_one` already skips, under quiet mode, incidents whose target fails `foreground_depends_on` (P8), so an unrelated repair rollback is not submitted and its budget does not advance. The §11 session-loss floor (`policy` AskFirst) is applied before `schedule`, so a repair rollback that ends a session is already parked for approval, not run. `Reverting` runs inside `Kernel::run` and is never deferred. A repair rollback submitted while another generation transaction is live (one waiting in `Built` counts, I6) is refused `busy` by the ledger, not held | one PR: `schedule` treats a diagnoser `Rollback` as a repair; the repair loop holds a generation repair while a generation transaction is live; the three acceptance cases |
+| P19 | open | `Core::context` sets `core_hash: Hash::ZERO`; the record exists (`nix/posture.nix` installs `/etc/planarian/core.sha256`, which `planarian-recovery` checks) but `planariad` never read it | filled from the record: `config::core_hash`, set by `main.rs` after `Core::start`; core test `the_state_carries_the_recorded_core_hash` |
+| C18 | open | no `SnapshotBackend` is wired in Phase A (the trait exists in `schema::backend`; nothing implements or calls it), so every `UserData` transaction meets the unsupported case; nothing records `NoSnapshot`. Step 6 sits between `Kernel::prepare` and the run, in `exec::submit`/`approve`; `schedule` is the point both reach | one PR, in the daemon's executor log (`LogRecord`) |
