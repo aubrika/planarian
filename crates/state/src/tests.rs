@@ -173,9 +173,9 @@ fn second_session_of_one_uid_is_judged_on_its_own() {
 }
 
 /// P10, §10: "`per` enforced by the cadence scheduler". A Measurement probe
-/// declared at one run per 30 s runs at most once per 30 s, on its cadence,
-/// on request and on a re-observe alike; a request made sooner runs on the
-/// first tick allowed, and the evidence stays fresh in between.
+/// on `EveryTick`, declared at one run per 30 s, runs on its cadence at most
+/// once per 30 s, and the unit stays judged between runs. A run on request
+/// (`request`, `reprobe`) is not the cadence and is not held back.
 #[test]
 fn a_measurement_probe_runs_at_most_once_per_its_per() {
     let web = UnitId::service("gym-web");
@@ -189,35 +189,28 @@ fn a_measurement_probe_runs_at_most_once_per_its_per() {
     let mut a = Assembler::new(Manifest { units, user_units: fixtures::gym_user_units() }, fixtures::canonical());
     let ran_at = |s: &SystemState| s.units[&web].1.iter().find(|e| e.probe == http).map(|e| e.at).unwrap();
 
-    let (s, defs) = tick(&fake, &mut a);
-    let first = ran_at(&s);
-    let mut runs = vec![first];
+    // On its cadence alone.
+    let mut runs = vec![ran_at(&tick(&fake, &mut a).0)];
     for n in 0..17 {
-        // Every way of asking for a run, inside the window.
-        match n % 3 {
-            0 => a.request(&web, &http),
-            1 => a.reprobe(&web),
-            _ => {}
-        }
         let (s, defs) = tick(&fake, &mut a);
         assert_eq!(s.status(&web, &defs), UnitStatus::Running, "fresh between runs (tick {n})");
-        let at = ran_at(&s);
-        if at != *runs.last().unwrap() {
-            runs.push(at);
+        if ran_at(&s) != *runs.last().unwrap() {
+            runs.push(ran_at(&s));
         }
     }
-    assert_eq!(s.status(&web, &defs), UnitStatus::Running);
-    assert!(runs.len() >= 3, "it still runs on its rate: {runs:?}");
+    assert!(runs.len() >= 3, "it still runs at its rate: {runs:?}");
     for w in runs.windows(2) {
-        assert!(w[1].0 - w[0].0 >= per.0, "two runs {} ms apart: {runs:?}", w[1].0 - w[0].0);
+        assert!(w[1].0 - w[0].0 >= per.0, "two cadence runs {} ms apart: {runs:?}", w[1].0 - w[0].0);
     }
-    // A request made inside the window runs on the first tick allowed.
-    a.request(&web, &http);
-    let last = *runs.last().unwrap();
-    let mut s = tick(&fake, &mut a).0;
-    while ran_at(&s) == last {
-        assert!(fake.w().now.0 < last.0 + per.0, "the request was dropped");
-        s = tick(&fake, &mut a).0;
+    // On request, or a re-observe, right after a cadence run: it runs on the
+    // next tick, well inside the window.
+    let asks: [fn(&mut Assembler, &UnitId, &ProbeId); 2] = [|a, u, p| a.request(u, p), |a, u, _| a.reprobe(u)];
+    for ask in asks {
+        while ran_at(&tick(&fake, &mut a).0) != fake.w().now {}
+        let last = fake.w().now;
+        ask(&mut a, &web, &http);
+        let s = tick(&fake, &mut a).0;
+        assert_eq!(ran_at(&s), fake.w().now, "a requested run was held back");
+        assert!(ran_at(&s).0 - last.0 < per.0);
     }
-    assert!(ran_at(&s).0 - last.0 >= per.0 && ran_at(&s).0 - last.0 < per.0 + TICK.0);
 }
