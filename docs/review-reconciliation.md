@@ -143,3 +143,15 @@ order keeps ConnectivityLoss and the DataInterruption floor is lost. The
 control (the ConnectivityLoss unit alone) runs on `main` and must keep
 running. The test asserts the decision (Parked), not the representation of
 the combined disruption.
+
+## Reviewer: C10 catalog case (#10, against #21), 2 Nov
+
+Written from §11's global floors (`review/lane-change-path-c10-case`), at the
+coordinator's request against `main` plus #21 (`core/disruption-set`).
+`disruption-each-kind-keeps-its-floor`: a seated administrator's Rollback
+restarts a ConnectivityLoss unit and a DataInterruption unit (fixtures
+`gym-tunnel`, `gym-sync`, both Routine; step `restarts_on_switch`, fake only).
+It must carry both kinds and ask. On `main`: FAIL, committed without asking,
+disruption ConnectivityLoss only. Control
+`disruption-connectivity-alone-seated-runs` (the ConnectivityLoss unit alone)
+passes on `main` and must keep passing.

@@ -103,6 +103,8 @@
 #   set_knob {unit, knob, value}             fixture runtime toggle (cleared on restart)
 #   set_persistent_knob {unit, knob, value}  fixture toggle stored on disk (survives restart)
 #   unbind_driver {device}                   sysfs unbind
+#   restarts_on_switch {units}               fake only: every switch away from the
+#                                            current generation also restarts these
 #   hotunplug {device}                       QMP device_del
 #   block_network {dst, port?} / unblock_network {dst}
 #   stop_host_service {name} / start_host_service {name}
@@ -182,6 +184,14 @@ purpose = "External dependency served by the VM host at 10.0.2.2:9000."
 [[fixture]]
 unit = "service:gym-usb-reader"
 purpose = "Desired Running when DeviceConnected(device:gym-usb0); BindsTo the device."
+
+[[fixture]]
+unit = "service:gym-tunnel"
+purpose = "Routine; restart_disruption ConnectivityLoss (fake harness only so far; C10)."
+
+[[fixture]]
+unit = "service:gym-sync"
+purpose = "Routine; restart_disruption DataInterruption (fake harness only so far; C10)."
 
 [[fixture]]
 unit = "device:snd-hda0"
