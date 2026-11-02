@@ -46,6 +46,18 @@ impl Start {
 /// (a new cgroup wakes it at once).
 pub const IDLE_MS: i64 = 50;
 
+/// The inode of this process's netns, if it is the host's (pid 1's);
+/// refused otherwise: netwatch in another netns would watch the wrong one.
+pub fn host_netns(proc: &Path) -> Result<u32, String> {
+    use std::os::unix::fs::MetadataExt;
+    let ns = |p: &str| std::fs::metadata(proc.join(p)).map(|m| (m.dev(), m.ino())).map_err(|e| format!("{p}: {e}"));
+    let (own, init) = (ns("self/ns/net")?, ns("1/ns/net")?);
+    if own != init {
+        return Err(format!("not in the host's network namespace (net:[{}], pid 1 is in net:[{}])", own.1, init.1));
+    }
+    u32::try_from(own.1).map_err(|_| format!("netns inode {} is not 32-bit", own.1))
+}
+
 /// How long a refused attach waits before the next try.
 pub const RETRY_SECS: u64 = 30;
 
@@ -234,20 +246,20 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
             return Err(why);
         }
     };
-    // Changes count only in this netns, the host's (crate docs, "Namespaces").
-    let own_netns = match std::fs::metadata("/proc/self/ns/net") {
-        Ok(m) => std::os::unix::fs::MetadataExt::ino(&m) as u32,
-        Err(e) => {
-            let why = format!("/proc/self/ns/net: {e}");
-            tell(&why);
-            return Err(why);
-        }
-    };
     let bytes = match read_object(object) {
         Ok(b) => b,
         Err(e) => {
             tell(e.reason());
             return Err(e.reason().to_string());
+        }
+    };
+    // Changes count only in this netns, which must be the host's: the
+    // unit runs with no PrivateNetwork= (crate docs, "Namespaces").
+    let own_netns = match host_netns(Path::new("/proc")) {
+        Ok(n) => n,
+        Err(why) => {
+            tell(&why);
+            return Err(why);
         }
     };
     let stop = Arc::new(AtomicBool::new(false));

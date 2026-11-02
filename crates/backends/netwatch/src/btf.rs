@@ -2,10 +2,14 @@
 //! where a struct member lives, so the probes can read the netns of a
 //! request on any kernel: Rust eBPF has no CO-RE, so the loader resolves
 //! the offsets here and hands them to the object as globals (crate docs,
-//! "Namespaces"). Read-only and bounds-checked; malformed input is an error.
+//! "Namespaces"). Trusted code in the loader, so: read-only, every read
+//! bounds-checked, recursion bounded, and an answer only when each member
+//! found lies inside its struct; anything else is an error (the loader
+//! writes `failed`), never a panic.
 
 const MAGIC: u16 = 0xEB9F;
 const KIND_INT: u32 = 1;
+const KIND_PTR: u32 = 2;
 const KIND_ARRAY: u32 = 3;
 const KIND_STRUCT: u32 = 4;
 const KIND_UNION: u32 = 5;
@@ -20,6 +24,9 @@ const KIND_DATASEC: u32 = 15;
 const KIND_DECL_TAG: u32 = 17;
 const KIND_TYPE_TAG: u32 = 18;
 const KIND_ENUM64: u32 = 19;
+const KIND_FLOAT: u32 = 16;
+/// How deep anonymous members and typedef chains are followed.
+const DEPTH: usize = 16;
 
 struct Member {
     name: u32,
@@ -30,7 +37,8 @@ struct Member {
 struct Ty {
     name: u32,
     kind: u32,
-    /// The referenced type (typedef, const, volatile, …).
+    /// The referenced type (typedef, const, volatile, pointer) or the size
+    /// in bytes (int, enum, struct, union, float), by kind.
     refers: u32,
     members: Vec<Member>,
 }
@@ -93,7 +101,7 @@ impl Btf {
 
     /// Through typedefs and qualifiers to the type itself.
     fn resolve(&self, mut id: u32) -> Option<&Ty> {
-        for _ in 0..32 {
+        for _ in 0..DEPTH {
             let t = self.types.get(id as usize)?;
             match t.kind {
                 KIND_TYPEDEF | KIND_VOLATILE | KIND_CONST | KIND_RESTRICT | KIND_TYPE_TAG => id = t.refers,
@@ -105,7 +113,10 @@ impl Btf {
 
     /// A member by name, looking into anonymous structs and unions; its
     /// type id and bit offset from the start of `t`.
-    fn member(&self, t: &Ty, name: &str) -> Option<(u32, u32)> {
+    fn member(&self, t: &Ty, name: &str, depth: usize) -> Option<(u32, u32)> {
+        if depth > DEPTH {
+            return None;
+        }
         for m in &t.members {
             if self.name(m.name) == name.as_bytes() {
                 return Some((m.ty, m.bit_offset));
@@ -113,16 +124,27 @@ impl Btf {
             if m.name == 0
                 && let Some(inner) = self.resolve(m.ty)
                 && matches!(inner.kind, KIND_STRUCT | KIND_UNION)
-                && let Some((ty, off)) = self.member(inner, name)
+                && let Some((ty, off)) = self.member(inner, name, depth + 1)
             {
-                return Some((ty, m.bit_offset + off));
+                return Some((ty, m.bit_offset.checked_add(off)?));
             }
         }
         None
     }
 
+    /// The size in bytes of type `id`, where it has one.
+    fn size(&self, id: u32) -> Option<u32> {
+        let t = self.resolve(id)?;
+        match t.kind {
+            KIND_PTR => Some(8),
+            KIND_INT | KIND_ENUM | KIND_ENUM64 | KIND_STRUCT | KIND_UNION | KIND_FLOAT => Some(t.refers),
+            _ => None,
+        }
+    }
+
     /// The byte offset of `path` (member, member of that, …) in `struct
-    /// strukt`.
+    /// strukt`. Each member must lie whole inside the struct or union it
+    /// was found in.
     pub fn offset(&self, strukt: &str, path: &[&str]) -> Result<u32, String> {
         let what = || format!("struct {strukt}.{}", path.join("."));
         let mut t = self
@@ -130,10 +152,14 @@ impl Btf {
             .iter()
             .find(|t| t.kind == KIND_STRUCT && self.name(t.name) == strukt.as_bytes())
             .ok_or_else(|| format!("BTF: no {}", what()))?;
-        let mut bits = 0;
+        let mut bits: u32 = 0;
         for (i, name) in path.iter().enumerate() {
-            let (ty, off) = self.member(t, name).ok_or_else(|| format!("BTF: no member {name} in {}", what()))?;
-            bits += off;
+            let (ty, off) = self.member(t, name, 0).ok_or_else(|| format!("BTF: no member {name} in {}", what()))?;
+            let size = self.size(ty).ok_or_else(|| format!("BTF: {name} has no size in {}", what()))?;
+            if !off.is_multiple_of(8) || (off / 8).checked_add(size).is_none_or(|end| end > t.refers) {
+                return Err(format!("BTF: {name} lies outside its struct in {}", what()));
+            }
+            bits = bits.checked_add(off).ok_or_else(|| format!("BTF: offset overflow in {}", what()))?;
             if i + 1 < path.len() {
                 t = self
                     .resolve(ty)
@@ -141,7 +167,7 @@ impl Btf {
                     .ok_or_else(|| format!("BTF: {name} is not a struct in {}", what()))?;
             }
         }
-        if bits % 8 != 0 {
+        if !bits.is_multiple_of(8) {
             return Err(format!("BTF: {} is a bitfield", what()));
         }
         Ok(bits / 8)

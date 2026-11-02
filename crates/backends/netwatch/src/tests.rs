@@ -436,6 +436,23 @@ mod loader_checks {
         }
     }
 
+    /// netwatch watches its own netns, so it refuses to run outside the
+    /// host's (pid 1's).
+    #[test]
+    fn it_refuses_a_netns_other_than_the_hosts() {
+        let d = tempfile::tempdir().unwrap();
+        for p in ["self/ns", "1/ns"] {
+            std::fs::create_dir_all(d.path().join(p)).unwrap();
+        }
+        std::fs::write(d.path().join("self/ns/net"), "").unwrap();
+        std::fs::write(d.path().join("1/ns/net"), "").unwrap();
+        let e = crate::loader::host_netns(d.path()).unwrap_err();
+        assert!(e.contains("not in the host's network namespace"), "{e}");
+        std::fs::remove_file(d.path().join("1/ns/net")).unwrap();
+        std::os::unix::fs::symlink(d.path().join("self/ns/net"), d.path().join("1/ns/net")).unwrap();
+        assert!(crate::loader::host_netns(d.path()).is_ok(), "the same namespace");
+    }
+
     /// An empty or foreign object is refused before the kernel is asked.
     #[test]
     fn an_object_without_the_programs_is_refused() {
@@ -812,19 +829,93 @@ mod physical_nic {
     }
 }
 
-/// The BTF reader finds the netns offsets on the kernel this runs on (when
-/// it has BTF), and refuses what is not BTF.
+/// The BTF reader (trusted code in the loader): the offsets on the kernel
+/// this runs on and on a synthetic kernel; refusal, never a panic or an
+/// out-of-bounds answer, on malformed input.
 mod btf {
     use crate::btf::{Btf, NetnsOffsets};
+
+    /// A BTF blob, written by hand.
+    struct Blob {
+        types: Vec<u8>,
+        strs: Vec<u8>,
+        count: u32,
+    }
+
+    impl Blob {
+        fn new() -> Blob {
+            Blob { types: vec![], strs: vec![0], count: 0 }
+        }
+        fn name(&mut self, n: &str) -> u32 {
+            if n.is_empty() {
+                return 0;
+            }
+            let off = self.strs.len() as u32;
+            self.strs.extend(n.as_bytes());
+            self.strs.push(0);
+            off
+        }
+        /// A type; returns its id. `members` are (name, type, byte offset).
+        fn ty(&mut self, name: &str, kind: u32, size_or_type: u32, members: &[(&str, u32, u32)]) -> u32 {
+            let n = self.name(name);
+            let info = (kind << 24) | members.len() as u32;
+            for v in [n, info, size_or_type] {
+                self.types.extend(v.to_le_bytes());
+            }
+            if kind == 1 {
+                self.types.extend(32u32.to_le_bytes()); // int encoding: 32 bits
+            }
+            for (mname, mty, off) in members {
+                let mn = self.name(mname);
+                for v in [mn, *mty, off * 8] {
+                    self.types.extend(v.to_le_bytes());
+                }
+            }
+            self.count += 1;
+            self.count
+        }
+        fn bytes(&self) -> Vec<u8> {
+            let mut b = vec![0x9f, 0xeb, 1, 0];
+            for v in [24u32, 0, self.types.len() as u32, self.types.len() as u32, self.strs.len() as u32] {
+                b.extend(v.to_le_bytes());
+            }
+            b.extend(&self.types);
+            b.extend(&self.strs);
+            b
+        }
+    }
+
+    /// The shape of the netns path on 6.18, with `sk` inside an anonymous
+    /// union as there.
+    fn kernel() -> Vec<u8> {
+        let mut b = Blob::new();
+        let uint = b.ty("unsigned int", 1, 4, &[]);
+        let ns_common = b.ty("ns_common", 4, 32, &[("inum", uint, 24)]);
+        let net = b.ty("net", 4, 512, &[("ns", ns_common, 152)]);
+        let net_ptr = b.ty("", 2, net, &[]);
+        let anon = b.ty("", 4, 8, &[("net", net_ptr, 0)]);
+        let possible = b.ty("possible_net_t", 8, anon, &[]);
+        let sk_common = b.ty("sock_common", 4, 136, &[("skc_net", possible, 48)]);
+        let sock = b.ty("sock", 4, 760, &[("__sk_common", sk_common, 0)]);
+        let sock_ptr = b.ty("", 2, sock, &[]);
+        let union = b.ty("", 5, 8, &[("sk", sock_ptr, 0), ("ip_defrag_offset", uint, 0)]);
+        b.ty("sk_buff", 4, 232, &[("", union, 24)]);
+        b.bytes()
+    }
 
     #[test]
     fn the_running_kernels_netns_offsets_resolve() {
         let Ok(bytes) = std::fs::read("/sys/kernel/btf/vmlinux") else { return };
-        let btf = Btf::parse(&bytes).unwrap();
-        let o = NetnsOffsets::from_btf(&btf).unwrap();
-        eprintln!("{o:?}");
-        assert!(o.skb_sk > 0 && o.skb_sk < 256, "{o:?}");
-        assert!(o.sk_net < 256 && o.net_inum < 1024, "{o:?}");
+        let o = NetnsOffsets::from_btf(&Btf::parse(&bytes).unwrap()).unwrap();
+        // 6.18: sk inside sk_buff's second union; skc_net after skc_prot
+        // (40); inum at 24 in ns_common, at 152 in net.
+        assert_eq!(o, NetnsOffsets { skb_sk: 24, sk_net: 48, net_inum: 176 }, "if a kernel moved these, check by hand");
+    }
+
+    #[test]
+    fn a_synthetic_kernels_netns_offsets_resolve() {
+        let o = NetnsOffsets::from_btf(&Btf::parse(&kernel()).unwrap()).unwrap();
+        assert_eq!(o, NetnsOffsets { skb_sk: 24, sk_net: 48, net_inum: 176 });
     }
 
     #[test]
@@ -834,6 +925,61 @@ mod btf {
         let mut short = vec![0x9f, 0xeb, 1, 0, 24, 0, 0, 0];
         short.extend([0, 0, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert!(Btf::parse(&short).is_err(), "a section past the end");
+    }
+
+    /// A member outside its struct, and an anonymous member that contains
+    /// itself, are refused (no out-of-bounds answer, no endless recursion).
+    #[test]
+    fn a_bad_layout_is_refused() {
+        let mut b = Blob::new();
+        let uint = b.ty("unsigned int", 1, 4, &[]);
+        b.ty("ns_common", 4, 16, &[("inum", uint, 24)]); // past its 16 bytes
+        assert!(Btf::parse(&b.bytes()).unwrap().offset("ns_common", &["inum"]).is_err());
+
+        let mut b = Blob::new();
+        // Type 1 is an anonymous struct whose only member is itself.
+        b.ty("", 4, 8, &[("", 1, 0)]);
+        b.ty("loop", 4, 8, &[("", 1, 0)]);
+        assert!(Btf::parse(&b.bytes()).unwrap().offset("loop", &["x"]).is_err());
+    }
+
+    /// Mutated and truncated blobs: an answer or a refusal, never a panic.
+    #[test]
+    fn malformed_blobs_never_panic() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut blobs = vec![(kernel(), 4000)];
+        if let Ok(real) = std::fs::read("/sys/kernel/btf/vmlinux") {
+            blobs.push((real, 24));
+        }
+        for (base, rounds) in blobs {
+            for _ in 0..rounds {
+                let mut b = base.clone();
+                match next() % 4 {
+                    0 => b.truncate((next() as usize) % (b.len() + 1)),
+                    1 => {
+                        // A header field.
+                        let at = 4 + 4 * (next() as usize % 5);
+                        b[at..at + 4].copy_from_slice(&(next() as u32).to_le_bytes());
+                    }
+                    _ => {
+                        for _ in 0..1 + next() % 8 {
+                            let at = (next() as usize) % b.len();
+                            b[at] = next() as u8;
+                        }
+                    }
+                }
+                if let Ok(btf) = Btf::parse(&b) {
+                    let _ = NetnsOffsets::from_btf(&btf);
+                    let _ = btf.offset("sk_buff", &["sk", "x", "y"]);
+                }
+            }
+        }
     }
 }
 
@@ -955,15 +1101,26 @@ mod namespaces {
     }
 
     /// A link message elsewhere that may reach into the host (moved by
-    /// netns pid or fd, or aimed at a netns id) is unattributed.
+    /// netns pid or fd, or aimed at a netns id) is never dropped: charged
+    /// to the mover's unit as unattributed, or to nobody if it is unknown.
     #[test]
     fn a_link_moved_from_elsewhere_is_unattributed() {
         for ty in [19u16, 28, 46] {
             let mut body = new_link("wg1");
             body.extend(attr(ty, &1u32.to_ne_bytes()));
-            assert_eq!(scope(&msg(CONTAINER, 16, 0x1, &body), HOST), Scope::Unknown, "attr {ty}");
-            assert_eq!(scope(&msg(CONTAINER, 19, 0x1, &body), HOST), Scope::Unknown, "RTM_SETLINK, attr {ty}");
+            assert_eq!(scope(&msg(CONTAINER, 16, 0x1, &body), HOST), Scope::Reaches, "attr {ty}");
+            assert_eq!(scope(&msg(CONTAINER, 19, 0x1, &body), HOST), Scope::Reaches, "RTM_SETLINK, attr {ty}");
         }
+        let mut body = new_link("wg1");
+        body.extend(attr(28, &3u32.to_ne_bytes()));
+        let mover = UnitId::service("nspawn-mover");
+        let mut t = Tracker::default();
+        take(&mut t, &msg(CONTAINER, 19, 0x1, &body), HOST, || Some(mover.clone()), &mut names);
+        let v = t.view(WatchState::Attached { at: NOW }, std::slice::from_ref(&mover), NOW);
+        assert!(v.units["nspawn-mover"].unattributed && v.protecting_now("nspawn-mover", NOW), "the mover holds");
+        let mut t = Tracker::default();
+        take(&mut t, &msg(CONTAINER, 19, 0x1, &body), HOST, || None, &mut names);
+        assert!(!clean(&t), "no mover known: unattributed for all");
         assert_eq!(scope(&msg(CONTAINER, 16, 0x1, &new_link("wg1")), HOST), Scope::Elsewhere);
         assert_eq!(scope(&msg(HOST, 16, 0x1, &new_link("wg1")), HOST), Scope::Host);
     }

@@ -82,10 +82,14 @@ pub enum Scope {
     /// Another (a container's, a `PrivateNetwork=` service's): how traffic
     /// leaves the machine is not changed there. Ignored.
     Elsewhere,
-    /// Could not tell, or a request elsewhere that may reach into this
-    /// one (a link moved by netns pid or fd, or one aimed at a netns id):
-    /// a loss nothing can place (`.unattributed`, fail closed).
+    /// The probe could not read the netns: a loss nothing can place
+    /// (`.unattributed`, fail closed).
     Unknown,
+    /// A request elsewhere that may reach into this one (a link moved by
+    /// netns pid or fd, or aimed at a netns id; the kernel makes no request
+    /// here for the device arriving): charged to the mover as unattributed,
+    /// or to nobody if its unit is not known (fail closed either way).
+    Reaches,
 }
 
 pub fn scope(ev: &Event, own: u32) -> Scope {
@@ -101,7 +105,7 @@ pub fn scope(ev: &Event, own: u32) -> Scope {
         };
         match attrs(&ev.data, NLMSG_HDRLEN + IFINFOMSG_LEN) {
             Some(a) if !reaches(&a) && !ev.truncated() => {}
-            _ => return Scope::Unknown,
+            _ => return Scope::Reaches,
         }
     }
     Scope::Elsewhere
@@ -120,6 +124,7 @@ pub fn take(
     match scope(ev, own_netns) {
         Scope::Elsewhere => return,
         Scope::Unknown => return t.lost(None),
+        Scope::Reaches => return t.lost(unit().as_ref()),
         Scope::Host => {}
     }
     let unit = unit();
