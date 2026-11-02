@@ -101,8 +101,12 @@
 //! systemd makes a unit's cgroup before its first process starts, so
 //! netwatch records ids as cgroups are made (inotify on `system.slice` and
 //! the slices under it, waking the loop at once) and keeps them after the
-//! cgroup goes (ids are not reused within a boot): a oneshot that changes
-//! something and exits at once is still charged with it. A cgroup made and
+//! cgroup goes: a oneshot that changes something and exits at once is still
+//! charged with it. Keeping old ids is safe because cgroup ids are 64-bit
+//! and not reused within a boot. An id is forgotten only once its cgroup
+//! has been gone for two walks (a tick apart, so none of its events is
+//! still unread) and its unit claims nothing in the footprint, so the map
+//! stays bounded on a long-lived host. A cgroup made and
 //! gone before netwatch saw it at all leaves the change unattributed
 //! (`.unattributed`: fail closed).
 //!

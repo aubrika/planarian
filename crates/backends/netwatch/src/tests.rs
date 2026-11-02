@@ -441,39 +441,106 @@ mod loader_checks {
     }
 }
 
-/// A unit's cgroup is recorded as it is made, and kept after it goes, so
-/// a oneshot that exits at once is still charged with its change.
+/// Attribution (crate docs): a unit's cgroup is recorded as it is made and
+/// kept after it goes, so a oneshot that exits at once is still charged
+/// with its change; a cgroup never seen fails closed.
 #[cfg(feature = "loader")]
 mod cgroups {
     use crate::cgroups::Cgroups;
+    use crate::{Change, ChangeKind, Owner, Tracker, WatchState};
     use planarian_schema::UnitId;
+    use std::collections::BTreeSet;
     use std::os::unix::fs::MetadataExt;
 
     fn ino(p: &std::path::Path) -> u64 {
         std::fs::metadata(p).unwrap().ino()
     }
 
-    #[test]
-    fn a_oneshot_that_exits_stays_attributed() {
+    fn tree() -> (tempfile::TempDir, std::path::PathBuf) {
         let d = tempfile::tempdir().unwrap();
         let slice = d.path().join("system.slice");
         std::fs::create_dir(&slice).unwrap();
+        (d, slice)
+    }
+
+    /// A tick's walk merges: a unit whose cgroup went is still known.
+    #[test]
+    fn the_map_merges_and_does_not_replace() {
+        let (d, slice) = tree();
+        let unit = slice.join("nw-route.service");
+        std::fs::create_dir(&unit).unwrap();
+        let mut c = Cgroups::new(d.path());
+        let id = ino(&unit);
+        std::fs::remove_dir(&unit).unwrap();
+        let running = c.walk(&BTreeSet::new());
+        assert!(!running.contains("nw-route"));
+        assert_eq!(c.unit(id), Some(UnitId::service("nw-route")));
+    }
+
+    /// The cgroup is made (IN_CREATE wakes the loop, which drains), the
+    /// oneshot changes something and exits, its cgroup goes; then its event
+    /// is read: still charged to it, from the IN_CREATE record alone.
+    #[test]
+    fn a_unit_gone_before_its_event_is_read_is_still_attributed() {
+        let (d, slice) = tree();
         let mut c = Cgroups::new(d.path());
         let unit = slice.join("nw-sockopt.service");
         std::fs::create_dir(&unit).unwrap();
         let id = ino(&unit);
-        c.drain(); // the loop drains before it reads the ring buffer
-        std::fs::remove_dir(&unit).unwrap(); // the oneshot exited
-        let running = c.walk(); // a tick's walk does not forget it
-        assert!(!running.contains("nw-sockopt"));
+        c.drain();
+        std::fs::remove_dir(&unit).unwrap();
         assert_eq!(c.unit(id), Some(UnitId::service("nw-sockopt")));
+    }
+
+    /// Made and gone before netwatch saw it at all: unknown, so the change
+    /// is unattributed and the hold reads `.unattributed` (fail closed).
+    #[test]
+    fn a_cgroup_never_seen_is_unattributed() {
+        let (d, _) = tree();
+        let mut c = Cgroups::new(d.path());
+        assert_eq!(c.unit(424_242), None);
+        let owner = c.unit(424_242).map(Owner::Unit).unwrap_or(Owner::Unattributed);
+        let mut t = Tracker::default();
+        t.apply(&Change {
+            owner,
+            kind: ChangeKind::Firewall,
+            object: "legacy tables pf 2".into(),
+            iface: None,
+            steers: true,
+            removed: false,
+        });
+        let v = t.view(WatchState::Attached { at: 100 }, &[UnitId::service("nw-sockopt")], 100);
+        assert!(!v.unattributed.is_empty(), "fail closed");
+        assert!(v.protecting_now("nw-sockopt", 100), "held: not known to be not protecting");
+    }
+
+    /// Bounded: an id is forgotten once its cgroup has been gone for two
+    /// walks and its unit claims nothing; a claimed unit's id is kept.
+    #[test]
+    fn gone_unclaimed_ids_are_forgotten_and_claimed_ones_kept() {
+        let (d, slice) = tree();
+        let (quiet, vpn) = (slice.join("nw-quiet.service"), slice.join("nw-route.service"));
+        std::fs::create_dir(&quiet).unwrap();
+        std::fs::create_dir(&vpn).unwrap();
+        let mut c = Cgroups::new(d.path());
+        let (iq, iv) = (ino(&quiet), ino(&vpn));
+        assert_eq!(c.len(), 2);
+        std::fs::remove_dir(&quiet).unwrap();
+        std::fs::remove_dir(&vpn).unwrap();
+        let claimed: BTreeSet<UnitId> = [UnitId::service("nw-route")].into();
+        c.walk(&claimed); // gone once: both kept, so an unread event still finds them
+        assert_eq!(c.len(), 2);
+        c.walk(&claimed); // gone twice: the unclaimed one goes
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.unit(iv), Some(UnitId::service("nw-route")));
+        assert_eq!(c.unit(iq), None);
+        c.walk(&BTreeSet::new()); // its claim gone too: forgotten
+        assert!(c.is_empty());
     }
 
     #[test]
     fn a_unit_in_a_new_slice_is_found() {
-        let d = tempfile::tempdir().unwrap();
-        let slice = d.path().join("system.slice");
-        std::fs::create_dir(&slice).unwrap();
+        let (d, slice) = tree();
         let mut c = Cgroups::new(d.path());
         let tpl = slice.join("system-nw\\x2dtpl.slice");
         std::fs::create_dir(&tpl).unwrap();
@@ -491,15 +558,6 @@ mod cgroups {
         std::fs::remove_dir(&b).unwrap();
         assert_eq!(c.unit(ida), Some(UnitId::service("nw-tpl@a")));
         assert_eq!(c.unit(idb), Some(UnitId::service("nw-tpl@b")));
-    }
-
-    /// Made and gone before netwatch saw it: unknown (unattributed).
-    #[test]
-    fn a_cgroup_never_seen_is_unknown() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::create_dir(d.path().join("system.slice")).unwrap();
-        let mut c = Cgroups::new(d.path());
-        assert_eq!(c.unit(424242), None);
     }
 }
 

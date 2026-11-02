@@ -1,10 +1,13 @@
 //! Which unit a cgroup id belongs to, kept as systemd creates them (crate
 //! docs, "Attribution"). systemd makes a unit's cgroup before it starts the
 //! unit's first process, so an inotify watch on `system.slice` (and each
-//! slice under it) records the id before the unit can change anything. Ids
-//! are never forgotten when a cgroup goes: they are 64-bit and not reused
-//! within a boot, so a short-lived unit (a oneshot that exits at once) is
-//! still charged with what it did. A cgroup made and removed before netwatch
+//! slice under it) records the id before the unit can change anything. An id
+//! is kept after its cgroup goes, which is safe because ids are 64-bit and
+//! not reused within a boot: a short-lived unit (a oneshot that exits at
+//! once) is still charged with what it did. It is forgotten only once its
+//! cgroup has been gone for two walks (a tick apart, so no event of it is
+//! still unread) and its unit has no footprint claim, so the map stays
+//! bounded on a long-lived host. A cgroup made and removed before netwatch
 //! sees it at all stays unknown: unattributed, fail closed.
 
 use crate::host::{read_cgroups, unit_of_cgroup};
@@ -15,14 +18,13 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-/// Ids kept at most; the oldest gone ones are dropped first.
-pub const KEEP: usize = 65_536;
-
 pub struct Cgroups {
     root: PathBuf,
     ids: BTreeMap<u64, UnitId>,
     inotify: Option<OwnedFd>,
     watched: BTreeMap<i32, PathBuf>,
+    /// Ids whose cgroup was gone at the last walk.
+    gone: BTreeSet<u64>,
 }
 
 impl Cgroups {
@@ -30,9 +32,15 @@ impl Cgroups {
     /// Without inotify (refused), lookups still fall back to walking.
     pub fn new(root: &Path) -> Cgroups {
         let inotify = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK).ok();
-        let mut c = Cgroups { root: root.to_path_buf(), ids: BTreeMap::new(), inotify, watched: BTreeMap::new() };
+        let mut c = Cgroups {
+            root: root.to_path_buf(),
+            ids: BTreeMap::new(),
+            inotify,
+            watched: BTreeMap::new(),
+            gone: BTreeSet::new(),
+        };
         c.watch_tree(&root.join("system.slice"));
-        c.walk();
+        c.merge();
         c
     }
 
@@ -41,19 +49,33 @@ impl Cgroups {
         self.inotify.as_ref()
     }
 
-    /// Walk the tree; ids are merged, never replaced. Returns the units
-    /// running now.
-    pub fn walk(&mut self) -> BTreeSet<String> {
+    /// A tick's walk: merge what stands (never replace), then forget the
+    /// ids gone for two walks whose unit has no claim (`claimed`: every unit
+    /// the footprint claims anything for). Returns the units running now.
+    pub fn walk(&mut self, claimed: &BTreeSet<UnitId>) -> BTreeSet<String> {
         let (ids, running) = read_cgroups(&self.root);
-        if self.ids.len() + ids.len() > KEEP {
-            // Drop the oldest ids no longer standing.
-            let gone: Vec<u64> = self.ids.keys().filter(|i| !ids.contains_key(i)).copied().collect();
-            for i in gone.into_iter().take(self.ids.len() + ids.len() - KEEP) {
-                self.ids.remove(&i);
-            }
-        }
+        let gone: BTreeSet<u64> = self.ids.keys().filter(|i| !ids.contains_key(i)).copied().collect();
+        let before = std::mem::take(&mut self.gone);
+        self.ids.retain(|i, u| !(before.contains(i) && gone.contains(i) && !claimed.contains(u)));
+        self.gone = gone.into_iter().filter(|i| self.ids.contains_key(i)).collect();
         self.ids.extend(ids);
         running
+    }
+
+    /// How many ids are known (kept or standing).
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether no id is known.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Merge what stands now, forgetting nothing.
+    fn merge(&mut self) {
+        let (ids, _) = read_cgroups(&self.root);
+        self.ids.extend(ids);
     }
 
     /// Record every cgroup created since the last call.
@@ -86,7 +108,7 @@ impl Cgroups {
             self.drain();
         }
         if !self.ids.contains_key(&id) {
-            self.walk();
+            self.merge();
         }
         self.ids.get(&id).cloned()
     }

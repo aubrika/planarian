@@ -309,9 +309,10 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         if Instant::now() >= next_tick {
             next_tick += Duration::from_secs(crate::TICK_SECS);
             let Some(now) = boottime_secs() else { return fail("no /proc/uptime".into()) };
-            let running = cgroups.walk();
+            let claims = tracker.claims();
+            let running = cgroups.walk(&claims.units());
             let view = tracker.view(WatchState::Attached { at: now }, &expand_tools(&tools, &running), now);
-            if let Err(e) = crate::write_state(dir, &tracker.claims()).and_then(|()| crate::write(dir, &view)) {
+            if let Err(e) = crate::write_state(dir, &claims).and_then(|()| crate::write(dir, &view)) {
                 return fail(format!("write {}: {e}", dir.display()));
             }
             if !ready.replace(true) {
