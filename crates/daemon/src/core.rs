@@ -215,10 +215,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     quiet_queue: Vec<String>,
     /// Waiting generations interrupted by a restart, to prepare again (§12f).
     reprepare: Vec<(TxnId, Transition)>,
-    /// Generation transactions withdrawn for a repair rollback before they
-    /// mutated (§12f, I6; owner decision, Nov 2), to prepare again once no
-    /// generation transaction is active.
-    withdrawn: Vec<(TxnId, Transition)>,
+    /// Generation transactions withdrawn from `Built` for a rollback about to
+    /// run (§12f, I6; owner decision, Nov 2), with when each began waiting,
+    /// to prepare again once no generation transaction is active.
+    withdrawn: Vec<(TxnId, Transition, Option<Timestamp>)>,
     /// From the executor log of earlier runs: each transaction's proposal and
     /// caller, so one prepared again keeps its source and caller (§12, C21).
     pub earlier: BTreeMap<TxnId, (Proposal, Actor)>,
@@ -556,7 +556,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let pre = s.digest();
         let policy = self.ex.policy_version();
         let caller = authz.actor.clone();
+        let built = self.waiting_built();
         let result = self.ex.submit(p.clone(), authz.clone(), s, defs);
+        self.note_withdrawn(built);
         if let Some((facts, _)) = self.ex.last.clone() {
             self.touched.extend(facts.affected_units.iter().cloned());
             // §11: the affected sessions are notified either way.
@@ -662,8 +664,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
     /// Prepare again transactions interrupted before they mutated (by a
     /// restart, or withdrawn for a repair rollback).
-    fn prepare_again(&mut self, list: Vec<(TxnId, Transition)>, why: &str, s: &SystemState, defs: &UnitDefs) {
-        for (id, t) in list {
+    fn prepare_again(
+        &mut self,
+        list: Vec<(TxnId, Transition, Option<Timestamp>)>,
+        why: &str,
+        s: &SystemState,
+        defs: &UnitDefs,
+    ) {
+        for (id, t, since) in list {
             // Its original source and caller (C21), so floors that depend on
             // who asked (the own-session exemption) still apply; the daemon's
             // own only when no record of it survives.
@@ -689,28 +697,37 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             {
                 self.incident_parked.insert(inc, *txn);
             }
+            // A withdrawal never extends a change's parking limit (I12).
+            if let (Some(since), Submitted::Finished { txn, state: TxnState::Built, .. }) = (since, &r) {
+                self.ex.keep_waiting_since(*txn, since);
+            }
             self.notice(format!("{}: prepared again {why}: {}", render::transition(&t), render::submitted_short(&r)));
         }
     }
 
-    /// §12f, I6 (owner decision, Nov 2): a repair rollback pre-empts every
-    /// generation transaction waiting in `Built` for its window: each is
-    /// `Rejected(Interrupted)` and prepared again, with its original source
-    /// and caller, once the repair is terminal. One parked for approval in
-    /// `Prepared` is not active for I6 (the ledger's `compatible`) and is
-    /// left alone, so nobody approves twice. One past `Built` is never
-    /// withdrawn; the repair loop does not run while it is active, so the
-    /// incident waits for it with its budget unchanged.
-    fn withdraw_for_repair(&mut self) {
-        let ids: Vec<(TxnId, Transition)> = self
-            .ledger()
-            .live
+    /// Generation transactions waiting in `Built`, with when each began
+    /// waiting: what a rollback about to run would withdraw (§12f, I6).
+    fn waiting_built(&mut self) -> Vec<(TxnId, Transition, Option<Timestamp>)> {
+        let l = self.ledger();
+        l.live
             .values()
             .filter(|t| t.txn.transition.changes_generation() && t.txn.state == TxnState::Built)
-            .map(|t| (t.txn.id, t.txn.transition.clone()))
-            .collect();
-        for (id, t) in ids {
-            if self.ex.kernel.reject(id, RejectReason::Interrupted).is_err() {
+            .map(|t| (t.txn.id, t.txn.transition.clone(), self.ex.waiting_since(t.txn.id)))
+            .collect()
+    }
+
+    /// §12f, I6 (owner decision, Nov 2): a rollback of any source withdraws
+    /// what waits in `Built` at the moment it is about to run (admitted, and
+    /// approved if it asked; `exec::schedule`). Those of `before` the
+    /// executor withdrew are remembered, with their proposal, caller and
+    /// parking start, to prepare again once the rollback is terminal.
+    fn note_withdrawn(&mut self, before: Vec<(TxnId, Transition, Option<Timestamp>)>) {
+        if before.is_empty() {
+            return;
+        }
+        let l = self.ledger();
+        for (id, t, since) in before {
+            if l.terminal.get(&id).is_none_or(|x| x.state != TxnState::Rejected(RejectReason::Interrupted)) {
                 continue;
             }
             if !self.earlier.contains_key(&id) {
@@ -722,11 +739,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
             }
             self.notice(format!(
-                "{}: set aside for a repair rollback (transaction {}); it will be prepared again once the repair is done",
+                "{}: set aside for a rollback (transaction {}); it will be prepared again once the rollback is done",
                 render::transition(&t),
                 id.0
             ));
-            self.withdrawn.push((id, t));
+            self.withdrawn.push((id, t, since));
         }
     }
 
@@ -1157,12 +1174,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             return;
         }
 
-        let again = std::mem::take(&mut self.reprepare);
+        let again = std::mem::take(&mut self.reprepare).into_iter().map(|(id, t)| (id, t, None)).collect();
         self.prepare_again(again, "after a restart", &s, &defs);
-        // §12f: what a repair rollback withdrew, once that repair is terminal.
+        // §12f: what a rollback withdrew, once that rollback is terminal.
         if !self.withdrawn.is_empty() && !self.generation_active() {
             let again = std::mem::take(&mut self.withdrawn);
-            self.prepare_again(again, "after the repair rollback", &s, &defs);
+            self.prepare_again(again, "after the rollback", &s, &defs);
         }
 
         // §11: stops nobody attributed, before anything treats them as faults.
@@ -1545,12 +1562,6 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         c.target, c.target
                     ));
                 }
-                // Withdrawn before the submission because the ledger's I6
-                // check refuses the rollback while a Built one is live.
-                let withdrawn_before = self.withdrawn.len();
-                if c.transition == Transition::Rollback {
-                    self.withdraw_for_repair();
-                }
                 let p = self.proposal(
                     c.transition.clone(),
                     s,
@@ -1564,17 +1575,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 if admitted && self.is_canonical(&c.target, defs) {
                     self.repaired_before_confirmation.insert(c.target.clone());
                 }
-                let result = self.submit(p, authorization_of(Actor::Daemon), s, defs);
-                // A rollback refused before it got a transaction (Stale,
-                // Precondition, policy) gave nothing the withdrawn changes
-                // made way for: prepare them again now.
-                if matches!(result, Submitted::Rejected { .. } | Submitted::Error(_))
-                    && self.withdrawn.len() > withdrawn_before
-                {
-                    let back = self.withdrawn.split_off(withdrawn_before);
-                    self.prepare_again(back, "after a refused repair rollback", s, defs);
-                }
-                match result {
+                match self.submit(p, authorization_of(Actor::Daemon), s, defs) {
                     // §12f: waiting in Built for an activation window is not an
                     // attempt; the incident waits with it, and reopens if the
                     // wait expires.
@@ -2167,7 +2168,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
                 let (s, defs) = self.observe();
                 let approver = self.authz(&peer);
+                let built = self.waiting_built();
                 let r = self.ex.approve(&hash, &approver, &s, &defs);
+                self.note_withdrawn(built);
                 render::response(&r)
             }
             Request::Cancel { txn } => {
