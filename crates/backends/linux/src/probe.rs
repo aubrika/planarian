@@ -2,8 +2,8 @@
 //! contract). A probe's timeout is a deadline for the whole probe: name
 //! resolution, connection, writing and every read count against the one
 //! budget (R06). A batch runs on a bounded pool and returns by its deadline;
-//! a probe still running then is recorded `Timeout` (Unknown, never Failed)
-//! and abandoned. Output is data: it is truncated and logged, never
+//! a probe still running then is recorded `Abandoned` (Unknown, never
+//! Failed) and abandoned; `Timeout` is a probe past its own deadline. Output is data: it is truncated and logged, never
 //! interpreted as instructions.
 //!
 //! Exec probes run under `systemd-run` with a dedicated dynamic user, no
@@ -270,7 +270,8 @@ fn run_one(p: &ProbeDef) -> ProbeResult {
 
 /// Run `jobs` on at most `WORKERS` threads and return by the batch deadline
 /// (the longest timeout plus `allowance`): a probe not finished by then, or
-/// not started, is `Timeout`, and its thread is abandoned, never waited for.
+/// not started, is `Abandoned` (§10: recorded Unknown and abandoned), and its
+/// thread is never waited for.
 fn run_batch_with(
     jobs: &[(UnitId, ProbeDef)],
     run: fn(&ProbeDef) -> ProbeResult,
@@ -309,7 +310,7 @@ fn run_batch_with(
         }
     }
     over.store(true, Ordering::Relaxed);
-    out.into_iter().map(|r| r.unwrap_or(ProbeResult::Timeout)).collect()
+    out.into_iter().map(|r| r.unwrap_or(ProbeResult::Abandoned)).collect()
 }
 
 impl ProbeBackend for Probes {
@@ -442,7 +443,7 @@ mod tests {
     }
 
     /// R06: the batch returns by its deadline; a wedged probe is recorded
-    /// Timeout (Unknown) and abandoned, and the others keep their results.
+    /// Abandoned (Unknown), not Timeout, and the others keep their results.
     #[test]
     fn a_wedged_probe_does_not_hold_the_batch() {
         fn run(p: &ProbeDef) -> ProbeResult {
@@ -455,10 +456,36 @@ mod tests {
         let t = Instant::now();
         let r = run_batch_with(&jobs, run, Duration::from_millis(300));
         assert!(t.elapsed() < Duration::from_millis(900), "took {:?}", t.elapsed());
-        assert_eq!(r, vec![ProbeResult::Pass, ProbeResult::Timeout, ProbeResult::Pass]);
+        assert_eq!(r, vec![ProbeResult::Pass, ProbeResult::Abandoned, ProbeResult::Pass]);
         // More jobs than workers still all run.
         let many: Vec<_> = (0..WORKERS * 2 + 3).map(|i| job(&format!("p{i}"), 500)).collect();
         assert!(run_batch_with(&many, run, Duration::from_millis(500)).iter().all(|r| *r == ProbeResult::Pass));
+    }
+
+    /// R06, §10: `Timeout` is a probe past its own deadline; a probe still
+    /// queued behind wedged ones when the batch deadline passes is
+    /// `Abandoned`, not blamed with a `Timeout` it never had.
+    #[test]
+    fn a_straggler_is_abandoned_and_its_own_timeout_stays_timeout() {
+        fn run(p: &ProbeDef) -> ProbeResult {
+            match p.id.0.as_str() {
+                "own-timeout" => ProbeResult::Timeout,
+                id if id.starts_with("wedged") => {
+                    std::thread::sleep(Duration::from_secs(10));
+                    ProbeResult::Pass
+                }
+                _ => ProbeResult::Pass,
+            }
+        }
+        // Every worker wedged, then two that never start.
+        let mut jobs = vec![job("own-timeout", 200)];
+        jobs.extend((0..WORKERS).map(|i| job(&format!("wedged{i}"), 200)));
+        jobs.push(job("queued", 200));
+        let t = Instant::now();
+        let r = run_batch_with(&jobs, run, Duration::from_millis(300));
+        assert!(t.elapsed() < Duration::from_millis(900), "took {:?}", t.elapsed());
+        assert_eq!(r[0], ProbeResult::Timeout, "its own deadline");
+        assert!(r[1..].iter().all(|r| *r == ProbeResult::Abandoned), "{r:?}");
     }
 
     #[test]
