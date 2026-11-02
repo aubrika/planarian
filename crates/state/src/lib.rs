@@ -68,6 +68,9 @@ pub struct Assembler {
     canonical: Canonical,
     evidence: BTreeMap<(UnitId, ProbeId), Evidence>,
     last_run: BTreeMap<(UnitId, ProbeId), Timestamp>,
+    /// When each Measurement probe last ran, which `reprobe` does not clear:
+    /// its declared `per` holds whoever asks for the run (§10).
+    last_measured: BTreeMap<(UnitId, ProbeId), Timestamp>,
     on_demand: BTreeSet<(UnitId, ProbeId)>,
     pub failed_since: BTreeMap<UnitId, Timestamp>,
     pub known_drivers: BTreeMap<UnitId, DriverRef>,
@@ -177,12 +180,23 @@ impl Assembler {
             Cadence::Every(d) => d,
             Cadence::OnDemand => return None,
         };
-        Some(if p.cost == ProbeCost::WakesHardware {
+        let base = if p.cost == ProbeCost::WakesHardware {
             let floor = if self.on_battery { HARDWARE_CADENCE_BATTERY } else { HARDWARE_CADENCE };
             Millis(base.0.max(floor.0))
         } else {
             base
-        })
+        };
+        Some(Millis(base.0.max(per(p).map_or(0, |m| m.0))))
+    }
+
+    /// §10: a Measurement probe runs at most once per its declared `per`,
+    /// on its cadence or on request (`request`, `reprobe`) alike. A request
+    /// made sooner waits for the next tick that is allowed.
+    fn within_rate(&self, key: &(UnitId, ProbeId), p: &ProbeDef, now: Timestamp) -> bool {
+        match (per(p), self.last_measured.get(key)) {
+            (Some(m), Some(last)) => now.0 < last.0 + m.0,
+            _ => false,
+        }
     }
 
     fn stale_after(&self, p: &ProbeDef) -> Millis {
@@ -206,6 +220,9 @@ impl Assembler {
 
     fn due(&self, unit: &UnitId, p: &ProbeDef, now: Timestamp) -> bool {
         let key = (unit.clone(), p.id.clone());
+        if self.within_rate(&key, p, now) {
+            return false;
+        }
         if self.on_demand.contains(&key) {
             return true;
         }
@@ -428,11 +445,16 @@ impl Assembler {
             let key = (unit.clone(), p.id.clone());
             self.on_demand.remove(&key);
             self.last_run.insert(key.clone(), now);
+            if per(&p).is_some() {
+                self.last_measured.insert(key.clone(), now);
+            }
             let stale_after = self.stale_after(&p);
             self.evidence.insert(key, Evidence { probe: p.id.clone(), result, at: now, stale_after });
         }
         // Drop evidence for units or probes that no longer exist.
-        self.evidence.retain(|(u, pid), _| defs.get(u).is_some_and(|d| d.probes.iter().any(|p| &p.id == pid)));
+        let exists = |(u, pid): &(UnitId, ProbeId)| defs.get(u).is_some_and(|d| d.probes.iter().any(|p| &p.id == pid));
+        self.evidence.retain(|k, _| exists(k));
+        self.last_measured.retain(|k, _| exists(k));
 
         let units = observed
             .into_iter()
@@ -468,6 +490,14 @@ impl Assembler {
 }
 
 /// A `Reason` for a unit observed failed with a backend error.
+/// A Measurement probe's declared rate (§10): at most one run per `per`.
+fn per(p: &ProbeDef) -> Option<Millis> {
+    match p.side_effects {
+        planarian_schema::SideEffects::Measurement { per, .. } if per.0 > 0 => Some(per),
+        _ => None,
+    }
+}
+
 pub fn backend_reason(msg: &str) -> Reason {
     Reason::Backend(msg.into())
 }

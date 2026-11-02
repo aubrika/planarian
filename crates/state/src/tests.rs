@@ -171,3 +171,53 @@ fn second_session_of_one_uid_is_judged_on_its_own() {
     assert_eq!(s.status(&s1, &defs), UnitStatus::Running);
     assert_eq!(s.status(&s2, &defs), UnitStatus::Stopped);
 }
+
+/// P10, §10: "`per` enforced by the cadence scheduler". A Measurement probe
+/// declared at one run per 30 s runs at most once per 30 s, on its cadence,
+/// on request and on a re-observe alike; a request made sooner runs on the
+/// first tick allowed, and the evidence stays fresh in between.
+#[test]
+fn a_measurement_probe_runs_at_most_once_per_its_per() {
+    let web = UnitId::service("gym-web");
+    let http = ProbeId("gym-web-http".into());
+    let per = Millis::secs(30);
+    let mut units = fixtures::gym_units();
+    for p in units.get_mut(&web).unwrap().probes.iter_mut().filter(|p| p.id == http) {
+        p.side_effects = SideEffects::Measurement { bytes_max: 4096, per };
+    }
+    let fake = gym_world(MemStore::new(1 << 20));
+    let mut a = Assembler::new(Manifest { units, user_units: fixtures::gym_user_units() }, fixtures::canonical());
+    let ran_at = |s: &SystemState| s.units[&web].1.iter().find(|e| e.probe == http).map(|e| e.at).unwrap();
+
+    let (s, defs) = tick(&fake, &mut a);
+    let first = ran_at(&s);
+    let mut runs = vec![first];
+    for n in 0..17 {
+        // Every way of asking for a run, inside the window.
+        match n % 3 {
+            0 => a.request(&web, &http),
+            1 => a.reprobe(&web),
+            _ => {}
+        }
+        let (s, defs) = tick(&fake, &mut a);
+        assert_eq!(s.status(&web, &defs), UnitStatus::Running, "fresh between runs (tick {n})");
+        let at = ran_at(&s);
+        if at != *runs.last().unwrap() {
+            runs.push(at);
+        }
+    }
+    assert_eq!(s.status(&web, &defs), UnitStatus::Running);
+    assert!(runs.len() >= 3, "it still runs on its rate: {runs:?}");
+    for w in runs.windows(2) {
+        assert!(w[1].0 - w[0].0 >= per.0, "two runs {} ms apart: {runs:?}", w[1].0 - w[0].0);
+    }
+    // A request made inside the window runs on the first tick allowed.
+    a.request(&web, &http);
+    let last = *runs.last().unwrap();
+    let mut s = tick(&fake, &mut a).0;
+    while ran_at(&s) == last {
+        assert!(fake.w().now.0 < last.0 + per.0, "the request was dropped");
+        s = tick(&fake, &mut a).0;
+    }
+    assert!(ran_at(&s).0 - last.0 >= per.0 && ran_at(&s).0 - last.0 < per.0 + TICK.0);
+}
