@@ -17,10 +17,12 @@
 #
 # Fixtures (all root with no capability bounding set, so network tools by
 # the build-time rule): nw-route makes a dummy interface and a default route
-# over it; nw-quiet steers nothing; nw-legacy adds a legacy-iptables OUTPUT
-# drop; nw-nft loads an nftables table with an output drop. The drops target
-# 203.0.113.79 and .80 (TEST-NET-3), and the default route has metric 4000,
-# so none of them disturbs the test itself.
+# over it; nw-quiet steers nothing; nw-nft loads an nftables table with an
+# output drop (to 203.0.113.80, TEST-NET-3); the default route has metric
+# 4000, so none of them disturbs the test itself. There is no legacy-iptables
+# fixture: the reference kernel has no legacy xtables tables
+# (CONFIG_NETFILTER_XTABLES_LEGACY unset) and NixOS blacklists ip_tables with
+# nftables, so nothing on it can steer through legacy iptables (see (d)).
 { pkgs, self }:
 
 let
@@ -67,9 +69,6 @@ pkgs.testers.runNixOSTest {
         ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
       };
     };
-    systemd.services.nw-legacy = oneshot
-      "${ipt} -A OUTPUT -d 203.0.113.79 -j DROP"
-      "${ipt} -D OUTPUT -d 203.0.113.79 -j DROP";
     systemd.services.nw-nft = oneshot
       "${nft} 'add table inet nwnft; add chain inet nwnft out { type filter hook output priority 0; }; add rule inet nwnft out ip daddr 203.0.113.80 drop'"
       "${nft} delete table inet nwnft";
@@ -145,7 +144,7 @@ pkgs.testers.runNixOSTest {
 
     machine.wait_for_unit("planarian-ready.target")
     machine.wait_for_unit("planarian-netwatch.service")
-    for u in ["nw-route", "nw-quiet", "nw-legacy", "nw-nft"]:
+    for u in ["nw-route", "nw-quiet", "nw-nft"]:
         machine.wait_for_unit(f"{u}.service")
 
     with subtest("(a) the watch is attached, with a fresh CLOCK_BOOTTIME stamp"):
@@ -175,7 +174,7 @@ pkgs.testers.runNixOSTest {
         import json
         export = json.loads(machine.succeed("cat /etc/planarian/export.json"))
         tools = set(export["networkTools"]) - set(export.get("networkToolsUnordered", []))
-        for want in ["nw-route", "nw-quiet", "nw-legacy", "nw-nft", "nftables", "wireguard-wgnw", "nw-tpl@"]:
+        for want in ["nw-route", "nw-quiet", "nw-nft", "nftables", "wireguard-wgnw", "nw-tpl@"]:
             assert want in tools, (want, sorted(tools))
         def mono(unit, prop):
             return int(machine.succeed(f"systemctl show -P {prop} {unit}").strip() or 0)
@@ -207,9 +206,12 @@ pkgs.testers.runNixOSTest {
         protecting("nw-quiet", "no")
         machine.fail(f"test -e {FP}/.unattributed")
 
-    with subtest("(d) a legacy iptables OUTPUT drop: protecting"):
-        machine.succeed("${ipt} -S OUTPUT | grep -q 203.0.113.79")
-        protecting("nw-legacy", "yes")
+    with subtest("(d) legacy iptables cannot steer on the reference kernel"):
+        # It has no legacy xtables tables, so a legacy rule cannot be loaded
+        # at all: that path (nf_setsockopt) has nothing to attribute here.
+        # netwatch still attaches its probe for kernels that have it.
+        machine.fail("${ipt} -A OUTPUT -d 203.0.113.79 -j DROP")
+        machine.fail("${ipt} -S OUTPUT")
 
     with subtest("(e) an nftables table that drops traffic: protecting"):
         machine.succeed("${nft} list table inet nwnft")
@@ -225,7 +227,7 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds(
             f"[ $(systemctl show -P NRestarts planarian-netwatch.service) -gt {n0} ] && systemctl is-active planarian-netwatch.service", timeout=60)
         machine.wait_until_succeeds(f"grep -q '^attached ' {FP}/.watch && [ $(awk '{{print $2}}' {FP}/.watch) -gt {t0} ]", timeout=60)
-        for u in ["nw-route", "nw-legacy", "nw-nft"]:
+        for u in ["nw-route", "nw-nft"]:
             protecting(u, "yes")
         assert "iface nwdummy0" in footprint("nw-route")
 
