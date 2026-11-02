@@ -650,6 +650,10 @@ in
       # §12d: every system service that is a network tool, declared or not
       # (netwatch writes a footprint for each when its watch attaches).
       inherit networkTools;
+      # The network tools not ordered after netwatch (its startup chain;
+      # nix/netwatch-unordered.nix): their early changes may precede its
+      # attach, and read as pre-attach steering (§12d).
+      inherit (cfg) networkToolsUnordered;
       userUnits = unitsOf "user";
       coreUnits = {
         "planariad.service" = unitHash "planariad.service";
