@@ -45,6 +45,19 @@ fn already_failed(s: &SystemState, defs: &UnitDefs, u: &UnitId) -> bool {
         && matches!(s.status(u, defs), UnitStatus::Failed(_) | UnitStatus::Stopped | UnitStatus::Absent)
 }
 
+/// §12d "Which units": whether `u` is a network tool the kernel has
+/// attributed a traffic-steering change to (its footprint, in `/run`), i.e.
+/// a network-security unit. STUB: `false` until lane-daemon carries the
+/// footprints in `SystemState`; then read `s` here and nowhere else. When it
+/// is plugged in, note that §12d's fail-closed reading (a footprint missing
+/// or stale when a network tool fails counts as protecting) makes this
+/// `true`, and so waives the RestartUnit row's escalations for that unit:
+/// right for the hold (the traffic is blocked meanwhile), but it is the
+/// direction that asks less.
+fn footprint_protecting(_s: &SystemState, _u: &UnitId) -> bool {
+    false
+}
+
 fn unit_facts<'a>(
     units: impl IntoIterator<Item = &'a UnitId>,
     defs: &UnitDefs,
@@ -245,6 +258,10 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             // this; Security still escalates). The same reading as the
             // disruption rule: current observation, Unknown is not failed.
             f.restarts_failed_unit = already_failed(i.state, i.defs, u);
+            // §11, §12d (owner decision, Nov 2): a failed network-security
+            // unit's traffic is held, so its restart only ends an outage and
+            // waives both escalations of the RestartUnit row.
+            f.restarts_held_unit = f.restarts_failed_unit && footprint_protecting(i.state, u);
         }
         Transition::StopUnit(u) | Transition::StopAndSuppress { unit: u, .. } => {
             unit_op(&mut f, u, Recovery::Revertible)
