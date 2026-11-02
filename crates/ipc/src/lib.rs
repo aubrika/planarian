@@ -121,6 +121,132 @@ pub struct Pending {
     pub what: String,
     pub facts: DerivedFacts,
     pub issued: Timestamp,
+    /// §16 *Approvals show the change*: what a generation transition would
+    /// apply, computed by the core from the evaluated generations (never
+    /// from the proposal). Empty for a transition that is not one.
+    #[serde(default)]
+    pub diff: ApprovalDiff,
+}
+
+/// §16 (owner decision, Nov 2): the configuration a generation transition
+/// that asks would apply, as a person sees it in `planarian approve`, the
+/// console and the notice, and as an agent reads it (`approve --json`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalDiff {
+    /// Every option added, removed or changed; Security- and
+    /// External-sensitive ones first, then by path.
+    pub options: Vec<OptionChange>,
+    /// The units it would remove or stop, with their sensitivity; Security-
+    /// and External-sensitive ones first.
+    pub removes: Vec<RemovedUnit>,
+    /// Said when the core could not read the evaluated generations: the
+    /// options shown are the requested settings only, not the whole change.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovedUnit {
+    pub unit: UnitId,
+    pub sensitivity: planarian_schema::Sensitivities,
+    /// The sensitivity by name ("Security", "External", ...), as shown.
+    pub kinds: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptionChange {
+    pub path: String,
+    /// `None`: the option is added (`old`) or removed (`new`).
+    pub old: Option<Value>,
+    pub new: Option<Value>,
+    pub sensitivity: planarian_schema::Sensitivities,
+    /// The sensitivity by name ("Security", "External", ...), as shown.
+    pub kinds: Vec<String>,
+}
+
+/// A sensitivity by name, most significant first; "Routine" when it is
+/// nothing else.
+pub fn sensitivity_kinds(s: &planarian_schema::Sensitivities) -> Vec<String> {
+    use planarian_schema::Sensitivity;
+    let k: Vec<String> = [
+        (Sensitivity::Security, "Security"),
+        (Sensitivity::External, "External"),
+        (Sensitivity::UserData, "UserData"),
+        (Sensitivity::Core, "Core"),
+    ]
+    .into_iter()
+    .filter(|(x, _)| s.contains(*x))
+    .map(|(_, n)| n.to_string())
+    .collect();
+    if k.is_empty() { vec!["Routine".into()] } else { k }
+}
+
+impl ApprovalDiff {
+    pub fn is_empty(&self) -> bool {
+        self.options.is_empty() && self.removes.is_empty() && self.note.is_none()
+    }
+
+    /// The full diff, one line each, for `planarian approve` and the console.
+    pub fn lines(&self) -> Vec<String> {
+        let d = self;
+        let mut out: Vec<String> = d.note.iter().cloned().collect();
+        out.extend(d.options.iter().map(|o| format!("{} [{}]", change(o), o.kinds.join(", "))));
+        out.extend(d.removes.iter().map(|r| format!("removes or stops {} [{}]", r.unit, r.kinds.join(", "))));
+        out
+    }
+
+    /// One line for the notice: how much it changes, the sensitive options
+    /// spelled out, and the units it removes or stops.
+    pub fn summary(&self) -> Option<String> {
+        let d = self;
+        if d.is_empty() {
+            return None;
+        }
+        let mut parts: Vec<String> = d.note.iter().cloned().collect();
+        if !d.options.is_empty() {
+            let sensitive: Vec<String> = d.options.iter().filter(|o| first(&o.sensitivity)).map(change).collect();
+            let n = d.options.len();
+            parts.push(if sensitive.is_empty() {
+                format!("changes {n} option{}", if n == 1 { "" } else { "s" })
+            } else {
+                format!(
+                    "changes {n} option{} ({} Security/External: {})",
+                    if n == 1 { "" } else { "s" },
+                    sensitive.len(),
+                    sensitive.join("; ")
+                )
+            });
+        }
+        if !d.removes.is_empty() {
+            let units: Vec<String> = d.removes.iter().map(|r| r.unit.to_string()).collect();
+            parts.push(format!("removes or stops {}", units.join(", ")));
+        }
+        Some(parts.join("; "))
+    }
+}
+
+fn first(s: &planarian_schema::Sensitivities) -> bool {
+    use planarian_schema::Sensitivity;
+    s.contains(Sensitivity::Security) || s.contains(Sensitivity::External)
+}
+
+fn value(v: &Value) -> String {
+    match v {
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Str(s) => s.clone(),
+        Value::List(l) => format!("[{}]", l.iter().map(value).collect::<Vec<_>>().join(", ")),
+    }
+}
+
+fn change(o: &OptionChange) -> String {
+    let v = |x: &Option<Value>| x.as_ref().map(value);
+    match (v(&o.old), v(&o.new)) {
+        (None, Some(n)) => format!("{} added: {n}", o.path),
+        (Some(old), None) => format!("{} removed (was {old})", o.path),
+        (Some(old), Some(n)) => format!("{}: {old} → {n}", o.path),
+        (None, None) => o.path.clone(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

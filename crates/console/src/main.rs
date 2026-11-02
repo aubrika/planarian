@@ -323,6 +323,20 @@ fn banner<'a>(s: String, warn: bool) -> Element<'a, Message> {
         .into()
 }
 
+/// A change waiting for approval, with what it would change (§16
+/// *Approvals show the change*; the core computed the diff).
+fn pending_text(p: &planarian_ipc::Pending) -> String {
+    let mut t = format!("Waiting for approval: {} (as root: planarian approve {})", p.what, p.approve);
+    if !p.diff.is_empty() {
+        t.push_str("\nIt would change:");
+        for l in p.diff.lines() {
+            t.push_str("\n  ");
+            t.push_str(&l);
+        }
+    }
+    t
+}
+
 fn banners<'a>(r: &ConsoleReport) -> Vec<Element<'a, Message>> {
     let s = &r.status;
     let mut out = vec![];
@@ -336,7 +350,7 @@ fn banners<'a>(r: &ConsoleReport) -> Vec<Element<'a, Message>> {
         ));
     }
     for p in &s.pending {
-        out.push(banner(format!("Waiting for approval: {} (as root: planarian approve {})", p.what, p.approve), false));
+        out.push(banner(pending_text(p), false));
     }
     // §11 (B-11): stops taken as someone's intent, until a user acknowledges.
     for (u, why) in &s.inferred {
