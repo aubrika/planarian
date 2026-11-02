@@ -318,6 +318,89 @@ interim `restarts_held_unit` rule in derive; `vm.yml`'s `vm-netsec` line.
 | `planarian hold release` | — | an attested `Override` on `planarian-hold@<unit>` through the executor; the hold unit has a never-expected def carrying the held unit's sensitivity, so a non-administrator's release is AskFirst with an Administrator approver; on commit, journal `HoldLifted` and write the release marker (`boot` by default) |
 | Bypass register | — | X-13 (accepted): a posture response without `Prepared` or a lease; I15, I21 |
 
+## Reviewer: §12f *Rollbacks* acceptance cases (#9), 2 Nov
+
+Written from §12f (*Rollbacks*, *Quiet mode*), §11 global floors and §13
+ordering only, before the builder's code (`review/lane-daemon-12f-rollbacks`).
+
+| Case | On `main` | Why |
+| --- | --- | --- |
+| `rollback-repair-foreground-dependency` | FAIL | no Rollback runs: the Wi-Fi repair chain parks at its first step (below) |
+| `rollback-repair-foreground-unrelated` | PASS | the repair loop already skips non-dependency incidents under quiet mode; the case guards it |
+| `rollback-repair-session-loss-asks` | PASS | the Rollback is already AskFirst/SessionLoss and pending; the case guards it against a "repair skips the floors" regression |
+
+Test vocabulary these needed, added on the review branch (it crosses into
+lane-gym's `crates/gym/src/**` and lane-change-path's `crates/fake/**`;
+the coordinator decides whether it stays there):
+
+- `break_in_generation {unit, generation, switch_restarts?}` (fake only): a
+  committed generation's flaw that shows once it is live; restarts cannot fix
+  it, a switch away from that generation does.
+- fixture `service:gym-printer` (Routine, Brief): a unit no foreground work
+  depends on.
+- `[[txn]] count = 0` with `while_foreground = "<session>"`, and incident
+  `budget_steady_while_foreground`. Both shown to bite: added to
+  `quiet-repair-not-deferred` (a repair that is not deferred), both fail.
+
+Open, for the owner: under §11, a diagnoser-proposed change with
+ConnectivityLoss is AskFirst ("a `SetRuntimeOption` Wi-Fi change proposed by
+the diagnoser ... ask"), and §12f says the floors apply to a repair rollback.
+A Rollback that restarts NetworkManager is ConnectivityLoss (§11's own gym
+case). So the English of `rollback-repair-foreground-dependency` ("the
+rollback runs at once") cannot pass as written without a decision; on the
+fake today the chain does not even reach the Rollback, because the in-place
+Wi-Fi repair parks at AskFirst. The case is written to the literal English
+(runs during Foreground, no approval step) pending that decision.
+
+## lane-daemon: §12f *Rollbacks* (#9), 2 Nov
+
+Built against the owner's decisions of 2 Nov (PR #22) and the reviewer's
+cases above, at `main` `f470cc1`.
+
+| Rule | Change | Evidence |
+| --- | --- | --- |
+| A User/Intent `Rollback` runs at once, also under `Foreground` | `exec::schedule`: a `Rollback` from User, Intent or the diagnoser never waits in `Built`; the §11 floors were applied before it, so one may still be parked for approval | core test `a_rollback_never_waits_for_a_window` (fails on `main`) |
+| A diagnoser `Rollback` is a repair, never parked in `Built` | the same | the same test; `rollback-repair-session-loss-asks` (AskFirst, pending) |
+| Under `Foreground`, an unrelated repair rollback is not submitted, budget unchanged | unchanged: `repair_one` already filters by `foreground_depends_on` | `rollback-repair-foreground-unrelated` |
+| I6: a rollback of any source, at the moment it is about to run (admitted, and approved if it asked), withdraws what waits in `Built`; each is prepared again once the rollback is terminal, keeping its parking start; one past `Built` is waited for; one parked for approval in `Prepared` is left alone (owner and coordinator, Nov 2) | `exec::schedule`: before running a rollback (User/Intent `Rollback` or `planarian undo`'s `Revert`, or the diagnoser's `Rollback`), `Kernel::reject(id, Interrupted)` on each waiting transaction; the ledger's I6 `compatible` admits a `Prepared` rollback beside a `Built` one, so nothing is withdrawn earlier. `Core::note_withdrawn` keeps each one's proposal, caller and `waiting_since`; `prepare_again` (shared with the restart path) re-links a diagnoser repair to its incident and restores the parking start (`keep_waiting_since`). The repair loop already does not run while a transaction is past `Built`. No `crates/txn` change | core tests `a_parked_rollback_withdraws_nothing_until_approved`, `undo_withdraws_a_waiting_update_and_runs`, `a_refused_repair_rollback_withdraws_nothing`, `a_repair_rollback_leaves_a_parked_update_alone`, `a_repair_prepared_again_keeps_its_incident` |
+| `Reverting` never deferred | unchanged (`Kernel::run`) | — |
+
+`rollback-repair-foreground-dependency` stays FAIL until lane-change-path's
+derive change (§11: a unit already failed contributes no disruption) lands:
+the Wi-Fi repair chain still parks at the ConnectivityLoss floor before it
+reaches the Rollback. The case is not edited.
+
+### lane-daemon: the withdrawal survives a restart (#26 review at `2cba51e`), 2 Nov
+
+At `2cba51e`, `Core::withdrawn` lived only in memory. The startup re-prepare
+took only transactions that recovery interrupted, and a withdrawn one is
+already terminal. So a restart between the withdrawal and the next tick after
+the rollback lost the update, even though the notice said it would be
+prepared again. The reviewer's case is
+`a_withdrawn_update_is_prepared_again_after_a_restart` (7b5cb65, unedited).
+
+The fix: each fact is atomic with the record that makes it true, and no new
+record kind is added (coordinator, Nov 2).
+- `Record::Advance.withdrawn_for` (serde default) is written by
+  `Kernel::withdraw` from `exec::schedule` and folded into
+  `TerminalTxn.withdrawn_for`.
+- `Transaction.prepared_again_from` (serde default) is set only through
+  `Executor::submit_again`, which only the daemon's `prepare_again` calls.
+  It is not in `Proposal`, so no caller can name a withdrawn transaction. It
+  is folded into `TerminalTxn.prepared_again_from`.
+- At start, `withdrawn` is rebuilt as the withdrawn terminal transactions that
+  no live or terminal transaction names. It is deduped against the restart
+  re-prepare set.
+- `apply_advance` passes the new field to `archive` (`external_body`), so
+  the proof's obligations are unchanged.
+
+Tests:
+- daemon: `a_withdrawn_update_prepared_again_is_not_prepared_twice_after_a_restart`
+  and `an_ordinary_submission_prepares_nothing_again`;
+- daemon: `records_journaled_before_the_withdrawal_fields_decode`, literals of
+  main's Advance, Prepared and checkpoint `TerminalTxn`;
+- txn: `withdrawal_links_replay_and_survive_compaction`.
+
 ## lane-daemon: #35 part 2, approvals show the change (§16), 2 Nov
 
 Reconciled at `main` `9f18fe7` against #35 and #34's §16 text. The

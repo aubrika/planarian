@@ -43,6 +43,11 @@ pub enum Record {
         epoch: u64,
         to: TxnState,
         note: String,
+        /// §12f: on a `Rejected(Interrupted)`, the rollback it was withdrawn
+        /// for; the daemon prepares it again once that rollback is terminal,
+        /// across a restart too. Absent in records from before it.
+        #[serde(default)]
+        withdrawn_for: Option<TxnId>,
     },
     /// Compare-and-swap on the epoch: valid only if `from_epoch` is current.
     Takeover {
@@ -183,6 +188,12 @@ pub struct TerminalTxn {
     pub transition: Transition,
     /// The most recent reason journaled with a step (why it reverted, …).
     pub why: String,
+    /// §12f: the rollback it was withdrawn for (its last Advance's).
+    #[serde(default)]
+    pub withdrawn_for: Option<TxnId>,
+    /// §12f: the withdrawn transaction it prepared again.
+    #[serde(default)]
+    pub prepared_again_from: Option<TxnId>,
 }
 
 /// An unresolved RecoveryFailed (§12c). While any exists, autonomous mutation is blocked.
@@ -812,7 +823,7 @@ fn note_why(why: &mut String, note: &String) {
 }
 
 #[verifier::external_body]
-fn archive(terminal: &mut BTreeMap<TxnId, TerminalTxn>, id: TxnId, l: LiveTxn) {
+fn archive(terminal: &mut BTreeMap<TxnId, TerminalTxn>, id: TxnId, l: LiveTxn, withdrawn_for: Option<TxnId>) {
     terminal.insert(
         id,
         TerminalTxn {
@@ -822,6 +833,8 @@ fn archive(terminal: &mut BTreeMap<TxnId, TerminalTxn>, id: TxnId, l: LiveTxn) {
             path: l.path,
             transition: l.txn.transition,
             why: l.why,
+            withdrawn_for,
+            prepared_again_from: l.txn.prepared_again_from,
         },
     );
     while terminal.len() > TERMINAL_KEEP {
@@ -940,7 +953,9 @@ impl Ledger {
         let at = e.at;
         match e.record {
             Record::Prepared(t) => self.apply_prepared(*t),
-            Record::Advance { txn, epoch, to, note } => self.apply_advance(txn, epoch, to, note),
+            Record::Advance { txn, epoch, to, note, withdrawn_for } => {
+                self.apply_advance(txn, epoch, to, note, withdrawn_for)
+            },
             Record::Takeover { txn, from_epoch, lease } => self.apply_takeover(txn, from_epoch, lease),
             Record::Renew { txn, epoch, worker_pid, boot_at } => self.apply_renew(txn, epoch, boot_at, worker_pid),
             Record::OpBegin { op, call } => self.apply_op_begin(op, call),
@@ -991,7 +1006,7 @@ impl Ledger {
     }
 
     #[allow(unused_variables)] // used in the specification
-    fn apply_advance(&mut self, txn: TxnId, epoch: u64, to: TxnState, note: String)
+    fn apply_advance(&mut self, txn: TxnId, epoch: u64, to: TxnState, note: String, withdrawn_for: Option<TxnId>)
         requires
             advance_rule(*old(self), txn, epoch, to),
         ensures
@@ -1048,7 +1063,7 @@ impl Ledger {
         l.boot_only = l.boot_only || publishing;
         l.txn.state = to;
         if l.txn.state.is_terminal() {
-            archive(&mut self.terminal, id, l);
+            archive(&mut self.terminal, id, l, withdrawn_for);
             proof {
                 assert(self.live.entries@ =~= pre.live.entries@.remove(i as int));
                 if inv(pre) {

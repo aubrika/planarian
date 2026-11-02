@@ -1779,3 +1779,390 @@ fn a_rollback_that_removes_a_security_unit_asks_and_shows_the_change() {
         assert!(diff_text.contains(needle), "the structured diff carries {needle}: {diff_text}");
     }
 }
+
+fn seated_session(r: &mut Rig, idle: bool) {
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: Timestamp(0),
+        active: true,
+        idle,
+    });
+}
+
+fn font(scale: &str) -> Request {
+    Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str(scale.into()))].into(),
+    }
+}
+
+/// §12f *Rollbacks* (owner decisions, Oct 31 and Nov 2): a `Rollback` is
+/// never parked in `Built` for a window. The user's runs at once, also under
+/// `Foreground`; the diagnoser's is a repair and runs at once too (the
+/// repair loop decides whether to submit it under quiet mode).
+#[test]
+fn a_rollback_never_waits_for_a_window() {
+    let mut r = Rig::new();
+    seated_session(&mut r, false);
+    r.ticks(2);
+    let resp = r.core.handle(ALICE.in_session("s1"), font("1.25"));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert_eq!(r.fake.w().current, GenerationId(2));
+
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    // The user's rollback runs now, Foreground or not.
+    let (s, defs) = r.core.observe();
+    let p = r.core.proposal(Transition::Rollback, &s, &defs, Source::User, "planarian undo".into());
+    let got = r.core.submit(p, user_authorization(Actor::user(0), true), &s, &defs);
+    assert!(matches!(got, Submitted::Finished { state: TxnState::Committed, .. }), "{got:?}");
+    assert_eq!(r.fake.w().current, GenerationId(1));
+
+    // Forward again, then the diagnoser's rollback under Foreground: a
+    // repair, not parked.
+    r.fake.w().foreground.clear();
+    r.ticks(2);
+    let resp = r.core.handle(ALICE.in_session("s1"), font("1.25"));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    let (s, defs) = r.core.observe();
+    let p = r.core.proposal(
+        Transition::Rollback,
+        &s,
+        &defs,
+        Source::Diagnoser { incident: IncidentId(99) },
+        "repair".into(),
+    );
+    let got = r.core.submit(p, authorization_of(Actor::Daemon), &s, &defs);
+    assert!(matches!(got, Submitted::Finished { state: TxnState::Committed, .. }), "{got:?}");
+    let l = r.core.ledger();
+    let rollbacks: Vec<_> = l.terminal.values().filter(|t| t.transition == Transition::Rollback).collect();
+    assert_eq!(rollbacks.len(), 2);
+    assert!(rollbacks.iter().all(|t| t.state == TxnState::Committed), "{rollbacks:?}");
+}
+
+/// Commit alice's font scale (generation 2), then make a further update that
+/// restarts the display manager wait in `Built` while her session is in use
+/// (asked by maintenance, so not its own window). Returns its txn.
+fn an_update_waiting_in_built(r: &mut Rig) -> TxnId {
+    seated_session(r, false);
+    r.ticks(2);
+    let resp = r.core.handle(ALICE.in_session("s1"), font("1.25"));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert_eq!(r.fake.w().current, GenerationId(2));
+    r.fake.w().activation_restarts.insert(UnitId::service("display-manager"));
+    let (s, defs) = r.core.observe();
+    let t = Transition::ApplyChange {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.5".into()))].into(),
+    };
+    let p = r.core.proposal(t, &s, &defs, Source::Maintenance, "update".into());
+    let alice = r.core.authz(&ALICE.in_session("s1"));
+    let got = r.core.submit(p, alice, &s, &defs);
+    let Submitted::Finished { txn, state: TxnState::Built, .. } = got else { panic!("{got:?}") };
+    txn
+}
+
+/// Tick until the diagnoser's Rollback is parked for approval; its hash.
+fn until_rollback_asks(r: &mut Rig) -> Hash {
+    for _ in 0..200 {
+        r.ticks(1);
+        if let Some(p) = r.core.ex.parked.values().find(|p| p.proposal.transition == Transition::Rollback) {
+            return p.bound_to;
+        }
+    }
+    panic!("the repair rollback was not proposed: {:?}", r.core.notices)
+}
+
+/// §12f, I6 (owner decisions, Nov 2): a rollback that must ask withdraws
+/// nothing while it waits for approval; once approved, at the moment it is
+/// about to run, it withdraws the update waiting in `Built`
+/// (`Rejected(Interrupted)`), which is prepared again, with its caller and
+/// its original parking start (I12), once the rollback is terminal.
+#[test]
+fn a_parked_rollback_withdraws_nothing_until_approved() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    let since = r.core.ex.waiting_since(waiting).expect("waiting");
+    // The committed update's flaw shows; restarts cannot fix it, so the
+    // diagnoser reaches its rollback, which restarts the display manager too
+    // and so asks.
+    r.fake.w().break_in(GenerationId(2), &UnitId::service("gym-printer"));
+    let approve = until_rollback_asks(&mut r);
+    r.ticks(3);
+    let l = r.core.ledger();
+    assert_eq!(l.live.get(&waiting).map(|t| t.txn.state.clone()), Some(TxnState::Built), "untouched while it asks");
+    assert!(!r.core.notices.iter().any(|n| n.contains("set aside for a rollback")), "{:?}", r.core.notices);
+
+    r.fake.advance(Millis::secs(600));
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert_eq!(r.fake.w().current, GenerationId(1));
+    let l = r.core.ledger();
+    assert_eq!(
+        l.terminal.get(&waiting).map(|t| t.state.clone()),
+        Some(TxnState::Rejected(RejectReason::Interrupted)),
+        "withdrawn when the rollback ran"
+    );
+    assert!(r.core.notices.iter().any(|n| n.contains("set aside for a rollback")), "{:?}", r.core.notices);
+    r.ticks(2);
+    let l = r.core.ledger();
+    let again = l
+        .live
+        .values()
+        .find(|t| matches!(t.txn.transition, Transition::ApplyChange { .. }))
+        .expect("prepared again once the rollback is terminal");
+    assert_eq!(again.txn.state, TxnState::Built, "and waits for its window again");
+    assert_eq!(r.core.ex.waiting_since(again.txn.id), Some(since), "its parking limit is not extended");
+    assert!(r.core.notices.iter().any(|n| n.contains("prepared again after the rollback")));
+}
+
+/// §12f (owner decision, Nov 2): `planarian undo` with an update waiting in
+/// `Built` withdraws it and runs, rather than being refused under I6.
+#[test]
+fn undo_withdraws_a_waiting_update_and_runs() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    // Going back restarts nothing in the session: no floor asks.
+    r.fake.w().activation_restarts.clear();
+    let resp = r.core.handle(ADMIN, Request::Undo);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert_eq!(r.fake.w().current, GenerationId(1));
+    let l = r.core.ledger();
+    assert_eq!(l.terminal.get(&waiting).map(|t| t.state.clone()), Some(TxnState::Rejected(RejectReason::Interrupted)));
+    r.ticks(2);
+    // Prepared again once the undo is terminal; nothing in the session is
+    // disturbed now, so it runs.
+    assert!(r.core.notices.iter().any(|n| n.contains("prepared again after the rollback")), "{:?}", r.core.notices);
+    let l = r.core.ledger();
+    assert!(
+        l.terminal.iter().any(|(id, t)| *id > waiting
+            && matches!(t.transition, Transition::ApplyChange { .. })
+            && t.state == TxnState::Committed),
+        "{:?}",
+        l.terminal
+    );
+}
+
+/// §12f, I6 (coordinator, Nov 2): an update parked for approval in
+/// `Prepared` is not active for I6, so a repair rollback leaves it alone:
+/// nobody is asked to approve it twice.
+#[test]
+fn a_repair_rollback_leaves_a_parked_update_alone() {
+    let mut r = Rig::new();
+    seated_session(&mut r, false);
+    r.ticks(2);
+    let resp = r.core.handle(ALICE.in_session("s1"), font("1.25"));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let broken = GenerationId(2);
+    // An update that would end alice's session, asked for outside it: the
+    // §11 floor parks it for approval.
+    r.fake.w().activation_restarts.insert(UnitId::service("display-manager"));
+    let (s, defs) = r.core.observe();
+    let t = Transition::ApplyChange {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.5".into()))].into(),
+    };
+    let p = r.core.proposal(t, &s, &defs, Source::Maintenance, "update".into());
+    let got = r.core.submit(p, user_authorization(Actor::user(1000), false), &s, &defs);
+    let Submitted::Parked { txn: parked, .. } = got else { panic!("{got:?}") };
+
+    let printer = UnitId::service("gym-printer");
+    r.fake.w().break_in(broken, &printer);
+    let mut proposed = false;
+    for _ in 0..200 {
+        r.ticks(1);
+        let l = r.core.ledger();
+        if l.live.values().any(|t| t.txn.transition == Transition::Rollback)
+            || l.terminal.values().any(|t| t.transition == Transition::Rollback)
+        {
+            proposed = true;
+            break;
+        }
+    }
+    assert!(proposed, "the repair rollback was proposed");
+    let l = r.core.ledger();
+    assert_eq!(l.live.get(&parked).map(|t| t.txn.state.clone()), Some(TxnState::Prepared), "left alone");
+    assert!(r.core.ex.parked.contains_key(&parked), "still waiting for its approval");
+    assert!(!r.core.notices.iter().any(|n| n.contains("set aside for a rollback")), "{:?}", r.core.notices);
+}
+
+/// #26 review (1): a rollback withdraws only when it is about to run: one
+/// refused before it gets a transaction (here its dry activation fails,
+/// R10) withdraws nothing.
+#[test]
+fn a_refused_repair_rollback_withdraws_nothing() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    r.fake.w().break_in(GenerationId(2), &UnitId::service("gym-printer"));
+    // The rollback's dry activation will fail (the restart does not use one).
+    r.fake.w().dry_activate_fails = Some("dry-activate: exit 1".into());
+    let refused = |r: &Rig| {
+        r.core
+            .log
+            .iter()
+            .any(|x| x.proposal.transition == Transition::Rollback && matches!(x.result, Submitted::Rejected { .. }))
+    };
+    for _ in 0..200 {
+        r.ticks(1);
+        if refused(&r) {
+            break;
+        }
+    }
+    assert!(refused(&r), "the repair rollback was refused: {:#?}", r.core.log);
+    let l = r.core.ledger();
+    assert_eq!(l.live.get(&waiting).map(|t| t.txn.state.clone()), Some(TxnState::Built), "still waiting");
+    assert!(!r.core.notices.iter().any(|n| n.contains("set aside")), "{:?}", r.core.notices);
+}
+
+/// #26 review (4): a diagnoser's repair prepared again (after a restart or
+/// a withdrawal; both use `prepare_again`) that waits again is linked back
+/// to its incident.
+#[test]
+fn a_repair_prepared_again_keeps_its_incident() {
+    let mut r = Rig::new();
+    seated_session(&mut r, false);
+    r.ticks(2);
+    r.fake.w().activation_restarts.insert(UnitId::service("display-manager"));
+    let t = Transition::ApplyChange {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.25".into()))].into(),
+    };
+    let incident = IncidentId(7);
+    let (s, defs) = r.core.observe();
+    let earlier = r.core.proposal(t.clone(), &s, &defs, Source::Diagnoser { incident }, "repair".into());
+    r.core.earlier.insert(TxnId(40), (earlier, Actor::Daemon));
+    r.core.prepare_again(vec![(TxnId(40), t, None)], "after a restart", &s, &defs);
+    let l = r.core.ledger();
+    let again = l
+        .live
+        .values()
+        .find(|t| matches!(t.txn.transition, Transition::ApplyChange { .. }))
+        .expect("prepared again, and waiting");
+    assert_eq!(r.core.incident_parked.get(&incident), Some(&again.txn.id), "linked to its incident");
+}
+
+/// §12f *Rollbacks*: a change withdrawn for a rollback is "prepared again
+/// once the rollback is terminal". That promise must survive the daemon
+/// restarting in between (a rollback to an older generation may itself
+/// restart planariad): after the restart, the withdrawn update is prepared
+/// again, not lost behind its "set aside" notice. (Reviewer's case.)
+#[test]
+fn a_withdrawn_update_is_prepared_again_after_a_restart() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    r.fake.w().activation_restarts.clear();
+    let resp = r.core.handle(ADMIN, Request::Undo);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert!(r.core.notices.iter().any(|n| n.contains("set aside for a rollback")), "{:?}", r.core.notices);
+    let l = r.core.ledger();
+    assert_eq!(l.terminal.get(&waiting).map(|t| t.state.clone()), Some(TxnState::Rejected(RejectReason::Interrupted)));
+
+    // The daemon restarts before its next tick: a new process on the same
+    // journal, with the executor log of the earlier run (as `main` passes it).
+    let log = r.core.log.clone();
+    r.fake.w().alive.remove(&100);
+    r.fake.w().alive.insert(101);
+    let mut core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO },
+        config(),
+    );
+    core.remember(log);
+    r.core = core;
+    r.ticks(3);
+
+    let l = r.core.ledger();
+    let again = l
+        .terminal
+        .iter()
+        .map(|(id, t)| (*id, t.transition.clone(), t.state.clone()))
+        .chain(l.live.values().map(|t| (t.txn.id, t.txn.transition.clone(), t.txn.state.clone())))
+        .any(|(id, t, _)| id > waiting && matches!(t, Transition::ApplyChange { .. }));
+    assert!(again, "the withdrawn update was not prepared again after the restart; notices: {:?}", r.core.notices);
+}
+
+/// §12f, the other half of the reviewer's case: once a withdrawn update has
+/// been prepared again, a later restart does not prepare it a second time
+/// (the new transaction names it in `prepared_again_from`).
+#[test]
+fn a_withdrawn_update_prepared_again_is_not_prepared_twice_after_a_restart() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    r.fake.w().activation_restarts.clear();
+    let resp = r.core.handle(ADMIN, Request::Undo);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    r.ticks(3);
+    let again_of = |l: &planarian_txn::ledger::Ledger| {
+        l.terminal
+            .values()
+            .filter_map(|t| t.prepared_again_from)
+            .chain(l.live.values().filter_map(|t| t.txn.prepared_again_from))
+            .filter(|f| *f == waiting)
+            .count()
+    };
+    assert_eq!(again_of(&r.core.ledger()), 1, "prepared again once before the restart: {:?}", r.core.notices);
+    let terminal_withdrawal = r.core.ledger().terminal.get(&waiting).cloned().expect("terminal");
+    assert!(terminal_withdrawal.withdrawn_for.is_some(), "the withdrawal names its rollback");
+
+    let log = r.core.log.clone();
+    r.fake.w().alive.remove(&100);
+    r.fake.w().alive.insert(101);
+    let mut core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO },
+        config(),
+    );
+    core.remember(log);
+    r.core = core;
+    r.ticks(3);
+    assert_eq!(again_of(&r.core.ledger()), 1, "not prepared a second time: {:?}", r.core.notices);
+}
+
+/// Records as main journals them, before `withdrawn_for` and
+/// `prepared_again_from` (§12c: a retained record that does not parse is
+/// truncated, or Integrity). Literals, not round-trips.
+#[test]
+fn records_journaled_before_the_withdrawal_fields_decode() {
+    let advance =
+        r#"{"Advance":{"txn":3,"epoch":1,"to":{"Rejected":"Interrupted"},"note":"rejected before mutation"}}"#;
+    let r: Record = serde_json::from_str(advance).expect("main's Advance decodes");
+    assert_eq!(
+        r,
+        Record::Advance {
+            txn: TxnId(3),
+            epoch: 1,
+            to: TxnState::Rejected(RejectReason::Interrupted),
+            note: "rejected before mutation".into(),
+            withdrawn_for: None,
+        }
+    );
+    let prepared = include_str!("../fixtures/prepared-before-removes-each.json");
+    assert!(!prepared.contains("prepared_again_from"), "the fixture is main's form");
+    let Record::Prepared(t) = serde_json::from_str::<Record>(prepared).expect("main's Prepared decodes") else {
+        panic!("a Prepared record")
+    };
+    assert_eq!(t.prepared_again_from, None);
+    // And a terminal ledger entry from a checkpoint before them.
+    let terminal = r#"{"state":{"Rejected":"Interrupted"},"epoch":1,"owner":{"Daemon":{"pid":100,"boot_id":"0000000000000000000000000000000000000000000000000000000000000000"}},"path":["Prepared","Built","Rejected"],"transition":"Rollback","why":""}"#;
+    let t: planarian_txn::ledger::TerminalTxn = serde_json::from_str(terminal).expect("main's TerminalTxn decodes");
+    assert_eq!((t.withdrawn_for, t.prepared_again_from), (None, None));
+}
+
+/// §12f: only `prepare_again` links a transaction to a withdrawn one; an
+/// ordinary submission journals no link.
+#[test]
+fn an_ordinary_submission_prepares_nothing_again() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    let l = r.core.ledger();
+    let t = &l.live.values().find(|t| t.txn.id == waiting).expect("live").txn;
+    assert_eq!(t.prepared_again_from, None);
+}
