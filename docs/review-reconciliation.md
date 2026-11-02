@@ -272,3 +272,15 @@ manifest. Controls: an identical manifest does not; the fields already covered
 | Id | Status | What closes it | Case |
 | --- | --- | --- | --- |
 | C19 | closed by this PR | `derive.rs` `touches_manifest` compares every entry whole (canonical probes left to `touches_canonical`), system and user scope, and an added or removed entry; it had compared only `edges`, `sensitivity`, `restart_disruption`, `synonyms` and user probes of units present in both | reviewer's `crates/exec/src/derive_c19_tests.rs` (4 of 6 fail on `main`; all pass); fake verdicts unchanged |
+
+## lane-nix: #35 part 1, network security fails closed (2 Nov)
+
+Read #35 and §12d on #34's branch (`ccr-c64ddb68-a5g3k5`), `nix/module.nix`, `nix/posture.nix`, the gym VM, and the pinned nixpkgs nftables, firewall, sshd and wg-quick modules. Design approved by the coordinator (2 Nov); interface sent to lane-daemon.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| Which units | The shipped table gives VPN units (`wg-quick-*`, `wireguard-*`, `openvpn-*`, `tailscaled`, `strongswan`) `Security` only, so by §12d's rule ("Security and External") no unit is a network-security unit by default but the firewall | raised with the coordinator; the module keys on the rule; the shipped default is unchanged pending that decision |
+| The table | `flushRuleset` is off by default in the pinned nftables module, but when set every reload flushes every table, the hold's included | `planarian-hold@<unit>` (core script, in `coreFiles`) builds `table inet planarian-hold`, priority raw, policy drop; re-applied by a drop-in on nftables.service's ExecStartPost and ExecReload |
+| Administrator sessions | `meta skuid` would keep every SSH session (sshd's accepted sockets are root's) and every root daemon | snapshot at apply: sockets of processes in the scope of a logind session of root or `planarian-admin`, matched by exact tuples (a flow from before the hold may have no conntrack entry to mark). New connections are refused, so the snapshot is the whole set |
+| OnFailure= | `systemd.services.<x>.onFailure` would define a stub unit for a declared unit the system does not define (P13's lesson) | drop-ins in a package, `<unit>.service.d/50-planarian-hold.conf`, inert for an undefined unit |
+| WireGuard fixture | NixOS's wg-quick units are oneshots: nothing to kill, and a kill would not fail them | `wireguard-gym`, a wireguard-go daemon unit to the upstream node, for `netsec-*` entries only (no other entry gains a watched unit) |

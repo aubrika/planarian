@@ -76,6 +76,12 @@ let
     if securityUnit name then [ "Security" ]
     else if builtins.elem name [ "NetworkManager" "wpa_supplicant" "systemd-networkd" ] then [ "External" ]
     else [ "Routine" ];
+  # §12d: a network-security unit's failure holds the machine's traffic:
+  # its sensitivity holds both Security and External, or it is the firewall.
+  holdsTraffic = name: u:
+    u.kind == "service" && u.scope == "system"
+    && ((builtins.elem "Security" u.sensitivity && builtins.elem "External" u.sensitivity)
+        || builtins.elem name [ "firewall" "nftables" ]);
   defaultDisruption = name:
     if builtins.elem name [ "display-manager" "greetd" "graphical-session" ] then "SessionLoss"
     else if builtins.elem name [ "NetworkManager" "systemd-networkd" "wpa_supplicant" ] then "ConnectivityLoss"
@@ -152,6 +158,22 @@ let
           for units whose absence is harm whoever caused it (backup, sync, the
           desktop's own units): such a stop is a fault, restarted and alarmed
           (§11). Security-sensitive units are always treated so.
+        '';
+      };
+      holdAllow = mkOption {
+        type = types.listOf (types.submodule {
+          options = {
+            addr = mkOption { type = types.str; description = "An IPv4 or IPv6 address (a literal: nothing resolves names while traffic is held)."; };
+            port = mkOption { type = types.port; };
+            proto = mkOption { type = types.enum [ "tcp" "udp" ]; default = "udp"; };
+          };
+        });
+        default = [ ];
+        example = [ { addr = "198.51.100.7"; port = 51820; } ];
+        description = ''
+          For a network-security unit (§12d): the endpoints it needs to
+          reconnect while its traffic is held, e.g. a WireGuard peer. Every
+          other connection is refused until the unit is back.
         '';
       };
       runtimeRepair = mkOption {
@@ -265,6 +287,10 @@ let
     systemd_restart = if u.scope == "system" && u.kind == "service" then restartJSON name else null;
     startup_grace = if u.startupGrace == null then null else u.startupGrace * 1000;
     runtime_repair = u.runtimeRepair;
+    # §12d: whether its failure holds the machine's traffic, and what the
+    # hold still lets it reach.
+    holds = holdsTraffic name u;
+    hold_allow = map (a: { inherit (a) addr port proto; }) u.holdAllow;
     stops_are_faults = !u.inferStops;
   };
 
@@ -547,6 +573,11 @@ in
       wireplumber = mkIf (config.services.pipewire.enable && config.services.pipewire.wireplumber.enable)
         (mkDefault { scope = "user"; edges = [ { to = "service@0:pipewire"; kind = "Requires"; } ]; });
     };
+
+    services.planarian.holdUnits = lib.unique (
+      lib.attrNames (lib.filterAttrs holdsTraffic cfg.units)
+      ++ lib.optional (config.networking.firewall.enable && !config.networking.nftables.enable) "firewall"
+      ++ lib.optional config.networking.nftables.enable "nftables");
 
     services.planarian.export = {
       units = unitsOf "system";

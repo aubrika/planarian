@@ -34,6 +34,13 @@ let
         services.planarian.units.gym-db.probes = [
           { id = "gym-db-exec"; type = "exec"; argv = [ "true" ]; establishes = "gym-db answers a local query"; }
         ];
+        # §12d: a network-security unit (Security and External), with the
+        # endpoint its hold still lets it reach.
+        systemd.services.gym-vpn = { wantedBy = [ "multi-user.target" ]; script = "sleep infinity"; };
+        services.planarian.units.gym-vpn = {
+          sensitivity = [ "Security" "External" ];
+          holdAllow = [ { addr = "192.0.2.7"; port = 51820; } ];
+        };
         services.planarian.units.gym-app.probes = [
           { id = "gym-app-tcp"; type = "tcp"; addr = "127.0.0.1:8081"; establishes = "gym-app accepts connections"; }
         ];
@@ -97,6 +104,13 @@ let
   # `flagged = true` iff its kind is Exec; the key is absent otherwise.
   probes = builtins.concatMap (u: u.probes or [ ]) (export.units ++ export.userUnits);
   isExec = p: builtins.isAttrs p.kind && p.kind ? Exec;
+  # §12d "Network security fails closed": the hold, its OnFailure= wiring,
+  # its re-application after nftables loads, and holdAllow in the export.
+  hold = cfg.services.planarian;
+  holdUnit = cfg.systemd.services."planarian-hold@";
+  holdScript = builtins.readFile (builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart));
+  vpn = unit "service:gym-vpn";
+  nftDropin = hold.holdDropins."nftables.service.d/50-planarian-hold.conf";
   check = cond: msg: if cond then true else throw "planarian module eval: ${msg}";
   checks = [
     (check (builtins.any isExec probes) "the configuration exports an Exec probe (P11's check is not vacuous)")
@@ -110,6 +124,17 @@ let
     (check (allowLines != [ ]) "the posture restricts sshd with AllowGroups (P14's check is not vacuous)")
     (check (builtins.all (l: pkgs.lib.hasInfix "AllowGroups planarian-admin root" l && !(pkgs.lib.hasInfix "wheel" l)) allowLines) "every AllowGroups the posture writes is planarian-admin and root, never wheel (§12d, P14)")
     (check (pkgs.lib.hasInfix "Include /run/planarian/sshd/*.conf" cfg.services.openssh.extraConfig) "sshd includes the posture's drop-in, so the restriction takes effect (§12d, P14)")
+    (check (cfg.networking.firewall.enable && builtins.sort builtins.lessThan hold.holdUnits == [ "firewall" "gym-vpn" "nftables" ]) "the network-security units are those with Security and External, and the firewall (§12d)")
+    (check (hold.holdDropins."firewall.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@firewall.service\n") "the firewall's failure applies the hold (§12d)")
+    (check (vpn.holds && vpn.hold_allow == [ { addr = "192.0.2.7"; port = 51820; proto = "udp"; } ]) "a network-security unit exports holds and its holdAllow (§9, §12d)")
+    (check (builtins.all (u: builtins.elem u.id [ "service:gym-vpn" "service:firewall" "service:nftables" ] == u.holds) export.units) "exactly the network-security units hold traffic: not sshd, not any other Security unit (§12d)")
+    (check (hold.holdDropins."gym-vpn.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@gym-vpn.service\n") "a network-security unit's failure applies the hold through OnFailure= (§12d)")
+    (check (!(cfg.systemd.services.gym-vpn ? onFailure) || !(builtins.elem "planarian-hold@gym-vpn.service" cfg.systemd.services.gym-vpn.onFailure)) "the OnFailure= is a drop-in, not a unit definition (no stub for an undefined unit)")
+    (check (pkgs.lib.hasInfix "ExecStartPost=" nftDropin && pkgs.lib.hasInfix "ExecReload=" nftDropin && pkgs.lib.hasInfix " reapply" nftDropin) "a hold is re-applied after nftables.service starts or reloads, which may flush every table (§12d)")
+    (check (cfg.environment.etc."planarian/hold/gym-vpn.allow".text == "udp 192.0.2.7 51820\n") "the hold reads the unit's holdAllow endpoints (§12d)")
+    (check (holdUnit.unitConfig.DefaultDependencies == false && !(holdUnit ? bindsTo && builtins.elem "planariad.service" holdUnit.bindsTo) && !(holdUnit ? partOf && builtins.elem "planariad.service" holdUnit.partOf)) "the hold unit does not depend on planariad, so it survives its restart (§12d)")
+    (check (holdUnit.serviceConfig.RemainAfterExit && pkgs.lib.hasSuffix " apply %i" holdUnit.serviceConfig.ExecStart && pkgs.lib.hasSuffix " lift %i" holdUnit.serviceConfig.ExecStop && pkgs.lib.hasSuffix " released %i" holdUnit.serviceConfig.ExecCondition) "start applies, stop lifts, an unexpired release skips (§12d)")
+    (check (pkgs.lib.hasInfix "policy drop" holdScript && pkgs.lib.hasInfix "planarian-admin" holdScript && pkgs.lib.hasInfix "/run/planarian/hold-released" holdScript) "the hold table drops by default and keeps only administrator sessions (§12d)")
     (check (builtins.any (u: u.id == "service:sshd") export.units) "sshd is a canonical unit")
     (check (builtins.any (u: u.id == "device:fs-root") export.units) "fs-root is present")
     (check (builtins.any (u: u.id == "device:fs-boot") export.units) "fs-boot is present")
