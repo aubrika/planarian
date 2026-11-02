@@ -182,6 +182,7 @@ mod tests {
                 config_diff: None,
             },
             issued: Timestamp(0),
+            diff: Default::default(),
         });
         assert_eq!(classify(Ok(&r)).line, "waiting for your approval: apply service-enable service=sshd enabled=false");
         let mut r = report();
