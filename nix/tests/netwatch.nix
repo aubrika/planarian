@@ -85,6 +85,15 @@ pkgs.testers.runNixOSTest {
             print("setsockopt IPT_SO_SET_REPLACE:", name)
       '')
       "${pkgs.coreutils}/bin/true";
+    # A host VPN's interface named wg0 (a dummy: the name is what matters)
+    # carrying a default route: protecting, for (n).
+    systemd.services.nw-hostwg = oneshot
+      (pkgs.writeShellScript "nw-hostwg-up" ''
+        ${ip} link add wg0 type dummy
+        ${ip} link set wg0 up
+        ${ip} route add default dev wg0 metric 4002
+      '')
+      "${ip} link delete wg0";
     systemd.services.nw-nft = oneshot
       "${nft} 'add table inet nwnft; add chain inet nwnft out { type filter hook output priority 0; }; add rule inet nwnft out ip daddr 203.0.113.80 drop'"
       "${nft} delete table inet nwnft";
@@ -160,7 +169,7 @@ pkgs.testers.runNixOSTest {
 
     machine.wait_for_unit("planarian-ready.target")
     machine.wait_for_unit("planarian-netwatch.service")
-    for u in ["nw-route", "nw-quiet", "nw-sockopt", "nw-nft"]:
+    for u in ["nw-route", "nw-quiet", "nw-sockopt", "nw-nft", "nw-hostwg"]:
         machine.wait_for_unit(f"{u}.service")
 
     with subtest("(a) the watch is attached, with a fresh CLOCK_BOOTTIME stamp"):
@@ -250,6 +259,38 @@ pkgs.testers.runNixOSTest {
         for u in ["nw-route", "nw-sockopt", "nw-nft"]:
             protecting(u, "yes")
         assert "iface nwdummy0" in footprint("nw-route")
+
+    with subtest("(n) other network namespaces are not the host's: same-named wg0, routes, a moved interface"):
+        # §12d: protecting is about "how traffic leaves the machine", the host
+        # netns. The driver's commands run in backdoor.service, a network
+        # tool here, so whatever netwatch takes from them is charged to it.
+        protecting("nw-hostwg", "yes")
+        assert "iface wg0" in footprint("nw-hostwg")
+        protecting("backdoor", "no")
+        machine.succeed("${ip} netns add nwns")
+        # Fail-open guard: a wg0 made and deleted in another netns leaves the
+        # host VPN's wg0 claim (and its route) alone.
+        machine.succeed("${ip} -n nwns link add wg0 type dummy && ${ip} -n nwns link set wg0 up")
+        machine.succeed("${ip} -n nwns link del wg0")
+        # Spurious-hold guard: a default route inside the netns is not host
+        # steering.
+        machine.succeed("${ip} -n nwns link add nsd0 type dummy && ${ip} -n nwns link set nsd0 up")
+        machine.succeed("${ip} -n nwns route add default dev nsd0")
+        machine.sleep(12)
+        lines = protecting("nw-hostwg", "yes")
+        assert "iface wg0" in lines, lines
+        protecting("backdoor", "no")
+        machine.fail(f"test -e {FP}/.unattributed")
+        # A virtual interface made in the netns and moved into the host is
+        # host steering once a default route uses it: charged to whoever
+        # moved it, or unattributed; never read as a physical NIC.
+        machine.succeed("${ip} -n nwns link add nwmove0 type dummy && ${ip} -n nwns link set nwmove0 netns 1")
+        machine.succeed("${ip} link set nwmove0 up && ${ip} route add default dev nwmove0 metric 4003")
+        machine.wait_until_succeeds(
+            f"grep -qx 'protecting yes' {FP}/backdoor || test -e {FP}/.unattributed", timeout=30)
+        machine.succeed("${ip} link del nwmove0 && ${ip} netns del nwns")
+        machine.wait_until_succeeds(f"grep -qx 'protecting no' {FP}/backdoor && ! test -e {FP}/.unattributed", timeout=30)
+        protecting("nw-hostwg", "yes")
 
     with subtest("(f) a stopped watch goes stale, and a failing tool that was not protecting is held"):
         # Stopped, not killed: a killed watcher may be restarted at once, and
