@@ -63,13 +63,17 @@ pub fn apply(unit: &UnitId) -> Outcome {
 /// `systemctl reload` fails on an inactive unit, so one not active (the hold
 /// was stopped, or never started on this boot) is started instead.
 pub fn reapply(unit: &UnitId) -> Outcome {
+    reapply_with(unit, |argv| run(argv, TIMEOUT))
+}
+
+fn reapply_with(unit: &UnitId, run: impl Fn(&[&str]) -> Output) -> Outcome {
     let name = hold_unit(unit);
-    let active = run(&["systemctl", "is-active", "--quiet", &name], TIMEOUT);
+    let active = run(&["systemctl", "is-active", "--quiet", &name]);
     if active.timed_out {
         return Outcome::Unknown(format!("systemctl is-active {name} did not finish"));
     }
     let verb = if active.ok() { "reload" } else { "start" };
-    outcome(verb, unit, run(&["systemctl", verb, &name], TIMEOUT))
+    outcome(verb, unit, run(&["systemctl", verb, &name]))
 }
 
 /// The hold script's table (`table inet planarian-hold`).
@@ -169,6 +173,35 @@ mod tests {
         // Already past: the boot deadline is now, so the script holds.
         assert_eq!(marker(Some(Timestamp(1_000)), now, 5_000), "1 5000\n");
         assert_eq!(marker(None, now, 5_000), "boot\n");
+    }
+
+    /// §12d: re-applying reloads an active hold unit (never lifting it) and
+    /// starts an inactive one, since `systemctl reload` fails on that.
+    #[test]
+    fn reapply_reloads_an_active_hold_and_starts_an_inactive_one() {
+        let u = UnitId::service("wireguard-gym");
+        for (active, verb) in [(true, "reload"), (false, "start")] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let o = reapply_with(&u, |argv| {
+                calls.borrow_mut().push(argv.join(" "));
+                let status = if argv[1] == "is-active" && !active { 3 } else { 0 };
+                Output {
+                    status: Some(status),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    timed_out: false,
+                    truncated: false,
+                }
+            });
+            assert_eq!(o, Outcome::Succeeded);
+            assert_eq!(
+                calls.into_inner(),
+                [
+                    "systemctl is-active --quiet planarian-hold@wireguard-gym.service".to_string(),
+                    format!("systemctl {verb} planarian-hold@wireguard-gym.service"),
+                ]
+            );
+        }
     }
 
     #[test]
