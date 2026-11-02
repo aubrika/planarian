@@ -43,6 +43,11 @@ pub enum Record {
         epoch: u64,
         to: TxnState,
         note: String,
+        /// §12f: on a `Rejected(Interrupted)`, the rollback it was withdrawn
+        /// for; the daemon prepares it again once that rollback is terminal,
+        /// across a restart too. Absent in records from before it.
+        #[serde(default)]
+        withdrawn_for: Option<TxnId>,
     },
     /// Compare-and-swap on the epoch: valid only if `from_epoch` is current.
     Takeover {
@@ -112,6 +117,28 @@ pub enum Record {
         by: Actor,
     },
     Reconciliation(Reconciliation),
+    /// §12d *Network security fails closed*: the unit's traffic is held,
+    /// journaled before the call (write-ahead). A failure posture response,
+    /// not a transaction (docs/bypasses.md).
+    HoldApplied {
+        unit: UnitId,
+        by: HoldBy,
+    },
+    /// The hold is lifted: the unit is Running and its Readiness probes
+    /// pass, or an attested release. Journaled before the call.
+    HoldLifted {
+        unit: UnitId,
+        reason: String,
+    },
+}
+
+/// Who applied a hold: systemd's `OnFailure=` (seen by the daemon) or the
+/// daemon itself, for a stop outside Planarian that is not attributed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[verifier::external_derive]
+pub enum HoldBy {
+    OnFailure,
+    Daemon,
 }
 
 /// What a restarted owner found and did (§12 daemon restart reconciliation).
@@ -161,6 +188,12 @@ pub struct TerminalTxn {
     pub transition: Transition,
     /// The most recent reason journaled with a step (why it reverted, …).
     pub why: String,
+    /// §12f: the rollback it was withdrawn for (its last Advance's).
+    #[serde(default)]
+    pub withdrawn_for: Option<TxnId>,
+    /// §12f: the withdrawn transaction it prepared again.
+    #[serde(default)]
+    pub prepared_again_from: Option<TxnId>,
 }
 
 /// An unresolved RecoveryFailed (§12c). While any exists, autonomous mutation is blocked.
@@ -209,6 +242,12 @@ pub struct Ledger {
     /// it). A peer is matched by its instance, never its name (I24).
     #[serde(default)]
     pub agents: Vec<(String, [u8; 16], u32)>,
+    /// §12d: every hold applied (`true`) and lifted (`false`), in order; the
+    /// current holds are `holds()`. Append-only, so the fold needs no
+    /// comparison of units (and no new trusted helper). A journal from before
+    /// holds replays to none.
+    #[serde(default)]
+    pub hold_events: Vec<(UnitId, bool)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -784,7 +823,7 @@ fn note_why(why: &mut String, note: &String) {
 }
 
 #[verifier::external_body]
-fn archive(terminal: &mut BTreeMap<TxnId, TerminalTxn>, id: TxnId, l: LiveTxn) {
+fn archive(terminal: &mut BTreeMap<TxnId, TerminalTxn>, id: TxnId, l: LiveTxn, withdrawn_for: Option<TxnId>) {
     terminal.insert(
         id,
         TerminalTxn {
@@ -794,6 +833,8 @@ fn archive(terminal: &mut BTreeMap<TxnId, TerminalTxn>, id: TxnId, l: LiveTxn) {
             path: l.path,
             transition: l.txn.transition,
             why: l.why,
+            withdrawn_for,
+            prepared_again_from: l.txn.prepared_again_from,
         },
     );
     while terminal.len() > TERMINAL_KEEP {
@@ -912,7 +953,9 @@ impl Ledger {
         let at = e.at;
         match e.record {
             Record::Prepared(t) => self.apply_prepared(*t),
-            Record::Advance { txn, epoch, to, note } => self.apply_advance(txn, epoch, to, note),
+            Record::Advance { txn, epoch, to, note, withdrawn_for } => {
+                self.apply_advance(txn, epoch, to, note, withdrawn_for)
+            },
             Record::Takeover { txn, from_epoch, lease } => self.apply_takeover(txn, from_epoch, lease),
             Record::Renew { txn, epoch, worker_pid, boot_at } => self.apply_renew(txn, epoch, boot_at, worker_pid),
             Record::OpBegin { op, call } => self.apply_op_begin(op, call),
@@ -933,6 +976,8 @@ impl Ledger {
             },
             Record::Reconciliation(r) => self.last_reconciliation = Some(r),
             Record::AgentStarted { name, instance, by } => self.agents.push((name, instance, by)),
+            Record::HoldApplied { unit, .. } => self.hold_events.push((unit, true)),
+            Record::HoldLifted { unit, .. } => self.hold_events.push((unit, false)),
         }
     }
 
@@ -961,7 +1006,7 @@ impl Ledger {
     }
 
     #[allow(unused_variables)] // used in the specification
-    fn apply_advance(&mut self, txn: TxnId, epoch: u64, to: TxnState, note: String)
+    fn apply_advance(&mut self, txn: TxnId, epoch: u64, to: TxnState, note: String, withdrawn_for: Option<TxnId>)
         requires
             advance_rule(*old(self), txn, epoch, to),
         ensures
@@ -1018,7 +1063,7 @@ impl Ledger {
         l.boot_only = l.boot_only || publishing;
         l.txn.state = to;
         if l.txn.state.is_terminal() {
-            archive(&mut self.terminal, id, l);
+            archive(&mut self.terminal, id, l, withdrawn_for);
             proof {
                 assert(self.live.entries@ =~= pre.live.entries@.remove(i as int));
                 if inv(pre) {
@@ -1372,6 +1417,21 @@ impl Ledger {
     /// Who started the last instance under `name`, for a refusal's message.
     pub fn agent_owner(&self, name: &str) -> Option<u32> {
         self.agents.iter().rev().find(|(n, _, _)| n == name).map(|(_, _, by)| *by)
+    }
+
+    /// §12d: the units whose traffic the journal says is held now: the
+    /// last event for each is an apply. The recovery source of truth after a
+    /// restart (the daemon reconciles it with the host, failing closed).
+    pub fn holds(&self) -> std::collections::BTreeSet<UnitId> {
+        let mut held = std::collections::BTreeSet::new();
+        for (u, on) in &self.hold_events {
+            if *on {
+                held.insert(u.clone());
+            } else {
+                held.remove(u);
+            }
+        }
+        held
     }
 }
 

@@ -183,6 +183,10 @@ pub struct Transaction {
     pub prior_driver: Option<DriverRef>,
     /// What the probe check needs, journaled so the watchdog can run it alone.
     pub check: CheckContext,
+    /// §12f: the withdrawn transaction this one prepares again (from its
+    /// proposal). Absent in records from before it.
+    #[serde(default)]
+    pub prepared_again_from: Option<TxnId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

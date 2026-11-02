@@ -66,6 +66,10 @@ pub const NEW_DECLARATIONS_FOR: Millis = Millis::secs(24 * 3600);
 
 /// How often the running daemon re-reads its journal's hash chain (I18).
 pub const CHAIN_CHECK_EVERY: Millis = Millis::secs(3600);
+/// §12d: the first and the longest wait between re-applies of a hold whose
+/// firewall table is missing.
+pub const HOLD_RETRY_MIN: Millis = Millis::secs(10);
+pub const HOLD_RETRY_MAX: Millis = Millis::secs(300);
 
 /// The caller of a request, from `SO_PEERCRED`, group membership and logind.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -234,6 +238,21 @@ pub struct Core<B: Backends + Clone, S: Store> {
     quiet_queue: Vec<String>,
     /// Waiting generations interrupted by a restart, to prepare again (§12f).
     reprepare: Vec<(TxnId, Transition)>,
+    /// §12d: the hold's firewall table was there at the last check (or no
+    /// hold was active). The alarm is raised once, on the change to missing
+    /// or uncheckable.
+    hold_table_seen: bool,
+    /// §12d: this episode's "removed" alarm and `HoldApplied` are written
+    /// (separately from the "could not be checked" one, so an episode that
+    /// starts uncheckable still journals the re-apply).
+    hold_missing_noted: bool,
+    /// §12d: while the table is missing, the next re-apply (boot clock) and
+    /// the wait after it, doubling to `HOLD_RETRY_MAX`.
+    hold_retry: Option<(Timestamp, Millis)>,
+    /// Generation transactions withdrawn from `Built` for a rollback about to
+    /// run (§12f, I6; owner decision, Nov 2), with when each began waiting,
+    /// to prepare again once no generation transaction is active.
+    withdrawn: Vec<(TxnId, Transition, Option<Timestamp>)>,
     /// From the executor log of earlier runs: each transaction's proposal and
     /// caller, so one prepared again keeps its source and caller (§12, C21).
     pub earlier: BTreeMap<TxnId, (Proposal, Actor)>,
@@ -264,6 +283,11 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// The agent behind each change parked for approval, for the approved
     /// execution's log record (I7).
     parked_agents: BTreeMap<TxnId, Option<String>>,
+    /// §12d: held units whose hold an attested release lifted, until the
+    /// release ends; and held units whose failed repair administrators have
+    /// been told about (once per hold).
+    hold_released: BTreeSet<UnitId>,
+    hold_notified: BTreeSet<UnitId>,
 }
 
 /// How to finish a request whose slow part ran elsewhere.
@@ -337,6 +361,27 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             })
             .map(|(id, t)| (*id, t.transition.clone()))
             .collect();
+        // §12f: what a rollback withdrew and nothing has prepared again yet
+        // (no transaction names it in `prepared_again_from`), from the
+        // journal, so a restart between the two loses nothing and prepares
+        // nothing twice. Prepared again once the rollback is terminal.
+        let named: BTreeSet<TxnId> = ledger
+            .live
+            .values()
+            .filter_map(|t| t.txn.prepared_again_from)
+            .chain(ledger.terminal.values().filter_map(|t| t.prepared_again_from))
+            .collect();
+        let withdrawn: Vec<(TxnId, Transition, Option<Timestamp>)> = ledger
+            .terminal
+            .iter()
+            .filter(|(id, t)| {
+                t.withdrawn_for.is_some()
+                    && t.state == TxnState::Rejected(RejectReason::Interrupted)
+                    && !named.contains(id)
+                    && !reprepare.iter().any(|(r, _)| r == *id)
+            })
+            .map(|(id, t)| (*id, t.transition.clone(), None))
+            .collect();
         let mut incidents = Manager::restore(ledger.incidents.values().cloned());
         incidents.startup_grace = cfg.startup_grace;
         let current = b.generations().current().unwrap_or_default();
@@ -375,6 +420,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             core_hash: Hash::ZERO,
             core_hash_record: None,
             parked_agents: BTreeMap::new(),
+            hold_released: BTreeSet::new(),
+            hold_notified: BTreeSet::new(),
             after_ready: deferred,
             ex,
             b,
@@ -414,6 +461,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             quiet: false,
             quiet_queue: vec![],
             reprepare: vec![],
+            hold_table_seen: true,
+            hold_missing_noted: false,
+            hold_retry: None,
+            withdrawn: vec![],
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
             generation_touched: false,
@@ -435,6 +486,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
         core.reprepare = reprepare;
+        core.withdrawn = withdrawn;
         core.note_declarations(None, current, false);
         core
     }
@@ -587,8 +639,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         } else {
             self.cfg.exec.settings.max_tier
         };
-        let s = self.asm.observe(&self.b, &ctx);
-        let defs = self.asm.defs();
+        let mut s = self.asm.observe(&self.b, &ctx);
+        // §12d: what is held now, the journal's and the host's (fail closed:
+        // either one holding is held).
+        s.holds = l.holds();
+        if let Ok(h) = self.b.units().held() {
+            s.holds.extend(h);
+        }
+        let mut defs = self.asm.defs();
+        // §12d: each network-security unit's hold unit, known (so releasing
+        // it derives the held unit's sensitivity) but never expected.
+        let holds: Vec<UnitDef> = crate::hold::network_security(&defs).map(crate::hold::hold_def).collect();
+        for d in holds {
+            defs.entry(d.id.clone()).or_insert(d);
+        }
         self.last = Some((s.clone(), defs.clone()));
         if !self.awaiting_post.is_empty() {
             let digest = s.digest();
@@ -605,11 +669,29 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     fn submit(&mut self, p: Proposal, authz: Authorization, s: &SystemState, defs: &UnitDefs) -> Submitted {
+        self.submit_from(p, authz, s, defs, None)
+    }
+
+    /// `again`: the withdrawn transaction this prepares again (§12f), set
+    /// only by `prepare_again`.
+    fn submit_from(
+        &mut self,
+        p: Proposal,
+        authz: Authorization,
+        s: &SystemState,
+        defs: &UnitDefs,
+        again: Option<TxnId>,
+    ) -> Submitted {
         let now = self.b.clock().now();
         let pre = s.digest();
         let policy = self.ex.policy_version();
         let caller = authz.actor.clone();
-        let result = self.ex.submit(p.clone(), authz.clone(), s, defs);
+        let built = self.waiting_built();
+        let result = match again {
+            Some(from) => self.ex.submit_again(p.clone(), from, authz.clone(), s, defs),
+            None => self.ex.submit(p.clone(), authz.clone(), s, defs),
+        };
+        self.note_withdrawn(built);
         if let Some((facts, _)) = self.ex.last.clone() {
             self.touched.extend(facts.affected_units.iter().cloned());
             // §11: the affected sessions are notified either way.
@@ -720,6 +802,250 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.flush_writebacks();
         }
         result
+    }
+
+    /// §12d *Network security fails closed*, each tick. The journal's holds
+    /// (`Ledger::holds`) are the source of truth after a restart; they are
+    /// reconciled with the host's (`held`), and any disagreement keeps the
+    /// hold (fail closed).
+    /// Returns whether it applied a hold the observed state does not show.
+    fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {
+        use crate::hold;
+        use planarian_txn::ledger::HoldBy;
+        let units: Vec<UnitId> = hold::network_security(defs).map(|d| d.id.clone()).collect();
+        if units.is_empty() {
+            return false;
+        }
+        let mut applied = false;
+        let journaled = self.ledger().holds();
+        let host = self.b.units().held();
+        // Anything else flushing the ruleset removes the hold's table while
+        // the units stay held: put it back (journal, alarm, re-apply).
+        let mut holding = journaled.clone();
+        if let Ok(h) = &host {
+            holding.extend(h.iter().cloned());
+        }
+        if holding.is_empty() {
+            self.hold_table_seen = true;
+            self.hold_missing_noted = false;
+            self.hold_retry = None;
+        } else {
+            self.hold_table(&holding, &units);
+        }
+        for u in units {
+            let in_journal = journaled.contains(&u);
+            // None: the host cannot say; a failed unit is then held again
+            // (the call is idempotent).
+            let on_host = host.as_ref().ok().map(|h| h.contains(&u));
+            // An attested release (an override on the hold unit) lifts it
+            // until the release ends.
+            if s.override_of(&hold::hold_unit(&u)).is_some() {
+                if in_journal {
+                    self.journal(Record::HoldLifted {
+                        unit: u.clone(),
+                        reason: "released by an attested override".into(),
+                    });
+                }
+                self.hold_released.insert(u);
+                continue;
+            }
+            if self.hold_released.remove(&u) {
+                // The release ended: the hold script's marker goes; a unit
+                // still failed is held again below.
+                let _ = self.b.units().end_release(&u);
+            }
+            if hold::failed(s, defs, &u) {
+                if !in_journal {
+                    // systemd's OnFailure= already holds a crash or a kill;
+                    // a stop outside Planarian is the daemon's to hold.
+                    let by = if on_host == Some(true) { HoldBy::OnFailure } else { HoldBy::Daemon };
+                    self.journal(Record::HoldApplied { unit: u.clone(), by });
+                    self.notice(hold::alarm(&u));
+                }
+                if on_host != Some(true) {
+                    match self.b.units().hold(&u) {
+                        o @ (Outcome::Failed(_) | Outcome::Unknown(_)) => {
+                            self.notice(format!("ALARM: {u}: its traffic could not be held ({o:?})"))
+                        }
+                        _ => applied |= !s.holds.contains(&u),
+                    }
+                }
+                // Repair failed: the hold stays, and administrators hear of it once.
+                let given_up = self.incidents.active_for(&u).is_some_and(|i| {
+                    matches!(i.state, IncidentState::Cooldown { .. } | IncidentState::Escalated { .. })
+                });
+                if given_up && self.hold_notified.insert(u.clone()) {
+                    self.notice(format!(
+                        "ALARM: {u}: repair failed; its network traffic stays blocked. It needs a person: an administrator can fix it, or lift the hold with `planarian hold release {}`",
+                        u.name
+                    ));
+                }
+            } else if in_journal || on_host == Some(true) {
+                if !in_journal {
+                    // OnFailure= held it while the daemon was not looking.
+                    self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::OnFailure });
+                }
+                if hold::back(s, defs, &u) {
+                    self.journal(Record::HoldLifted {
+                        unit: u.clone(),
+                        reason: "Running, and its Readiness probes pass".into(),
+                    });
+                    match self.b.units().lift_hold(&u) {
+                        o @ (Outcome::Failed(_) | Outcome::Unknown(_)) => {
+                            self.notice(format!("{u}: the hold could not be lifted ({o:?}); its traffic stays blocked"))
+                        }
+                        _ => {
+                            self.hold_notified.remove(&u);
+                            self.notice(format!("{u} is back; network traffic flows again"));
+                        }
+                    }
+                }
+            }
+        }
+        applied
+    }
+
+    /// §12d: the hold's table, while a hold stands. Missing: alarm once, then
+    /// re-apply (a reload, which never lifts; `HoldApplied` journaled
+    /// first), and retry with backoff until a check finds it. Uncheckable:
+    /// alarm once and check again next tick; nothing is re-applied blind.
+    fn hold_table(&mut self, holding: &BTreeSet<UnitId>, units: &[UnitId]) {
+        use planarian_txn::ledger::HoldBy;
+        let present = self.b.units().hold_table_present();
+        let held: Vec<UnitId> = holding.iter().filter(|u| units.contains(u)).cloned().collect();
+        match &present {
+            Ok(true) => {
+                self.hold_table_seen = true;
+                self.hold_missing_noted = false;
+                self.hold_retry = None;
+                return;
+            }
+            Err(o) => {
+                if self.hold_table_seen {
+                    for u in &held {
+                        self.notice(format!(
+                            "ALARM: {u}: the network hold's firewall table could not be checked ({o:?}); checking again"
+                        ));
+                    }
+                }
+                self.hold_table_seen = false;
+                return;
+            }
+            Ok(false) => {}
+        }
+        let now = self.b.clock().boot_now();
+        let first = !self.hold_missing_noted;
+        if !first && self.hold_retry.is_some_and(|(next, _)| now < next) {
+            return;
+        }
+        self.hold_missing_noted = true;
+        for u in &held {
+            if first {
+                self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::Daemon });
+                self.notice(format!("ALARM: {u}: the network hold was removed from the firewall; re-applying it"));
+            }
+            if let o @ (Outcome::Failed(_) | Outcome::Unknown(_)) = self.b.units().reapply_hold(u)
+                && first
+            {
+                self.notice(format!("ALARM: {u}: its traffic could not be held again ({o:?}); retrying"));
+            }
+        }
+        self.hold_table_seen = false;
+        if matches!(self.b.units().hold_table_present(), Ok(true)) {
+            self.hold_table_seen = true;
+            self.hold_missing_noted = false;
+            self.hold_retry = None;
+        } else {
+            let wait =
+                self.hold_retry.map_or(HOLD_RETRY_MIN, |(_, w)| Millis(w.0.saturating_mul(2).min(HOLD_RETRY_MAX.0)));
+            self.hold_retry = Some((Timestamp(now.0.saturating_add(wait.0)), wait));
+        }
+    }
+
+    /// Prepare again transactions interrupted before they mutated (by a
+    /// restart, or withdrawn for a repair rollback).
+    fn prepare_again(
+        &mut self,
+        list: Vec<(TxnId, Transition, Option<Timestamp>)>,
+        why: &str,
+        s: &SystemState,
+        defs: &UnitDefs,
+    ) {
+        for (id, t, since) in list {
+            // Its original source and caller (C21), so floors that depend on
+            // who asked (the own-session exemption) still apply; the daemon's
+            // own only when no record of it survives.
+            let (source, authz) = match self.earlier.get(&id).cloned() {
+                Some((p, caller @ Actor::User { .. })) => {
+                    let admin = caller.uid().is_some_and(|u| (self.admin_of)(u));
+                    (p.source, user_authorization(caller, admin))
+                }
+                Some((p, caller)) => (p.source, authorization_of(caller)),
+                None => (Source::Maintenance, authorization_of(Actor::Daemon)),
+            };
+            let incident = match &source {
+                Source::Diagnoser { incident } => Some(*incident),
+                _ => None,
+            };
+            let p = self.proposal(t.clone(), s, defs, source, format!("prepared again {why}"));
+            // Journaled with it: this is what prepares `id` again (§12f).
+            let r = self.submit_from(p, authz, s, defs, Some(id));
+            // A diagnoser's repair that waits again keeps its incident with it.
+            if let (
+                Some(inc),
+                Submitted::Finished { txn, state: TxnState::Built, .. } | Submitted::Parked { txn, .. },
+            ) = (incident, &r)
+            {
+                self.incident_parked.insert(inc, *txn);
+            }
+            // A withdrawal never extends a change's parking limit (I12).
+            if let (Some(since), Submitted::Finished { txn, state: TxnState::Built, .. }) = (since, &r) {
+                self.ex.keep_waiting_since(*txn, since);
+            }
+            self.notice(format!("{}: prepared again {why}: {}", render::transition(&t), render::submitted_short(&r)));
+        }
+    }
+
+    /// Generation transactions waiting in `Built`, with when each began
+    /// waiting: what a rollback about to run would withdraw (§12f, I6).
+    fn waiting_built(&mut self) -> Vec<(TxnId, Transition, Option<Timestamp>)> {
+        let l = self.ledger();
+        l.live
+            .values()
+            .filter(|t| t.txn.transition.changes_generation() && t.txn.state == TxnState::Built)
+            .map(|t| (t.txn.id, t.txn.transition.clone(), self.ex.waiting_since(t.txn.id)))
+            .collect()
+    }
+
+    /// §12f, I6 (owner decision, Nov 2): a rollback of any source withdraws
+    /// what waits in `Built` at the moment it is about to run (admitted, and
+    /// approved if it asked; `exec::schedule`). Those of `before` the
+    /// executor withdrew are remembered, with their proposal, caller and
+    /// parking start, to prepare again once the rollback is terminal.
+    fn note_withdrawn(&mut self, before: Vec<(TxnId, Transition, Option<Timestamp>)>) {
+        if before.is_empty() {
+            return;
+        }
+        let l = self.ledger();
+        for (id, t, since) in before {
+            if l.terminal.get(&id).is_none_or(|x| x.state != TxnState::Rejected(RejectReason::Interrupted)) {
+                continue;
+            }
+            if !self.earlier.contains_key(&id) {
+                let asked = self.log.iter().chain(&self.awaiting_post).find(|r| {
+                    matches!(r.result, Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if txn == id)
+                });
+                if let Some(r) = asked {
+                    self.earlier.insert(id, (r.proposal.clone(), r.caller.clone()));
+                }
+            }
+            self.notice(format!(
+                "{}: set aside for a rollback (transaction {}); it will be prepared again once the rollback is done",
+                render::transition(&t),
+                id.0
+            ));
+            self.withdrawn.push((id, t, since));
+        }
     }
 
     /// The response to a submission; one parked for approval says, in one
@@ -1204,25 +1530,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             return;
         }
 
-        for (id, t) in std::mem::take(&mut self.reprepare) {
-            // Its original source and caller (C21), so floors that depend on
-            // who asked (the own-session exemption) still apply; the daemon's
-            // own only when no record of it survives.
-            let (source, authz) = match self.earlier.get(&id).cloned() {
-                Some((p, caller @ Actor::User { .. })) => {
-                    let admin = caller.uid().is_some_and(|u| (self.admin_of)(u));
-                    (p.source, user_authorization(caller, admin))
-                }
-                Some((p, caller)) => (p.source, authorization_of(caller)),
-                None => (Source::Maintenance, authorization_of(Actor::Daemon)),
-            };
-            let p = self.proposal(t.clone(), &s, &defs, source, "prepared again after a restart".into());
-            let r = self.submit(p, authz, &s, &defs);
-            self.notice(format!(
-                "{}: prepared again after a restart: {}",
-                render::transition(&t),
-                render::submitted_short(&r)
-            ));
+        let again = std::mem::take(&mut self.reprepare).into_iter().map(|(id, t)| (id, t, None)).collect();
+        self.prepare_again(again, "after a restart", &s, &defs);
+        // §12f: what a rollback withdrew, once that rollback is terminal.
+        if !self.withdrawn.is_empty() && !self.generation_active() {
+            let again = std::mem::take(&mut self.withdrawn);
+            self.prepare_again(again, "after the rollback", &s, &defs);
         }
 
         // §11: stops nobody attributed, before anything treats them as faults.
@@ -1236,6 +1549,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 return;
             }
         }
+
+        // §12d: the hold is in place before the incident opens; a hold the
+        // daemon just applied is in the state the repair is derived from.
+        let (s, defs) = if self.network_holds(&s, &defs) { self.observe() } else { (s, defs) };
 
         for inc in self.incidents.tick(now, &s, &defs) {
             if matches!(inc.state, IncidentState::Escalated { .. }) && inc.attempts.is_empty() {
@@ -1828,7 +2145,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 render::facts_summary(facts)
             ));
         }
-        self.respond(&r)
+        let mut resp = self.respond(&r);
+        // Who may approve it (§11): an administrator, when the class says so.
+        if let (Response::NeedsApproval { txn, why, .. }, Submitted::Parked { .. }) = (&mut resp, &r)
+            && self.ex.parked.get(txn).is_some_and(|p| p.class == ApproverClass::Administrator)
+        {
+            why.push_str("; an administrator must approve it");
+        }
+        resp
     }
 
     fn status(&mut self) -> StatusReport {
@@ -2062,6 +2386,41 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 let s = Override::attested(unit, desired, until, "from the CLI".into(), Actor::user(peer.uid));
                 self.user_submit(Transition::SetOverride(s), peer, Source::User, "from the CLI".into())
             }
+            Request::HoldRelease { unit, until } => {
+                // §12d: an attested override on the hold unit, through the
+                // executor like any override, so the hold unit's sensitivity
+                // (the held unit's) decides: administrator authority, or
+                // AskFirst with an Administrator approver (§11).
+                let hold = crate::hold::hold_unit(&unit);
+                let (_, defs) = self.observe();
+                if !defs.contains_key(&hold) {
+                    return Response::Error {
+                        message: format!("{unit} is not a network-security unit; there is no hold to release"),
+                    };
+                }
+                let reason = format!("planarian hold release {}", unit.name);
+                let o = Override::attested(
+                    hold,
+                    OverrideDesired::Stopped,
+                    until.clone(),
+                    reason.clone(),
+                    Actor::user(peer.uid),
+                );
+                let r = self.user_submit(Transition::SetOverride(o), peer.clone(), Source::User, reason);
+                if matches!(&r, Response::Done { state: TxnState::Committed, .. }) {
+                    // The executor stopped the hold unit; the marker keeps a
+                    // new failure from holding again until the release ends.
+                    if self.ledger().holds().contains(&unit) {
+                        self.journal(Record::HoldLifted {
+                            unit: unit.clone(),
+                            reason: format!("released by uid {}", peer.uid),
+                        });
+                    }
+                    let _ = self.b.units().release_hold(&unit, crate::hold::release_until(&until));
+                    self.hold_released.insert(unit);
+                }
+                r
+            }
             Request::LiftOverride { unit } => {
                 let r = self.user_submit(
                     Transition::LiftOverride(unit.clone()),
@@ -2237,7 +2596,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 let approver = self.authz(&peer);
                 let parked = self.ex.parked.values().find(|p| p.bound_to == hash).cloned();
                 let (pre, policy) = (s.digest(), self.ex.policy_version());
+                let built = self.waiting_built();
                 let r = self.ex.approve(&hash, &approver, &s, &defs);
+                self.note_withdrawn(built);
                 // Re-bound and asked again under a new id (§12 step 4): the
                 // proposer's agent goes with it.
                 if let (Some(pk), Submitted::Parked { txn: again, .. }) = (&parked, &r)
