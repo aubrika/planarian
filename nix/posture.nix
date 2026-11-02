@@ -97,7 +97,9 @@ let
     # the target's start failed (After= orders, it does not require).
     systemctl is-active --quiet planarian-ready.target || exit 0
     systemctl is-active --quiet planariad.service || exit 0
-    if [ -e /run/planarian/alarm ]; then
+    # A respond that has marked its class but not yet written the alarm
+    # counts: both are cleared together, so they cannot diverge.
+    if [ -e /run/planarian/alarm ] || [ -e /run/planarian/failed-absent ] || [ -e /run/planarian/failed-crashed ]; then
       rm -f /run/planarian/alarm /run/issue.d/50-planarian.issue /run/planarian/failed-absent /run/planarian/failed-crashed
       rm -f /run/planarian/sshd/posture.conf
       ${optionalString config.services.openssh.enable "systemctl try-reload-or-restart sshd.service || true"}
@@ -483,7 +485,11 @@ in
     systemd.services.planarian-posture-lift = {
       description = "Planarian failure posture: lift restrictions once ready";
       wantedBy = [ "planarian-ready.target" ];
-      after = [ "planarian-ready.target" ];
+      # After the responses it lifts: a restart of planariad queues Absent
+      # (stopPost, --no-block) and reaches ready again before respond has
+      # finished; unordered, lift ran first, found nothing, and Absent
+      # stayed raised (VM run 41507137168, P16).
+      after = [ "planarian-ready.target" "planarian-respond@absent.service" "planarian-respond@crashed.service" ];
       serviceConfig = { Type = "oneshot"; ExecStart = lift; };
     };
 
