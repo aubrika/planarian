@@ -835,3 +835,136 @@ fn a_unit_recovered_before_approval_asks_again() {
     assert!(facts.disruption.connectivity_loss && facts.disruption.data_interruption, "{facts:?}");
     assert_eq!(r.fake.w().current, GenerationId(2), "nothing ran on the stale approval");
 }
+
+/// A rig whose `gym-web` has `sens` (Brief restart disruption, as in the
+/// fixture) for the RestartUnit row's escalations.
+fn sensitive_web_rig(sens: &[Sensitivity]) -> (Rig, UnitId) {
+    let web = UnitId::service("gym-web");
+    let mut r = Rig::new();
+    let mut units = fixtures::gym_units();
+    units.get_mut(&web).unwrap().sensitivity = Sensitivities::of(sens);
+    r.asm = Assembler::new(Manifest { units, user_units: fixtures::gym_user_units() }, fixtures::canonical());
+    (r, web)
+}
+
+/// §11 RestartUnit row as amended in #34 (owner decision, Nov 2): restarting
+/// an already-failed External unit is not escalated; a healthy one is, and
+/// so is one whose status is Unknown (§10: Unknown is not failed). Security
+/// still escalates, failed or not.
+#[test]
+fn restarting_a_failed_external_unit_is_not_escalated() {
+    let restart = |r: &mut Rig, u: &UnitId| r.propose(Transition::RestartUnit(u.clone()), admin());
+
+    let (mut r, web) = sensitive_web_rig(&[Sensitivity::External]);
+    let s = restart(&mut r, &web);
+    let Submitted::Parked { facts, .. } = &s else { panic!("a healthy External unit's restart asks: {s:?}") };
+    assert!(!facts.restarts_failed_unit, "{facts:?}");
+
+    let (mut r, web) = sensitive_web_rig(&[Sensitivity::External]);
+    r.fake.w().units.get_mut(&web).unwrap().observed = Observed::Failed(Reason::ExitCode(1));
+    let s = restart(&mut r, &web);
+    assert!(
+        !matches!(s, Submitted::Parked { .. } | Submitted::Rejected { .. }),
+        "already failed: no escalation: {s:?}"
+    );
+
+    let (mut r, web) = sensitive_web_rig(&[Sensitivity::External]);
+    r.fake.w().units.get_mut(&web).unwrap().health = planarian_fake::Health::Stall(Millis::secs(15));
+    assert_eq!(r.status(&web), UnitStatus::Unknown);
+    let s = restart(&mut r, &web);
+    let Submitted::Parked { facts, .. } = &s else { panic!("an Unknown unit is not failed: it asks: {s:?}") };
+    assert!(!facts.restarts_failed_unit, "{facts:?}");
+
+    let (mut r, web) = sensitive_web_rig(&[Sensitivity::Security]);
+    r.fake.w().units.get_mut(&web).unwrap().observed = Observed::Failed(Reason::ExitCode(1));
+    let s = restart(&mut r, &web);
+    assert!(matches!(s, Submitted::Parked { .. }), "Security escalates, failed or not: {s:?}");
+}
+
+/// The fact is derived again at approval, from the observation then: a unit
+/// failed at proposal (parked on its Security escalation alone) that has
+/// recovered by approval has `restarts_failed_unit` false again, which voids
+/// the token: the approval asks again and nothing runs. (A unit that is only
+/// External and failed is never parked, so it has no approval to recover
+/// before.)
+#[test]
+fn a_restart_recovered_before_approval_asks_again() {
+    let (mut r, web) = sensitive_web_rig(&[Sensitivity::Security, Sensitivity::External]);
+    r.fake.w().units.get_mut(&web).unwrap().observed = Observed::Failed(Reason::ExitCode(1));
+    let s = r.propose(Transition::RestartUnit(web.clone()), admin());
+    let Submitted::Parked { approve, facts, .. } = s else { panic!("Security asks: {s:?}") };
+    assert!(facts.restarts_failed_unit, "failed at proposal: {facts:?}");
+
+    r.fake.w().units.get_mut(&web).unwrap().observed = Observed::Active;
+    assert_eq!(r.status(&web), UnitStatus::Running);
+    let restarts_before = r.fake.w().calls.iter().filter(|c| c.call.starts_with("restart")).count();
+    let s = r.approve(approve);
+    let Submitted::Parked { facts, .. } = &s else { panic!("recovered before approval: it asks again: {s:?}") };
+    assert!(!facts.restarts_failed_unit, "{facts:?}");
+    let restarts_after = r.fake.w().calls.iter().filter(|c| c.call.starts_with("restart")).count();
+    assert_eq!(restarts_before, restarts_after, "nothing ran on the stale approval");
+}
+
+fn wifi() -> Transition {
+    Transition::SetRuntimeOption { path: "wifi.network".into(), value: Value::Str("gym-ap-b".into()) }
+}
+
+/// §11, §12a as amended in #34 (owner decision, Nov 2): Wi-Fi selection's
+/// ConnectivityLoss is its providing unit's (the unit whose manifest entry
+/// has `runtime_repair = wifi.network`: NetworkManager in the fixtures), and
+/// none while that unit has already failed. A remote administrator meets the
+/// ConnectivityLoss floor only while NetworkManager is not failed; Unknown is
+/// not failed.
+#[test]
+fn wifi_selection_carries_no_connectivity_loss_while_its_unit_has_failed() {
+    let nm = UnitId::service("NetworkManager");
+    assert!(fixtures::gym_units()[&nm].runtime_repair.as_deref() == Some("wifi.network"), "the manifest link");
+
+    let mut r = Rig::new();
+    let s = r.propose(wifi(), remote_admin());
+    let Submitted::Parked { facts, .. } = &s else { panic!("NetworkManager healthy: the floor asks: {s:?}") };
+    assert!(facts.disruption.connectivity_loss, "{facts:?}");
+
+    let mut r = Rig::new();
+    r.fake.w().units.get_mut(&nm).unwrap().observed = Observed::Failed(Reason::ExitCode(1));
+    let s = r.propose(wifi(), remote_admin());
+    assert!(!matches!(s, Submitted::Parked { .. } | Submitted::Rejected { .. }), "NetworkManager failed: {s:?}");
+
+    let mut r = Rig::new();
+    r.fake.w().units.get_mut(&nm).unwrap().observed =
+        Observed::Unknown { since: Timestamp(1), reason: "no answer from systemd".into() };
+    assert_eq!(r.status(&nm), UnitStatus::Unknown);
+    let s = r.propose(wifi(), remote_admin());
+    assert!(matches!(s, Submitted::Parked { .. }), "Unknown is not failed: {s:?}");
+}
+
+/// The observation is the current one, at proposal and at approval. Failed
+/// at an earlier tick and recovered by the proposal: it asks. Healthy at the
+/// proposal (parked on ConnectivityLoss) and failed by the approval: the
+/// approval derives the facts again, the token is void, and the change no
+/// longer carries ConnectivityLoss. (A Wi-Fi change made while NetworkManager
+/// is failed is never parked, so it has no approval to recover before.)
+#[test]
+fn wifi_selection_reads_the_current_observation() {
+    let nm = UnitId::service("NetworkManager");
+    let mut r = Rig::new();
+    r.fake.w().units.get_mut(&nm).unwrap().observed = Observed::Failed(Reason::ExitCode(1));
+    assert!(matches!(r.status(&nm), UnitStatus::Failed(_)));
+    r.fake.w().units.get_mut(&nm).unwrap().observed = Observed::Active;
+    let s = r.propose(wifi(), remote_admin());
+    let Submitted::Parked { txn: parked, approve, facts } = s else {
+        panic!("recovered by the proposal: it asks: {s:?}")
+    };
+    assert!(facts.disruption.connectivity_loss, "{facts:?}");
+
+    r.fake.w().units.get_mut(&nm).unwrap().observed = Observed::Failed(Reason::ExitCode(1));
+    let s = r.approve(approve);
+    // The approval covered a ConnectivityLoss the change no longer has: the
+    // token is void and the parked transaction is withdrawn; what runs is a
+    // new transaction, prepared from the facts derived now.
+    match &s {
+        Submitted::Parked { facts, .. } => panic!("no floor is left to ask for: {facts:?}"),
+        Submitted::Finished { txn, .. } => assert_ne!(*txn, parked, "the stale approval was used: {s:?}"),
+        other => panic!("{other:?}"),
+    }
+}

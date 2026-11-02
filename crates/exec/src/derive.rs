@@ -183,7 +183,14 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         f.touches_core = f.sensitivity.contains(Sensitivity::Core);
     };
     match i.transition {
-        Transition::RestartUnit(u) => unit_op(&mut f, u, Recovery::Idempotent),
+        Transition::RestartUnit(u) => {
+            unit_op(&mut f, u, Recovery::Idempotent);
+            // §11 (owner decision, Nov 2): restarting an already-failed unit
+            // waives the RestartUnit row's External escalation (policy reads
+            // this; Security still escalates). The same reading as the
+            // disruption rule: current observation, Unknown is not failed.
+            f.restarts_failed_unit = already_failed(i.state, i.defs, u);
+        }
         Transition::StopUnit(u) | Transition::StopAndSuppress { unit: u, .. } => {
             unit_op(&mut f, u, Recovery::Revertible)
         }
@@ -209,7 +216,16 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         Transition::BindDriver { device, .. } => unit_op(&mut f, device, Recovery::Revertible),
         Transition::SetRuntimeOption { path, .. } => {
             f.sensitivity = i.tables.option_sensitivity(&format!("runtime.{path}"));
-            f.disruption = if path == "wifi.network" {
+            // §11, §12a (owner decision, Nov 2): Wi-Fi selection's
+            // ConnectivityLoss is its providing unit's (NetworkManager's),
+            // and none while that unit has already failed. The providing
+            // units are those whose manifest entry names this option as its
+            // `runtime_repair`; with none declared, the loss stays (fail
+            // closed), and every one of them must have failed.
+            let providers: Vec<&UnitId> =
+                i.defs.values().filter(|d| d.runtime_repair.as_deref() == Some(path.as_str())).map(|d| &d.id).collect();
+            let provider_failed = !providers.is_empty() && providers.iter().all(|u| already_failed(i.state, i.defs, u));
+            f.disruption = if path == "wifi.network" && !provider_failed {
                 Disruptions::of(Disruption::ConnectivityLoss)
             } else {
                 Disruptions::default()
