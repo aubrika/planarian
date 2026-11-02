@@ -131,3 +131,17 @@ Still open, each in issue #7's lanes: §12f
 (#10); P11 and the module-eval assertions (#11); deviations and the closing
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
 proved; the residue classifier under Kani).
+
+## Reviewer: C19 acceptance test (#10), 2 Nov
+
+Written from §9 (a manifest entry is `desired`, `edges`, `sensitivity`,
+`restartDisruption`, `probes`, `synonyms`; the manifest is Security) and §11's
+ApplyChange row (AskFirst when `touches_manifest`), plus issue #10's C19 field
+list, on `review/lane-change-path-c19`. `crates/exec/src/derive_c19_tests.rs`
+(hooked from `derive.rs`) edits one field of one entry at a time:
+`desired` status and condition; `systemd_restart`, `startup_grace`,
+`runtime_repair`, `stops_are_faults`; an added and a removed unit; a user-scope
+entry's field, an added and a removed user-scope entry. Each must touch the
+manifest. Controls: an identical manifest does not; the fields already covered
+(synonyms, restart_disruption, sensitivity) still do. On `main`: 4 of 6 fail
+(desired, the exported fields, added/removed, user scope).

@@ -357,3 +357,8 @@ mod sensitivity_completeness {
         assert!(!s.external, "an undeclared user unit stays as it was: {s:?}");
     }
 }
+
+// C19 (§9 manifest, §11 ApplyChange row): the reviewer's acceptance test.
+#[cfg(test)]
+#[path = "derive_c19_tests.rs"]
+mod c19;
