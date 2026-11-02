@@ -548,7 +548,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         let now = self.b.clock().now();
         // Leases and deadlines on the boot clock (§12h); `started` is shown.
         let boot = self.b.clock().boot_now();
-        let network = plan.facts.disruption == Disruption::ConnectivityLoss
+        let network = plan.facts.disruption.connectivity_loss
             || plan.facts.affected_units.iter().any(|u| u.name == "NetworkManager");
         let prior_driver = match &plan.transition {
             Transition::BindDriver { device, .. } => self.b.inventory().bound_driver(device).ok().flatten(),

@@ -1427,10 +1427,41 @@ fn check_txn(e: &Evidence, all: &[TxnView], spec: &T, v: &mut Verdict) {
             Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if *txn == t.id => r.facts.clone(),
             _ => None,
         });
-        match facts.map(|f| serde_json::to_value(f).unwrap_or_default()) {
+        match facts {
             None => v.failures.push(format!("{label}: no derived facts in the executor log")),
-            Some(got) => {
+            Some(f) => {
+                let got = serde_json::to_value(&f).unwrap_or_default();
                 for (k, w) in want {
+                    // The disruption is a set (C10): one kind means the set
+                    // holds it; a list means exactly those kinds.
+                    if k == "disruption" {
+                        let kinds: Option<Vec<Disruption>> = match w {
+                            T::String(_) => serde_json::to_value(w)
+                                .ok()
+                                .and_then(|x| serde_json::from_value(x).ok())
+                                .map(|d| vec![d]),
+                            T::Array(_) => serde_json::to_value(w).ok().and_then(|x| serde_json::from_value(x).ok()),
+                            _ => None,
+                        };
+                        let ok = match (&kinds, w) {
+                            (Some(ks), T::String(_)) => ks.iter().all(|d| f.disruption.contains(*d)),
+                            (Some(ks), _) => {
+                                f.disruption.members() == {
+                                    let mut ks = ks.clone();
+                                    ks.sort();
+                                    ks.dedup();
+                                    ks.retain(|d| *d != Disruption::None);
+                                    ks
+                                }
+                            }
+                            (None, _) => false,
+                        };
+                        if !ok {
+                            v.failures
+                                .push(format!("{label}: facts.disruption is {:?}, want {w}", f.disruption.members()));
+                        }
+                        continue;
+                    }
                     let w = serde_json::to_value(w).unwrap_or_default();
                     if got.get(k) != Some(&w) {
                         v.failures.push(format!("{label}: facts.{k} is {:?}, want {w}", got.get(k)));
