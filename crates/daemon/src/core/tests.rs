@@ -1158,3 +1158,34 @@ fn a_slow_tick_is_warned() {
     r.ticks(20);
     assert_eq!(r.core.slow_tick_warnings, 2);
 }
+
+/// P19: `SystemState.core_hash` is the recorded core hash, not zero, so
+/// `digest()` covers it: a proposal observed under one record is stale
+/// under another.
+#[test]
+fn the_state_carries_the_recorded_core_hash() {
+    let dir = std::env::temp_dir().join(format!("planarian-core-hash-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = dir.join("core.sha256");
+    std::fs::write(&record, "00ab /run/current-system/sw/bin/planariad\n").unwrap();
+    let recorded = crate::config::core_hash(&record);
+    assert_eq!(recorded, Hash::of(&std::fs::read(&record).unwrap()));
+    assert_eq!(crate::config::core_hash(&dir.join("absent")), Hash::ZERO, "no record: zero");
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let mut r = Rig::new();
+    r.ticks(2);
+    let (before, _) = r.core.observe();
+    assert_eq!(before.core_hash, Hash::ZERO);
+    r.core.core_hash = recorded;
+    let (s, defs) = r.core.observe();
+    assert_eq!(s.core_hash, recorded, "the state carries the record's hash");
+    assert_ne!(s.digest(), before.digest(), "the digest covers it");
+
+    // Observed before the core hash changed: refused as Stale (§12 step 1).
+    let mut p =
+        r.core.proposal(Transition::RestartUnit(UnitId::service("gym-web")), &s, &defs, Source::User, "restart".into());
+    p.observed = before.digest();
+    let got = r.core.ex.submit(p, authorization_of(Actor::Daemon), &s, &defs);
+    assert!(matches!(got, Submitted::Rejected { reason: RejectReason::Stale, .. }), "{got:?}");
+}

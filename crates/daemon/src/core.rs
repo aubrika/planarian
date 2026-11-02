@@ -235,6 +235,11 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// Set by the daemon while a deferred change builds elsewhere: what, and since when.
     pub building: Option<(String, Timestamp)>,
     deferred: Option<(PrebuildJob<B::Gens>, Resume)>,
+    /// The hash of the core-hash record the running generation installs
+    /// (`/etc/planarian/core.sha256`, I2), for `SystemState.core_hash` and
+    /// so for `digest()` (P19). Set by the daemon after `start`; zero where no
+    /// record exists (tests, the fake harness).
+    pub core_hash: Hash,
 }
 
 /// How to finish a request whose slow part ran elsewhere.
@@ -343,6 +348,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             _ => None,
         };
         let mut core = Core {
+            core_hash: Hash::ZERO,
             after_ready: deferred,
             ex,
             b,
@@ -465,7 +471,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             accepted_baseline: l.accepted_baseline,
             overrides: l.overrides.iter().filter(|s| s.holds_at(now)).cloned().collect(),
             security_floor: l.security_floor,
-            core_hash: Hash::ZERO,
+            core_hash: self.core_hash,
         }
     }
 

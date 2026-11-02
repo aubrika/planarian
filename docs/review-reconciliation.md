@@ -117,3 +117,11 @@ Still open, each in issue #7's lanes: R13's benchmark run (#8); §12f
 (#10); P11 and the module-eval assertions (#11); deviations and the closing
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
 proved; the residue classifier under Kani).
+
+## lane-daemon (#9), reconciled 2026-11-02 at `47caca7`
+
+| Id | At `47caca7` | Evidence at head | Work |
+| --- | --- | --- | --- |
+| §12f *Rollbacks* | open, partly | `exec::schedule` parks any generation candidate in `Built` while `Foreground` holds, and a session-disturbing one whose source is not User/Intent while a session is in use: a diagnoser `Rollback` is parked in both cases, which §12f forbids. User/Intent rollbacks already skip the idle-session wait, but still wait under `Foreground`. `Core::repair_one` already skips, under quiet mode, incidents whose target fails `foreground_depends_on` (P8), so an unrelated repair rollback is not submitted and its budget does not advance. The §11 session-loss floor (`policy` AskFirst) is applied before `schedule`, so a repair rollback that ends a session is already parked for approval, not run. `Reverting` runs inside `Kernel::run` and is never deferred. A repair rollback submitted while another generation transaction is live (one waiting in `Built` counts, I6) is refused `busy` by the ledger, not held | one PR: `schedule` treats a diagnoser `Rollback` as a repair; the repair loop holds a generation repair while a generation transaction is live; the three acceptance cases |
+| P19 | open | `Core::context` sets `core_hash: Hash::ZERO`; the record exists (`nix/posture.nix` installs `/etc/planarian/core.sha256`, which `planarian-recovery` checks) but `planariad` never read it | filled from the record: `config::core_hash`, set by `main.rs` after `Core::start`; core test `the_state_carries_the_recorded_core_hash` |
+| C18 | open | no `SnapshotBackend` is wired in Phase A (the trait exists in `schema::backend`; nothing implements or calls it), so every `UserData` transaction meets the unsupported case; nothing records `NoSnapshot`. Step 6 sits between `Kernel::prepare` and the run, in `exec::submit`/`approve`; `schedule` is the point both reach | one PR, in the daemon's executor log (`LogRecord`) |
