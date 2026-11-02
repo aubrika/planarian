@@ -50,7 +50,15 @@ stdenv.mkDerivation {
   '';
   installPhase = ''
     runHook preInstall
-    obj=$(find target/bpfel-unknown-none/release -maxdepth 1 -type f ! -name '*.d' | head -n1)
+    # The crate's [[bin]] is the object (`netwatch`; lane-change-path's
+    # contract). Not "the first file there": that was cargo's empty
+    # .cargo-lock.
+    obj=target/bpfel-unknown-none/release/${name}
+    # It must be a non-empty ELF object for eBPF (e_machine 247, EM_BPF), or
+    # the build fails rather than shipping an object netwatch cannot load.
+    [ -s "$obj" ] || { echo "netwatch-ebpf: $obj is missing or empty" >&2; exit 1; }
+    [ "$(od -An -tx1 -N4 "$obj" | tr -d ' \n')" = 7f454c46 ] || { echo "netwatch-ebpf: $obj is not ELF" >&2; exit 1; }
+    [ "$(od -An -tu2 -j18 -N2 --endian=little "$obj" | tr -d ' ')" = 247 ] || { echo "netwatch-ebpf: $obj is not an eBPF object" >&2; exit 1; }
     install -Dm444 "$obj" $out/share/planarian/${name}.bpf.o
     runHook postInstall
   '';
