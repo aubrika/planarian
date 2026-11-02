@@ -58,6 +58,12 @@ struct MemInner {
     fail_next_checkpoint: bool,
     /// Fault injection: log writes fail with ENOSPC.
     enospc: bool,
+    /// P21 (§12 "fsync'd", §17a): log bytes written since the last `sync`,
+    /// as (offset, the bytes there before), oldest first. `sync` makes the
+    /// writes durable by forgetting them; `crash` undoes them. The
+    /// checkpoint, sentinel and fences are replaced atomically and durably
+    /// on write (`Store`'s contract), so they are not buffered.
+    unsynced: Vec<(usize, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +96,15 @@ impl MemStore {
 
     fn inner(&self) -> MutexGuard<'_, MemInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A power loss: the log keeps exactly what the last `sync` covered; a
+    /// write after it is gone, as if never made.
+    pub fn crash(&self) {
+        let mut inner = self.inner();
+        while let Some((off, before)) = inner.unsynced.pop() {
+            inner.log[off..off + before.len()].copy_from_slice(&before);
+        }
     }
 
     pub fn tear_next_write(&self, keep: usize) {
@@ -157,14 +172,19 @@ impl Store for MemStore {
         if let Some(keep) = inner.tear_next_write.take() {
             inner.torn = true;
             let keep = keep.min(bytes.len());
+            let before = inner.log[off..off + keep].to_vec();
+            inner.unsynced.push((off, before));
             inner.log[off..off + keep].copy_from_slice(&bytes[..keep]);
             return Err(io::Error::other("torn write (injected)"));
         }
+        let before = inner.log[off..off + bytes.len()].to_vec();
+        inner.unsynced.push((off, before));
         inner.log[off..off + bytes.len()].copy_from_slice(bytes);
         Ok(())
     }
 
     fn sync(&self) -> io::Result<()> {
+        self.inner().unsynced.clear();
         Ok(())
     }
 

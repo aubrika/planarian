@@ -18,8 +18,10 @@ use planarian_txn::store::Store;
 use toml::Value as T;
 
 /// The mutating calls, and the catalog entry whose run makes each one.
-/// (`protect`, `cancel`, `unbind` and the runtime `set` are not made by any
-/// fake-harness entry: `protect` by no caller at all.)
+/// `unbind` is a failed driver bind's revert (`revert_device`); `cancel` is
+/// the kernel cancelling an unanswered activation's jobs before its drain.
+/// (`protect` and the runtime `set` are not made by any fake-harness entry:
+/// `protect` by no caller at all.)
 pub const MATRIX: &[(&str, &str)] = &[
     ("restart", "svc-killed"),
     ("stop", "intent-user-stops-service"),
@@ -29,6 +31,8 @@ pub const MATRIX: &[(&str, &str)] = &[
     ("bind", "drv-unbound-audio"),
     ("collect_garbage", "storage-budget-unsatisfiable"),
     ("publish_boot_once", "boot-only-kernel-confirmed"),
+    ("unbind", "drv-bind-fails-restores-previous"),
+    ("cancel", "crash-job-outlives-drain"),
 ];
 
 pub const OUTCOMES: &[Injected] = &[Injected::Partial, Injected::Unknown, Injected::Fenced];
