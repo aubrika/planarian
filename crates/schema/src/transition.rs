@@ -213,6 +213,13 @@ pub struct DerivedFacts {
     /// Derived from systemd's state, never from a proposal.
     #[serde(default)]
     pub restores_unattributed_stop: bool,
+    /// A RestartUnit whose unit has already failed (observed `Failed`, or not
+    /// running while it is desired running) in the observation the facts are
+    /// derived against; `Unknown` is not failed. Waives the External
+    /// escalation of the RestartUnit row, never the Security one (§11; owner
+    /// decision, Nov 2).
+    #[serde(default)]
+    pub restarts_failed_unit: bool,
     pub caller: Actor,
     pub config_diff: Option<ConfigDiff>,
 }

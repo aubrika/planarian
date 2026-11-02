@@ -52,6 +52,7 @@ fn facts(
         touches_core: flags & 8 != 0,
         below_security_floor: flags & 16 != 0,
         restores_unattributed_stop: flags & 128 != 0,
+        restarts_failed_unit: false,
         other_sessions_affected: flags & 32 != 0,
         affected_sessions: if flags & 64 != 0 { vec!["s1".into()] } else { vec![] },
         caller: Actor::Daemon,
@@ -150,6 +151,46 @@ fn c10_two_disruptions_meet_both_floors() {
         let asks = matches!(r, Decision::Allow { tier: Tier::AskFirst, .. } | Decision::Reject(_));
         assert_eq!(asks, must_ask, "{d:?}: {r:?}");
     }
+}
+
+/// §11 (owner decision, Nov 2): restarting an External unit that has already
+/// failed does not ask for External; a Security one still does, failed or not;
+/// stopping an External unit still asks.
+#[test]
+fn restarting_a_failed_external_unit_does_not_ask() {
+    let st = state();
+    let tb = tables();
+    let locked: Vec<String> = vec![];
+    let admin = user(0, true, true, true);
+    let nm = UnitId::service("NetworkManager");
+    let run = |t: &Transition, sens: &[Sensitivity], failed: bool| {
+        let mut f = facts(sens, Disruptions::default(), Recovery::Revertible, 0, None);
+        f.restarts_failed_unit = failed;
+        decide(&Input {
+            transition: t,
+            facts: &f,
+            known_good: st.known_good,
+            live_tested: st.live_tested,
+            cumulative: &ConfigDiff::default(),
+            authz: &admin,
+            settings: &Settings::default(),
+            tables: &tb,
+            locked: &locked,
+            revert_to: None,
+        })
+    };
+    let restart = Transition::RestartUnit(nm.clone());
+    let stop = Transition::StopUnit(nm);
+    let asks = |d: &Decision| matches!(d, Decision::Allow { tier: Tier::AskFirst, .. });
+    // External: asks while running, not once failed.
+    assert!(asks(&run(&restart, &[Sensitivity::External], false)));
+    assert!(!asks(&run(&restart, &[Sensitivity::External], true)));
+    // Security: asks either way.
+    assert!(asks(&run(&restart, &[Sensitivity::Security], false)));
+    assert!(asks(&run(&restart, &[Sensitivity::Security], true)));
+    assert!(asks(&run(&restart, &[Sensitivity::Security, Sensitivity::External], true)));
+    // Stopping is unchanged.
+    assert!(asks(&run(&stop, &[Sensitivity::External], true)));
 }
 
 fn ask(class: ApproverClass) -> Decision {

@@ -564,9 +564,15 @@ pub open spec fn base_spec(i: Input) -> Decision {
     match *i.transition {
         // §11: a Security-sensitive unit stopped outside Planarian and not
         // attributed is restored on its own (and alarmed); otherwise a
-        // Security or External restart asks.
+        // Security restart asks. An External restart asks unless the unit has
+        // already failed: what that escalation protects is already lost
+        // (owner decision, Nov 2).
         Transition::RestartUnit(_) => allow(
-            ask_if(sec_or_ext(f.sensitivity) && (f.sensitivity.external || !f.restores_unattributed_stop), Tier::Runtime),
+            ask_if(
+                (f.sensitivity.security && !f.restores_unattributed_stop)
+                    || (f.sensitivity.external && !f.restarts_failed_unit),
+                Tier::Runtime,
+            ),
         ),
         Transition::StopUnit(_) => allow(ask_if(sec_or_ext(f.sensitivity), Tier::Runtime)),
         Transition::SetOverride(_) => override_spec(f, *i.authz),
@@ -795,7 +801,8 @@ fn base_tier(i: &Input) -> (r: Decision)
     match i.transition {
         Transition::RestartUnit(_) => allow_exec(
             ask_if_exec(
-                sec_or_ext_exec(&f.sensitivity) && (f.sensitivity.external || !f.restores_unattributed_stop),
+                (f.sensitivity.security && !f.restores_unattributed_stop)
+                    || (f.sensitivity.external && !f.restarts_failed_unit),
                 Tier::Runtime,
             ),
         ),
