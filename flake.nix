@@ -98,6 +98,8 @@
         vm-posture = import ./nix/tests/posture.nix { inherit pkgs self; };
         # §12d network security fails closed (#35; reviewer's case).
         vm-netsec = import ./nix/tests/netsec.nix { inherit pkgs self; };
+        # §12d netwatch: footprints and the watch heartbeat (reviewer's case).
+        vm-netwatch = import ./nix/tests/netwatch.nix { inherit pkgs self; };
         vm-generations = import ./nix/tests/vm-generations.nix { inherit pkgs self; };
         installer = import ./nix/tests/installer.nix { inherit pkgs self nixpkgs; };
         # The demo VM (`nix run .#vm-text`) builds.
