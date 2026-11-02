@@ -221,3 +221,34 @@ pinned nixpkgs greetd module always aliases `display-manager.service` to
 | Item | Found | Doing |
 | --- | --- | --- |
 | P13, module-eval (lane-nix, 2 Nov) | As reconciled above: with greetd on, `principalUnits` listed both `display-manager.service` and `greetd.service`, so the posture defined an `ExecStart`-less `display-manager.service`; the built tree came out right only because systemd-lib's alias `ln -sfn` runs after the unit links | `nix/posture.nix` orders `greetd.service` when greetd is enabled, else `display-manager.service` when NixOS runs one. The reviewer's case passes unedited: greetd ordered, no stub beside the alias, SDDM's `display-manager.service` ordered, and the SSH group (`AllowGroups planarian-admin root`, never `wheel`; the drop-in included) asserted. The module-eval assertions task closes with it |
+
+## Reviewer: C10 acceptance test (#10), 2 Nov
+
+Written from §11's global floors only (`review/lane-change-path-c10`).
+`crates/exec/src/tests.rs::each_disruption_keeps_its_own_floor`: a seated
+administrator's Rollback restarts a ConnectivityLoss unit (no floor for a
+local caller) and a DataInterruption unit (AskFirst unless it is the caller's
+own session). On `main` it commits without asking: `max` over `Disruption`'s
+order keeps ConnectivityLoss and the DataInterruption floor is lost. The
+control (the ConnectivityLoss unit alone) runs on `main` and must keep
+running. The test asserts the decision (Parked), not the representation of
+the combined disruption.
+
+## Reviewer: C10 catalog case (#10, against #21), 2 Nov
+
+Written from §11's global floors (`review/lane-change-path-c10-case`), at the
+coordinator's request against `main` plus #21 (`core/disruption-set`).
+`disruption-each-kind-keeps-its-floor`: a seated administrator's Rollback
+restarts a ConnectivityLoss unit and a DataInterruption unit (fixtures
+`gym-tunnel`, `gym-sync`, both Routine; step `restarts_on_switch`, fake only).
+It must carry both kinds and ask. On `main`: FAIL, committed without asking,
+disruption ConnectivityLoss only. Control
+`disruption-connectivity-alone-seated-runs` (the ConnectivityLoss unit alone)
+passes on `main` and must keep passing.
+
+### lane-change-path: C10 and the already-failed rule (#27), 2 Nov
+
+| Id | Status | What closes it | Case |
+| --- | --- | --- | --- |
+| C10 | closed by #21 (the set type, floors per member) and #27 (`unit_facts` inserts every unit's `restart_disruption`) | §11 global floors, each applied to its own kind | exec `each_disruption_keeps_its_own_floor`; catalog `disruption-each-kind-keeps-its-floor` (FAIL on `main` + #21, PASS here), control `disruption-connectivity-alone-seated-runs` |
+| §11 already-failed rule | closed by #27 | §11 as amended in #22 (owner decision, Nov 2): "A unit that has already failed (observed `Failed`, or not running while it is desired running, when the facts are derived) contributes no disruption of its own ... Every other unit the transition touches still contributes its own." `derive.rs` `already_failed` reads the observation passed to that derivation (`DeriveInput::state`), so it is current at proposal, at approval and before Activating; status `Failed`, `Stopped` or `Absent` while desired Running and expected. `Unknown` (Timeout, Error, Abandoned), Degraded, Transitioning and overridden units still contribute | exec `an_already_failed_unit_contributes_no_disruption`, `an_unknown_unit_still_contributes_its_disruption`, `a_unit_recovered_before_approval_asks_again` (the reviewer's) |
