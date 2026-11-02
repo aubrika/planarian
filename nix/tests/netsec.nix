@@ -186,6 +186,14 @@ pkgs.testers.runNixOSTest {
         peer.succeed("ssh -S /tmp/bob.sock bob@machine true")
         peer.fail(new_ssh("alice"))
         peer.fail(new_ssh("bob"))
+        # Address assignment passes the hold (§12d: "except loopback,
+        # address assignment (DHCP, …)"): a lease renewed while held
+        # succeeds, so a held machine never loses its address.
+        leased = "journalctl -b -u dhcpcd -o cat | grep -c 'eth0: leased' || true"
+        n0 = int(machine.succeed(leased).strip() or 0)
+        machine.succeed("dhcpcd --rebind eth0")
+        machine.wait_until_succeeds(f"[ $({leased}) -gt {n0} ]", timeout=20)
+        held()
         # Restarted by Planarian at once; the hold lifts once it is Running
         # and its Readiness probe passes. That probe crosses the tunnel
         # (wireguard-gym-tunnel, 10.77.0.2:9000), so the lift itself shows the
