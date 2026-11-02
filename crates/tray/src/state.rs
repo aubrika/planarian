@@ -175,6 +175,11 @@ mod tests {
                 changes_desired: true,
                 below_security_floor: false,
                 restores_unattributed_stop: false,
+                restarts_failed_unit: false,
+                removes_sensitivity: Default::default(),
+                removes: Default::default(),
+                removes_each: Default::default(),
+                restarts_held_unit: false,
                 other_sessions_affected: false,
                 affected_sessions: Vec::new(),
                 touches_core: false,
@@ -182,6 +187,7 @@ mod tests {
                 config_diff: None,
             },
             issued: Timestamp(0),
+            diff: Default::default(),
         });
         assert_eq!(classify(Ok(&r)).line, "waiting for your approval: apply service-enable service=sshd enabled=false");
         let mut r = report();

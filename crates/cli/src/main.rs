@@ -19,10 +19,12 @@ const USAGE: &str = "usage:
   planarian restart <unit>
   planarian override <unit> [--leave-alone|--stopped|--absent|--detached] [--until next-boot|explicit|<N>m]
   planarian release <unit>
+  planarian hold release <unit> [--until next-boot|<N>m]   lift a network hold (administrator)
   planarian gc
   planarian undo
   planarian diagnose <unit> [probe]
-  planarian approve <hash>            root, at a terminal
+  planarian approve [--json]          list what waits for approval, with what each would change
+  planarian approve <hash>            root, at a terminal; shows what it changes, then approves
   planarian cancel <txn>
   planarian resolve <txn> --as-committed|--as-reverted|--manual-repaired
   planarian mark-good [--accept-unconfirmed]
@@ -99,12 +101,28 @@ fn parse(args: &[String]) -> Result<(Request, bool), String> {
             Request::SetOverride { unit: unit(u)?, until, desired }
         }
         ["release", u] => Request::LiftOverride { unit: unit(u)? },
+        ["hold", "release", u, rest @ ..] => {
+            // §12d: a release is never forever; without --until it lasts
+            // until the next boot.
+            let until = match rest {
+                [] => Until::NextBoot,
+                ["--until", "next-boot"] => Until::NextBoot,
+                ["--until", m] if m.ends_with('m') => {
+                    let n: u64 = m.trim_end_matches('m').parse().map_err(|_| "--until takes next-boot or <N>m")?;
+                    Until::At(planarian_schema::Timestamp(now_ms() + n * 60_000))
+                }
+                _ => return Err("hold release <unit> [--until next-boot|<N>m]".into()),
+            };
+            Request::HoldRelease { unit: unit(u)?, until }
+        }
         ["gc"] => Request::Gc,
         ["undo"] => Request::Undo,
         ["diagnose", u] => Request::Diagnose { unit: unit(u)?, probe: None },
         ["diagnose", u, p] => {
             Request::Diagnose { unit: unit(u)?, probe: Some(planarian_schema::ProbeId(p.to_string())) }
         }
+        // Listing is read-only: what waits for approval, from the status.
+        ["approve"] => Request::Status,
         ["approve", h] => {
             if !std::io::stdin().is_terminal() {
                 // The daemon decides (from the process, not from us); this
@@ -202,6 +220,7 @@ fn print_status(r: &StatusReport) {
         println!("\nwaiting for approval (as root: planarian approve <hash>):");
         for p in &r.pending {
             println!("  transaction {}: {}\n    {}", p.txn.0, p.what, p.approve);
+            print_diff(&p.diff, "    ");
         }
     }
     for (t, s, what) in &r.in_flight {
@@ -306,6 +325,36 @@ fn print(resp: &Response, json: bool) -> i32 {
     0
 }
 
+/// §16 *Approvals show the change*: each pending change with the diff the
+/// core computed for it.
+fn print_pending(pending: &[planarian_ipc::Pending], json: bool) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(pending).unwrap_or_default());
+        return;
+    }
+    if pending.is_empty() {
+        println!("nothing waits for approval");
+        return;
+    }
+    for p in pending {
+        println!(
+            "transaction {}: {}\n  approve (as root, at a terminal): planarian approve {}",
+            p.txn.0, p.what, p.approve
+        );
+        print_diff(&p.diff, "  ");
+    }
+}
+
+fn print_diff(d: &planarian_ipc::ApprovalDiff, indent: &str) {
+    if d.is_empty() {
+        return;
+    }
+    println!("{indent}it would change:");
+    for l in d.lines() {
+        println!("{indent}  {l}");
+    }
+}
+
 fn run(args: Vec<String>) -> i32 {
     let (req, json) = match parse(&args) {
         Ok(r) => r,
@@ -314,6 +363,32 @@ fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
+    let words: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
+    if words == ["approve"] {
+        return match send(&Request::Status) {
+            Ok(Response::Status(r)) => {
+                print_pending(&r.pending, json);
+                0
+            }
+            Ok(other) => print(&other, json),
+            Err(e) => {
+                eprintln!("{e}");
+                69
+            }
+        };
+    }
+    // `approve <hash>`: what it changes, above the result.
+    let shown = match &req {
+        Request::Approve { hash } => match send(&Request::Status) {
+            Ok(Response::Status(r)) => r.pending.into_iter().find(|p| p.approve == *hash),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let (Some(p), false) = (&shown, json) {
+        println!("transaction {}: {}", p.txn.0, p.what);
+        print_diff(&p.diff, "");
+    }
     let resp = match send(&req) {
         Ok(r) => r,
         Err(e) => {
@@ -342,6 +417,11 @@ fn run(args: Vec<String>) -> i32 {
                 69
             }
         };
+    }
+    if let (Some(p), true) = (&shown, json) {
+        let v = serde_json::json!({ "pending": p, "response": resp });
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return if matches!(resp, Response::Error { .. } | Response::Rejected { .. }) { 1 } else { 0 };
     }
     print(&resp, json)
 }
@@ -390,5 +470,8 @@ mod tests {
         ));
         assert!(matches!(p("override backup --until 20m"), Request::SetOverride { until: Until::At(_), .. }));
         assert!(parse(&["bogus".into()]).is_err());
+        // Listing what waits for approval reads the status; approving does not.
+        assert_eq!(p("approve"), Request::Status);
+        assert!(matches!(p(&format!("approve {}", "ab".repeat(32))), Request::Approve { .. }));
     }
 }

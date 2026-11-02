@@ -510,3 +510,86 @@ fn file_store_set_fence_creates_a_missing_directory() {
     store.set_fence(TxnId(9), 4).unwrap();
     assert_eq!(store.fence(TxnId(9)).unwrap(), Some(4));
 }
+
+/// §12c "Format": "a torn or mismatched tail record is ignored and truncated
+/// on open … a retained record that does [not parse] … is an `Integrity`
+/// failure". A tail record whose frame is intact (its CRC matches, its `prev`
+/// follows the chain) is neither torn nor mismatched: if it does not parse,
+/// open reports Integrity and leaves the record where it is. Two shapes: bytes
+/// that are not JSON, and well-formed JSON of another shape (a record written
+/// by a build whose types differ, e.g. a field whose type changed).
+/// A named payload edit for `tamper`.
+type Edit = (&'static str, fn(&mut Vec<u8>));
+
+#[test]
+fn intact_but_unparsable_tail_is_integrity_and_kept() {
+    let edits: [Edit; 2] = [
+        ("not JSON", |p| p[0] = b'#'),
+        ("another shape", |p| {
+            let s = String::from_utf8(p.clone()).unwrap();
+            let i = s.find("\"at\":").unwrap();
+            p[i + 1..i + 3].copy_from_slice(b"zz");
+        }),
+    ];
+    for (what, edit) in edits {
+        let (store, j) = filled(10);
+        drop(j);
+        // The 10th (last) record: re-framed with a valid CRC and its own prev.
+        assert!(planarian_txn::journal::tamper(&store, 9, edit).unwrap(), "{what}");
+        match Journal::open(store.clone()) {
+            Err(JournalError::Integrity(_)) => {}
+            other => {
+                panic!("{what}: an intact, unparsable tail was not Integrity: {:?}", other.map(|j| j.ledger().last_seq))
+            }
+        }
+        // Not truncated: the record is still there, and a second open says the same.
+        assert!(planarian_txn::journal::tamper(&store, 9, |_| {}).unwrap(), "{what}: record 10 was removed");
+        assert!(matches!(Journal::open(store), Err(JournalError::Integrity(_))), "{what}: second open");
+    }
+}
+
+/// A journal written by today's types opens after the change: every record a
+/// full transaction history writes (prepare, run, stop, approvals, takeovers,
+/// checkpoints) parses, so none reaches the new Integrity path, on a store
+/// reopened from its bytes as after a restart.
+#[test]
+fn a_journal_written_by_todays_types_still_opens() {
+    let entries = history();
+    let store = MemStore::new(1 << 20);
+    let mut j = Journal::open(store.clone()).unwrap();
+    for e in &entries {
+        j.append(e.at, e.record.clone()).unwrap();
+    }
+    let written = j.ledger().clone();
+    drop(j);
+    let reopened = Journal::open(store.clone()).expect("today's records all parse");
+    assert_eq!(reopened.ledger(), &written);
+    assert_eq!(reopened.ledger().last_seq, entries.len() as u64);
+}
+
+/// §12d (#35): the journal's holds. Applied and lifted per unit, last event
+/// wins; they survive a reopen and a compaction (the daemon's recovery
+/// source of truth); a journal written before holds replays to none.
+#[test]
+fn holds_replay_and_survive_compaction() {
+    use planarian_txn::ledger::HoldBy;
+    let wg = UnitId::service("wireguard-gym");
+    let fw = UnitId::service("firewall");
+    let store = MemStore::new(1 << 20);
+    let mut j = Journal::open(store.clone()).unwrap();
+    assert!(j.ledger().holds().is_empty(), "no hold records: none");
+    j.append(Timestamp(1), Record::HoldApplied { unit: wg.clone(), by: HoldBy::OnFailure }).unwrap();
+    j.append(Timestamp(2), Record::HoldApplied { unit: fw.clone(), by: HoldBy::Daemon }).unwrap();
+    j.append(Timestamp(3), Record::HoldLifted { unit: fw.clone(), reason: "Running, Readiness passes".into() })
+        .unwrap();
+    assert_eq!(j.ledger().holds(), [wg.clone()].into());
+    j.compact().unwrap();
+    let reopened = Journal::open(store).unwrap();
+    assert_eq!(reopened.ledger().holds(), [wg.clone()].into(), "after a compaction and a reopen");
+
+    // An old checkpoint without the field reads back as no holds.
+    let mut v = serde_json::to_value(planarian_txn::ledger::Ledger::default()).unwrap();
+    v.as_object_mut().unwrap().remove("hold_events");
+    let old: planarian_txn::ledger::Ledger = serde_json::from_value(v).unwrap();
+    assert!(old.holds().is_empty());
+}

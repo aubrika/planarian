@@ -1692,6 +1692,7 @@ fn evidence() -> Evidence {
         full_replay,
         effects: Some(effects(&entries, start.unix)),
         status_timeline: Some(timeline),
+        foreground: None,
         drivers: Some(drivers),
         options: Some(options),
         probe_defs: Some((start.probe_defs, probe_defs(&cfg))),

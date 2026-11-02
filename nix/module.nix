@@ -106,7 +106,7 @@ let
     ++ map (i: "wg-quick-${i}") (lib.attrNames (config.networking.wg-quick.interfaces or { }));
   # The set this module declares (posture.nix), not a name prefix: a
   # foreign `planarian-*` unit is classified like any other.
-  ownUnits = name: builtins.elem name cfg.ownUnits;
+  ownUnits = name: builtins.elem name (import ./own-units.nix);
   netCaps = [ "CAP_NET_ADMIN" "CAP_NET_RAW" ];
   words = v:
     if builtins.isList v then lib.concatMap words v
@@ -650,6 +650,13 @@ in
       # §12d: every system service that is a network tool, declared or not
       # (netwatch writes a footprint for each when its watch attaches).
       inherit networkTools;
+      # The network tools not ordered after netwatch (its startup chain;
+      # nix/netwatch-unordered.nix): their early changes may precede its
+      # attach, and read as pre-attach steering (§12d).
+      inherit (cfg) networkToolsUnordered;
+      # The network tools the systemd initrd also runs: their initrd run
+      # precedes netwatch; a stage-2 start is ordered after it (§12d).
+      inherit (cfg) networkToolsInitrd;
       userUnits = unitsOf "user";
       coreUnits = {
         "planariad.service" = unitHash "planariad.service";
@@ -791,7 +798,8 @@ in
       after = [ "planarian-recovery.service" ];
       restartIfChanged = false;
       stopIfChanged = false;
-      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux pkgs.kmod pkgs.getent ]
+      # nftables: the daemon checks the hold's table each tick (§12d).
+      path = [ config.nix.package pkgs.git config.systemd.package pkgs.util-linux pkgs.kmod pkgs.getent pkgs.nftables ]
         ++ lib.optional config.networking.networkmanager.enable config.networking.networkmanager.package;
       environment.PLANARIAN_CONFIG = "/etc/planarian/config.json";
       serviceConfig = {

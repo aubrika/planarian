@@ -2,8 +2,10 @@
 //! request handler. The `planariad` binary instantiates it with the systemd,
 //! udev and nixos-rebuild backends; the gym, with the fake machine.
 
+pub mod approval;
 pub mod config;
 pub mod core;
+pub mod hold;
 pub mod hooks;
 pub mod render;
 pub mod snapshot;
