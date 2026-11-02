@@ -630,7 +630,10 @@ in
       description = "Planarian: attribute network changes to the units that make them";
       wantedBy = [ "multi-user.target" ];
       wants = [ "network-pre.target" ];
-      before = [ "network-pre.target" ];
+      # Before the firewall too: its boot batch would otherwise land before
+      # the attach and read as unattributed pre-attach steering, and every
+      # network tool's failure would hold.
+      before = [ "network-pre.target" "firewall.service" "nftables.service" ];
       after = [ "sysinit.target" "systemd-tmpfiles-setup.service" ];
       unitConfig.DefaultDependencies = false;
       restartIfChanged = false;

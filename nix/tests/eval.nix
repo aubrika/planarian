@@ -127,6 +127,9 @@ let
   # its re-application after nftables loads, and holdAllow in the export.
   hold = cfg.services.planarian;
   ownSet = import ../own-units.nix;
+  # planarian-netwatch exists only with the netwatch package; its ordering
+  # is read from the definition the module would make.
+  nwBefore = (sys.extendModules { modules = [ { services.planarian.package = pkgs.lib.mkForce (cfg.services.planarian.package // { netwatch = true; }); } ]; }).config.systemd.services.planarian-netwatch.before;
   holdUnit = cfg.systemd.services."planarian-hold@";
   holdScript = builtins.readFile (builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart));
   vpn = unit "service:gym-vpn";
@@ -171,6 +174,7 @@ let
     (check (holdUnit.unitConfig.DefaultDependencies == false && !(holdUnit ? bindsTo && builtins.elem "planariad.service" holdUnit.bindsTo) && !(holdUnit ? partOf && builtins.elem "planariad.service" holdUnit.partOf)) "the hold unit does not depend on planariad, so it survives its restart (§12d)")
     (check (!holdUnit.restartIfChanged && !holdUnit.stopIfChanged) "an activation (a repair rollback, undo) never stops or restarts a running hold (§12d)")
     (check (holdUnit.serviceConfig.RemainAfterExit && pkgs.lib.hasSuffix " apply %i" holdUnit.serviceConfig.ExecStart && pkgs.lib.hasSuffix " lift %i" holdUnit.serviceConfig.ExecStop && pkgs.lib.hasSuffix " condition %i" holdUnit.serviceConfig.ExecCondition) "start applies, stop lifts, an unexpired release skips (§12d)")
+    (check (builtins.all (u: builtins.elem u nwBefore) [ "network-pre.target" "firewall.service" "nftables.service" ]) "netwatch attaches before networking and the firewall, so their boot changes are attributed (§12d)")
     (check (pkgs.lib.hasInfix "/run/planarian/footprint" holdScript && pkgs.lib.hasInfix "protecting yes" holdScript && pkgs.lib.hasInfix "unattributed" holdScript && pkgs.lib.hasInfix "-le 30" holdScript && pkgs.lib.hasInfix "/proc/uptime" holdScript && pkgs.lib.hasInfix "-ge -5" holdScript && pkgs.lib.hasInfix ".unattributed" holdScript && pkgs.lib.hasInfix "its footprint is stale" holdScript) "the hold's condition reads the footprint and fails closed on a stale watch, a stale footprint, or a standing unattributed change (§12d)")
     (check (pkgs.lib.hasInfix "policy drop" holdScript && pkgs.lib.hasInfix "planarian-admin" holdScript && pkgs.lib.hasInfix "/run/planarian/hold-released" holdScript) "the hold table drops by default and keeps only administrator sessions (§12d)")
     (check (builtins.all kernelHas netwatchKernel) "the reference kernel has BTF and the BPF options netwatch needs: ${toString (builtins.filter (o: !(kernelHas o)) netwatchKernel)} missing (§12d)")
