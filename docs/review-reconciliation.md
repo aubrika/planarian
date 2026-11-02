@@ -127,3 +127,11 @@ gives `gym-db` an Exec probe and asserts: an Exec probe is exported (so the
 check is not vacuous); every exported Exec probe has `flagged = true`; no
 other exported probe has the key. On `main`: the build throws "every exported
 Exec probe carries flagged = true".
+
+lane-nix, P11 (2 Nov): `probeJSON` in `nix/module.nix` adds `flagged = true`
+to an exported probe whose type is `exec`, and nothing to the others. The
+reviewer's case above fails on `main` ("every exported Exec probe carries
+flagged = true") and passes with it. No Rust reader denies unknown fields, so
+`Export` and `ProbeDef` read the key as before; the gym VMs' own Exec probes
+(`snd-hda0-driven`, `pipewire-has-a-card`, `wifi-associated`) carry it on
+real machines.
