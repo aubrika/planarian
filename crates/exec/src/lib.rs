@@ -586,6 +586,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             deadline: boot.plus(if network { NETWORK_DEADLINE } else { GENERATION_DEADLINE }),
             revert_to: state.generation,
             prior_driver,
+            prepared_again_from: None,
             check: CheckContext {
                 candidate: plan.cand_eval.as_ref().map(manifest_of),
                 base: manifest_of(&plan.base_eval),
@@ -672,6 +673,33 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
 
     /// Submit a proposal. `state` and `defs` are the current observation.
     pub fn submit(&mut self, p: Proposal, authz: Authorization, state: &SystemState, defs: &UnitDefs) -> Submitted {
+        self.submit_from(p, authz, state, defs, None)
+    }
+
+    /// §12f: submit `p` as preparing again `from`, a transaction a rollback
+    /// withdrew. The link is journaled with the new transaction
+    /// (`Transaction.prepared_again_from`). Core only: it is not in
+    /// `Proposal`, which callers build, so no caller can name a withdrawn
+    /// transaction and keep it from being prepared again.
+    pub fn submit_again(
+        &mut self,
+        p: Proposal,
+        from: TxnId,
+        authz: Authorization,
+        state: &SystemState,
+        defs: &UnitDefs,
+    ) -> Submitted {
+        self.submit_from(p, authz, state, defs, Some(from))
+    }
+
+    fn submit_from(
+        &mut self,
+        p: Proposal,
+        authz: Authorization,
+        state: &SystemState,
+        defs: &UnitDefs,
+        again: Option<TxnId>,
+    ) -> Submitted {
         let digest = state.digest();
         if p.observed != digest {
             return Submitted::Rejected {
@@ -727,7 +755,8 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             self.release(&plan);
             return reject(RejectReason::Stale, "your configuration changed while the change was being built");
         }
-        let txn = self.transaction(&p, &plan, state, defs);
+        let mut txn = self.transaction(&p, &plan, state, defs);
+        txn.prepared_again_from = again;
         let id = match self.kernel.prepare(txn) {
             Ok(id) => id,
             Err(e) => {
@@ -782,7 +811,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         if rollback {
             let waiting: Vec<TxnId> = self.waiting.keys().copied().collect();
             for w in waiting {
-                if self.kernel.reject(w, RejectReason::Interrupted).is_ok() {
+                if self.kernel.withdraw(w, id).is_ok() {
                     self.waiting.remove(&w);
                 }
             }

@@ -176,6 +176,7 @@ pub fn txn(transition: Transition, caller: Actor) -> Transaction {
         revert_to: G1,
         prior_driver: None,
         check: CheckContext::default(),
+        prepared_again_from: None,
     }
 }
 

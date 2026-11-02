@@ -350,3 +350,34 @@ cases above, at `main` `f470cc1`.
 derive change (§11: a unit already failed contributes no disruption) lands:
 the Wi-Fi repair chain still parks at the ConnectivityLoss floor before it
 reaches the Rollback. The case is not edited.
+
+### lane-daemon: the withdrawal survives a restart (#26 review at `2cba51e`), 2 Nov
+
+At `2cba51e`, `Core::withdrawn` lived only in memory. The startup re-prepare
+took only transactions that recovery interrupted, and a withdrawn one is
+already terminal. So a restart between the withdrawal and the next tick after
+the rollback lost the update, even though the notice said it would be
+prepared again. The reviewer's case is
+`a_withdrawn_update_is_prepared_again_after_a_restart` (7b5cb65, unedited).
+
+The fix: each fact is atomic with the record that makes it true, and no new
+record kind is added (coordinator, Nov 2).
+- `Record::Advance.withdrawn_for` (serde default) is written by
+  `Kernel::withdraw` from `exec::schedule` and folded into
+  `TerminalTxn.withdrawn_for`.
+- `Transaction.prepared_again_from` (serde default) is set only through
+  `Executor::submit_again`, which only the daemon's `prepare_again` calls.
+  It is not in `Proposal`, so no caller can name a withdrawn transaction. It
+  is folded into `TerminalTxn.prepared_again_from`.
+- At start, `withdrawn` is rebuilt as the withdrawn terminal transactions that
+  no live or terminal transaction names. It is deduped against the restart
+  re-prepare set.
+- `apply_advance` passes the new field to `archive` (`external_body`), so
+  the proof's obligations are unchanged.
+
+Tests:
+- daemon: `a_withdrawn_update_prepared_again_is_not_prepared_twice_after_a_restart`
+  and `an_ordinary_submission_prepares_nothing_again`;
+- daemon: `records_journaled_before_the_withdrawal_fields_decode`, literals of
+  main's Advance, Prepared and checkpoint `TerminalTxn`;
+- txn: `withdrawal_links_replay_and_survive_compaction`.

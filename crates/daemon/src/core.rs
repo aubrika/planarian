@@ -341,6 +341,27 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             })
             .map(|(id, t)| (*id, t.transition.clone()))
             .collect();
+        // §12f: what a rollback withdrew and nothing has prepared again yet
+        // (no transaction names it in `prepared_again_from`), from the
+        // journal, so a restart between the two loses nothing and prepares
+        // nothing twice. Prepared again once the rollback is terminal.
+        let named: BTreeSet<TxnId> = ledger
+            .live
+            .values()
+            .filter_map(|t| t.txn.prepared_again_from)
+            .chain(ledger.terminal.values().filter_map(|t| t.prepared_again_from))
+            .collect();
+        let withdrawn: Vec<(TxnId, Transition, Option<Timestamp>)> = ledger
+            .terminal
+            .iter()
+            .filter(|(id, t)| {
+                t.withdrawn_for.is_some()
+                    && t.state == TxnState::Rejected(RejectReason::Interrupted)
+                    && !named.contains(id)
+                    && !reprepare.iter().any(|(r, _)| r == *id)
+            })
+            .map(|(id, t)| (*id, t.transition.clone(), None))
+            .collect();
         let mut incidents = Manager::restore(ledger.incidents.values().cloned());
         incidents.startup_grace = cfg.startup_grace;
         let current = b.generations().current().unwrap_or_default();
@@ -440,6 +461,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
         core.reprepare = reprepare;
+        core.withdrawn = withdrawn;
         core.note_declarations(None, current, false);
         core
     }
@@ -610,12 +632,28 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     fn submit(&mut self, p: Proposal, authz: Authorization, s: &SystemState, defs: &UnitDefs) -> Submitted {
+        self.submit_from(p, authz, s, defs, None)
+    }
+
+    /// `again`: the withdrawn transaction this prepares again (§12f), set
+    /// only by `prepare_again`.
+    fn submit_from(
+        &mut self,
+        p: Proposal,
+        authz: Authorization,
+        s: &SystemState,
+        defs: &UnitDefs,
+        again: Option<TxnId>,
+    ) -> Submitted {
         let now = self.b.clock().now();
         let pre = s.digest();
         let policy = self.ex.policy_version();
         let caller = authz.actor.clone();
         let built = self.waiting_built();
-        let result = self.ex.submit(p.clone(), authz.clone(), s, defs);
+        let result = match again {
+            Some(from) => self.ex.submit_again(p.clone(), from, authz.clone(), s, defs),
+            None => self.ex.submit(p.clone(), authz.clone(), s, defs),
+        };
         self.note_withdrawn(built);
         if let Some((facts, _)) = self.ex.last.clone() {
             self.touched.extend(facts.affected_units.iter().cloned());
@@ -755,7 +793,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 _ => None,
             };
             let p = self.proposal(t.clone(), s, defs, source, format!("prepared again {why}"));
-            let r = self.submit(p, authz, s, defs);
+            // Journaled with it: this is what prepares `id` again (§12f).
+            let r = self.submit_from(p, authz, s, defs, Some(id));
             // A diagnoser's repair that waits again keeps its incident with it.
             if let (
                 Some(inc),

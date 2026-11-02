@@ -1723,3 +1723,82 @@ fn a_withdrawn_update_is_prepared_again_after_a_restart() {
         .any(|(id, t, _)| id > waiting && matches!(t, Transition::ApplyChange { .. }));
     assert!(again, "the withdrawn update was not prepared again after the restart; notices: {:?}", r.core.notices);
 }
+
+/// §12f, the other half of the reviewer's case: once a withdrawn update has
+/// been prepared again, a later restart does not prepare it a second time
+/// (the new transaction names it in `prepared_again_from`).
+#[test]
+fn a_withdrawn_update_prepared_again_is_not_prepared_twice_after_a_restart() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    r.fake.w().activation_restarts.clear();
+    let resp = r.core.handle(ADMIN, Request::Undo);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    r.ticks(3);
+    let again_of = |l: &planarian_txn::ledger::Ledger| {
+        l.terminal
+            .values()
+            .filter_map(|t| t.prepared_again_from)
+            .chain(l.live.values().filter_map(|t| t.txn.prepared_again_from))
+            .filter(|f| *f == waiting)
+            .count()
+    };
+    assert_eq!(again_of(&r.core.ledger()), 1, "prepared again once before the restart: {:?}", r.core.notices);
+    let terminal_withdrawal = r.core.ledger().terminal.get(&waiting).cloned().expect("terminal");
+    assert!(terminal_withdrawal.withdrawn_for.is_some(), "the withdrawal names its rollback");
+
+    let log = r.core.log.clone();
+    r.fake.w().alive.remove(&100);
+    r.fake.w().alive.insert(101);
+    let mut core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO },
+        config(),
+    );
+    core.remember(log);
+    r.core = core;
+    r.ticks(3);
+    assert_eq!(again_of(&r.core.ledger()), 1, "not prepared a second time: {:?}", r.core.notices);
+}
+
+/// Records as main journals them, before `withdrawn_for` and
+/// `prepared_again_from` (§12c: a retained record that does not parse is
+/// truncated, or Integrity). Literals, not round-trips.
+#[test]
+fn records_journaled_before_the_withdrawal_fields_decode() {
+    let advance =
+        r#"{"Advance":{"txn":3,"epoch":1,"to":{"Rejected":"Interrupted"},"note":"rejected before mutation"}}"#;
+    let r: Record = serde_json::from_str(advance).expect("main's Advance decodes");
+    assert_eq!(
+        r,
+        Record::Advance {
+            txn: TxnId(3),
+            epoch: 1,
+            to: TxnState::Rejected(RejectReason::Interrupted),
+            note: "rejected before mutation".into(),
+            withdrawn_for: None,
+        }
+    );
+    let prepared = include_str!("../fixtures/prepared-before-removes-each.json");
+    assert!(!prepared.contains("prepared_again_from"), "the fixture is main's form");
+    let Record::Prepared(t) = serde_json::from_str::<Record>(prepared).expect("main's Prepared decodes") else {
+        panic!("a Prepared record")
+    };
+    assert_eq!(t.prepared_again_from, None);
+    // And a terminal ledger entry from a checkpoint before them.
+    let terminal = r#"{"state":{"Rejected":"Interrupted"},"epoch":1,"owner":{"Daemon":{"pid":100,"boot_id":"0000000000000000000000000000000000000000000000000000000000000000"}},"path":["Prepared","Built","Rejected"],"transition":"Rollback","why":""}"#;
+    let t: planarian_txn::ledger::TerminalTxn = serde_json::from_str(terminal).expect("main's TerminalTxn decodes");
+    assert_eq!((t.withdrawn_for, t.prepared_again_from), (None, None));
+}
+
+/// §12f: only `prepare_again` links a transaction to a withdrawn one; an
+/// ordinary submission journals no link.
+#[test]
+fn an_ordinary_submission_prepares_nothing_again() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    let l = r.core.ledger();
+    let t = &l.live.values().find(|t| t.txn.id == waiting).expect("live").txn;
+    assert_eq!(t.prepared_again_from, None);
+}

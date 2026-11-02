@@ -1072,7 +1072,7 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                             Record::Takeover { txn, lease, .. } if lease.owner.is_watchdog() => {
                                 watchdog.insert((*txn, lease.epoch));
                             }
-                            Record::Advance { txn, epoch, to: TxnState::Published, note }
+                            Record::Advance { txn, epoch, to: TxnState::Published, note, .. }
                                 if watchdog.contains(&(*txn, *epoch)) && note == "probes passed" =>
                             {
                                 ok = true;
