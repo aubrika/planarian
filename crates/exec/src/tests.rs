@@ -700,3 +700,50 @@ fn an_existing_generation_without_a_plan_is_refused() {
     assert!(matches!(s, Submitted::Rejected { reason: RejectReason::ActivationUnknown, .. }), "{s:?}");
     assert_eq!(r.fake.w().current, GenerationId(1));
 }
+
+/// C10 (§11 global floors): a transition carries the disruption of every unit
+/// it affects, and each floor applies to its own disruption. A seated
+/// administrator's rollback restarts two Routine units: one whose restart is
+/// ConnectivityLoss (no floor: the caller has a local session) and one whose
+/// restart is DataInterruption (at least AskFirst: it is not the caller's own
+/// session). It asks. Ranking ConnectivityLoss above DataInterruption and
+/// keeping only the greater drops the second floor. The control (the
+/// ConnectivityLoss unit alone) runs, so the floor is the only difference.
+#[test]
+fn each_disruption_keeps_its_own_floor() {
+    let net = UnitId::service("gym-cache");
+    let db = UnitId::service("gym-db");
+    for with_db in [false, true] {
+        let mut r = Rig::new();
+        let mut units = fixtures::gym_units();
+        units.get_mut(&net).expect("gym-cache is a fixture").restart_disruption = Disruption::ConnectivityLoss;
+        units.get_mut(&db).expect("gym-db is a fixture").restart_disruption = Disruption::DataInterruption;
+        r.asm = Assembler::new(Manifest { units, user_units: fixtures::gym_user_units() }, fixtures::canonical());
+        {
+            let mut w = r.fake.w();
+            let g2 = w.add_generation(&OverrideSet::default());
+            // What the dry activation of the rollback target reports.
+            let restart = &mut w.gens.get_mut(&GenerationId(1)).unwrap().eval.activation.restart;
+            restart.insert(net.clone());
+            if with_db {
+                restart.insert(db.clone());
+            }
+            w.boot_entries.insert(g2);
+            w.boot_default = g2;
+            w.current = g2;
+        }
+        let s = r.propose(Transition::Rollback, admin());
+        if with_db {
+            let Submitted::Parked { facts, .. } = &s else {
+                panic!("ConnectivityLoss and DataInterruption together: the DataInterruption floor asks: {s:?}");
+            };
+            assert!(facts.affected_units.contains(&net) && facts.affected_units.contains(&db), "{facts:?}");
+            assert_eq!(r.fake.w().current, GenerationId(2), "nothing ran before approval");
+        } else {
+            assert!(
+                !matches!(s, Submitted::Parked { .. } | Submitted::Rejected { .. }),
+                "ConnectivityLoss alone, local caller: no floor: {s:?}"
+            );
+        }
+    }
+}
