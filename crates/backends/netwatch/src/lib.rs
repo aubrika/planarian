@@ -103,7 +103,12 @@
 //! rules that drop or redirect traffic ([`Tracker`]). Fail closed where the
 //! kernel's messages are not read in full: any nftables batch or legacy
 //! table change (`nf_setsockopt`) from a unit counts as firewall rules that
-//! steer. A route by itself makes nobody protecting: only through an
+//! steer. On a kernel without legacy xtables (`CONFIG_NETFILTER_XTABLES_LEGACY`
+//! unset: no `/proc/net/*_tables_names`), nothing can show such a claim
+//! gone, so a unit that ever called `nf_setsockopt` stays protecting until
+//! reboot, across netwatch's restarts and the unit's own stop (claims
+//! outlive the unit, as a route it left behind still steers). Deliberate:
+//! it fails closed (coordinator, Nov 2). A route by itself makes nobody protecting: only through an
 //! interface its creator made. A default route over a physical NIC no unit
 //! created (NetworkManager's DHCP route over wlan0) steers nothing, watched
 //! or found at attach; one over a virtual link, or over none, that nobody can
