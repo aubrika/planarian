@@ -17,7 +17,7 @@
 #
 # Fixtures (all root with no capability bounding set, so network tools by
 # the build-time rule): nw-route makes a dummy interface and a default route
-# over it; nw-quiet steers nothing; nw-legacy makes a legacy-iptables call
+# over it; nw-quiet steers nothing; nw-sockopt makes a legacy-iptables call
 # (setsockopt IPT_SO_SET_REPLACE, which reaches nf_setsockopt); nw-nft loads
 # an nftables table with an output drop (to 203.0.113.80, TEST-NET-3). The
 # default route has metric 4000, so none of them disturbs the test itself.
@@ -71,8 +71,8 @@ pkgs.testers.runNixOSTest {
     # ip_setsockopt, an IPT-range optname goes there before any module or
     # capability check) and returns ENOPROTOOPT. netwatch counts any such
     # call from a unit as steering (fail closed). The error is expected.
-    systemd.services.nw-legacy = oneshot
-      (pkgs.writers.writePython3 "nw-legacy-setsockopt" { } ''
+    systemd.services.nw-sockopt = oneshot
+      (pkgs.writers.writePython3 "nw-sockopt-setsockopt" { } ''
         import errno
         import socket
 
@@ -160,7 +160,7 @@ pkgs.testers.runNixOSTest {
 
     machine.wait_for_unit("planarian-ready.target")
     machine.wait_for_unit("planarian-netwatch.service")
-    for u in ["nw-route", "nw-quiet", "nw-legacy", "nw-nft"]:
+    for u in ["nw-route", "nw-quiet", "nw-sockopt", "nw-nft"]:
         machine.wait_for_unit(f"{u}.service")
 
     with subtest("(a) the watch is attached, with a fresh CLOCK_BOOTTIME stamp"):
@@ -190,7 +190,7 @@ pkgs.testers.runNixOSTest {
         import json
         export = json.loads(machine.succeed("cat /etc/planarian/export.json"))
         tools = set(export["networkTools"]) - set(export.get("networkToolsUnordered", []))
-        for want in ["nw-route", "nw-quiet", "nw-legacy", "nw-nft", "nftables", "wireguard-wgnw", "nw-tpl@"]:
+        for want in ["nw-route", "nw-quiet", "nw-sockopt", "nw-nft", "nftables", "wireguard-wgnw", "nw-tpl@"]:
             assert want in tools, (want, sorted(tools))
         def mono(unit, prop):
             return int(machine.succeed(f"systemctl show -P {prop} {unit}").strip() or 0)
@@ -223,10 +223,15 @@ pkgs.testers.runNixOSTest {
         machine.fail(f"test -e {FP}/.unattributed")
 
     with subtest("(d) a legacy-iptables call (nf_setsockopt) from a unit: protecting"):
-        # nw-legacy's call returned an error (no legacy tables here), and
+        # nw-sockopt's call returned an error (no legacy tables here), and
         # the unit still finished: what is under test is the attribution.
-        machine.succeed("journalctl -b -u nw-legacy -o cat | grep -q 'setsockopt IPT_SO_SET_REPLACE'")
-        protecting("nw-legacy", "yes")
+        machine.succeed("journalctl -b -u nw-sockopt -o cat | grep -q 'setsockopt IPT_SO_SET_REPLACE'")
+        protecting("nw-sockopt", "yes")
+        # Context: this kernel has no legacy xtables tables (iptables-legacy
+        # fails at boot, gate run 41507137168), so the call above is the only
+        # producer here. Checked without a call of our own, which would be an
+        # unattributed change from the test driver.
+        machine.fail("test -e /proc/net/ip_tables_names")
 
     with subtest("(e) an nftables table that drops traffic: protecting"):
         machine.succeed("${nft} list table inet nwnft")
@@ -242,7 +247,7 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds(
             f"[ $(systemctl show -P NRestarts planarian-netwatch.service) -gt {n0} ] && systemctl is-active planarian-netwatch.service", timeout=60)
         machine.wait_until_succeeds(f"grep -q '^attached ' {FP}/.watch && [ $(awk '{{print $2}}' {FP}/.watch) -gt {t0} ]", timeout=60)
-        for u in ["nw-route", "nw-legacy", "nw-nft"]:
+        for u in ["nw-route", "nw-sockopt", "nw-nft"]:
             protecting(u, "yes")
         assert "iface nwdummy0" in footprint("nw-route")
 
