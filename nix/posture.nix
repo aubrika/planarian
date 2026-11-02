@@ -439,6 +439,11 @@ let
     in (ign == true || ign == "yes" || ign == "true") && !(lib.any (c: builtins.elem c [ "initrd-switch-root.target" "initrd-switch-root.service" ]) conf);
   initrdSurvivors = lib.optionals config.boot.initrd.systemd.enable
     (unordered.initrdSurvivors ++ lib.attrNames (lib.filterAttrs (_: initrdSurvives) config.boot.initrd.systemd.services));
+  # Every service the systemd initrd runs: the upstream list, the
+  # configuration's additional upstream units, and those it declares.
+  initrdRuns = lib.optionals config.boot.initrd.systemd.enable (unordered.initrdUpstream
+    ++ map (lib.removeSuffix ".service") (lib.filter (lib.hasSuffix ".service") (config.boot.initrd.systemd.additionalUpstreamUnits or [ ]))
+    ++ lib.attrNames config.boot.initrd.systemd.services);
   unorderedTools = lib.unique (unordered.cycle ++ lib.optionals netwatchOn initrdSurvivors);
   # The units ordered before planarian-netwatch.service in this
   # configuration, transitively (its After=, and every unit whose Before=
@@ -519,6 +524,12 @@ in
       readOnly = true;
       internal = true;
       description = "The network tools that do not start after planarian-netwatch.service (nix/netwatch-unordered.nix: its startup chain, and the systemd initrd's survivors), for the export.";
+    };
+    networkToolsInitrd = mkOption {
+      type = types.listOf types.str;
+      readOnly = true;
+      internal = true;
+      description = "The network tools the systemd initrd also runs, before netwatch exists (a template covers its instances), for the export.";
     };
     netwatchInitrdSurvivors = mkOption {
       type = types.listOf types.str;
@@ -677,6 +688,7 @@ in
     services.planarian.holdDropins = holdDropins;
     services.planarian.networkToolsUnordered = lib.filter (u: builtins.elem u unorderedTools) cfg.holdUnits;
     services.planarian.netwatchInitrdSurvivors = lib.filter (u: builtins.elem u initrdSurvivors) cfg.holdUnits;
+    services.planarian.networkToolsInitrd = lib.optionals netwatchOn (lib.filter (u: builtins.elem u initrdRuns) cfg.holdUnits);
     services.planarian.netwatchCycle = if netwatchOn then cyclicTools else [ ];
     assertions = lib.optional netwatchOn {
       assertion = lib.all (u: builtins.elem u unordered.cycle) cyclicTools;
