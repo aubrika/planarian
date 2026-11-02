@@ -305,6 +305,23 @@ let
     NFT
     }
 
+    # Fail closed: when the full table does not load (and a hold stands),
+    # hold everything but loopback rather than nothing. apply, lift (other
+    # holds may stand) and reapply (after a flush) all go through it.
+    build_or_lock() {
+      build && return 0
+      log "the hold table did not load; holding all traffic but loopback"
+      nft -f - <<NFT
+    table inet planarian-hold
+    delete table inet planarian-hold
+    table inet planarian-hold {
+      chain input { type filter hook input priority -300; policy drop; iif lo accept; }
+      chain output { type filter hook output priority -300; policy drop; oif lo accept; }
+      chain forward { type filter hook forward priority -300; policy drop; }
+    }
+    NFT
+    }
+
     case "$cmd" in
       condition)
         # ExecCondition (exit 0: hold; 1: skip, the unit stays inactive).
@@ -380,27 +397,12 @@ let
       apply)
         touch "$dir/$unit"
         snapshot
-        if build; then
-          log "traffic held: $unit has failed"
-        else
-          # Fail closed: the full table did not load; hold everything but
-          # loopback rather than nothing.
-          log "the hold table did not load; holding all traffic but loopback"
-          nft -f - <<NFT
-    table inet planarian-hold
-    delete table inet planarian-hold
-    table inet planarian-hold {
-      chain input { type filter hook input priority -300; policy drop; iif lo accept; }
-      chain output { type filter hook output priority -300; policy drop; oif lo accept; }
-      chain forward { type filter hook forward priority -300; policy drop; }
-    }
-    NFT
-        fi ;;
+        build_or_lock && log "traffic held: $unit has failed" ;;
       lift)
         rm -f "$dir/$unit"
-        build && log "hold on $unit lifted" ;;
+        build_or_lock && log "hold on $unit lifted" ;;
       reapply)
-        build ;;
+        build_or_lock ;;
       *) echo "usage: planarian-hold apply|lift|condition UNIT | reapply" >&2; exit 2 ;;
     esac
   '';
@@ -409,13 +411,53 @@ let
   # re-application after nftables.service (re)loads, as drop-ins. A drop-in
   # for a unit this system does not define is inert, where a
   # systemd.services entry would define a stub unit.
+  #
+  # §12d (owner decision, Nov 2): with netwatch, every network tool also
+  # starts after it (After= only: if netwatch fails, the tool still starts
+  # and its failure holds). With Type=notify, after its attach. In the same
+  # drop-in, so a template orders every instance, a tool shipped as unit
+  # files is covered, and a socket- or timer-activated tool is ordered by
+  # its service.
   holdDropins = lib.listToAttrs (map (u: {
     name = "${u}.service.d/50-planarian-hold.conf";
     # %N: the failed unit's name, per instance for a template's drop-in.
-    value = "[Unit]\nOnFailure=planarian-hold@%N.service\n";
+    value = "[Unit]\nOnFailure=planarian-hold@%N.service\n"
+      + lib.optionalString (netwatchOn && !(builtins.elem u unordered.cycle)) "After=planarian-netwatch.service\n";
   }) cfg.holdUnits) // {
     "nftables.service.d/50-planarian-hold.conf" = "[Service]\nExecStartPost=${hold} reapply\nExecReload=${hold} reapply\n";
   };
+  netwatchOn = cfg.package.netwatch or false;
+  unordered = import ./netwatch-unordered.nix;
+  # With the systemd initrd, the tools it starts and keeps across
+  # switch-root: the upstream list, and any unit declared for the initrd
+  # with IgnoreOnIsolate= and no Conflicts= on initrd-switch-root.
+  initrdSurvives = v:
+    let uc = v.unitConfig or { }; ign = uc.IgnoreOnIsolate or false;
+        conf = (v.conflicts or [ ]) ++ ordWords v "conflicts" "Conflicts";
+    in (ign == true || ign == "yes" || ign == "true") && !(lib.any (c: builtins.elem c [ "initrd-switch-root.target" "initrd-switch-root.service" ]) conf);
+  initrdSurvivors = lib.optionals config.boot.initrd.systemd.enable
+    (unordered.initrdSurvivors ++ lib.attrNames (lib.filterAttrs (_: initrdSurvives) config.boot.initrd.systemd.services));
+  unorderedTools = lib.unique (unordered.cycle ++ lib.optionals netwatchOn initrdSurvivors);
+  # The units ordered before planarian-netwatch.service in this
+  # configuration, transitively (its After=, and every unit whose Before=
+  # names one already found). A network tool among them, ordered after
+  # netwatch, would be an ordering cycle. An instance's edges include its
+  # template's. Unit files outside the module system are checked at build
+  # time (module-eval, systemd-analyze verify).
+  unitKinds = { service = config.systemd.services; target = config.systemd.targets; socket = config.systemd.sockets; timer = config.systemd.timers; path = config.systemd.paths; slice = config.systemd.slices; };
+  ordWords = v: f: F: (v.${f} or [ ]) ++ lib.concatMap (w: lib.filter (x: x != "") (lib.splitString " " (toString w))) (lib.toList (v.unitConfig.${F} or [ ]));
+  unitDefs = lib.concatLists (lib.mapAttrsToList (k: us: lib.mapAttrsToList (n: v: { name = "${n}.${k}"; after = ordWords v "after" "After"; before = ordWords v "before" "Before"; }) us) unitKinds);
+  templateOf = n: let m = builtins.match "([^@]+@).+(\\.[a-z]+)" n; in if m == null then null else "${builtins.elemAt m 0}${builtins.elemAt m 1}";
+  afterOf = lib.foldl' (acc: d: acc // { ${d.name} = (acc.${d.name} or [ ]) ++ d.after; }) { } unitDefs;
+  # Reversed Before=: x.before has y means x is ordered before y.
+  beforeOf = lib.foldl' (acc: d: lib.foldl' (a: y: a // { ${y} = (a.${y} or [ ]) ++ [ d.name ]; }) acc d.before) { } unitDefs;
+  predsOf = n: let t = templateOf n; ns = [ n ] ++ lib.optional (t != null) t; in
+    lib.concatMap (x: (afterOf.${x} or [ ]) ++ (beforeOf.${x} or [ ])) ns;
+  beforeNetwatch = map (i: i.key) (builtins.genericClosure {
+    startSet = map (key: { inherit key; }) (predsOf "planarian-netwatch.service");
+    operator = i: map (key: { inherit key; }) (predsOf i.key);
+  });
+  cyclicTools = lib.filter (t: lib.any (n: n == "${t}.service" || templateOf n == "${t}.service") beforeNetwatch) cfg.holdUnits;
   holdDropinPackage = pkgs.runCommand "planarian-hold-dropins" { passthru.planarianHoldDropins = true; } (lib.concatStrings (lib.mapAttrsToList (n: t: ''
     mkdir -p "$out/etc/systemd/system/$(dirname ${lib.escapeShellArg n})"
     printf '%s' ${lib.escapeShellArg t} > "$out/etc/systemd/system/"${lib.escapeShellArg n}
@@ -469,6 +511,24 @@ in
       readOnly = true;
       internal = true;
       description = "The network-security units (§12d): a failure of any holds the machine's traffic.";
+    };
+    networkToolsUnordered = mkOption {
+      type = types.listOf types.str;
+      readOnly = true;
+      internal = true;
+      description = "The network tools that do not start after planarian-netwatch.service (nix/netwatch-unordered.nix: its startup chain, and the systemd initrd's survivors), for the export.";
+    };
+    netwatchInitrdSurvivors = mkOption {
+      type = types.listOf types.str;
+      readOnly = true;
+      internal = true;
+      description = "The network tools the systemd initrd starts and keeps across switch-root (for module-eval).";
+    };
+    netwatchCycle = mkOption {
+      type = types.listOf types.str;
+      readOnly = true;
+      internal = true;
+      description = "The network tools ordered before planarian-netwatch.service in this configuration (for module-eval).";
     };
     holdDropins = mkOption {
       type = types.attrsOf types.str;
@@ -609,6 +669,13 @@ in
     # §12d "Network security fails closed": the hold unit, its drop-ins
     # and each held unit's holdAllow endpoints.
     services.planarian.holdDropins = holdDropins;
+    services.planarian.networkToolsUnordered = lib.filter (u: builtins.elem u unorderedTools) cfg.holdUnits;
+    services.planarian.netwatchInitrdSurvivors = lib.filter (u: builtins.elem u initrdSurvivors) cfg.holdUnits;
+    services.planarian.netwatchCycle = if netwatchOn then cyclicTools else [ ];
+    assertions = lib.optional netwatchOn {
+      assertion = lib.all (u: builtins.elem u unordered.cycle) cyclicTools;
+      message = "planarian: network tools are ordered before planarian-netwatch.service, so ordering them after it (owner decision, Nov 2; SPEC §12d) would be a cycle: ${toString (lib.filter (u: !(builtins.elem u unordered.cycle)) cyclicTools)}. Remove that ordering.";
+    };
     systemd.packages = [ holdDropinPackage ];
     environment.etc = lib.listToAttrs (map (u: {
       name = "planarian/hold/${u}.allow";
@@ -626,21 +693,45 @@ in
     # Before networking starts, so early changes are attributed. It writes
     # `.watch failed` when it stops or cannot attach (every network tool's
     # failure then holds), and is restarted.
-    systemd.services.planarian-netwatch = mkIf (cfg.package.netwatch or false) {
+    # nfnetlink is a module (CONFIG_NETFILTER_NETLINK=m): until it is loaded
+    # its functions do not exist, and netwatch cannot attach to them. A boot
+    # module, loaded in the initrd so it is present when netwatch starts:
+    # not by systemd-modules-load, which is a network tool and starts after
+    # netwatch, nor by the first nftables use, which comes after it too. A
+    # configuration that removes it from boot.kernelModules removes it from
+    # the initrd as well (netwatch then reports `failed` and retries).
+    boot.kernelModules = mkIf netwatchOn [ "nfnetlink" ];
+    boot.initrd.kernelModules = mkIf netwatchOn (lib.intersectLists [ "nfnetlink" ] config.boot.kernelModules);
+    systemd.services.planarian-netwatch = mkIf netwatchOn {
       description = "Planarian: attribute network changes to the units that make them";
-      wantedBy = [ "multi-user.target" ];
+      # At the front of boot: ordered after nothing, so every network tool,
+      # early-boot ones included, can start after it (owner decision,
+      # Nov 2). It needs only what is there before systemd starts: the
+      # store, /etc, /sys (BTF), /run, the initrd's nfnetlink. Wanted by
+      # sysinit.target, so a rescue boot attaches too.
+      wantedBy = [ "sysinit.target" ];
       wants = [ "network-pre.target" ];
       # Before the firewall too: its boot batch would otherwise land before
       # the attach and read as unattributed pre-attach steering, and every
       # network tool's failure would hold.
       before = [ "network-pre.target" "firewall.service" "nftables.service" ];
-      after = [ "sysinit.target" "systemd-tmpfiles-setup.service" ];
       unitConfig.DefaultDependencies = false;
       restartIfChanged = false;
       serviceConfig = {
+        # Ready (READY=1) once attached, snapshotted and its first files
+        # written, so "before the firewall and networking" means something;
+        # on a failed attach it writes `.watch failed` and notifies or exits
+        # promptly. Bounded, so boot never stalls on it.
+        Type = "notify";
+        NotifyAccess = "main";
+        TimeoutStartSec = 30;
         ExecStart = "${cfg.package}/bin/planarian-netwatch --export /etc/planarian/export.json --object ${cfg.package}/share/planarian/netwatch.bpf.o --dir /run/planarian/footprint";
         Restart = "always";
         RestartSec = 1;
+        # /run/planarian/footprint without waiting for tmpfiles (the
+        # footprints outlive netwatch's restarts).
+        RuntimeDirectory = "planarian/footprint";
+        RuntimeDirectoryPreserve = true;
         CapabilityBoundingSet = [ "CAP_BPF" "CAP_PERFMON" "CAP_SYS_ADMIN" "CAP_NET_ADMIN" "CAP_DAC_READ_SEARCH" ];
       };
     };

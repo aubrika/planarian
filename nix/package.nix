@@ -13,8 +13,8 @@ let
   # The programs the loader attaches (lane-change-path's contract).
   netwatchSections = [
     "fentry/rtnetlink_rcv_msg"
-    "fentry/nfnetlink_rcv_msg"
-    "fentry/nfnetlink_rcv_batch"
+    "kprobe/nfnetlink_rcv_msg"
+    "kprobe/nfnetlink_rcv_batch"
     "fentry/nf_setsockopt"
     "fentry/genl_rcv_msg"
   ];
