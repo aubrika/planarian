@@ -126,6 +126,10 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"test -e /run/planarian/hold/{unit}")
     def as_alice(cmd):
         return machine.execute(f"su alice -c '{cmd}' 2>&1")
+    def as_bob(cmd):
+        # bob, an administrator who is not root, proposes, and root approves
+        # at a terminal: I19, "No principal approves its own proposal".
+        return machine.succeed(f"su bob -c '{cmd}' 2>&1 || true")
     def approve_as_root(out):
         h = re.search(r"approve ([0-9a-f]{64})", out)
         assert h, out
@@ -147,16 +151,17 @@ pkgs.testers.runNixOSTest {
         assert alarms() == 0
 
     with subtest("planarian stop holds nothing (§12d: an attested stop is not a failure)"):
-        out = machine.succeed("planarian stop wireguard-gym 2>&1 || true")
-        if "approve" in out:
-            approve_as_root(out)
+        # Stopping a Security/External unit asks (§11 StopUnit row).
+        out = as_bob("planarian stop wireguard-gym")
+        assert "approve" in out, out
+        approve_as_root(out)
         machine.wait_until_fails("systemctl is-active wireguard-gym.service", timeout=60)
         machine.sleep(15)
         not_held()
         machine.succeed(lan_ok())
         peer.succeed(new_ssh("alice"))
         assert alarms() == 0, alarms()
-        out = machine.succeed("planarian release wireguard-gym 2>&1 || true")
+        out = as_bob("planarian release wireguard-gym")
         if "approve" in out:
             approve_as_root(out)
         machine.succeed("systemctl start wireguard-gym.service")
