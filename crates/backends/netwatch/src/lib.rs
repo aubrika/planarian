@@ -140,7 +140,12 @@
 //! host's; a debug assertion in `parse::take` keeps it so. Rust eBPF has no CO-RE,
 //! so the loader reads where `sk_buff.sk`, `sock.__sk_common.skc_net.net`
 //! and `net.ns.inum` are from the running kernel's BTF and sets them in the
-//! object before load (an object without those globals is unusable). A
+//! object before load (an object without those globals is unusable). The
+//! BTF reader refuses a kind of type it does not know (kind 0, or past
+//! ENUM64): it cannot skip data it cannot size without misreading every
+//! type after it. So a future kernel that adds a kind makes netwatch fail
+//! closed (`failed BTF: unknown kind N`, the hold holds), and the reader in
+//! `btf.rs` needs updating for it (coordinator, Nov 2). A
 //! container's or a `PrivateNetwork=` service's own interfaces, routes and
 //! firewall are ignored, so a container's `wg0` going away leaves the host
 //! VPN's `wg0` claim standing. Fail closed: a netns the probe could not
