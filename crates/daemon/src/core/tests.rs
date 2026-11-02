@@ -1610,10 +1610,9 @@ fn a_flushed_hold_table_is_put_back() {
 }
 
 /// §12d: a hold table that cannot be checked (planariad has no `nft`, say)
-/// alarms and re-applies once, not on every tick: a re-apply restarts the
-/// hold unit, which lifts it for a moment.
+/// alarms once and is checked again each tick; nothing is re-applied blind.
 #[test]
-fn an_uncheckable_hold_table_alarms_and_reapplies_once() {
+fn an_uncheckable_hold_table_alarms_once_and_is_checked_again() {
     let sshd = UnitId::service("sshd");
     let mut r = rig_with_held_sshd(true);
     r.fake.w().units.get_mut(&sshd).unwrap().fail_on_start = true;
@@ -1621,17 +1620,50 @@ fn an_uncheckable_hold_table_alarms_and_reapplies_once() {
     r.ticks(2);
     r.fake.w().hold_table_unreadable = true;
     r.ticks(5);
-    let reapplied = r.fake.w().calls.iter().filter(|c| c.call == "reapply_hold(service:sshd)").count();
-    assert_eq!(reapplied, 1, "once while it stays uncheckable");
+    let reapplied = |r: &Rig| r.fake.w().calls.iter().filter(|c| c.call == "reapply_hold(service:sshd)").count();
+    assert_eq!(reapplied(&r), 0, "not re-applied blind");
     let alarms = r.core.notices.iter().filter(|n| n.contains("could not be checked")).count();
     assert_eq!(alarms, 1, "{:?}", r.core.notices);
-    // Checkable again, then flushed: that is a new occurrence.
+    // Checkable again and missing: re-applied.
     r.fake.w().hold_table_unreadable = false;
-    r.ticks(1);
     r.fake.w().hold_table_flushed = true;
     r.ticks(1);
-    let reapplied = r.fake.w().calls.iter().filter(|c| c.call == "reapply_hold(service:sshd)").count();
-    assert_eq!(reapplied, 2);
+    assert_eq!(reapplied(&r), 1);
+    assert!(!r.fake.w().hold_table_flushed);
+}
+
+/// §12d: a re-apply that fails is retried with backoff while the hold stands
+/// and the table is missing; the alarm and `HoldApplied` come once.
+#[test]
+fn a_failed_reapply_is_retried_with_backoff() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().units.get_mut(&sshd).unwrap().fail_on_start = true;
+    r.fake.w().signal(&sshd, 11);
+    r.ticks(2);
+    r.fake.w().hold_reapply_fails = true;
+    r.fake.w().hold_table_flushed = true;
+    r.ticks(1);
+    let reapplied = |r: &Rig| r.fake.w().calls.iter().filter(|c| c.call == "reapply_hold(service:sshd)").count();
+    assert_eq!(reapplied(&r), 1);
+    // Retried, but not every tick: the waits double from 10 s.
+    for _ in 0..(120_000 / planarian_state::TICK.0) {
+        r.ticks(1);
+    }
+    let tries = reapplied(&r);
+    assert!(tries > 1, "retried: {tries}");
+    assert!(tries < 2 + (120_000 / planarian_state::TICK.0) as usize / 2, "with backoff: {tries}");
+    let alarms = r.core.notices.iter().filter(|n| n.contains("removed from the firewall")).count();
+    assert_eq!(alarms, 1, "one alarm: {:?}", r.core.notices);
+    // It loads: held again, and no more retries.
+    r.fake.w().hold_reapply_fails = false;
+    for _ in 0..(300_000 / planarian_state::TICK.0) {
+        r.ticks(1);
+    }
+    assert!(!r.fake.w().hold_table_flushed, "held again");
+    let after = reapplied(&r);
+    r.ticks(20);
+    assert_eq!(reapplied(&r), after, "no retry once the table is back");
 }
 
 /// §16 *Approvals show the change*: a pending generation change carries the

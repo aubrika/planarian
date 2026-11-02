@@ -66,6 +66,10 @@ pub const NEW_DECLARATIONS_FOR: Millis = Millis::secs(24 * 3600);
 
 /// How often the running daemon re-reads its journal's hash chain (I18).
 pub const CHAIN_CHECK_EVERY: Millis = Millis::secs(3600);
+/// §12d: the first and the longest wait between re-applies of a hold whose
+/// firewall table is missing.
+pub const HOLD_RETRY_MIN: Millis = Millis::secs(10);
+pub const HOLD_RETRY_MAX: Millis = Millis::secs(300);
 
 /// The caller of a request, from `SO_PEERCRED`, group membership and logind.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,9 +239,12 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// Waiting generations interrupted by a restart, to prepare again (§12f).
     reprepare: Vec<(TxnId, Transition)>,
     /// §12d: the hold's firewall table was there at the last check (or no
-    /// hold was active). Re-application is on the change to missing or
-    /// uncheckable, not on every tick: a re-apply restarts the hold unit.
+    /// hold was active). The alarm is raised once, on the change to missing
+    /// or uncheckable.
     hold_table_seen: bool,
+    /// §12d: while the table is missing, the next re-apply (boot clock) and
+    /// the wait after it, doubling to `HOLD_RETRY_MAX`.
+    hold_retry: Option<(Timestamp, Millis)>,
     /// From the executor log of earlier runs: each transaction's proposal and
     /// caller, so one prepared again keeps its source and caller (§12, C21).
     pub earlier: BTreeMap<TxnId, (Proposal, Actor)>,
@@ -426,6 +433,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             quiet_queue: vec![],
             reprepare: vec![],
             hold_table_seen: true,
+            hold_retry: None,
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
             generation_touched: false,
@@ -769,25 +777,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
         if holding.is_empty() {
             self.hold_table_seen = true;
+            self.hold_retry = None;
         } else {
-            let present = self.b.units().hold_table_present();
-            if !matches!(present, Ok(true)) && self.hold_table_seen {
-                let why = match &present {
-                    Err(o) => format!("the network hold's firewall table could not be checked ({o:?}); re-applying it"),
-                    Ok(_) => "the network hold was removed from the firewall; re-applying it".to_string(),
-                };
-                for u in holding.iter().filter(|u| units.contains(u)) {
-                    self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::Daemon });
-                    self.notice(format!("ALARM: {u}: {why}"));
-                    if let o @ (Outcome::Failed(_) | Outcome::Unknown(_)) = self.b.units().reapply_hold(u) {
-                        self.notice(format!("ALARM: {u}: its traffic could not be held again ({o:?})"));
-                    }
-                }
-                // Once per occurrence: until a check finds the table again.
-                self.hold_table_seen = matches!(self.b.units().hold_table_present(), Ok(true));
-            } else {
-                self.hold_table_seen = matches!(present, Ok(true));
-            }
+            self.hold_table(&holding, &units);
         }
         for u in units {
             let in_journal = journaled.contains(&u);
@@ -860,6 +852,60 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
         applied
+    }
+
+    /// §12d: the hold's table, while a hold stands. Missing: alarm once, then
+    /// re-apply (a reload, which never lifts; `HoldApplied` journaled
+    /// first), and retry with backoff until a check finds it. Uncheckable:
+    /// alarm once and check again next tick; nothing is re-applied blind.
+    fn hold_table(&mut self, holding: &BTreeSet<UnitId>, units: &[UnitId]) {
+        use planarian_txn::ledger::HoldBy;
+        let present = self.b.units().hold_table_present();
+        let held: Vec<UnitId> = holding.iter().filter(|u| units.contains(u)).cloned().collect();
+        match &present {
+            Ok(true) => {
+                self.hold_table_seen = true;
+                self.hold_retry = None;
+                return;
+            }
+            Err(o) => {
+                if self.hold_table_seen {
+                    for u in &held {
+                        self.notice(format!(
+                            "ALARM: {u}: the network hold's firewall table could not be checked ({o:?}); checking again"
+                        ));
+                    }
+                }
+                self.hold_table_seen = false;
+                return;
+            }
+            Ok(false) => {}
+        }
+        let now = self.b.clock().boot_now();
+        let first = self.hold_table_seen;
+        if !first && self.hold_retry.is_some_and(|(next, _)| now < next) {
+            return;
+        }
+        for u in &held {
+            if first {
+                self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::Daemon });
+                self.notice(format!("ALARM: {u}: the network hold was removed from the firewall; re-applying it"));
+            }
+            if let o @ (Outcome::Failed(_) | Outcome::Unknown(_)) = self.b.units().reapply_hold(u)
+                && first
+            {
+                self.notice(format!("ALARM: {u}: its traffic could not be held again ({o:?}); retrying"));
+            }
+        }
+        self.hold_table_seen = false;
+        if matches!(self.b.units().hold_table_present(), Ok(true)) {
+            self.hold_table_seen = true;
+            self.hold_retry = None;
+        } else {
+            let wait =
+                self.hold_retry.map_or(HOLD_RETRY_MIN, |(_, w)| Millis(w.0.saturating_mul(2).min(HOLD_RETRY_MAX.0)));
+            self.hold_retry = Some((Timestamp(now.0.saturating_add(wait.0)), wait));
+        }
     }
 
     /// The response to a submission; one parked for approval says, in one

@@ -59,8 +59,17 @@ pub fn apply(unit: &UnitId) -> Outcome {
 /// Rebuild the hold's table in place (`ExecReload` runs the script's
 /// `reapply`). A reload never lifts the hold, where a restart would run
 /// `ExecStop` (`lift`) first and let traffic through for a moment.
+///
+/// `systemctl reload` fails on an inactive unit, so one not active (the hold
+/// was stopped, or never started on this boot) is started instead.
 pub fn reapply(unit: &UnitId) -> Outcome {
-    outcome("reload", unit, run(&["systemctl", "reload", &hold_unit(unit)], TIMEOUT))
+    let name = hold_unit(unit);
+    let active = run(&["systemctl", "is-active", "--quiet", &name], TIMEOUT);
+    if active.timed_out {
+        return Outcome::Unknown(format!("systemctl is-active {name} did not finish"));
+    }
+    let verb = if active.ok() { "reload" } else { "start" };
+    outcome(verb, unit, run(&["systemctl", verb, &name], TIMEOUT))
 }
 
 /// The hold script's table (`table inet planarian-hold`).

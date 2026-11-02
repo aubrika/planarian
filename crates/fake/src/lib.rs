@@ -238,6 +238,9 @@ pub struct World {
     /// Fault injection (§12d): the hold table cannot be checked (`nft`
     /// missing or failing).
     pub hold_table_unreadable: bool,
+    /// Fault injection (§12d): re-applying the hold fails (the table stays
+    /// missing) while this is set.
+    pub hold_reapply_fails: bool,
     /// Fault injection (C6): the next candidate's store contents no longer
     /// hash to the NAR hash recorded when it was built.
     pub nar_mismatch: bool,
@@ -783,6 +786,9 @@ impl UnitBackend for Fake {
         let mut w = self.w();
         let now = w.now;
         w.calls.push(Call { call: format!("reapply_hold({unit})"), op: NO_OP, at: now, fenced: false });
+        if w.hold_reapply_fails {
+            return Outcome::Failed("planarian-hold: nft: the table did not load".into());
+        }
         w.held.insert(unit.clone());
         w.hold_table_flushed = false;
         Outcome::Succeeded
