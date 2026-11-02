@@ -518,9 +518,12 @@ fn file_store_set_fence_creates_a_missing_directory() {
 /// open reports Integrity and leaves the record where it is. Two shapes: bytes
 /// that are not JSON, and well-formed JSON of another shape (a record written
 /// by a build whose types differ, e.g. a field whose type changed).
+/// A named payload edit for `tamper`.
+type Edit = (&'static str, fn(&mut Vec<u8>));
+
 #[test]
 fn intact_but_unparsable_tail_is_integrity_and_kept() {
-    let edits: [(&str, fn(&mut Vec<u8>)); 2] = [
+    let edits: [Edit; 2] = [
         ("not JSON", |p| p[0] = b'#'),
         ("another shape", |p| {
             let s = String::from_utf8(p.clone()).unwrap();
@@ -535,7 +538,9 @@ fn intact_but_unparsable_tail_is_integrity_and_kept() {
         assert!(planarian_txn::journal::tamper(&store, 9, edit).unwrap(), "{what}");
         match Journal::open(store.clone()) {
             Err(JournalError::Integrity(_)) => {}
-            other => panic!("{what}: an intact, unparsable tail was not Integrity: {:?}", other.map(|j| j.ledger().last_seq)),
+            other => {
+                panic!("{what}: an intact, unparsable tail was not Integrity: {:?}", other.map(|j| j.ledger().last_seq))
+            }
         }
         // Not truncated: the record is still there, and a second open says the same.
         assert!(planarian_txn::journal::tamper(&store, 9, |_| {}).unwrap(), "{what}: record 10 was removed");
