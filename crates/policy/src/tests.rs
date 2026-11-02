@@ -52,6 +52,9 @@ fn facts(
         touches_core: flags & 8 != 0,
         below_security_floor: flags & 16 != 0,
         restores_unattributed_stop: flags & 128 != 0,
+        restarts_failed_unit: false,
+        removes_sensitivity: Default::default(),
+        removes: Default::default(),
         other_sessions_affected: flags & 32 != 0,
         affected_sessions: if flags & 64 != 0 { vec!["s1".into()] } else { vec![] },
         caller: Actor::Daemon,
@@ -150,6 +153,102 @@ fn c10_two_disruptions_meet_both_floors() {
         let asks = matches!(r, Decision::Allow { tier: Tier::AskFirst, .. } | Decision::Reject(_));
         assert_eq!(asks, must_ask, "{d:?}: {r:?}");
     }
+}
+
+/// §11 (owner decision, Nov 2): restarting an External unit that has already
+/// failed does not ask for External; a Security one still does, failed or not;
+/// stopping an External unit still asks.
+#[test]
+fn restarting_a_failed_external_unit_does_not_ask() {
+    let st = state();
+    let tb = tables();
+    let locked: Vec<String> = vec![];
+    let admin = user(0, true, true, true);
+    let nm = UnitId::service("NetworkManager");
+    let run = |t: &Transition, sens: &[Sensitivity], failed: bool| {
+        let mut f = facts(sens, Disruptions::default(), Recovery::Revertible, 0, None);
+        f.restarts_failed_unit = failed;
+        decide(&Input {
+            transition: t,
+            facts: &f,
+            known_good: st.known_good,
+            live_tested: st.live_tested,
+            cumulative: &ConfigDiff::default(),
+            authz: &admin,
+            settings: &Settings::default(),
+            tables: &tb,
+            locked: &locked,
+            revert_to: None,
+        })
+    };
+    let restart = Transition::RestartUnit(nm.clone());
+    let stop = Transition::StopUnit(nm);
+    let asks = |d: &Decision| matches!(d, Decision::Allow { tier: Tier::AskFirst, .. });
+    // External: asks while running, not once failed.
+    assert!(asks(&run(&restart, &[Sensitivity::External], false)));
+    assert!(!asks(&run(&restart, &[Sensitivity::External], true)));
+    // Security: asks either way.
+    assert!(asks(&run(&restart, &[Sensitivity::Security], false)));
+    assert!(asks(&run(&restart, &[Sensitivity::Security], true)));
+    assert!(asks(&run(&restart, &[Sensitivity::Security, Sensitivity::External], true)));
+    // Stopping is unchanged.
+    assert!(asks(&run(&stop, &[Sensitivity::External], true)));
+    // The two waivers compose (§11): a Security-and-External unit that was
+    // stopped outside Planarian, and so has failed, is restored without asking;
+    // its traffic is held meanwhile (§12d).
+    let mut f =
+        facts(&[Sensitivity::Security, Sensitivity::External], Disruptions::default(), Recovery::Revertible, 128, None);
+    f.restarts_failed_unit = true;
+    let d = decide(&Input {
+        transition: &restart,
+        facts: &f,
+        known_good: st.known_good,
+        live_tested: st.live_tested,
+        cumulative: &ConfigDiff::default(),
+        authz: &admin,
+        settings: &Settings::default(),
+        tables: &tb,
+        locked: &locked,
+        revert_to: None,
+    });
+    assert!(!asks(&d), "{d:?}");
+}
+
+/// §11 Rollback row (owner decision, Nov 2): a rollback asks for what it would
+/// take away (a Security- or External-sensitive option restored, or such a
+/// unit removed or stopped), not for the units it restarts.
+#[test]
+fn a_rollback_asks_for_what_it_takes_away() {
+    let st = state();
+    let tb = tables();
+    let locked: Vec<String> = vec![];
+    let admin = user(0, true, true, true);
+    let run = |f: &DerivedFacts| {
+        decide(&Input {
+            transition: &Transition::Rollback,
+            facts: f,
+            known_good: st.known_good,
+            live_tested: st.live_tested,
+            cumulative: &ConfigDiff::default(),
+            authz: &admin,
+            settings: &Settings::default(),
+            tables: &tb,
+            locked: &locked,
+            revert_to: None,
+        })
+    };
+    let asks = |d: &Decision| matches!(d, Decision::Allow { tier: Tier::AskFirst, .. });
+    // Restarts an External unit, Routine diff: runs.
+    let restart_only = facts(&[Sensitivity::External], Disruptions::default(), Recovery::Revertible, 0, None);
+    assert!(!asks(&run(&restart_only)), "{:?}", run(&restart_only));
+    // Removes a Security unit (a VPN): asks.
+    let mut removes_vpn = restart_only.clone();
+    removes_vpn.removes_sensitivity = Sensitivities::of(&[Sensitivity::Security, Sensitivity::External]);
+    assert!(asks(&run(&removes_vpn)));
+    // Restores a Security-sensitive option: asks (I11).
+    let restores_ssh =
+        facts(&[Sensitivity::Routine], Disruptions::default(), Recovery::Revertible, 0, Some("services.openssh"));
+    assert!(asks(&run(&restores_ssh)));
 }
 
 fn ask(class: ApproverClass) -> Decision {

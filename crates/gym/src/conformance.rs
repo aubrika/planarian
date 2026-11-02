@@ -18,8 +18,10 @@ use planarian_txn::store::Store;
 use toml::Value as T;
 
 /// The mutating calls, and the catalog entry whose run makes each one.
-/// (`protect`, `cancel`, `unbind` and the runtime `set` are not made by any
-/// fake-harness entry: `protect` by no caller at all.)
+/// `unbind` is a failed driver bind's revert (`revert_device`); `cancel` is
+/// the kernel cancelling an unanswered activation's jobs before its drain.
+/// (`protect` and the runtime `set` are not made by any fake-harness entry:
+/// `protect` by no caller at all.)
 pub const MATRIX: &[(&str, &str)] = &[
     ("restart", "svc-killed"),
     ("stop", "intent-user-stops-service"),
@@ -29,6 +31,8 @@ pub const MATRIX: &[(&str, &str)] = &[
     ("bind", "drv-unbound-audio"),
     ("collect_garbage", "storage-budget-unsatisfiable"),
     ("publish_boot_once", "boot-only-kernel-confirmed"),
+    ("unbind", "drv-bind-fails-restores-previous"),
+    ("cancel", "crash-job-outlives-drain"),
 ];
 
 pub const OUTCOMES: &[Injected] = &[Injected::Partial, Injected::Unknown, Injected::Fenced];
@@ -126,6 +130,8 @@ pub fn contracts() -> Vec<(&'static str, Result<(), String>)> {
         let mut j = Journal::open(store.clone()).expect("open");
         j.append(Timestamp(1), Record::KnownGood(GenerationId(7))).expect("append");
         drop(j);
+        // A power loss: only what a sync covered is left (P21).
+        store.crash();
         match Journal::open(store) {
             Ok(j) if j.ledger().known_good == Some(GenerationId(7)) => Ok(()),
             Ok(_) => Err("the synced record is gone".into()),
