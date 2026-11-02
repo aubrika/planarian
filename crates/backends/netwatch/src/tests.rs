@@ -308,6 +308,40 @@ mod sockopt {
 
 #[cfg(feature = "loader")]
 mod loader_checks {
+    /// `READY=1` reaches the notify socket (a path, or an abstract `@name`).
+    #[test]
+    fn ready_reaches_the_notify_socket() {
+        use std::os::unix::net::UnixDatagram;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("notify");
+        let sock = UnixDatagram::bind(&path).unwrap();
+        crate::loader::notify_ready(Some(&path));
+        let mut buf = [0u8; 32];
+        let n = sock.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"READY=1");
+        crate::loader::notify_ready(None); // not under systemd: nothing to do
+    }
+
+    /// A watch that cannot start writes `.watch` = `failed <reason>` first,
+    /// then still tells systemd it is ready (once), so boot never waits on
+    /// the start timeout and the hold already reads it as not attached.
+    #[test]
+    fn a_failed_start_writes_failed_then_ready() {
+        use std::os::unix::net::UnixDatagram;
+        let d = tempfile::tempdir().unwrap();
+        let (fp, path) = (d.path().join("footprint"), d.path().join("notify"));
+        let sock = UnixDatagram::bind(&path).unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let r = crate::loader::run(&d.path().join("no-export.json"), &d.path().join("none.o"), &fp, Some(&path));
+        assert!(r.is_err());
+        let watch = std::fs::read_to_string(fp.join(".watch")).unwrap();
+        assert!(watch.starts_with("failed "), "{watch}");
+        let mut buf = [0u8; 32];
+        let n = sock.recv(&mut buf).expect("READY=1 was sent");
+        assert_eq!(&buf[..n], b"READY=1");
+        assert!(sock.recv(&mut buf).is_err(), "exactly once");
+    }
+
     /// An empty or foreign object is refused before the kernel is asked.
     #[test]
     fn an_object_without_the_programs_is_refused() {

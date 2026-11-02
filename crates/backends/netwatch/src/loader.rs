@@ -95,7 +95,28 @@ pub fn write_failed(dir: &Path, reason: &str) {
 /// [`crate::TICK_SECS`] until SIGTERM or SIGINT, which writes `failed
 /// stopped`. Returns only with an error to report (also written to
 /// `.watch`), for a nonzero exit.
-pub fn run(export: &Path, object: &Path, dir: &Path) -> Result<(), String> {
+/// Tell systemd the watch has started (`READY=1` to `$NOTIFY_SOCKET`; the
+/// unit is `Type=notify`). Sent once: after the probes are attached, the
+/// attach snapshot is taken and the first files are written, so a unit
+/// ordered after netwatch (the firewall, `network-pre.target`) only starts
+/// once its changes will be attributed; or after `.watch` says `failed`, so
+/// boot never waits on a watch that cannot start. Best effort: without a
+/// socket (not started by systemd) it does nothing.
+pub fn notify_ready(socket: Option<&Path>) {
+    use std::os::unix::net::UnixDatagram;
+    let Some(path) = socket else { return };
+    let Ok(sock) = UnixDatagram::unbound() else { return };
+    let name = path.as_os_str().as_encoded_bytes();
+    let _ = if let Some(abstract_name) = name.strip_prefix(b"@") {
+        use std::os::linux::net::SocketAddrExt;
+        std::os::unix::net::SocketAddr::from_abstract_name(abstract_name)
+            .and_then(|a| sock.send_to_addr(b"READY=1", &a))
+    } else {
+        sock.send_to(b"READY=1", path)
+    };
+}
+
+pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> Result<(), String> {
     use crate::host::{boottime_secs, expand_tools, network_tools, read_cgroups, read_ifnames};
     use crate::parse::{Parsed, parse};
     use crate::{Owner, Tracker, WatchState};
@@ -103,25 +124,30 @@ pub fn run(export: &Path, object: &Path, dir: &Path) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    let fail = |why: String| {
+    // Started or not, systemd hears once; `failed` is written first.
+    let mut ready = false;
+    let fail = |why: String, ready: bool| {
         write_failed(dir, &why);
+        if !ready {
+            notify_ready(notify);
+        }
         Err(why)
     };
     let tools = match std::fs::read_to_string(export).ok().as_deref().and_then(network_tools) {
         Some(t) => t,
-        None => return fail(format!("{}: no networkTools", export.display())),
+        None => return fail(format!("{}: no networkTools", export.display()), ready),
     };
     let mut ebpf = match load(object) {
         Ok(e) => e,
-        Err(e) => return fail(e),
+        Err(e) => return fail(e, ready),
     };
     let mut ring = match ebpf.take_map("EVENTS").map(aya::maps::RingBuf::try_from) {
         Some(Ok(r)) => r,
-        _ => return fail("no EVENTS ring buffer".into()),
+        _ => return fail("no EVENTS ring buffer".into(), ready),
     };
     let lost_map = match ebpf.take_map("LOST").map(aya::maps::Array::<_, u64>::try_from) {
         Some(Ok(m)) => m,
-        _ => return fail("no LOST map".into()),
+        _ => return fail("no LOST map".into(), ready),
     };
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
@@ -141,7 +167,7 @@ pub fn run(export: &Path, object: &Path, dir: &Path) -> Result<(), String> {
     };
     let (standing, virtual_ifaces) = match crate::snapshot::standing(&mut name) {
         Ok(s) => s,
-        Err(e) => return fail(format!("snapshot: {e}")),
+        Err(e) => return fail(format!("snapshot: {e}"), ready),
     };
     let mut tracker = Tracker::attach(&crate::read_claims(dir), &standing, &virtual_ifaces);
     let mut lost_seen = 0u64;
@@ -181,12 +207,17 @@ pub fn run(export: &Path, object: &Path, dir: &Path) -> Result<(), String> {
         }
         if Instant::now() >= next_tick {
             next_tick += Duration::from_secs(crate::TICK_SECS);
-            let Some(now) = boottime_secs() else { return fail("no /proc/uptime".into()) };
+            let Some(now) = boottime_secs() else { return fail("no /proc/uptime".into(), ready) };
             let running;
             (cgroups, running) = read_cgroups(root);
             let view = tracker.view(WatchState::Attached { at: now }, &expand_tools(&tools, &running), now);
             if let Err(e) = crate::write_state(dir, &tracker.claims()).and_then(|()| crate::write(dir, &view)) {
-                return fail(format!("write {}: {e}", dir.display()));
+                return fail(format!("write {}: {e}", dir.display()), ready);
+            }
+            if !ready {
+                // Attached, reconciled, and the first files written.
+                notify_ready(notify);
+                ready = true;
             }
         }
         if drained == 0 {

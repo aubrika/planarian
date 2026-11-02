@@ -57,7 +57,8 @@ fn main() {
     let export = flag("--export").unwrap_or_else(|| "/etc/planarian/export.json".into());
     let dir = flag("--dir").unwrap_or_else(|| planarian_backend_netwatch::DIR.into());
     let p = std::path::Path::new;
-    if let Err(e) = planarian_backend_netwatch::loader::run(p(&export), p(&object), p(&dir)) {
+    let notify = std::env::var_os("NOTIFY_SOCKET").map(std::path::PathBuf::from);
+    if let Err(e) = planarian_backend_netwatch::loader::run(p(&export), p(&object), p(&dir), notify.as_deref()) {
         eprintln!("planarian-netwatch: {e}");
         std::process::exit(1);
     }
