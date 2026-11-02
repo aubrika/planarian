@@ -1,0 +1,17 @@
+[package]
+name = "planarian-backend-netwatch"
+description = "Planarian netwatch: the kernel-attributed footprint of each network tool, and its file contract (SPEC §12d \"Which units\")."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+planarian-schema.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

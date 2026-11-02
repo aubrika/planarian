@@ -2213,6 +2213,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "planarian-backend-netwatch"
+version = "0.0.0"
+dependencies = [
+ "planarian-schema",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "planarian-changes"
 version = "0.0.0"
 dependencies = [
