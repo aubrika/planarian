@@ -1322,3 +1322,48 @@ fn an_approved_change_that_waits_keeps_its_agent() {
     assert_eq!(rec.agent.as_deref(), Some("helper"));
     assert!(r.core.parked_agents.is_empty());
 }
+
+/// #24 review (I7): an approval that re-binds, whose fresh decision no
+/// longer asks, runs as an ordinary submission under a new id. Its record
+/// names no approver and no `bound_to`, carries the fresh decision, and
+/// keeps the proposer's agent.
+#[test]
+fn a_rebound_approval_that_no_longer_asks_is_logged_as_a_submission() {
+    let mut cfg = config();
+    cfg.exec
+        .tables
+        .option_sensitivity
+        .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let font = Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.25".into()))].into(),
+    };
+    let resp = r.core.handle(ALICE, font);
+    let Response::NeedsApproval { txn: first, approve, .. } = resp else { panic!("{resp:?}") };
+    r.core.parked_agents.insert(first, Some("helper".into()));
+    // What the change touches is no longer user data: re-derived at
+    // approval, the facts differ, and the fresh decision does not ask.
+    r.core.ex.cfg.tables.option_sensitivity.retain(|(o, _)| o != "planarian.reference.fontScale");
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    let Response::Done { txn: ran, .. } = resp else { panic!("ran without asking: {resp:?}") };
+    assert_ne!(ran, first, "under a new id");
+    r.ticks(2);
+    let rec = r
+        .core
+        .log
+        .iter()
+        .find(|x| matches!(x.result, Submitted::Finished { txn, .. } if txn == ran))
+        .expect("the resubmission's record");
+    assert_eq!(rec.approver, None, "nobody approved what ran");
+    assert_eq!(rec.bound_to, None);
+    assert!(
+        matches!(rec.decision, Some(Decision::Allow { tier, .. }) if tier != Tier::AskFirst),
+        "the fresh decision: {:?}",
+        rec.decision
+    );
+    assert_eq!(rec.agent.as_deref(), Some("helper"), "the proposer's agent");
+    assert!(!r.core.log.iter().any(|x| x.approver.is_some()), "no approval record: {:#?}", r.core.log);
+    assert!(r.core.parked_agents.is_empty());
+}

@@ -2144,23 +2144,51 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 // approval passes §12 step 6 here, not at submission (C18).
                 if let (Some(pk), Submitted::Finished { txn, .. }) = (parked, &r) {
                     let l = self.ledger();
-                    let rec = LogRecord {
-                        at: self.b.clock().now(),
-                        no_snapshot: no_snapshot(&r, Some(&pk.facts)),
-                        approver: Some(approver.actor.clone()),
-                        bound_to: Some(hash),
-                        proposal: pk.proposal,
-                        caller: pk.authz.actor,
-                        pre_digest: pre,
-                        policy,
-                        result: r.clone(),
-                        facts: Some(pk.facts),
-                        decision: Some(Decision::Allow { tier: Tier::AskFirst, approver: pk.class }),
-                        post_digest: None,
-                        path: l.path(*txn).map(<[String]>::to_vec).unwrap_or_default(),
-                        why: l.terminal.get(txn).map(|x| x.why.clone()).unwrap_or_default(),
-                        // The proposer's agent, not whoever is acting now.
-                        agent: self.parked_agents.remove(txn).flatten(),
+                    // The proposer's agent, not whoever is acting now.
+                    let agent = self.parked_agents.remove(&pk.txn).flatten();
+                    let rec = if *txn == pk.txn {
+                        LogRecord {
+                            at: self.b.clock().now(),
+                            no_snapshot: no_snapshot(&r, Some(&pk.facts)),
+                            approver: Some(approver.actor.clone()),
+                            bound_to: Some(hash),
+                            proposal: pk.proposal,
+                            caller: pk.authz.actor,
+                            pre_digest: pre,
+                            policy,
+                            result: r.clone(),
+                            facts: Some(pk.facts),
+                            decision: Some(Decision::Allow { tier: Tier::AskFirst, approver: pk.class }),
+                            post_digest: None,
+                            path: l.path(*txn).map(<[String]>::to_vec).unwrap_or_default(),
+                            why: l.terminal.get(txn).map(|x| x.why.clone()).unwrap_or_default(),
+                            agent,
+                        }
+                    } else {
+                        // Re-bound (§12 step 4), and the fresh decision no
+                        // longer asks: it ran as an ordinary submission under
+                        // a new id, approved by nobody. Log it as one, with the
+                        // new plan's facts and decision.
+                        let (facts, decision) = self.ex.last.clone().unzip();
+                        let mut proposal = pk.proposal;
+                        proposal.observed = pre;
+                        LogRecord {
+                            at: self.b.clock().now(),
+                            no_snapshot: no_snapshot(&r, facts.as_ref()),
+                            approver: None,
+                            bound_to: None,
+                            proposal,
+                            caller: pk.authz.actor,
+                            pre_digest: pre,
+                            policy,
+                            result: r.clone(),
+                            facts,
+                            decision,
+                            post_digest: None,
+                            path: l.path(*txn).map(<[String]>::to_vec).unwrap_or_default(),
+                            why: l.terminal.get(txn).map(|x| x.why.clone()).unwrap_or_default(),
+                            agent,
+                        }
                     };
                     self.awaiting_post.push(rec);
                 }
