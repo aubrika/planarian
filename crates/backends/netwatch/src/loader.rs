@@ -1,6 +1,6 @@
 //! The aya loader (feature `loader`).
 
-use aya::programs::{FEntry, KProbe};
+use aya::programs::{FEntry, FExit, KProbe};
 use aya::{Btf, Ebpf};
 use std::path::Path;
 
@@ -10,6 +10,9 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     FEntry,
+    /// At the function's return, with its result (`register_netdevice`:
+    /// the name is final only then).
+    FExit,
     KProbe,
 }
 
@@ -26,7 +29,7 @@ pub const PROBES: [(&str, &str, Kind); 6] = [
     ("nfbatch", "nfnetlink_rcv_batch", Kind::KProbe),
     ("sockopt", "nf_setsockopt", Kind::FEntry),
     ("genl", "genl_rcv_msg", Kind::FEntry),
-    ("netdev", "register_netdevice", Kind::FEntry),
+    ("netdev", "register_netdevice", Kind::FExit),
 ];
 
 /// Why the watch could not start (crate docs, "Starting"): an unusable
@@ -108,7 +111,7 @@ pub fn check_object(bytes: &[u8]) -> Result<(), String> {
 /// The globals the loader sets from the kernel's BTF before load.
 pub const NETNS_GLOBALS: [&str; 3] = ["NETNS_SKB_SK", "NETNS_SK_NET", "NETNS_NET_INUM"];
 pub const CG_GLOBALS: [&str; 5] = ["CG_TASK_CGROUPS", "CG_CSS_DFL", "CG_CGROUP_KN", "CG_KN_NAME", "CG_KN_PARENT"];
-pub const NETDEV_GLOBALS: [&str; 2] = ["NETDEV_NAME", "NETDEV_NET"];
+pub const NETDEV_GLOBALS: [&str; 3] = ["NETDEV_SET", "NETDEV_NAME", "NETDEV_NET"];
 
 /// `<prefix>/share/planarian/netwatch.bpf.o`, next to the running binary.
 pub fn default_object() -> String {
@@ -153,8 +156,9 @@ pub fn load_bytes(bytes: &[u8]) -> Result<Ebpf, Start> {
         .set_global(CG_GLOBALS[2], &cg.cgroup_kn, true)
         .set_global(CG_GLOBALS[3], &cg.kn_name, true)
         .set_global(CG_GLOBALS[4], &cg.kn_parent, true)
-        .set_global(NETDEV_GLOBALS[0], &dev.name, true)
-        .set_global(NETDEV_GLOBALS[1], &dev.net, true)
+        .set_global(NETDEV_GLOBALS[0], &1u32, true)
+        .set_global(NETDEV_GLOBALS[1], &dev.name, true)
+        .set_global(NETDEV_GLOBALS[2], &dev.net, true)
         .load(bytes)
         .map_err(|e| kernel(format!("load the object: {e}")))?;
     let btf = Btf::from_sys_fs().map_err(|e| kernel(format!("kernel BTF: {e}")))?;
@@ -165,6 +169,11 @@ pub fn load_bytes(bytes: &[u8]) -> Result<Ebpf, Start> {
                 let p: &mut FEntry = p.try_into().map_err(|e| Start::Unusable(format!("{prog}: {e}")))?;
                 p.load(func, &btf).map_err(|e| kernel(format!("load fentry {func}: {e:?}")))?;
                 p.attach().map_err(|e| kernel(format!("attach fentry {func}: {e}")))?;
+            }
+            Kind::FExit => {
+                let p: &mut FExit = p.try_into().map_err(|e| Start::Unusable(format!("{prog}: {e}")))?;
+                p.load(func, &btf).map_err(|e| kernel(format!("load fexit {func}: {e:?}")))?;
+                p.attach().map_err(|e| kernel(format!("attach fexit {func}: {e}")))?;
             }
             Kind::KProbe => {
                 let p: &mut KProbe = p.try_into().map_err(|e| Start::Unusable(format!("{prog}: {e}")))?;

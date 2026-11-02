@@ -15,9 +15,9 @@ use aya_ebpf::helpers::{
     bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_current_task, bpf_probe_read_kernel_buf,
     bpf_probe_read_kernel_str_bytes,
 };
-use aya_ebpf::macros::{fentry, kprobe, map};
+use aya_ebpf::macros::{fentry, fexit, kprobe, map};
 use aya_ebpf::maps::RingBuf;
-use aya_ebpf::programs::{FEntryContext, ProbeContext};
+use aya_ebpf::programs::{FEntryContext, FExitContext, ProbeContext};
 
 /// Bytes of each message copied to userspace (headers and the first
 /// attributes; a longer message is flagged truncated).
@@ -267,6 +267,10 @@ pub fn sockopt(ctx: FEntryContext) -> u32 {
 
 /// Where `register_netdevice` finds the device's name and netns, set by
 /// the loader from BTF: `net_device.name`, `net_device.nd_net.net`.
+/// `NETDEV_SET` is 1 once they are: `name` was at offset 0 before 6.8, so
+/// an offset cannot double as the sentinel.
+#[unsafe(no_mangle)]
+static NETDEV_SET: u32 = 0;
 #[unsafe(no_mangle)]
 static NETDEV_NAME: u32 = 0;
 #[unsafe(no_mangle)]
@@ -275,13 +279,24 @@ static NETDEV_NET: u32 = 0;
 /// Every interface the kernel registers, of every kind, in its creator's
 /// context: a tun or tap made by `ioctl(TUNSETIFF)` (classic OpenVPN,
 /// wireguard-go, tailscaled), which no netlink message announces, as well
-/// as netlink-made links (veth, wireguard, dummy). `data` is the name
-/// (`IFNAMSIZ`, NUL-terminated); `netns` the device's own netns.
-#[fentry(function = "register_netdevice")]
-pub fn netdev(ctx: FEntryContext) -> u32 {
+/// as netlink-made links (veth, wireguard, dummy). At *exit*, and only on
+/// success: on entry the name may still be a template (`tun%d`, `veth%d`),
+/// which `register_netdevice` resolves itself (reviewer, #42). `data` is
+/// the name (`IFNAMSIZ`, NUL-terminated); `netns` the device's own netns.
+#[fexit(function = "register_netdevice")]
+pub fn netdev(ctx: FExitContext) -> u32 {
     let dev: *const u8 = ctx.arg(0);
-    let (name_off, net_off, inum) = unsafe {
-        (core::ptr::read_volatile(&NETDEV_NAME), core::ptr::read_volatile(&NETDEV_NET), core::ptr::read_volatile(&NETNS_NET_INUM))
+    let ret: i32 = ctx.arg(1);
+    if ret != 0 {
+        return 0; // not registered: nothing was made
+    }
+    let (set, name_off, net_off, inum) = unsafe {
+        (
+            core::ptr::read_volatile(&NETDEV_SET),
+            core::ptr::read_volatile(&NETDEV_NAME),
+            core::ptr::read_volatile(&NETDEV_NET),
+            core::ptr::read_volatile(&NETNS_NET_INUM),
+        )
     };
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
         if let Some(n) = LOST.get_ptr_mut(0) {
@@ -295,7 +310,7 @@ pub fn netdev(ctx: FEntryContext) -> u32 {
         (*ev).tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).hook = HOOK_NETDEV;
         (*ev).netns = 0;
-        if name_off != 0 && !dev.is_null() {
+        if set != 0 && !dev.is_null() {
             let net = read_ptr(dev, net_off);
             if !net.is_null() {
                 let mut b = [0u8; 4];
@@ -306,7 +321,7 @@ pub fn netdev(ctx: FEntryContext) -> u32 {
         }
         cgroup_path(ev);
         let data = &mut (*ev).data;
-        let ok = name_off != 0
+        let ok = set != 0
             && !dev.is_null()
             && bpf_probe_read_kernel_buf(dev.wrapping_add(name_off as usize), &mut data[..16]).is_ok();
         (*ev).len = 16;
