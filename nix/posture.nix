@@ -326,20 +326,36 @@ let
         #    no footprint (netwatch writes `protecting no` for every network
         #    tool once it attaches, so a missing file was never seen by a
         #    healthy watch); `protecting yes`; or a change the kernel could
-        #    not attribute: hold. Only a fresh watch and `protecting no` skip.
+        #    not attribute, here or anywhere (.unattributed); a footprint not
+        #    confirmed within the window (`at`): hold. Only a fresh watch, no
+        #    standing unattributed change, and a fresh `protecting no` skip.
         w="$footprint/.watch"
+        fresh() { case "''${1:-}" in ""|*[!0-9]*) return 1 ;; esac; [ $(( $(date +%s) - $1 )) -le 30 ]; }
         state=missing; ts=""
         [ -f "$w" ] && read -r state ts < "$w"
-        if [ "$state" = attached ] && ! { case "$ts" in ""|*[!0-9]*) false ;; esac && [ $(( $(date +%s) - ts )) -le 30 ]; }; then
+        if [ "$state" = attached ] && ! fresh "$ts"; then
           state=stale
         fi
         if [ "$state" != attached ]; then
           log "holding for $unit: the network watch is $state, so whether it protected traffic is unknown"
           exit 0
         fi
+        # A steering change netwatch could not attribute to any unit (or a
+        # lost event it could not place) stands: any network tool's failure
+        # holds while it does.
+        if [ -e "$footprint/.unattributed" ]; then
+          log "holding for $unit: an unattributed change to how traffic leaves stands"
+          exit 0
+        fi
         f="$footprint/$unit"
         if [ ! -f "$f" ]; then
           log "holding for $unit: no footprint"
+          exit 0
+        fi
+        # Each footprint is confirmed current by netwatch (`at`, refreshed
+        # with the heartbeat); one older than the watch window is stale.
+        if ! fresh "$(awk '$1 == "at" { print $2; exit }' "$f")"; then
+          log "holding for $unit: its footprint is stale"
           exit 0
         fi
         if grep -qx 'protecting yes' "$f" || grep -qx 'unattributed' "$f"; then
@@ -424,6 +440,13 @@ in
       default = [ ];
       example = [ "my-assistant.service" ];
       description = "Units that run an agent principal (§11). They start only after planarian-ready.target and are stopped by every failure class (I20).";
+    };
+    ownUnits = mkOption {
+      type = types.listOf types.str;
+      readOnly = true;
+      internal = true;
+      default = [ "planariad" "planarian-recovery" "planarian-respond@" "planarian-posture-check" "planarian-posture-lift" "planarian-hold@" ];
+      description = "The system services this module itself declares (module-eval checks each exists): not classified as network tools, since their failures have their own posture (§12d).";
     };
     holdAllowsOwnInterface = mkOption {
       type = types.bool;

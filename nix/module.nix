@@ -104,7 +104,9 @@ let
     lib.optional (config.systemd.network.enable && config.systemd.network.netdevs != { }) "systemd-networkd"
     ++ map (i: "wireguard-${i}") (lib.attrNames (config.networking.wireguard.interfaces or { }))
     ++ map (i: "wg-quick-${i}") (lib.attrNames (config.networking.wg-quick.interfaces or { }));
-  ownUnits = name: lib.hasPrefix "planarian" name || name == "planariad";
+  # The set this module declares (posture.nix), not a name prefix: a
+  # foreign `planarian-*` unit is classified like any other.
+  ownUnits = name: builtins.elem name cfg.ownUnits;
   netCaps = [ "CAP_NET_ADMIN" "CAP_NET_RAW" ];
   words = v:
     if builtins.isList v then lib.concatMap words v
