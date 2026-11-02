@@ -745,13 +745,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// (`Ledger::holds`) are the source of truth after a restart; they are
     /// reconciled with the host's (`held`), and any disagreement keeps the
     /// hold (fail closed).
-    fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) {
+    /// Returns whether it applied a hold the observed state does not show.
+    fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {
         use crate::hold;
         use planarian_txn::ledger::HoldBy;
         let units: Vec<UnitId> = hold::network_security(defs).map(|d| d.id.clone()).collect();
         if units.is_empty() {
-            return;
+            return false;
         }
+        let mut applied = false;
         let journaled = self.ledger().holds();
         let host = self.b.units().held();
         // Anything else flushing the ruleset removes the hold's table while
@@ -799,10 +801,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     self.journal(Record::HoldApplied { unit: u.clone(), by });
                     self.notice(hold::alarm(&u));
                 }
-                if on_host != Some(true)
-                    && let o @ (Outcome::Failed(_) | Outcome::Unknown(_)) = self.b.units().hold(&u)
-                {
-                    self.notice(format!("ALARM: {u}: its traffic could not be held ({o:?})"));
+                if on_host != Some(true) {
+                    match self.b.units().hold(&u) {
+                        o @ (Outcome::Failed(_) | Outcome::Unknown(_)) => {
+                            self.notice(format!("ALARM: {u}: its traffic could not be held ({o:?})"))
+                        }
+                        _ => applied |= !s.holds.contains(&u),
+                    }
                 }
                 // Repair failed: the hold stays, and administrators hear of it once.
                 let given_up = self.incidents.active_for(&u).is_some_and(|i| {
@@ -836,6 +841,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
             }
         }
+        applied
     }
 
     /// A generation transaction is live, in any state (I6: one waiting in
@@ -1306,8 +1312,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
 
-        // §12d: the hold is in place before the incident opens.
-        self.network_holds(&s, &defs);
+        // §12d: the hold is in place before the incident opens; a hold the
+        // daemon just applied is in the state the repair is derived from.
+        let (s, defs) = if self.network_holds(&s, &defs) { self.observe() } else { (s, defs) };
 
         for inc in self.incidents.tick(now, &s, &defs) {
             if matches!(inc.state, IncidentState::Escalated { .. }) && inc.attempts.is_empty() {

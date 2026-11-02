@@ -51,10 +51,9 @@ fn already_failed(s: &SystemState, defs: &UnitDefs, u: &UnitId) -> bool {
 /// held", so the waiver reads the hold itself, not the footprint that leads
 /// to it: §12d fails closed toward applying a hold, and with this a missing
 /// or stale footprint buys a waiver only once traffic is in fact blocked.
-/// STUB: `false` until lane-daemon carries the active holds in `SystemState`;
-/// then read `s` here and nowhere else.
-fn hold_in_place(_s: &SystemState, _u: &UnitId) -> bool {
-    false
+/// `SystemState.holds`: the journal's holds and the host's, their union.
+fn hold_in_place(s: &SystemState, u: &UnitId) -> bool {
+    s.holds.contains(u)
 }
 
 fn unit_facts<'a>(
@@ -446,14 +445,6 @@ pub fn stop_fact(f: &mut DerivedFacts, t: &Transition, s: &SystemState, defs: &U
         && s.override_of(u).is_none()
         && s.expected(u, defs)
         && defs.get(u).is_some_and(|d| d.desired.status == DesiredStatus::Running);
-    // §11, §12d: a network-security unit that has failed, or been stopped
-    // outside Planarian and not attributed, is restarted at once, whatever
-    // its sensitivity: its traffic is held while it is down, so the restart
-    // ends an outage and exposes nothing. INTERIM (B-21): "network-security"
-    // is the module's exported `holds`; the netwatch footprint replaces it.
-    f.restarts_held_unit = defs.get(u).is_some_and(|d| d.holds)
-        && s.override_of(u).is_none()
-        && (already_failed(s, defs, u) || f.restores_unattributed_stop);
 }
 
 /// §12e: whether the generation a transition goes to is below the security

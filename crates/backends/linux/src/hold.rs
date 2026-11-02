@@ -7,9 +7,11 @@
 //!   systemd's `OnFailure=` starts the same unit on a crash or kill);
 //! - lift: `systemctl stop` of it;
 //! - state: `/run/planarian/hold/<unit>` exists while a hold is in place;
-//! - release: `/run/planarian/hold-released/<unit>` holds the expiry in Unix
-//!   seconds, or `boot` for the next boot; an unparsable or past one is
-//!   expired (the script holds).
+//! - release: `/run/planarian/hold-released/<unit>` holds `boot` (until the
+//!   next boot), or `<unix> <boottime>`: the expiry in Unix seconds and the
+//!   same deadline in `CLOCK_BOOTTIME` seconds. The script takes whichever
+//!   passes first, so a stepped wall clock cannot lengthen a release; an
+//!   unparsable or past one is expired (the script holds).
 //!
 //! `<unit>` is the systemd unit name without `.service`. A failure posture
 //! response, not a transition (docs/bypasses.md): no `Prepared`, no lease,
@@ -87,12 +89,27 @@ pub fn held_in(dir: &Path) -> Result<BTreeSet<UnitId>, Outcome> {
     }
 }
 
-/// The marker's content: the expiry in Unix seconds, or `boot`.
-pub fn marker(until: Option<Timestamp>) -> String {
+/// The marker's content: `boot`, or the expiry in Unix seconds and the same
+/// deadline on the boot clock, `boottime_now + (until - wall_now)`, both
+/// truncated to seconds. A deadline already past saturates to `boottime_now`
+/// or below: expired.
+pub fn marker(until: Option<Timestamp>, wall_now: Timestamp, boottime_now_s: u64) -> String {
     match until {
-        Some(t) => format!("{}\n", t.0 / 1000),
+        Some(t) => {
+            let left = (t.0 / 1000).saturating_sub(wall_now.0 / 1000);
+            format!("{} {}\n", t.0 / 1000, boottime_now_s.saturating_add(left))
+        }
         None => "boot\n".into(),
     }
+}
+
+fn boottime_s() -> u64 {
+    rustix::time::clock_gettime(rustix::time::ClockId::Boottime).tv_sec as u64
+}
+
+fn wall_now() -> Timestamp {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    Timestamp(d.as_millis() as u64)
 }
 
 fn marker_path(dir: &Path, unit: &UnitId) -> PathBuf {
@@ -102,7 +119,9 @@ fn marker_path(dir: &Path, unit: &UnitId) -> PathBuf {
 /// Write the release marker, then lift the hold. The marker comes first so
 /// that a failure racing the lift does not re-apply the hold.
 pub fn release_in(dir: &Path, unit: &UnitId, until: Option<Timestamp>) -> Outcome {
-    if let Err(e) = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(marker_path(dir, unit), marker(until))) {
+    if let Err(e) = std::fs::create_dir_all(dir)
+        .and_then(|_| std::fs::write(marker_path(dir, unit), marker(until, wall_now(), boottime_s())))
+    {
         return Outcome::Failed(format!("{}: {e}", dir.display()));
     }
     lift(unit)
@@ -124,12 +143,18 @@ mod tests {
     fn instance_names_drop_the_service_suffix() {
         assert_eq!(instance(&UnitId::service("wireguard-gym")), "wireguard-gym");
         assert_eq!(hold_unit(&UnitId::service("wg-quick-wg0")), "planarian-hold@wg-quick-wg0.service");
+        // A template instance keeps its `@`, as systemd's `%N` gives it to `OnFailure=`.
+        assert_eq!(hold_unit(&UnitId::service("wg-quick@wg0")), "planarian-hold@wg-quick@wg0.service");
     }
 
     #[test]
-    fn the_marker_is_unix_seconds_or_boot() {
-        assert_eq!(marker(Some(Timestamp(1_800_000_000_123))), "1800000000\n");
-        assert_eq!(marker(None), "boot\n");
+    fn the_marker_is_boot_or_wall_and_boot_deadlines() {
+        let now = Timestamp(1_799_999_000_900);
+        // 1000 s from now on both clocks, truncated.
+        assert_eq!(marker(Some(Timestamp(1_800_000_000_123)), now, 5_000), "1800000000 6000\n");
+        // Already past: the boot deadline is now, so the script holds.
+        assert_eq!(marker(Some(Timestamp(1_000)), now, 5_000), "1 5000\n");
+        assert_eq!(marker(None, now, 5_000), "boot\n");
     }
 
     #[test]
