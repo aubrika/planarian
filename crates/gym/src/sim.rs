@@ -1471,6 +1471,7 @@ impl Sim {
                     path: vec![],
                     why: String::new(),
                     agent: None,
+                    no_snapshot: false,
                 });
                 return Ok(());
             }
@@ -1538,6 +1539,7 @@ impl Sim {
             path: vec![],
             why: String::new(),
             agent: None,
+            no_snapshot: false,
         });
         if crashed {
             self.kill_daemon();
