@@ -132,6 +132,26 @@ Still open, each in issue #7's lanes: §12f
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
 proved; the residue classifier under Kani).
 
+## Reviewer: P21 acceptance tests (#10), 2 Nov
+
+Written from §17a (the assumptions the proofs rely on include "the journal's
+fsync is durable"), §18.12 (`fake-assumptions-conformance`: the fake is a
+second implementation of each, and the matrix covers each mutating call under
+Partial, Unknown and Fenced) and §12 (the journal is "fsync'd"), on
+`review/lane-change-path-p21`.
+
+- `crates/gym/src/tests.rs::the_conformance_matrix_covers_unbind_and_cancel`:
+  `MATRIX` has `unbind` and `cancel`, and `conformance::injected` passes for
+  each under every outcome (it already fails if the entry never makes the
+  call). On `main`: "unbind is not in the conformance matrix".
+- `crates/txn/tests/memstore_sync.rs`: `MemStore::crash()` (power loss) keeps
+  exactly what the last `sync` covered: an unsynced write is gone, a synced one
+  survives, a journal-appended record survives and replays. On `main`: does
+  not compile (no `crash`; `sync` is a no-op).
+
+Not tested, by nature: `conformance.rs`'s comment that no fake-harness entry
+makes `cancel` or `unbind` must go once the matrix covers them.
+
 ## lane-nix (#11): reconciliation, 2 Nov
 
 Read #11 and its owner decision (P24, 1 Nov), this file, `nix/module.nix`,
