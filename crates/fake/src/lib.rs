@@ -141,6 +141,14 @@ pub struct Call {
 #[derive(Debug, Default)]
 pub struct World {
     pub now: Timestamp,
+    // ---- netwatch (§12d "Which units"), scripted ----
+    /// What the kernel attributed to whom (gym step `footprint`).
+    pub netwatch: planarian_backend_netwatch::Tracker,
+    /// The watch failed to attach, and why (gym step `netwatch`); `None`:
+    /// attached, confirmed on every read.
+    pub netwatch_failed: Option<String>,
+    /// Units whose footprint has gone stale (gym step `footprint_stale`).
+    pub netwatch_stale: BTreeSet<UnitId>,
     /// Wall clock minus boot clock, in ms (`set_wall_clock`, §12h).
     pub wall_skew: i64,
     // ---- NixOS ----
@@ -604,6 +612,26 @@ pub struct Fake {
 }
 
 impl Fake {
+    /// §12d: the footprints as `/run/planarian/footprint/` would hold them
+    /// for the network tools `tools`, on the boot clock (seconds): the same
+    /// [`planarian_backend_netwatch::FootprintView`] the Linux side reads.
+    pub fn footprint_view(&self, tools: &[UnitId]) -> planarian_backend_netwatch::FootprintView {
+        use planarian_backend_netwatch::{FRESH_SECS, WatchState, file_name};
+        let w = self.w();
+        let now = w.now.0 / 1000;
+        let watch = match &w.netwatch_failed {
+            None => WatchState::Attached { at: now },
+            Some(reason) => WatchState::Failed { reason: reason.clone() },
+        };
+        let mut view = w.netwatch.view(watch, tools, now);
+        for u in &w.netwatch_stale {
+            if let Some(f) = view.units.get_mut(&file_name(u)) {
+                f.at = now.saturating_sub(FRESH_SECS + 1);
+            }
+        }
+        view
+    }
+
     pub fn new(world: World, store: MemStore) -> Fake {
         Fake { world: Arc::new(Mutex::new(world)), store }
     }

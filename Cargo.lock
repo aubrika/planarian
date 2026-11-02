@@ -2395,6 +2395,7 @@ dependencies = [
 name = "planarian-fake"
 version = "0.0.0"
 dependencies = [
+ "planarian-backend-netwatch",
  "planarian-changes",
  "planarian-schema",
  "planarian-txn",
@@ -2407,6 +2408,7 @@ name = "planarian-gym"
 version = "0.0.0"
 dependencies = [
  "planarian-backend-linux",
+ "planarian-backend-netwatch",
  "planarian-changes",
  "planarian-daemon",
  "planarian-exec",
