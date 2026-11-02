@@ -132,6 +132,20 @@ Still open, each in issue #7's lanes: §12f
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
 proved; the residue classifier under Kani).
 
+## lane-nix (#11): reconciliation, 2 Nov
+
+Read #11 and its owner decision (P24, 1 Nov), this file, `nix/module.nix`,
+`nix/posture.nix`, `nix/tests/eval.nix`, and the pinned nixpkgs
+(`1f607aa`, nixos-26.05) greetd and systemd-lib modules.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P11 | `probeJSON` exports an `Exec` probe as `kind.Exec` with nothing else marking it; §9 wants it flagged. `Export` and `ProbeDef` have no `deny_unknown_fields`, so an added key is read as before | flag it in the export; assert in module-eval |
+| P13 | The greetd module aliases `display-manager.service` to `greetd.service` and sets `services.displayManager.enable = mkDefault true`. So with greetd, `principalUnits` lists both names and the posture defines a second, `ExecStart`-less `display-manager.service` unit; systemd-lib's alias `ln -sfn` overwrites its file, so the built tree is right by order of operations only (checked: `display-manager.service -> greetd.service`). The reference configuration hits this (cosmic-greeter runs on greetd). "`displayManager.enable` unset" never holds with greetd | order `display-manager.service` only when greetd is not enabled; `greetd.service` when it is; assert in module-eval that no stray unit is defined |
+| module-eval | Asserts neither the greetd ordering, the posture's SSH group, nor the Exec flag. The SSH rule lives in the `respond` script (`AllowGroups ${adminGroup} root`), reachable at eval only through the script's text | the three assertions (reviewer's case first) |
+| P24 | `wireplumber` is in `userControllable.units` and has a canonical probe, but no default unit, so nothing watches it | declare it per the owner decision; assert in module-eval |
+| posture comment | `posture.nix` said in-budget restarts keep planariad activating, so the target stays up. Run 41288596484 shows otherwise: each SIGSEGV in vm-posture logs `Stopped target Planarian is ready` with no `OnFailure=`; in crash-slow-worker-overlap the SIGKILL drops the target and a restart of the restarting unit raises Absent through `ExecStopPost` (result `success`) | comment corrected; ordering unchanged (I20; any change is the coordinator's) |
+
 ## Reviewer: C10 acceptance test (#10), 2 Nov
 
 Written from §11's global floors only (`review/lane-change-path-c10`).
