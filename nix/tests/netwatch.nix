@@ -73,6 +73,18 @@ pkgs.testers.runNixOSTest {
     systemd.services.nw-nft = oneshot
       "${nft} 'add table inet nwnft; add chain inet nwnft out { type filter hook output priority 0; }; add rule inet nwnft out ip daddr 203.0.113.80 drop'"
       "${nft} delete table inet nwnft";
+    # A WireGuard interface (a network tool by its netdev, §12d), with no
+    # peer: only its ordering after the watch is under test. A fixed test key.
+    networking.wireguard.interfaces.wgnw = {
+      ips = [ "10.78.0.1/24" ];
+      privateKeyFile = "${pkgs.writeText "wgnw.key" "uJhR8JkZjr32TbqdjI+D0hftWxS1UzsOHfr1VRjvLWA="}";
+      peers = [ ];
+    };
+    # A templated network tool, instance `a` (root, no bounding set).
+    systemd.services."nw-tpl@" = {
+      serviceConfig = { Type = "simple"; Restart = "no"; ExecStart = "${pkgs.coreutils}/bin/sleep infinity"; };
+    };
+    systemd.targets.multi-user.wants = [ "nw-tpl@a.service" ];
     # Declared with no tag so the daemon restarts nw-quiet after each kill.
     services.planarian.units.nw-quiet = { };
   };
@@ -143,6 +155,40 @@ pkgs.testers.runNixOSTest {
         protecting("nftables", "yes")
         machine.fail(f"test -e {FP}/.unattributed")
 
+    with subtest("(j) at boot every network tool starts only after the watch is ready; nothing is pre-attach"):
+        # "Every network tool is ordered after planarian-netwatch.service.
+        # That service reports ready only once its probes are attached and
+        # its first footprints are written" (§12d). Under Type=notify,
+        # netwatch's ActiveEnter is its READY=1; a tool's InactiveExit is
+        # when it began to start. Units the watch itself needs are exempt
+        # (the export's networkToolsUnordered).
+        import json
+        export = json.loads(machine.succeed("cat /etc/planarian/export.json"))
+        tools = set(export["networkTools"]) - set(export.get("networkToolsUnordered", []))
+        for want in ["nw-route", "nw-quiet", "nw-legacy", "nw-nft", "nftables", "wireguard-wgnw", "nw-tpl@"]:
+            assert want in tools, (want, sorted(tools))
+        def mono(unit, prop):
+            return int(machine.succeed(f"systemctl show -P {prop} {unit}").strip() or 0)
+        ready = mono("planarian-netwatch.service", "ActiveEnterTimestampMonotonic")
+        assert ready > 0, "netwatch never became active"
+        units = []
+        for t in sorted(tools):
+            if t.endswith("@"):
+                # (l) each loaded instance of a templated tool is ordered too.
+                out = machine.succeed(f"systemctl list-units --all --plain --no-legend '{t}*.service' | awk '{{print $1}}'")
+                units += [u for u in out.split() if u]
+            else:
+                units.append(f"{t}.service")
+        assert "nw-tpl@a.service" in units, units
+        early = []
+        for u in units:
+            began = mono(u, "InactiveExitTimestampMonotonic")
+            if began and began < ready:
+                early.append((u, began, ready))
+        assert not early, f"started before the watch was ready: {early}"
+        machine.fail(f"grep -rq 'pre-attach' {FP}")
+        machine.fail(f"test -e {FP}/.unattributed")
+
     with subtest("(b) a dummy interface with a default route over it: protecting, with that interface"):
         lines = protecting("nw-route", "yes")
         assert "iface nwdummy0" in lines, lines
@@ -211,6 +257,28 @@ pkgs.testers.runNixOSTest {
         # The object gone, the unattributed change no longer stands.
         machine.succeed("${ip} link delete nwgap0")
         machine.wait_until_fails(f"test -e {FP}/.unattributed", timeout=30)
+        quiet_back_and_lifted()
+    with subtest("(k) a watch that fails to start: network tools still start, .watch reads failed, a failing tool is held"):
+        # "The ordering is not a dependency: if the watch fails to start,
+        # network tools still start, and the watch counts as failed" (§12d).
+        # Its eBPF object is made empty (a bind mount of /dev/null over it),
+        # which the loader refuses.
+        import re
+        argv = machine.succeed("systemctl show -P ExecStart planarian-netwatch.service")
+        obj = re.search(r"--object (\S+)", argv).group(1)
+        machine.succeed("systemctl stop planarian-netwatch.service nw-quiet.service")
+        machine.succeed(f"rm -f {FP}/.watch")
+        machine.succeed(f"mount --bind /dev/null {obj}")
+        # One transaction, as at boot: nw-quiet is ordered after the watch.
+        machine.execute("systemctl start planarian-netwatch.service nw-quiet.service")
+        machine.wait_until_succeeds("systemctl is-active nw-quiet.service", timeout=90)
+        machine.wait_until_succeeds(f"grep -q '^failed' {FP}/.watch", timeout=60)
+        machine.fail("systemctl is-active planarian-netwatch.service")
+        quiet_is_held()
+        # Repaired: the object back, the watch attaches, and the hold lifts.
+        machine.succeed(f"umount {obj}")
+        machine.succeed("systemctl reset-failed planarian-netwatch.service; systemctl start planarian-netwatch.service")
+        watch_fresh()
         quiet_back_and_lifted()
   '';
 }
