@@ -305,6 +305,7 @@ pub proof fn i14_facts_caller_is_not_authority(a: Input, b: Input)
         a.facts.restarts_failed_unit == b.facts.restarts_failed_unit,
         a.facts.removes_sensitivity == b.facts.removes_sensitivity,
         a.facts.removes == b.facts.removes,
+        a.facts.removes_each == b.facts.removes_each,
         a.facts.restarts_held_unit == b.facts.restarts_held_unit,
         a.facts.config_diff == b.facts.config_diff,
         a.known_good == b.known_good,

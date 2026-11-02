@@ -726,9 +726,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// line, what it would change (§16 *Approvals show the change*).
     fn respond(&self, r: &Submitted) -> Response {
         let mut resp = render::response(r);
-        if let (Response::NeedsApproval { txn, why, .. }, Some((_, defs))) = (&mut resp, self.last.as_ref())
+        if let Response::NeedsApproval { txn, why, .. } = &mut resp
             && let Some(p) = self.ex.parked.get(txn)
-            && let Some(sum) = self.approval_diff(*txn, &p.proposal.transition, &p.facts, defs).summary()
+            && let Some(sum) = self.approval_diff(*txn, &p.proposal.transition, &p.facts).summary()
         {
             *why = if why.is_empty() { sum } else { format!("{why}; {sum}") };
         }
@@ -737,13 +737,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
     /// §16 *Approvals show the change*: built from the derived facts (from
     /// the evaluated generations), never from the proposal.
-    fn approval_diff(
-        &self,
-        txn: TxnId,
-        t: &Transition,
-        f: &DerivedFacts,
-        _defs: &UnitDefs,
-    ) -> planarian_ipc::ApprovalDiff {
+    fn approval_diff(&self, txn: TxnId, t: &Transition, f: &DerivedFacts) -> planarian_ipc::ApprovalDiff {
         // The options, from the evaluated generations (§16): the one the
         // transaction runs on against its candidate. A generation built
         // outside Planarian has no recorded override, so the override diff
@@ -753,7 +747,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let options = evaluated.as_ref().or(f.config_diff.as_ref());
         // The units it would remove or stop: derive's `removes`, the same set
         // as `removes_sensitivity` (§11 Rollback row), each with its own.
-        crate::approval::diff(t, options, evaluated.is_some(), &f.removes, &self.ex.cfg.tables)
+        let (removed, each_known) = crate::approval::removed(f);
+        crate::approval::diff(t, options, evaluated.is_some(), &removed, each_known, &self.ex.cfg.tables)
     }
 
     /// Every option whose value differs between a live generation
@@ -1675,7 +1670,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     Submitted::Parked { txn, approve, facts } => {
                         self.incident_parked.insert(inc.id, txn);
                         let changes = self
-                            .approval_diff(txn, &c.transition, &facts, defs)
+                            .approval_diff(txn, &c.transition, &facts)
                             .summary()
                             .map(|s| format!("; {s}"))
                             .unwrap_or_default();
@@ -1825,7 +1820,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         // §16: the notice shows what a generation change waiting for
         // approval would change.
         if let Submitted::Parked { txn, approve, facts } = &r
-            && let Some(changes) = self.approval_diff(*txn, &t, facts, &defs).summary()
+            && let Some(changes) = self.approval_diff(*txn, &t, facts).summary()
         {
             self.notice(format!(
                 "{} needs approval ({}; {changes}): planarian approve {approve}",
@@ -1858,7 +1853,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 approve: p.bound_to,
                 what: render::transition(&p.proposal.transition),
                 facts: p.facts.clone(),
-                diff: self.approval_diff(p.txn, &p.proposal.transition, &p.facts, &defs),
+                diff: self.approval_diff(p.txn, &p.proposal.transition, &p.facts),
                 // Shown to people: the boot-clock issue time on the wall clock.
                 issued: Timestamp(
                     self.b.clock().now().0.saturating_sub(self.b.clock().boot_now().0.saturating_sub(p.issued.0)),
