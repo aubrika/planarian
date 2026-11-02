@@ -738,7 +738,11 @@ in
         # footprints outlive netwatch's restarts).
         RuntimeDirectory = "planarian/footprint";
         RuntimeDirectoryPreserve = true;
-        CapabilityBoundingSet = [ "CAP_BPF" "CAP_PERFMON" "CAP_SYS_ADMIN" "CAP_NET_ADMIN" "CAP_DAC_READ_SEARCH" ];
+        # CAP_SYS_PTRACE: netwatch refuses to start outside the host's
+        # network namespace, checked against /proc/1/ns/net; reading it is
+        # a ptrace READ access, which a bounded root passes only with this
+        # (its permitted set is not a superset of pid 1's).
+        CapabilityBoundingSet = [ "CAP_BPF" "CAP_PERFMON" "CAP_SYS_ADMIN" "CAP_NET_ADMIN" "CAP_DAC_READ_SEARCH" "CAP_SYS_PTRACE" ];
       };
     };
     systemd.services."planarian-hold@" = {
