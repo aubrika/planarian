@@ -81,9 +81,10 @@
 //! The probes attach before the snapshot is taken, so a change racing it is
 //! seen as an event too (applying it twice changes nothing).
 //!
-//! **Interfaces.** "An interface it created" is seen at
-//! `register_netdevice`, which runs in the creator's context for every
-//! kind: a tun or tap made by `ioctl(TUNSETIFF)` (classic OpenVPN,
+//! **Interfaces.** "An interface it created" is seen at the return of
+//! `register_netdevice`, on success only (on entry the name can still be a
+//! template, `tun%d`, which it resolves), which runs in the creator's
+//! context for every kind: a tun or tap made by `ioctl(TUNSETIFF)` (classic OpenVPN,
 //! wireguard-go, tailscaled), which no netlink message announces, as well
 //! as netlink-made links, whose RTM_NEWLINK is a second witness. Only a
 //! *virtual* link can be one a tool created; virtual is read live each
@@ -161,7 +162,8 @@
 //!   first attach that succeeds reconciles (above) and writes `attached`.
 //!
 //! Probes: `rtnetlink_rcv_msg`, `nf_setsockopt`, `genl_rcv_msg` and
-//! `register_netdevice` are built in, so fentry (they need vmlinux's BTF); `nfnetlink_rcv_msg` and
+//! `register_netdevice` are built in, so fentry, or fexit for
+//! `register_netdevice` (they need vmlinux's BTF); `nfnetlink_rcv_msg` and
 //! `nfnetlink_rcv_batch` are in the `nfnetlink` module (`=m` on NixOS
 //! kernels), so kprobes by symbol, which need the module loaded: the
 //! initrd loads it (`boot.kernelModules`), since netwatch starts early in

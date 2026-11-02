@@ -469,7 +469,12 @@ mod loader_checks {
     fn module_functions_are_kprobes() {
         use crate::loader::{Kind, PROBES};
         for (prog, func, kind) in PROBES {
-            let want = if func.starts_with("nfnetlink_") { Kind::KProbe } else { Kind::FEntry };
+            // register_netdevice at exit: the name is final only then.
+            let want = match func {
+                f if f.starts_with("nfnetlink_") => Kind::KProbe,
+                "register_netdevice" => Kind::FExit,
+                _ => Kind::FEntry,
+            };
             assert_eq!(kind, want, "{prog} ({func})");
         }
     }
@@ -984,6 +989,20 @@ mod btf {
         b.ty("", 4, 8, &[("", 1, 0)]);
         b.ty("loop", 4, 8, &[("", 1, 0)]);
         assert!(Btf::parse(&b.bytes()).unwrap().offset("loop", &["x"]).is_err());
+    }
+
+    /// A kind past ENUM64 has data the reader cannot size: refused, not
+    /// skipped (which would misread every type after it).
+    #[test]
+    fn an_unknown_kind_is_refused() {
+        let mut b = Blob::new();
+        b.ty("unsigned int", 1, 4, &[]);
+        b.ty("future", 20, 0, &[]);
+        let e = Btf::parse(&b.bytes()).err().unwrap();
+        assert!(e.contains("unknown kind 20"), "{e}");
+        let mut b = Blob::new();
+        b.ty("", 0, 0, &[]); // kind 0 is not a type
+        assert!(Btf::parse(&b.bytes()).is_err());
     }
 
     /// Mutated and truncated blobs: an answer or a refusal, never a panic.

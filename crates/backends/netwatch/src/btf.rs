@@ -95,7 +95,12 @@ impl Btf {
                 }
                 KIND_ENUM | KIND_FUNC_PROTO => 8 * vlen,
                 KIND_DATASEC | KIND_ENUM64 => 12 * vlen,
-                _ => 0,
+                // No trailing data: ptr, fwd, typedef, the qualifiers,
+                // func, float, type tag.
+                2 | 7..=12 | KIND_FLOAT | KIND_TYPE_TAG => 0,
+                // A kind this reader does not know has data it cannot size:
+                // stop rather than misread everything after it.
+                k => return Err(format!("BTF: unknown kind {k} at type {}", types.len())),
             };
             at += extra;
             types.push(Ty { name, kind, refers, nelems, members });
