@@ -307,3 +307,27 @@ fn repair_prepared_in_each_exclusive_state() {
     let v = judge(&e, &post);
     assert!(!v.failures.iter().any(|f| f.contains("prepared while")), "{:?}", v.failures);
 }
+
+/// P21 (§17a, §18.12: the fake is a second implementation of every assumption,
+/// and the matrix covers each mutating backend call): `unbind` and `cancel`
+/// are in the conformance matrix, and each, under every injected outcome a
+/// real backend may give (Partial, Unknown, Fenced), is actually called by its
+/// catalog entry and leaves every transaction terminal (I12) and the journal
+/// replaying (I15).
+#[test]
+fn the_conformance_matrix_covers_unbind_and_cancel() {
+    let cat = catalog();
+    for call in ["unbind", "cancel"] {
+        let (_, id) = crate::conformance::MATRIX
+            .iter()
+            .find(|(c, _)| *c == call)
+            .unwrap_or_else(|| panic!("{call} is not in the conformance matrix"));
+        let entry = cat
+            .iter()
+            .find(|e| e.get("id").and_then(T::as_str) == Some(id))
+            .unwrap_or_else(|| panic!("{call}: no catalog entry {id}"));
+        for o in crate::conformance::OUTCOMES {
+            crate::conformance::injected(entry, call, *o).unwrap_or_else(|e| panic!("{call} × {o:?} ({id}): {e}"));
+        }
+    }
+}
