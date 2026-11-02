@@ -25,9 +25,15 @@ let
   # Units that admit a principal (§12d): ordered after planarian-ready.target.
   principalUnits =
     lib.optional config.services.openssh.enable "sshd.service"
-    ++ lib.optional (config.services.xserver.enable || config.services.displayManager.enable or false) "display-manager.service"
-    # P13: greetd is its own unit, not display-manager.service.
-    ++ lib.optional (config.services.greetd.enable or false) "greetd.service"
+    # P13: the display manager is whichever unit NixOS runs for it. greetd
+    # is its own unit, greetd.service; NixOS's greetd module aliases
+    # display-manager.service to it (and turns services.displayManager on),
+    # so ordering that name too would define a second, ExecStart-less
+    # display-manager.service that the alias link merely overwrites.
+    ++ (if config.services.greetd.enable or false then [ "greetd.service" ]
+        else lib.optional (config.services.xserver.enable || config.services.displayManager.enable or false) "display-manager.service")
+    # The template: greetd's module disables its autovt@tty1 instance, and
+    # ordering a disabled instance does nothing.
     ++ [ "user@.service" "getty@.service" "autovt@.service" ];
 
 

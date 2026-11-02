@@ -278,6 +278,16 @@ impl FileStore {
         Ok(FileStore { dir: dir.to_owned(), txn_dir: txn_dir.to_owned(), journal, capacity })
     }
 
+    /// §12 step 4: a transaction's fence directory is durable before the
+    /// journal records the transaction as Prepared. `replace_atomically`
+    /// fsyncs the directory the lease is in; the entry naming that
+    /// directory lives in `txn_dir`, so `txn_dir` is fsynced once it is
+    /// created. Without it a power loss could keep Prepared and lose the
+    /// fence (fails safe, as an unfenced transaction, but not §12's intent).
+    fn sync_txn_dir(&self) -> io::Result<()> {
+        std::fs::File::open(&self.txn_dir)?.sync_all()
+    }
+
     fn replace_atomically(&self, target: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write;
         let parent = target.parent().expect("target has a parent");
@@ -361,7 +371,10 @@ impl Store for FileStore {
 
     fn set_fence(&self, txn: TxnId, epoch: u64) -> io::Result<()> {
         let d = self.txn_dir.join(txn.0.to_string());
-        std::fs::create_dir_all(&d)?;
+        if !d.is_dir() {
+            std::fs::create_dir_all(&d)?;
+            self.sync_txn_dir()?;
+        }
         self.replace_atomically(&d.join("lease"), format!("{epoch}\n").as_bytes())
     }
 
@@ -369,6 +382,7 @@ impl Store for FileStore {
         std::fs::create_dir_all(&self.txn_dir)?;
         let d = self.txn_dir.join(txn.0.to_string());
         std::fs::create_dir(&d)?;
+        self.sync_txn_dir()?;
         self.replace_atomically(&d.join("lease"), format!("{epoch}\n").as_bytes())
     }
 
