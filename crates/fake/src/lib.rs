@@ -232,6 +232,9 @@ pub struct World {
     pub hold_released: BTreeMap<UnitId, Option<Timestamp>>,
     /// Fault injection: the next hold or lift fails this way.
     pub hold_fails: Option<String>,
+    /// Fault injection: something flushed the nftables ruleset, so the hold's
+    /// table is gone while holds are still in place (`/run` says held).
+    pub hold_table_flushed: bool,
     /// Fault injection (C6): the next candidate's store contents no longer
     /// hash to the NAR hash recorded when it was built.
     pub nar_mismatch: bool,
@@ -762,6 +765,20 @@ impl UnitBackend for Fake {
 
     fn end_release(&self, unit: &UnitId) -> Outcome {
         self.w().hold_released.remove(unit);
+        Outcome::Succeeded
+    }
+
+    fn hold_table_present(&self) -> Result<bool, Outcome> {
+        let w = self.w();
+        Ok(w.held.is_empty() || !w.hold_table_flushed)
+    }
+
+    fn reapply_hold(&self, unit: &UnitId) -> Outcome {
+        let mut w = self.w();
+        let now = w.now;
+        w.calls.push(Call { call: format!("reapply_hold({unit})"), op: NO_OP, at: now, fenced: false });
+        w.held.insert(unit.clone());
+        w.hold_table_flushed = false;
         Outcome::Succeeded
     }
 

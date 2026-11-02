@@ -754,6 +754,21 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
         let journaled = self.ledger().holds();
         let host = self.b.units().held();
+        // Anything else flushing the ruleset removes the hold's table while
+        // the units stay held: put it back (journal, alarm, re-apply).
+        let mut holding = journaled.clone();
+        if let Ok(h) = &host {
+            holding.extend(h.iter().cloned());
+        }
+        if !holding.is_empty() && !matches!(self.b.units().hold_table_present(), Ok(true)) {
+            for u in holding.iter().filter(|u| units.contains(u)) {
+                self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::Daemon });
+                self.notice(format!("ALARM: {u}: the network hold was removed from the firewall; re-applying it"));
+                if let o @ (Outcome::Failed(_) | Outcome::Unknown(_)) = self.b.units().reapply_hold(u) {
+                    self.notice(format!("ALARM: {u}: its traffic could not be held again ({o:?})"));
+                }
+            }
+        }
         for u in units {
             let in_journal = journaled.contains(&u);
             // None: the host cannot say; a failed unit is then held again

@@ -1575,3 +1575,36 @@ fn hold_release_needs_an_administrator() {
     let resp = r.core.handle(ADMIN, Request::HoldRelease { unit: UnitId::service("gym-web"), until: Until::NextBoot });
     assert!(matches!(resp, Response::Error { .. }), "no hold to release: {resp:?}");
 }
+
+/// §12d (#36 review): anything else flushing the ruleset removes the hold's
+/// table and would fail open. While a hold is active the daemon checks the
+/// table each tick and, if it is gone, journals, alarms and re-applies it.
+#[test]
+fn a_flushed_hold_table_is_put_back() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().units.get_mut(&sshd).unwrap().fail_on_start = true;
+    r.fake.w().signal(&sshd, 11);
+    r.ticks(2);
+    let applied = |r: &mut Rig| {
+        r.core
+            .ex
+            .kernel
+            .journal
+            .segment()
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(&e.record, Record::HoldApplied { unit, .. } if *unit == UnitId::service("sshd")))
+            .count()
+    };
+    let before = applied(&mut r);
+    assert!(before >= 1);
+    r.fake.w().hold_table_flushed = true;
+    r.ticks(1);
+    assert!(r.fake.w().calls.iter().any(|c| c.call == "reapply_hold(service:sshd)"), "re-applied");
+    assert!(!r.fake.w().hold_table_flushed);
+    assert_eq!(applied(&mut r), before + 1, "journaled");
+    assert!(r.core.notices.iter().any(|n| n.contains("removed from the firewall")), "{:?}", r.core.notices);
+    r.ticks(2);
+    assert_eq!(applied(&mut r), before + 1, "once, while the table stays");
+}

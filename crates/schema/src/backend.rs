@@ -145,6 +145,18 @@ pub trait UnitBackend {
     fn end_release(&self, _unit: &UnitId) -> Outcome {
         Outcome::Succeeded
     }
+    /// Whether the hold's nftables table is in place. Anything else that
+    /// flushes the ruleset (`nft flush ruleset`) removes it and would fail
+    /// open; the daemon checks this while a hold is active. An error means
+    /// "cannot say".
+    fn hold_table_present(&self) -> Result<bool, Outcome> {
+        Ok(true)
+    }
+    /// Build a unit's hold again (the table was removed under it): restart
+    /// its hold unit, since starting an active one does nothing.
+    fn reapply_hold(&self, unit: &UnitId) -> Outcome {
+        self.hold(unit)
+    }
 }
 
 pub trait GenerationBackend {

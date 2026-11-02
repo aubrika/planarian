@@ -52,6 +52,22 @@ pub fn apply(unit: &UnitId) -> Outcome {
     outcome("start", unit, run(&["systemctl", "start", &hold_unit(unit)], TIMEOUT))
 }
 
+pub fn reapply(unit: &UnitId) -> Outcome {
+    outcome("restart", unit, run(&["systemctl", "restart", &hold_unit(unit)], TIMEOUT))
+}
+
+/// The hold script's table (`table inet planarian-hold`).
+pub fn table_present() -> Result<bool, Outcome> {
+    let o = run(&["nft", "list", "table", "inet", "planarian-hold"], TIMEOUT);
+    if o.ok() {
+        Ok(true)
+    } else if !o.timed_out && o.stderr.contains("No such file or directory") {
+        Ok(false)
+    } else {
+        Err(Outcome::Failed(o.tail()))
+    }
+}
+
 pub fn lift(unit: &UnitId) -> Outcome {
     outcome("stop", unit, run(&["systemctl", "stop", &hold_unit(unit)], TIMEOUT))
 }
