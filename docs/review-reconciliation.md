@@ -145,3 +145,18 @@ Read #11 and its owner decision (P24, 1 Nov), this file, `nix/module.nix`,
 | module-eval | Asserts neither the greetd ordering, the posture's SSH group, nor the Exec flag. The SSH rule lives in the `respond` script (`AllowGroups ${adminGroup} root`), reachable at eval only through the script's text | the three assertions (reviewer's case first) |
 | P24 | `wireplumber` is in `userControllable.units` and has a canonical probe, but no default unit, so nothing watches it | declare it per the owner decision; assert in module-eval |
 | posture comment | `posture.nix` said in-budget restarts keep planariad activating, so the target stays up. Run 41288596484 shows otherwise: each SIGSEGV in vm-posture logs `Stopped target Planarian is ready` with no `OnFailure=`; in crash-slow-worker-overlap the SIGKILL drops the target and a restart of the restarting unit raises Absent through `ExecStopPost` (result `success`) | comment corrected; ordering unchanged (I20; any change is the coordinator's) |
+
+## lane-change-path (#10), reconciled 2026-11-02 at `47caca7`
+
+Owner decisions in force (issue #10 comments, 1 Nov): R06 follows §10 as
+written, with one `ProbeResult` variant allowed in `crates/schema`; P24
+declares wireplumber (lane-nix, #11).
+
+| Id | Status at `47caca7` | Evidence | Crosses lanes |
+| --- | --- | --- | --- |
+| C10 | open | `exec/src/derive.rs:46` folds `restart_disruption` with `max`; `Disruption`'s `Ord` (`schema/src/unit.rs:128`) ranks ConnectivityLoss over DataInterruption and DataInterruption over SessionLoss, so ConnectivityLoss + DataInterruption keeps only ConnectivityLoss and a seated user escapes the DataInterruption floor (§11) | yes: `DerivedFacts.disruption` is one `Disruption` in `schema/src/transition.rs:173` and in SPEC §5 (`pub disruption: Disruption`); read by `policy` (floors in `lib.rs` and the Verus `proofs.rs`), `daemon/src/render.rs`, `gym/src/metrics.rs`, `tray`, `txn` tests |
+| C19 | open | `touches_manifest` (`derive.rs:104`) compares `edges`, `sensitivity`, `restart_disruption`, `synonyms` and User probes of units present in both; not `desired`, `systemd_restart`, `startup_grace`, `runtime_repair`, `stops_are_faults`, added or removed units, nor `user_units` at all | no |
+| P21 | open | `gym/src/conformance.rs:20-21` says `cancel` and `unbind` are made by no fake-harness entry, and the matrix omits them; the "Journal fsync is durable" contract cannot fail because `MemStore::sync` (`txn/src/store.rs:167`) is a no-op and a drop loses nothing unsynced. The fake's `cancel` and `unbind` already honour `World::inject` (`fake/src/lib.rs:919`, `:1057`) | yes: `conformance.rs` is in `crates/gym`, `MemStore` in `crates/txn` |
+| R06 remainder | open | `run_batch_with` (`backends/linux/src/probe.rs:271`) maps a straggler to `ProbeResult::Timeout`; §10 says "recorded `Unknown` and abandoned" | yes: a new variant breaks the exhaustive match in `daemon/src/render.rs:99`, and `daemon/src/core.rs:1189`, `:1325` match `Timeout \| Error(_)` and must also take it |
+| P24 | decided | `share/canonical.json:81` keeps `wireplumber`; the declaration is lane-nix's (`nix/module.nix`) | lane-nix |
+| P10 remainder | open | `SideEffects::Measurement { per }` is read nowhere; the scheduler's `interval` (`state/src/lib.rs:174`) ignores it. §10 binds it to the cadence scheduler only; runs on request (`request`, `reprobe`, Checking's fresh assembler) are not rate-limited (reviewer, #18) | no |

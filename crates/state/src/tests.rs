@@ -171,3 +171,46 @@ fn second_session_of_one_uid_is_judged_on_its_own() {
     assert_eq!(s.status(&s1, &defs), UnitStatus::Running);
     assert_eq!(s.status(&s2, &defs), UnitStatus::Stopped);
 }
+
+/// P10, §10: "`per` enforced by the cadence scheduler". A Measurement probe
+/// on `EveryTick`, declared at one run per 30 s, runs on its cadence at most
+/// once per 30 s, and the unit stays judged between runs. A run on request
+/// (`request`, `reprobe`) is not the cadence and is not held back.
+#[test]
+fn a_measurement_probe_runs_at_most_once_per_its_per() {
+    let web = UnitId::service("gym-web");
+    let http = ProbeId("gym-web-http".into());
+    let per = Millis::secs(30);
+    let mut units = fixtures::gym_units();
+    for p in units.get_mut(&web).unwrap().probes.iter_mut().filter(|p| p.id == http) {
+        p.side_effects = SideEffects::Measurement { bytes_max: 4096, per };
+    }
+    let fake = gym_world(MemStore::new(1 << 20));
+    let mut a = Assembler::new(Manifest { units, user_units: fixtures::gym_user_units() }, fixtures::canonical());
+    let ran_at = |s: &SystemState| s.units[&web].1.iter().find(|e| e.probe == http).map(|e| e.at).unwrap();
+
+    // On its cadence alone.
+    let mut runs = vec![ran_at(&tick(&fake, &mut a).0)];
+    for n in 0..17 {
+        let (s, defs) = tick(&fake, &mut a);
+        assert_eq!(s.status(&web, &defs), UnitStatus::Running, "fresh between runs (tick {n})");
+        if ran_at(&s) != *runs.last().unwrap() {
+            runs.push(ran_at(&s));
+        }
+    }
+    assert!(runs.len() >= 3, "it still runs at its rate: {runs:?}");
+    for w in runs.windows(2) {
+        assert!(w[1].0 - w[0].0 >= per.0, "two cadence runs {} ms apart: {runs:?}", w[1].0 - w[0].0);
+    }
+    // On request, or a re-observe, right after a cadence run: it runs on the
+    // next tick, well inside the window.
+    let asks: [fn(&mut Assembler, &UnitId, &ProbeId); 2] = [|a, u, p| a.request(u, p), |a, u, _| a.reprobe(u)];
+    for ask in asks {
+        while ran_at(&tick(&fake, &mut a).0) != fake.w().now {}
+        let last = fake.w().now;
+        ask(&mut a, &web, &http);
+        let s = tick(&fake, &mut a).0;
+        assert_eq!(ran_at(&s), fake.w().now, "a requested run was held back");
+        assert!(ran_at(&s).0 - last.0 < per.0);
+    }
+}
