@@ -309,14 +309,19 @@ let
       condition)
         # ExecCondition (exit 0: hold; 1: skip, the unit stays inactive).
         #
-        # 1. An unexpired release stands: skip. The marker holds a Unix
-        #    time, or `boot` (/run never survives a reboot); anything else
-        #    is no release.
+        # 1. An unexpired release stands: skip. The marker is `boot` (until
+        #    the next boot; /run never survives one), or `<unix> <boottime>`:
+        #    the administrator's --until as wall-clock seconds, and the same
+        #    deadline in CLOCK_BOOTTIME seconds (/proc/uptime). It expires at
+        #    whichever passes first, so a stepped wall clock cannot lengthen
+        #    it. Anything else is no release: hold.
         m="$released/$unit"
         if [ -f "$m" ]; then
-          t="$(head -n1 "$m")"
-          if [ "$t" = boot ] || { case "$t" in ""|*[!0-9]*) false ;; esac && [ "$t" -gt "$(date +%s)" ]; }; then
-            log "hold on $unit not applied: released until $t"
+          read -r until deadline < "$m"
+          num() { case "''${1:-}" in ""|*[!0-9]*) return 1 ;; esac; }
+          if [ "$until" = boot ] || { num "$until" && num "$deadline" \
+               && [ "$until" -gt "$(date +%s)" ] && [ "$deadline" -gt "$(cut -d. -f1 /proc/uptime)" ]; }; then
+            log "hold on $unit not applied: released until $until"
             exit 1
           fi
         fi
