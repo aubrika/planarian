@@ -84,6 +84,8 @@ let
   isNetworkSecurity = name: u:
     u.kind == "service" && u.scope == "system"
     && ((builtins.elem "Security" u.sensitivity && builtins.elem "External" u.sensitivity)
+        # The one interim name, §12d's "or the firewall", pending the
+        # owner's classifier, which replaces this whole body (coordinator, Nov 2).
         || builtins.elem name [ "firewall" "nftables" ]);
   defaultDisruption = name:
     if builtins.elem name [ "display-manager" "greetd" "graphical-session" ] then "SessionLoss"
@@ -590,6 +592,7 @@ in
 
     services.planarian.holdUnits = lib.unique (
       lib.attrNames (lib.filterAttrs isNetworkSecurity cfg.units)
+      # The firewall, by name: the same interim name as in isNetworkSecurity.
       ++ lib.optional (config.networking.firewall.enable && !config.networking.nftables.enable) "firewall"
       ++ lib.optional config.networking.nftables.enable "nftables");
 
