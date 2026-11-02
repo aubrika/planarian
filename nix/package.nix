@@ -11,7 +11,13 @@ let
   netwatchLoader = builtins.pathExists ../crates/backends/netwatch/Cargo.toml;
   netwatchCrate = ../crates/backends/netwatch-ebpf;
   # The programs the loader attaches (lane-change-path's contract).
-  netwatchSections = [ ];
+  netwatchSections = [
+    "fentry/rtnetlink_rcv_msg"
+    "fentry/nfnetlink_rcv_msg"
+    "fentry/nfnetlink_rcv_batch"
+    "fentry/nf_setsockopt"
+    "fentry/genl_rcv_msg"
+  ];
   netwatchEbpf =
     if builtins.pathExists (netwatchCrate + "/Cargo.toml")
     then callPackage ./netwatch-ebpf.nix { sections = netwatchSections; src = lib.fileset.toSource { root = netwatchCrate; fileset = lib.fileset.difference netwatchCrate (lib.fileset.maybeMissing (netwatchCrate + "/target")); }; }
