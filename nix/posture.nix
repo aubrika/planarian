@@ -558,6 +558,9 @@ in
         ExecCondition = "${hold} released %i";
         ExecStart = "${hold} apply %i";
         ExecStop = "${hold} lift %i";
+        # Rebuild the table in place (after a flush), never lifting it: a
+        # restart would run lift then apply, passing traffic between them.
+        ExecReload = "${hold} reapply";
       };
     };
   }
