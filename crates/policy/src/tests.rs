@@ -55,6 +55,7 @@ fn facts(
         restarts_failed_unit: false,
         removes_sensitivity: Default::default(),
         removes: Default::default(),
+        restarts_held_unit: false,
         other_sessions_affected: flags & 32 != 0,
         affected_sessions: if flags & 64 != 0 { vec!["s1".into()] } else { vec![] },
         caller: Actor::Daemon,
@@ -212,6 +213,29 @@ fn restarting_a_failed_external_unit_does_not_ask() {
         revert_to: None,
     });
     assert!(!asks(&d), "{d:?}");
+    // A network-security unit that crashed (failed, not an unattributed stop)
+    // and whose traffic is held restarts at once (§12d); without the hold it
+    // still asks for Security.
+    let mut crashed =
+        facts(&[Sensitivity::Security, Sensitivity::External], Disruptions::default(), Recovery::Revertible, 0, None);
+    crashed.restarts_failed_unit = true;
+    let decide_with = |f: &DerivedFacts| {
+        decide(&Input {
+            transition: &restart,
+            facts: f,
+            known_good: st.known_good,
+            live_tested: st.live_tested,
+            cumulative: &ConfigDiff::default(),
+            authz: &admin,
+            settings: &Settings::default(),
+            tables: &tb,
+            locked: &locked,
+            revert_to: None,
+        })
+    };
+    assert!(asks(&decide_with(&crashed)), "a crashed Security unit with no hold asks");
+    crashed.restarts_held_unit = true;
+    assert!(!asks(&decide_with(&crashed)), "a crashed, held network-security unit restarts at once");
 }
 
 /// §11 Rollback row (owner decision, Nov 2): a rollback asks for what it would
