@@ -125,7 +125,10 @@ let
   isExec = p: builtins.isAttrs p.kind && p.kind ? Exec;
   # §12d "Network security fails closed": the hold, its OnFailure= wiring,
   # its re-application after nftables loads, and holdAllow in the export.
-  hold = cfg.services.planarian;
+  # The drop-ins' exact text without netwatch (the package may carry it;
+  # with it, each tool's drop-in also orders it after netwatch, checked on
+  # nwSys below).
+  hold = (sys.extendModules { modules = [ { services.planarian.package = pkgs.lib.mkForce (cfg.services.planarian.package // { netwatch = false; }); } ]; }).config.services.planarian;
   ownSet = import ../own-units.nix;
   # planarian-netwatch exists only with the netwatch package; its ordering
   # is read from the definition the module would make.
