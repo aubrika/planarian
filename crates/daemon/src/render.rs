@@ -128,11 +128,15 @@ pub fn facts_summary(f: &DerivedFacts) -> String {
     if f.sensitivity.contains(Sensitivity::UserData) {
         why.push("it touches user data".to_string());
     }
-    match f.disruption {
-        Disruption::SessionLoss => why.push("it would end your graphical session".into()),
-        Disruption::DataInterruption => why.push("it would interrupt a data service".into()),
-        Disruption::ConnectivityLoss => why.push("it would drop network connectivity".into()),
-        _ => {}
+    // Every kind of disruption the change carries (C10).
+    if f.disruption.session_loss {
+        why.push("it would end your graphical session".into());
+    }
+    if f.disruption.data_interruption {
+        why.push("it would interrupt a data service".into());
+    }
+    if f.disruption.connectivity_loss {
+        why.push("it would drop network connectivity".into());
     }
     if f.recovery == Recovery::NonReversible {
         why.push("it cannot be undone".into());

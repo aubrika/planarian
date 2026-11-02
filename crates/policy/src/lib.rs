@@ -28,9 +28,9 @@
 )]
 
 use planarian_schema::{
-    Actor, ApproverClass, Authorization, Capabilities, ChangeId, ConfigDiff, Decision, DerivedFacts, Disruption,
-    GenerationId, Grant, Hash, ModelId, PolicyVersion, PrincipalId, Recovery, RejectReason, Scope, Sensitivities, Tier,
-    Transition, UnitId,
+    Actor, ApproverClass, Authorization, Capabilities, ChangeId, ConfigDiff, Decision, DerivedFacts, GenerationId,
+    Grant, Hash, ModelId, PolicyVersion, PrincipalId, Recovery, RejectReason, Scope, Sensitivities, Tier, Transition,
+    UnitId,
 };
 use serde::{Deserialize, Serialize};
 use vstd::prelude::*;
@@ -607,11 +607,15 @@ pub open spec fn base_spec(i: Input) -> Decision {
 /// non-reversible; session or data loss unless the user's own session;
 /// connectivity loss unless a user with a seat; a session or connectivity loss
 /// reaching another uid's session unless an administrator.
+///
+/// The disruption is a set (C10): each floor applies when any member triggers
+/// it, so a change carrying two kinds meets both floors.
 pub open spec fn floor_spec(f: DerivedFacts, a: Authorization) -> bool {
-    f.recovery == Recovery::NonReversible || ((f.disruption == Disruption::SessionLoss || f.disruption
-        == Disruption::DataInterruption) && !(is_user(a.actor) && own_session(a.actor, f))) || (f.disruption
-        == Disruption::ConnectivityLoss && !is_local(a.actor)) || (f.other_sessions_affected && (f.disruption
-        == Disruption::SessionLoss || f.disruption == Disruption::ConnectivityLoss) && !is_admin(a))
+    f.recovery == Recovery::NonReversible || ((f.disruption.session_loss || f.disruption.data_interruption)
+        && !(is_user(a.actor) && own_session(a.actor, f))) || (f.disruption.connectivity_loss && !is_local(
+        a.actor,
+    )) || (f.other_sessions_affected && (f.disruption.session_loss || f.disruption.connectivity_loss)
+        && !is_admin(a))
 }
 
 /// I11: this change's diff, or the session's cumulative diff, is non-Routine.
@@ -842,18 +846,9 @@ fn floors(f: &DerivedFacts, a: &Authorization) -> (r: bool)
         Recovery::NonReversible => true,
         _ => false,
     };
-    let session = match f.disruption {
-        Disruption::SessionLoss | Disruption::DataInterruption => true,
-        _ => false,
-    };
-    let connectivity = match f.disruption {
-        Disruption::ConnectivityLoss => true,
-        _ => false,
-    };
-    let reaches_others = match f.disruption {
-        Disruption::SessionLoss | Disruption::ConnectivityLoss => f.other_sessions_affected,
-        _ => false,
-    };
+    let session = f.disruption.session_loss || f.disruption.data_interruption;
+    let connectivity = f.disruption.connectivity_loss;
+    let reaches_others = f.other_sessions_affected && (f.disruption.session_loss || f.disruption.connectivity_loss);
     non_reversible || (session && !(user && own_session_exec(&a.actor, f))) || (connectivity && !is_local_exec(
         &a.actor,
     )) || (reaches_others && !is_admin_exec(a))

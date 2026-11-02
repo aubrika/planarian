@@ -134,7 +134,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
     let mut f = DerivedFacts {
         affected_units: Vec::new(),
         sensitivity: Sensitivities::of(&[Sensitivity::Routine]),
-        disruption: Disruption::None,
+        disruption: Disruptions::default(),
         recovery: Recovery::Idempotent,
         touches_manifest: false,
         touches_canonical_probe: false,
@@ -151,7 +151,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         f.affected_units = unit_set(one(u));
         let (s, d) = unit_facts(&f.affected_units, i.defs, &i.base.services);
         f.sensitivity = s;
-        f.disruption = d;
+        f.disruption = Disruptions::of(d);
         f.recovery = recovery;
         f.touches_core = f.sensitivity.contains(Sensitivity::Core);
     };
@@ -168,7 +168,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             OverrideDesired::LeaveAlone => {
                 unit_op(&mut f, &s.unit, Recovery::Idempotent);
                 f.affected_units = vec![s.unit.clone()];
-                f.disruption = Disruption::None;
+                f.disruption = Disruptions::default();
             }
             OverrideDesired::Stopped | OverrideDesired::Absent | OverrideDesired::Detected => {
                 unit_op(&mut f, &s.unit, Recovery::Revertible)
@@ -177,12 +177,16 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         Transition::LiftOverride(u) => {
             unit_op(&mut f, u, Recovery::Idempotent);
             f.affected_units = vec![u.clone()];
-            f.disruption = Disruption::None;
+            f.disruption = Disruptions::default();
         }
         Transition::BindDriver { device, .. } => unit_op(&mut f, device, Recovery::Revertible),
         Transition::SetRuntimeOption { path, .. } => {
             f.sensitivity = i.tables.option_sensitivity(&format!("runtime.{path}"));
-            f.disruption = if path == "wifi.network" { Disruption::ConnectivityLoss } else { Disruption::None };
+            f.disruption = if path == "wifi.network" {
+                Disruptions::of(Disruption::ConnectivityLoss)
+            } else {
+                Disruptions::default()
+            };
             f.recovery = Recovery::Revertible;
         }
         Transition::CollectGarbage { .. } | Transition::Resolve { .. } => {}
@@ -211,7 +215,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             services.extend(cand.services.iter().map(|(k, v)| (k.clone(), *v)));
             let (s, d) = unit_facts(&affected, &all_defs, &services);
             f.sensitivity = s.union(&i.tables.diff_sensitivity(&config));
-            f.disruption = d;
+            f.disruption = Disruptions::of(d);
             f.touches_manifest = touches_manifest(&base_m, &cand_m, &config);
             f.touches_canonical_probe = touches_canonical(&base_m, &cand_m, i.canonical);
             f.changes_desired = changes_desired(&base_m, &cand_m);
@@ -263,8 +267,7 @@ pub fn unexplained(
 /// every session.
 pub fn session_facts(f: &mut DerivedFacts, sessions: &[SessionInfo]) {
     let live: Vec<&SessionInfo> = sessions.iter().filter(|s| s.establishes()).collect();
-    let disruptive =
-        matches!(f.disruption, Disruption::SessionLoss | Disruption::ConnectivityLoss | Disruption::DataInterruption);
+    let disruptive = f.disruption.session_loss || f.disruption.connectivity_loss || f.disruption.data_interruption;
     let mut hit: BTreeSet<String> = BTreeSet::new();
     let mut system = false;
     for u in &f.affected_units {
@@ -281,7 +284,7 @@ pub fn session_facts(f: &mut DerivedFacts, sessions: &[SessionInfo]) {
     }
     let caller = f.caller.uid();
     f.other_sessions_affected = system
-        && matches!(f.disruption, Disruption::SessionLoss | Disruption::ConnectivityLoss)
+        && (f.disruption.session_loss || f.disruption.connectivity_loss)
         && live.iter().any(|x| Some(x.uid) != caller);
     f.affected_sessions = hit.into_iter().collect();
 }
