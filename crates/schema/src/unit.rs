@@ -652,6 +652,11 @@ pub enum ProbeResult {
     Fail(String),
     Timeout,
     Error(String),
+    /// Still running, or not yet started, when the batch deadline passed
+    /// (§10): recorded Unknown and abandoned. Not `Timeout`, which is a probe
+    /// past its own deadline, so a probe that only waited behind a wedged one
+    /// is not blamed for it.
+    Abandoned,
 }
 
 /// `probe` is not in §8; status derivation cannot match evidence to probes without it (G11).

@@ -1186,7 +1186,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                             .filter(|p| p.role == ProbeRole::Readiness)
                             .filter(|p| {
                                 !ev.iter().any(|e| {
-                                    e.probe == p.id && matches!(e.result, ProbeResult::Timeout | ProbeResult::Error(_))
+                                    e.probe == p.id
+                                        && matches!(
+                                            e.result,
+                                            ProbeResult::Timeout | ProbeResult::Abandoned | ProbeResult::Error(_)
+                                        )
                                 })
                             })
                             .map(|p| p.id.0.clone())
@@ -1322,7 +1326,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             let timing_out: Vec<String> = match (s.status(id, defs), s.units.get(id)) {
                 (UnitStatus::Unknown, Some((_, ev))) => ev
                     .iter()
-                    .filter(|e| matches!(e.result, ProbeResult::Timeout | ProbeResult::Error(_)))
+                    .filter(|e| {
+                        matches!(e.result, ProbeResult::Timeout | ProbeResult::Abandoned | ProbeResult::Error(_))
+                    })
                     .map(|e| e.probe.0.clone())
                     .collect(),
                 _ => vec![],
