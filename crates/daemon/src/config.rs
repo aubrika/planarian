@@ -252,6 +252,46 @@ mod tests {
         assert!(c.contains_key("sshd") && c.contains_key("graphical-session") && c.contains_key("fs-journal"));
     }
 
+    /// P24 (#28 review): the shipped canonical map keys wireplumber's probe
+    /// by name (`"wireplumber"`), and the module declares wireplumber as the
+    /// user template `service@0:wireplumber`. The assembler matches by name,
+    /// so the template, and each session's instance of it, carries
+    /// `wireplumber-active` as a Canonical probe.
+    #[test]
+    fn shipped_canonical_probe_reaches_the_wireplumber_user_unit() {
+        use planarian_schema::{ProbeId, ProbeOrigin, SessionInfo, Timestamp, UnitId};
+        let text = include_str!("../../../share/canonical.json");
+        let canonical: BTreeMap<String, Vec<ProbeDef>> = serde_json::from_str(text).unwrap();
+        let template: UnitId = "service@0:wireplumber".parse().unwrap();
+        let mut def = planarian_fake::fixtures::gym_user_units().into_iter().next().expect("a user unit fixture");
+        def.id = template.clone();
+        def.probes.clear();
+        let manifest = planarian_schema::txn::Manifest { units: Default::default(), user_units: vec![def] };
+        let mut asm = planarian_state::Assembler::new(manifest, canonical);
+        let active = ProbeId("wireplumber-active".into());
+        let has_it = |d: &planarian_schema::UnitDef| {
+            d.probes.iter().any(|p| p.id == active && p.origin == ProbeOrigin::Canonical)
+        };
+        let t = asm.manifest().user_units.iter().find(|d| d.id == template).expect("the template");
+        assert!(has_it(t), "template probes: {:?}", t.probes);
+
+        // Instantiated for a user with an established session.
+        asm.sessions = vec![SessionInfo {
+            id: "s1".into(),
+            uid: 1000,
+            class: "user".into(),
+            seat: Some("seat0".into()),
+            remote: false,
+            created: Timestamp(0),
+            active: true,
+            idle: false,
+        }];
+        let defs = asm.defs();
+        let inst = defs.values().find(|d| d.id.name == "wireplumber").expect("an instance for uid 1000");
+        assert!(matches!(inst.id.scope, planarian_schema::Scope::User { uid: 1000, .. }), "{:?}", inst.id);
+        assert!(has_it(inst), "instance probes: {:?}", inst.probes);
+    }
+
     #[test]
     fn default_config_roundtrips() {
         let c = FileConfig::default();

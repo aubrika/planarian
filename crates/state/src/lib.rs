@@ -177,12 +177,16 @@ impl Assembler {
             Cadence::Every(d) => d,
             Cadence::OnDemand => return None,
         };
-        Some(if p.cost == ProbeCost::WakesHardware {
+        let base = if p.cost == ProbeCost::WakesHardware {
             let floor = if self.on_battery { HARDWARE_CADENCE_BATTERY } else { HARDWARE_CADENCE };
             Millis(base.0.max(floor.0))
         } else {
             base
-        })
+        };
+        // §10: "`per` enforced by the cadence scheduler". A Measurement probe's
+        // cadence is never faster than its declared rate. Runs on request
+        // (`request`, `reprobe`) are not held back by it.
+        Some(Millis(base.0.max(per(p).map_or(0, |m| m.0))))
     }
 
     fn stale_after(&self, p: &ProbeDef) -> Millis {
@@ -464,6 +468,15 @@ impl Assembler {
             core_hash: ctx.core_hash,
             observed_at: now,
         }
+    }
+}
+
+/// A Measurement probe's declared rate (§10): its cadence runs at most once
+/// per `per`.
+fn per(p: &ProbeDef) -> Option<Millis> {
+    match p.side_effects {
+        planarian_schema::SideEffects::Measurement { per, .. } if per.0 > 0 => Some(per),
+        _ => None,
     }
 }
 
