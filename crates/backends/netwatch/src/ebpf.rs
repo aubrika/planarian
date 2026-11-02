@@ -19,6 +19,9 @@ pub const HOOK_GENL: u32 = 3;
 pub const HOOK_NFBATCH: u32 = 4;
 /// `nf_setsockopt`: a legacy table change; `data` is `pf` then the option.
 pub const HOOK_SOCKOPT: u32 = 5;
+/// `register_netdevice`: an interface registered, of any kind; `data` is
+/// its name, `netns` its own.
+pub const HOOK_NETDEV: u32 = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {

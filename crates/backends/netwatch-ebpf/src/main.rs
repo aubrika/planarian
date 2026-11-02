@@ -35,6 +35,7 @@ pub const HOOK_NFNETLINK: u32 = 2;
 pub const HOOK_GENL: u32 = 3;
 pub const HOOK_NFBATCH: u32 = 4;
 pub const HOOK_SOCKOPT: u32 = 5;
+pub const HOOK_NETDEV: u32 = 6;
 
 #[repr(C)]
 pub struct Event {
@@ -259,6 +260,57 @@ pub fn sockopt(ctx: FEntryContext) -> u32 {
         (*ev).data[5] = v[1];
         (*ev).data[6] = v[2];
         (*ev).data[7] = v[3];
+    }
+    entry.submit(0);
+    0
+}
+
+/// Where `register_netdevice` finds the device's name and netns, set by
+/// the loader from BTF: `net_device.name`, `net_device.nd_net.net`.
+#[unsafe(no_mangle)]
+static NETDEV_NAME: u32 = 0;
+#[unsafe(no_mangle)]
+static NETDEV_NET: u32 = 0;
+
+/// Every interface the kernel registers, of every kind, in its creator's
+/// context: a tun or tap made by `ioctl(TUNSETIFF)` (classic OpenVPN,
+/// wireguard-go, tailscaled), which no netlink message announces, as well
+/// as netlink-made links (veth, wireguard, dummy). `data` is the name
+/// (`IFNAMSIZ`, NUL-terminated); `netns` the device's own netns.
+#[fentry(function = "register_netdevice")]
+pub fn netdev(ctx: FEntryContext) -> u32 {
+    let dev: *const u8 = ctx.arg(0);
+    let (name_off, net_off, inum) = unsafe {
+        (core::ptr::read_volatile(&NETDEV_NAME), core::ptr::read_volatile(&NETDEV_NET), core::ptr::read_volatile(&NETNS_NET_INUM))
+    };
+    let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
+        if let Some(n) = LOST.get_ptr_mut(0) {
+            unsafe { *n += 1 };
+        }
+        return 0;
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).cgroup = bpf_get_current_cgroup_id();
+        (*ev).tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).hook = HOOK_NETDEV;
+        (*ev).netns = 0;
+        if name_off != 0 && !dev.is_null() {
+            let net = read_ptr(dev, net_off);
+            if !net.is_null() {
+                let mut b = [0u8; 4];
+                if bpf_probe_read_kernel_buf(net.wrapping_add(inum as usize), &mut b).is_ok() {
+                    (*ev).netns = u32::from_ne_bytes(b);
+                }
+            }
+        }
+        cgroup_path(ev);
+        let data = &mut (*ev).data;
+        let ok = name_off != 0
+            && !dev.is_null()
+            && bpf_probe_read_kernel_buf(dev.wrapping_add(name_off as usize), &mut data[..16]).is_ok();
+        (*ev).len = 16;
+        (*ev).captured = if ok { 16 } else { 0 };
     }
     entry.submit(0);
     0

@@ -17,12 +17,16 @@ pub enum Kind {
 /// nftables sends its changes as a batch, which `nfnetlink_rcv_batch`
 /// dispatches itself, never through `nfnetlink_rcv_msg`; legacy iptables
 /// and its kin use `setsockopt`, all through `nf_setsockopt`.
-pub const PROBES: [(&str, &str, Kind); 5] = [
+/// `register_netdevice` sees every interface registered, in its creator's
+/// context, including a tun made by ioctl, which no netlink message
+/// announces (coordinator, Nov 2).
+pub const PROBES: [(&str, &str, Kind); 6] = [
     ("rtnetlink", "rtnetlink_rcv_msg", Kind::FEntry),
     ("nfnetlink", "nfnetlink_rcv_msg", Kind::KProbe),
     ("nfbatch", "nfnetlink_rcv_batch", Kind::KProbe),
     ("sockopt", "nf_setsockopt", Kind::FEntry),
     ("genl", "genl_rcv_msg", Kind::FEntry),
+    ("netdev", "register_netdevice", Kind::FEntry),
 ];
 
 /// Why the watch could not start (crate docs, "Starting"): an unusable
@@ -92,7 +96,7 @@ pub fn check_object(bytes: &[u8]) -> Result<(), String> {
     // The netns offsets the loader sets (an object from before them would
     // read every netns as 0: everything unattributed). Their names are in
     // the ELF string table, NUL-terminated.
-    for g in NETNS_GLOBALS.iter().chain(&CG_GLOBALS) {
+    for g in NETNS_GLOBALS.iter().chain(&CG_GLOBALS).chain(&NETDEV_GLOBALS) {
         let name = [g.as_bytes(), b"\0"].concat();
         if !bytes.windows(name.len()).any(|w| w == name) {
             missing.push(g);
@@ -104,6 +108,7 @@ pub fn check_object(bytes: &[u8]) -> Result<(), String> {
 /// The globals the loader sets from the kernel's BTF before load.
 pub const NETNS_GLOBALS: [&str; 3] = ["NETNS_SKB_SK", "NETNS_SK_NET", "NETNS_NET_INUM"];
 pub const CG_GLOBALS: [&str; 5] = ["CG_TASK_CGROUPS", "CG_CSS_DFL", "CG_CGROUP_KN", "CG_KN_NAME", "CG_KN_PARENT"];
+pub const NETDEV_GLOBALS: [&str; 2] = ["NETDEV_NAME", "NETDEV_NET"];
 
 /// `<prefix>/share/planarian/netwatch.bpf.o`, next to the running binary.
 pub fn default_object() -> String {
@@ -129,6 +134,7 @@ pub fn load_bytes(bytes: &[u8]) -> Result<Ebpf, Start> {
     let raw = std::fs::read("/sys/kernel/btf/vmlinux").map_err(|e| kernel(format!("kernel BTF: {e}")))?;
     let parsed = crate::btf::Btf::parse(&raw).map_err(kernel)?;
     let off = crate::btf::NetnsOffsets::from_btf(&parsed).map_err(kernel)?;
+    let dev = crate::btf::NetdevOffsets::from_btf(&parsed).map_err(kernel)?;
     // The cgroup names are a help, not a need: without them (0s), userspace
     // attributes by cgroup id alone.
     let cg = crate::btf::CgroupOffsets::from_btf(&parsed).unwrap_or(crate::btf::CgroupOffsets {
@@ -147,6 +153,8 @@ pub fn load_bytes(bytes: &[u8]) -> Result<Ebpf, Start> {
         .set_global(CG_GLOBALS[2], &cg.cgroup_kn, true)
         .set_global(CG_GLOBALS[3], &cg.kn_name, true)
         .set_global(CG_GLOBALS[4], &cg.kn_parent, true)
+        .set_global(NETDEV_GLOBALS[0], &dev.name, true)
+        .set_global(NETDEV_GLOBALS[1], &dev.net, true)
         .load(bytes)
         .map_err(|e| kernel(format!("load the object: {e}")))?;
     let btf = Btf::from_sys_fs().map_err(|e| kernel(format!("kernel BTF: {e}")))?;
@@ -238,7 +246,7 @@ pub fn notify_ready(socket: Option<&Path>) {
 }
 
 pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> Result<(), String> {
-    use crate::host::{boottime_secs, expand_tools, network_tools, read_ifnames, unit_of_cgroup};
+    use crate::host::{boottime_secs, expand_tools, network_tools, read_ifnames, read_virtual_ifaces, unit_of_cgroup};
     use crate::parse::take;
     use crate::{Tracker, WatchState};
     use std::sync::Arc;
@@ -311,6 +319,8 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         let names = read_ifnames();
         let (standing, virtual_ifaces) = crate::snapshot::standing(&mut |i| names.get(&i).cloned())
             .map_err(|e| Start::Kernel(format!("snapshot: {e}")))?;
+        let mut virtual_ifaces = virtual_ifaces;
+        virtual_ifaces.extend(read_virtual_ifaces(Path::new("/sys/class/net")));
         let tracker = Tracker::attach(&crate::read_claims(dir), &standing, &virtual_ifaces);
         Ok((ebpf, ring, lost_map, tracker))
     };
@@ -362,6 +372,7 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         if Instant::now() >= next_tick {
             next_tick += Duration::from_secs(crate::TICK_SECS);
             let Some(now) = boottime_secs() else { return fail("no /proc/uptime".into()) };
+            tracker.set_virtual(read_virtual_ifaces(Path::new("/sys/class/net")));
             let claims = tracker.claims();
             let running = cgroups.walk(&claims.units());
             let view = tracker.view(WatchState::Attached { at: now }, &expand_tools(&tools, &running), now);

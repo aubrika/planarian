@@ -4,7 +4,7 @@
 //! is reported as [`Parsed::Unreadable`], which marks the sender's
 //! footprint `unattributed` (fail closed).
 
-use crate::ebpf::{Event, HOOK_GENL, HOOK_NFBATCH, HOOK_NFNETLINK, HOOK_RTNETLINK, HOOK_SOCKOPT};
+use crate::ebpf::{Event, HOOK_GENL, HOOK_NETDEV, HOOK_NFBATCH, HOOK_NFNETLINK, HOOK_RTNETLINK, HOOK_SOCKOPT};
 use crate::model::{Change, ChangeKind, Owner};
 
 const NLM_F_CREATE: u16 = 0x400;
@@ -143,6 +143,22 @@ pub fn take(
 /// The changes in `ev`, made by `owner`. `ifname` names an interface index.
 pub fn parse(ev: &Event, owner: &Owner, ifname: &mut dyn FnMut(u32) -> Option<String>) -> Parsed {
     let b = &ev.data;
+    if ev.hook == HOOK_NETDEV {
+        // An interface registered in its creator's context: how a tun made
+        // by ioctl is seen at all (no netlink message announces it).
+        let name = cstr(b);
+        if name.is_empty() {
+            return Parsed::Unreadable("an interface registered without a readable name".into());
+        }
+        return Parsed::Changes(vec![Change {
+            owner: owner.clone(),
+            kind: ChangeKind::Interface,
+            object: name.clone(),
+            iface: Some(name),
+            steers: false,
+            removed: false,
+        }]);
+    }
     if ev.hook == HOOK_SOCKOPT {
         // A legacy table replaced (or its counters set) through setsockopt:
         // fail closed, like an nftables batch. The object names the family.

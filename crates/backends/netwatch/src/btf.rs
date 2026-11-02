@@ -40,6 +40,8 @@ struct Ty {
     /// The referenced type (typedef, const, volatile, pointer) or the size
     /// in bytes (int, enum, struct, union, float), by kind.
     refers: u32,
+    /// An array's element count (its element type is `refers`).
+    nelems: u32,
     members: Vec<Member>,
 }
 
@@ -63,7 +65,7 @@ impl Btf {
         let (str_off, str_len) = (u32_at(b, 16)? as usize, u32_at(b, 20)? as usize);
         let types_b = b.get(hdr + type_off..hdr + type_off + type_len).ok_or("BTF: type section out of range")?;
         let strings = b.get(hdr + str_off..hdr + str_off + str_len).ok_or("BTF: string section out of range")?.to_vec();
-        let mut types = vec![Ty { name: 0, kind: 0, refers: 0, members: vec![] }];
+        let mut types = vec![Ty { name: 0, kind: 0, refers: 0, nelems: 0, members: vec![] }];
         let mut at = 0;
         while at < types_b.len() {
             let (name, info, size_or_type) = (u32_at(types_b, at)?, u32_at(types_b, at + 4)?, u32_at(types_b, at + 8)?);
@@ -72,9 +74,16 @@ impl Btf {
             let kind = (info >> 24) & 0x1f;
             let kind_flag = info >> 31 == 1;
             let mut members = Vec::new();
+            let mut refers = size_or_type;
+            let mut nelems = 0;
             let extra = match kind {
                 KIND_INT | KIND_VAR | KIND_DECL_TAG => 4,
-                KIND_ARRAY => 12,
+                KIND_ARRAY => {
+                    // struct btf_array { type, index_type, nelems }
+                    refers = u32_at(types_b, at)?;
+                    nelems = u32_at(types_b, at + 8)?;
+                    12
+                }
                 KIND_STRUCT | KIND_UNION => {
                     for i in 0..vlen {
                         let m = at + 12 * i;
@@ -89,7 +98,7 @@ impl Btf {
                 _ => 0,
             };
             at += extra;
-            types.push(Ty { name, kind, refers: size_or_type, members });
+            types.push(Ty { name, kind, refers, nelems, members });
         }
         Ok(Btf { types, strings })
     }
@@ -134,9 +143,17 @@ impl Btf {
 
     /// The size in bytes of type `id`, where it has one.
     fn size(&self, id: u32) -> Option<u32> {
+        self.size_at(id, 0)
+    }
+
+    fn size_at(&self, id: u32, depth: usize) -> Option<u32> {
+        if depth > DEPTH {
+            return None;
+        }
         let t = self.resolve(id)?;
         match t.kind {
             KIND_PTR => Some(8),
+            KIND_ARRAY => self.size_at(t.refers, depth + 1)?.checked_mul(t.nelems),
             KIND_INT | KIND_ENUM | KIND_ENUM64 | KIND_STRUCT | KIND_UNION | KIND_FLOAT => Some(t.refers),
             _ => None,
         }
@@ -215,6 +232,23 @@ impl CgroupOffsets {
             cgroup_kn: btf.offset("cgroup", &["kn"])?,
             kn_name: btf.offset("kernfs_node", &["name"])?,
             kn_parent: btf.offset("kernfs_node", &["__parent"]).or_else(|_| btf.offset("kernfs_node", &["parent"]))?,
+        })
+    }
+}
+
+/// Where the `register_netdevice` probe finds the new device's name and
+/// netns: `net_device.name` (`char[IFNAMSIZ]`) and `net_device.nd_net.net`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetdevOffsets {
+    pub name: u32,
+    pub net: u32,
+}
+
+impl NetdevOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<NetdevOffsets, String> {
+        Ok(NetdevOffsets {
+            name: btf.offset("net_device", &["name"])?,
+            net: btf.offset("net_device", &["nd_net", "net"])?,
         })
     }
 }

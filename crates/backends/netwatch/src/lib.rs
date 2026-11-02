@@ -81,6 +81,19 @@
 //! The probes attach before the snapshot is taken, so a change racing it is
 //! seen as an event too (applying it twice changes nothing).
 //!
+//! **Interfaces.** "An interface it created" is seen at
+//! `register_netdevice`, which runs in the creator's context for every
+//! kind: a tun or tap made by `ioctl(TUNSETIFF)` (classic OpenVPN,
+//! wireguard-go, tailscaled), which no netlink message announces, as well
+//! as netlink-made links, whose RTM_NEWLINK is a second witness. Only a
+//! *virtual* link can be one a tool created; virtual is read live each
+//! tick (`/sys/class/net/<if>` under `/sys/devices/virtual/`), so a tun made
+//! by ioctl or a link moved in from another netns is never taken for a
+//! physical NIC. And (coordinator, Nov 2; the owner is told, since §12d
+//! says "it created") a unit's own steering route over a virtual link that
+//! another unit created makes it protecting too, as well as the creator:
+//! OpenVPN on a persistent tun a setup unit made, both hold.
+//!
 //! **Protecting** means the footprint includes, now: an interface the unit
 //! created that carries a default or all-covering route (a `/0` or `/1`, in
 //! any table, whoever added the route); a policy rule that catches all
@@ -147,8 +160,8 @@
 //!   `loader::RETRY_SECS` (30 s), rewriting the reason each time. The
 //!   first attach that succeeds reconciles (above) and writes `attached`.
 //!
-//! Probes: `rtnetlink_rcv_msg`, `nf_setsockopt` and `genl_rcv_msg` are built
-//! in, so fentry (they need vmlinux's BTF); `nfnetlink_rcv_msg` and
+//! Probes: `rtnetlink_rcv_msg`, `nf_setsockopt`, `genl_rcv_msg` and
+//! `register_netdevice` are built in, so fentry (they need vmlinux's BTF); `nfnetlink_rcv_msg` and
 //! `nfnetlink_rcv_batch` are in the `nfnetlink` module (`=m` on NixOS
 //! kernels), so kprobes by symbol, which need the module loaded: the
 //! initrd loads it (`boot.kernelModules`), since netwatch starts early in

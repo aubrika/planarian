@@ -951,6 +951,8 @@ mod btf {
         assert!(o.skb_sk >= 16 && o.sk_net >= 16 && o.net_inum >= 16, "{o:?}");
         let c = crate::btf::CgroupOffsets::from_btf(&Btf::parse(&bytes).unwrap()).unwrap();
         assert!(c.task_cgroups > 0 && c.kn_name > 0, "{c:?}");
+        let n = crate::btf::NetdevOffsets::from_btf(&Btf::parse(&bytes).unwrap()).unwrap();
+        assert!(n.name > 0 && n.net > 0 && n.name != n.net, "{n:?}");
     }
 
     #[test]
@@ -1018,6 +1020,7 @@ mod btf {
                 if let Ok(btf) = Btf::parse(&b) {
                     let _ = NetnsOffsets::from_btf(&btf);
                     let _ = crate::btf::CgroupOffsets::from_btf(&btf);
+                    let _ = crate::btf::NetdevOffsets::from_btf(&btf);
                     let _ = btf.offset("sk_buff", &["sk", "x", "y"]);
                 }
             }
@@ -1166,5 +1169,155 @@ mod namespaces {
         assert!(!clean(&t), "no mover known: unattributed for all");
         assert_eq!(scope(&msg(CONTAINER, 16, 0x1, &new_link("wg1")), HOST), Scope::Elsewhere);
         assert_eq!(scope(&msg(HOST, 16, 0x1, &new_link("wg1")), HOST), Scope::Host);
+    }
+}
+
+/// Interfaces of every kind (coordinator, Nov 2): `register_netdevice`
+/// sees a tun made by ioctl, which no netlink message announces; "virtual"
+/// is read live from sysfs; and a unit routing over another unit's virtual
+/// link protects as well.
+mod interfaces {
+    use crate::ebpf::{Event, HOOK_NETDEV, HOOK_RTNETLINK};
+    use crate::parse::{Parsed, parse, take};
+    use crate::{Owner, Tracker, WatchState};
+    use planarian_schema::UnitId;
+    use std::collections::BTreeSet;
+
+    const HOST: u32 = 0xF000_0000;
+    const NOW: u64 = 100;
+
+    fn registered(name: &str, netns: u32) -> Event {
+        let mut data = name.as_bytes().to_vec();
+        data.resize(16, 0);
+        Event { cgroup: 1, tgid: 2, hook: HOOK_NETDEV, len: 16, netns, cgpath: None, data }
+    }
+
+    fn attr(ty: u16, v: &[u8]) -> Vec<u8> {
+        let mut a = ((4 + v.len()) as u16).to_ne_bytes().to_vec();
+        a.extend(ty.to_ne_bytes());
+        a.extend(v);
+        a
+    }
+
+    /// RTM_NEWROUTE `dst/len` over `oif`.
+    fn route(dst: [u8; 4], len: u8, oif: u32) -> Event {
+        let mut body = vec![2u8, len, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0];
+        if len > 0 {
+            body.extend(attr(1, &dst));
+        }
+        body.extend(attr(4, &oif.to_ne_bytes()));
+        let mut d = ((16 + body.len()) as u32).to_ne_bytes().to_vec();
+        d.extend(24u16.to_ne_bytes());
+        d.extend(0x400u16.to_ne_bytes());
+        d.extend([0u8; 8]);
+        d.extend(body);
+        Event { cgroup: 1, tgid: 2, hook: HOOK_RTNETLINK, len: d.len() as u32, netns: HOST, cgpath: None, data: d }
+    }
+
+    fn names(i: u32) -> Option<String> {
+        match i {
+            9 => Some("tun0".into()),
+            2 => Some("eth0".into()),
+            _ => None,
+        }
+    }
+
+    fn by(u: &UnitId) -> impl FnOnce() -> Option<UnitId> + '_ {
+        move || Some(u.clone())
+    }
+
+    fn set(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Classic OpenVPN: tun0 by ioctl, then 0/1 and 128/1 over it.
+    #[test]
+    fn a_tun_made_by_ioctl_protects() {
+        let vpn = UnitId::service("openvpn-work");
+        let mut t = Tracker::default();
+        take(&mut t, &registered("tun0", HOST), HOST, by(&vpn), &mut names);
+        take(&mut t, &route([0, 0, 0, 0], 1, 9), HOST, by(&vpn), &mut names);
+        take(&mut t, &route([128, 0, 0, 0], 1, 9), HOST, by(&vpn), &mut names);
+        t.set_virtual(set(&["tun0", "lo"]));
+        let v = t.view(WatchState::Attached { at: NOW }, std::slice::from_ref(&vpn), NOW);
+        let f = &v.units["openvpn-work"];
+        assert!(f.protecting, "{f:?}");
+        assert_eq!(f.ifaces, set(&["tun0"]));
+    }
+
+    /// A persistent tun made by a setup unit, routed over by the VPN: both
+    /// hold (the coordinator's narrow reading).
+    #[test]
+    fn a_route_over_another_units_tun_protects_both() {
+        let (setup, vpn) = (UnitId::service("tun-setup"), UnitId::service("openvpn-work"));
+        let mut t = Tracker::default();
+        take(&mut t, &registered("tun0", HOST), HOST, by(&setup), &mut names);
+        take(&mut t, &route([0, 0, 0, 0], 1, 9), HOST, by(&vpn), &mut names);
+        t.set_virtual(set(&["tun0"]));
+        let v = t.view(WatchState::Attached { at: NOW }, &[setup.clone(), vpn.clone()], NOW);
+        assert!(v.units["tun-setup"].protecting, "the creator");
+        assert!(v.units["openvpn-work"].protecting, "the router");
+        assert_eq!(v.units["openvpn-work"].ifaces, set(&["tun0"]));
+    }
+
+    /// A physical NIC registered in a unit's context is not one it created,
+    /// and NetworkManager's default route over it protects nobody.
+    #[test]
+    fn a_physical_nic_is_never_created_by_a_tool() {
+        let (udev, nm) = (UnitId::service("systemd-udevd"), UnitId::service("NetworkManager"));
+        let mut t = Tracker::default();
+        take(&mut t, &registered("eth0", HOST), HOST, by(&udev), &mut names);
+        take(&mut t, &route([0, 0, 0, 0], 0, 2), HOST, by(&nm), &mut names);
+        t.set_virtual(set(&["lo"])); // eth0 resolves under its PCI device
+        let v = t.view(WatchState::Attached { at: NOW }, &[udev.clone(), nm.clone()], NOW);
+        assert!(!v.units["systemd-udevd"].protecting && !v.units["NetworkManager"].protecting, "{v:?}");
+        assert!(v.unattributed.is_empty());
+    }
+
+    /// A link that is virtual by sysfs but was never seen made (moved in
+    /// from another netns): a default route over it that nobody can be
+    /// charged with fails closed, never exempt as a physical NIC.
+    #[test]
+    fn a_moved_in_link_is_not_a_physical_nic() {
+        let mut t = Tracker::default();
+        take(&mut t, &route([0, 0, 0, 0], 0, 9), HOST, || None, &mut names);
+        t.set_virtual(set(&["tun0"]));
+        let v = t.view(WatchState::Attached { at: NOW }, &[], NOW);
+        assert!(!v.unattributed.is_empty(), "fail closed");
+    }
+
+    /// A container's registration is its own business; a nameless one is
+    /// unreadable (fail closed).
+    #[test]
+    fn registrations_elsewhere_are_ignored_and_nameless_ones_unreadable() {
+        let vpn = UnitId::service("openvpn-work");
+        let mut t = Tracker::default();
+        take(&mut t, &registered("tun0", 0xF000_1234), HOST, by(&vpn), &mut names);
+        take(&mut t, &route([0, 0, 0, 0], 1, 9), HOST, by(&vpn), &mut names);
+        t.set_virtual(set(&["tun0"]));
+        let v = t.view(WatchState::Attached { at: NOW }, std::slice::from_ref(&vpn), NOW);
+        assert!(!v.units["openvpn-work"].protecting, "the host's tun0 was not made by it");
+        let owner = Owner::Unit(vpn);
+        assert!(matches!(parse(&registered("", HOST), &owner, &mut names), Parsed::Unreadable(_)));
+    }
+
+    #[test]
+    fn virtual_links_are_read_from_sysfs() {
+        let d = tempfile::tempdir().unwrap();
+        let class = d.path().join("class/net");
+        std::fs::create_dir_all(&class).unwrap();
+        for (name, target) in [
+            ("eth0", "../../devices/pci0000:00/0000:00:08.0/virtio7/net/eth0"),
+            ("tun0", "../../devices/virtual/net/tun0"),
+            ("lo", "../../devices/virtual/net/lo"),
+        ] {
+            std::os::unix::fs::symlink(target, class.join(name)).unwrap();
+        }
+        assert_eq!(crate::host::read_virtual_ifaces(&class), set(&["lo", "tun0"]));
+        // This machine's own, read live.
+        let live = crate::host::read_virtual_ifaces(std::path::Path::new("/sys/class/net"));
+        if std::path::Path::new("/sys/class/net/lo").exists() {
+            assert!(live.contains("lo"));
+        }
     }
 }
