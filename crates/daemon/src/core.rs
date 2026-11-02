@@ -742,7 +742,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         txn: TxnId,
         t: &Transition,
         f: &DerivedFacts,
-        defs: &UnitDefs,
+        _defs: &UnitDefs,
     ) -> planarian_ipc::ApprovalDiff {
         // The options, from the evaluated generations (§16): the one the
         // transaction runs on against its candidate. A generation built
@@ -752,8 +752,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let evaluated = self.evaluated_diff(txn);
         let options = evaluated.as_ref().or(f.config_diff.as_ref());
         // The units it would remove or stop: derive's `removes`, the same set
-        // as `removes_sensitivity` (§11 Rollback row).
-        crate::approval::diff(t, options, &f.removes, &self.ex.cfg.tables, defs)
+        // as `removes_sensitivity` (§11 Rollback row), each with its own.
+        crate::approval::diff(t, options, evaluated.is_some(), &f.removes, &self.ex.cfg.tables)
     }
 
     /// Every option whose value differs between a live generation

@@ -139,6 +139,10 @@ pub struct ApprovalDiff {
     /// The units it would remove or stop, with their sensitivity; Security-
     /// and External-sensitive ones first.
     pub removes: Vec<RemovedUnit>,
+    /// Said when the core could not read the evaluated generations: the
+    /// options shown are the requested settings only, not the whole change.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,14 +183,14 @@ pub fn sensitivity_kinds(s: &planarian_schema::Sensitivities) -> Vec<String> {
 
 impl ApprovalDiff {
     pub fn is_empty(&self) -> bool {
-        self.options.is_empty() && self.removes.is_empty()
+        self.options.is_empty() && self.removes.is_empty() && self.note.is_none()
     }
 
     /// The full diff, one line each, for `planarian approve` and the console.
     pub fn lines(&self) -> Vec<String> {
         let d = self;
-        let mut out: Vec<String> =
-            d.options.iter().map(|o| format!("{} [{}]", change(o), o.kinds.join(", "))).collect();
+        let mut out: Vec<String> = d.note.iter().cloned().collect();
+        out.extend(d.options.iter().map(|o| format!("{} [{}]", change(o), o.kinds.join(", "))));
         out.extend(d.removes.iter().map(|r| format!("removes or stops {} [{}]", r.unit, r.kinds.join(", "))));
         out
     }
@@ -198,7 +202,7 @@ impl ApprovalDiff {
         if d.is_empty() {
             return None;
         }
-        let mut parts = vec![];
+        let mut parts: Vec<String> = d.note.iter().cloned().collect();
         if !d.options.is_empty() {
             let sensitive: Vec<String> = d.options.iter().filter(|o| first(&o.sensitivity)).map(change).collect();
             let n = d.options.len();

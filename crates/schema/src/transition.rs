@@ -227,10 +227,11 @@ pub struct DerivedFacts {
     /// decision, Nov 2). Empty for every other transition.
     #[serde(default)]
     pub removes_sensitivity: Sensitivities,
-    /// The units behind `removes_sensitivity`, sorted: what an approval shows
-    /// as removed or stopped (§16).
+    /// The units behind `removes_sensitivity`, sorted, each with its own
+    /// sensitivity from the same lookup: what an approval shows as removed
+    /// or stopped (§16), so the display and the decision agree.
     #[serde(default)]
-    pub removes: Vec<UnitId>,
+    pub removes: Vec<(UnitId, Sensitivities)>,
     /// A RestartUnit of a network-security unit (§12d: a network tool the
     /// kernel attributes traffic-steering changes to) that has failed: its
     /// traffic is held, so the restart only ends an outage and runs at once

@@ -186,7 +186,7 @@ pub(crate) fn removed_units(
     activation: Option<&ActivationPlan>,
     defs: &UnitDefs,
     services: &BTreeMap<String, Sensitivities>,
-) -> (Vec<UnitId>, Sensitivities) {
+) -> (Vec<(UnitId, Sensitivities)>, Sensitivities) {
     let mut removed: Vec<UnitId> = base_m.units.keys().filter(|u| !cand_m.units.contains_key(*u)).cloned().collect();
     removed.extend(
         base_m.user_units.iter().filter(|b| !cand_m.user_units.iter().any(|c| c.id == b.id)).map(|b| b.id.clone()),
@@ -199,7 +199,16 @@ pub(crate) fn removed_units(
         known.entry(b.id.clone()).or_insert_with(|| b.clone());
     }
     let sens = unit_facts(&removed, &known, services, |_| false).0;
-    (unit_set(removed), sens)
+    // Each one's own, from the same lookup as the decision's (§16: what the
+    // approval shows is what was decided on).
+    let each = unit_set(removed)
+        .into_iter()
+        .map(|u| {
+            let s = unit_facts(std::iter::once(&u), &known, services, |_| false).0;
+            (u, s)
+        })
+        .collect();
+    (each, sens)
 }
 
 pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
@@ -476,7 +485,8 @@ mod sensitivity_completeness {
         cand.user_units.clear();
         let none = BTreeMap::new();
         let (removed, s) = removed_units(&base, &cand, None, &UnitDefs::new(), &none);
-        assert_eq!(removed, vec![vpn.id.clone()]);
+        assert_eq!(removed.iter().map(|(u, _)| u).collect::<Vec<_>>(), vec![&vpn.id]);
+        assert!(removed[0].1.security, "each carries its own: {removed:?}");
         assert!(s.security, "the removed user template is Security: {s:?}");
         // Nothing removed: nothing carried.
         let (removed, s) = removed_units(&base, &base, None, &base.units, &none);
@@ -485,7 +495,7 @@ mod sensitivity_completeness {
         let web = UnitId::service("gym-web");
         let plan = ActivationPlan { stop: [web.clone()].into(), ..Default::default() };
         let (removed, _) = removed_units(&base, &base, Some(&plan), &base.units, &none);
-        assert_eq!(removed, vec![web]);
+        assert_eq!(removed.into_iter().map(|(u, _)| u).collect::<Vec<_>>(), vec![web]);
     }
 }
 
