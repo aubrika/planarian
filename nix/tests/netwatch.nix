@@ -89,6 +89,16 @@ pkgs.testers.runNixOSTest {
     services.planarian.units.nw-quiet = { };
   };
 
+  # A second node for netwatch's retry rule: no firewall, no nftables, and
+  # no module loaded at boot, so nfnetlink is absent when netwatch starts.
+  nodes.bare = { lib, ... }: {
+    imports = [ self.nixosModules.default ];
+    services.planarian.enable = true;
+    networking.firewall.enable = false;
+    networking.nftables.enable = false;
+    boot.kernelModules = lib.mkForce [ ];
+  };
+
   testScript = ''
     FP = "/run/planarian/footprint"
 
@@ -273,12 +283,24 @@ pkgs.testers.runNixOSTest {
         machine.execute("systemctl start planarian-netwatch.service nw-quiet.service")
         machine.wait_until_succeeds("systemctl is-active nw-quiet.service", timeout=90)
         machine.wait_until_succeeds(f"grep -q '^failed' {FP}/.watch", timeout=60)
-        machine.fail("systemctl is-active planarian-netwatch.service")
         quiet_is_held()
         # Repaired: the object back, the watch attaches, and the hold lifts.
         machine.succeed(f"umount {obj}")
         machine.succeed("systemctl reset-failed planarian-netwatch.service; systemctl start planarian-netwatch.service")
         watch_fresh()
         quiet_back_and_lifted()
+    with subtest("(m) the kernel refuses the attach (nfnetlink absent): failed, up, and attached within ~30 s of the module loading"):
+        # Coordinator, Nov 2: a load or attach the kernel refuses writes
+        # `failed`, sends READY=1 and stays up, retrying every 30 s.
+        bare.start()
+        bare.wait_for_unit("planarian-netwatch.service")
+        bare.fail("grep -qw '^nfnetlink' /proc/modules")
+        bare.wait_until_succeeds(f"grep -q '^failed' {FP}/.watch", timeout=60)
+        bare.succeed("systemctl is-active planarian-netwatch.service")
+        n0 = bare.succeed("systemctl show -P NRestarts planarian-netwatch.service").strip()
+        bare.succeed("modprobe nfnetlink")
+        bare.wait_until_succeeds(f"grep -q '^attached ' {FP}/.watch", timeout=45)
+        # Retried in place, not by systemd restarting it.
+        assert bare.succeed("systemctl show -P NRestarts planarian-netwatch.service").strip() == n0
   '';
 }
