@@ -117,3 +117,15 @@ Still open, each in issue #7's lanes: R13's benchmark run (#8); §12f
 (#10); P11 and the module-eval assertions (#11); deviations and the closing
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
 proved; the residue classifier under Kani).
+
+## Reviewer: C10 catalog case (#10, against #21), 2 Nov
+
+Written from §11's global floors (`review/lane-change-path-c10-case`), at the
+coordinator's request against `main` plus #21 (`core/disruption-set`).
+`disruption-each-kind-keeps-its-floor`: a seated administrator's Rollback
+restarts a ConnectivityLoss unit and a DataInterruption unit (fixtures
+`gym-tunnel`, `gym-sync`, both Routine; step `restarts_on_switch`, fake only).
+It must carry both kinds and ask. On `main`: FAIL, committed without asking,
+disruption ConnectivityLoss only. Control
+`disruption-connectivity-alone-seated-runs` (the ConnectivityLoss unit alone)
+passes on `main` and must keep passing.
