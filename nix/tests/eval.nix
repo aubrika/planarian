@@ -30,7 +30,10 @@ let
           serviceConfig = { Restart = "on-failure"; RestartSec = "5s"; };
           startLimitBurst = 3;
         };
-        services.planarian.units.gym-db = { };
+        # §9 (P11): an administrator-authored Exec probe, next to typed ones.
+        services.planarian.units.gym-db.probes = [
+          { id = "gym-db-exec"; type = "exec"; argv = [ "true" ]; establishes = "gym-db answers a local query"; }
+        ];
         services.planarian.units.gym-app.probes = [
           { id = "gym-app-tcp"; type = "tcp"; addr = "127.0.0.1:8081"; establishes = "gym-app accepts connections"; }
         ];
@@ -59,8 +62,15 @@ let
   export = cfg.services.planarian.export;
   unit = id: builtins.head (builtins.filter (u: u.id == id) export.units);
   app = unit "service:gym-app";
+  # §9 (P11): "`Exec` probes … are flagged". Each exported probe carries
+  # `flagged = true` iff its kind is Exec; the key is absent otherwise.
+  probes = builtins.concatMap (u: u.probes or [ ]) (export.units ++ export.userUnits);
+  isExec = p: builtins.isAttrs p.kind && p.kind ? Exec;
   check = cond: msg: if cond then true else throw "planarian module eval: ${msg}";
   checks = [
+    (check (builtins.any isExec probes) "the configuration exports an Exec probe (P11's check is not vacuous)")
+    (check (builtins.all (p: !(isExec p) || (p.flagged or null) == true) probes) "every exported Exec probe carries flagged = true (§9, P11)")
+    (check (builtins.all (p: isExec p || !(p ? flagged)) probes) "no other exported probe carries flagged (§9, P11)")
     (check (builtins.any (u: u.id == "service:sshd") export.units) "sshd is a canonical unit")
     (check (builtins.any (u: u.id == "device:fs-root") export.units) "fs-root is present")
     (check (builtins.any (u: u.id == "device:fs-boot") export.units) "fs-boot is present")

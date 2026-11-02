@@ -1158,3 +1158,212 @@ fn a_slow_tick_is_warned() {
     r.ticks(20);
     assert_eq!(r.core.slow_tick_warnings, 2);
 }
+
+/// C18 (§12 step 6): a transaction touching user data, with no snapshot
+/// backend (Phase A), logs `NoSnapshot` and continues: on the approval path
+/// (a UserData change is AskFirst in A) and on the submission path (a
+/// Runtime restart of a UserData unit); one that does not touch user data
+/// does not. The approved execution's record names the approver, the
+/// token's `bound_to` and the decision (I7).
+#[test]
+fn user_data_without_a_snapshot_backend_logs_no_snapshot() {
+    let mut cfg = config();
+    cfg.exec
+        .tables
+        .option_sensitivity
+        .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
+    // gym-web holds user data, in every generation the fake knows.
+    let store = MemStore::new(8 << 20);
+    let fake = gym_world(store.clone());
+    let web = UnitId::service("gym-web");
+    {
+        let mut w = fake.w();
+        let user_data = Sensitivities::of(&[Sensitivity::UserData]);
+        for g in w.gens.values_mut() {
+            if let Some(d) = g.eval.units.get_mut(&web) {
+                d.sensitivity = user_data;
+            }
+        }
+        // And in generations built from here on.
+        if let Some(d) = w.base_units.get_mut(&web) {
+            d.sensitivity = user_data;
+        }
+    }
+    fake.w().alive.insert(100);
+    let mut j = Journal::open(store).unwrap();
+    j.append(fake.w().now, Record::KnownGood(GenerationId(1))).unwrap();
+    let core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, cfg);
+    let mut r = Rig { fake, core };
+    r.ticks(2);
+    let font = |scale: &str| Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str(scale.into()))].into(),
+    };
+    let flagged = |r: &Rig| r.core.log.iter().filter(|x| x.no_snapshot).cloned().collect::<Vec<LogRecord>>();
+
+    // Approval path: alice asks; user data makes it AskFirst.
+    let Response::NeedsApproval { approve, .. } = r.core.handle(ALICE, font("1.25")) else {
+        panic!("a UserData change asks in Phase A")
+    };
+    r.ticks(1);
+    assert!(flagged(&r).is_empty(), "not past step 5 while it waits for approval");
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "continued: {resp:?}");
+    r.ticks(2);
+    let f = flagged(&r);
+    assert_eq!(f.len(), 1, "{:#?}", r.core.log);
+    assert!(matches!(f[0].result, Submitted::Finished { state: TxnState::Committed, .. }));
+    assert_eq!(f[0].caller, Actor::user(1000), "the proposer");
+    assert_eq!(f[0].approver, Some(Actor::user(0)), "I7: the approver");
+    assert_eq!(f[0].bound_to, Some(approve), "I7: the token's bound_to");
+    assert!(
+        matches!(f[0].decision, Some(Decision::Allow { tier: Tier::AskFirst, .. })),
+        "the decision: {:?}",
+        f[0].decision
+    );
+
+    // Submission path: a Runtime restart of a unit holding user data.
+    let (s, defs) = r.core.observe();
+    let p = r.core.proposal(Transition::RestartUnit(web.clone()), &s, &defs, Source::User, "restart".into());
+    let got = r.core.submit(p, user_authorization(Actor::user(0), true), &s, &defs);
+    assert!(matches!(got, Submitted::Finished { .. }), "Runtime, runs at once: {got:?}");
+    r.ticks(2);
+    let f = flagged(&r);
+    assert_eq!(f.len(), 2, "{:#?}", r.core.log);
+    assert!(matches!(f[1].proposal.transition, Transition::RestartUnit(_)));
+    assert_eq!(f[1].approver, None, "no approval on this path");
+
+    // Not user data: nothing to snapshot, nothing logged.
+    let (s, defs) = r.core.observe();
+    let p =
+        r.core.proposal(Transition::RestartUnit(UnitId::service("sshd")), &s, &defs, Source::User, "restart".into());
+    let got = r.core.submit(p, user_authorization(Actor::user(0), true), &s, &defs);
+    assert!(matches!(got, Submitted::Finished { .. } | Submitted::Parked { .. }), "{got:?}");
+    r.ticks(2);
+    assert!(
+        r.core
+            .log
+            .iter()
+            .filter(|x| !x.facts.as_ref().is_some_and(|f| f.sensitivity.contains(Sensitivity::UserData)))
+            .all(|x| !x.no_snapshot),
+        "{:#?}",
+        r.core.log
+    );
+    assert_eq!(flagged(&r).len(), 2);
+}
+
+/// #24 review: the agent kept for a parked change's approval record
+/// (I7) is dropped once the change is no longer parked, whether it is
+/// approved or withdrawn, so the map does not grow for the daemon's life.
+#[test]
+fn a_withdrawn_parked_change_forgets_its_agent() {
+    let mut cfg = config();
+    cfg.exec
+        .tables
+        .option_sensitivity
+        .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let font = |scale: &str| Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str(scale.into()))].into(),
+    };
+    let resp = r.core.handle(ALICE, font("1.25"));
+    let Response::NeedsApproval { txn, .. } = resp else { panic!("{resp:?}") };
+    assert!(r.core.parked_agents.contains_key(&txn), "kept while parked");
+    let resp = r.core.handle(ALICE, Request::Cancel { txn });
+    assert!(matches!(resp, Response::Done { .. }), "{resp:?}");
+    r.ticks(1);
+    assert!(r.core.parked_agents.is_empty(), "{:?}", r.core.parked_agents);
+}
+
+/// #24 review: an approved change that cannot run on the same tick (here it
+/// waits in Built while Foreground holds) still has its proposer's agent in
+/// its approval record: the record is written in the approval's own call,
+/// before any tick prunes.
+#[test]
+fn an_approved_change_that_waits_keeps_its_agent() {
+    let mut cfg = config();
+    cfg.exec
+        .tables
+        .option_sensitivity
+        .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
+    let mut r = Rig::with(cfg);
+    r.fake.w().sessions.push(planarian_schema::SessionInfo {
+        id: "s1".into(),
+        uid: 1000,
+        class: "user".into(),
+        seat: Some("seat0".into()),
+        remote: false,
+        created: Timestamp(0),
+        active: true,
+        idle: false,
+    });
+    r.ticks(2);
+    let font = Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.25".into()))].into(),
+    };
+    let resp = r.core.handle(ALICE, font);
+    let Response::NeedsApproval { txn, approve, .. } = resp else { panic!("{resp:?}") };
+    // As if an agent of alice's had asked (the agent path sets this entry).
+    r.core.parked_agents.insert(txn, Some("helper".into()));
+    r.fake.w().foreground.insert("s1".into());
+    r.ticks(2);
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    assert!(matches!(resp, Response::Done { state: TxnState::Built, .. }), "waits for its window: {resp:?}");
+    r.ticks(3);
+    let rec = r
+        .core
+        .log
+        .iter()
+        .find(|x| x.approver.is_some() && matches!(x.result, Submitted::Finished { txn: t, .. } if t == txn))
+        .expect("the approved execution's record");
+    assert_eq!(rec.agent.as_deref(), Some("helper"));
+    assert!(r.core.parked_agents.is_empty());
+}
+
+/// #24 review (I7): an approval that re-binds, whose fresh decision no
+/// longer asks, runs as an ordinary submission under a new id. Its record
+/// names no approver and no `bound_to`, carries the fresh decision, and
+/// keeps the proposer's agent.
+#[test]
+fn a_rebound_approval_that_no_longer_asks_is_logged_as_a_submission() {
+    let mut cfg = config();
+    cfg.exec
+        .tables
+        .option_sensitivity
+        .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let font = Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.25".into()))].into(),
+    };
+    let resp = r.core.handle(ALICE, font);
+    let Response::NeedsApproval { txn: first, approve, .. } = resp else { panic!("{resp:?}") };
+    r.core.parked_agents.insert(first, Some("helper".into()));
+    // What the change touches is no longer user data: re-derived at
+    // approval, the facts differ, and the fresh decision does not ask.
+    r.core.ex.cfg.tables.option_sensitivity.retain(|(o, _)| o != "planarian.reference.fontScale");
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    let Response::Done { txn: ran, .. } = resp else { panic!("ran without asking: {resp:?}") };
+    assert_ne!(ran, first, "under a new id");
+    r.ticks(2);
+    let rec = r
+        .core
+        .log
+        .iter()
+        .find(|x| matches!(x.result, Submitted::Finished { txn, .. } if txn == ran))
+        .expect("the resubmission's record");
+    assert_eq!(rec.approver, None, "nobody approved what ran");
+    assert_eq!(rec.bound_to, None);
+    assert!(
+        matches!(rec.decision, Some(Decision::Allow { tier, .. }) if tier != Tier::AskFirst),
+        "the fresh decision: {:?}",
+        rec.decision
+    );
+    assert_eq!(rec.agent.as_deref(), Some("helper"), "the proposer's agent");
+    assert!(!r.core.log.iter().any(|x| x.approver.is_some()), "no approval record: {:#?}", r.core.log);
+    assert!(r.core.parked_agents.is_empty());
+}
