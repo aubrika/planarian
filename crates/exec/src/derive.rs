@@ -242,7 +242,8 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             // Kinds come from `all_defs` (a unit only the candidate adds has its
             // definition there); the already-failed rule reads `i.defs`, the
             // definitions `i.state` was observed against. A unit only the
-            // candidate adds is in neither, so it is never exempt.
+            // candidate adds is not in `i.defs` and was never observed, so it
+            // is never exempt.
             let (s, d) = unit_facts(&affected, &all_defs, &services, |u| already_failed(i.state, i.defs, u));
             f.sensitivity = s.union(&i.tables.diff_sensitivity(&config));
             f.disruption = d;
