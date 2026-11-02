@@ -55,6 +55,12 @@ let
     } ];
   };
   weakRefused = builtins.filter (a: !a.assertion) weakEdgeSys.config.assertions;
+  # P24 (owner decision, 1 Nov): WirePlumber is watched per user whenever
+  # PipeWire and its WirePlumber session manager are both enabled.
+  noWireplumberSys = sys.extendModules {
+    modules = [ { services.pipewire.wireplumber.enable = false; } ];
+  };
+  wireplumberIn = e: builtins.filter (u: pkgs.lib.hasSuffix ":wireplumber" u.id) (e.units ++ e.userUnits);
   external = m: pkgs.lib.hasInfix "external dependency" m.message;
   export = cfg.services.planarian.export;
   unit = id: builtins.head (builtins.filter (u: u.id == id) export.units);
@@ -66,6 +72,10 @@ let
     (check (builtins.any (u: u.id == "device:fs-boot") export.units) "fs-boot is present")
     (check (builtins.any (u: u.id == "target:graphical-session") export.units) "graphical-session for the desktop")
     (check (builtins.any (u: u.id == "service@0:pipewire") export.userUnits) "pipewire is per-user")
+    (check (cfg.services.pipewire.enable && cfg.services.pipewire.wireplumber.enable) "the reference configuration runs PipeWire with WirePlumber (P24's check is not vacuous)")
+    (check (builtins.map (u: u.id) (wireplumberIn export) == [ "service@0:wireplumber" ]) "wireplumber is a default per-user unit, and only that (P24)")
+    (check (builtins.elem { from = "service@0:wireplumber"; to = "service@0:pipewire"; kind = "Requires"; origin = "Manifest"; } (builtins.head (wireplumberIn export)).edges) "wireplumber requires pipewire, as upstream's BindsTo= says (P24)")
+    (check (wireplumberIn noWireplumberSys.config.services.planarian.export == [ ]) "no wireplumber unit when services.pipewire.wireplumber.enable is false (P24)")
     (check (builtins.elem { from = "service:gym-app"; to = "service:gym-db"; kind = "Requires"; origin = "SystemdRequires"; } app.edges) "Requires= became a Requires edge")
     (check (builtins.elem { from = "service:gym-app"; to = "service:gym-db"; kind = "Ordering"; origin = "SystemdAfter"; } app.edges) "After= became an Ordering edge")
     (check (app.systemd_restart.restart_sec == 5000) "RestartSec parsed")

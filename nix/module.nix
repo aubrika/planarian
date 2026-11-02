@@ -538,6 +538,12 @@ in
       ${dmUnit} = mkIf hasDm (mkDefault { synonyms = [ "login screen" "greeter" ]; inferStops = false; });
       graphical-session = mkIf hasDesktop (mkDefault { kind = "target"; when = "seat"; synonyms = [ "desktop" ]; });
       pipewire = mkIf config.services.pipewire.enable (mkDefault { scope = "user"; synonyms = [ "sound" "audio" ]; });
+      # P24 (owner decision, 1 Nov): PipeWire's session manager, per user.
+      # Upstream's unit carries BindsTo=pipewire.service, which the module
+      # cannot derive for a user unit: declared, so a PipeWire fault is
+      # diagnosed at PipeWire.
+      wireplumber = mkIf (config.services.pipewire.enable && config.services.pipewire.wireplumber.enable)
+        (mkDefault { scope = "user"; edges = [ { to = "service@0:pipewire"; kind = "Requires"; } ]; });
     };
 
     services.planarian.export = {
