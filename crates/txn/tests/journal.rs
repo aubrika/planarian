@@ -493,3 +493,20 @@ fn file_store_txn_dirs_are_exclusive() {
     assert!(!tdir.join("5").exists());
     assert!(tdir.join("6/lease").exists() && tdir.join("README").exists());
 }
+
+/// §12 step 4: `set_fence` on a transaction with no directory yet (a fence
+/// written by takeover after the sweep) creates it, and it reads back; a
+/// second `set_fence` rewrites the lease in place. Whether the directory
+/// entry survives a power loss (the `txn_dir` fsync) is not observable from
+/// a test.
+#[test]
+fn file_store_set_fence_creates_a_missing_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (jdir, tdir) = (dir.path().join("journal"), dir.path().join("txn"));
+    let store = FileStore::open(&jdir, &tdir, 1 << 20).unwrap();
+    store.set_fence(TxnId(9), 3).unwrap();
+    assert!(tdir.join("9/lease").exists());
+    assert_eq!(store.fence(TxnId(9)).unwrap(), Some(3));
+    store.set_fence(TxnId(9), 4).unwrap();
+    assert_eq!(store.fence(TxnId(9)).unwrap(), Some(4));
+}
