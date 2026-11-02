@@ -1291,3 +1291,46 @@ fn a_repair_rollback_withdraws_a_waiting_update() {
     assert_eq!(again.txn.state, TxnState::Built, "and waits for its window again");
     assert!(r.core.notices.iter().any(|n| n.contains("prepared again after the repair rollback")));
 }
+
+/// §12f, I6 (coordinator, Nov 2): an update parked for approval in
+/// `Prepared` is not active for I6, so a repair rollback leaves it alone:
+/// nobody is asked to approve it twice.
+#[test]
+fn a_repair_rollback_leaves_a_parked_update_alone() {
+    let mut r = Rig::new();
+    seated_session(&mut r, false);
+    r.ticks(2);
+    let resp = r.core.handle(ALICE.in_session("s1"), font("1.25"));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let broken = GenerationId(2);
+    // An update that would end alice's session, asked for outside it: the
+    // §11 floor parks it for approval.
+    r.fake.w().activation_restarts.insert(UnitId::service("display-manager"));
+    let (s, defs) = r.core.observe();
+    let t = Transition::ApplyChange {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.5".into()))].into(),
+    };
+    let p = r.core.proposal(t, &s, &defs, Source::Maintenance, "update".into());
+    let got = r.core.submit(p, user_authorization(Actor::user(1000), false), &s, &defs);
+    let Submitted::Parked { txn: parked, .. } = got else { panic!("{got:?}") };
+
+    let printer = UnitId::service("gym-printer");
+    r.fake.w().break_in(broken, &printer);
+    let mut proposed = false;
+    for _ in 0..200 {
+        r.ticks(1);
+        let l = r.core.ledger();
+        if l.live.values().any(|t| t.txn.transition == Transition::Rollback)
+            || l.terminal.values().any(|t| t.transition == Transition::Rollback)
+        {
+            proposed = true;
+            break;
+        }
+    }
+    assert!(proposed, "the repair rollback was proposed");
+    let l = r.core.ledger();
+    assert_eq!(l.live.get(&parked).map(|t| t.txn.state.clone()), Some(TxnState::Prepared), "left alone");
+    assert!(r.core.ex.parked.contains_key(&parked), "still waiting for its approval");
+    assert!(!r.core.notices.iter().any(|n| n.contains("set aside for a repair rollback")), "{:?}", r.core.notices);
+}

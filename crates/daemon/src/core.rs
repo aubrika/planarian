@@ -682,25 +682,25 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     /// §12f, I6 (owner decision, Nov 2): a repair rollback pre-empts every
-    /// generation transaction that has not mutated yet (waiting in `Built`
-    /// for its window, or parked for approval): each is `Rejected(Interrupted)`
-    /// and prepared again, with its original source and caller, once the
-    /// repair is terminal. One past `Built` is never withdrawn; the repair
-    /// loop does not run while it is active, so the incident waits for it
-    /// with its budget unchanged.
+    /// generation transaction waiting in `Built` for its window: each is
+    /// `Rejected(Interrupted)` and prepared again, with its original source
+    /// and caller, once the repair is terminal. One parked for approval in
+    /// `Prepared` is not active for I6 (the ledger's `compatible`) and is
+    /// left alone, so nobody approves twice. One past `Built` is never
+    /// withdrawn; the repair loop does not run while it is active, so the
+    /// incident waits for it with its budget unchanged.
     fn withdraw_for_repair(&mut self) {
         let ids: Vec<(TxnId, Transition)> = self
             .ledger()
             .live
             .values()
-            .filter(|t| t.txn.transition.changes_generation() && t.txn.state.is_pre_mutation())
+            .filter(|t| t.txn.transition.changes_generation() && t.txn.state == TxnState::Built)
             .map(|t| (t.txn.id, t.txn.transition.clone()))
             .collect();
         for (id, t) in ids {
             if self.ex.kernel.reject(id, RejectReason::Interrupted).is_err() {
                 continue;
             }
-            self.ex.parked.remove(&id);
             if !self.earlier.contains_key(&id) {
                 let asked = self.log.iter().chain(&self.awaiting_post).find(|r| {
                     matches!(r.result, Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if txn == id)
