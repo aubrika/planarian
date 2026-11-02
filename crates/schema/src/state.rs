@@ -78,6 +78,11 @@ pub struct SystemState {
     /// Excluded from the digest.
     pub resources: Resources,
     pub core_hash: Hash,
+    /// §12d: the units whose traffic is held now: the journal's holds and
+    /// the host's (`/run/planarian/hold`), their union (fail closed). In the
+    /// digest: a hold changes what a transition does.
+    #[serde(default)]
+    pub holds: BTreeSet<UnitId>,
     /// The reference time for staleness. Excluded from the digest.
     pub observed_at: Timestamp,
 }
@@ -217,6 +222,7 @@ impl SystemState {
             },
             conditions: &self.conditions,
             core_hash: self.core_hash,
+            holds: &self.holds,
         };
         Hash::of(&serde_json::to_vec(&view).expect("digest view serializes"))
     }
@@ -234,6 +240,7 @@ struct DigestView<'a> {
     overrides: Vec<&'a Override>,
     conditions: &'a BTreeSet<Condition>,
     core_hash: Hash,
+    holds: &'a BTreeSet<UnitId>,
 }
 
 #[derive(Serialize, PartialEq)]
@@ -296,6 +303,9 @@ mod tests {
             startup_grace: None,
             runtime_repair: None,
             stops_are_faults: false,
+            holds: false,
+            hold_allow: vec![],
+            hold_interfaces: vec![],
         }
     }
 
@@ -315,6 +325,7 @@ mod tests {
             conditions: BTreeSet::new(),
             resources: Resources::default(),
             core_hash: Hash::ZERO,
+            holds: BTreeSet::new(),
             observed_at: Timestamp(now),
         }
     }
