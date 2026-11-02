@@ -52,6 +52,42 @@ pkgs.testers.runNixOSTest {
     virtualisation.memorySize = 2048;
     virtualisation.diskSize = 8192;
 
+    # §12d classifier: a network tool by capability; one that is not (its
+    # own network namespace, no capabilities); an untagged tool whose
+    # short-lived start helper steers traffic (a dropping firewall rule for an
+    # address nobody uses, so the test's own traffic is untouched).
+    systemd.services.gym-capnet = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+        DynamicUser = true;
+        AmbientCapabilities = [ "CAP_NET_ADMIN" ];
+        CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
+      };
+    };
+    systemd.services.gym-privnet = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+        DynamicUser = true;
+        PrivateNetwork = true;
+        CapabilityBoundingSet = [ "" ];
+      };
+    };
+    systemd.services.gym-vpn-untagged = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "simple";
+        Restart = "no";
+        ExecStartPre = "${pkgs.bash}/bin/bash -c 'sleep $(cat /run/gym-vpn-untagged-slow 2>/dev/null || echo 0)'";
+        ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+        ExecStartPost = "${pkgs.writeShellScript "gym-vpn-untagged-helper" ''
+          ${pkgs.nftables}/bin/nft 'add table inet gymvpn'
+          ${pkgs.nftables}/bin/nft 'add chain inet gymvpn out { type filter hook output priority 0; }'
+          ${pkgs.nftables}/bin/nft 'add rule inet gymvpn out ip daddr 203.0.113.77 drop'
+        ''}";
+      };
+    };
     # Something on loopback to reach while held.
     systemd.services.local-web = {
       wantedBy = [ "multi-user.target" ];
@@ -76,9 +112,13 @@ pkgs.testers.runNixOSTest {
         machine.succeed("nft list table inet planarian-hold")
         machine.succeed("systemctl is-active planarian-hold@wireguard-gym.service")
         machine.succeed("test -e /run/planarian/hold/wireguard-gym")
-    def not_held():
-        machine.fail("systemctl is-active planarian-hold@wireguard-gym.service")
-        machine.fail("test -e /run/planarian/hold/wireguard-gym")
+    def not_held(unit="wireguard-gym"):
+        machine.fail(f"systemctl is-active planarian-hold@{unit}.service")
+        machine.fail(f"test -e /run/planarian/hold/{unit}")
+    def held_for(unit):
+        machine.succeed("nft list table inet planarian-hold")
+        machine.succeed(f"systemctl is-active planarian-hold@{unit}.service")
+        machine.succeed(f"test -e /run/planarian/hold/{unit}")
     def as_alice(cmd):
         return machine.execute(f"su alice -c '{cmd}' 2>&1")
     def approve_as_root(out):
@@ -177,6 +217,51 @@ pkgs.testers.runNixOSTest {
         machine.succeed("rm -f /run/wireguard-gym-broken")
         machine.succeed("systemctl reset-failed wireguard-gym.service; systemctl start wireguard-gym.service")
         machine.wait_until_succeeds(lan_ok(), timeout=120)
+        not_held()
         peer.succeed(new_ssh("alice"))
+
+    # §12d "Which units" (owner decisions, Nov 2): the classifier.
+    with subtest("build-time tag: CAP_NET_ADMIN makes a network tool; PrivateNetwork=yes and no capabilities does not"):
+        machine.succeed("systemctl show -p OnFailure gym-capnet.service | grep -q 'planarian-hold@'")
+        machine.fail("systemctl show -p OnFailure gym-privnet.service | grep -q 'planarian-hold@'")
+        machine.succeed("systemctl kill --signal=SIGKILL gym-privnet.service")
+        machine.sleep(15)
+        not_held("gym-privnet")
+        machine.succeed(lan_ok())
+
+    with subtest("netwatch: an untagged tool whose short-lived helper set a dropping firewall rule is protecting"):
+        # No services.planarian.units entry and no tag: only the kernel's
+        # attribution (the helper ran in gym-vpn-untagged's cgroup) says so.
+        machine.succeed("nft list table inet gymvpn")
+        machine.fail("pgrep -f gym-vpn-untagged-helper")
+        machine.succeed("echo 30 > /run/gym-vpn-untagged-slow")
+        machine.succeed("systemctl kill --signal=SIGKILL gym-vpn-untagged.service")
+        machine.wait_until_fails(lan_ok(), timeout=20)
+        held_for("gym-vpn-untagged")
+        machine.wait_until_succeeds("systemctl is-active gym-vpn-untagged.service", timeout=120)
+        machine.wait_until_succeeds(lan_ok(), timeout=60)
+        not_held("gym-vpn-untagged")
+        machine.succeed("rm -f /run/gym-vpn-untagged-slow")
+        machine.succeed("journalctl -b -u planariad -o cat | grep gym-vpn-untagged | grep -q 'stopped unexpectedly'")
+
+    with subtest("a crashed (exit 1, not killed) VPN restarts at once under the hold"):
+        machine.wait_until_succeeds(tunnel_ok(), timeout=60)
+        machine.succeed("echo 30 > /run/wireguard-gym-slow")
+        asked = "journalctl -b -u planariad -o cat | grep -c 'wireguard-gym.*needs approval' || true"
+        before = int(machine.succeed(asked).strip() or 0)
+        # wireguard-go exits with an error when its TUN device goes away: a
+        # crash, not a kill. (Precondition: the unit ended by its exit code.)
+        machine.succeed("ip link delete wg0")
+        machine.wait_until_succeeds("journalctl -b -u wireguard-gym -o cat | grep -q 'status=1/FAILURE'", timeout=30)
+        machine.wait_until_fails(lan_ok(), timeout=20)
+        held()
+        # Restarted at once, without asking (§11: restarts_held_unit).
+        machine.wait_until_succeeds("systemctl is-active wireguard-gym.service", timeout=120)
+        machine.wait_until_succeeds(lan_ok(), timeout=60)
+        machine.wait_until_succeeds(tunnel_ok(), timeout=60)
+        not_held()
+        after = int(machine.succeed(asked).strip() or 0)
+        assert after == before, f"the restart asked: {before} -> {after}"
+        machine.succeed("rm -f /run/wireguard-gym-slow")
   '';
 }
