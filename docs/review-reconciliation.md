@@ -117,3 +117,13 @@ Still open, each in issue #7's lanes: R13's benchmark run (#8); §12f
 (#10); P11 and the module-eval assertions (#11); deviations and the closing
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
 proved; the residue classifier under Kani).
+
+## Reviewer: P11 module-eval case (#11), 2 Nov
+
+Written from §9 ("`Exec` probes … are flagged") and the coordinator's key
+decision (each exported probe carries `flagged = true` iff its kind is Exec,
+the key absent otherwise), on `review/lane-nix-p11`. `nix/tests/eval.nix`
+gives `gym-db` an Exec probe and asserts: an Exec probe is exported (so the
+check is not vacuous); every exported Exec probe has `flagged = true`; no
+other exported probe has the key. On `main`: the build throws "every exported
+Exec probe carries flagged = true".
