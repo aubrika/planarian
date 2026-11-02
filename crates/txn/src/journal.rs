@@ -386,9 +386,16 @@ impl<S: Store> Journal<S> {
                     )));
                 }
             }
+            // §12c Format: only a torn or mismatched tail is truncated (the
+            // frame check above). This frame is intact (its CRC holds and it
+            // follows the chain) yet does not parse: a retained record that
+            // does not parse is Integrity, here or anywhere, and nothing is
+            // truncated or zeroed.
             let entry: Entry = match serde_json::from_slice(payload) {
                 Ok(e) => e,
-                Err(_) => return self.stop_at_tail(truncate),
+                Err(e) => {
+                    return Err(JournalError::Integrity(format!("record {seq} is intact but does not parse: {e}")));
+                }
             };
             if entry.seq != seq {
                 return self.stop_at_tail(truncate);

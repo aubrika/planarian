@@ -535,10 +535,31 @@ fn intact_but_unparsable_tail_is_integrity_and_kept() {
         assert!(planarian_txn::journal::tamper(&store, 9, edit).unwrap(), "{what}");
         match Journal::open(store.clone()) {
             Err(JournalError::Integrity(_)) => {}
-            other => panic!("{what}: an intact, unparsable tail was not Integrity: {:?}", other.map(|j| j.ledger().last_seq)),
+            other => {
+                panic!("{what}: an intact, unparsable tail was not Integrity: {:?}", other.map(|j| j.ledger().last_seq))
+            }
         }
         // Not truncated: the record is still there, and a second open says the same.
         assert!(planarian_txn::journal::tamper(&store, 9, |_| {}).unwrap(), "{what}: record 10 was removed");
         assert!(matches!(Journal::open(store), Err(JournalError::Integrity(_))), "{what}: second open");
     }
+}
+
+/// A journal written by today's types opens after the change: every record a
+/// full transaction history writes (prepare, run, stop, approvals, takeovers,
+/// checkpoints) parses, so none reaches the new Integrity path, on a store
+/// reopened from its bytes as after a restart.
+#[test]
+fn a_journal_written_by_todays_types_still_opens() {
+    let entries = history();
+    let store = MemStore::new(1 << 20);
+    let mut j = Journal::open(store.clone()).unwrap();
+    for e in &entries {
+        j.append(e.at, e.record.clone()).unwrap();
+    }
+    let written = j.ledger().clone();
+    drop(j);
+    let reopened = Journal::open(store.clone()).expect("today's records all parse");
+    assert_eq!(reopened.ledger(), &written);
+    assert_eq!(reopened.ledger().last_seq, entries.len() as u64);
 }
