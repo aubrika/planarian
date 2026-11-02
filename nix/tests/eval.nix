@@ -37,6 +37,21 @@ let
         # §12d: a network-security unit (Security and External), with the
         # endpoint its hold still lets it reach.
         systemd.services.gym-vpn = { wantedBy = [ "multi-user.target" ]; script = "sleep infinity"; };
+        # §12d "Which units": one service per branch of the network-tool
+        # rule, and its negatives.
+        systemd.services.nt-ambient = { script = "true"; serviceConfig = { User = "nobody"; AmbientCapabilities = [ "CAP_NET_ADMIN" ]; }; };
+        systemd.services.nt-tun = { script = "true"; serviceConfig = { DynamicUser = true; DeviceAllow = [ "/dev/net/tun rw" ]; }; };
+        systemd.services.nt-inverted = { script = "true"; serviceConfig.CapabilityBoundingSet = "~CAP_SYS_ADMIN"; };
+        systemd.services.nt-root-bounded = { script = "true"; serviceConfig.CapabilityBoundingSet = [ "CAP_NET_RAW" ]; };
+        # A templated network tool (an openvpn@-style VPN): classified, its
+        # instances carry the hold.
+        systemd.services."nt-vpn@" = { script = "true"; };
+        # A foreign unit named like Planarian's: classified like any other.
+        systemd.services.planarian-test-vpn = { script = "true"; serviceConfig = { DynamicUser = true; AmbientCapabilities = [ "CAP_NET_ADMIN" ]; }; };
+        systemd.services.not-bounded-empty = { script = "true"; serviceConfig.CapabilityBoundingSet = ""; };
+        systemd.services.not-unprivileged = { script = "true"; serviceConfig = { DynamicUser = true; CapabilityBoundingSet = ""; }; };
+        systemd.services.not-bounded-other = { script = "true"; serviceConfig.CapabilityBoundingSet = [ "CAP_CHOWN" "CAP_SETUID" ]; };
+        networking.wg-quick.interfaces.wg7 = { address = [ "10.99.0.1/24" ]; privateKeyFile = "/nonexistent"; peers = [ ]; };
         services.planarian.units.gym-vpn = {
           sensitivity = [ "Security" "External" ];
           holdAllow = [ { address = "192.0.2.7"; port = 51820; } ];
@@ -115,6 +130,15 @@ let
   holdScript = builtins.readFile (builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart));
   vpn = unit "service:gym-vpn";
   nftDropin = hold.holdDropins."nftables.service.d/50-planarian-hold.conf";
+  # §12d (netwatch): the reference kernel carries BTF and what aya's
+  # programs on the netlink paths need. Read from its configuration (built,
+  # like the respond script above). netwatch reports a failed attach at
+  # runtime on any other kernel, and every network tool then holds.
+  kernelConfig = builtins.filter builtins.isString (builtins.split "\n" (builtins.readFile cfg.boot.kernelPackages.kernel.configfile));
+  kernelHas = o: builtins.elem "CONFIG_${o}=y" kernelConfig;
+  # lane-daemon's list: fentry programs (BPF_PROG_TYPE_TRACING, the JIT's
+  # trampolines, x86_64 direct-call ftrace) and a ring buffer.
+  netwatchKernel = [ "BPF" "BPF_SYSCALL" "BPF_JIT" "DEBUG_INFO_BTF" "FTRACE" "FUNCTION_TRACER" "DYNAMIC_FTRACE" "DYNAMIC_FTRACE_WITH_DIRECT_CALLS" "CGROUPS" ];
   check = cond: msg: if cond then true else throw "planarian module eval: ${msg}";
   checks = [
     (check (builtins.any isExec probes) "the configuration exports an Exec probe (P11's check is not vacuous)")
@@ -128,20 +152,27 @@ let
     (check (allowLines != [ ]) "the posture restricts sshd with AllowGroups (P14's check is not vacuous)")
     (check (builtins.all (l: pkgs.lib.hasInfix "AllowGroups planarian-admin root" l && !(pkgs.lib.hasInfix "wheel" l)) allowLines) "every AllowGroups the posture writes is planarian-admin and root, never wheel (§12d, P14)")
     (check (pkgs.lib.hasInfix "Include /run/planarian/sshd/*.conf" cfg.services.openssh.extraConfig) "sshd includes the posture's drop-in, so the restriction takes effect (§12d, P14)")
-    (check (cfg.networking.firewall.enable && builtins.sort builtins.lessThan hold.holdUnits == [ "firewall" "gym-vpn" "nftables" ]) "the network-security units are those with Security and External, and the firewall (§12d)")
-    (check (hold.holdDropins."firewall.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@firewall.service\n") "the firewall's failure applies the hold (§12d)")
-    (check (vpn.holds && vpn.hold_allow == [ { address = "192.0.2.7"; port = 51820; protocol = "udp"; } ]) "a network-security unit exports holds and its holdAllow (§9, §12d)")
-    (check (builtins.all (u: builtins.elem u.id [ "service:gym-vpn" "service:firewall" "service:nftables" ] == u.holds) export.units) "exactly the network-security units hold traffic: not sshd, not any other Security unit (§12d)")
-    (check (builtins.all (u: u.holds == (pkgs.lib.hasPrefix "service:" u.id && (builtins.elem "Security" u.sensitivity && builtins.elem "External" u.sensitivity || builtins.elem u.id [ "service:firewall" "service:nftables" ]))) export.units && builtins.all (u: !u.holds) export.userUnits) "every exported unit's holds is the rule, computed: Security and External, or the firewall (§12d)")
-    (check (!(sys.options.services.planarian.units.type.getSubOptions [ ] ? holds)) "holds is not a manifest option, so no unit can opt out of the hold (§12d)")
-    (check (hold.holdDropins."gym-vpn.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@gym-vpn.service\n") "a network-security unit's failure applies the hold through OnFailure= (§12d)")
+    (check (builtins.all (n: builtins.elem n hold.holdUnits) [ "gym-vpn" "nt-ambient" "nt-tun" "nt-inverted" "nt-root-bounded" "wg-quick-wg7" "firewall" ]) "each branch of the network-tool rule classifies (§12d): root with no bounding set, ambient CAP_NET_ADMIN, DeviceAllow /dev/net/tun, an inverted bounding set, a bounding set with CAP_NET_RAW, a netdev from the wg-quick tree, the firewall")
+    (check (builtins.elem "planarian-test-vpn" hold.holdUnits) "a foreign unit named planarian-* is classified: Planarian's own units are excluded by the set the module declares, not by name (§12d)")
+    (check (builtins.all (n: cfg.systemd.services ? ${n}) hold.ownUnits && builtins.all (n: !(builtins.elem n hold.holdUnits)) hold.ownUnits) "every unit in the module's own set exists, and none is classified")
+    (check (builtins.all (n: !(builtins.elem n hold.holdUnits)) [ "not-bounded-empty" "not-unprivileged" "not-bounded-other" "planariad" "planarian-recovery" ]) "a root unit with no network capabilities in its bounding set, an unprivileged one, and Planarian's own units are not network tools (§12d)")
+    (check (builtins.elem "nt-vpn@" hold.holdUnits && hold.holdDropins."nt-vpn@.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "a templated network tool is classified, and each instance's failure holds as planarian-hold@<instance> (§12d)")
+    (check (hold.holdDropins."firewall.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "the firewall is a network tool from its configuration, not its name (§12d)")
+    (check (builtins.sort builtins.lessThan export.networkTools == builtins.sort builtins.lessThan hold.holdUnits) "the export lists every network tool, declared or not (netwatch's footprints)")
+    (check (vpn.network_tool && vpn.hold_allow == [ { address = "192.0.2.7"; port = 51820; protocol = "udp"; } ] && vpn.hold_interfaces == [ "wg9" ]) "a network tool exports network_tool, its holdAllow and its holdInterfaces (§9, §12d)")
+    (check (builtins.all (u: u.network_tool == (builtins.elem (pkgs.lib.removePrefix "service:" u.id) hold.holdUnits)) export.units && builtins.all (u: !u.network_tool) export.userUnits) "every exported unit's network_tool is the computed rule")
+    (check (!(sys.options.services.planarian.units.type.getSubOptions [ ] ? network_tool) && !(sys.options.services.planarian.units.type.getSubOptions [ ] ? networkTool)) "network_tool is not a manifest option, so no unit can opt out of the hold (§12d)")
+    (check (hold.holdDropins."gym-vpn.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "a network-security unit's failure applies the hold through OnFailure= (§12d)")
     (check (!(cfg.systemd.services.gym-vpn ? onFailure) || !(builtins.elem "planarian-hold@gym-vpn.service" cfg.systemd.services.gym-vpn.onFailure)) "the OnFailure= is a drop-in, not a unit definition (no stub for an undefined unit)")
     (check (pkgs.lib.hasInfix "ExecStartPost=" nftDropin && pkgs.lib.hasInfix "ExecReload=" nftDropin && pkgs.lib.hasInfix " reapply" nftDropin) "a hold is re-applied after nftables.service starts or reloads, which may flush every table (§12d)")
     (check (cfg.environment.etc."planarian/hold/gym-vpn.allow".text == "udp 192.0.2.7 51820\niface wg9\n") "the hold passes the unit's holdAllow endpoints and its own interfaces, as a kill switch does (§12d; owner decision, Nov 2)")
     (check (ownIfaceSys.config.environment.etc."planarian/hold/gym-vpn.allow".text == "udp 192.0.2.7 51820\n") "with the switch off, the held unit's own interfaces are held too")
     (check (holdUnit.unitConfig.DefaultDependencies == false && !(holdUnit ? bindsTo && builtins.elem "planariad.service" holdUnit.bindsTo) && !(holdUnit ? partOf && builtins.elem "planariad.service" holdUnit.partOf)) "the hold unit does not depend on planariad, so it survives its restart (§12d)")
-    (check (holdUnit.serviceConfig.RemainAfterExit && pkgs.lib.hasSuffix " apply %i" holdUnit.serviceConfig.ExecStart && pkgs.lib.hasSuffix " lift %i" holdUnit.serviceConfig.ExecStop && pkgs.lib.hasSuffix " released %i" holdUnit.serviceConfig.ExecCondition) "start applies, stop lifts, an unexpired release skips (§12d)")
+    (check (!holdUnit.restartIfChanged && !holdUnit.stopIfChanged) "an activation (a repair rollback, undo) never stops or restarts a running hold (§12d)")
+    (check (holdUnit.serviceConfig.RemainAfterExit && pkgs.lib.hasSuffix " apply %i" holdUnit.serviceConfig.ExecStart && pkgs.lib.hasSuffix " lift %i" holdUnit.serviceConfig.ExecStop && pkgs.lib.hasSuffix " condition %i" holdUnit.serviceConfig.ExecCondition) "start applies, stop lifts, an unexpired release skips (§12d)")
+    (check (pkgs.lib.hasInfix "/run/planarian/footprint" holdScript && pkgs.lib.hasInfix "protecting yes" holdScript && pkgs.lib.hasInfix "unattributed" holdScript && pkgs.lib.hasInfix "-le 30" holdScript && pkgs.lib.hasInfix ".unattributed" holdScript && pkgs.lib.hasInfix "its footprint is stale" holdScript) "the hold's condition reads the footprint and fails closed on a stale watch, a stale footprint, or a standing unattributed change (§12d)")
     (check (pkgs.lib.hasInfix "policy drop" holdScript && pkgs.lib.hasInfix "planarian-admin" holdScript && pkgs.lib.hasInfix "/run/planarian/hold-released" holdScript) "the hold table drops by default and keeps only administrator sessions (§12d)")
+    (check (builtins.all kernelHas netwatchKernel) "the reference kernel has BTF and the BPF options netwatch needs: ${toString (builtins.filter (o: !(kernelHas o)) netwatchKernel)} missing (§12d)")
     (check (builtins.any (u: u.id == "service:sshd") export.units) "sshd is a canonical unit")
     (check (builtins.any (u: u.id == "device:fs-root") export.units) "fs-root is present")
     (check (builtins.any (u: u.id == "device:fs-boot") export.units) "fs-boot is present")

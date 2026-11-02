@@ -1,7 +1,17 @@
 # `gymHooks`: the gym's VM harness build (fault injection and the gym binary;
 # nix/tests/gym-vm.nix). Never the shipped package.
-{ lib, rustPlatform, nix, gymHooks ? false }:
+{ lib, rustPlatform, nix, callPackage, gymHooks ? false }:
 
+let
+  # §12d: netwatch's eBPF object (nix/netwatch-ebpf.nix), once its crate
+  # exists. It is its own cargo workspace, outside this one's (no_std,
+  # bpfel-unknown-none, RUSTC_BOOTSTRAP for -Z build-std).
+  netwatchCrate = ../crates/backends/netwatch-ebpf;
+  netwatchEbpf =
+    if builtins.pathExists (netwatchCrate + "/Cargo.toml")
+    then callPackage ./netwatch-ebpf.nix { src = lib.fileset.toSource { root = netwatchCrate; fileset = lib.fileset.difference netwatchCrate (lib.fileset.maybeMissing (netwatchCrate + "/target")); }; }
+    else null;
+in
 rustPlatform.buildRustPackage {
   pname = if gymHooks then "planarian-gym-hooks" else "planarian";
   version = "0.0.0";
@@ -35,10 +45,16 @@ rustPlatform.buildRustPackage {
   postInstall = ''
     install -Dm644 share/canonical.json $out/share/planarian/canonical.json
     ln -s planarian $out/bin/ask
+  '' + lib.optionalString (netwatchEbpf != null) ''
+    # Read at runtime next to the running binary, never from the
+    # generation, like canonical.json (I10); hashed in coreFiles (I2).
+    install -Dm444 ${netwatchEbpf}/share/planarian/netwatch.bpf.o $out/share/planarian/netwatch.bpf.o
   '';
 
   # §12d, §15 (B-13): the module refuses a test build outside the gym.
   passthru.testBuild = gymHooks;
+  # Whether the package carries netwatch's eBPF object (coreFiles hashes it).
+  passthru.netwatch = netwatchEbpf != null;
 
   meta = {
     description = "A self-healing layer for declaratively configured computers";

@@ -167,8 +167,9 @@ let
   # §12d "Network security fails closed": the hold. `apply <unit>` holds the
   # machine's traffic for a failed network-security unit; `lift <unit>` ends
   # that unit's hold; `reapply` rebuilds the table (after nftables.service
-  # starts or reloads, which may flush every table); `released <unit>` is the
-  # ExecCondition that skips a hold an administrator released.
+  # starts or reloads, which may flush every table); `condition <unit>` is the
+  # ExecCondition: it skips a hold an administrator released, and one for a
+  # network tool whose footprint shows it was not protecting traffic.
   #
   # The table drops all traffic in and out except loopback, address
   # assignment (DHCP, DHCPv6, ICMPv6 neighbour and router discovery), the held
@@ -188,6 +189,7 @@ let
     PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep pkgs.gawk pkgs.nftables pkgs.iproute2 pkgs.findutils pkgs.getent config.systemd.package ]}
     dir=/run/planarian/hold
     released=/run/planarian/hold-released
+    footprint=/run/planarian/footprint
     mkdir -p "$dir" "$released"
     cmd="$1"; unit="''${2:-}"
     log() { echo "planarian-hold: $*"; }
@@ -207,12 +209,17 @@ let
         [ -n "$uid" ] && is_admin "$uid" || continue
         scope="$(loginctl show-session "$s" -p Scope --value 2>/dev/null)"
         [ -n "$scope" ] || continue
-        for d in $(find /sys/fs/cgroup -type d -name "$scope" 2>/dev/null); do
-          pids="$pids$(find "$d" -name cgroup.procs -exec cat {} + 2>/dev/null | tr '\n' ' ')"
+        # Bounded: a session scope sits at user.slice/user-UID.slice/, and
+        # at most 4096 of its processes are taken. Beyond either bound the
+        # rest are not taken, i.e. held (fail closed).
+        for d in $(find /sys/fs/cgroup -maxdepth 4 -type d -name "$scope" 2>/dev/null | head -n 4); do
+          pids="$pids$(find "$d" -maxdepth 8 -name cgroup.procs -exec cat {} + 2>/dev/null | head -n 4096 | tr '\n' ' ')"
         done
       done
       ss -tunpH state established 2>/dev/null | awk -v pids="$pids" '
-        function split_ap(s, r,  i) { i = match(s, /:[0-9]+$/); r[1] = substr(s, 1, i - 1); r[2] = substr(s, i + 1); gsub(/^\[|\]$/, "", r[1]); sub(/%.*/, "", r[1]) }
+        # An IPv4 peer of a dual-stack socket shows as [::ffff:a.b.c.d]; on
+        # the wire it is IPv4, so it is matched as IPv4.
+        function split_ap(s, r,  i) { i = match(s, /:[0-9]+$/); r[1] = substr(s, 1, i - 1); r[2] = substr(s, i + 1); gsub(/^\[|\]$/, "", r[1]); sub(/%.*/, "", r[1]); if (r[1] ~ /^::ffff:[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) sub(/^::ffff:/, "", r[1]) }
         {
           ok = 0; line = $0
           while (match(line, /pid=[0-9]+/)) { p = substr(line, RSTART + 4, RLENGTH - 4); if (index(pids, " " p " ")) ok = 1; line = substr(line, RSTART + RLENGTH) }
@@ -233,13 +240,18 @@ let
       fi
       a4=""; a6=""; i4=""; o4=""; i6=""; o6=""; ifs=""
       for u in $units; do
-        f=/etc/planarian/hold/$u.allow
-        [ -f "$f" ] || continue
+        # What it passes: the footprint's interfaces and endpoints (§12d),
+        # and the manifest's holdInterfaces and holdAllow.
+        allow="$(cat "/etc/planarian/hold/$u.allow" 2>/dev/null
+                 awk '$1 == "iface" { print "iface", $2 } $1 == "endpoint" { print $2, $3, $4 }' "$footprint/$u" 2>/dev/null)"
+        [ -n "$allow" ] || continue
         while read -r proto addr port; do
           if [ "$proto" = iface ]; then ifs="$ifs \"$addr\","; continue; fi
           [ -n "$port" ] || continue
           case "$addr" in *:*) a6="$a6 $proto . $addr . $port," ;; *) a4="$a4 $proto . $addr . $port," ;; esac
-        done < "$f"
+        done <<ALLOW
+    $allow
+    ALLOW
       done
       if [ -f "$dir/.admin" ]; then
         while read -r fam proto la lp ra rp; do
@@ -294,18 +306,63 @@ let
     }
 
     case "$cmd" in
-      released)
-        # ExecCondition: exit 1 skips the hold while an unexpired release
-        # stands (the marker holds a Unix time, or `boot`; /run never
-        # survives a reboot). Anything else is no release: hold.
+      condition)
+        # ExecCondition (exit 0: hold; 1: skip, the unit stays inactive).
+        #
+        # 1. An unexpired release stands: skip. The marker holds a Unix
+        #    time, or `boot` (/run never survives a reboot); anything else
+        #    is no release.
         m="$released/$unit"
-        [ -f "$m" ] || exit 0
-        t="$(head -n1 "$m")"
-        if [ "$t" = boot ] || { case "$t" in ""|*[!0-9]*) false ;; esac && [ "$t" -gt "$(date +%s)" ]; }; then
-          log "hold on $unit not applied: released until $t"
-          exit 1
+        if [ -f "$m" ]; then
+          t="$(head -n1 "$m")"
+          if [ "$t" = boot ] || { case "$t" in ""|*[!0-9]*) false ;; esac && [ "$t" -gt "$(date +%s)" ]; }; then
+            log "hold on $unit not applied: released until $t"
+            exit 1
+          fi
         fi
-        exit 0 ;;
+        # 2. Is the failed network tool a network-security unit, i.e. was it
+        #    protecting traffic (§12d)? Its kernel-attributed footprint says.
+        #    Fail closed: a watch heartbeat missing, failed or older than 30 s;
+        #    no footprint (netwatch writes `protecting no` for every network
+        #    tool once it attaches, so a missing file was never seen by a
+        #    healthy watch); `protecting yes`; or a change the kernel could
+        #    not attribute, here or anywhere (.unattributed); a footprint not
+        #    confirmed within the window (`at`): hold. Only a fresh watch, no
+        #    standing unattributed change, and a fresh `protecting no` skip.
+        w="$footprint/.watch"
+        fresh() { case "''${1:-}" in ""|*[!0-9]*) return 1 ;; esac; [ $(( $(date +%s) - $1 )) -le 30 ]; }
+        state=missing; ts=""
+        [ -f "$w" ] && read -r state ts < "$w"
+        if [ "$state" = attached ] && ! fresh "$ts"; then
+          state=stale
+        fi
+        if [ "$state" != attached ]; then
+          log "holding for $unit: the network watch is $state, so whether it protected traffic is unknown"
+          exit 0
+        fi
+        # A steering change netwatch could not attribute to any unit (or a
+        # lost event it could not place) stands: any network tool's failure
+        # holds while it does.
+        if [ -e "$footprint/.unattributed" ]; then
+          log "holding for $unit: an unattributed change to how traffic leaves stands"
+          exit 0
+        fi
+        f="$footprint/$unit"
+        if [ ! -f "$f" ]; then
+          log "holding for $unit: no footprint"
+          exit 0
+        fi
+        # Each footprint is confirmed current by netwatch (`at`, refreshed
+        # with the heartbeat); one older than the watch window is stale.
+        if ! fresh "$(awk '$1 == "at" { print $2; exit }' "$f")"; then
+          log "holding for $unit: its footprint is stale"
+          exit 0
+        fi
+        if grep -qx 'protecting yes' "$f" || grep -qx 'unattributed' "$f"; then
+          exit 0
+        fi
+        log "$unit failed but was not protecting traffic: not held"
+        exit 1 ;;
       apply)
         touch "$dir/$unit"
         snapshot
@@ -330,7 +387,7 @@ let
         build && log "hold on $unit lifted" ;;
       reapply)
         build ;;
-      *) echo "usage: planarian-hold apply|lift|released UNIT | reapply" >&2; exit 2 ;;
+      *) echo "usage: planarian-hold apply|lift|condition UNIT | reapply" >&2; exit 2 ;;
     esac
   '';
 
@@ -340,11 +397,12 @@ let
   # systemd.services entry would define a stub unit.
   holdDropins = lib.listToAttrs (map (u: {
     name = "${u}.service.d/50-planarian-hold.conf";
-    value = "[Unit]\nOnFailure=planarian-hold@${u}.service\n";
+    # %N: the failed unit's name, per instance for a template's drop-in.
+    value = "[Unit]\nOnFailure=planarian-hold@%N.service\n";
   }) cfg.holdUnits) // {
     "nftables.service.d/50-planarian-hold.conf" = "[Service]\nExecStartPost=${hold} reapply\nExecReload=${hold} reapply\n";
   };
-  holdDropinPackage = pkgs.runCommand "planarian-hold-dropins" { } (lib.concatStrings (lib.mapAttrsToList (n: t: ''
+  holdDropinPackage = pkgs.runCommand "planarian-hold-dropins" { passthru.planarianHoldDropins = true; } (lib.concatStrings (lib.mapAttrsToList (n: t: ''
     mkdir -p "$out/etc/systemd/system/$(dirname ${lib.escapeShellArg n})"
     printf '%s' ${lib.escapeShellArg t} > "$out/etc/systemd/system/"${lib.escapeShellArg n}
   '') holdDropins));
@@ -363,7 +421,7 @@ let
     "${stopPost "planarian-recovery"}"
     "${check}"
     "${hold}"
-  ];
+  ] ++ lib.optional (cfg.package.netwatch or false) "${cfg.package}/share/planarian/netwatch.bpf.o";
   coreHash = pkgs.runCommand "planarian-core-hash" { } ''
     for f in ${lib.escapeShellArgs coreFiles}; do
       printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"
@@ -382,6 +440,13 @@ in
       default = [ ];
       example = [ "my-assistant.service" ];
       description = "Units that run an agent principal (§11). They start only after planarian-ready.target and are stopped by every failure class (I20).";
+    };
+    ownUnits = mkOption {
+      type = types.listOf types.str;
+      readOnly = true;
+      internal = true;
+      default = [ "planariad" "planarian-recovery" "planarian-respond@" "planarian-posture-check" "planarian-posture-lift" "planarian-hold@" ];
+      description = "The system services this module itself declares (module-eval checks each exists): not classified as network tools, since their failures have their own posture (§12d).";
     };
     holdAllowsOwnInterface = mkOption {
       type = types.bool;
@@ -539,14 +604,21 @@ in
       name = "planarian/hold/${u}.allow";
       value.text = lib.concatMapStrings (a: "${a.protocol} ${a.address} ${toString a.port}\n") cfg.units.${u}.holdAllow
         + lib.optionalString cfg.holdAllowsOwnInterface (lib.concatMapStrings (i: "iface ${i}\n") cfg.units.${u}.holdInterfaces);
-    }) (builtins.filter (u: cfg.units ? ${u}) cfg.holdUnits));
+    # Keyed by the manifest, not by holdUnits: the network tools are computed
+    # from every service's configuration, and a service may read
+    # environment.etc.
+    }) (lib.attrNames (lib.filterAttrs (_: u: u.scope == "system" && (u.holdAllow != [ ] || u.holdInterfaces != [ ])) cfg.units)));
     systemd.services."planarian-hold@" = {
       description = "Planarian: hold network traffic while %i has failed";
+      # An activation (a repair rollback, `undo`) must not stop and start a
+      # running hold: that would open traffic while the unit is still down.
+      restartIfChanged = false;
+      stopIfChanged = false;
       unitConfig.DefaultDependencies = false;
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        ExecCondition = "${hold} released %i";
+        ExecCondition = "${hold} condition %i";
         ExecStart = "${hold} apply %i";
         ExecStop = "${hold} lift %i";
       };
