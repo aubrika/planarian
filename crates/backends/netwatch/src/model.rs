@@ -344,6 +344,13 @@ impl Tracker {
 
     /// An event was lost. With the unit known, its footprint is marked
     /// unattributed; without, the global marker stands.
+    /// The virtual links standing now (`host::read_virtual_ifaces`): read
+    /// live each tick, so a tun made by ioctl or a link moved in from
+    /// another netns is never taken for a physical NIC.
+    pub fn set_virtual(&mut self, live: BTreeSet<String>) {
+        self.virtual_ifaces = live;
+    }
+
     pub fn lost(&mut self, unit: Option<&UnitId>) {
         match unit {
             Some(u) => self.units.entry(u.clone()).or_default().unattributed = true,
@@ -354,10 +361,12 @@ impl Tracker {
     /// The footprint of `unit` now, confirmed at `at`.
     pub fn footprint(&self, unit: &UnitId, at: u64) -> Footprint {
         let Some(s) = self.units.get(unit) else { return Footprint { at, ..Default::default() } };
+        // Only a virtual link can be one a tool created; a physical NIC is
+        // registered by its driver, whoever's context that runs in.
         let created: BTreeSet<String> = s
             .objects
             .iter()
-            .filter(|((k, _), _)| *k == ChangeKind::Interface)
+            .filter(|((k, name), _)| *k == ChangeKind::Interface && self.virtual_ifaces.contains(name))
             .map(|((_, name), _)| name.clone())
             .collect();
         // §12d: an interface the unit created that carries a default or
@@ -367,7 +376,29 @@ impl Tracker {
         // (NetworkManager's DHCP route over wlan0) steers nothing of its own,
         // watched or found at attach (coordinator, Nov 2). `iface` lines name
         // the created interfaces that steer: what the hold passes.
-        let ifaces: BTreeSet<String> = self.steering_ifaces().intersection(&created).cloned().collect();
+        let mut ifaces: BTreeSet<String> = self.steering_ifaces().intersection(&created).cloned().collect();
+        // The coordinator's narrow reading (Nov 2; the owner is told, since
+        // §12d says "an interface it created"): the unit's own steering
+        // route over a virtual link that ANOTHER unit created makes it
+        // protecting too, as well as the creator. OpenVPN on a persistent
+        // tun that a setup unit made: both hold. It leans fail-closed.
+        let by_others: BTreeSet<&String> = self
+            .units
+            .iter()
+            .filter(|(u, _)| *u != unit)
+            .flat_map(|(_, o)| o.objects.keys())
+            .filter(|(k, name)| *k == ChangeKind::Interface && self.virtual_ifaces.contains(name))
+            .map(|(_, name)| name)
+            .collect();
+        for ((k, _), (i, steers)) in &s.objects {
+            if *k == ChangeKind::Route
+                && *steers
+                && let Some(i) = i
+                && by_others.contains(i)
+            {
+                ifaces.insert(i.clone());
+            }
+        }
         let own = |k: &ChangeKind| !matches!(k, ChangeKind::Interface | ChangeKind::Route);
         Footprint {
             at,

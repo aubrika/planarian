@@ -81,6 +81,19 @@
 //! The probes attach before the snapshot is taken, so a change racing it is
 //! seen as an event too (applying it twice changes nothing).
 //!
+//! **Interfaces.** "An interface it created" is seen at
+//! `register_netdevice`, which runs in the creator's context for every
+//! kind: a tun or tap made by `ioctl(TUNSETIFF)` (classic OpenVPN,
+//! wireguard-go, tailscaled), which no netlink message announces, as well
+//! as netlink-made links, whose RTM_NEWLINK is a second witness. Only a
+//! *virtual* link can be one a tool created; virtual is read live each
+//! tick (`/sys/class/net/<if>` under `/sys/devices/virtual/`), so a tun made
+//! by ioctl or a link moved in from another netns is never taken for a
+//! physical NIC. And (coordinator, Nov 2; the owner is told, since §12d
+//! says "it created") a unit's own steering route over a virtual link that
+//! another unit created makes it protecting too, as well as the creator:
+//! OpenVPN on a persistent tun a setup unit made, both hold.
+//!
 //! **Protecting** means the footprint includes, now: an interface the unit
 //! created that carries a default or all-covering route (a `/0` or `/1`, in
 //! any table, whoever added the route); a policy rule that catches all
@@ -95,11 +108,15 @@
 //! or found at attach; one over a virtual link, or over none, that nobody can
 //! be charged with is unattributed (fail closed).
 //!
-//! **Attribution.** The kernel reports each change with the sender's
-//! cgroup id; the unit is the first `<name>.service` under `system.slice`,
-//! past any slices (a template's instances sit in the template's slice).
-//! systemd makes a unit's cgroup before its first process starts, so
-//! netwatch records ids as cgroups are made (inotify on `system.slice` and
+//! **Attribution.** The unit is the first `<name>.service` under
+//! `system.slice`, past any slices (a template's instances sit in the
+//! template's slice). The probe reads the sender's cgroup path from kernfs
+//! at the request (`task->cgroups->dfl_cgrp->kn`, up to four names toward
+//! the root, at offsets the loader takes from BTF), so a unit is known even
+//! if its cgroup is gone before netwatch reads the event. The path is used
+//! only when whole (the walk reached the root, no name cut short); else the
+//! cgroup id is looked up. systemd makes a unit's cgroup before its first
+//! process starts, so netwatch records ids as cgroups are made (inotify on `system.slice` and
 //! the slices under it, waking the loop at once) and keeps them after the
 //! cgroup goes: a oneshot that changes something and exits at once is still
 //! charged with it. Keeping old ids is safe because cgroup ids are 64-bit
@@ -109,6 +126,26 @@
 //! stays bounded on a long-lived host. A cgroup made and
 //! gone before netwatch saw it at all leaves the change unattributed
 //! (`.unattributed`: fail closed).
+//!
+//! **Namespaces** (reviewer, #42). How traffic leaves the machine is the
+//! host netns's business, so only requests that act in netwatch's own netns
+//! (`/proc/self/ns/net`; the unit runs in the host's) count. Each probe
+//! reports the netns the request acts on: the kernel's own `sock_net(skb->
+//! sk)` for netlink, the socket's for `setsockopt` (the netns whose tables
+//! it changes). That is the target, not the sender's netns (`nsproxy`): a
+//! process can open a socket in one netns and then `setns` to another, and
+//! what changes is the socket's. The tracker's keys (names, and indices
+//! resolved through the host's /sys/class/net) are therefore implicitly the
+//! host's; a debug assertion in `parse::take` keeps it so. Rust eBPF has no CO-RE,
+//! so the loader reads where `sk_buff.sk`, `sock.__sk_common.skc_net.net`
+//! and `net.ns.inum` are from the running kernel's BTF and sets them in the
+//! object before load (an object without those globals is unusable). A
+//! container's or a `PrivateNetwork=` service's own interfaces, routes and
+//! firewall are ignored, so a container's `wg0` going away leaves the host
+//! VPN's `wg0` claim standing. Fail closed: a netns the probe could not
+//! read, or a link message elsewhere that may reach into the host (moved
+//! by `IFLA_NET_NS_PID`/`_FD`, or aimed by `IFLA_TARGET_NETNSID`), is a loss
+//! nothing can place (`.unattributed`, until the next attach).
 //!
 //! **Starting** (coordinator, Nov 2). Whatever happens, `.watch` is
 //! written before systemd hears `READY=1`, and systemd hears it once, so
@@ -123,8 +160,8 @@
 //!   `loader::RETRY_SECS` (30 s), rewriting the reason each time. The
 //!   first attach that succeeds reconciles (above) and writes `attached`.
 //!
-//! Probes: `rtnetlink_rcv_msg`, `nf_setsockopt` and `genl_rcv_msg` are built
-//! in, so fentry (they need vmlinux's BTF); `nfnetlink_rcv_msg` and
+//! Probes: `rtnetlink_rcv_msg`, `nf_setsockopt`, `genl_rcv_msg` and
+//! `register_netdevice` are built in, so fentry (they need vmlinux's BTF); `nfnetlink_rcv_msg` and
 //! `nfnetlink_rcv_batch` are in the `nfnetlink` module (`=m` on NixOS
 //! kernels), so kprobes by symbol, which need the module loaded: the
 //! initrd loads it (`boot.kernelModules`), since netwatch starts early in
@@ -144,6 +181,7 @@
 //! [`FootprintView::protecting_now`] is (2) to (6); the release is the
 //! hold's own.
 
+pub mod btf;
 #[cfg(feature = "loader")]
 pub mod cgroups;
 mod contract;

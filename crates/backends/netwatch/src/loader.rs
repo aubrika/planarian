@@ -17,12 +17,16 @@ pub enum Kind {
 /// nftables sends its changes as a batch, which `nfnetlink_rcv_batch`
 /// dispatches itself, never through `nfnetlink_rcv_msg`; legacy iptables
 /// and its kin use `setsockopt`, all through `nf_setsockopt`.
-pub const PROBES: [(&str, &str, Kind); 5] = [
+/// `register_netdevice` sees every interface registered, in its creator's
+/// context, including a tun made by ioctl, which no netlink message
+/// announces (coordinator, Nov 2).
+pub const PROBES: [(&str, &str, Kind); 6] = [
     ("rtnetlink", "rtnetlink_rcv_msg", Kind::FEntry),
     ("nfnetlink", "nfnetlink_rcv_msg", Kind::KProbe),
     ("nfbatch", "nfnetlink_rcv_batch", Kind::KProbe),
     ("sockopt", "nf_setsockopt", Kind::FEntry),
     ("genl", "genl_rcv_msg", Kind::FEntry),
+    ("netdev", "register_netdevice", Kind::FEntry),
 ];
 
 /// Why the watch could not start (crate docs, "Starting"): an unusable
@@ -45,6 +49,18 @@ impl Start {
 /// How long the loop waits for a new event when the ring buffer is empty
 /// (a new cgroup wakes it at once).
 pub const IDLE_MS: i64 = 50;
+
+/// The inode of this process's netns, if it is the host's (pid 1's);
+/// refused otherwise: netwatch in another netns would watch the wrong one.
+pub fn host_netns(proc: &Path) -> Result<u32, String> {
+    use std::os::unix::fs::MetadataExt;
+    let ns = |p: &str| std::fs::metadata(proc.join(p)).map(|m| (m.dev(), m.ino())).map_err(|e| format!("{p}: {e}"));
+    let (own, init) = (ns("self/ns/net")?, ns("1/ns/net")?);
+    if own != init {
+        return Err(format!("not in the host's network namespace (net:[{}], pid 1 is in net:[{}])", own.1, init.1));
+    }
+    u32::try_from(own.1).map_err(|_| format!("netns inode {} is not 32-bit", own.1))
+}
 
 /// How long a refused attach waits before the next try.
 pub const RETRY_SECS: u64 = 30;
@@ -76,9 +92,23 @@ pub fn retry<T>(
 /// attached watch.
 pub fn check_object(bytes: &[u8]) -> Result<(), String> {
     let obj = aya_obj::Object::parse(bytes).map_err(|e| format!("not an eBPF object: {e}"))?;
-    let missing: Vec<&str> = PROBES.iter().map(|(p, _, _)| *p).filter(|p| !obj.programs.contains_key(*p)).collect();
+    let mut missing: Vec<&str> = PROBES.iter().map(|(p, _, _)| *p).filter(|p| !obj.programs.contains_key(*p)).collect();
+    // The netns offsets the loader sets (an object from before them would
+    // read every netns as 0: everything unattributed). Their names are in
+    // the ELF string table, NUL-terminated.
+    for g in NETNS_GLOBALS.iter().chain(&CG_GLOBALS).chain(&NETDEV_GLOBALS) {
+        let name = [g.as_bytes(), b"\0"].concat();
+        if !bytes.windows(name.len()).any(|w| w == name) {
+            missing.push(g);
+        }
+    }
     if missing.is_empty() { Ok(()) } else { Err(format!("the object lacks {}", missing.join(", "))) }
 }
+
+/// The globals the loader sets from the kernel's BTF before load.
+pub const NETNS_GLOBALS: [&str; 3] = ["NETNS_SKB_SK", "NETNS_SK_NET", "NETNS_NET_INUM"];
+pub const CG_GLOBALS: [&str; 5] = ["CG_TASK_CGROUPS", "CG_CSS_DFL", "CG_CGROUP_KN", "CG_KN_NAME", "CG_KN_PARENT"];
+pub const NETDEV_GLOBALS: [&str; 2] = ["NETDEV_NAME", "NETDEV_NET"];
 
 /// `<prefix>/share/planarian/netwatch.bpf.o`, next to the running binary.
 pub fn default_object() -> String {
@@ -100,7 +130,33 @@ pub fn read_object(object: &Path) -> Result<Vec<u8>, Start> {
 /// an unusable object; anything the kernel refuses is [`Start::Kernel`].
 pub fn load_bytes(bytes: &[u8]) -> Result<Ebpf, Start> {
     let kernel = |what: String| Start::Kernel(what);
-    let mut ebpf = Ebpf::load(bytes).map_err(|e| kernel(format!("load the object: {e}")))?;
+    // Where the probes find a request's netns on this kernel (no CO-RE).
+    let raw = std::fs::read("/sys/kernel/btf/vmlinux").map_err(|e| kernel(format!("kernel BTF: {e}")))?;
+    let parsed = crate::btf::Btf::parse(&raw).map_err(kernel)?;
+    let off = crate::btf::NetnsOffsets::from_btf(&parsed).map_err(kernel)?;
+    let dev = crate::btf::NetdevOffsets::from_btf(&parsed).map_err(kernel)?;
+    // The cgroup names are a help, not a need: without them (0s), userspace
+    // attributes by cgroup id alone.
+    let cg = crate::btf::CgroupOffsets::from_btf(&parsed).unwrap_or(crate::btf::CgroupOffsets {
+        task_cgroups: 0,
+        css_dfl: 0,
+        cgroup_kn: 0,
+        kn_name: 0,
+        kn_parent: 0,
+    });
+    let mut ebpf = aya::EbpfLoader::new()
+        .set_global(NETNS_GLOBALS[0], &off.skb_sk, true)
+        .set_global(NETNS_GLOBALS[1], &off.sk_net, true)
+        .set_global(NETNS_GLOBALS[2], &off.net_inum, true)
+        .set_global(CG_GLOBALS[0], &cg.task_cgroups, true)
+        .set_global(CG_GLOBALS[1], &cg.css_dfl, true)
+        .set_global(CG_GLOBALS[2], &cg.cgroup_kn, true)
+        .set_global(CG_GLOBALS[3], &cg.kn_name, true)
+        .set_global(CG_GLOBALS[4], &cg.kn_parent, true)
+        .set_global(NETDEV_GLOBALS[0], &dev.name, true)
+        .set_global(NETDEV_GLOBALS[1], &dev.net, true)
+        .load(bytes)
+        .map_err(|e| kernel(format!("load the object: {e}")))?;
     let btf = Btf::from_sys_fs().map_err(|e| kernel(format!("kernel BTF: {e}")))?;
     for (prog, func, kind) in PROBES {
         let p = ebpf.program_mut(prog).ok_or_else(|| Start::Unusable(format!("no program {prog} in the object")))?;
@@ -190,9 +246,9 @@ pub fn notify_ready(socket: Option<&Path>) {
 }
 
 pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> Result<(), String> {
-    use crate::host::{boottime_secs, expand_tools, network_tools, read_ifnames};
-    use crate::parse::{Parsed, parse};
-    use crate::{Owner, Tracker, WatchState};
+    use crate::host::{boottime_secs, expand_tools, network_tools, read_ifnames, read_virtual_ifaces, unit_of_cgroup};
+    use crate::parse::take;
+    use crate::{Tracker, WatchState};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -219,6 +275,15 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         Err(e) => {
             tell(e.reason());
             return Err(e.reason().to_string());
+        }
+    };
+    // Changes count only in this netns, which must be the host's: the
+    // unit runs with no PrivateNetwork= (crate docs, "Namespaces").
+    let own_netns = match host_netns(Path::new("/proc")) {
+        Ok(n) => n,
+        Err(why) => {
+            tell(&why);
+            return Err(why);
         }
     };
     let stop = Arc::new(AtomicBool::new(false));
@@ -254,6 +319,8 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         let names = read_ifnames();
         let (standing, virtual_ifaces) = crate::snapshot::standing(&mut |i| names.get(&i).cloned())
             .map_err(|e| Start::Kernel(format!("snapshot: {e}")))?;
+        let mut virtual_ifaces = virtual_ifaces;
+        virtual_ifaces.extend(read_virtual_ifaces(Path::new("/sys/class/net")));
         let tracker = Tracker::attach(&crate::read_claims(dir), &standing, &virtual_ifaces);
         Ok((ebpf, ring, lost_map, tracker))
     };
@@ -285,19 +352,15 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                 tracker.lost(None);
                 continue;
             };
-            let unit = cgroups.unit(ev.cgroup);
-            let owner = unit.clone().map(Owner::Unit).unwrap_or(Owner::Unattributed);
             let mut name = |i: u32| {
                 if !ifnames.contains_key(&i) {
                     ifnames = read_ifnames();
                 }
                 ifnames.get(&i).cloned()
             };
-            match parse(&ev, &owner, &mut name) {
-                Parsed::Nothing => {}
-                Parsed::Changes(cs) => cs.iter().for_each(|c| tracker.apply(c)),
-                Parsed::Unreadable(_) => tracker.lost(unit.as_ref()),
-            }
+            // The path the kernel had at the request, else the id's record.
+            let unit = || ev.cgpath.as_deref().and_then(unit_of_cgroup).or_else(|| cgroups.unit(ev.cgroup));
+            take(&mut tracker, &ev, own_netns, unit, &mut name);
         }
         // Events the ring buffer had no room for: a loss nothing can place.
         if let Ok(n) = lost_map.get(&0, 0)
@@ -309,6 +372,7 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         if Instant::now() >= next_tick {
             next_tick += Duration::from_secs(crate::TICK_SECS);
             let Some(now) = boottime_secs() else { return fail("no /proc/uptime".into()) };
+            tracker.set_virtual(read_virtual_ifaces(Path::new("/sys/class/net")));
             let claims = tracker.claims();
             let running = cgroups.walk(&claims.units());
             let view = tracker.view(WatchState::Attached { at: now }, &expand_tools(&tools, &running), now);

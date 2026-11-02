@@ -69,6 +69,19 @@ pub fn read_cgroups(root: &Path) -> (BTreeMap<u64, UnitId>, BTreeSet<String>) {
     (ids, running)
 }
 
+/// The virtual links standing: those whose `/sys/class/net/<name>`
+/// resolves under `/sys/devices/virtual/` (tun, tap, wireguard, dummy,
+/// veth, bridges, `lo`). A physical NIC's resolves under its bus device.
+pub fn read_virtual_ifaces(class_net: &Path) -> BTreeSet<String> {
+    std::fs::read_dir(class_net)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| std::fs::read_link(e.path()).is_ok_and(|t| t.to_string_lossy().contains("/devices/virtual/")))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
 /// Interface index → name, from `/sys/class/net`.
 pub fn read_ifnames() -> BTreeMap<u32, String> {
     let mut out = BTreeMap::new();
