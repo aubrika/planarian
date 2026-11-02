@@ -21,25 +21,12 @@ let
   # The journal's filesystem: btrfs for an entry whose layouts ask for it
   # (and not ext4), else ext4.
   layouts = (lib.findFirst (e: e.id == id) { } (import ../gym/catalog.nix catalog).fault).layouts or [ ];
-  # §12d "Network security fails closed": a WireGuard tunnel from the machine
-  # to the upstream node, for the netsec-* entries only, so no other entry
-  # gains a watched unit. The keys are test-only and never leave the gym.
+  # §12d "Network security fails closed": the WireGuard fixture, for the
+  # netsec-* entries only, so no other entry gains a watched unit. The test
+  # driver numbers nodes alphabetically on vlan 1: machine is 192.168.1.1,
+  # upstream 192.168.1.2.
   netsec = lib.hasPrefix "netsec-" id;
-  wg = {
-    machine = { priv = "cP6KjFs6ETrMbtGOUa5iicYlJfIeiO5YfUM9kE/UImA="; pub = "1yKBJKBQ4Pvx9s9TFx+CTdA4nr+WBoVAFDVQTzuB9F8="; addr = "10.77.0.1"; };
-    upstream = { priv = "cNk4txfT3ovozycRTDaecu2vEpRnGpg4406CWwi+nXU="; pub = "l7HFMh19jc6/K32cwArdHyKr/tgskXKDvmM3wutKvA0="; addr = "10.77.0.2"; };
-    # The test driver numbers nodes alphabetically on vlan 1: machine is
-    # 192.168.1.1, upstream 192.168.1.2.
-    endpoint = "192.168.1.2";
-    port = 51820;
-  };
-  wgModule = me: peer: extra: {
-    networking.wg-quick.interfaces.wg0 = {
-      address = [ "${me.addr}/24" ];
-      privateKeyFile = "${pkgs.writeText "wg-${me.addr}.key" me.priv}";
-      peers = [ ({ publicKey = peer.pub; allowedIPs = [ "${peer.addr}/32" ]; persistentKeepalive = 5; } // extra) ];
-    };
-  };
+  wireguardGym = import ./wireguard-gym.nix { inherit pkgs lib; };
   journalFs = if layouts != [ ] && !(builtins.elem "ext4" layouts) && builtins.elem "btrfs" layouts then "btrfs" else "ext4";
   # A third-party flake input's source at two revisions (store paths).
   modulesOld = builtins.path { path = ./gym-modules-old; name = "gym-modules"; };
@@ -182,44 +169,7 @@ let
       }) candidates));
     in {
     imports = [ self.nixosModules.default self.nixosModules.reference ./gym-payload.nix
-      # The netsec-* entries' tunnel, watched as a network-security unit. The
-      # machine's end is a userspace WireGuard daemon (wireguard-go) in its
-      # own unit, so a kill fails the unit as it would a VPN daemon (NixOS's
-      # kernel wg-quick units are oneshots with nothing to kill). Restart=no:
-      # restarting is Planarian's repair (§12d). The hold still lets the
-      # unit reach the peer's endpoint.
-      { config = lib.mkIf netsec {
-          systemd.services.wireguard-gym = {
-            description = "WireGuard tunnel to the gym upstream (wireguard-go)";
-            wantedBy = [ "multi-user.target" ];
-            after = [ "network.target" ];
-            path = [ pkgs.wireguard-tools pkgs.iproute2 pkgs.coreutils ];
-            serviceConfig = {
-              Type = "simple";
-              Restart = "no";
-              Environment = "WG_PROCESS_FOREGROUND=1";
-              ExecStart = "${pkgs.wireguard-go}/bin/wireguard-go -f wg0";
-              ExecStartPost = pkgs.writeShellScript "wireguard-gym-up" ''
-                for _ in $(seq 50); do [ -S /var/run/wireguard/wg0.sock ] && break; sleep 0.1; done
-                wg set wg0 private-key ${pkgs.writeText "wg-machine.key" wg.machine.priv} \
-                  peer ${wg.upstream.pub} endpoint ${wg.endpoint}:${toString wg.port} \
-                  allowed-ips ${wg.upstream.addr}/32 persistent-keepalive 5
-                ip address add ${wg.machine.addr}/24 dev wg0
-                ip link set wg0 up
-              '';
-            };
-          };
-          services.planarian.units.wireguard-gym = {
-            sensitivity = [ "Security" "External" ];
-            holdAllow = [ { address = wg.endpoint; port = wg.port; protocol = "udp"; } ];
-            # Its own interface: inert until the owner decides whether the
-            # tunnel's own traffic passes the hold (§12d). Until then the
-            # Readiness probe must not cross the tunnel, or a hold could
-            # never lift: it checks the daemon.
-            holdInterfaces = [ "wg0" ];
-            probes = [ { id = "wireguard-gym-active"; type = "systemd-active"; establishes = "the tunnel's daemon runs"; } ];
-          };
-        }; }
+      { config = lib.mkIf netsec (wireguardGym.machine { endpoint = "192.168.1.2"; }); }
     ];
 
     options.services.gym-web.listenAddress = lib.mkOption { type = lib.types.str; default = "127.0.0.1"; };
@@ -615,8 +565,8 @@ let
   test = pkgs.testers.runNixOSTest {
       name = "gym-${id}";
       nodes.machine = machineModule;
-      nodes.upstream = { pkgs, ... }: lib.recursiveUpdate (lib.optionalAttrs netsec (wgModule wg.upstream wg.machine { })) {
-        networking.wg-quick.interfaces = lib.optionalAttrs netsec { wg0.listenPort = wg.port; };
+      nodes.upstream = { pkgs, ... }: {
+        imports = lib.optional netsec wireguardGym.peer;
         networking.interfaces.eth1.ipv4.addresses = lib.mkAfter [ { address = "10.0.2.2"; prefixLength = 32; } ];
         environment.etc.health.text = "ok\n";
         networking.firewall.enable = false;
