@@ -127,6 +127,10 @@ pub fn take(
         Scope::Reaches => return t.lost(unit().as_ref()),
         Scope::Host => {}
     }
+    // The tracker's keys (interface names, `oif` resolved through the
+    // host's /sys/class/net) are implicitly the host's: nothing from
+    // another netns may reach it.
+    debug_assert_eq!(ev.netns, own_netns, "a non-host event reached the tracker");
     let unit = unit();
     let owner = unit.clone().map(Owner::Unit).unwrap_or(Owner::Unattributed);
     match parse(ev, &owner, ifname) {

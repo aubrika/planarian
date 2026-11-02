@@ -118,7 +118,12 @@
 //! host netns's business, so only requests that act in netwatch's own netns
 //! (`/proc/self/ns/net`; the unit runs in the host's) count. Each probe
 //! reports the netns the request acts on: the kernel's own `sock_net(skb->
-//! sk)` for netlink, the socket's for `setsockopt`. Rust eBPF has no CO-RE,
+//! sk)` for netlink, the socket's for `setsockopt` (the netns whose tables
+//! it changes). That is the target, not the sender's netns (`nsproxy`): a
+//! process can open a socket in one netns and then `setns` to another, and
+//! what changes is the socket's. The tracker's keys (names, and indices
+//! resolved through the host's /sys/class/net) are therefore implicitly the
+//! host's; a debug assertion in `parse::take` keeps it so. Rust eBPF has no CO-RE,
 //! so the loader reads where `sk_buff.sk`, `sock.__sk_common.skc_net.net`
 //! and `net.ns.inum` are from the running kernel's BTF and sets them in the
 //! object before load (an object without those globals is unusable). A
