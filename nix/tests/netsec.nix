@@ -88,6 +88,11 @@ pkgs.testers.runNixOSTest {
         ''}";
       };
     };
+    # Declared, but with no sensitivity tag: only the kernel's attribution of
+    # its helper's rule makes it a network-security unit. TODO (#35, parked
+    # with the owner): the same with no entry at all, once §12d says what
+    # happens to an undeclared network tool (held; repaired or not).
+    services.planarian.units.gym-vpn-untagged = { };
     # Something on loopback to reach while held.
     systemd.services.local-web = {
       wantedBy = [ "multi-user.target" ];
@@ -229,9 +234,9 @@ pkgs.testers.runNixOSTest {
         not_held("gym-privnet")
         machine.succeed(lan_ok())
 
-    with subtest("netwatch: an untagged tool whose short-lived helper set a dropping firewall rule is protecting"):
-        # No services.planarian.units entry and no tag: only the kernel's
-        # attribution (the helper ran in gym-vpn-untagged's cgroup) says so.
+    with subtest("netwatch: a declared, untagged tool whose short-lived helper set a dropping firewall rule is protecting"):
+        # Declared with no tag: only the kernel's attribution (the helper ran
+        # in gym-vpn-untagged's cgroup) makes it protecting.
         machine.succeed("nft list table inet gymvpn")
         machine.fail("pgrep -f gym-vpn-untagged-helper")
         machine.succeed("echo 30 > /run/gym-vpn-untagged-slow")
