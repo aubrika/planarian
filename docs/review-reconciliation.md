@@ -188,3 +188,7 @@ pinned nixpkgs greetd module always aliases `display-manager.service` to
   `wheel` (read from the script, IFD); sshd's `extraConfig` includes
   `/run/planarian/sshd/*.conf`. Passes on `main` (guard); a mutation writing
   `wheel` fails it.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P13, module-eval (lane-nix, 2 Nov) | As reconciled above: with greetd on, `principalUnits` listed both `display-manager.service` and `greetd.service`, so the posture defined an `ExecStart`-less `display-manager.service`; the built tree came out right only because systemd-lib's alias `ln -sfn` runs after the unit links | `nix/posture.nix` orders `greetd.service` when greetd is enabled, else `display-manager.service` when NixOS runs one. The reviewer's case passes unedited: greetd ordered, no stub beside the alias, SDDM's `display-manager.service` ordered, and the SSH group (`AllowGroups planarian-admin root`, never `wheel`; the drop-in included) asserted. The module-eval assertions task closes with it |
