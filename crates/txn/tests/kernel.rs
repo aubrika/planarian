@@ -586,3 +586,29 @@ fn undeferred_reconcile_recovers_at_once() {
     assert!(deferred.is_empty());
     assert_eq!(state_of(&mut d2, id), TxnState::Reverted);
 }
+
+/// §12f: a withdrawal names its rollback, and a transaction that prepares it
+/// again names it; both survive compaction and a restart (the daemon
+/// rebuilds what is still to be prepared again from them).
+#[test]
+fn withdrawal_links_replay_and_survive_compaction() {
+    let rig = Rig::new();
+    let mut d = rig.daemon();
+    let id = d.prepare(good_change()).unwrap();
+    let rollback = TxnId(99);
+    assert_eq!(d.withdraw(id, rollback).unwrap(), TxnState::Rejected(RejectReason::Interrupted));
+    let mut again = good_change();
+    again.prepared_again_from = Some(id);
+    let again = d.prepare(again).unwrap();
+    assert_eq!(d.reject(again, RejectReason::Interrupted).unwrap(), TxnState::Rejected(RejectReason::Interrupted));
+    d.journal.compact().unwrap();
+    drop(d);
+
+    for k in [rig.daemon2(), rig.watchdog()] {
+        let l = k.journal.ledger();
+        assert_eq!(l.terminal[&id].withdrawn_for, Some(rollback));
+        assert_eq!(l.terminal[&id].prepared_again_from, None);
+        assert_eq!(l.terminal[&again].prepared_again_from, Some(id));
+        assert_eq!(l.terminal[&again].withdrawn_for, None, "a plain reject names no rollback");
+    }
+}

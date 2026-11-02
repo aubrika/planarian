@@ -273,8 +273,12 @@ impl<S: Store, H: Host> Kernel<S, H> {
     }
 
     fn advance(&mut self, txn: &Transaction, to: TxnState, note: &str) -> R<()> {
+        self.advance_for(txn, to, note, None)
+    }
+
+    fn advance_for(&mut self, txn: &Transaction, to: TxnState, note: &str, withdrawn_for: Option<TxnId>) -> R<()> {
         let epoch = self.epoch(txn.id)?;
-        let rec = Record::Advance { txn: txn.id, epoch, to: to.clone(), note: note.into() };
+        let rec = Record::Advance { txn: txn.id, epoch, to: to.clone(), note: note.into(), withdrawn_for };
         self.record(rec)?;
         if to.is_terminal()
             && to != TxnState::Committed
@@ -397,6 +401,15 @@ impl<S: Store, H: Host> Kernel<S, H> {
         let l = self.live(id)?;
         let to = TxnState::Rejected(reason);
         self.advance(&l.txn, to.clone(), "rejected before mutation")?;
+        Ok(to)
+    }
+
+    /// §12f: withdraw `id`, waiting in `Built`, for the rollback `rollback`
+    /// (`Rejected(Interrupted)`, naming it in the same record).
+    pub fn withdraw(&mut self, id: TxnId, rollback: TxnId) -> R<TxnState> {
+        let l = self.live(id)?;
+        let to = TxnState::Rejected(RejectReason::Interrupted);
+        self.advance_for(&l.txn, to.clone(), "withdrawn for a rollback", Some(rollback))?;
         Ok(to)
     }
 
