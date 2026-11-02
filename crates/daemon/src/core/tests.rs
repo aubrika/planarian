@@ -1181,7 +1181,7 @@ fn user_data_without_a_snapshot_backend_logs_no_snapshot() {
         let user_data = Sensitivities::of(&[Sensitivity::UserData]);
         for g in w.gens.values_mut() {
             if let Some(d) = g.eval.units.get_mut(&web) {
-                d.sensitivity = user_data.clone();
+                d.sensitivity = user_data;
             }
         }
         // And in generations built from here on.
