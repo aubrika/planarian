@@ -675,8 +675,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 Some((p, caller)) => (p.source, authorization_of(caller)),
                 None => (Source::Maintenance, authorization_of(Actor::Daemon)),
             };
+            let incident = match &source {
+                Source::Diagnoser { incident } => Some(*incident),
+                _ => None,
+            };
             let p = self.proposal(t.clone(), s, defs, source, format!("prepared again {why}"));
             let r = self.submit(p, authz, s, defs);
+            // A diagnoser's repair that waits again keeps its incident with it.
+            if let (
+                Some(inc),
+                Submitted::Finished { txn, state: TxnState::Built, .. } | Submitted::Parked { txn, .. },
+            ) = (incident, &r)
+            {
+                self.incident_parked.insert(inc, *txn);
+            }
             self.notice(format!("{}: prepared again {why}: {}", render::transition(&t), render::submitted_short(&r)));
         }
     }
@@ -1533,6 +1545,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         c.target, c.target
                     ));
                 }
+                // Withdrawn before the submission because the ledger's I6
+                // check refuses the rollback while a Built one is live.
+                let withdrawn_before = self.withdrawn.len();
                 if c.transition == Transition::Rollback {
                     self.withdraw_for_repair();
                 }
@@ -1549,7 +1564,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 if admitted && self.is_canonical(&c.target, defs) {
                     self.repaired_before_confirmation.insert(c.target.clone());
                 }
-                match self.submit(p, authorization_of(Actor::Daemon), s, defs) {
+                let result = self.submit(p, authorization_of(Actor::Daemon), s, defs);
+                // A rollback refused before it got a transaction (Stale,
+                // Precondition, policy) gave nothing the withdrawn changes
+                // made way for: prepare them again now.
+                if matches!(result, Submitted::Rejected { .. } | Submitted::Error(_))
+                    && self.withdrawn.len() > withdrawn_before
+                {
+                    let back = self.withdrawn.split_off(withdrawn_before);
+                    self.prepare_again(back, "after a refused repair rollback", s, defs);
+                }
+                match result {
                     // §12f: waiting in Built for an activation window is not an
                     // attempt; the incident waits with it, and reopens if the
                     // wait expires.

@@ -1334,3 +1334,84 @@ fn a_repair_rollback_leaves_a_parked_update_alone() {
     assert!(r.core.ex.parked.contains_key(&parked), "still waiting for its approval");
     assert!(!r.core.notices.iter().any(|n| n.contains("set aside for a repair rollback")), "{:?}", r.core.notices);
 }
+
+/// #26 review (1): a repair rollback refused before it gets a transaction
+/// (here its dry activation fails, R10) gives nothing the withdrawn change
+/// made way for: it is prepared again in the same tick.
+#[test]
+fn a_refused_repair_rollback_gives_the_withdrawn_change_back() {
+    let mut r = Rig::new();
+    seated_session(&mut r, false);
+    r.ticks(2);
+    let resp = r.core.handle(ALICE.in_session("s1"), font("1.25"));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let broken = GenerationId(2);
+    r.fake.w().activation_restarts.insert(UnitId::service("display-manager"));
+    let (s, defs) = r.core.observe();
+    let t = Transition::ApplyChange {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.5".into()))].into(),
+    };
+    let p = r.core.proposal(t, &s, &defs, Source::Maintenance, "update".into());
+    let alice = r.core.authz(&ALICE.in_session("s1"));
+    let got = r.core.submit(p, alice, &s, &defs);
+    let Submitted::Finished { txn: waiting, state: TxnState::Built, .. } = got else { panic!("{got:?}") };
+
+    r.fake.w().break_in(broken, &UnitId::service("gym-printer"));
+    // The rollback's dry activation will fail (the restart does not use one).
+    r.fake.w().dry_activate_fails = Some("dry-activate: exit 1".into());
+    let refused = |r: &Rig| {
+        r.core
+            .log
+            .iter()
+            .any(|x| x.proposal.transition == Transition::Rollback && matches!(x.result, Submitted::Rejected { .. }))
+    };
+    for _ in 0..200 {
+        r.ticks(1);
+        if refused(&r) {
+            break;
+        }
+    }
+    assert!(refused(&r), "the repair rollback was refused: {:#?}", r.core.log);
+    let l = r.core.ledger();
+    assert_eq!(
+        l.terminal.get(&waiting).map(|t| t.state.clone()),
+        Some(TxnState::Rejected(RejectReason::Interrupted)),
+        "it was withdrawn for the attempt"
+    );
+    let again = l
+        .live
+        .values()
+        .find(|t| matches!(t.txn.transition, Transition::ApplyChange { .. }))
+        .expect("prepared again in the same tick");
+    assert_eq!(again.txn.state, TxnState::Built);
+    assert!(r.core.notices.iter().any(|n| n.contains("prepared again after a refused repair rollback")));
+    assert!(r.core.withdrawn.is_empty(), "nothing left waiting for a repair that never ran");
+}
+
+/// #26 review (4): a diagnoser's repair prepared again (after a restart or
+/// a withdrawal; both use `prepare_again`) that waits again is linked back
+/// to its incident.
+#[test]
+fn a_repair_prepared_again_keeps_its_incident() {
+    let mut r = Rig::new();
+    seated_session(&mut r, false);
+    r.ticks(2);
+    r.fake.w().activation_restarts.insert(UnitId::service("display-manager"));
+    let t = Transition::ApplyChange {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.25".into()))].into(),
+    };
+    let incident = IncidentId(7);
+    let (s, defs) = r.core.observe();
+    let earlier = r.core.proposal(t.clone(), &s, &defs, Source::Diagnoser { incident }, "repair".into());
+    r.core.earlier.insert(TxnId(40), (earlier, Actor::Daemon));
+    r.core.prepare_again(vec![(TxnId(40), t)], "after a restart", &s, &defs);
+    let l = r.core.ledger();
+    let again = l
+        .live
+        .values()
+        .find(|t| matches!(t.txn.transition, Transition::ApplyChange { .. }))
+        .expect("prepared again, and waiting");
+    assert_eq!(r.core.incident_parked.get(&incident), Some(&again.txn.id), "linked to its incident");
+}
