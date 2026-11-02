@@ -103,6 +103,22 @@ pub fn diff(base: &OverrideSet, cand: &OverrideSet) -> ConfigDiff {
     d
 }
 
+/// The options two evaluated generations set differently (§11, §16).
+pub fn option_diff(base: &BTreeMap<String, Value>, cand: &BTreeMap<String, Value>) -> ConfigDiff {
+    let mut d = ConfigDiff::default();
+    for (k, v) in cand {
+        if base.get(k) != Some(v) {
+            d.options.insert(k.clone(), (base.get(k).cloned(), Some(v.clone())));
+        }
+    }
+    for (k, v) in base {
+        if !cand.contains_key(k) {
+            d.options.insert(k.clone(), (Some(v.clone()), None));
+        }
+    }
+    d
+}
+
 /// A generation tried to define a canonical probe differently from the core
 /// package, or dropped one from a unit that is still present (I10).
 fn touches_canonical(base: &Manifest, cand: &Manifest, canonical: &Canonical) -> bool {
@@ -158,6 +174,34 @@ fn changes_desired(base: &Manifest, cand: &Manifest) -> bool {
         || base.units.iter().any(|(id, b)| cand.units.get(id).is_some_and(|c| c.desired != b.desired))
 }
 
+/// What a generation transition takes away (§11 Rollback row, §16): units
+/// present now and absent from the target, and units its activation stops,
+/// sorted, with their sensitivity. A removed user template's definition is in
+/// the base manifest, not in `defs` (which holds the per-session instances), so
+/// it is looked up there: an unknown unit must not count as Routine (§11
+/// sensitivity completeness, fail closed).
+pub(crate) fn removed_units(
+    base_m: &Manifest,
+    cand_m: &Manifest,
+    activation: Option<&ActivationPlan>,
+    defs: &UnitDefs,
+    services: &BTreeMap<String, Sensitivities>,
+) -> (Vec<UnitId>, Sensitivities) {
+    let mut removed: Vec<UnitId> = base_m.units.keys().filter(|u| !cand_m.units.contains_key(*u)).cloned().collect();
+    removed.extend(
+        base_m.user_units.iter().filter(|b| !cand_m.user_units.iter().any(|c| c.id == b.id)).map(|b| b.id.clone()),
+    );
+    if let Some(a) = activation {
+        removed.extend(a.stop.iter().cloned());
+    }
+    let mut known = defs.clone();
+    for b in &base_m.user_units {
+        known.entry(b.id.clone()).or_insert_with(|| b.clone());
+    }
+    let sens = unit_facts(&removed, &known, services, |_| false).0;
+    (unit_set(removed), sens)
+}
+
 pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
     let base_m = manifest_of(i.base);
     let one = |u: &UnitId| {
@@ -178,6 +222,8 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         restores_unattributed_stop: false,
         restarts_failed_unit: false,
         removes_sensitivity: Default::default(),
+        removes: Default::default(),
+        restarts_held_unit: false,
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
         caller: i.caller.clone(),
@@ -258,7 +304,22 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             if let Some(a) = i.activation {
                 affected.extend(a.start.iter().chain(&a.stop).chain(&a.restart).chain(&a.reload).cloned());
             }
-            let config = i.candidate_overrides.map(|c| diff(i.base_overrides, c)).unwrap_or_default();
+            let mut config = i.candidate_overrides.map(|c| diff(i.base_overrides, c)).unwrap_or_default();
+            // A generation built outside Planarian (known_good often is) has no
+            // recorded override, so for a switch, revert or rollback the
+            // evaluated option sets are compared too: an option it would
+            // restore is in the diff even without an override (§11 Rollback
+            // row, I11, §16; owner decision, Nov 2).
+            if matches!(
+                i.transition,
+                Transition::SwitchGeneration(_) | Transition::Revert { .. } | Transition::Rollback
+            ) {
+                for (k, v) in option_diff(&i.base.options, &cand.options).options {
+                    if !config.options.contains_key(&k) {
+                        config.options.insert(k, v);
+                    }
+                }
+            }
             let mut all_defs = i.defs.clone();
             for (k, v) in &cand.units {
                 all_defs.entry(k.clone()).or_insert_with(|| v.clone());
@@ -286,21 +347,9 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
                 f.sensitivity = f.sensitivity.union(&Sensitivities::of(&[Sensitivity::Security]));
                 f.touches_manifest = true;
             }
-            // What the transition takes away (§11 Rollback row): units present
-            // now and absent from the target, and units its activation stops.
-            let mut removed: Vec<UnitId> =
-                base_m.units.keys().filter(|u| !cand_m.units.contains_key(*u)).cloned().collect();
-            removed.extend(
-                base_m
-                    .user_units
-                    .iter()
-                    .filter(|b| !cand_m.user_units.iter().any(|c| c.id == b.id))
-                    .map(|b| b.id.clone()),
-            );
-            if let Some(a) = i.activation {
-                removed.extend(a.stop.iter().cloned());
-            }
-            f.removes_sensitivity = unit_facts(&removed, &all_defs, &services, |_| false).0;
+            let (removes, removes_sensitivity) = removed_units(&base_m, &cand_m, i.activation, &all_defs, &services);
+            f.removes_sensitivity = removes_sensitivity;
+            f.removes = removes;
             f.affected_units = unit_set(affected);
             f.config_diff = (!config.options.is_empty()).then_some(config);
         }
@@ -427,6 +476,32 @@ mod sensitivity_completeness {
             UnitId { kind: UnitKind::Service, name: "notes".into(), scope: Scope::User { uid: 1000, session: None } };
         let (s, _) = unit_facts([&own], &defs, &none, |_| false);
         assert!(!s.external, "an undeclared user unit stays as it was: {s:?}");
+    }
+
+    /// §11 Rollback row (owner decision, Nov 2): a removed user template
+    /// carries its own sensitivity, read from the base manifest (the per-session
+    /// instances alone would miss it), and a removed or stopped system unit
+    /// carries its own.
+    #[test]
+    fn removed_units_carry_their_sensitivity() {
+        let mut vpn = planarian_fake::fixtures::gym_user_units()[0].clone();
+        vpn.id.name = "user-vpn".into();
+        vpn.sensitivity = Sensitivities::of(&[Sensitivity::Security]);
+        let base = Manifest { units: planarian_fake::fixtures::gym_units(), user_units: vec![vpn.clone()] };
+        let mut cand = base.clone();
+        cand.user_units.clear();
+        let none = BTreeMap::new();
+        let (removed, s) = removed_units(&base, &cand, None, &UnitDefs::new(), &none);
+        assert_eq!(removed, vec![vpn.id.clone()]);
+        assert!(s.security, "the removed user template is Security: {s:?}");
+        // Nothing removed: nothing carried.
+        let (removed, s) = removed_units(&base, &base, None, &base.units, &none);
+        assert!(removed.is_empty() && s == Sensitivities::default(), "{removed:?} {s:?}");
+        // A unit the activation stops counts too.
+        let web = UnitId::service("gym-web");
+        let plan = ActivationPlan { stop: [web.clone()].into(), ..Default::default() };
+        let (removed, _) = removed_units(&base, &base, Some(&plan), &base.units, &none);
+        assert_eq!(removed, vec![web]);
     }
 }
 
