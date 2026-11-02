@@ -162,3 +162,116 @@ fn the_hold_scripts_lines_read_what_is_written() {
     assert_eq!(sh(r#"grep -qx 'protecting yes' "$1/wg-quick-wg0" && echo held"#), "held\n");
     assert_eq!(sh(r#"grep -qx 'protecting no' "$1/gym-syncd" && echo free"#), "free\n");
 }
+
+mod parsing {
+    use crate::ebpf::{Event, HOOK_NFBATCH, HOOK_NFNETLINK, HOOK_RTNETLINK};
+    use crate::model::{ChangeKind, Owner};
+    use crate::parse::{Parsed, parse};
+    use planarian_schema::UnitId;
+
+    fn attr(ty: u16, v: &[u8]) -> Vec<u8> {
+        let mut a = ((4 + v.len()) as u16).to_ne_bytes().to_vec();
+        a.extend(ty.to_ne_bytes());
+        a.extend(v);
+        while a.len() % 4 != 0 {
+            a.push(0);
+        }
+        a
+    }
+
+    fn msg(hook: u32, ty: u16, flags: u16, body: &[u8]) -> Event {
+        let mut d = ((16 + body.len()) as u32).to_ne_bytes().to_vec();
+        d.extend(ty.to_ne_bytes());
+        d.extend(flags.to_ne_bytes());
+        d.extend([0u8; 8]);
+        d.extend(body);
+        Event { cgroup: 1, tgid: 2, hook, len: d.len() as u32, data: d }
+    }
+
+    fn owner() -> Owner {
+        Owner::Unit(UnitId::service("wg-quick-wg0"))
+    }
+
+    fn names(i: u32) -> Option<String> {
+        (i == 7).then(|| "wg0".to_string())
+    }
+
+    fn one(p: Parsed) -> crate::model::Change {
+        match p {
+            Parsed::Changes(mut c) if c.len() == 1 => c.remove(0),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_created_link_is_an_interface() {
+        let mut body = vec![0u8; 16]; // ifinfomsg
+        body.extend(attr(3, b"wg0\0"));
+        let c = one(parse(&msg(HOOK_RTNETLINK, 16, 0x400 | 0x1, &body), &owner(), &names));
+        assert_eq!((c.kind, c.object.as_str(), c.steers, c.removed), (ChangeKind::Interface, "wg0", false, false));
+        // Setting a link up creates nothing.
+        assert_eq!(parse(&msg(HOOK_RTNETLINK, 16, 0x1, &body), &owner(), &names), Parsed::Nothing);
+        // Deleting by index alone still names it.
+        let mut del = vec![0u8; 16];
+        del[4..8].copy_from_slice(&7u32.to_ne_bytes());
+        let c = one(parse(&msg(HOOK_RTNETLINK, 17, 0x1, &del), &owner(), &names));
+        assert!(c.removed && c.object == "wg0");
+    }
+
+    fn route(dst_len: u8, oif: u32) -> Vec<u8> {
+        let mut b = vec![2u8, dst_len, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0]; // rtmsg: AF_INET, main
+        if dst_len > 0 {
+            b.extend(attr(1, &[10, 0, 0, 0]));
+        }
+        b.extend(attr(4, &oif.to_ne_bytes()));
+        b
+    }
+
+    #[test]
+    fn a_default_or_all_covering_route_steers() {
+        for (dst_len, steers) in [(0, true), (1, true), (8, false)] {
+            let c = one(parse(&msg(HOOK_RTNETLINK, 24, 0x400, &route(dst_len, 7)), &owner(), &names));
+            assert_eq!((c.kind, c.steers, c.iface.as_deref()), (ChangeKind::Route, steers, Some("wg0")), "/{dst_len}");
+        }
+        let c = one(parse(&msg(HOOK_RTNETLINK, 25, 0, &route(0, 7)), &owner(), &names));
+        assert!(c.removed, "RTM_DELROUTE");
+        // A read changes nothing.
+        assert_eq!(parse(&msg(HOOK_RTNETLINK, 26, 0x300, &route(0, 7)), &owner(), &names), Parsed::Nothing);
+    }
+
+    #[test]
+    fn a_catch_all_rule_steers() {
+        // fib_rule_hdr: AF_INET, dst 0, src 0, tos, table, res, res, action TO_TBL, flags.
+        let mut b = vec![2u8, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
+        b.extend(attr(15, &51820u32.to_ne_bytes()));
+        let c = one(parse(&msg(HOOK_RTNETLINK, 32, 0x400, &b), &owner(), &names));
+        assert!(c.kind == ChangeKind::Rule && c.steers, "{c:?}");
+        b[1] = 24; // a rule for one destination prefix does not catch all
+        assert!(!one(parse(&msg(HOOK_RTNETLINK, 32, 0x400, &b), &owner(), &names)).steers);
+    }
+
+    #[test]
+    fn nftables_changes_are_firewall_changes_and_reads_are_not() {
+        let c = one(parse(&msg(HOOK_NFBATCH, 0x10, 0x1, &[0u8; 4]), &owner(), &names));
+        assert!(c.kind == ChangeKind::Firewall && c.steers);
+        let newrule = (10u16 << 8) | 6;
+        assert!(matches!(parse(&msg(HOOK_NFNETLINK, newrule, 0x1, &[0u8; 4]), &owner(), &names), Parsed::Changes(_)));
+        let getrule = (10u16 << 8) | 7;
+        assert_eq!(parse(&msg(HOOK_NFNETLINK, getrule, 0x301, &[0u8; 4]), &owner(), &names), Parsed::Nothing);
+        let ctnetlink = (1u16 << 8) | 0;
+        assert_eq!(parse(&msg(HOOK_NFNETLINK, ctnetlink, 0x1, &[0u8; 4]), &owner(), &names), Parsed::Nothing);
+    }
+
+    #[test]
+    fn a_route_past_the_capture_is_unreadable() {
+        let mut e = msg(HOOK_RTNETLINK, 24, 0x400, &route(0, 7));
+        let n = e.data.len();
+        e.data.truncate(n - 3);
+        assert!(matches!(parse(&e, &owner(), &names), Parsed::Unreadable(_)));
+    }
+
+    #[test]
+    fn the_event_layout_matches_the_kernel_side() {
+        assert_eq!(crate::ebpf::EVENT_SIZE, 8 + 4 + 4 + 4 + 4 + 512);
+    }
+}

@@ -9,6 +9,8 @@ pub const EVENT_SIZE: usize = 8 + 4 * 4 + CAPTURE;
 pub const HOOK_RTNETLINK: u32 = 1;
 pub const HOOK_NFNETLINK: u32 = 2;
 pub const HOOK_GENL: u32 = 3;
+/// `nfnetlink_rcv_batch`: an nftables batch (its header is the batch's).
+pub const HOOK_NFBATCH: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {

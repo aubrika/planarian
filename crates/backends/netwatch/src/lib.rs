@@ -75,6 +75,7 @@ pub mod ebpf;
 #[cfg(feature = "loader")]
 pub mod loader;
 mod model;
+pub mod parse;
 
 pub use contract::{AHEAD_SECS, CLOCK, DIR, FRESH_SECS, TICK_SECS, file_name, read, write};
 pub use model::{Change, ChangeKind, Endpoint, Footprint, FootprintView, Owner, Proto, Tracker, WatchState};

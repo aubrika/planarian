@@ -5,8 +5,14 @@ use aya::{Btf, Ebpf};
 use std::path::Path;
 
 /// The probes and the kernel functions they attach to.
-pub const PROBES: [(&str, &str); 3] =
-    [("rtnetlink", "rtnetlink_rcv_msg"), ("nfnetlink", "nfnetlink_rcv_msg"), ("genl", "genl_rcv_msg")];
+/// nftables sends its changes as a batch, which `nfnetlink_rcv_batch`
+/// dispatches itself, never through `nfnetlink_rcv_msg`: hence the fourth.
+pub const PROBES: [(&str, &str); 4] = [
+    ("rtnetlink", "rtnetlink_rcv_msg"),
+    ("nfnetlink", "nfnetlink_rcv_msg"),
+    ("nfbatch", "nfnetlink_rcv_batch"),
+    ("genl", "genl_rcv_msg"),
+];
 
 /// `<prefix>/share/planarian/netwatch.bpf.o`, next to the running binary.
 pub fn default_object() -> String {

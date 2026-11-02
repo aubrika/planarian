@@ -1,8 +1,8 @@
 //! netwatch's eBPF program (SPEC §12d "Which units"): an fentry probe on
 //! each netlink receive path that can change how traffic leaves the
 //! machine (`rtnetlink_rcv_msg`: links, addresses, routes, rules;
-//! `nfnetlink_rcv_msg`: nftables; `genl_rcv_msg`: generic netlink, e.g.
-//! WireGuard). Each message is reported to userspace with the sender's
+//! `nfnetlink_rcv_msg` and `nfnetlink_rcv_batch`: nftables, whose changes
+//! come as batches; `genl_rcv_msg`: generic netlink, e.g. WireGuard). Each message is reported to userspace with the sender's
 //! cgroup id; userspace parses it. The kernel side stays small so the
 //! verifier has little to prove. The event layout is `Event`, mirrored by
 //! `planarian-backend-netwatch` (its `ebpf` module; a test checks the size).
@@ -22,6 +22,7 @@ const CAP: usize = 512;
 pub const HOOK_RTNETLINK: u32 = 1;
 pub const HOOK_NFNETLINK: u32 = 2;
 pub const HOOK_GENL: u32 = 3;
+pub const HOOK_NFBATCH: u32 = 4;
 
 #[repr(C)]
 pub struct Event {
@@ -47,7 +48,7 @@ static LOST: aya_ebpf::maps::Array<u64> = aya_ebpf::maps::Array::with_max_entrie
 fn report(ctx: &FEntryContext, hook: u32) -> u32 {
     // rtnetlink_rcv_msg, nfnetlink_rcv_msg and genl_rcv_msg all take
     // (struct sk_buff *skb, struct nlmsghdr *nlh, struct netlink_ext_ack *).
-    let nlh: *const u8 = unsafe { ctx.arg(1) };
+    let nlh: *const u8 = ctx.arg(1);
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
         if let Some(n) = LOST.get_ptr_mut(0) {
             unsafe { *n += 1 };
@@ -80,6 +81,13 @@ pub fn rtnetlink(ctx: FEntryContext) -> u32 {
 #[fentry(function = "nfnetlink_rcv_msg")]
 pub fn nfnetlink(ctx: FEntryContext) -> u32 {
     report(&ctx, HOOK_NFNETLINK)
+}
+
+/// nftables batches bypass `nfnetlink_rcv_msg`: `nfnetlink_rcv_batch(skb,
+/// nlh, subsys_id, genid)` sees each one (its `nlh` is the batch's first).
+#[fentry(function = "nfnetlink_rcv_batch")]
+pub fn nfbatch(ctx: FEntryContext) -> u32 {
+    report(&ctx, HOOK_NFBATCH)
 }
 
 #[fentry(function = "genl_rcv_msg")]
