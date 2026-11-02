@@ -72,7 +72,14 @@ impl Metrics {
         }
         for r in sim.log.iter().filter(executed) {
             if let Some(f) = &r.facts {
-                *self.disruption.entry(disruption_name(f.disruption)).or_default() += 1;
+                // Once per kind the change carries (C10), or as none.
+                let kinds = f.disruption.members();
+                if kinds.is_empty() {
+                    *self.disruption.entry(disruption_name(Disruption::None)).or_default() += 1;
+                }
+                for d in kinds {
+                    *self.disruption.entry(disruption_name(d)).or_default() += 1;
+                }
             }
             if let Transition::RestartUnit(u) = &r.proposal.transition {
                 *self.restarts.entry(u.to_string()).or_default() += 1;

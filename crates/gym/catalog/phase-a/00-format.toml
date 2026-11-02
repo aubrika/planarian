@@ -53,6 +53,10 @@
 #                       (count = 0) appear; fields match on transition, target,
 #                       change, source, actor, decision, terminal, path (an
 #                       ordered subsequence of journal states), owner
+#                       and facts (derived facts by field; facts.disruption is a
+#                       set: one kind, "SessionLoss", means it holds that kind;
+#                       a list, ["ConnectivityLoss", "DataInterruption"],
+#                       means exactly those kinds)
 #   [[...incident]]     an incident that must exist, with target, state, root_of
 #
 # Symbolic generations (real ids are assigned at run time):
