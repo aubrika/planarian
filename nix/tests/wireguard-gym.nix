@@ -86,6 +86,39 @@ in
     };
     systemd.targets.multi-user.wants = [ "gym-tpl@a.service" ];
 
+    # netwatch's attribution (§12d "Which units"), for its VM case. Each is a
+    # network tool (root, no bounding set) and a daemon, so a kill fails it;
+    # none starts at boot: the case starts them once the watch is attached.
+    # gym-steer creates a dummy interface carrying a default route (metric
+    # 9999, so it diverts no test traffic): protecting. gym-quiet changes
+    # nothing: not protecting. gym-legacy adds an iptables-legacy rule that
+    # drops 203.0.113.79 (no test traffic): protecting.
+    systemd.services.gym-steer = {
+      description = "Gym: a dummy interface carrying a default route";
+      path = [ pkgs.iproute2 ];
+      serviceConfig = {
+        Type = "simple";
+        Restart = "no";
+        ExecStartPre = [ "${pkgs.iproute2}/bin/ip link add gsteer0 type dummy" "${pkgs.iproute2}/bin/ip link set gsteer0 up" "${pkgs.iproute2}/bin/ip route add default dev gsteer0 metric 9999" ];
+        ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+        ExecStopPost = "-${pkgs.iproute2}/bin/ip link delete gsteer0";
+      };
+    };
+    systemd.services.gym-quiet = {
+      description = "Gym: a network tool that changes nothing";
+      serviceConfig = { Type = "simple"; Restart = "no"; ExecStart = "${pkgs.coreutils}/bin/sleep infinity"; };
+    };
+    systemd.services.gym-legacy = {
+      description = "Gym: an iptables-legacy rule that drops";
+      serviceConfig = {
+        Type = "simple";
+        Restart = "no";
+        ExecStartPre = "${pkgs.iptables}/bin/iptables-legacy -A OUTPUT -d 203.0.113.79 -j DROP";
+        ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+        ExecStopPost = "-${pkgs.iptables}/bin/iptables-legacy -D OUTPUT -d 203.0.113.79 -j DROP";
+      };
+    };
+
     services.planarian.units.wireguard-gym = {
       sensitivity = [ "Security" "External" ];
       holdAllow = [ { address = endpoint; inherit port; protocol = "udp"; } ];

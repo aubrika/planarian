@@ -3,4 +3,4 @@
 # failures have their own posture (Absent, Crashed, Integrity). A plain
 # value, not an option, so no configuration can widen it (an owner's
 # definition would otherwise replace the set and exclude a VPN).
-[ "planariad" "planarian-recovery" "planarian-respond@" "planarian-posture-check" "planarian-posture-lift" "planarian-hold@" ]
+[ "planariad" "planarian-recovery" "planarian-respond@" "planarian-posture-check" "planarian-posture-lift" "planarian-hold@" "planarian-netwatch" ]

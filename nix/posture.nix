@@ -433,7 +433,10 @@ let
     "${stopPost "planarian-recovery"}"
     "${check}"
     "${hold}"
-  ] ++ lib.optional (cfg.package.netwatch or false) "${cfg.package}/share/planarian/netwatch.bpf.o";
+  ] ++ lib.optionals (cfg.package.netwatch or false) [
+    "${cfg.package}/share/planarian/netwatch.bpf.o"
+    "${cfg.package}/bin/planarian-netwatch"
+  ];
   coreHash = pkgs.runCommand "planarian-core-hash" { } ''
     for f in ${lib.escapeShellArgs coreFiles}; do
       printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"
@@ -613,6 +616,29 @@ in
     # from every service's configuration, and a service may read
     # environment.etc.
     }) (lib.attrNames (lib.filterAttrs (_: u: u.scope == "system" && (u.holdAllow != [ ] || u.holdInterfaces != [ ])) cfg.units)));
+    # The footprints' directory outlives planarian-netwatch's restarts.
+    systemd.tmpfiles.rules = [ "d /run/planarian/footprint 0755 root root -" ];
+    # §12d: netwatch, attributing every routing, interface, rule and
+    # nftables change to the unit that made it, from inside the kernel, and
+    # keeping each network tool's footprint (crates/backends/netwatch).
+    # Before networking starts, so early changes are attributed. It writes
+    # `.watch failed` when it stops or cannot attach (every network tool's
+    # failure then holds), and is restarted.
+    systemd.services.planarian-netwatch = mkIf (cfg.package.netwatch or false) {
+      description = "Planarian: attribute network changes to the units that make them";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "network-pre.target" ];
+      before = [ "network-pre.target" ];
+      after = [ "sysinit.target" "systemd-tmpfiles-setup.service" ];
+      unitConfig.DefaultDependencies = false;
+      restartIfChanged = false;
+      serviceConfig = {
+        ExecStart = "${cfg.package}/bin/planarian-netwatch --export /etc/planarian/export.json --object ${cfg.package}/share/planarian/netwatch.bpf.o --dir /run/planarian/footprint";
+        Restart = "always";
+        RestartSec = 1;
+        CapabilityBoundingSet = [ "CAP_BPF" "CAP_PERFMON" "CAP_SYS_ADMIN" "CAP_NET_ADMIN" "CAP_DAC_READ_SEARCH" ];
+      };
+    };
     systemd.services."planarian-hold@" = {
       description = "Planarian: hold network traffic while %i has failed";
       # An activation (a repair rollback, `undo`) must not stop and start a
