@@ -183,6 +183,20 @@ pub fn gym_units() -> UnitDefs {
         vec![user_probe("gym-backup-active", ProbeKind::SystemdActive)],
     );
     backup.stops_are_faults = true;
+    // C10 (§11 floors): two Routine units that differ only in what a restart
+    // costs, so a transition restarting both carries both disruptions.
+    let tunnel = unit(
+        "service:gym-tunnel",
+        r,
+        Disruption::ConnectivityLoss,
+        vec![user_probe("gym-tunnel-active", ProbeKind::SystemdActive)],
+    );
+    let sync = unit(
+        "service:gym-sync",
+        r,
+        Disruption::DataInterruption,
+        vec![user_probe("gym-sync-active", ProbeKind::SystemdActive)],
+    );
 
     [
         web,
@@ -203,6 +217,8 @@ pub fn gym_units() -> UnitDefs {
         gpu,
         wlan,
         backup,
+        tunnel,
+        sync,
         fs("fs-root"),
         fs("fs-nix"),
         fs("fs-boot"),

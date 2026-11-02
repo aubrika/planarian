@@ -145,3 +145,34 @@ Read #11 and its owner decision (P24, 1 Nov), this file, `nix/module.nix`,
 | module-eval | Asserts neither the greetd ordering, the posture's SSH group, nor the Exec flag. The SSH rule lives in the `respond` script (`AllowGroups ${adminGroup} root`), reachable at eval only through the script's text | the three assertions (reviewer's case first) |
 | P24 | `wireplumber` is in `userControllable.units` and has a canonical probe, but no default unit, so nothing watches it | declare it per the owner decision; assert in module-eval |
 | posture comment | `posture.nix` said in-budget restarts keep planariad activating, so the target stays up. Run 41288596484 shows otherwise: each SIGSEGV in vm-posture logs `Stopped target Planarian is ready` with no `OnFailure=`; in crash-slow-worker-overlap the SIGKILL drops the target and a restart of the restarting unit raises Absent through `ExecStopPost` (result `success`) | comment corrected; ordering unchanged (I20; any change is the coordinator's) |
+
+## Reviewer: C10 acceptance test (#10), 2 Nov
+
+Written from §11's global floors only (`review/lane-change-path-c10`).
+`crates/exec/src/tests.rs::each_disruption_keeps_its_own_floor`: a seated
+administrator's Rollback restarts a ConnectivityLoss unit (no floor for a
+local caller) and a DataInterruption unit (AskFirst unless it is the caller's
+own session). On `main` it commits without asking: `max` over `Disruption`'s
+order keeps ConnectivityLoss and the DataInterruption floor is lost. The
+control (the ConnectivityLoss unit alone) runs on `main` and must keep
+running. The test asserts the decision (Parked), not the representation of
+the combined disruption.
+
+## Reviewer: C10 catalog case (#10, against #21), 2 Nov
+
+Written from §11's global floors (`review/lane-change-path-c10-case`), at the
+coordinator's request against `main` plus #21 (`core/disruption-set`).
+`disruption-each-kind-keeps-its-floor`: a seated administrator's Rollback
+restarts a ConnectivityLoss unit and a DataInterruption unit (fixtures
+`gym-tunnel`, `gym-sync`, both Routine; step `restarts_on_switch`, fake only).
+It must carry both kinds and ask. On `main`: FAIL, committed without asking,
+disruption ConnectivityLoss only. Control
+`disruption-connectivity-alone-seated-runs` (the ConnectivityLoss unit alone)
+passes on `main` and must keep passing.
+
+### lane-change-path: C10 and the already-failed rule (#27), 2 Nov
+
+| Id | Status | What closes it | Case |
+| --- | --- | --- | --- |
+| C10 | closed by #21 (the set type, floors per member) and #27 (`unit_facts` inserts every unit's `restart_disruption`) | §11 global floors, each applied to its own kind | exec `each_disruption_keeps_its_own_floor`; catalog `disruption-each-kind-keeps-its-floor` (FAIL on `main` + #21, PASS here), control `disruption-connectivity-alone-seated-runs` |
+| §11 already-failed rule | closed by #27 | §11 as amended in #22 (owner decision, Nov 2): "A unit that has already failed (observed `Failed`, or not running while it is desired running, when the facts are derived) contributes no disruption of its own ... Every other unit the transition touches still contributes its own." `derive.rs` `already_failed` reads the observation passed to that derivation (`DeriveInput::state`), so it is current at proposal, at approval and before Activating; status `Failed`, `Stopped` or `Absent` while desired Running and expected. `Unknown` (Timeout, Error, Abandoned), Degraded, Transitioning and overridden units still contribute | exec `an_already_failed_unit_contributes_no_disruption`, `an_unknown_unit_still_contributes_its_disruption`, `a_unit_recovered_before_approval_asks_again` (the reviewer's) |

@@ -21,19 +21,40 @@ pub struct DeriveInput<'a> {
     pub caller: Actor,
     pub tables: &'a Tables,
     pub canonical: &'a Canonical,
+    /// The observation this derivation is made against: the one passed to
+    /// it, current at proposal, approval and before Activating (§9 step 6).
+    pub state: &'a SystemState,
 }
 
 pub fn manifest_of(e: &EvaluatedGeneration) -> Manifest {
     Manifest { units: e.units.clone(), user_units: e.user_units.clone() }
 }
 
+/// §11 as amended in #22 (owner decision, Nov 2): "A unit that has already
+/// failed (observed `Failed`, or not running while it is desired running,
+/// when the facts are derived) contributes no disruption of its own". Read
+/// from `s`, the observation this derivation is made against, never from an
+/// incident or from evidence past its `stale_after` (`status` ignores that).
+/// `Unknown` counts as running (§10: "`Unknown`, never `Failed`"), so a probe
+/// that timed out, errored or was abandoned buys no exemption; so does
+/// Degraded, Transitioning, an override, or a unit not desired Running.
+fn already_failed(s: &SystemState, defs: &UnitDefs, u: &UnitId) -> bool {
+    let Some(d) = defs.get(u) else { return false };
+    d.desired.status == DesiredStatus::Running
+        && s.expected(u, defs)
+        && matches!(s.status(u, defs), UnitStatus::Failed(_) | UnitStatus::Stopped | UnitStatus::Absent)
+}
+
 fn unit_facts<'a>(
     units: impl IntoIterator<Item = &'a UnitId>,
     defs: &UnitDefs,
     services: &BTreeMap<String, Sensitivities>,
-) -> (Sensitivities, Disruption) {
+    already_failed: impl Fn(&UnitId) -> bool,
+) -> (Sensitivities, Disruptions) {
     let mut sens = Sensitivities::default();
-    let mut disruption = Disruption::None;
+    // C10 (§11): every kind any unit carries, not the `max` of them. The
+    // floors are not ordered, so a fold would drop one.
+    let mut disruption = Disruptions::default();
     for u in units {
         // Fail closed (§11 sensitivity completeness, B-5): a unit with no
         // sensitivity entry, or none in the manifest at all, is not taken
@@ -43,7 +64,12 @@ fn unit_facts<'a>(
         match defs.get(u) {
             Some(d) => {
                 sens = sens.union(if empty(&d.sensitivity) { &unknown } else { &d.sensitivity });
-                disruption = disruption.max(d.restart_disruption);
+                // What an already-failed unit provides is already lost:
+                // restarting it restores rather than costs. Its sensitivity
+                // still counts.
+                if !already_failed(u) {
+                    disruption.insert(d.restart_disruption);
+                }
             }
             // A user-scope unit runs with that user's rights only; an
             // undeclared one stays Routine (deviations.md).
@@ -149,9 +175,9 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
     };
     let unit_op = |f: &mut DerivedFacts, u: &UnitId, recovery: Recovery| {
         f.affected_units = unit_set(one(u));
-        let (s, d) = unit_facts(&f.affected_units, i.defs, &i.base.services);
+        let (s, d) = unit_facts(&f.affected_units, i.defs, &i.base.services, |u| already_failed(i.state, i.defs, u));
         f.sensitivity = s;
-        f.disruption = Disruptions::of(d);
+        f.disruption = d;
         f.recovery = recovery;
         f.touches_core = f.sensitivity.contains(Sensitivity::Core);
     };
@@ -213,9 +239,14 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             }
             let mut services = i.base.services.clone();
             services.extend(cand.services.iter().map(|(k, v)| (k.clone(), *v)));
-            let (s, d) = unit_facts(&affected, &all_defs, &services);
+            // Kinds come from `all_defs` (a unit only the candidate adds has its
+            // definition there); the already-failed rule reads `i.defs`, the
+            // definitions `i.state` was observed against. A unit only the
+            // candidate adds is not in `i.defs` and was never observed, so it
+            // is never exempt.
+            let (s, d) = unit_facts(&affected, &all_defs, &services, |u| already_failed(i.state, i.defs, u));
             f.sensitivity = s.union(&i.tables.diff_sensitivity(&config));
-            f.disruption = Disruptions::of(d);
+            f.disruption = d;
             f.touches_manifest = touches_manifest(&base_m, &cand_m, &config);
             f.touches_canonical_probe = touches_canonical(&base_m, &cand_m, i.canonical);
             f.changes_desired = changes_desired(&base_m, &cand_m);
@@ -337,23 +368,23 @@ mod sensitivity_completeness {
         empty.sensitivity = Sensitivities::default();
         defs.insert(empty.id.clone(), empty.clone());
         let none = BTreeMap::new();
-        let (s, _) = unit_facts([&empty.id], &defs, &none);
+        let (s, _) = unit_facts([&empty.id], &defs, &none, |_| false);
         assert!(s.external && !s.routine, "an empty sensitivity is External: {s:?}");
         let ghost = UnitId::service("not-in-the-manifest");
-        let (s, _) = unit_facts([&ghost], &defs, &none);
+        let (s, _) = unit_facts([&ghost], &defs, &none, |_| false);
         assert!(s.external && !s.routine, "an undeclared system unit is External: {s:?}");
         // One NixOS defines has the shipped tables' entry instead.
         let tables = BTreeMap::from([
             ("dbus-broker".to_string(), Sensitivities::of(&[Sensitivity::Routine])),
             ("blank".to_string(), Sensitivities::default()),
         ]);
-        let (s, _) = unit_facts([&UnitId::service("dbus-broker")], &defs, &tables);
+        let (s, _) = unit_facts([&UnitId::service("dbus-broker")], &defs, &tables, |_| false);
         assert!(s.routine && !s.external, "a defined service takes its table entry: {s:?}");
-        let (s, _) = unit_facts([&UnitId::service("blank")], &defs, &tables);
+        let (s, _) = unit_facts([&UnitId::service("blank")], &defs, &tables, |_| false);
         assert!(s.external, "an empty table entry still fails closed: {s:?}");
         let own =
             UnitId { kind: UnitKind::Service, name: "notes".into(), scope: Scope::User { uid: 1000, session: None } };
-        let (s, _) = unit_facts([&own], &defs, &none);
+        let (s, _) = unit_facts([&own], &defs, &none, |_| false);
         assert!(!s.external, "an undeclared user unit stays as it was: {s:?}");
     }
 }
