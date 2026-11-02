@@ -118,7 +118,7 @@ pub fn facts(caller: Actor) -> DerivedFacts {
     DerivedFacts {
         affected_units: Vec::new(),
         sensitivity: Sensitivities::default(),
-        disruption: Disruption::Brief,
+        disruption: Disruptions::of(Disruption::Brief),
         recovery: Recovery::Revertible,
         touches_manifest: false,
         touches_canonical_probe: false,

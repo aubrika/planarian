@@ -168,7 +168,7 @@ mod tests {
             facts: DerivedFacts {
                 affected_units: vec![],
                 sensitivity: Sensitivities::default(),
-                disruption: Disruption::Brief,
+                disruption: Disruptions::of(Disruption::Brief),
                 recovery: Recovery::Revertible,
                 touches_manifest: false,
                 touches_canonical_probe: false,
