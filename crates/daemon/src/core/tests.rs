@@ -1415,3 +1415,47 @@ fn a_rebound_approval_that_no_longer_asks_is_logged_as_a_submission() {
     assert!(!r.core.log.iter().any(|x| x.approver.is_some()), "no approval record: {:#?}", r.core.log);
     assert!(r.core.parked_agents.is_empty());
 }
+
+/// §16 *Approvals show the change*: a pending generation change carries the
+/// diff the core computed (option, old, new, sensitivity), and its response
+/// says what it changes. The diff is base override → candidate override,
+/// both fixed by hash at Prepared, so it can differ at approval only if the
+/// override file changed: then the approval does not apply (Stale, §12
+/// step 4) and nothing runs. Any other change in the re-derived facts
+/// re-binds and asks again (`a_rebound_approval_that_no_longer_asks_…`
+/// covers a re-bind; the binding hashes the facts, `config_diff` included).
+#[test]
+fn an_approval_shows_its_diff_and_a_changed_diff_does_not_apply() {
+    let mut cfg = config();
+    cfg.exec
+        .tables
+        .option_sensitivity
+        .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let font = Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.25".into()))].into(),
+    };
+    let resp = r.core.handle(ALICE, font);
+    let Response::NeedsApproval { approve, why, .. } = resp else { panic!("{resp:?}") };
+    assert!(why.contains("changes 1 option"), "the response says what it changes: {why}");
+    let Response::Status(st) = r.core.handle(ALICE, Request::Status) else { panic!() };
+    let p = st.pending.iter().find(|p| p.approve == approve).expect("pending");
+    assert_eq!(p.diff.options.len(), 1);
+    let o = &p.diff.options[0];
+    assert_eq!(o.path, "planarian.reference.fontScale");
+    assert_eq!(o.new, Some(Value::Str("1.25".into())));
+    assert!(o.sensitivity.contains(Sensitivity::UserData));
+    assert!(p.diff.lines()[0].starts_with("planarian.reference.fontScale"), "{:?}", p.diff.lines());
+
+    // The live override file now holds another value for that option: the
+    // diff re-derived at approval would differ from the one shown.
+    r.fake.w().overrides.assignments.insert("planarian.reference.fontScale".into(), Value::Str("1.1".into()));
+    let before = r.fake.w().current;
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Stale"), "does not apply: {resp:?}");
+    assert_eq!(r.fake.w().current, before, "nothing ran");
+    let Response::Status(st) = r.core.handle(ALICE, Request::Status) else { panic!() };
+    assert!(st.pending.iter().all(|p| p.approve != approve), "the old approval is gone");
+}

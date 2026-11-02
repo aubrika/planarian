@@ -121,6 +121,116 @@ pub struct Pending {
     pub what: String,
     pub facts: DerivedFacts,
     pub issued: Timestamp,
+    /// §16 *Approvals show the change*: what a generation transition would
+    /// apply, computed by the core from the evaluated generations (never
+    /// from the proposal). Empty for a transition that is not one.
+    #[serde(default)]
+    pub diff: ApprovalDiff,
+}
+
+/// §16 (owner decision, Nov 2): the configuration a generation transition
+/// that asks would apply, as a person sees it in `planarian approve`, the
+/// console and the notice, and as an agent reads it (`approve --json`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalDiff {
+    /// Every option added, removed or changed; Security- and
+    /// External-sensitive ones first, then by path.
+    pub options: Vec<OptionChange>,
+    /// The units it would remove or stop, with their sensitivity.
+    pub removes: Vec<(UnitId, planarian_schema::Sensitivities)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptionChange {
+    pub path: String,
+    /// `None`: the option is added (`old`) or removed (`new`).
+    pub old: Option<Value>,
+    pub new: Option<Value>,
+    pub sensitivity: planarian_schema::Sensitivities,
+}
+
+impl ApprovalDiff {
+    pub fn is_empty(&self) -> bool {
+        self.options.is_empty() && self.removes.is_empty()
+    }
+
+    /// The full diff, one line each, for `planarian approve` and the console.
+    pub fn lines(&self) -> Vec<String> {
+        let d = self;
+        let mut out: Vec<String> =
+            d.options.iter().map(|o| format!("{} [{}]", change(o), kinds(&o.sensitivity))).collect();
+        out.extend(d.removes.iter().map(|(u, s)| format!("removes or stops {u} [{}]", kinds(s))));
+        out
+    }
+
+    /// One line for the notice: how much it changes, the sensitive options
+    /// spelled out, and the units it removes or stops.
+    pub fn summary(&self) -> Option<String> {
+        let d = self;
+        if d.is_empty() {
+            return None;
+        }
+        let mut parts = vec![];
+        if !d.options.is_empty() {
+            let sensitive: Vec<String> = d.options.iter().filter(|o| first(&o.sensitivity)).map(change).collect();
+            let n = d.options.len();
+            parts.push(if sensitive.is_empty() {
+                format!("changes {n} option{}", if n == 1 { "" } else { "s" })
+            } else {
+                format!(
+                    "changes {n} option{} ({} Security/External: {})",
+                    if n == 1 { "" } else { "s" },
+                    sensitive.len(),
+                    sensitive.join("; ")
+                )
+            });
+        }
+        if !d.removes.is_empty() {
+            let units: Vec<String> = d.removes.iter().map(|(u, _)| u.to_string()).collect();
+            parts.push(format!("removes or stops {}", units.join(", ")));
+        }
+        Some(parts.join("; "))
+    }
+}
+
+fn first(s: &planarian_schema::Sensitivities) -> bool {
+    use planarian_schema::Sensitivity;
+    s.contains(Sensitivity::Security) || s.contains(Sensitivity::External)
+}
+
+fn value(v: &Value) -> String {
+    match v {
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Str(s) => s.clone(),
+        Value::List(l) => format!("[{}]", l.iter().map(value).collect::<Vec<_>>().join(", ")),
+    }
+}
+
+fn kinds(s: &planarian_schema::Sensitivities) -> String {
+    use planarian_schema::Sensitivity;
+    let mut k = vec![];
+    for (on, name) in [
+        (s.contains(Sensitivity::Security), "Security"),
+        (s.contains(Sensitivity::External), "External"),
+        (s.contains(Sensitivity::UserData), "UserData"),
+        (s.contains(Sensitivity::Core), "Core"),
+    ] {
+        if on {
+            k.push(name);
+        }
+    }
+    if k.is_empty() { "Routine".into() } else { k.join(", ") }
+}
+
+fn change(o: &OptionChange) -> String {
+    let v = |x: &Option<Value>| x.as_ref().map(value);
+    match (v(&o.old), v(&o.new)) {
+        (None, Some(n)) => format!("{} added: {n}", o.path),
+        (Some(old), None) => format!("{} removed (was {old})", o.path),
+        (Some(old), Some(n)) => format!("{}: {old} → {n}", o.path),
+        (None, None) => o.path.clone(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

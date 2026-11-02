@@ -722,6 +722,28 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         result
     }
 
+    /// The response to a submission; one parked for approval says, in one
+    /// line, what it would change (§16 *Approvals show the change*).
+    fn respond(&self, r: &Submitted) -> Response {
+        let mut resp = render::response(r);
+        if let (Response::NeedsApproval { txn, why, .. }, Some((_, defs))) = (&mut resp, self.last.as_ref())
+            && let Some(p) = self.ex.parked.get(txn)
+            && let Some(sum) = self.approval_diff(&p.proposal.transition, &p.facts, defs).summary()
+        {
+            *why = if why.is_empty() { sum } else { format!("{why}; {sum}") };
+        }
+        resp
+    }
+
+    /// §16 *Approvals show the change*: built from the derived facts (from
+    /// the evaluated generations), never from the proposal.
+    fn approval_diff(&self, t: &Transition, f: &DerivedFacts, defs: &UnitDefs) -> planarian_ipc::ApprovalDiff {
+        // TODO(#34): the units it would remove or stop, `f.removes`, once
+        // derive carries them (the same set as `removes_sensitivity`).
+        let removed: &[UnitId] = &[];
+        crate::approval::diff(t, f.config_diff.as_ref(), removed, &self.ex.cfg.tables, defs)
+    }
+
     /// A generation transaction is live, in any state (I6: one waiting in
     /// `Built` counts).
     fn generation_active(&mut self) -> bool {
@@ -1622,8 +1644,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     }
                     Submitted::Parked { txn, approve, facts } => {
                         self.incident_parked.insert(inc.id, txn);
+                        let changes = self
+                            .approval_diff(&c.transition, &facts, defs)
+                            .summary()
+                            .map(|s| format!("; {s}"))
+                            .unwrap_or_default();
                         self.notice(format!(
-                            "{}: {} needs approval ({}): planarian approve {approve}",
+                            "{}: {} needs approval ({}{changes}): planarian approve {approve}",
                             inc.target,
                             render::transition(&c.transition),
                             render::facts_summary(&facts)
@@ -1764,7 +1791,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let p = self.proposal(t, &s, &defs, source, reason);
         let authz = self.authz(&peer);
         let r = self.submit(p, authz, &s, &defs);
-        render::response(&r)
+        self.respond(&r)
     }
 
     fn status(&mut self) -> StatusReport {
@@ -1789,6 +1816,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 approve: p.bound_to,
                 what: render::transition(&p.proposal.transition),
                 facts: p.facts.clone(),
+                diff: self.approval_diff(&p.proposal.transition, &p.facts, &defs),
                 // Shown to people: the boot-clock issue time on the wall clock.
                 issued: Timestamp(
                     self.b.clock().now().0.saturating_sub(self.b.clock().boot_now().0.saturating_sub(p.issued.0)),
@@ -2233,7 +2261,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     };
                     self.awaiting_post.push(rec);
                 }
-                render::response(&r)
+                self.respond(&r)
             }
             Request::Cancel { txn } => {
                 let Some(p) = self.ex.parked.get(&txn) else {
@@ -2245,7 +2273,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     };
                 }
                 let r = self.ex.cancel(txn, Actor::user(peer.uid));
-                render::response(&r)
+                self.respond(&r)
             }
             Request::Resolve { txn, resolution } => self.user_submit(
                 Transition::Resolve { txn, resolution },
@@ -2365,7 +2393,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
                 let authz = self.authz(&peer);
                 let r = self.submit(p, authz, &s, &defs);
-                render::response(&r)
+                self.respond(&r)
             }
             #[cfg(feature = "gym-hooks")]
             Request::GymCompact => match self.ex.kernel.journal.compact() {

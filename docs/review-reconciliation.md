@@ -272,3 +272,16 @@ manifest. Controls: an identical manifest does not; the fields already covered
 | Id | Status | What closes it | Case |
 | --- | --- | --- | --- |
 | C19 | closed by this PR | `derive.rs` `touches_manifest` compares every entry whole (canonical probes left to `touches_canonical`), system and user scope, and an added or removed entry; it had compared only `edges`, `sensitivity`, `restart_disruption`, `synonyms` and user probes of units present in both | reviewer's `crates/exec/src/derive_c19_tests.rs` (4 of 6 fail on `main`; all pass); fake verdicts unchanged |
+
+## lane-daemon: #35 part 2, approvals show the change (§16), 2 Nov
+
+Reconciled at `main` `9f18fe7` against #35 and #34's §16 text. The
+coordinator granted `crates/ipc` (`Pending.diff`) and `crates/console` (the
+view) to this task.
+
+| Item | At `9f18fe7` | Work |
+| --- | --- | --- |
+| The diff is computed by the core | `facts.config_diff` (base override → candidate override, from `derive`) exists; per-option sensitivity is `Tables::option_sensitivity` | `approval::diff` builds `ApprovalDiff { options: [OptionChange { path, old, new, sensitivity }], removes }`, Security and External first, for generation transitions only |
+| A diff that differs at approval does not apply | `exec::binding` hashes the whole `DerivedFacts`, `config_diff` included: a re-derived difference re-binds and asks again. The diff itself is fixed by the two override hashes recorded at Prepared, so it can differ only if the override file changed, which the approval's stale check refuses (`Stale`) | no new mechanism; core test `an_approval_shows_its_diff_and_a_changed_diff_does_not_apply` |
+| Shown in `planarian approve`, the console and the notice; structured for agents | not shown anywhere; `Pending` had `facts` only | `Pending.diff` (serde default); `planarian approve [--json]` lists pending changes with their diffs (read-only, no TTY or root); `approve <hash>` prints the diff above its result; `status` and the console's banner show it; the notice and the `NeedsApproval` response carry a one-line summary (`ApprovalDiff::summary`) |
+| The units it would remove or stop | not in `DerivedFacts`; `removes_sensitivity` is #34's | `removes` is filled from `facts.removes` once #34's derive change lands (coordinator, Nov 2); empty until then |
