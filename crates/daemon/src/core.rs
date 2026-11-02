@@ -242,6 +242,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// hold was active). The alarm is raised once, on the change to missing
     /// or uncheckable.
     hold_table_seen: bool,
+    /// §12d: this episode's "removed" alarm and `HoldApplied` are written
+    /// (separately from the "could not be checked" one, so an episode that
+    /// starts uncheckable still journals the re-apply).
+    hold_missing_noted: bool,
     /// §12d: while the table is missing, the next re-apply (boot clock) and
     /// the wait after it, doubling to `HOLD_RETRY_MAX`.
     hold_retry: Option<(Timestamp, Millis)>,
@@ -433,6 +437,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             quiet_queue: vec![],
             reprepare: vec![],
             hold_table_seen: true,
+            hold_missing_noted: false,
             hold_retry: None,
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
@@ -777,6 +782,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
         if holding.is_empty() {
             self.hold_table_seen = true;
+            self.hold_missing_noted = false;
             self.hold_retry = None;
         } else {
             self.hold_table(&holding, &units);
@@ -865,6 +871,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         match &present {
             Ok(true) => {
                 self.hold_table_seen = true;
+                self.hold_missing_noted = false;
                 self.hold_retry = None;
                 return;
             }
@@ -882,10 +889,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             Ok(false) => {}
         }
         let now = self.b.clock().boot_now();
-        let first = self.hold_table_seen;
+        let first = !self.hold_missing_noted;
         if !first && self.hold_retry.is_some_and(|(next, _)| now < next) {
             return;
         }
+        self.hold_missing_noted = true;
         for u in &held {
             if first {
                 self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::Daemon });
@@ -900,6 +908,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         self.hold_table_seen = false;
         if matches!(self.b.units().hold_table_present(), Ok(true)) {
             self.hold_table_seen = true;
+            self.hold_missing_noted = false;
             self.hold_retry = None;
         } else {
             let wait =

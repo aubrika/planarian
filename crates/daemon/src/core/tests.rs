@@ -1624,12 +1624,20 @@ fn an_uncheckable_hold_table_alarms_once_and_is_checked_again() {
     assert_eq!(reapplied(&r), 0, "not re-applied blind");
     let alarms = r.core.notices.iter().filter(|n| n.contains("could not be checked")).count();
     assert_eq!(alarms, 1, "{:?}", r.core.notices);
-    // Checkable again and missing: re-applied.
+    // Checkable again and missing: re-applied, with its own alarm and
+    // `HoldApplied` (review of #40 at d147ec6).
+    let applied = |r: &mut Rig| {
+        let seg = r.core.ex.kernel.journal.segment().unwrap();
+        seg.iter().filter(|e| matches!(&e.record, Record::HoldApplied { unit, .. } if *unit == sshd)).count()
+    };
+    let before = applied(&mut r);
     r.fake.w().hold_table_unreadable = false;
     r.fake.w().hold_table_flushed = true;
     r.ticks(1);
     assert_eq!(reapplied(&r), 1);
     assert!(!r.fake.w().hold_table_flushed);
+    assert_eq!(applied(&mut r), before + 1, "journaled");
+    assert!(r.core.notices.iter().any(|n| n.contains("removed from the firewall")), "{:?}", r.core.notices);
 }
 
 /// §12d: a re-apply that fails is retried with backoff while the hold stands
