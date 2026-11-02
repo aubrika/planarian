@@ -149,3 +149,7 @@ flagged = true") and passes with it. No Rust reader denies unknown fields, so
 `Export` and `ProbeDef` read the key as before; the gym VMs' own Exec probes
 (`snd-hda0-driven`, `pipewire-has-a-card`, `wifi-associated`) carry it on
 real machines.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P11, scope (review 5731300056) | P11 flags the export only. §9's "flagged in the console and the journal" is still open: neither shows an Exec probe today. The Rust readers are to show it from `ProbeKind::Exec`, not from the `flagged` key | no code in P11; open for the console and daemon lanes |
