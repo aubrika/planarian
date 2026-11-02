@@ -19,6 +19,7 @@ const USAGE: &str = "usage:
   planarian restart <unit>
   planarian override <unit> [--leave-alone|--stopped|--absent|--detached] [--until next-boot|explicit|<N>m]
   planarian release <unit>
+  planarian hold release <unit> [--until next-boot|<N>m]   lift a network hold (administrator)
   planarian gc
   planarian undo
   planarian diagnose <unit> [probe]
@@ -100,6 +101,20 @@ fn parse(args: &[String]) -> Result<(Request, bool), String> {
             Request::SetOverride { unit: unit(u)?, until, desired }
         }
         ["release", u] => Request::LiftOverride { unit: unit(u)? },
+        ["hold", "release", u, rest @ ..] => {
+            // §12d: a release is never forever; without --until it lasts
+            // until the next boot.
+            let until = match rest {
+                [] => Until::NextBoot,
+                ["--until", "next-boot"] => Until::NextBoot,
+                ["--until", m] if m.ends_with('m') => {
+                    let n: u64 = m.trim_end_matches('m').parse().map_err(|_| "--until takes next-boot or <N>m")?;
+                    Until::At(planarian_schema::Timestamp(now_ms() + n * 60_000))
+                }
+                _ => return Err("hold release <unit> [--until next-boot|<N>m]".into()),
+            };
+            Request::HoldRelease { unit: unit(u)?, until }
+        }
         ["gc"] => Request::Gc,
         ["undo"] => Request::Undo,
         ["diagnose", u] => Request::Diagnose { unit: unit(u)?, probe: None },

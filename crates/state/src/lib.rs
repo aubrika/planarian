@@ -466,6 +466,8 @@ impl Assembler {
             conditions,
             resources,
             core_hash: ctx.core_hash,
+            // §12d: filled by the daemon from its journal and the host.
+            holds: Default::default(),
             observed_at: now,
         }
     }

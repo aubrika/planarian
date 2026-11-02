@@ -5,6 +5,7 @@
 pub mod approval;
 pub mod config;
 pub mod core;
+pub mod hold;
 pub mod hooks;
 pub mod render;
 pub mod snapshot;

@@ -123,6 +123,48 @@ pub trait UnitBackend {
     }
     fn restart(&self, id: &UnitId, op: &OpId) -> Outcome;
     fn stop(&self, id: &UnitId, op: &OpId) -> Outcome;
+    /// §12d *Network security fails closed*: hold the traffic a failed
+    /// network-security unit protected (`planarian-hold@<unit>`). A failure
+    /// posture response, not a transition: no `Prepared`, no lease (it only
+    /// ever restricts traffic; docs/bypasses.md). Idempotent. Unlike the
+    /// other mutations here it takes no `OpId`; the daemon journals
+    /// `HoldApplied` before calling it.
+    fn hold(&self, _unit: &UnitId) -> Outcome {
+        Outcome::Failed("this backend cannot hold traffic".into())
+    }
+    /// Lift a unit's hold, once it is Running and its Readiness probes pass
+    /// (journaled `HoldLifted` first). Idempotent.
+    fn lift_hold(&self, _unit: &UnitId) -> Outcome {
+        Outcome::Failed("this backend cannot hold traffic".into())
+    }
+    /// The units whose traffic is held now, as the host says (§12d: the
+    /// hold survives a restart of planariad). An error means "cannot say",
+    /// never "none".
+    fn held(&self) -> Result<BTreeSet<UnitId>, Outcome> {
+        Ok(BTreeSet::new())
+    }
+    /// `planarian hold release` (an attested Override, decided before this):
+    /// mark the unit's hold released until `until` (`None`: the next boot),
+    /// then lift it. While the mark stands, a new failure does not hold.
+    fn release_hold(&self, _unit: &UnitId, _until: Option<Timestamp>) -> Outcome {
+        Outcome::Failed("this backend cannot hold traffic".into())
+    }
+    /// The release ended (expired, or the override lifted): remove the mark.
+    fn end_release(&self, _unit: &UnitId) -> Outcome {
+        Outcome::Succeeded
+    }
+    /// Whether the hold's nftables table is in place. Anything else that
+    /// flushes the ruleset (`nft flush ruleset`) removes it and would fail
+    /// open; the daemon checks this while a hold is active. An error means
+    /// "cannot say".
+    fn hold_table_present(&self) -> Result<bool, Outcome> {
+        Ok(true)
+    }
+    /// Build a unit's hold again (the table was removed under it): restart
+    /// its hold unit, since starting an active one does nothing.
+    fn reapply_hold(&self, unit: &UnitId) -> Outcome {
+        self.hold(unit)
+    }
 }
 
 pub trait GenerationBackend {

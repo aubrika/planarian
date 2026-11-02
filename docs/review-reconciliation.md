@@ -299,6 +299,25 @@ manifest. Controls: an identical manifest does not; the fields already covered
 | --- | --- | --- | --- |
 | P21 | closed by this PR | `MemStore` keeps an undo log of log writes since the last `sync`: `sync` makes them durable, the new `crash()` (a power loss) undoes them, so the fake's "Journal fsync is durable" contract can fail. `conformance::MATRIX` adds `unbind` (`drv-bind-fails-restores-previous`: a failed bind's revert) and `cancel` (`crash-job-outlives-drain`: an unanswered activation's jobs), each under Partial, Unknown and Fenced; the comment that no fake entry makes them is corrected. The fake's `unbind` and `cancel` already honoured `World::inject` (`fake/src/lib.rs`), so `crates/fake` is unchanged | reviewer's `crates/txn/tests/memstore_sync.rs` (did not compile on `main`) and gym test `the_conformance_matrix_covers_unbind_and_cancel` (failed on `main`); both pass |
 
+## lane-daemon: #35 part 1, network security fails closed (§12d, the daemon's half), 2 Nov
+
+Built on lane-nix's `lane-nix/network-hold` (#36, `3530716`: the hold unit and
+script, `OnFailure=`, the export's `holds`/`hold_allow`, and the reviewer's
+`vm-netsec`) and #34 (`2ab358b`: §12d's text, `restarts_held_unit` in
+policy). Grants (coordinator, Nov 2): the hold calls in `schema::backend`,
+`backends/linux` and the fake; the `HoldApplied`/`HoldLifted` records and the
+fold in `crates/txn`; `UnitDef.holds`/`hold_allow`/`hold_interfaces`; the
+interim `restarts_held_unit` rule in derive; `vm.yml`'s `vm-netsec` line.
+
+| Item | At the base | Work |
+| --- | --- | --- |
+| The daemon knows which units hold | `UnitDef` had no such field; the export carried `holds` | `UnitDef.holds`, `hold_allow`, `hold_interfaces` (serde default; read straight from the export) |
+| A held unit restarts at once | policy reads `restarts_held_unit`; derive always set it `false` | `derive::stop_fact`: `holds && no override && (already failed \|\| an unattributed stop)`, marked INTERIM (B-21) |
+| Apply, alarm, lift, notify | nothing in the daemon | `Core::network_holds` each tick, before incidents open: journal `HoldApplied` (`OnFailure` if the host already holds it, else `Daemon`, then `hold`), alarm once; journal `HoldLifted` and `lift_hold` once Running with every Readiness probe passing; when repair has given up, the hold stays and administrators are told once |
+| The hold survives planariad | — | `Ledger::holds()`, from an append-only `hold_events` log (no new trusted helper), is the source of truth; reconciled with the host's `held` each tick, failing closed |
+| `planarian hold release` | — | an attested `Override` on `planarian-hold@<unit>` through the executor; the hold unit has a never-expected def carrying the held unit's sensitivity, so a non-administrator's release is AskFirst with an Administrator approver; on commit, journal `HoldLifted` and write the release marker (`boot` by default) |
+| Bypass register | — | X-13 (accepted): a posture response without `Prepared` or a lease; I15, I21 |
+
 ## Reviewer: §12f *Rollbacks* acceptance cases (#9), 2 Nov
 
 Written from §12f (*Rollbacks*, *Quiet mode*), §11 global floors and §13

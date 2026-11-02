@@ -89,6 +89,8 @@ pub fn record(r: &Record) -> String {
         Record::Resolved { txn, resolution, by } => format!("txn {} resolved as {resolution:?} by {by:?}", txn.0),
         Record::Reconciliation(r) => format!("reconciliation by {:?}: {}", r.by, r.actions.join("; ")),
         Record::AgentStarted { name, by, .. } => format!("agent {name} started by uid {by}, acting for it"),
+        Record::HoldApplied { unit, by } => format!("traffic held for {unit} ({by:?})"),
+        Record::HoldLifted { unit, reason } => format!("traffic hold on {unit} lifted: {reason}"),
     }
 }
 
