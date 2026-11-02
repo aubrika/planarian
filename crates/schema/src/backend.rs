@@ -13,7 +13,7 @@ use crate::transition::{DriverRef, EvaluatedGeneration, Value};
 use crate::txn::Outcome;
 use crate::unit::{ProbeDef, ProbeResult, UnitId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceKind {
@@ -100,6 +100,14 @@ pub trait UnitBackend {
     /// not a generator's).
     fn foreign_units(&self) -> Vec<String> {
         vec![]
+    }
+    /// §12d "Which units": which of the network tools `tools` are protecting
+    /// traffic now, from netwatch's kernel-attributed footprints, with every
+    /// unknown counted as protecting (fail closed). `Err` means netwatch could
+    /// not be read at all; a caller counts every tool as protecting then. The
+    /// default is that error: a backend without netwatch never waives a hold.
+    fn protecting(&self, _tools: &[UnitId]) -> Result<BTreeSet<UnitId>, Outcome> {
+        Err(Outcome::Unknown("no netwatch".into()))
     }
     fn list(&self) -> Result<Vec<UnitId>, Outcome>;
     /// Start an agent (§11, §16): the transient unit `planarian-agent-<name>`,

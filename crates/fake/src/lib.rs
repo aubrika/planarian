@@ -677,6 +677,12 @@ impl Fake {
 }
 
 impl UnitBackend for Fake {
+    /// §12d: the scripted footprints (`footprint_view`), read as the Linux
+    /// side reads the files.
+    fn protecting(&self, tools: &[UnitId]) -> Result<BTreeSet<UnitId>, Outcome> {
+        let now = self.w().now.0 / 1000;
+        Ok(self.footprint_view(tools).protecting(tools, now))
+    }
     fn observe(&self, id: &UnitId) -> Result<Observed, Outcome> {
         let w = self.w();
         Ok(w.units.get(&World::key(id)).map(|s| s.observed.clone()).unwrap_or(Observed::Absent))

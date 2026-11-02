@@ -89,7 +89,15 @@
 //! rules that drop or redirect traffic ([`Tracker`]). Fail closed where the
 //! kernel's messages are not read in full: any nftables batch or legacy
 //! table change (`nf_setsockopt`) from a unit counts as firewall rules that
-//! steer, and the unit's own default route counts whatever its interface.
+//! steer. A route by itself makes nobody protecting: only through an
+//! interface its creator made. A default route over a physical NIC no unit
+//! created (NetworkManager's DHCP route over wlan0) steers nothing, watched
+//! or found at attach; one over a virtual link, or over none, that nobody can
+//! be charged with is unattributed (fail closed).
+//!
+//! **Not yet observed** (docs/bypasses.md, temporary): DNS servers set
+//! through resolved (D-Bus) or `/etc/resolv.conf`, the system proxy, and
+//! WireGuard peer endpoints (generic netlink is not read).
 //!
 //! **The hold's order.** When a network tool fails, it is held unless all of
 //! these pass: (1) no unexpired release; (2) `.watch` is `attached` and

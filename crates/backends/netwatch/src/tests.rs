@@ -496,3 +496,60 @@ mod restart {
         assert_eq!(back, c);
     }
 }
+
+/// §12d: steering is "an interface it created that carries a default or
+/// all-covering route". The same rule on both paths (coordinator, Nov 2):
+/// NetworkManager's DHCP default route over wlan0, an interface no unit
+/// created, does not make it protecting, watched or found at attach.
+mod physical_nic {
+    use super::*;
+
+    fn nm() -> UnitId {
+        UnitId::service("NetworkManager")
+    }
+
+    fn dhcp_default() -> Change {
+        change(unit(&nm()), ChangeKind::Route, "route 2 254 /0 oif 3 metric 600", Some("wlan0"), true)
+    }
+
+    #[test]
+    fn watched_a_default_route_over_a_physical_nic_is_not_protecting() {
+        let mut t = Tracker::default();
+        t.apply(&dhcp_default());
+        let v = t.view(ATTACHED, &[nm()], NOW);
+        assert!(!v.units["NetworkManager"].protecting && v.unattributed.is_empty(), "{v:?}");
+        assert!(!v.protecting_now("NetworkManager", NOW), "its failure holds nothing");
+        // Nor does one nobody can be charged with.
+        let mut u = Tracker::default();
+        u.apply(&Change { owner: Owner::Unattributed, ..dhcp_default() });
+        assert!(u.view(ATTACHED, &[nm()], NOW).unattributed.is_empty());
+        // Over a tunnel NM created, it does.
+        let mut v = Tracker::default();
+        v.apply(&change(unit(&nm()), ChangeKind::Interface, "tun0", Some("tun0"), false));
+        v.apply(&change(unit(&nm()), ChangeKind::Route, "route 2 254 /0 oif 9 metric 50", Some("tun0"), true));
+        assert!(v.footprint(&nm(), NOW).protecting);
+        // And an unattributed one over a link created while watched fails closed.
+        let mut w = Tracker::default();
+        w.apply(&change(unit(&nm()), ChangeKind::Interface, "tun0", Some("tun0"), false));
+        w.apply(&change(Owner::Unattributed, ChangeKind::Route, "route 2 254 /0 oif 9 metric 50", Some("tun0"), true));
+        assert!(!w.view(ATTACHED, &[nm()], NOW).unattributed.is_empty());
+    }
+
+    #[test]
+    fn at_attach_a_default_route_over_a_physical_nic_is_not_protecting() {
+        // Claimed by NM before the restart, still standing: kept, but steers nothing.
+        let mut before = Tracker::default();
+        before.apply(&dhcp_default());
+        let standing = vec![
+            change(Owner::Unattributed, ChangeKind::Interface, "wlan0", Some("wlan0"), false),
+            Change { owner: Owner::Unattributed, ..dhcp_default() },
+        ];
+        let physical = std::collections::BTreeSet::new();
+        let t = Tracker::attach(&before.claims(), &standing, &physical);
+        let v = t.view(ATTACHED, &[nm()], NOW);
+        assert!(!v.units["NetworkManager"].protecting && v.unattributed.is_empty(), "{v:?}");
+        // Unclaimed (the files lost): still not pre-attach.
+        let t = Tracker::attach(&Claims::default(), &standing, &physical);
+        assert!(t.view(ATTACHED, &[nm()], NOW).unattributed.is_empty());
+    }
+}
