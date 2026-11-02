@@ -167,3 +167,24 @@ real machines.
 | Item | Found | Doing |
 | --- | --- | --- |
 | P11, scope (review 5731300056) | P11 flags the export only. §9's "flagged in the console and the journal" is still open: neither shows an Exec probe today. The Rust readers are to show it from `ProbeKind::Exec`, not from the `flagged` key | no code in P11; open for the console and daemon lanes |
+
+## Reviewer: P13 and SSH-group module-eval cases (#11), 2 Nov
+
+Written from §12d ("ordered before every unit that admits a principal: the
+display manager (whichever unit NixOS uses for it …)"; "*Restrict remote
+access to administrators* means Planarian's administrators (root and
+`planarian-admin`), not `wheel`"), on `review/lane-nix-p13-sshgroup`. The
+pinned nixpkgs greetd module always aliases `display-manager.service` to
+`greetd.service`. Checks in `nix/tests/eval.nix`:
+
+- reference configuration (greetd): greetd is the DM (non-vacuous);
+  `greetd.service` is after `planarian-ready.target`; no ExecStart-less
+  `display-manager` unit is defined beside the alias. On `main` the last one
+  FAILS (the posture defines a stub `display-manager.service`).
+- the same configuration with SDDM instead: `display-manager.service` is a
+  real unit and is after the target. Passes on `main` (guard).
+- SSH: the `planarian-respond@` script writes at least one `AllowGroups` line;
+  every such line is `AllowGroups planarian-admin root` and never names
+  `wheel` (read from the script, IFD); sshd's `extraConfig` includes
+  `/run/planarian/sshd/*.conf`. Passes on `main` (guard); a mutation writing
+  `wheel` fails it.
