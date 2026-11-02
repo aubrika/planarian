@@ -145,3 +145,9 @@ entry's field, an added and a removed user-scope entry. Each must touch the
 manifest. Controls: an identical manifest does not; the fields already covered
 (synonyms, restart_disruption, sensitivity) still do. On `main`: 4 of 6 fail
 (desired, the exported fields, added/removed, user scope).
+
+### lane-change-path: C19 (#10), 2 Nov
+
+| Id | Status | What closes it | Case |
+| --- | --- | --- | --- |
+| C19 | closed by this PR | `derive.rs` `touches_manifest` compares every entry whole (canonical probes left to `touches_canonical`), system and user scope, and an added or removed entry; it had compared only `edges`, `sensitivity`, `restart_disruption`, `synonyms` and user probes of units present in both | reviewer's `crates/exec/src/derive_c19_tests.rs` (4 of 6 fail on `main`; all pass); fake verdicts unchanged |

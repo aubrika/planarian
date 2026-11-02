@@ -101,22 +101,30 @@ fn touches_canonical(base: &Manifest, cand: &Manifest, canonical: &Canonical) ->
     false
 }
 
+/// C19 (§9, §11 ApplyChange row): whether the candidate's manifest differs
+/// from the base's in any part of any entry (`desired`, `edges`,
+/// `sensitivity`, `restart_disruption`, the user probes, `synonyms`, and the
+/// exported `systemd_restart`, `startup_grace`, `runtime_repair`,
+/// `stops_are_faults`), in user-scope entries as in system ones, or adds or
+/// removes an entry. Canonical probes are left out: they come from the core
+/// package, and redefining one is `touches_canonical`.
 fn touches_manifest(base: &Manifest, cand: &Manifest, diff: &ConfigDiff) -> bool {
     if diff.options.keys().any(|k| k.starts_with("services.planarian.")) {
         return true;
     }
-    base.units.iter().any(|(id, b)| {
-        cand.units.get(id).is_some_and(|c| {
-            c.edges != b.edges
-                || c.sensitivity != b.sensitivity
-                || c.restart_disruption != b.restart_disruption
-                || c.synonyms != b.synonyms
-                || c.probes
-                    .iter()
-                    .filter(|p| p.origin == ProbeOrigin::User)
-                    .ne(b.probes.iter().filter(|p| p.origin == ProbeOrigin::User))
-        })
-    })
+    // An entry as the manifest declares it: every field, the user probes only.
+    let entry = |d: &UnitDef| {
+        let mut d = d.clone();
+        d.probes.retain(|p| p.origin == ProbeOrigin::User);
+        d
+    };
+    let entries = |m: &Manifest| -> (BTreeMap<UnitId, UnitDef>, BTreeMap<UnitId, UnitDef>) {
+        (
+            m.units.iter().map(|(id, d)| (id.clone(), entry(d))).collect(),
+            m.user_units.iter().map(|d| (d.id.clone(), entry(d))).collect(),
+        )
+    };
+    entries(base) != entries(cand)
 }
 
 fn changes_desired(base: &Manifest, cand: &Manifest) -> bool {
