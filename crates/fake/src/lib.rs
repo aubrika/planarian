@@ -235,6 +235,9 @@ pub struct World {
     /// Fault injection: something flushed the nftables ruleset, so the hold's
     /// table is gone while holds are still in place (`/run` says held).
     pub hold_table_flushed: bool,
+    /// Fault injection (§12d): the hold table cannot be checked (`nft`
+    /// missing or failing).
+    pub hold_table_unreadable: bool,
     /// Fault injection (C6): the next candidate's store contents no longer
     /// hash to the NAR hash recorded when it was built.
     pub nar_mismatch: bool,
@@ -770,6 +773,9 @@ impl UnitBackend for Fake {
 
     fn hold_table_present(&self) -> Result<bool, Outcome> {
         let w = self.w();
+        if w.hold_table_unreadable {
+            return Err(Outcome::Failed("nft: No such file or directory".into()));
+        }
         Ok(w.held.is_empty() || !w.hold_table_flushed)
     }
 

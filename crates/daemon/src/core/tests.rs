@@ -1608,3 +1608,28 @@ fn a_flushed_hold_table_is_put_back() {
     r.ticks(2);
     assert_eq!(applied(&mut r), before + 1, "once, while the table stays");
 }
+
+/// §12d: a hold table that cannot be checked (planariad has no `nft`, say)
+/// alarms and re-applies once, not on every tick: a re-apply restarts the
+/// hold unit, which lifts it for a moment.
+#[test]
+fn an_uncheckable_hold_table_alarms_and_reapplies_once() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().units.get_mut(&sshd).unwrap().fail_on_start = true;
+    r.fake.w().signal(&sshd, 11);
+    r.ticks(2);
+    r.fake.w().hold_table_unreadable = true;
+    r.ticks(5);
+    let reapplied = r.fake.w().calls.iter().filter(|c| c.call == "reapply_hold(service:sshd)").count();
+    assert_eq!(reapplied, 1, "once while it stays uncheckable");
+    let alarms = r.core.notices.iter().filter(|n| n.contains("could not be checked")).count();
+    assert_eq!(alarms, 1, "{:?}", r.core.notices);
+    // Checkable again, then flushed: that is a new occurrence.
+    r.fake.w().hold_table_unreadable = false;
+    r.ticks(1);
+    r.fake.w().hold_table_flushed = true;
+    r.ticks(1);
+    let reapplied = r.fake.w().calls.iter().filter(|c| c.call == "reapply_hold(service:sshd)").count();
+    assert_eq!(reapplied, 2);
+}

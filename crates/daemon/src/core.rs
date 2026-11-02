@@ -234,6 +234,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     quiet_queue: Vec<String>,
     /// Waiting generations interrupted by a restart, to prepare again (§12f).
     reprepare: Vec<(TxnId, Transition)>,
+    /// §12d: the hold's firewall table was there at the last check (or no
+    /// hold was active). Re-application is on the change to missing or
+    /// uncheckable, not on every tick: a re-apply restarts the hold unit.
+    hold_table_seen: bool,
     /// From the executor log of earlier runs: each transaction's proposal and
     /// caller, so one prepared again keeps its source and caller (§12, C21).
     pub earlier: BTreeMap<TxnId, (Proposal, Actor)>,
@@ -421,6 +425,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             quiet: false,
             quiet_queue: vec![],
             reprepare: vec![],
+            hold_table_seen: true,
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
             generation_touched: false,
@@ -762,13 +767,26 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         if let Ok(h) = &host {
             holding.extend(h.iter().cloned());
         }
-        if !holding.is_empty() && !matches!(self.b.units().hold_table_present(), Ok(true)) {
-            for u in holding.iter().filter(|u| units.contains(u)) {
-                self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::Daemon });
-                self.notice(format!("ALARM: {u}: the network hold was removed from the firewall; re-applying it"));
-                if let o @ (Outcome::Failed(_) | Outcome::Unknown(_)) = self.b.units().reapply_hold(u) {
-                    self.notice(format!("ALARM: {u}: its traffic could not be held again ({o:?})"));
+        if holding.is_empty() {
+            self.hold_table_seen = true;
+        } else {
+            let present = self.b.units().hold_table_present();
+            if !matches!(present, Ok(true)) && self.hold_table_seen {
+                let why = match &present {
+                    Err(o) => format!("the network hold's firewall table could not be checked ({o:?}); re-applying it"),
+                    Ok(_) => "the network hold was removed from the firewall; re-applying it".to_string(),
+                };
+                for u in holding.iter().filter(|u| units.contains(u)) {
+                    self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::Daemon });
+                    self.notice(format!("ALARM: {u}: {why}"));
+                    if let o @ (Outcome::Failed(_) | Outcome::Unknown(_)) = self.b.units().reapply_hold(u) {
+                        self.notice(format!("ALARM: {u}: its traffic could not be held again ({o:?})"));
+                    }
                 }
+                // Once per occurrence: until a check finds the table again.
+                self.hold_table_seen = matches!(self.b.units().hold_table_present(), Ok(true));
+            } else {
+                self.hold_table_seen = matches!(present, Ok(true));
             }
         }
         for u in units {
