@@ -213,6 +213,37 @@ pub struct DerivedFacts {
     /// Derived from systemd's state, never from a proposal.
     #[serde(default)]
     pub restores_unattributed_stop: bool,
+    /// A RestartUnit whose unit has already failed (observed `Failed`, or not
+    /// running while it is desired running) in the observation the facts are
+    /// derived against; `Unknown` is not failed. Waives the External
+    /// escalation of the RestartUnit row, never the Security one (§11; owner
+    /// decision, Nov 2).
+    #[serde(default)]
+    pub restarts_failed_unit: bool,
+    /// The sensitivity of the units a generation transition would remove or
+    /// stop: present now and absent from the target's manifest, or stopped by
+    /// its activation. A Rollback that takes away a Security- or
+    /// External-sensitive unit (a VPN) asks (§11 Rollback row; owner
+    /// decision, Nov 2). Empty for every other transition.
+    #[serde(default)]
+    pub removes_sensitivity: Sensitivities,
+    /// The units behind `removes_sensitivity`, sorted: what an approval shows
+    /// as removed or stopped (§16). Journaled in this form since 4bb9c99.
+    #[serde(default)]
+    pub removes: Vec<UnitId>,
+    /// `removes[i]`'s own sensitivity, from the decision's lookup, so the
+    /// display and the decision agree. A parallel field, not a change to
+    /// `removes`, so a record journaled before it still decodes (and an older
+    /// build ignores it). Absent or of another length: the display shows
+    /// `removes_sensitivity` for each and says so.
+    #[serde(default)]
+    pub removes_each: Vec<Sensitivities>,
+    /// A RestartUnit of a network-security unit (§12d: a network tool the
+    /// kernel attributes traffic-steering changes to) that has failed: its
+    /// traffic is held, so the restart only ends an outage and runs at once
+    /// whatever its sensitivity (§11; owner decision, Nov 2).
+    #[serde(default)]
+    pub restarts_held_unit: bool,
     pub caller: Actor,
     pub config_diff: Option<ConfigDiff>,
 }

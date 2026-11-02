@@ -564,9 +564,15 @@ pub open spec fn base_spec(i: Input) -> Decision {
     match *i.transition {
         // §11: a Security-sensitive unit stopped outside Planarian and not
         // attributed is restored on its own (and alarmed); otherwise a
-        // Security or External restart asks.
+        // Security restart asks. An External restart asks unless the unit has
+        // already failed: what that escalation protects is already lost
+        // (owner decision, Nov 2).
         Transition::RestartUnit(_) => allow(
-            ask_if(sec_or_ext(f.sensitivity) && (f.sensitivity.external || !f.restores_unattributed_stop), Tier::Runtime),
+            ask_if(
+                (f.sensitivity.security && !f.restores_unattributed_stop && !f.restarts_held_unit)
+                    || (f.sensitivity.external && !f.restarts_failed_unit && !f.restarts_held_unit),
+                Tier::Runtime,
+            ),
         ),
         Transition::StopUnit(_) => allow(ask_if(sec_or_ext(f.sensitivity), Tier::Runtime)),
         Transition::SetOverride(_) => override_spec(f, *i.authz),
@@ -586,7 +592,12 @@ pub open spec fn base_spec(i: Input) -> Decision {
                 Tier::Tested,
             ),
         ),
-        Transition::Rollback => allow(ask_if(sec_or_ext(f.sensitivity), Tier::Runtime)),
+        // §11: a Rollback asks for what it would take away, not for what it
+        // restarts. Security- or External-sensitive options it would restore
+        // ask through I11 (any non-Routine option in its diff); a Security- or
+        // External-sensitive unit it would remove or stop asks here (owner
+        // decision, Nov 2).
+        Transition::Rollback => allow(ask_if(sec_or_ext(f.removes_sensitivity), Tier::Runtime)),
         Transition::LoadModel(m) => if has_model(i.tables.model_catalog@, m) {
             allow(Tier::Tested)
         } else {
@@ -795,7 +806,8 @@ fn base_tier(i: &Input) -> (r: Decision)
     match i.transition {
         Transition::RestartUnit(_) => allow_exec(
             ask_if_exec(
-                sec_or_ext_exec(&f.sensitivity) && (f.sensitivity.external || !f.restores_unattributed_stop),
+                (f.sensitivity.security && !f.restores_unattributed_stop && !f.restarts_held_unit)
+                    || (f.sensitivity.external && !f.restarts_failed_unit && !f.restarts_held_unit),
                 Tier::Runtime,
             ),
         ),
@@ -820,7 +832,7 @@ fn base_tier(i: &Input) -> (r: Decision)
             };
             allow_exec(ask_if_exec(!vetted_exec(*to, i.known_good, i.live_tested) || mismatched, Tier::Tested))
         },
-        Transition::Rollback => allow_exec(ask_if_exec(sec_or_ext_exec(&f.sensitivity), Tier::Runtime)),
+        Transition::Rollback => allow_exec(ask_if_exec(sec_or_ext_exec(&f.removes_sensitivity), Tier::Runtime)),
         Transition::LoadModel(m) => if contains_model(&i.tables.model_catalog, m) {
             allow_exec(Tier::Tested)
         } else {

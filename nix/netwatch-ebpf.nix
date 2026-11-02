@@ -8,22 +8,33 @@
 # the build fails if their majors differ, rather than producing a broken
 # object. -Z build-std resolves the standard library's own lockfile, so its
 # crates are vendored next to the crate's.
-{ lib, stdenv, rustPlatform, rustc, cargo, bpf-linker, lndir, src, name ? "netwatch" }:
+{ lib, stdenv, rustPlatform, rustc, cargo, bpf-linker, lndir, binutils-unwrapped, src, name ? "netwatch", sections ? [ ] }:
 
 let
   library = rustPlatform.rustLibSrc;
   vendorCrate = rustPlatform.importCargoLock { lockFile = "${src}/Cargo.lock"; };
-  vendorStd = rustPlatform.importCargoLock { lockFile = "${library}/Cargo.lock"; };
+  # A fixed-output vendor of the library's crates: read at build time, not
+  # at evaluation (importCargoLock would read the library's lockfile at
+  # evaluation, building rust-lib-src first, which an offline evaluation,
+  # e.g. the installer's, cannot). Pinned to the rustc at the pin; a rustc
+  # bump changes the hash and fails here until it is renewed.
+  vendorStd = rustPlatform.fetchCargoVendor {
+    src = library;
+    name = "rust-lib-src";
+    hash = "sha256-5oJ/mtsJW0R3F7jgxafP23+WMLkyMKu10De5WIzb7Ro=";
+  };
   rustcLlvm = lib.versions.major (rustc.llvm.version or rustc.llvmPackages.llvm.version);
   linkerLlvm = lib.versions.major (lib.findFirst (d: lib.hasPrefix "llvm-" (d.name or "")) { version = "none"; } (bpf-linker.buildInputs ++ bpf-linker.nativeBuildInputs)).version;
 in
+assert lib.assertMsg (sections != [ ])
+  "netwatch-ebpf: name the loader's program sections, so a missing program fails the build";
 assert lib.assertMsg (rustcLlvm == linkerLlvm)
   "netwatch-ebpf: rustc's LLVM (${rustcLlvm}) and bpf-linker's (${linkerLlvm}) differ; the eBPF object would be broken";
 stdenv.mkDerivation {
   pname = "${name}-ebpf";
   version = "0";
   inherit src;
-  nativeBuildInputs = [ rustc cargo bpf-linker lndir ];
+  nativeBuildInputs = [ rustc cargo bpf-linker lndir binutils-unwrapped ];
   dontConfigure = true;
   buildPhase = ''
     runHook preBuild
@@ -36,7 +47,7 @@ stdenv.mkDerivation {
     # One vendor directory for the crate's and the library's dependencies.
     mkdir vendor
     lndir -silent ${vendorCrate} vendor
-    lndir -silent ${vendorStd} vendor
+    lndir -silent ${vendorStd}/source-registry-0 vendor
     mkdir -p .cargo
     cat > .cargo/config.toml <<CFG
     [source.crates-io]
@@ -59,6 +70,10 @@ stdenv.mkDerivation {
     [ -s "$obj" ] || { echo "netwatch-ebpf: $obj is missing or empty" >&2; exit 1; }
     [ "$(od -An -tx1 -N4 "$obj" | tr -d ' \n')" = 7f454c46 ] || { echo "netwatch-ebpf: $obj is not ELF" >&2; exit 1; }
     [ "$(od -An -tu2 -j18 -N2 --endian=little "$obj" | tr -d ' ')" = 247 ] || { echo "netwatch-ebpf: $obj is not an eBPF object" >&2; exit 1; }
+    # Every program section the loader expects (e.g. fentry/<function>).
+    for sec in ${lib.escapeShellArgs sections}; do
+      readelf -SW "$obj" | grep -qF " $sec " || { echo "netwatch-ebpf: $obj has no section $sec" >&2; exit 1; }
+    done
     install -Dm444 "$obj" $out/share/planarian/${name}.bpf.o
     runHook postInstall
   '';

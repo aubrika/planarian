@@ -305,6 +305,23 @@ let
     NFT
     }
 
+    # Fail closed: when the full table does not load (and a hold stands),
+    # hold everything but loopback rather than nothing. apply, lift (other
+    # holds may stand) and reapply (after a flush) all go through it.
+    build_or_lock() {
+      build && return 0
+      log "the hold table did not load; holding all traffic but loopback"
+      nft -f - <<NFT
+    table inet planarian-hold
+    delete table inet planarian-hold
+    table inet planarian-hold {
+      chain input { type filter hook input priority -300; policy drop; iif lo accept; }
+      chain output { type filter hook output priority -300; policy drop; oif lo accept; }
+      chain forward { type filter hook forward priority -300; policy drop; }
+    }
+    NFT
+    }
+
     case "$cmd" in
       condition)
         # ExecCondition (exit 0: hold; 1: skip, the unit stays inactive).
@@ -328,9 +345,11 @@ let
         # 2. Is the failed network tool a network-security unit, i.e. was it
         #    protecting traffic (§12d)? Its kernel-attributed footprint says.
         #    Fail closed: a watch heartbeat missing, failed or older than 30 s;
-        #    no footprint (netwatch writes `protecting no` for every network
-        #    tool once it attaches, so a missing file was never seen by a
-        #    healthy watch); `protecting yes`; or a change the kernel could
+        #    no footprint (netwatch keeps the footprints it has across its own
+        #    restarts, charges steering it finds on attach but did not see
+        #    made to .unattributed, and writes `protecting no` only for a
+        #    network tool with no claim, so a missing file was never seen by
+        #    a healthy watch); `protecting yes`; or a change the kernel could
         #    not attribute, here or anywhere (.unattributed); a footprint not
         #    confirmed within the window (`at`): hold. Only a fresh watch, no
         #    standing unattributed change, and a fresh `protecting no` skip.
@@ -378,27 +397,12 @@ let
       apply)
         touch "$dir/$unit"
         snapshot
-        if build; then
-          log "traffic held: $unit has failed"
-        else
-          # Fail closed: the full table did not load; hold everything but
-          # loopback rather than nothing.
-          log "the hold table did not load; holding all traffic but loopback"
-          nft -f - <<NFT
-    table inet planarian-hold
-    delete table inet planarian-hold
-    table inet planarian-hold {
-      chain input { type filter hook input priority -300; policy drop; iif lo accept; }
-      chain output { type filter hook output priority -300; policy drop; oif lo accept; }
-      chain forward { type filter hook forward priority -300; policy drop; }
-    }
-    NFT
-        fi ;;
+        build_or_lock && log "traffic held: $unit has failed" ;;
       lift)
         rm -f "$dir/$unit"
-        build && log "hold on $unit lifted" ;;
+        build_or_lock && log "hold on $unit lifted" ;;
       reapply)
-        build ;;
+        build_or_lock ;;
       *) echo "usage: planarian-hold apply|lift|condition UNIT | reapply" >&2; exit 2 ;;
     esac
   '';
@@ -433,7 +437,10 @@ let
     "${stopPost "planarian-recovery"}"
     "${check}"
     "${hold}"
-  ] ++ lib.optional (cfg.package.netwatch or false) "${cfg.package}/share/planarian/netwatch.bpf.o";
+  ] ++ lib.optionals (cfg.package.netwatch or false) [
+    "${cfg.package}/share/planarian/netwatch.bpf.o"
+    "${cfg.package}/bin/planarian-netwatch"
+  ];
   coreHash = pkgs.runCommand "planarian-core-hash" { } ''
     for f in ${lib.escapeShellArgs coreFiles}; do
       printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"
@@ -613,6 +620,44 @@ in
     # from every service's configuration, and a service may read
     # environment.etc.
     }) (lib.attrNames (lib.filterAttrs (_: u: u.scope == "system" && (u.holdAllow != [ ] || u.holdInterfaces != [ ])) cfg.units)));
+    # The footprints' directory outlives planarian-netwatch's restarts.
+    systemd.tmpfiles.rules = [ "d /run/planarian/footprint 0755 root root -" ];
+    # §12d: netwatch, attributing every routing, interface, rule and
+    # nftables change to the unit that made it, from inside the kernel, and
+    # keeping each network tool's footprint (crates/backends/netwatch).
+    # Before networking starts, so early changes are attributed. It writes
+    # `.watch failed` when it stops or cannot attach (every network tool's
+    # failure then holds), and is restarted.
+    # nfnetlink is a module (CONFIG_NETFILTER_NETLINK=m): until it is loaded
+    # its functions, and their BTF, do not exist, and netwatch cannot attach
+    # to them. Loaded at boot (systemd-modules-load, before sysinit.target),
+    # not by the first nftables use, which comes after netwatch.
+    boot.kernelModules = mkIf (cfg.package.netwatch or false) [ "nfnetlink" ];
+    systemd.services.planarian-netwatch = mkIf (cfg.package.netwatch or false) {
+      description = "Planarian: attribute network changes to the units that make them";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "network-pre.target" ];
+      # Before the firewall too: its boot batch would otherwise land before
+      # the attach and read as unattributed pre-attach steering, and every
+      # network tool's failure would hold.
+      before = [ "network-pre.target" "firewall.service" "nftables.service" ];
+      after = [ "sysinit.target" "systemd-tmpfiles-setup.service" "systemd-modules-load.service" ];
+      unitConfig.DefaultDependencies = false;
+      restartIfChanged = false;
+      serviceConfig = {
+        # Ready (READY=1) once attached, snapshotted and its first files
+        # written, so "before the firewall and networking" means something;
+        # on a failed attach it writes `.watch failed` and notifies or exits
+        # promptly. Bounded, so boot never stalls on it.
+        Type = "notify";
+        NotifyAccess = "main";
+        TimeoutStartSec = 30;
+        ExecStart = "${cfg.package}/bin/planarian-netwatch --export /etc/planarian/export.json --object ${cfg.package}/share/planarian/netwatch.bpf.o --dir /run/planarian/footprint";
+        Restart = "always";
+        RestartSec = 1;
+        CapabilityBoundingSet = [ "CAP_BPF" "CAP_PERFMON" "CAP_SYS_ADMIN" "CAP_NET_ADMIN" "CAP_DAC_READ_SEARCH" ];
+      };
+    };
     systemd.services."planarian-hold@" = {
       description = "Planarian: hold network traffic while %i has failed";
       # An activation (a repair rollback, `undo`) must not stop and start a
@@ -626,6 +671,9 @@ in
         ExecCondition = "${hold} condition %i";
         ExecStart = "${hold} apply %i";
         ExecStop = "${hold} lift %i";
+        # Rebuild the table in place (after a flush), never lifting it: a
+        # restart would run lift then apply, passing traffic between them.
+        ExecReload = "${hold} reapply";
       };
     };
   }
