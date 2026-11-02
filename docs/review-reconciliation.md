@@ -131,3 +131,7 @@ Still open, each in issue #7's lanes: §12f
 (#10); P11 and the module-eval assertions (#11); deviations and the closing
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
 proved; the residue classifier under Kani).
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P24 (lane-nix, 2 Nov) | Pinned nixpkgs: `services.pipewire.wireplumber.enable` defaults to `services.pipewire.enable`; the user unit `wireplumber.service` carries `BindsTo=pipewire.service` (and `Alias=pipewire-session-manager.service`). The gym VMs already declare wireplumber with that edge, at normal priority, so the module's `mkDefault` leaves them as they were | `nix/module.nix` declares `wireplumber` (`scope = "user"`, `Requires` on `service@0:pipewire`) when PipeWire and WirePlumber are both enabled. module-eval: present in the reference configuration with the edge, absent with WirePlumber off. Fails on `main` |

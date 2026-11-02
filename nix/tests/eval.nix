@@ -74,6 +74,7 @@ let
     (check (builtins.any (u: u.id == "service@0:pipewire") export.userUnits) "pipewire is per-user")
     (check (cfg.services.pipewire.enable && cfg.services.pipewire.wireplumber.enable) "the reference configuration runs PipeWire with WirePlumber (P24's check is not vacuous)")
     (check (builtins.map (u: u.id) (wireplumberIn export) == [ "service@0:wireplumber" ]) "wireplumber is a default per-user unit, and only that (P24)")
+    (check (builtins.elem { from = "service@0:wireplumber"; to = "service@0:pipewire"; kind = "Requires"; origin = "Manifest"; } (builtins.head (wireplumberIn export)).edges) "wireplumber requires pipewire, as upstream's BindsTo= says (P24)")
     (check (wireplumberIn noWireplumberSys.config.services.planarian.export == [ ]) "no wireplumber unit when services.pipewire.wireplumber.enable is false (P24)")
     (check (builtins.elem { from = "service:gym-app"; to = "service:gym-db"; kind = "Requires"; origin = "SystemdRequires"; } app.edges) "Requires= became a Requires edge")
     (check (builtins.elem { from = "service:gym-app"; to = "service:gym-db"; kind = "Ordering"; origin = "SystemdAfter"; } app.edges) "After= became an Ordering edge")
