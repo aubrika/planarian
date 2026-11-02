@@ -275,7 +275,9 @@ pkgs.testers.runNixOSTest {
         # which the loader refuses.
         import re
         argv = machine.succeed("systemctl show -P ExecStart planarian-netwatch.service")
-        obj = re.search(r"--object (\S+)", argv).group(1)
+        m = re.search(r"--object (\S+)", argv)
+        assert m, argv
+        obj = m.group(1)
         machine.succeed("systemctl stop planarian-netwatch.service nw-quiet.service")
         machine.succeed(f"rm -f {FP}/.watch")
         machine.succeed(f"mount --bind /dev/null {obj}")
