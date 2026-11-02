@@ -147,6 +147,10 @@ let
   # systemd's included, which evaluation cannot see): the demo VM's
   # configuration, whose closure the same CI job builds, with netwatch.
   bootSys = (withNetwatch self.nixosConfigurations."planarian-vm-text-${pkgs.stdenv.hostPlatform.system}").config;
+  bootHold = bootSys.services.planarian;
+  nwOrderedIn = u: pkgs.lib.hasInfix "\nAfter=planarian-netwatch.service\n" bootHold.holdDropins."${u}.service.d/50-planarian-hold.conf";
+  unorderedSets = import ../netwatch-unordered.nix;
+  sortU = l: builtins.sort builtins.lessThan (pkgs.lib.unique l);
   nwBefore = nwUnit.before;
   holdUnit = cfg.systemd.services."planarian-hold@";
   holdScript = builtins.readFile (builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart));
@@ -199,7 +203,9 @@ let
     (check (nwUnit.after == [ ] && !(nwUnit.unitConfig ? After) && nwUnit.unitConfig.DefaultDependencies == false && builtins.elem "nfnetlink" nwCfg.boot.initrd.kernelModules && builtins.elem "nfnetlink" nwCfg.boot.kernelModules && !(builtins.elem "nfnetlink" (nwSys.extendModules { modules = [ { boot.kernelModules = pkgs.lib.mkForce [ ]; } ]; }).config.boot.initrd.kernelModules) && nwUnit.serviceConfig.RuntimeDirectory == "planarian/footprint") "netwatch is ordered after nothing: nfnetlink comes from the initrd, its directory is its own (owner decision, Nov 2)")
     (check (builtins.elem "systemd-modules-load" nwHold.holdUnits && builtins.elem "systemd-udevd" nwHold.holdUnits && builtins.elem "nt-vpn@" nwHold.holdUnits) "early-boot and templated network tools exist here (the ordering check is not vacuous)")
     (check (builtins.all (u: builtins.elem u nwHold.networkToolsUnordered || nwOrdered u) nwHold.holdUnits) "every network tool not in nix/netwatch-unordered.nix starts after planarian-netwatch.service, a template's instances through its drop-in (owner decision, Nov 2)")
-    (check (nwHold.networkToolsUnordered == nwHold.netwatchCycle && nwHold.networkToolsUnordered == builtins.filter (u: builtins.elem u nwHold.holdUnits) (import ../netwatch-unordered.nix) && nwCfg.services.planarian.export.networkToolsUnordered == nwHold.networkToolsUnordered) "the unordered network tools are exactly those in netwatch's startup chain, and the export lists them")
+    (check (sortU nwHold.networkToolsUnordered == sortU (nwHold.netwatchCycle ++ nwHold.netwatchInitrdSurvivors) && builtins.all (u: builtins.elem u nwHold.holdUnits && (builtins.elem u unorderedSets.cycle || builtins.elem u (unorderedSets.initrdSurvivors ++ builtins.attrNames nwCfg.boot.initrd.systemd.services))) nwHold.networkToolsUnordered && nwCfg.services.planarian.export.networkToolsUnordered == nwHold.networkToolsUnordered) "the tools that do not start after netwatch are exactly those in its startup chain and the systemd initrd's survivors, and the export lists them")
+    (check (bootHold.netwatchInitrdSurvivors != [ ] && builtins.elem "systemd-journald" bootHold.networkToolsUnordered && builtins.all nwOrderedIn bootHold.holdUnits) "on the demo VM (systemd initrd) journald, kept across switch-root, is listed as not starting after netwatch, and still carries the After= (a stage-2 restart is ordered)")
+    (check ((nwSys.extendModules { modules = [ { boot.initrd.systemd.enable = pkgs.lib.mkForce false; } ]; }).config.services.planarian.networkToolsUnordered == nwHold.netwatchCycle) "with the scripted initrd, which keeps no unit across switch-root, only the startup chain is listed")
     (check (builtins.filter (a: !a.assertion) nwCfg.assertions == [ ] && cycleSys.config.services.planarian.netwatchCycle == [ "nt-early" ] && builtins.any (a: pkgs.lib.hasInfix "would be a cycle: nt-early." a.message) cycleRefused) "a network tool ordered before netwatch, transitively, fails evaluation, naming it")
     (check (builtins.all (u: !(pkgs.lib.hasInfix "planarian-netwatch" hold.holdDropins."${u}.service.d/50-planarian-hold.conf")) hold.holdUnits) "without netwatch, no tool is ordered after it")
     (check (pkgs.lib.hasInfix "/run/planarian/footprint" holdScript && pkgs.lib.hasInfix "protecting yes" holdScript && pkgs.lib.hasInfix "unattributed" holdScript && pkgs.lib.hasInfix "-le 30" holdScript && pkgs.lib.hasInfix "/proc/uptime" holdScript && pkgs.lib.hasInfix "-ge -5" holdScript && pkgs.lib.hasInfix ".unattributed" holdScript && pkgs.lib.hasInfix "its footprint is stale" holdScript) "the hold's condition reads the footprint and fails closed on a stale watch, a stale footprint, or a standing unattributed change (§12d)")
@@ -332,5 +338,25 @@ pkgs.runCommand "planarian-module-eval.json" {
   grep -q 'Found ordering cycle.*planarian-netwatch.service' injected.log \
     || { echo "an injected cycle through systemd-udevd was not found" >&2; exit 1; }
   echo "ok: the boot transaction orders every network tool after netwatch with no cycle; an injected one is found"
+  # The systemd initrd's survivors, from its unit files: a unit with
+  # IgnoreOnIsolate= (initrd-cleanup isolates initrd-switch-root.target)
+  # and no Conflicts= on initrd-switch-root keeps running into stage 2. On
+  # the demo VM, those that are network tools are exactly the export's list
+  # (its startup chain is empty).
+  initrd=${bootSys.boot.initrd.systemd.contents."/etc/systemd/system".source}
+  : > survivors
+  for f in $initrd/*.service; do
+    n=$(basename "$f" .service)
+    body=$(cat "$f" "$f".d/*.conf 2>/dev/null || cat "$f")
+    printf '%s\n' "$body" | grep -qiE '^IgnoreOnIsolate=(yes|true|1|on)$' || continue
+    printf '%s\n' "$body" | grep -iE '^Conflicts=' | grep -qE 'initrd-switch-root\.(target|service)' && continue
+    echo "$n" >> survivors
+  done
+  grep -qx systemd-journald survivors || { echo "the initrd survivor scan found no journald (the check is vacuous)" >&2; exit 1; }
+  printf '%s\n' ${pkgs.lib.escapeShellArgs bootHold.holdUnits} | sort > tools
+  sort survivors | comm -12 - tools > want
+  printf '%s\n' ${pkgs.lib.escapeShellArgs (bootHold.netwatchCycle ++ bootHold.networkToolsUnordered)} | grep -v '^$' | sort -u > got
+  diff want got || { echo "networkToolsUnordered differs from the initrd's survivors among the network tools (above: < from the files, > exported)" >&2; exit 1; }
+  echo "ok: the systemd initrd's survivors that are network tools ($(tr '\n' ' ' < want)) are exactly networkToolsUnordered"
   cp $exportPath $out
 ''

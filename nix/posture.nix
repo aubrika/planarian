@@ -422,12 +422,22 @@ let
     name = "${u}.service.d/50-planarian-hold.conf";
     # %N: the failed unit's name, per instance for a template's drop-in.
     value = "[Unit]\nOnFailure=planarian-hold@%N.service\n"
-      + lib.optionalString (netwatchOn && !(builtins.elem u unorderedTools)) "After=planarian-netwatch.service\n";
+      + lib.optionalString (netwatchOn && !(builtins.elem u unordered.cycle)) "After=planarian-netwatch.service\n";
   }) cfg.holdUnits) // {
     "nftables.service.d/50-planarian-hold.conf" = "[Service]\nExecStartPost=${hold} reapply\nExecReload=${hold} reapply\n";
   };
   netwatchOn = cfg.package.netwatch or false;
-  unorderedTools = import ./netwatch-unordered.nix;
+  unordered = import ./netwatch-unordered.nix;
+  # With the systemd initrd, the tools it starts and keeps across
+  # switch-root: the upstream list, and any unit declared for the initrd
+  # with IgnoreOnIsolate= and no Conflicts= on initrd-switch-root.
+  initrdSurvives = v:
+    let uc = v.unitConfig or { }; ign = uc.IgnoreOnIsolate or false;
+        conf = (v.conflicts or [ ]) ++ ordWords v "conflicts" "Conflicts";
+    in (ign == true || ign == "yes" || ign == "true") && !(lib.any (c: builtins.elem c [ "initrd-switch-root.target" "initrd-switch-root.service" ]) conf);
+  initrdSurvivors = lib.optionals config.boot.initrd.systemd.enable
+    (unordered.initrdSurvivors ++ lib.attrNames (lib.filterAttrs (_: initrdSurvives) config.boot.initrd.systemd.services));
+  unorderedTools = lib.unique (unordered.cycle ++ lib.optionals netwatchOn initrdSurvivors);
   # The units ordered before planarian-netwatch.service in this
   # configuration, transitively (its After=, and every unit whose Before=
   # names one already found). A network tool among them, ordered after
@@ -506,7 +516,13 @@ in
       type = types.listOf types.str;
       readOnly = true;
       internal = true;
-      description = "The network tools not ordered after planarian-netwatch.service (nix/netwatch-unordered.nix), for the export.";
+      description = "The network tools that do not start after planarian-netwatch.service (nix/netwatch-unordered.nix: its startup chain, and the systemd initrd's survivors), for the export.";
+    };
+    netwatchInitrdSurvivors = mkOption {
+      type = types.listOf types.str;
+      readOnly = true;
+      internal = true;
+      description = "The network tools the systemd initrd starts and keeps across switch-root (for module-eval).";
     };
     netwatchCycle = mkOption {
       type = types.listOf types.str;
@@ -654,10 +670,11 @@ in
     # and each held unit's holdAllow endpoints.
     services.planarian.holdDropins = holdDropins;
     services.planarian.networkToolsUnordered = lib.filter (u: builtins.elem u unorderedTools) cfg.holdUnits;
+    services.planarian.netwatchInitrdSurvivors = lib.filter (u: builtins.elem u initrdSurvivors) cfg.holdUnits;
     services.planarian.netwatchCycle = if netwatchOn then cyclicTools else [ ];
     assertions = lib.optional netwatchOn {
-      assertion = lib.all (u: builtins.elem u unorderedTools) cyclicTools;
-      message = "planarian: network tools are ordered before planarian-netwatch.service, so ordering them after it (owner decision, Nov 2; SPEC §12d) would be a cycle: ${toString (lib.filter (u: !(builtins.elem u unorderedTools)) cyclicTools)}. Remove that ordering.";
+      assertion = lib.all (u: builtins.elem u unordered.cycle) cyclicTools;
+      message = "planarian: network tools are ordered before planarian-netwatch.service, so ordering them after it (owner decision, Nov 2; SPEC §12d) would be a cycle: ${toString (lib.filter (u: !(builtins.elem u unordered.cycle)) cyclicTools)}. Remove that ordering.";
     };
     systemd.packages = [ holdDropinPackage ];
     environment.etc = lib.listToAttrs (map (u: {
