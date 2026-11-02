@@ -1251,3 +1251,28 @@ fn user_data_without_a_snapshot_backend_logs_no_snapshot() {
     );
     assert_eq!(flagged(&r).len(), 2);
 }
+
+/// #24 review: the agent kept for a parked change's approval record
+/// (I7) is dropped once the change is no longer parked, whether it is
+/// approved or withdrawn, so the map does not grow for the daemon's life.
+#[test]
+fn a_withdrawn_parked_change_forgets_its_agent() {
+    let mut cfg = config();
+    cfg.exec
+        .tables
+        .option_sensitivity
+        .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let font = |scale: &str| Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str(scale.into()))].into(),
+    };
+    let resp = r.core.handle(ALICE, font("1.25"));
+    let Response::NeedsApproval { txn, .. } = resp else { panic!("{resp:?}") };
+    assert!(r.core.parked_agents.contains_key(&txn), "kept while parked");
+    let resp = r.core.handle(ALICE, Request::Cancel { txn });
+    assert!(matches!(resp, Response::Done { .. }), "{resp:?}");
+    r.ticks(1);
+    assert!(r.core.parked_agents.is_empty(), "{:?}", r.core.parked_agents);
+}

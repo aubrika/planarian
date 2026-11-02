@@ -1076,6 +1076,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     pub fn tick(&mut self) {
+        // I7's agent for an approval is needed only while the change is
+        // parked; a cancelled, expired, invalidated or refused one leaves.
+        let parked = &self.ex.parked;
+        self.parked_agents.retain(|t, _| parked.contains_key(t));
         let (s, defs) = self.observe();
         let now = s.observed_at;
         // P9: a tick over its 500 ms budget is warned, with the probes that
