@@ -399,7 +399,7 @@ let
     "${stopPost "planarian-recovery"}"
     "${check}"
     "${hold}"
-  ];
+  ] ++ lib.optional (cfg.package.netwatch or false) "${cfg.package}/share/planarian/netwatch.bpf.o";
   coreHash = pkgs.runCommand "planarian-core-hash" { } ''
     for f in ${lib.escapeShellArgs coreFiles}; do
       printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"

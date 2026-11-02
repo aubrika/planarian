@@ -125,6 +125,13 @@ let
   holdScript = builtins.readFile (builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart));
   vpn = unit "service:gym-vpn";
   nftDropin = hold.holdDropins."nftables.service.d/50-planarian-hold.conf";
+  # §12d (netwatch): the reference kernel carries BTF and what aya's
+  # programs on the netlink paths need. Read from its configuration (built,
+  # like the respond script above). netwatch reports a failed attach at
+  # runtime on any other kernel, and every network tool then holds.
+  kernelConfig = builtins.filter builtins.isString (builtins.split "\n" (builtins.readFile cfg.boot.kernelPackages.kernel.configfile));
+  kernelHas = o: builtins.elem "CONFIG_${o}=y" kernelConfig;
+  netwatchKernel = [ "DEBUG_INFO_BTF" "BPF_SYSCALL" "BPF_JIT" "BPF_EVENTS" "KPROBES" "KPROBE_EVENTS" "FUNCTION_TRACER" ];
   check = cond: msg: if cond then true else throw "planarian module eval: ${msg}";
   checks = [
     (check (builtins.any isExec probes) "the configuration exports an Exec probe (P11's check is not vacuous)")
@@ -155,6 +162,7 @@ let
     (check (holdUnit.serviceConfig.RemainAfterExit && pkgs.lib.hasSuffix " apply %i" holdUnit.serviceConfig.ExecStart && pkgs.lib.hasSuffix " lift %i" holdUnit.serviceConfig.ExecStop && pkgs.lib.hasSuffix " condition %i" holdUnit.serviceConfig.ExecCondition) "start applies, stop lifts, an unexpired release skips (§12d)")
     (check (pkgs.lib.hasInfix "/run/planarian/footprint" holdScript && pkgs.lib.hasInfix "protecting yes" holdScript && pkgs.lib.hasInfix "unattributed" holdScript && pkgs.lib.hasInfix "-le 30" holdScript) "the hold's condition reads the footprint and fails closed on a stale watch (§12d)")
     (check (pkgs.lib.hasInfix "policy drop" holdScript && pkgs.lib.hasInfix "planarian-admin" holdScript && pkgs.lib.hasInfix "/run/planarian/hold-released" holdScript) "the hold table drops by default and keeps only administrator sessions (§12d)")
+    (check (builtins.all kernelHas netwatchKernel) "the reference kernel has BTF and the BPF options netwatch needs: ${toString (builtins.filter (o: !(kernelHas o)) netwatchKernel)} missing (§12d)")
     (check (builtins.any (u: u.id == "service:sshd") export.units) "sshd is a canonical unit")
     (check (builtins.any (u: u.id == "device:fs-root") export.units) "fs-root is present")
     (check (builtins.any (u: u.id == "device:fs-boot") export.units) "fs-boot is present")
