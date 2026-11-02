@@ -6,6 +6,8 @@
 //! - apply: `systemctl start planarian-hold@<unit>.service` (idempotent;
 //!   systemd's `OnFailure=` starts the same unit on a crash or kill);
 //! - lift: `systemctl stop` of it;
+//! - reapply: `systemctl reload` of it (`ExecReload`: rebuild the table,
+//!   never lift);
 //! - state: `/run/planarian/hold/<unit>` exists while a hold is in place;
 //! - release: `/run/planarian/hold-released/<unit>` holds `boot` (until the
 //!   next boot), or `<unix> <boottime>`: the expiry in Unix seconds and the
@@ -54,8 +56,11 @@ pub fn apply(unit: &UnitId) -> Outcome {
     outcome("start", unit, run(&["systemctl", "start", &hold_unit(unit)], TIMEOUT))
 }
 
+/// Rebuild the hold's table in place (`ExecReload` runs the script's
+/// `reapply`). A reload never lifts the hold, where a restart would run
+/// `ExecStop` (`lift`) first and let traffic through for a moment.
 pub fn reapply(unit: &UnitId) -> Outcome {
-    outcome("restart", unit, run(&["systemctl", "restart", &hold_unit(unit)], TIMEOUT))
+    outcome("reload", unit, run(&["systemctl", "reload", &hold_unit(unit)], TIMEOUT))
 }
 
 /// The hold script's table (`table inet planarian-hold`).
