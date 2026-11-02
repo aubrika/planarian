@@ -299,6 +299,20 @@ manifest. Controls: an identical manifest does not; the fields already covered
 | --- | --- | --- | --- |
 | P21 | closed by this PR | `MemStore` keeps an undo log of log writes since the last `sync`: `sync` makes them durable, the new `crash()` (a power loss) undoes them, so the fake's "Journal fsync is durable" contract can fail. `conformance::MATRIX` adds `unbind` (`drv-bind-fails-restores-previous`: a failed bind's revert) and `cancel` (`crash-job-outlives-drain`: an unanswered activation's jobs), each under Partial, Unknown and Fenced; the comment that no fake entry makes them is corrected. The fake's `unbind` and `cancel` already honoured `World::inject` (`fake/src/lib.rs`), so `crates/fake` is unchanged | reviewer's `crates/txn/tests/memstore_sync.rs` (did not compile on `main`) and gym test `the_conformance_matrix_covers_unbind_and_cancel` (failed on `main`); both pass |
 
+## lane-daemon: #35 part 2, approvals show the change (§16), 2 Nov
+
+Reconciled at `main` `9f18fe7` against #35 and #34's §16 text. The
+coordinator granted `crates/ipc` (`Pending.diff`) and `crates/console` (the
+view) to this task.
+
+| Item | At `9f18fe7` | Work |
+| --- | --- | --- |
+| The diff is computed by the core | `facts.config_diff` (base override → candidate override, from `derive`) exists; per-option sensitivity is `Tables::option_sensitivity` | `approval::diff` builds `ApprovalDiff { options: [OptionChange { path, old, new, sensitivity }], removes }`, Security and External first, for generation transitions only |
+| A diff that differs at approval does not apply | `exec::binding` hashes the whole `DerivedFacts`, `config_diff` included: a re-derived difference re-binds and asks again. The diff itself is fixed by the two override hashes recorded at Prepared, so it can differ only if the override file changed, which the approval's stale check refuses (`Stale`) | no new mechanism; core test `an_approval_shows_its_diff_and_a_changed_diff_does_not_apply` |
+| Shown in `planarian approve`, the console and the notice; structured for agents | not shown anywhere; `Pending` had `facts` only | `Pending.diff` (serde default); `planarian approve [--json]` lists pending changes with their diffs (read-only, no TTY or root); `approve <hash>` prints the diff above its result; `status` and the console's banner show it; the notice and the `NeedsApproval` response carry a one-line summary (`ApprovalDiff::summary`) |
+| The units it would remove or stop | not in `DerivedFacts`; `removes_sensitivity` is #34's | `removes` is filled from `facts.removes` once #34's derive change lands (coordinator, Nov 2); empty until then |
+| Journal compatibility of `removes` (#37 review at `f7e2dc3`) | main journals `DerivedFacts.removes: Vec<UnitId>` (since 4bb9c99) inside `Prepared`; `f7e2dc3` changed it to `Vec<(UnitId, Sensitivities)>`, so a record main wrote would not decode. No journaled type uses `deny_unknown_fields` | `removes` keeps main's form; `#[serde(default)] removes_each: Vec<Sensitivities>` runs parallel to it, filled by `removed_units` from the decision's lookup. The display takes `removes_each[i]` when the lengths match, else `removes_sensitivity` for each with a note (`approval::removed`). Literal fixtures of main's form, `DerivedFacts` and a whole `Prepared` record, decode; policy test `removed_units_and_their_own_sensitivities_do_not_move_a_decision` (I14). `approval_diff`'s unused `defs` is gone |
+
 ## lane-nix: #35 part 1, network security fails closed (2 Nov)
 
 Read #35 and §12d on #34's branch (`ccr-c64ddb68-a5g3k5`), `nix/module.nix`, `nix/posture.nix`, the gym VM, and the pinned nixpkgs nftables, firewall, sshd and wg-quick modules. Design approved by the coordinator (2 Nov); interface sent to lane-daemon.

@@ -1415,3 +1415,109 @@ fn a_rebound_approval_that_no_longer_asks_is_logged_as_a_submission() {
     assert!(!r.core.log.iter().any(|x| x.approver.is_some()), "no approval record: {:#?}", r.core.log);
     assert!(r.core.parked_agents.is_empty());
 }
+
+/// §16 *Approvals show the change*: a pending generation change carries the
+/// diff the core computed (option, old, new, sensitivity), and its response
+/// says what it changes. The diff is base override → candidate override,
+/// both fixed by hash at Prepared, so it can differ at approval only if the
+/// override file changed: then the approval does not apply (Stale, §12
+/// step 4) and nothing runs. Any other change in the re-derived facts
+/// re-binds and asks again (`a_rebound_approval_that_no_longer_asks_…`
+/// covers a re-bind; the binding hashes the facts, `config_diff` included).
+#[test]
+fn an_approval_shows_its_diff_and_a_changed_diff_does_not_apply() {
+    let mut cfg = config();
+    cfg.exec
+        .tables
+        .option_sensitivity
+        .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let font = Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str("1.25".into()))].into(),
+    };
+    let resp = r.core.handle(ALICE, font);
+    let Response::NeedsApproval { approve, why, .. } = resp else { panic!("{resp:?}") };
+    assert!(why.contains("changes 1 option"), "the response says what it changes: {why}");
+    let Response::Status(st) = r.core.handle(ALICE, Request::Status) else { panic!() };
+    let p = st.pending.iter().find(|p| p.approve == approve).expect("pending");
+    assert_eq!(p.diff.options.len(), 1);
+    let o = &p.diff.options[0];
+    assert_eq!(o.path, "planarian.reference.fontScale");
+    assert_eq!(o.new, Some(Value::Str("1.25".into())));
+    assert!(o.sensitivity.contains(Sensitivity::UserData));
+    assert!(p.diff.lines()[0].starts_with("planarian.reference.fontScale"), "{:?}", p.diff.lines());
+
+    // The live override file now holds another value for that option: the
+    // diff re-derived at approval would differ from the one shown.
+    r.fake.w().overrides.assignments.insert("planarian.reference.fontScale".into(), Value::Str("1.1".into()));
+    let before = r.fake.w().current;
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+    assert!(matches!(&resp, Response::Rejected { reason, .. } if reason == "Stale"), "does not apply: {resp:?}");
+    assert_eq!(r.fake.w().current, before, "nothing ran");
+    let Response::Status(st) = r.core.handle(ALICE, Request::Status) else { panic!() };
+    assert!(st.pending.iter().all(|p| p.approve != approve), "the old approval is gone");
+}
+
+/// #35, §16 *Approvals show the change* and §11's Rollback row (owner
+/// decisions, Nov 2), written from the spec before the change (reviewer's
+/// case). The known-good generation lacks sshd (`services.openssh.enable =
+/// false`); the running one has it. A Rollback to known-good would remove a
+/// Security-sensitive unit, so it asks; and what is asked shows the change:
+/// "each option added, removed or changed, with its old and new value and its
+/// sensitivity … and the units it would remove or stop", in the text the
+/// caller and the notice get, and as structured data on the pending approval
+/// (`PendingApproval.diff`, what `planarian approve --json` prints).
+#[test]
+fn a_rollback_that_removes_a_security_unit_asks_and_shows_the_change() {
+    let store = MemStore::new(8 << 20);
+    let fake = gym_world(store.clone());
+    fake.w().alive.insert(100);
+    let without_ssh = OverrideSet { assignments: [("services.openssh.enable".to_string(), Value::Bool(false))].into() };
+    let known_good = {
+        let mut w = fake.w();
+        let g = w.add_generation(&without_ssh);
+        w.boot_entries.insert(g);
+        w.override_store.insert(planarian_fake::World::override_hash_of(&without_ssh), without_ssh.clone());
+        g
+    };
+    assert_ne!(known_good, fake.w().current);
+    let mut j = Journal::open(store).unwrap();
+    j.append(fake.w().now, Record::KnownGood(known_good)).unwrap();
+    let mut r =
+        Rig { core: Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config()), fake };
+    r.ticks(2);
+    assert_eq!(r.status("service:sshd"), UnitStatus::Running, "sshd runs now");
+
+    let resp = r.core.user_submit(Transition::Rollback, ADMIN, Source::User, "roll back".into());
+    let Response::NeedsApproval { approve, what, why, .. } = resp else {
+        panic!("a rollback that removes sshd (Security) asks: {resp:?}");
+    };
+    assert_eq!(r.status("service:sshd"), UnitStatus::Running, "nothing ran before approval");
+
+    // The text the caller gets, and the notice.
+    let text = format!("{what}\n{why}");
+    for (needle, what_for) in [
+        ("sshd", "the unit it would remove"),
+        ("services.openssh.enable", "the option it would change"),
+        ("Security", "the option's sensitivity"),
+    ] {
+        assert!(text.contains(needle), "the approval text names {what_for} ({needle}): {text}");
+    }
+    assert!(text.contains("true") && text.contains("false"), "old and new value: {text}");
+    let notice = r.core.notices.iter().rev().find(|n| n.contains("services.openssh.enable"));
+    assert!(notice.is_some_and(|n| n.contains("sshd")), "the notice shows the change: {:?}", r.core.notices);
+
+    // The structured diff on the pending approval.
+    let Response::Status(st) = r.core.handle(ADMIN, Request::Status) else { panic!("status") };
+    let pending = st.pending.iter().find(|p| p.approve == approve).expect("the pending approval");
+    assert!(pending.facts.removes_sensitivity.security, "derived: it removes a Security unit");
+    let json = serde_json::to_value(pending).unwrap();
+    let diff =
+        json.get("diff").filter(|d| !d.is_null()).unwrap_or_else(|| panic!("a `diff` on the pending approval: {json}"));
+    let diff_text = diff.to_string();
+    for needle in ["services.openssh.enable", "sshd", "Security"] {
+        assert!(diff_text.contains(needle), "the structured diff carries {needle}: {diff_text}");
+    }
+}
