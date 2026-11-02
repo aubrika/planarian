@@ -167,8 +167,9 @@ let
   # §12d "Network security fails closed": the hold. `apply <unit>` holds the
   # machine's traffic for a failed network-security unit; `lift <unit>` ends
   # that unit's hold; `reapply` rebuilds the table (after nftables.service
-  # starts or reloads, which may flush every table); `released <unit>` is the
-  # ExecCondition that skips a hold an administrator released.
+  # starts or reloads, which may flush every table); `condition <unit>` is the
+  # ExecCondition: it skips a hold an administrator released, and one for a
+  # network tool whose footprint shows it was not protecting traffic.
   #
   # The table drops all traffic in and out except loopback, address
   # assignment (DHCP, DHCPv6, ICMPv6 neighbour and router discovery), the held
@@ -188,6 +189,7 @@ let
     PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep pkgs.gawk pkgs.nftables pkgs.iproute2 pkgs.findutils pkgs.getent config.systemd.package ]}
     dir=/run/planarian/hold
     released=/run/planarian/hold-released
+    footprint=/run/planarian/footprint
     mkdir -p "$dir" "$released"
     cmd="$1"; unit="''${2:-}"
     log() { echo "planarian-hold: $*"; }
@@ -233,13 +235,18 @@ let
       fi
       a4=""; a6=""; i4=""; o4=""; i6=""; o6=""; ifs=""
       for u in $units; do
-        f=/etc/planarian/hold/$u.allow
-        [ -f "$f" ] || continue
+        # What it passes: the footprint's interfaces and endpoints (§12d),
+        # and the manifest's holdInterfaces and holdAllow.
+        allow="$(cat "/etc/planarian/hold/$u.allow" 2>/dev/null
+                 awk '$1 == "iface" { print "iface", $2 } $1 == "endpoint" { print $2, $3, $4 }' "$footprint/$u" 2>/dev/null)"
+        [ -n "$allow" ] || continue
         while read -r proto addr port; do
           if [ "$proto" = iface ]; then ifs="$ifs \"$addr\","; continue; fi
           [ -n "$port" ] || continue
           case "$addr" in *:*) a6="$a6 $proto . $addr . $port," ;; *) a4="$a4 $proto . $addr . $port," ;; esac
-        done < "$f"
+        done <<ALLOW
+    $allow
+    ALLOW
       done
       if [ -f "$dir/.admin" ]; then
         while read -r fam proto la lp ra rp; do
@@ -294,18 +301,47 @@ let
     }
 
     case "$cmd" in
-      released)
-        # ExecCondition: exit 1 skips the hold while an unexpired release
-        # stands (the marker holds a Unix time, or `boot`; /run never
-        # survives a reboot). Anything else is no release: hold.
+      condition)
+        # ExecCondition (exit 0: hold; 1: skip, the unit stays inactive).
+        #
+        # 1. An unexpired release stands: skip. The marker holds a Unix
+        #    time, or `boot` (/run never survives a reboot); anything else
+        #    is no release.
         m="$released/$unit"
-        [ -f "$m" ] || exit 0
-        t="$(head -n1 "$m")"
-        if [ "$t" = boot ] || { case "$t" in ""|*[!0-9]*) false ;; esac && [ "$t" -gt "$(date +%s)" ]; }; then
-          log "hold on $unit not applied: released until $t"
-          exit 1
+        if [ -f "$m" ]; then
+          t="$(head -n1 "$m")"
+          if [ "$t" = boot ] || { case "$t" in ""|*[!0-9]*) false ;; esac && [ "$t" -gt "$(date +%s)" ]; }; then
+            log "hold on $unit not applied: released until $t"
+            exit 1
+          fi
         fi
-        exit 0 ;;
+        # 2. Is the failed network tool a network-security unit, i.e. was it
+        #    protecting traffic (§12d)? Its kernel-attributed footprint says.
+        #    Fail closed: a watch heartbeat missing, failed or older than 30 s;
+        #    no footprint (netwatch writes `protecting no` for every network
+        #    tool once it attaches, so a missing file was never seen by a
+        #    healthy watch); `protecting yes`; or a change the kernel could
+        #    not attribute: hold. Only a fresh watch and `protecting no` skip.
+        w="$footprint/.watch"
+        state=missing; ts=""
+        [ -f "$w" ] && read -r state ts < "$w"
+        if [ "$state" = attached ] && ! { case "$ts" in ""|*[!0-9]*) false ;; esac && [ $(( $(date +%s) - ts )) -le 30 ]; }; then
+          state=stale
+        fi
+        if [ "$state" != attached ]; then
+          log "holding for $unit: the network watch is $state, so whether it protected traffic is unknown"
+          exit 0
+        fi
+        f="$footprint/$unit"
+        if [ ! -f "$f" ]; then
+          log "holding for $unit: no footprint"
+          exit 0
+        fi
+        if grep -qx 'protecting yes' "$f" || grep -qx 'unattributed' "$f"; then
+          exit 0
+        fi
+        log "$unit failed but was not protecting traffic: not held"
+        exit 1 ;;
       apply)
         touch "$dir/$unit"
         snapshot
@@ -330,7 +366,7 @@ let
         build && log "hold on $unit lifted" ;;
       reapply)
         build ;;
-      *) echo "usage: planarian-hold apply|lift|released UNIT | reapply" >&2; exit 2 ;;
+      *) echo "usage: planarian-hold apply|lift|condition UNIT | reapply" >&2; exit 2 ;;
     esac
   '';
 
@@ -539,14 +575,17 @@ in
       name = "planarian/hold/${u}.allow";
       value.text = lib.concatMapStrings (a: "${a.protocol} ${a.address} ${toString a.port}\n") cfg.units.${u}.holdAllow
         + lib.optionalString cfg.holdAllowsOwnInterface (lib.concatMapStrings (i: "iface ${i}\n") cfg.units.${u}.holdInterfaces);
-    }) (builtins.filter (u: cfg.units ? ${u}) cfg.holdUnits));
+    # Keyed by the manifest, not by holdUnits: the network tools are computed
+    # from every service's configuration, and a service may read
+    # environment.etc.
+    }) (lib.attrNames (lib.filterAttrs (_: u: u.scope == "system" && (u.holdAllow != [ ] || u.holdInterfaces != [ ])) cfg.units)));
     systemd.services."planarian-hold@" = {
       description = "Planarian: hold network traffic while %i has failed";
       unitConfig.DefaultDependencies = false;
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
-        ExecCondition = "${hold} released %i";
+        ExecCondition = "${hold} condition %i";
         ExecStart = "${hold} apply %i";
         ExecStop = "${hold} lift %i";
       };

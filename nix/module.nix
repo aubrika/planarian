@@ -76,17 +76,58 @@ let
     if securityUnit name then [ "Security" ]
     else if builtins.elem name [ "NetworkManager" "wpa_supplicant" "systemd-networkd" ] then [ "External" ]
     else [ "Routine" ];
-  # §12d: a network-security unit's failure holds the machine's traffic:
-  # its sensitivity holds both Security and External, or it is the firewall.
-  # The one rule: it feeds the export's `holds` (computed, never settable)
-  # and the OnFailure= hold; the owner's pending decision on which units it
-  # names changes only this function and its module-eval assertion.
-  isNetworkSecurity = name: u:
-    u.kind == "service" && u.scope == "system"
-    && ((builtins.elem "Security" u.sensitivity && builtins.elem "External" u.sensitivity)
-        # The one interim name, §12d's "or the firewall", pending the
-        # owner's classifier, which replaces this whole body (coordinator, Nov 2).
-        || builtins.elem name [ "firewall" "nftables" ]);
+  # §12d "Which units": a *network tool* is a unit able to change how
+  # traffic leaves the machine, computed at build time from its systemd
+  # configuration, never from its name, and failing closed. It holds
+  # CAP_NET_ADMIN or CAP_NET_RAW (ambient, or root's bounding set); it is
+  # given /dev/net/tun or /dev/ppp explicitly (DeviceAllow= or Bind*Paths=;
+  # TUNSETIFF needs CAP_NET_ADMIN, so bare device access creates nothing); it
+  # declares network interfaces (the units the networkd netdev, WireGuard
+  # and wg-quick option trees create); or it runs as root with no
+  # CapabilityBoundingSet. A unit whose configuration does not evaluate is a
+  # tool. Whether a network tool is a network-security unit is decided at
+  # runtime, from its kernel-attributed footprint (the hold's condition).
+  #
+  # Not classified: templates and their instances (`foo@`, `foo@bar`), whose
+  # names cannot be a hold's instance; and Planarian's own units, whose failures have their own
+  # posture (Absent, Crashed, Integrity; §12d) and which change no routing.
+  netdevUnits =
+    lib.optional (config.systemd.network.enable && config.systemd.network.netdevs != { }) "systemd-networkd"
+    ++ map (i: "wireguard-${i}") (lib.attrNames (config.networking.wireguard.interfaces or { }))
+    ++ map (i: "wg-quick-${i}") (lib.attrNames (config.networking.wg-quick.interfaces or { }));
+  ownUnits = name: lib.hasPrefix "planarian" name || name == "planariad";
+  netCaps = [ "CAP_NET_ADMIN" "CAP_NET_RAW" ];
+  words = v:
+    if builtins.isList v then lib.concatMap words v
+    else if builtins.isString v then lib.filter (w: w != "") (lib.splitString " " v)
+    else [ (toString v) ];
+  # A capability set as systemd reads it: "~" inverts it (all but these).
+  grants = set: caps:
+    let ws = words set; inverted = ws != [ ] && lib.hasPrefix "~" (builtins.head ws);
+    in if inverted then lib.any (c: !(builtins.elem c (map (lib.removePrefix "~") ws))) caps
+       else lib.any (c: builtins.elem c ws) caps;
+  isNetworkToolUnchecked = name:
+    let
+      svc = config.systemd.services.${name};
+      sc = svc.serviceConfig;
+      user = sc.User or "root";
+      root = (user == "root" || user == "0") && !(sc.DynamicUser or false);
+      bounding = sc.CapabilityBoundingSet or null;
+      devices = words ((sc.DeviceAllow or [ ]) ++ (sc.BindPaths or [ ]) ++ (sc.BindReadOnlyPaths or [ ]));
+    in
+    builtins.elem name netdevUnits
+    || grants (sc.AmbientCapabilities or [ ]) netCaps
+    || (root && (bounding == null || grants bounding netCaps))
+    || lib.any (d: lib.hasInfix "/dev/net/tun" d || lib.hasInfix "/dev/ppp" d) devices;
+  isNetworkTool = name:
+    if lib.hasInfix "@" name || ownUnits name || !(config.systemd.services ? ${name}) then false
+    else let r = builtins.tryEval (builtins.deepSeq (isNetworkToolUnchecked name) (isNetworkToolUnchecked name)); in
+      !r.success || r.value;
+  # The build-time half of "network-security unit" (§12d); the runtime half
+  # is the footprint, read by the hold's condition. The one rule: it feeds
+  # the export's `network_tool` (computed, never settable) and OnFailure=.
+  isNetworkSecurity = name: _u: isNetworkTool name;
+  networkTools = builtins.filter isNetworkTool (lib.attrNames config.systemd.services);
   defaultDisruption = name:
     if builtins.elem name [ "display-manager" "greetd" "graphical-session" ] then "SessionLoss"
     else if builtins.elem name [ "NetworkManager" "systemd-networkd" "wpa_supplicant" ] then "ConnectivityLoss"
@@ -305,7 +346,7 @@ let
     runtime_repair = u.runtimeRepair;
     # §12d: whether its failure holds the machine's traffic, and what the
     # hold still lets it reach.
-    holds = isNetworkSecurity name u;
+    network_tool = u.kind == "service" && u.scope == "system" && isNetworkSecurity name u;
     hold_allow = map (a: { inherit (a) address port protocol; }) u.holdAllow;
     stops_are_faults = !u.inferStops;
   };
@@ -590,14 +631,13 @@ in
         (mkDefault { scope = "user"; edges = [ { to = "service@0:pipewire"; kind = "Requires"; } ]; });
     };
 
-    services.planarian.holdUnits = lib.unique (
-      lib.attrNames (lib.filterAttrs isNetworkSecurity cfg.units)
-      # The firewall, by name: the same interim name as in isNetworkSecurity.
-      ++ lib.optional (config.networking.firewall.enable && !config.networking.nftables.enable) "firewall"
-      ++ lib.optional config.networking.nftables.enable "nftables");
+    services.planarian.holdUnits = networkTools;
 
     services.planarian.export = {
       units = unitsOf "system";
+      # §12d: every system service that is a network tool, declared or not
+      # (netwatch writes a footprint for each when its watch attaches).
+      inherit networkTools;
       userUnits = unitsOf "user";
       coreUnits = {
         "planariad.service" = unitHash "planariad.service";

@@ -311,3 +311,13 @@ Read #35 and §12d on #34's branch (`ccr-c64ddb68-a5g3k5`), `nix/module.nix`, `n
 | OnFailure= | `systemd.services.<x>.onFailure` would define a stub unit for a declared unit the system does not define (P13's lesson) | drop-ins in a package, `<unit>.service.d/50-planarian-hold.conf`, inert for an undefined unit |
 | WireGuard fixture | NixOS's wg-quick units are oneshots: nothing to kill, and a kill would not fail them | `wireguard-gym`, a wireguard-go daemon unit to the upstream node, for `netsec-*` entries only (no other entry gains a watched unit) |
 | Owner decisions (2 Nov, through the coordinator) | The tunnel's own traffic passes the hold (a kill switch's default), so a Readiness probe across the tunnel can lift it. Which units hold: a classifier of units whose failure would expose unprotected traffic or endanger privacy, design pending; no name list | `holdAllowsOwnInterface` on by default (internal), per-unit `holdInterfaces`; the fixture's probe crosses the tunnel again. `isNetworkSecurity` stays the one switch for the classifier; until then the fixture is tagged Security and External explicitly |
+
+## lane-nix: #35, which units hold (2 Nov)
+
+§12d "Which units" on #34 (`2ab358b`): a network tool, computed at build time from its systemd configuration; a network-security unit is a network tool that is protecting traffic, by its kernel-attributed footprint (netwatch, lane-daemon). Interpretations approved by the coordinator: "can open /dev/net/tun or /dev/ppp" is an explicit `DeviceAllow=` or `Bind*Paths=`; "declares network interfaces" is the networkd netdev, WireGuard and wg-quick option trees.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| Scope | Most units come from upstream unit files whose capabilities NixOS cannot see, so failing closed classifies 64 of the reference configuration's 88 system services | every network tool gets the OnFailure= hold; the hold's condition decides from the footprint: a stale or failed watch, a missing footprint, `protecting yes` or an unattributed change hold; a fresh watch and `protecting no` skip. Templates and instances (no hold instance name) and Planarian's own units (their own posture) are not classified |
+| Interim firewall name | removed: the firewall is a network tool from its configuration | B-21 closed |
+| Before netwatch | with no watch heartbeat every network tool's failure holds | this must not merge before netwatch writes footprints (raised with the coordinator) |
