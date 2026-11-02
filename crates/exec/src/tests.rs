@@ -676,13 +676,50 @@ fn rollback_facts_come_from_the_dry_activation() {
         w.boot_default = g2;
         w.current = g2;
     }
-    let s = r.propose(Transition::Rollback, admin());
+    // A remote administrator, so the ConnectivityLoss floor (§11) asks: the
+    // Rollback row itself no longer asks for a restarted External unit (owner
+    // decision, Nov 2), and the facts are what this test is about.
+    let s = r.propose(Transition::Rollback, remote_admin());
     let facts = match &s {
         Submitted::Parked { facts, .. } => facts.clone(),
-        other => panic!("a ConnectivityLoss rollback is asked first: {other:?}"),
+        other => panic!("a ConnectivityLoss rollback from a remote caller is asked first: {other:?}"),
     };
     assert_eq!(facts.disruption, Disruptions::of(Disruption::ConnectivityLoss));
     assert!(facts.affected_units.contains(&nm));
+}
+
+/// §11 Rollback row and I11 (owner decision, Nov 2): known_good built outside
+/// Planarian has no recorded override, so the evaluated option sets are
+/// compared. A rollback that would restore a Security-sensitive option asks,
+/// with no unit removed and from a seated administrator (no floor applies).
+#[test]
+fn a_rollback_that_restores_a_security_option_asks_without_an_override() {
+    let mut r = Rig::new();
+    {
+        let mut w = r.fake.w();
+        let g2 = w.add_generation(&OverrideSet::default());
+        w.gens
+            .get_mut(&GenerationId(1))
+            .unwrap()
+            .eval
+            .options
+            .insert("services.openssh.enable".into(), Value::Bool(false));
+        w.gens.get_mut(&g2).unwrap().eval.options.insert("services.openssh.enable".into(), Value::Bool(true));
+        w.boot_entries.insert(g2);
+        w.boot_default = g2;
+        w.current = g2;
+    }
+    let s = r.propose(Transition::Rollback, admin());
+    let facts = match &s {
+        Submitted::Parked { facts, .. } => facts.clone(),
+        other => panic!("restoring a Security option asks: {other:?}"),
+    };
+    let diff = facts.config_diff.expect("the evaluated options differ");
+    assert_eq!(
+        diff.options.get("services.openssh.enable"),
+        Some(&(Some(Value::Bool(true)), Some(Value::Bool(false)))),
+        "{diff:?}"
+    );
 }
 
 /// R04 and rule 21: an existing generation whose dry activation fails has no
