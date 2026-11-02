@@ -747,3 +747,91 @@ fn each_disruption_keeps_its_own_floor() {
         }
     }
 }
+
+/// An administrator logged in remotely (no seat): the ConnectivityLoss floor
+/// applies to them (§11).
+fn remote_admin() -> Authorization {
+    user_authorization(Actor::User { uid: 1001, session: Some("2".into()), seat: None, active: true }, true)
+}
+
+/// A rollback whose dry activation restarts `gym-cache` (ConnectivityLoss)
+/// and, if `with_db`, `gym-db` (DataInterruption), as in
+/// `each_disruption_keeps_its_own_floor`.
+fn rollback_rig(with_db: bool) -> (Rig, UnitId, UnitId) {
+    let net = UnitId::service("gym-cache");
+    let db = UnitId::service("gym-db");
+    let mut r = Rig::new();
+    let mut units = fixtures::gym_units();
+    units.get_mut(&net).unwrap().restart_disruption = Disruption::ConnectivityLoss;
+    units.get_mut(&db).unwrap().restart_disruption = Disruption::DataInterruption;
+    r.asm = Assembler::new(Manifest { units, user_units: fixtures::gym_user_units() }, fixtures::canonical());
+    {
+        let mut w = r.fake.w();
+        let g2 = w.add_generation(&OverrideSet::default());
+        let restart = &mut w.gens.get_mut(&GenerationId(1)).unwrap().eval.activation.restart;
+        restart.insert(net.clone());
+        if with_db {
+            restart.insert(db.clone());
+        }
+        w.boot_entries.insert(g2);
+        w.boot_default = g2;
+        w.current = g2;
+    }
+    (r, net, db)
+}
+
+/// §11 as amended in #22 (owner decision, Nov 2): a unit already failed when
+/// the facts are derived contributes no disruption of its own; every other
+/// unit the transition touches still contributes its own.
+#[test]
+fn an_already_failed_unit_contributes_no_disruption() {
+    // Healthy: the remote administrator's rollback meets the ConnectivityLoss floor.
+    let (mut r, _, _) = rollback_rig(false);
+    let s = r.propose(Transition::Rollback, remote_admin());
+    let Submitted::Parked { facts, .. } = &s else { panic!("a healthy ConnectivityLoss unit asks: {s:?}") };
+    assert!(facts.disruption.connectivity_loss, "{facts:?}");
+
+    // Failed: restoring it costs nothing, so no floor applies because of it.
+    let (mut r, net, _) = rollback_rig(false);
+    r.fake.w().units.get_mut(&net).unwrap().observed = Observed::Failed(Reason::ExitCode(1));
+    let s = r.propose(Transition::Rollback, remote_admin());
+    assert!(!matches!(s, Submitted::Parked { .. } | Submitted::Rejected { .. }), "a failed unit's floor: {s:?}");
+
+    // Failed beside a healthy DataInterruption unit: that one still counts.
+    let (mut r, net, _) = rollback_rig(true);
+    r.fake.w().units.get_mut(&net).unwrap().observed = Observed::Failed(Reason::ExitCode(1));
+    let s = r.propose(Transition::Rollback, remote_admin());
+    let Submitted::Parked { facts, .. } = &s else { panic!("the healthy unit's floor still asks: {s:?}") };
+    assert_eq!(facts.disruption.members(), vec![Disruption::DataInterruption], "{facts:?}");
+}
+
+/// The exemption reads status, and `Unknown` is not `Failed` (§10): a unit
+/// whose probe timed out still contributes, and the rollback still asks.
+#[test]
+fn an_unknown_unit_still_contributes_its_disruption() {
+    let (mut r, net, _) = rollback_rig(false);
+    r.fake.w().units.get_mut(&net).unwrap().health = planarian_fake::Health::Stall(Millis::secs(15));
+    assert_eq!(r.status(&net), UnitStatus::Unknown);
+    let s = r.propose(Transition::Rollback, remote_admin());
+    let Submitted::Parked { facts, .. } = &s else { panic!("an Unknown unit buys no exemption: {s:?}") };
+    assert!(facts.disruption.connectivity_loss, "{facts:?}");
+}
+
+/// Facts are derived again at approval (§9 step 6, I8), from the observation
+/// then: a unit failed at proposal that has recovered by approval
+/// contributes its disruption again, and the approval asks again.
+#[test]
+fn a_unit_recovered_before_approval_asks_again() {
+    let (mut r, net, _) = rollback_rig(true);
+    r.fake.w().units.get_mut(&net).unwrap().observed = Observed::Failed(Reason::ExitCode(1));
+    let s = r.propose(Transition::Rollback, remote_admin());
+    let Submitted::Parked { approve, facts, .. } = s else { panic!("the DataInterruption floor asks: {s:?}") };
+    assert!(!facts.disruption.connectivity_loss, "failed at proposal: {facts:?}");
+
+    r.fake.w().units.get_mut(&net).unwrap().observed = Observed::Active;
+    assert_eq!(r.status(&net), UnitStatus::Running);
+    let s = r.approve(approve);
+    let Submitted::Parked { facts, .. } = &s else { panic!("recovered before approval: it asks again: {s:?}") };
+    assert!(facts.disruption.connectivity_loss && facts.disruption.data_interruption, "{facts:?}");
+    assert_eq!(r.fake.w().current, GenerationId(2), "nothing ran on the stale approval");
+}

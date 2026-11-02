@@ -155,3 +155,10 @@ It must carry both kinds and ask. On `main`: FAIL, committed without asking,
 disruption ConnectivityLoss only. Control
 `disruption-connectivity-alone-seated-runs` (the ConnectivityLoss unit alone)
 passes on `main` and must keep passing.
+
+### lane-change-path: C10 and the already-failed rule (#27), 2 Nov
+
+| Id | Status | What closes it | Case |
+| --- | --- | --- | --- |
+| C10 | closed by #21 (the set type, floors per member) and #27 (`unit_facts` inserts every unit's `restart_disruption`) | §11 global floors, each applied to its own kind | exec `each_disruption_keeps_its_own_floor`; catalog `disruption-each-kind-keeps-its-floor` (FAIL on `main` + #21, PASS here), control `disruption-connectivity-alone-seated-runs` |
+| §11 already-failed rule | closed by #27 | §11 as amended in #22 (owner decision, Nov 2): "A unit that has already failed (observed `Failed`, or not running while it is desired running, when the facts are derived) contributes no disruption of its own ... Every other unit the transition touches still contributes its own." `derive.rs` `already_failed` reads the observation passed to that derivation (`DeriveInput::state`), so it is current at proposal, at approval and before Activating; status `Failed`, `Stopped` or `Absent` while desired Running and expected. `Unknown` (Timeout, Error, Abandoned), Degraded, Transitioning and overridden units still contribute | exec `an_already_failed_unit_contributes_no_disruption`, `an_unknown_unit_still_contributes_its_disruption`, `a_unit_recovered_before_approval_asks_again` (the reviewer's) |
