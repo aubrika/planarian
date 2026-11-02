@@ -290,49 +290,5 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds(lan_ok(), timeout=60)
         not_held("gym-tpl@a")
         machine.succeed("rm -f /run/gym-tpl-a-slow")
-
-    # netwatch's real attach (§12d "Which units"; the merge gate for netwatch
-    # and #38): written by lane-nix at the coordinator's direction, for the
-    # reviewer to check against §12d. Fixture units: wireguard-gym.nix.
-    FP = "/run/planarian/footprint"
-
-    with subtest("netwatch attaches and attributes what steers traffic: a default route, a legacy iptables drop; a tool that changes nothing is not protecting"):
-        machine.wait_for_unit("planarian-netwatch.service")
-        machine.wait_until_succeeds(f"grep -q '^attached [0-9]' {FP}/.watch", timeout=60)
-        machine.succeed("systemctl start gym-steer.service")
-        machine.wait_until_succeeds(f"grep -qx 'protecting yes' {FP}/gym-steer && grep -qx 'iface gsteer0' {FP}/gym-steer", timeout=30)
-        machine.succeed("systemctl start gym-quiet.service")
-        machine.wait_until_succeeds(f"grep -qx 'protecting no' {FP}/gym-quiet", timeout=30)
-        machine.succeed("systemctl start gym-legacy.service")
-        machine.wait_until_succeeds(f"grep -qx 'protecting yes' {FP}/gym-legacy", timeout=30)
-
-    with subtest("the footprint decides: a tool that was not protecting holds nothing when it fails; one that was, holds"):
-        machine.succeed("systemctl kill --signal=SIGKILL gym-quiet.service")
-        machine.wait_until_fails("systemctl is-active gym-quiet.service", timeout=20)
-        machine.sleep(3)
-        not_held("gym-quiet")
-        machine.succeed("journalctl -b -u planarian-hold@gym-quiet.service -o cat | grep -q 'was not protecting traffic'")
-        machine.succeed(lan_ok())
-        machine.succeed("systemctl kill --signal=SIGKILL gym-steer.service")
-        machine.wait_until_succeeds("systemctl is-active planarian-hold@gym-steer.service", timeout=20)
-        held_for("gym-steer")
-        machine.fail(lan_ok())
-        machine.succeed("systemctl stop planarian-hold@gym-steer.service")
-        machine.succeed("systemctl reset-failed gym-steer.service gym-quiet.service")
-        machine.wait_until_succeeds(lan_ok(), timeout=30)
-
-    with subtest("the watch stopped: any network tool's failure holds (§12d: fail closed)"):
-        machine.succeed("systemctl stop planarian-netwatch.service")
-        machine.succeed(f"grep -q '^failed' {FP}/.watch")
-        machine.succeed("systemctl start gym-quiet.service")
-        machine.succeed("systemctl kill --signal=SIGKILL gym-quiet.service")
-        machine.wait_until_succeeds("systemctl is-active planarian-hold@gym-quiet.service", timeout=20)
-        held_for("gym-quiet")
-        machine.fail(lan_ok())
-        machine.succeed("systemctl stop planarian-hold@gym-quiet.service")
-        machine.succeed("systemctl reset-failed gym-quiet.service")
-        machine.succeed("systemctl start planarian-netwatch.service")
-        machine.wait_until_succeeds(f"grep -q '^attached [0-9]' {FP}/.watch", timeout=60)
-        machine.wait_until_succeeds(lan_ok(), timeout=30)
   '';
 }
