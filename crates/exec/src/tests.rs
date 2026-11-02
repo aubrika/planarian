@@ -676,10 +676,13 @@ fn rollback_facts_come_from_the_dry_activation() {
         w.boot_default = g2;
         w.current = g2;
     }
-    let s = r.propose(Transition::Rollback, admin());
+    // A remote administrator, so the ConnectivityLoss floor (§11) asks: the
+    // Rollback row itself no longer asks for a restarted External unit (owner
+    // decision, Nov 2), and the facts are what this test is about.
+    let s = r.propose(Transition::Rollback, remote_admin());
     let facts = match &s {
         Submitted::Parked { facts, .. } => facts.clone(),
-        other => panic!("a ConnectivityLoss rollback is asked first: {other:?}"),
+        other => panic!("a ConnectivityLoss rollback from a remote caller is asked first: {other:?}"),
     };
     assert_eq!(facts.disruption, Disruptions::of(Disruption::ConnectivityLoss));
     assert!(facts.affected_units.contains(&nm));

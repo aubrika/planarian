@@ -126,6 +126,7 @@ pub fn facts(caller: Actor) -> DerivedFacts {
         below_security_floor: false,
         restores_unattributed_stop: false,
         restarts_failed_unit: false,
+        removes_sensitivity: Default::default(),
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
         touches_core: false,

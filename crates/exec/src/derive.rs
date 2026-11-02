@@ -127,22 +127,30 @@ fn touches_canonical(base: &Manifest, cand: &Manifest, canonical: &Canonical) ->
     false
 }
 
+/// C19 (§9, §11 ApplyChange row): whether the candidate's manifest differs
+/// from the base's in any part of any entry (`desired`, `edges`,
+/// `sensitivity`, `restart_disruption`, the user probes, `synonyms`, and the
+/// exported `systemd_restart`, `startup_grace`, `runtime_repair`,
+/// `stops_are_faults`), in user-scope entries as in system ones, or adds or
+/// removes an entry. Canonical probes are left out: they come from the core
+/// package, and redefining one is `touches_canonical`.
 fn touches_manifest(base: &Manifest, cand: &Manifest, diff: &ConfigDiff) -> bool {
     if diff.options.keys().any(|k| k.starts_with("services.planarian.")) {
         return true;
     }
-    base.units.iter().any(|(id, b)| {
-        cand.units.get(id).is_some_and(|c| {
-            c.edges != b.edges
-                || c.sensitivity != b.sensitivity
-                || c.restart_disruption != b.restart_disruption
-                || c.synonyms != b.synonyms
-                || c.probes
-                    .iter()
-                    .filter(|p| p.origin == ProbeOrigin::User)
-                    .ne(b.probes.iter().filter(|p| p.origin == ProbeOrigin::User))
-        })
-    })
+    // An entry as the manifest declares it: every field, the user probes only.
+    let entry = |d: &UnitDef| {
+        let mut d = d.clone();
+        d.probes.retain(|p| p.origin == ProbeOrigin::User);
+        d
+    };
+    let entries = |m: &Manifest| -> (BTreeMap<UnitId, UnitDef>, BTreeMap<UnitId, UnitDef>) {
+        (
+            m.units.iter().map(|(id, d)| (id.clone(), entry(d))).collect(),
+            m.user_units.iter().map(|d| (d.id.clone(), entry(d))).collect(),
+        )
+    };
+    entries(base) != entries(cand)
 }
 
 fn changes_desired(base: &Manifest, cand: &Manifest) -> bool {
@@ -169,6 +177,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         below_security_floor: false,
         restores_unattributed_stop: false,
         restarts_failed_unit: false,
+        removes_sensitivity: Default::default(),
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
         caller: i.caller.clone(),
@@ -277,6 +286,21 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
                 f.sensitivity = f.sensitivity.union(&Sensitivities::of(&[Sensitivity::Security]));
                 f.touches_manifest = true;
             }
+            // What the transition takes away (§11 Rollback row): units present
+            // now and absent from the target, and units its activation stops.
+            let mut removed: Vec<UnitId> =
+                base_m.units.keys().filter(|u| !cand_m.units.contains_key(*u)).cloned().collect();
+            removed.extend(
+                base_m
+                    .user_units
+                    .iter()
+                    .filter(|b| !cand_m.user_units.iter().any(|c| c.id == b.id))
+                    .map(|b| b.id.clone()),
+            );
+            if let Some(a) = i.activation {
+                removed.extend(a.stop.iter().cloned());
+            }
+            f.removes_sensitivity = unit_facts(&removed, &all_defs, &services, |_| false).0;
             f.affected_units = unit_set(affected);
             f.config_diff = (!config.options.is_empty()).then_some(config);
         }
@@ -405,3 +429,8 @@ mod sensitivity_completeness {
         assert!(!s.external, "an undeclared user unit stays as it was: {s:?}");
     }
 }
+
+// C19 (§9 manifest, §11 ApplyChange row): the reviewer's acceptance test.
+#[cfg(test)]
+#[path = "derive_c19_tests.rs"]
+mod c19;

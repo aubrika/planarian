@@ -197,6 +197,31 @@ declares wireplumber (lane-nix, #11).
 | --- | --- | --- |
 | P24 (lane-nix, 2 Nov) | Pinned nixpkgs: `services.pipewire.wireplumber.enable` defaults to `services.pipewire.enable`; the user unit `wireplumber.service` carries `BindsTo=pipewire.service` (and `Alias=pipewire-session-manager.service`). The gym VMs already declare wireplumber with that edge, at normal priority, so the module's `mkDefault` leaves them as they were | `nix/module.nix` declares `wireplumber` (`scope = "user"`, `Requires` on `service@0:pipewire`) when PipeWire and WirePlumber are both enabled. module-eval: present in the reference configuration with the edge, absent with WirePlumber off. Fails on `main` |
 
+## Reviewer: P13 and SSH-group module-eval cases (#11), 2 Nov
+
+Written from §12d ("ordered before every unit that admits a principal: the
+display manager (whichever unit NixOS uses for it …)"; "*Restrict remote
+access to administrators* means Planarian's administrators (root and
+`planarian-admin`), not `wheel`"), on `review/lane-nix-p13-sshgroup`. The
+pinned nixpkgs greetd module always aliases `display-manager.service` to
+`greetd.service`. Checks in `nix/tests/eval.nix`:
+
+- reference configuration (greetd): greetd is the DM (non-vacuous);
+  `greetd.service` is after `planarian-ready.target`; no ExecStart-less
+  `display-manager` unit is defined beside the alias. On `main` the last one
+  FAILS (the posture defines a stub `display-manager.service`).
+- the same configuration with SDDM instead: `display-manager.service` is a
+  real unit and is after the target. Passes on `main` (guard).
+- SSH: the `planarian-respond@` script writes at least one `AllowGroups` line;
+  every such line is `AllowGroups planarian-admin root` and never names
+  `wheel` (read from the script, IFD); sshd's `extraConfig` includes
+  `/run/planarian/sshd/*.conf`. Passes on `main` (guard); a mutation writing
+  `wheel` fails it.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P13, module-eval (lane-nix, 2 Nov) | As reconciled above: with greetd on, `principalUnits` listed both `display-manager.service` and `greetd.service`, so the posture defined an `ExecStart`-less `display-manager.service`; the built tree came out right only because systemd-lib's alias `ln -sfn` runs after the unit links | `nix/posture.nix` orders `greetd.service` when greetd is enabled, else `display-manager.service` when NixOS runs one. The reviewer's case passes unedited: greetd ordered, no stub beside the alias, SDDM's `display-manager.service` ordered, and the SSH group (`AllowGroups planarian-admin root`, never `wheel`; the drop-in included) asserted. The module-eval assertions task closes with it |
+
 ## Reviewer: C10 acceptance test (#10), 2 Nov
 
 Written from §11's global floors only (`review/lane-change-path-c10`).
@@ -227,3 +252,24 @@ passes on `main` and must keep passing.
 | --- | --- | --- | --- |
 | C10 | closed by #21 (the set type, floors per member) and #27 (`unit_facts` inserts every unit's `restart_disruption`) | §11 global floors, each applied to its own kind | exec `each_disruption_keeps_its_own_floor`; catalog `disruption-each-kind-keeps-its-floor` (FAIL on `main` + #21, PASS here), control `disruption-connectivity-alone-seated-runs` |
 | §11 already-failed rule | closed by #27 | §11 as amended in #22 (owner decision, Nov 2): "A unit that has already failed (observed `Failed`, or not running while it is desired running, when the facts are derived) contributes no disruption of its own ... Every other unit the transition touches still contributes its own." `derive.rs` `already_failed` reads the observation passed to that derivation (`DeriveInput::state`), so it is current at proposal, at approval and before Activating; status `Failed`, `Stopped` or `Absent` while desired Running and expected. `Unknown` (Timeout, Error, Abandoned), Degraded, Transitioning and overridden units still contribute | exec `an_already_failed_unit_contributes_no_disruption`, `an_unknown_unit_still_contributes_its_disruption`, `a_unit_recovered_before_approval_asks_again` (the reviewer's) |
+
+## Reviewer: C19 acceptance test (#10), 2 Nov
+
+Written from §9 (a manifest entry is `desired`, `edges`, `sensitivity`,
+`restartDisruption`, `probes`, `synonyms`; the manifest is Security) and §11's
+ApplyChange row (AskFirst when `touches_manifest`), plus issue #10's C19 field
+list, on `review/lane-change-path-c19`. `crates/exec/src/derive_c19_tests.rs`
+(hooked from `derive.rs`) edits one field of one entry at a time:
+`desired` status and condition; `systemd_restart`, `startup_grace`,
+`runtime_repair`, `stops_are_faults`; an added and a removed unit; a user-scope
+entry's field, an added and a removed user-scope entry. Each must touch the
+manifest. Controls: an identical manifest does not; the fields already covered
+(synonyms, restart_disruption, sensitivity) still do. On `main`: 4 of 6 fail
+(desired, the exported fields, added/removed, user scope).
+
+### lane-change-path: C19 (#10), 2 Nov
+
+| Id | Status | What closes it | Case |
+| --- | --- | --- | --- |
+| C19 | closed by this PR | `derive.rs` `touches_manifest` compares every entry whole (canonical probes left to `touches_canonical`), system and user scope, and an added or removed entry; it had compared only `edges`, `sensitivity`, `restart_disruption`, `synonyms` and user probes of units present in both | reviewer's `crates/exec/src/derive_c19_tests.rs` (4 of 6 fail on `main`; all pass); fake verdicts unchanged |
+
