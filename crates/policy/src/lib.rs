@@ -569,8 +569,8 @@ pub open spec fn base_spec(i: Input) -> Decision {
         // (owner decision, Nov 2).
         Transition::RestartUnit(_) => allow(
             ask_if(
-                (f.sensitivity.security && !f.restores_unattributed_stop)
-                    || (f.sensitivity.external && !f.restarts_failed_unit),
+                (f.sensitivity.security && !f.restores_unattributed_stop && !f.restarts_held_unit)
+                    || (f.sensitivity.external && !f.restarts_failed_unit && !f.restarts_held_unit),
                 Tier::Runtime,
             ),
         ),
@@ -806,8 +806,8 @@ fn base_tier(i: &Input) -> (r: Decision)
     match i.transition {
         Transition::RestartUnit(_) => allow_exec(
             ask_if_exec(
-                (f.sensitivity.security && !f.restores_unattributed_stop)
-                    || (f.sensitivity.external && !f.restarts_failed_unit),
+                (f.sensitivity.security && !f.restores_unattributed_stop && !f.restarts_held_unit)
+                    || (f.sensitivity.external && !f.restarts_failed_unit && !f.restarts_held_unit),
                 Tier::Runtime,
             ),
         ),

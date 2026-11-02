@@ -103,6 +103,22 @@ pub fn diff(base: &OverrideSet, cand: &OverrideSet) -> ConfigDiff {
     d
 }
 
+/// The options two evaluated generations set differently (§11, §16).
+pub fn option_diff(base: &BTreeMap<String, Value>, cand: &BTreeMap<String, Value>) -> ConfigDiff {
+    let mut d = ConfigDiff::default();
+    for (k, v) in cand {
+        if base.get(k) != Some(v) {
+            d.options.insert(k.clone(), (base.get(k).cloned(), Some(v.clone())));
+        }
+    }
+    for (k, v) in base {
+        if !cand.contains_key(k) {
+            d.options.insert(k.clone(), (Some(v.clone()), None));
+        }
+    }
+    d
+}
+
 /// A generation tried to define a canonical probe differently from the core
 /// package, or dropped one from a unit that is still present (I10).
 fn touches_canonical(base: &Manifest, cand: &Manifest, canonical: &Canonical) -> bool {
@@ -207,6 +223,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         restarts_failed_unit: false,
         removes_sensitivity: Default::default(),
         removes: Default::default(),
+        restarts_held_unit: false,
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
         caller: i.caller.clone(),
@@ -271,7 +288,22 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             if let Some(a) = i.activation {
                 affected.extend(a.start.iter().chain(&a.stop).chain(&a.restart).chain(&a.reload).cloned());
             }
-            let config = i.candidate_overrides.map(|c| diff(i.base_overrides, c)).unwrap_or_default();
+            let mut config = i.candidate_overrides.map(|c| diff(i.base_overrides, c)).unwrap_or_default();
+            // A generation built outside Planarian (known_good often is) has no
+            // recorded override, so for a switch, revert or rollback the
+            // evaluated option sets are compared too: an option it would
+            // restore is in the diff even without an override (§11 Rollback
+            // row, I11, §16; owner decision, Nov 2).
+            if matches!(
+                i.transition,
+                Transition::SwitchGeneration(_) | Transition::Revert { .. } | Transition::Rollback
+            ) {
+                for (k, v) in option_diff(&i.base.options, &cand.options).options {
+                    if !config.options.contains_key(&k) {
+                        config.options.insert(k, v);
+                    }
+                }
+            }
             let mut all_defs = i.defs.clone();
             for (k, v) in &cand.units {
                 all_defs.entry(k.clone()).or_insert_with(|| v.clone());

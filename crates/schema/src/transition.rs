@@ -231,6 +231,12 @@ pub struct DerivedFacts {
     /// as removed or stopped (§16).
     #[serde(default)]
     pub removes: Vec<UnitId>,
+    /// A RestartUnit of a network-security unit (§12d: a network tool the
+    /// kernel attributes traffic-steering changes to) that has failed: its
+    /// traffic is held, so the restart only ends an outage and runs at once
+    /// whatever its sensitivity (§11; owner decision, Nov 2).
+    #[serde(default)]
+    pub restarts_held_unit: bool,
     pub caller: Actor,
     pub config_diff: Option<ConfigDiff>,
 }

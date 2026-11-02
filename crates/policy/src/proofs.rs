@@ -191,7 +191,8 @@ pub proof fn security_override_held_for_administrator(i: Input)
 /// §11 (owner gap G16, decided 2026-10-29): a restart of a Security-sensitive
 /// unit runs below AskFirst only when it restores a unit stopped outside
 /// Planarian and not attributed, and the unit is not also External, or is but
-/// has already failed (owner decision, Nov 2).
+/// has already failed; or when it restarts a failed network-security unit
+/// whose traffic is held (§12d; owner decision, Nov 2).
 pub proof fn security_restart_runs_alone_only_to_restore(i: Input)
     requires
         match *i.transition {
@@ -201,8 +202,8 @@ pub proof fn security_restart_runs_alone_only_to_restore(i: Input)
         i.facts.sensitivity.security,
     ensures
         match decide_spec(i) {
-            Decision::Allow { tier, .. } => tier != Tier::AskFirst ==> i.facts.restores_unattributed_stop
-                && (!i.facts.sensitivity.external || i.facts.restarts_failed_unit),
+            Decision::Allow { tier, .. } => tier != Tier::AskFirst ==> (i.facts.restores_unattributed_stop
+                && (!i.facts.sensitivity.external || i.facts.restarts_failed_unit)) || i.facts.restarts_held_unit,
             _ => true,
         },
 {
@@ -304,6 +305,7 @@ pub proof fn i14_facts_caller_is_not_authority(a: Input, b: Input)
         a.facts.restarts_failed_unit == b.facts.restarts_failed_unit,
         a.facts.removes_sensitivity == b.facts.removes_sensitivity,
         a.facts.removes == b.facts.removes,
+        a.facts.restarts_held_unit == b.facts.restarts_held_unit,
         a.facts.config_diff == b.facts.config_diff,
         a.known_good == b.known_good,
         a.live_tested == b.live_tested,
