@@ -819,6 +819,14 @@ impl Sim {
                 self.fake.w().signal(&unit(get("unit")), sig)
             }
             "oom" => self.fake.w().oom(&unit(get("unit"))),
+            // Units every switch away from the current generation restarts
+            // (what its dry activation reports); fake only.
+            "restarts_on_switch" => {
+                let mut w = self.fake.w();
+                for u in s.get("units").and_then(T::as_array).into_iter().flatten().filter_map(T::as_str) {
+                    w.activation_restarts.insert(unit(u));
+                }
+            }
             "stop_unit_out_of_band" => self.fake.w().stop_out_of_band(&unit(get("unit"))),
             "set_knob" | "set_persistent_knob" => self.knob(&unit(get("unit")), get("knob"), s.get("value"))?,
             "corrupt_state" => {
