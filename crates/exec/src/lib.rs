@@ -351,6 +351,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 caller: authz.actor.clone(),
                 tables: &self.cfg.tables,
                 canonical: &self.cfg.canonical,
+                state,
             }),
             decision: Decision::Reject(RejectReason::Other("undecided".into())),
             base_eval: base_eval.clone(),
@@ -434,6 +435,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             caller: plan.authz.actor.clone(),
             tables: &self.cfg.tables,
             canonical: &self.cfg.canonical,
+            state,
         });
         // §11: who else this reaches, and §12e: whether it goes below the floor.
         let sessions = self.b.sessions().sessions().unwrap_or_default();

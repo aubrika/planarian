@@ -400,6 +400,10 @@ fn main() {
         defer_recovery: true,
     };
     let mut core = Core::start(journal, real, me.clone(), core_cfg);
+    // P19: the state digest covers the recorded core hash.
+    let record =
+        std::env::var("PLANARIAN_CORE_HASH").unwrap_or_else(|_| planarian_daemon::config::CORE_HASH_RECORD.into());
+    core.set_core_hash_record(record.into());
     // The user an agent acts for is an administrator as that user is now (§11).
     let admins = file.admin_group.clone();
     core.admin_of = std::sync::Arc::new(move |uid| is_admin(uid, &admins));

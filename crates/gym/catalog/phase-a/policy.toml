@@ -170,3 +170,70 @@ units = { "service:sshd" = "Running" }
 transition = "ApplyChange"
 terminal = "pending"
 never = ["Activating"]
+
+# C10 (§11 global floors): the disruption is every affected unit's, and each
+# floor applies to its own kind. Two Routine units differ only in what a
+# restart costs. The caller is an administrator seated at seat0: the
+# ConnectivityLoss floor exempts a local caller; the DataInterruption floor
+# exempts only the caller's own session, and the sync service's interruption
+# is not that.
+[[fault]]
+id = "disruption-each-kind-keeps-its-floor"
+family = "policy"
+summary = "alice's font-scale change commits. An administrator at the seat (their own session, not alice's) rolls back; switching back restarts a tunnel service (ConnectivityLoss) and a sync service (DataInterruption). The rollback carries both kinds. Being seated exempts the caller from the ConnectivityLoss floor but not from the DataInterruption one, so it asks first and does not run without approval."
+spec = ["§11 global floors", "C10"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "session_login", uid = 1001, session = "s2", seat = "seat0" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" },
+  { raw = "wait", for = { journal = "Committed" } },
+  { raw = "restarts_on_switch", units = ["service:gym-tunnel", "service:gym-sync"] },
+]
+inject = { transition = "Rollback", source = "user", actor = "user:1001@s2" }
+after = [{ raw = "wait", for = "5m" }]
+window = "6m"
+
+[fault.required_post]
+generation = "candidate"
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+source = "user"
+decision = "Allow(AskFirst)"
+facts = { disruption = ["ConnectivityLoss", "DataInterruption"] }
+terminal = "pending"
+
+# The control: the ConnectivityLoss unit alone. The seated caller is exempt,
+# so the rollback runs; the floor in the case above is DataInterruption's.
+[[fault]]
+id = "disruption-connectivity-alone-seated-runs"
+family = "policy"
+summary = "The same rollback by the same seated administrator, but switching back restarts only the tunnel service (ConnectivityLoss). A local caller is exempt from that floor, so the rollback runs and commits; alice's session is notified."
+spec = ["§11 global floors", "C10"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { raw = "session_login", uid = 1001, session = "s2", seat = "seat0" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" },
+  { raw = "wait", for = { journal = "Committed" } },
+  { raw = "restarts_on_switch", units = ["service:gym-tunnel"] },
+]
+inject = { transition = "Rollback", source = "user", actor = "user:1001@s2" }
+after = [{ raw = "wait", for = "5m" }]
+window = "6m"
+
+[fault.required_post]
+generation = "known_good"
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+source = "user"
+facts = { disruption = "ConnectivityLoss" }
+terminal = "Committed"
