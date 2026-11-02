@@ -1158,3 +1158,61 @@ fn a_slow_tick_is_warned() {
     r.ticks(20);
     assert_eq!(r.core.slow_tick_warnings, 2);
 }
+
+/// C18 (§12 step 6): a transaction touching user data, with no snapshot
+/// backend (Phase A), logs `NoSnapshot` and continues, on the Allow path
+/// and on the approval path; one that does not touch user data does not.
+#[test]
+fn user_data_without_a_snapshot_backend_logs_no_snapshot() {
+    let mut cfg = config();
+    cfg.exec
+        .tables
+        .option_sensitivity
+        .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
+    let mut r = Rig::with(cfg);
+    r.ticks(2);
+    let font = |scale: &str| Request::Apply {
+        change: ChangeId("font-scale".into()),
+        args: [("scale".to_string(), Value::Str(scale.into()))].into(),
+    };
+    let user_data_logged =
+        |r: &Rig| r.core.log.iter().filter(|x| matches!(x.result, Submitted::Finished { .. }) && x.no_snapshot).count();
+
+    // Alice asks; user data may make it AskFirst, approved by an
+    // administrator at a terminal. Either way it runs.
+    let resp = r.core.handle(ALICE, font("1.25"));
+    let resp = match resp {
+        Response::NeedsApproval { approve, .. } => {
+            r.ticks(1);
+            assert_eq!(user_data_logged(&r), 0, "not past step 5 while it waits for approval");
+            r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve })
+        }
+        other => other,
+    };
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "continued: {resp:?}");
+    r.ticks(2);
+    assert_eq!(user_data_logged(&r), 1, "{:#?}", r.core.log);
+
+    // Not user data: nothing to snapshot, nothing logged.
+    let resp = r.core.handle(
+        ADMIN,
+        Request::Apply {
+            change: ChangeId("listen-address".into()),
+            args: [("service", "gym-web"), ("addr", "192.0.2.10")]
+                .map(|(k, v)| (k.to_string(), Value::Str(v.into())))
+                .into(),
+        },
+    );
+    r.ticks(2);
+    assert!(r.core.log.len() >= 2, "{resp:?}");
+    assert!(
+        r.core
+            .log
+            .iter()
+            .filter(|x| !x.facts.as_ref().is_some_and(|f| f.sensitivity.contains(Sensitivity::UserData)))
+            .all(|x| !x.no_snapshot),
+        "{:#?}",
+        r.core.log
+    );
+    assert_eq!(user_data_logged(&r), 1);
+}

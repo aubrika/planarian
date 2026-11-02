@@ -140,6 +140,18 @@ pub struct LogRecord {
     /// The agent that sent the request, acting for `caller` (§11).
     #[serde(default)]
     pub agent: Option<String>,
+    /// §12 step 6 (C18): the transaction touches user data and no snapshot
+    /// was taken, because Phase A has no snapshot backend; it continued.
+    #[serde(default)]
+    pub no_snapshot: bool,
+}
+
+/// §12 step 6 (C18): a transaction that got past step 5 (it ran, or waits
+/// for its activation window) with `UserData` among its sensitivities,
+/// where snapshots are unsupported (always, in Phase A: no snapshot backend
+/// is wired), logs `NoSnapshot` and continues.
+fn no_snapshot(result: &Submitted, facts: Option<&DerivedFacts>) -> bool {
+    matches!(result, Submitted::Finished { .. }) && facts.is_some_and(|f| f.sensitivity.contains(Sensitivity::UserData))
 }
 
 pub struct Core<B: Backends + Clone, S: Store> {
@@ -628,6 +640,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         };
         let record = LogRecord {
             at: now,
+            no_snapshot: no_snapshot(&result, facts.as_ref()),
             proposal: p,
             caller,
             pre_digest: pre,
@@ -2089,7 +2102,30 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
                 let (s, defs) = self.observe();
                 let approver = self.authz(&peer);
+                let parked = self.ex.parked.values().find(|p| p.bound_to == hash).cloned();
+                let (pre, policy) = (s.digest(), self.ex.policy_version());
                 let r = self.ex.approve(&hash, &approver, &s, &defs);
+                // I7: the approved execution writes its own log record; an
+                // approval passes §12 step 6 here, not at submission (C18).
+                if let (Some(pk), Submitted::Finished { txn, .. }) = (parked, &r) {
+                    let l = self.ledger();
+                    let rec = LogRecord {
+                        at: self.b.clock().now(),
+                        no_snapshot: no_snapshot(&r, Some(&pk.facts)),
+                        proposal: pk.proposal,
+                        caller: pk.authz.actor,
+                        pre_digest: pre,
+                        policy,
+                        result: r.clone(),
+                        facts: Some(pk.facts),
+                        decision: None,
+                        post_digest: None,
+                        path: l.path(*txn).map(<[String]>::to_vec).unwrap_or_default(),
+                        why: l.terminal.get(txn).map(|x| x.why.clone()).unwrap_or_default(),
+                        agent: self.acting_agent.clone(),
+                    };
+                    self.awaiting_post.push(rec);
+                }
                 render::response(&r)
             }
             Request::Cancel { txn } => {
