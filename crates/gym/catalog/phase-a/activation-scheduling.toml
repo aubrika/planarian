@@ -148,7 +148,9 @@ window = "16m"
 [fault.required_post]
 units = { "service:NetworkManager" = "Running" }
 generation = "known_good"
-notices_count = { match = "NetworkManager", count = 1 }
+# §12f: "the rollback runs at once, with one notice": the rollback's own
+# notice, once. The in-place attempts §13 orders first report their own.
+notices_count = { match = "NetworkManager: roll back to the known-good generation", count = 1 }
 
 [[fault.required_post.txn]]
 transition = "ApplyChange"
