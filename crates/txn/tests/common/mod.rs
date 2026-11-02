@@ -128,6 +128,7 @@ pub fn facts(caller: Actor) -> DerivedFacts {
         restarts_failed_unit: false,
         removes_sensitivity: Default::default(),
         removes: Default::default(),
+        removes_each: Default::default(),
         restarts_held_unit: false,
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
@@ -176,6 +177,7 @@ pub fn txn(transition: Transition, caller: Actor) -> Transaction {
         revert_to: G1,
         prior_driver: None,
         check: CheckContext::default(),
+        prepared_again_from: None,
     }
 }
 

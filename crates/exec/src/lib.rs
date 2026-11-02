@@ -586,6 +586,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             deadline: boot.plus(if network { NETWORK_DEADLINE } else { GENERATION_DEADLINE }),
             revert_to: state.generation,
             prior_driver,
+            prepared_again_from: None,
             check: CheckContext {
                 candidate: plan.cand_eval.as_ref().map(manifest_of),
                 base: manifest_of(&plan.base_eval),
@@ -672,6 +673,33 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
 
     /// Submit a proposal. `state` and `defs` are the current observation.
     pub fn submit(&mut self, p: Proposal, authz: Authorization, state: &SystemState, defs: &UnitDefs) -> Submitted {
+        self.submit_from(p, authz, state, defs, None)
+    }
+
+    /// §12f: submit `p` as preparing again `from`, a transaction a rollback
+    /// withdrew. The link is journaled with the new transaction
+    /// (`Transaction.prepared_again_from`). Core only: it is not in
+    /// `Proposal`, which callers build, so no caller can name a withdrawn
+    /// transaction and keep it from being prepared again.
+    pub fn submit_again(
+        &mut self,
+        p: Proposal,
+        from: TxnId,
+        authz: Authorization,
+        state: &SystemState,
+        defs: &UnitDefs,
+    ) -> Submitted {
+        self.submit_from(p, authz, state, defs, Some(from))
+    }
+
+    fn submit_from(
+        &mut self,
+        p: Proposal,
+        authz: Authorization,
+        state: &SystemState,
+        defs: &UnitDefs,
+        again: Option<TxnId>,
+    ) -> Submitted {
         let digest = state.digest();
         if p.observed != digest {
             return Submitted::Rejected {
@@ -727,7 +755,8 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             self.release(&plan);
             return reject(RejectReason::Stale, "your configuration changed while the change was being built");
         }
-        let txn = self.transaction(&p, &plan, state, defs);
+        let mut txn = self.transaction(&p, &plan, state, defs);
+        txn.prepared_again_from = again;
         let id = match self.kernel.prepare(txn) {
             Ok(id) => id,
             Err(e) => {
@@ -751,6 +780,17 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     /// boot-only path; one that would disturb a session, or any while
     /// foreground work holds, waits in `Built` for an activation window
     /// (`activate_waiting`); everything else runs now.
+    ///
+    /// *Rollbacks* (owner decisions, Oct 31 and Nov 2): a rollback never
+    /// waits. One the user or an Intent asks for (`Rollback`, or `planarian
+    /// undo`'s `Revert`) is its own window, also under `Foreground`; the
+    /// diagnoser's `Rollback` is a repair. The §11 floors were applied
+    /// before this, so either may have been parked for approval first; this
+    /// is reached once it is admitted and, if it asked, approved. At that
+    /// moment, and only then, every generation transaction waiting in
+    /// `Built` is withdrawn for it (`Rejected(Interrupted)`, I6); the daemon
+    /// prepares each again once the rollback is terminal. Quiet mode's
+    /// deferral of an unrelated repair rollback is the repair loop's.
     fn schedule(&mut self, id: TxnId, plan: Plan, source: &Source, state: &SystemState) -> Submitted {
         if !plan.transition.changes_generation() {
             return self.run(id, &plan);
@@ -763,6 +803,20 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         }
         let foreground = state.conditions.iter().any(|c| matches!(c, Condition::Foreground { .. }));
         let user_asked = matches!(source, Source::User | Source::Intent { .. });
+        let rollback = match plan.transition {
+            Transition::Rollback => user_asked || matches!(source, Source::Diagnoser { .. }),
+            Transition::Revert { .. } => user_asked,
+            _ => false,
+        };
+        if rollback {
+            let waiting: Vec<TxnId> = self.waiting.keys().copied().collect();
+            for w in waiting {
+                if self.kernel.withdraw(w, id).is_ok() {
+                    self.waiting.remove(&w);
+                }
+            }
+            return self.run(id, &plan);
+        }
         let disturbs = plan.built.as_ref().is_some_and(|b| self.disturbs_a_session(&b.activation));
         if foreground || (disturbs && !user_asked && !self.sessions_idle()) {
             let why = if foreground { "waiting: foreground work holds" } else { "waiting: a session is in use" };
@@ -980,6 +1034,19 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     /// The transaction waits in `Built` for an activation window (§12f).
     pub fn is_waiting(&self, txn: TxnId) -> bool {
         self.waiting.contains_key(&txn)
+    }
+
+    /// When the transaction began waiting in `Built` (`CLOCK_BOOTTIME`).
+    pub fn waiting_since(&self, txn: TxnId) -> Option<Timestamp> {
+        self.waiting.get(&txn).map(|(since, _)| *since)
+    }
+
+    /// §12f, I12: a change withdrawn for a rollback and prepared again keeps
+    /// the parking limit it had, from the earlier of the two times.
+    pub fn keep_waiting_since(&mut self, txn: TxnId, since: Timestamp) {
+        if let Some((s, _)) = self.waiting.get_mut(&txn) {
+            *s = (*s).min(since);
+        }
     }
 
     /// §12f, I12: parking in `Built` is bounded. A transaction that has

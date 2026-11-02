@@ -234,6 +234,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     quiet_queue: Vec<String>,
     /// Waiting generations interrupted by a restart, to prepare again (§12f).
     reprepare: Vec<(TxnId, Transition)>,
+    /// Generation transactions withdrawn from `Built` for a rollback about to
+    /// run (§12f, I6; owner decision, Nov 2), with when each began waiting,
+    /// to prepare again once no generation transaction is active.
+    withdrawn: Vec<(TxnId, Transition, Option<Timestamp>)>,
     /// From the executor log of earlier runs: each transaction's proposal and
     /// caller, so one prepared again keeps its source and caller (§12, C21).
     pub earlier: BTreeMap<TxnId, (Proposal, Actor)>,
@@ -337,6 +341,27 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             })
             .map(|(id, t)| (*id, t.transition.clone()))
             .collect();
+        // §12f: what a rollback withdrew and nothing has prepared again yet
+        // (no transaction names it in `prepared_again_from`), from the
+        // journal, so a restart between the two loses nothing and prepares
+        // nothing twice. Prepared again once the rollback is terminal.
+        let named: BTreeSet<TxnId> = ledger
+            .live
+            .values()
+            .filter_map(|t| t.txn.prepared_again_from)
+            .chain(ledger.terminal.values().filter_map(|t| t.prepared_again_from))
+            .collect();
+        let withdrawn: Vec<(TxnId, Transition, Option<Timestamp>)> = ledger
+            .terminal
+            .iter()
+            .filter(|(id, t)| {
+                t.withdrawn_for.is_some()
+                    && t.state == TxnState::Rejected(RejectReason::Interrupted)
+                    && !named.contains(id)
+                    && !reprepare.iter().any(|(r, _)| r == *id)
+            })
+            .map(|(id, t)| (*id, t.transition.clone(), None))
+            .collect();
         let mut incidents = Manager::restore(ledger.incidents.values().cloned());
         incidents.startup_grace = cfg.startup_grace;
         let current = b.generations().current().unwrap_or_default();
@@ -414,6 +439,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             quiet: false,
             quiet_queue: vec![],
             reprepare: vec![],
+            withdrawn: vec![],
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
             generation_touched: false,
@@ -435,6 +461,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
         core.reprepare = reprepare;
+        core.withdrawn = withdrawn;
         core.note_declarations(None, current, false);
         core
     }
@@ -605,11 +632,29 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     fn submit(&mut self, p: Proposal, authz: Authorization, s: &SystemState, defs: &UnitDefs) -> Submitted {
+        self.submit_from(p, authz, s, defs, None)
+    }
+
+    /// `again`: the withdrawn transaction this prepares again (§12f), set
+    /// only by `prepare_again`.
+    fn submit_from(
+        &mut self,
+        p: Proposal,
+        authz: Authorization,
+        s: &SystemState,
+        defs: &UnitDefs,
+        again: Option<TxnId>,
+    ) -> Submitted {
         let now = self.b.clock().now();
         let pre = s.digest();
         let policy = self.ex.policy_version();
         let caller = authz.actor.clone();
-        let result = self.ex.submit(p.clone(), authz.clone(), s, defs);
+        let built = self.waiting_built();
+        let result = match again {
+            Some(from) => self.ex.submit_again(p.clone(), from, authz.clone(), s, defs),
+            None => self.ex.submit(p.clone(), authz.clone(), s, defs),
+        };
+        self.note_withdrawn(built);
         if let Some((facts, _)) = self.ex.last.clone() {
             self.touched.extend(facts.affected_units.iter().cloned());
             // §11: the affected sessions are notified either way.
@@ -720,6 +765,139 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.flush_writebacks();
         }
         result
+    }
+
+    /// Prepare again transactions interrupted before they mutated (by a
+    /// restart, or withdrawn for a repair rollback).
+    fn prepare_again(
+        &mut self,
+        list: Vec<(TxnId, Transition, Option<Timestamp>)>,
+        why: &str,
+        s: &SystemState,
+        defs: &UnitDefs,
+    ) {
+        for (id, t, since) in list {
+            // Its original source and caller (C21), so floors that depend on
+            // who asked (the own-session exemption) still apply; the daemon's
+            // own only when no record of it survives.
+            let (source, authz) = match self.earlier.get(&id).cloned() {
+                Some((p, caller @ Actor::User { .. })) => {
+                    let admin = caller.uid().is_some_and(|u| (self.admin_of)(u));
+                    (p.source, user_authorization(caller, admin))
+                }
+                Some((p, caller)) => (p.source, authorization_of(caller)),
+                None => (Source::Maintenance, authorization_of(Actor::Daemon)),
+            };
+            let incident = match &source {
+                Source::Diagnoser { incident } => Some(*incident),
+                _ => None,
+            };
+            let p = self.proposal(t.clone(), s, defs, source, format!("prepared again {why}"));
+            // Journaled with it: this is what prepares `id` again (§12f).
+            let r = self.submit_from(p, authz, s, defs, Some(id));
+            // A diagnoser's repair that waits again keeps its incident with it.
+            if let (
+                Some(inc),
+                Submitted::Finished { txn, state: TxnState::Built, .. } | Submitted::Parked { txn, .. },
+            ) = (incident, &r)
+            {
+                self.incident_parked.insert(inc, *txn);
+            }
+            // A withdrawal never extends a change's parking limit (I12).
+            if let (Some(since), Submitted::Finished { txn, state: TxnState::Built, .. }) = (since, &r) {
+                self.ex.keep_waiting_since(*txn, since);
+            }
+            self.notice(format!("{}: prepared again {why}: {}", render::transition(&t), render::submitted_short(&r)));
+        }
+    }
+
+    /// Generation transactions waiting in `Built`, with when each began
+    /// waiting: what a rollback about to run would withdraw (§12f, I6).
+    fn waiting_built(&mut self) -> Vec<(TxnId, Transition, Option<Timestamp>)> {
+        let l = self.ledger();
+        l.live
+            .values()
+            .filter(|t| t.txn.transition.changes_generation() && t.txn.state == TxnState::Built)
+            .map(|t| (t.txn.id, t.txn.transition.clone(), self.ex.waiting_since(t.txn.id)))
+            .collect()
+    }
+
+    /// §12f, I6 (owner decision, Nov 2): a rollback of any source withdraws
+    /// what waits in `Built` at the moment it is about to run (admitted, and
+    /// approved if it asked; `exec::schedule`). Those of `before` the
+    /// executor withdrew are remembered, with their proposal, caller and
+    /// parking start, to prepare again once the rollback is terminal.
+    fn note_withdrawn(&mut self, before: Vec<(TxnId, Transition, Option<Timestamp>)>) {
+        if before.is_empty() {
+            return;
+        }
+        let l = self.ledger();
+        for (id, t, since) in before {
+            if l.terminal.get(&id).is_none_or(|x| x.state != TxnState::Rejected(RejectReason::Interrupted)) {
+                continue;
+            }
+            if !self.earlier.contains_key(&id) {
+                let asked = self.log.iter().chain(&self.awaiting_post).find(|r| {
+                    matches!(r.result, Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if txn == id)
+                });
+                if let Some(r) = asked {
+                    self.earlier.insert(id, (r.proposal.clone(), r.caller.clone()));
+                }
+            }
+            self.notice(format!(
+                "{}: set aside for a rollback (transaction {}); it will be prepared again once the rollback is done",
+                render::transition(&t),
+                id.0
+            ));
+            self.withdrawn.push((id, t, since));
+        }
+    }
+
+    /// The response to a submission; one parked for approval says, in one
+    /// line, what it would change (§16 *Approvals show the change*).
+    fn respond(&self, r: &Submitted) -> Response {
+        let mut resp = render::response(r);
+        if let Response::NeedsApproval { txn, why, .. } = &mut resp
+            && let Some(p) = self.ex.parked.get(txn)
+            && let Some(sum) = self.approval_diff(*txn, &p.proposal.transition, &p.facts).summary()
+        {
+            *why = if why.is_empty() { sum } else { format!("{why}; {sum}") };
+        }
+        resp
+    }
+
+    /// §16 *Approvals show the change*: built from the derived facts (from
+    /// the evaluated generations), never from the proposal.
+    fn approval_diff(&self, txn: TxnId, t: &Transition, f: &DerivedFacts) -> planarian_ipc::ApprovalDiff {
+        // The options, from the evaluated generations (§16): the one the
+        // transaction runs on against its candidate. A generation built
+        // outside Planarian has no recorded override, so the override diff
+        // alone would show nothing it changes. If either evaluation cannot be
+        // read, the core's override diff from the facts stands.
+        let evaluated = self.evaluated_diff(txn);
+        let options = evaluated.as_ref().or(f.config_diff.as_ref());
+        // The units it would remove or stop: derive's `removes`, the same set
+        // as `removes_sensitivity` (§11 Rollback row), each with its own.
+        let (removed, each_known) = crate::approval::removed(f);
+        crate::approval::diff(t, options, evaluated.is_some(), &removed, each_known, &self.ex.cfg.tables)
+    }
+
+    /// Every option whose value differs between a live generation
+    /// transaction's base and its candidate, as both evaluate.
+    fn evaluated_diff(&self, txn: TxnId) -> Option<ConfigDiff> {
+        let live = self.ex.kernel.journal.ledger().live.get(&txn)?;
+        let (_, cand_path) = live.txn.candidate.as_ref()?;
+        let gens = self.b.generations();
+        let base = gens.path_of(live.txn.base).and_then(|p| gens.evaluate_built(&p)).ok()?;
+        let cand = gens.evaluate_built(cand_path).ok()?;
+        let mut d = ConfigDiff::default();
+        for k in base.options.keys().chain(cand.options.keys()) {
+            let (old, new) = (base.options.get(k), cand.options.get(k));
+            if old != new {
+                d.options.insert(k.clone(), (old.cloned(), new.cloned()));
+            }
+        }
+        Some(d)
     }
 
     /// A generation transaction is live, in any state (I6: one waiting in
@@ -1157,25 +1335,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             return;
         }
 
-        for (id, t) in std::mem::take(&mut self.reprepare) {
-            // Its original source and caller (C21), so floors that depend on
-            // who asked (the own-session exemption) still apply; the daemon's
-            // own only when no record of it survives.
-            let (source, authz) = match self.earlier.get(&id).cloned() {
-                Some((p, caller @ Actor::User { .. })) => {
-                    let admin = caller.uid().is_some_and(|u| (self.admin_of)(u));
-                    (p.source, user_authorization(caller, admin))
-                }
-                Some((p, caller)) => (p.source, authorization_of(caller)),
-                None => (Source::Maintenance, authorization_of(Actor::Daemon)),
-            };
-            let p = self.proposal(t.clone(), &s, &defs, source, "prepared again after a restart".into());
-            let r = self.submit(p, authz, &s, &defs);
-            self.notice(format!(
-                "{}: prepared again after a restart: {}",
-                render::transition(&t),
-                render::submitted_short(&r)
-            ));
+        let again = std::mem::take(&mut self.reprepare).into_iter().map(|(id, t)| (id, t, None)).collect();
+        self.prepare_again(again, "after a restart", &s, &defs);
+        // §12f: what a rollback withdrew, once that rollback is terminal.
+        if !self.withdrawn.is_empty() && !self.generation_active() {
+            let again = std::mem::take(&mut self.withdrawn);
+            self.prepare_again(again, "after the rollback", &s, &defs);
         }
 
         // §11: stops nobody attributed, before anything treats them as faults.
@@ -1622,8 +1787,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     }
                     Submitted::Parked { txn, approve, facts } => {
                         self.incident_parked.insert(inc.id, txn);
+                        let changes = self
+                            .approval_diff(txn, &c.transition, &facts)
+                            .summary()
+                            .map(|s| format!("; {s}"))
+                            .unwrap_or_default();
                         self.notice(format!(
-                            "{}: {} needs approval ({}): planarian approve {approve}",
+                            "{}: {} needs approval ({}{changes}): planarian approve {approve}",
                             inc.target,
                             render::transition(&c.transition),
                             render::facts_summary(&facts)
@@ -1763,8 +1933,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let (s, defs) = self.observe();
         let p = self.proposal(t, &s, &defs, source, reason);
         let authz = self.authz(&peer);
+        let t = p.transition.clone();
         let r = self.submit(p, authz, &s, &defs);
-        render::response(&r)
+        // §16: the notice shows what a generation change waiting for
+        // approval would change.
+        if let Submitted::Parked { txn, approve, facts } = &r
+            && let Some(changes) = self.approval_diff(*txn, &t, facts).summary()
+        {
+            self.notice(format!(
+                "{} needs approval ({}; {changes}): planarian approve {approve}",
+                render::transition(&t),
+                render::facts_summary(facts)
+            ));
+        }
+        self.respond(&r)
     }
 
     fn status(&mut self) -> StatusReport {
@@ -1789,6 +1971,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 approve: p.bound_to,
                 what: render::transition(&p.proposal.transition),
                 facts: p.facts.clone(),
+                diff: self.approval_diff(p.txn, &p.proposal.transition, &p.facts),
                 // Shown to people: the boot-clock issue time on the wall clock.
                 issued: Timestamp(
                     self.b.clock().now().0.saturating_sub(self.b.clock().boot_now().0.saturating_sub(p.issued.0)),
@@ -2172,7 +2355,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 let approver = self.authz(&peer);
                 let parked = self.ex.parked.values().find(|p| p.bound_to == hash).cloned();
                 let (pre, policy) = (s.digest(), self.ex.policy_version());
+                let built = self.waiting_built();
                 let r = self.ex.approve(&hash, &approver, &s, &defs);
+                self.note_withdrawn(built);
                 // Re-bound and asked again under a new id (§12 step 4): the
                 // proposer's agent goes with it.
                 if let (Some(pk), Submitted::Parked { txn: again, .. }) = (&parked, &r)
@@ -2233,7 +2418,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     };
                     self.awaiting_post.push(rec);
                 }
-                render::response(&r)
+                self.respond(&r)
             }
             Request::Cancel { txn } => {
                 let Some(p) = self.ex.parked.get(&txn) else {
@@ -2245,7 +2430,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     };
                 }
                 let r = self.ex.cancel(txn, Actor::user(peer.uid));
-                render::response(&r)
+                self.respond(&r)
             }
             Request::Resolve { txn, resolution } => self.user_submit(
                 Transition::Resolve { txn, resolution },
@@ -2365,7 +2550,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
                 let authz = self.authz(&peer);
                 let r = self.submit(p, authz, &s, &defs);
-                render::response(&r)
+                self.respond(&r)
             }
             #[cfg(feature = "gym-hooks")]
             Request::GymCompact => match self.ex.kernel.journal.compact() {

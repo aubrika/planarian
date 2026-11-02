@@ -183,6 +183,13 @@ pub fn gym_units() -> UnitDefs {
         vec![user_probe("gym-backup-active", ProbeKind::SystemdActive)],
     );
     backup.stops_are_faults = true;
+    // A print service (§12f gym cases): nothing foreground work depends on.
+    let printer = unit(
+        "service:gym-printer",
+        r,
+        Disruption::Brief,
+        vec![user_probe("gym-printer-active", ProbeKind::SystemdActive)],
+    );
     // C10 (§11 floors): two Routine units that differ only in what a restart
     // costs, so a transition restarting both carries both disruptions.
     let tunnel = unit(
@@ -217,6 +224,7 @@ pub fn gym_units() -> UnitDefs {
         gpu,
         wlan,
         backup,
+        printer,
         tunnel,
         sync,
         fs("fs-root"),

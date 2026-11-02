@@ -76,6 +76,9 @@ pub struct Evidence {
     /// Each unit's status changes, in order.
     #[serde(default)]
     pub status_timeline: Option<BTreeMap<UnitId, Vec<(Timestamp, String)>>>,
+    /// Each `foreground` step (§12f quiet mode): when, session, on or off.
+    #[serde(default)]
+    pub foreground: Option<Vec<(Timestamp, String, bool)>>,
     /// The driver bound to each device at the end.
     #[serde(default)]
     pub drivers: Option<BTreeMap<UnitId, String>>,
