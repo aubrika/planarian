@@ -263,10 +263,23 @@ pkgs.testers.runNixOSTest {
             else:
                 units.append(f"{t}.service")
         assert "nw-tpl@a.service" in units, units
+        # A unit the systemd initrd also runs (the export's
+        # networkToolsInitrd, names or templates) that last started there,
+        # before the switch to userspace, did not start in stage 2: whatever
+        # it left steering is caught at attach as pre-attach. Exempt only
+        # then; one restarted in stage 2 is checked like any other.
+        initrd = set(export.get("networkToolsInitrd", []))
+        userspace = int(machine.succeed("systemctl show -P UserspaceTimestampMonotonic").strip() or 0)
+        assert userspace > 0, "no UserspaceTimestampMonotonic"
+        def in_initrd(u):
+            n = u.removesuffix(".service")
+            return n in initrd or ("@" in n and n.split("@")[0] + "@" in initrd)
         early = []
         for u in units:
             began = mono(u, "InactiveExitTimestampMonotonic")
             if began and began < ready:
+                if in_initrd(u) and began < userspace:
+                    continue
                 early.append((u, began, ready))
         assert not early, f"started before the watch was ready: {early}"
         machine.fail(f"grep -rq 'pre-attach' {FP}")
