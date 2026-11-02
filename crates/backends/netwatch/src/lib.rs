@@ -72,6 +72,7 @@
 
 mod contract;
 pub mod ebpf;
+pub mod host;
 #[cfg(feature = "loader")]
 pub mod loader;
 mod model;

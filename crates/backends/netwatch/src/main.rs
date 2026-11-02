@@ -1,6 +1,9 @@
-//! `planarian-netwatch`: attach the probes, keep the footprints, write the
-//! files (crate docs). `--attach-test` attaches, waits for one event and
-//! exits: a check that the kernel accepts the object.
+//! `planarian-netwatch [--export PATH] [--object PATH] [--dir PATH]`:
+//! attach the probes, keep the footprints, write the files (crate docs).
+//! Defaults: `/etc/planarian/export.json`, `<prefix>/share/planarian/
+//! netwatch.bpf.o`, `/run/planarian/footprint`. `--check-object` checks the
+//! object has every program; `--attach-test` attaches, waits for one event
+//! and exits.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
@@ -28,6 +31,11 @@ fn main() {
         }
         return;
     }
-    eprintln!("usage: planarian-netwatch --attach-test [--object PATH]");
-    std::process::exit(2);
+    let export = flag("--export").unwrap_or_else(|| "/etc/planarian/export.json".into());
+    let dir = flag("--dir").unwrap_or_else(|| planarian_backend_netwatch::DIR.into());
+    let p = std::path::Path::new;
+    if let Err(e) = planarian_backend_netwatch::loader::run(p(&export), p(&object), p(&dir)) {
+        eprintln!("planarian-netwatch: {e}");
+        std::process::exit(1);
+    }
 }

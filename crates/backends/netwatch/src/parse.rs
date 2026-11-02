@@ -67,7 +67,7 @@ fn cstr(b: &[u8]) -> String {
 }
 
 /// The changes in `ev`, made by `owner`. `ifname` names an interface index.
-pub fn parse(ev: &Event, owner: &Owner, ifname: &dyn Fn(u32) -> Option<String>) -> Parsed {
+pub fn parse(ev: &Event, owner: &Owner, ifname: &mut dyn FnMut(u32) -> Option<String>) -> Parsed {
     let b = &ev.data;
     if ev.hook == HOOK_SOCKOPT {
         // A legacy table replaced (or its counters set) through setsockopt:

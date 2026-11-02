@@ -207,14 +207,14 @@ mod parsing {
     fn a_created_link_is_an_interface() {
         let mut body = vec![0u8; 16]; // ifinfomsg
         body.extend(attr(3, b"wg0\0"));
-        let c = one(parse(&msg(HOOK_RTNETLINK, 16, 0x400 | 0x1, &body), &owner(), &names));
+        let c = one(parse(&msg(HOOK_RTNETLINK, 16, 0x400 | 0x1, &body), &owner(), &mut names));
         assert_eq!((c.kind, c.object.as_str(), c.steers, c.removed), (ChangeKind::Interface, "wg0", false, false));
         // Setting a link up creates nothing.
-        assert_eq!(parse(&msg(HOOK_RTNETLINK, 16, 0x1, &body), &owner(), &names), Parsed::Nothing);
+        assert_eq!(parse(&msg(HOOK_RTNETLINK, 16, 0x1, &body), &owner(), &mut names), Parsed::Nothing);
         // Deleting by index alone still names it.
         let mut del = vec![0u8; 16];
         del[4..8].copy_from_slice(&7u32.to_ne_bytes());
-        let c = one(parse(&msg(HOOK_RTNETLINK, 17, 0x1, &del), &owner(), &names));
+        let c = one(parse(&msg(HOOK_RTNETLINK, 17, 0x1, &del), &owner(), &mut names));
         assert!(c.removed && c.object == "wg0");
     }
 
@@ -230,13 +230,13 @@ mod parsing {
     #[test]
     fn a_default_or_all_covering_route_steers() {
         for (dst_len, steers) in [(0, true), (1, true), (8, false)] {
-            let c = one(parse(&msg(HOOK_RTNETLINK, 24, 0x400, &route(dst_len, 7)), &owner(), &names));
+            let c = one(parse(&msg(HOOK_RTNETLINK, 24, 0x400, &route(dst_len, 7)), &owner(), &mut names));
             assert_eq!((c.kind, c.steers, c.iface.as_deref()), (ChangeKind::Route, steers, Some("wg0")), "/{dst_len}");
         }
-        let c = one(parse(&msg(HOOK_RTNETLINK, 25, 0, &route(0, 7)), &owner(), &names));
+        let c = one(parse(&msg(HOOK_RTNETLINK, 25, 0, &route(0, 7)), &owner(), &mut names));
         assert!(c.removed, "RTM_DELROUTE");
         // A read changes nothing.
-        assert_eq!(parse(&msg(HOOK_RTNETLINK, 26, 0x300, &route(0, 7)), &owner(), &names), Parsed::Nothing);
+        assert_eq!(parse(&msg(HOOK_RTNETLINK, 26, 0x300, &route(0, 7)), &owner(), &mut names), Parsed::Nothing);
     }
 
     #[test]
@@ -244,22 +244,25 @@ mod parsing {
         // fib_rule_hdr: AF_INET, dst 0, src 0, tos, table, res, res, action TO_TBL, flags.
         let mut b = vec![2u8, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
         b.extend(attr(15, &51820u32.to_ne_bytes()));
-        let c = one(parse(&msg(HOOK_RTNETLINK, 32, 0x400, &b), &owner(), &names));
+        let c = one(parse(&msg(HOOK_RTNETLINK, 32, 0x400, &b), &owner(), &mut names));
         assert!(c.kind == ChangeKind::Rule && c.steers, "{c:?}");
         b[1] = 24; // a rule for one destination prefix does not catch all
-        assert!(!one(parse(&msg(HOOK_RTNETLINK, 32, 0x400, &b), &owner(), &names)).steers);
+        assert!(!one(parse(&msg(HOOK_RTNETLINK, 32, 0x400, &b), &owner(), &mut names)).steers);
     }
 
     #[test]
     fn nftables_changes_are_firewall_changes_and_reads_are_not() {
-        let c = one(parse(&msg(HOOK_NFBATCH, 0x10, 0x1, &[0u8; 4]), &owner(), &names));
+        let c = one(parse(&msg(HOOK_NFBATCH, 0x10, 0x1, &[0u8; 4]), &owner(), &mut names));
         assert!(c.kind == ChangeKind::Firewall && c.steers);
         let newrule = (10u16 << 8) | 6;
-        assert!(matches!(parse(&msg(HOOK_NFNETLINK, newrule, 0x1, &[0u8; 4]), &owner(), &names), Parsed::Changes(_)));
+        assert!(matches!(
+            parse(&msg(HOOK_NFNETLINK, newrule, 0x1, &[0u8; 4]), &owner(), &mut names),
+            Parsed::Changes(_)
+        ));
         let getrule = (10u16 << 8) | 7;
-        assert_eq!(parse(&msg(HOOK_NFNETLINK, getrule, 0x301, &[0u8; 4]), &owner(), &names), Parsed::Nothing);
+        assert_eq!(parse(&msg(HOOK_NFNETLINK, getrule, 0x301, &[0u8; 4]), &owner(), &mut names), Parsed::Nothing);
         let ctnetlink = 1u16 << 8;
-        assert_eq!(parse(&msg(HOOK_NFNETLINK, ctnetlink, 0x1, &[0u8; 4]), &owner(), &names), Parsed::Nothing);
+        assert_eq!(parse(&msg(HOOK_NFNETLINK, ctnetlink, 0x1, &[0u8; 4]), &owner(), &mut names), Parsed::Nothing);
     }
 
     #[test]
@@ -267,7 +270,7 @@ mod parsing {
         let mut e = msg(HOOK_RTNETLINK, 24, 0x400, &route(0, 7));
         let n = e.data.len();
         e.data.truncate(n - 3);
-        assert!(matches!(parse(&e, &owner(), &names), Parsed::Unreadable(_)));
+        assert!(matches!(parse(&e, &owner(), &mut names), Parsed::Unreadable(_)));
     }
 
     #[test]
@@ -290,7 +293,7 @@ mod sockopt {
         data.extend(64i32.to_ne_bytes()); // IPT_SO_SET_REPLACE
         let ev = Event { cgroup: 1, tgid: 2, hook: HOOK_SOCKOPT, len: 8, data };
         let owner = Owner::Unit(UnitId::service("gym-netd"));
-        match parse(&ev, &owner, &|_| None) {
+        match parse(&ev, &owner, &mut |_| None) {
             Parsed::Changes(c) => assert!(c.len() == 1 && c[0].kind == ChangeKind::Firewall && c[0].steers, "{c:?}"),
             other => panic!("{other:?}"),
         }
@@ -305,4 +308,47 @@ mod loader_checks {
         assert!(crate::loader::check_object(&[]).unwrap_err().contains("not an eBPF object"));
         assert!(crate::loader::check_object(b"\x7fELF not really").is_err());
     }
+}
+
+mod host {
+    use crate::host::{expand_tools, network_tools, unit_of_cgroup};
+    use planarian_schema::UnitId;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn the_exports_network_tools() {
+        let e = r#"{"networkTools": ["wg-quick-wg0", "openvpn@"], "units": {}}"#;
+        assert_eq!(network_tools(e), Some(vec!["wg-quick-wg0".into(), "openvpn@".into()]));
+        assert_eq!(network_tools("{}"), None, "missing: fail closed");
+        assert_eq!(network_tools("not json"), None);
+        assert_eq!(network_tools(r#"{"networkTools": [1]}"#), None);
+    }
+
+    #[test]
+    fn a_cgroup_belongs_to_its_service() {
+        assert_eq!(unit_of_cgroup("/system.slice/wg-quick-wg0.service"), Some(UnitId::service("wg-quick-wg0")));
+        assert_eq!(unit_of_cgroup("system.slice/openvpn@work.service/payload"), Some(UnitId::service("openvpn@work")));
+        assert_eq!(unit_of_cgroup("/user.slice/user-1000.slice/session-2.scope"), None);
+        assert_eq!(unit_of_cgroup("/"), None);
+        assert_eq!(unit_of_cgroup("/system.slice/foo.slice"), None);
+    }
+
+    #[test]
+    fn templates_expand_to_running_instances() {
+        let running: BTreeSet<String> = ["openvpn@work", "openvpn@home", "sshd", "openvpn"].map(String::from).into();
+        let t = expand_tools(&["wg-quick-wg0".into(), "openvpn@".into()], &running);
+        let names: Vec<&str> = t.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(names, ["openvpn@home", "openvpn@work", "wg-quick-wg0"], "a plain tool is listed even when stopped");
+    }
+}
+
+/// The set the daemon carries: every tool `protecting_now` says protects.
+#[test]
+fn the_protecting_set() {
+    let (vpn, quiet) = (UnitId::service("wg-quick-wg0"), UnitId::service("gym-syncd"));
+    let v = sample();
+    let set = v.protecting(&[vpn.clone(), quiet.clone()], NOW);
+    assert!(set.contains(&vpn) && !set.contains(&quiet), "{set:?}");
+    let all = FootprintView::default().protecting(&[vpn.clone(), quiet.clone()], NOW);
+    assert_eq!(all.len(), 2, "nothing known: every tool counts");
 }

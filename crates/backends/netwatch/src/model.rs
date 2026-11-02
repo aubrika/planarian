@@ -119,6 +119,14 @@ impl FootprintView {
     }
 }
 
+impl FootprintView {
+    /// Which of `tools` count as protecting traffic at `now` (§12d, fail
+    /// closed): what the daemon carries in its observation.
+    pub fn protecting(&self, tools: &[UnitId], now: u64) -> BTreeSet<UnitId> {
+        tools.iter().filter(|u| self.protecting_now(&crate::file_name(u), now)).cloned().collect()
+    }
+}
+
 /// The objects a unit has changed that still stand, and whether each one
 /// steers traffic.
 #[derive(Clone, Debug, Default)]
