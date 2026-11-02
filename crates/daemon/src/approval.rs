@@ -8,7 +8,7 @@
 //! hashes the facts), so the approval does not apply and the change asks
 //! again.
 
-use planarian_ipc::{ApprovalDiff, OptionChange};
+use planarian_ipc::{ApprovalDiff, OptionChange, RemovedUnit, sensitivity_kinds};
 use planarian_policy::Tables;
 use planarian_schema::*;
 
@@ -33,17 +33,26 @@ pub fn diff(
     let mut options: Vec<OptionChange> = config_diff
         .into_iter()
         .flat_map(|d| d.options.entries.iter())
-        .map(|(path, (old, new))| OptionChange {
-            path: path.clone(),
-            old: old.clone(),
-            new: new.clone(),
-            sensitivity: tables.option_sensitivity(path),
+        .map(|(path, (old, new))| {
+            let sensitivity = tables.option_sensitivity(path);
+            OptionChange {
+                path: path.clone(),
+                old: old.clone(),
+                new: new.clone(),
+                kinds: sensitivity_kinds(&sensitivity),
+                sensitivity,
+            }
         })
         .collect();
     options.sort_by(|a, b| (!first(&a.sensitivity), &a.path).cmp(&(!first(&b.sensitivity), &b.path)));
-    let mut removes: Vec<(UnitId, Sensitivities)> =
-        removed.iter().map(|u| (u.clone(), defs.get(u).map(|d| d.sensitivity).unwrap_or_default())).collect();
-    removes.sort_by(|a, b| (!first(&a.1), &a.0).cmp(&(!first(&b.1), &b.0)));
+    let mut removes: Vec<RemovedUnit> = removed
+        .iter()
+        .map(|u| {
+            let sensitivity = defs.get(u).map(|d| d.sensitivity).unwrap_or_default();
+            RemovedUnit { unit: u.clone(), kinds: sensitivity_kinds(&sensitivity), sensitivity }
+        })
+        .collect();
+    removes.sort_by(|a, b| (!first(&a.sensitivity), &a.unit).cmp(&(!first(&b.sensitivity), &b.unit)));
     ApprovalDiff { options, removes }
 }
 
@@ -89,7 +98,9 @@ mod tests {
         assert!(d.options[1].sensitivity.contains(Sensitivity::Security));
         assert_eq!(d.options[1].old, Some(Value::Bool(true)));
         assert_eq!(d.options[1].new, Some(Value::Bool(false)));
-        assert_eq!(d.removes, vec![(sshd, Sensitivities::of(&[Sensitivity::Security]))]);
+        assert_eq!(d.removes.len(), 1);
+        assert_eq!(d.removes[0].unit, sshd);
+        assert_eq!(d.removes[0].kinds, ["Security"]);
         let l = d.lines();
         assert_eq!(l[0], "networking.wireguard.interfaces.wg0 added: on [External]");
         assert_eq!(l[1], "services.openssh.enable: true → false [Security]");

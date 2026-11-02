@@ -136,8 +136,17 @@ pub struct ApprovalDiff {
     /// Every option added, removed or changed; Security- and
     /// External-sensitive ones first, then by path.
     pub options: Vec<OptionChange>,
-    /// The units it would remove or stop, with their sensitivity.
-    pub removes: Vec<(UnitId, planarian_schema::Sensitivities)>,
+    /// The units it would remove or stop, with their sensitivity; Security-
+    /// and External-sensitive ones first.
+    pub removes: Vec<RemovedUnit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovedUnit {
+    pub unit: UnitId,
+    pub sensitivity: planarian_schema::Sensitivities,
+    /// The sensitivity by name ("Security", "External", ...), as shown.
+    pub kinds: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +156,25 @@ pub struct OptionChange {
     pub old: Option<Value>,
     pub new: Option<Value>,
     pub sensitivity: planarian_schema::Sensitivities,
+    /// The sensitivity by name ("Security", "External", ...), as shown.
+    pub kinds: Vec<String>,
+}
+
+/// A sensitivity by name, most significant first; "Routine" when it is
+/// nothing else.
+pub fn sensitivity_kinds(s: &planarian_schema::Sensitivities) -> Vec<String> {
+    use planarian_schema::Sensitivity;
+    let k: Vec<String> = [
+        (Sensitivity::Security, "Security"),
+        (Sensitivity::External, "External"),
+        (Sensitivity::UserData, "UserData"),
+        (Sensitivity::Core, "Core"),
+    ]
+    .into_iter()
+    .filter(|(x, _)| s.contains(*x))
+    .map(|(_, n)| n.to_string())
+    .collect();
+    if k.is_empty() { vec!["Routine".into()] } else { k }
 }
 
 impl ApprovalDiff {
@@ -158,8 +186,8 @@ impl ApprovalDiff {
     pub fn lines(&self) -> Vec<String> {
         let d = self;
         let mut out: Vec<String> =
-            d.options.iter().map(|o| format!("{} [{}]", change(o), kinds(&o.sensitivity))).collect();
-        out.extend(d.removes.iter().map(|(u, s)| format!("removes or stops {u} [{}]", kinds(s))));
+            d.options.iter().map(|o| format!("{} [{}]", change(o), o.kinds.join(", "))).collect();
+        out.extend(d.removes.iter().map(|r| format!("removes or stops {} [{}]", r.unit, r.kinds.join(", "))));
         out
     }
 
@@ -186,7 +214,7 @@ impl ApprovalDiff {
             });
         }
         if !d.removes.is_empty() {
-            let units: Vec<String> = d.removes.iter().map(|(u, _)| u.to_string()).collect();
+            let units: Vec<String> = d.removes.iter().map(|r| r.unit.to_string()).collect();
             parts.push(format!("removes or stops {}", units.join(", ")));
         }
         Some(parts.join("; "))
@@ -205,22 +233,6 @@ fn value(v: &Value) -> String {
         Value::Str(s) => s.clone(),
         Value::List(l) => format!("[{}]", l.iter().map(value).collect::<Vec<_>>().join(", ")),
     }
-}
-
-fn kinds(s: &planarian_schema::Sensitivities) -> String {
-    use planarian_schema::Sensitivity;
-    let mut k = vec![];
-    for (on, name) in [
-        (s.contains(Sensitivity::Security), "Security"),
-        (s.contains(Sensitivity::External), "External"),
-        (s.contains(Sensitivity::UserData), "UserData"),
-        (s.contains(Sensitivity::Core), "Core"),
-    ] {
-        if on {
-            k.push(name);
-        }
-    }
-    if k.is_empty() { "Routine".into() } else { k.join(", ") }
 }
 
 fn change(o: &OptionChange) -> String {
