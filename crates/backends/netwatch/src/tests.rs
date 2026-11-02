@@ -173,7 +173,7 @@ mod parsing {
         let mut a = ((4 + v.len()) as u16).to_ne_bytes().to_vec();
         a.extend(ty.to_ne_bytes());
         a.extend(v);
-        while a.len() % 4 != 0 {
+        while !a.len().is_multiple_of(4) {
             a.push(0);
         }
         a
@@ -258,7 +258,7 @@ mod parsing {
         assert!(matches!(parse(&msg(HOOK_NFNETLINK, newrule, 0x1, &[0u8; 4]), &owner(), &names), Parsed::Changes(_)));
         let getrule = (10u16 << 8) | 7;
         assert_eq!(parse(&msg(HOOK_NFNETLINK, getrule, 0x301, &[0u8; 4]), &owner(), &names), Parsed::Nothing);
-        let ctnetlink = (1u16 << 8) | 0;
+        let ctnetlink = 1u16 << 8;
         assert_eq!(parse(&msg(HOOK_NFNETLINK, ctnetlink, 0x1, &[0u8; 4]), &owner(), &names), Parsed::Nothing);
     }
 
