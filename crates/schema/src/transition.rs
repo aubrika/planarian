@@ -220,6 +220,13 @@ pub struct DerivedFacts {
     /// decision, Nov 2).
     #[serde(default)]
     pub restarts_failed_unit: bool,
+    /// The sensitivity of the units a generation transition would remove or
+    /// stop: present now and absent from the target's manifest, or stopped by
+    /// its activation. A Rollback that takes away a Security- or
+    /// External-sensitive unit (a VPN) asks (§11 Rollback row; owner
+    /// decision, Nov 2). Empty for every other transition.
+    #[serde(default)]
+    pub removes_sensitivity: Sensitivities,
     pub caller: Actor,
     pub config_diff: Option<ConfigDiff>,
 }

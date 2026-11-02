@@ -592,7 +592,12 @@ pub open spec fn base_spec(i: Input) -> Decision {
                 Tier::Tested,
             ),
         ),
-        Transition::Rollback => allow(ask_if(sec_or_ext(f.sensitivity), Tier::Runtime)),
+        // §11: a Rollback asks for what it would take away, not for what it
+        // restarts. Security- or External-sensitive options it would restore
+        // ask through I11 (any non-Routine option in its diff); a Security- or
+        // External-sensitive unit it would remove or stop asks here (owner
+        // decision, Nov 2).
+        Transition::Rollback => allow(ask_if(sec_or_ext(f.removes_sensitivity), Tier::Runtime)),
         Transition::LoadModel(m) => if has_model(i.tables.model_catalog@, m) {
             allow(Tier::Tested)
         } else {
@@ -827,7 +832,7 @@ fn base_tier(i: &Input) -> (r: Decision)
             };
             allow_exec(ask_if_exec(!vetted_exec(*to, i.known_good, i.live_tested) || mismatched, Tier::Tested))
         },
-        Transition::Rollback => allow_exec(ask_if_exec(sec_or_ext_exec(&f.sensitivity), Tier::Runtime)),
+        Transition::Rollback => allow_exec(ask_if_exec(sec_or_ext_exec(&f.removes_sensitivity), Tier::Runtime)),
         Transition::LoadModel(m) => if contains_model(&i.tables.model_catalog, m) {
             allow_exec(Tier::Tested)
         } else {

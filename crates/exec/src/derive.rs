@@ -177,6 +177,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         below_security_floor: false,
         restores_unattributed_stop: false,
         restarts_failed_unit: false,
+        removes_sensitivity: Default::default(),
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
         caller: i.caller.clone(),
@@ -269,6 +270,21 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
                 f.sensitivity = f.sensitivity.union(&Sensitivities::of(&[Sensitivity::Security]));
                 f.touches_manifest = true;
             }
+            // What the transition takes away (§11 Rollback row): units present
+            // now and absent from the target, and units its activation stops.
+            let mut removed: Vec<UnitId> =
+                base_m.units.keys().filter(|u| !cand_m.units.contains_key(*u)).cloned().collect();
+            removed.extend(
+                base_m
+                    .user_units
+                    .iter()
+                    .filter(|b| !cand_m.user_units.iter().any(|c| c.id == b.id))
+                    .map(|b| b.id.clone()),
+            );
+            if let Some(a) = i.activation {
+                removed.extend(a.stop.iter().cloned());
+            }
+            f.removes_sensitivity = unit_facts(&removed, &all_defs, &services, |_| false).0;
             f.affected_units = unit_set(affected);
             f.config_diff = (!config.options.is_empty()).then_some(config);
         }
