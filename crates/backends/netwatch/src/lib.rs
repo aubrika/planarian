@@ -111,8 +111,11 @@
 //! Probes: `rtnetlink_rcv_msg`, `nf_setsockopt` and `genl_rcv_msg` are built
 //! in, so fentry (they need vmlinux's BTF); `nfnetlink_rcv_msg` and
 //! `nfnetlink_rcv_batch` are in the `nfnetlink` module (`=m` on NixOS
-//! kernels), so kprobes by symbol, which need the module loaded first: the
-//! unit starts after `systemd-modules-load`, which loads it
+//! kernels), so kprobes by symbol, which need the module loaded: the
+//! initrd loads it (`boot.kernelModules`), since netwatch starts early in
+//! `sysinit.target`, before every network tool and ordered after nothing
+//! (lane-nix, Nov 2). If it is not loaded yet, the attach is a kernel
+//! refusal and is retried, so the watch recovers once it is
 //! (`loader::PROBES`).
 //!
 //! **Not yet observed** (docs/bypasses.md, temporary): DNS servers set
