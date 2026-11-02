@@ -31,6 +31,10 @@ let
     peer = { priv = "cNk4txfT3ovozycRTDaecu2vEpRnGpg4406CWwi+nXU="; pub = "l7HFMh19jc6/K32cwArdHyKr/tgskXKDvmM3wutKvA0="; };
   };
   port = 51820;
+  # An address beyond the LAN, held by the peer: what a full tunnel exists
+  # to carry. The machine's plain default route reaches it too (via the
+  # peer on the LAN), so with wg0 gone only the hold keeps it from leaving.
+  upstream = "198.51.100.1";
   # The machine's tunnel up, after wireguard-go has made wg0 (its
   # ExecStartPost); module-eval reads this text.
   machineUp = endpoint: ''
@@ -48,7 +52,7 @@ let
   '';
 in
 {
-  inherit machineUp;
+  inherit machineUp upstream;
   machineAddress = "10.77.0.1";
   peerAddress = "10.77.0.2";
   inherit port;
@@ -109,6 +113,10 @@ in
     # which the crash subtest does to wg0; the tunnel's address is the
     # unit's own (ExecStartPost), so its footprint carries it.
     networking.dhcpcd.denyInterfaces = [ "wg*" ];
+    # The plain default route, via the peer on the LAN (below dhcpcd's on
+    # the user network): the tunnel's /1 routes are more specific while it
+    # is up; with wg0 gone, upstream would leave this way, unless held.
+    networking.defaultGateway = { address = endpoint; interface = "eth1"; metric = 10; };
 
     services.planarian.units.wireguard-gym = {
       sensitivity = [ "Security" "External" ];
@@ -127,6 +135,7 @@ in
     # The tunnel's upstream: what the machine sends through it is forwarded
     # and masqueraded out of the peer's other interfaces.
     boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
+    networking.interfaces.lo.ipv4.addresses = [ { address = upstream; prefixLength = 32; } ];
     networking.nftables.enable = true;
     networking.nftables.tables.wg-gym-nat = {
       family = "ip";
