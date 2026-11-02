@@ -120,6 +120,20 @@ pkgs.testers.runNixOSTest {
         machine.succeed("${nft} list table inet nwnft")
         protecting("nw-nft", "yes")
 
+    with subtest("(g) netwatch killed and restarted: what was protecting still reads protecting"):
+        # A restart sees existing state it did not watch being made; a tool
+        # that was protecting must not come back as `protecting no` (fail
+        # closed: a change it cannot attribute counts as protecting).
+        n0 = int(machine.succeed("systemctl show -P NRestarts planarian-netwatch.service").strip())
+        _, t0 = machine.succeed(f"cat {FP}/.watch").split()[:2]
+        machine.succeed("systemctl kill --signal=SIGKILL planarian-netwatch.service")
+        machine.wait_until_succeeds(
+            f"[ $(systemctl show -P NRestarts planarian-netwatch.service) -gt {n0} ] && systemctl is-active planarian-netwatch.service", timeout=60)
+        machine.wait_until_succeeds(f"grep -q '^attached ' {FP}/.watch && [ $(awk '{{print $2}}' {FP}/.watch) -gt {t0} ]", timeout=60)
+        for u in ["nw-route", "nw-legacy", "nw-nft"]:
+            protecting(u, "yes")
+        assert "iface nwdummy0" in footprint("nw-route")
+
     with subtest("(f) a stopped watch goes stale, and a failing tool that was not protecting is held"):
         # Stopped, not killed: a killed watcher may be restarted at once, and
         # what is under test is a watch that is no longer refreshed.
