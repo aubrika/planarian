@@ -213,8 +213,18 @@ in
       wantedBy = [ "multi-user.target" ];
       # BindsTo, not Requires: a required unit that fails (rather than is
       # stopped) leaves its dependents up, which would read as ready with
-      # planariad dead. Restarts within the budget keep planariad activating
-      # (RestartMode=direct), so they do not take the target down.
+      # planariad dead. Every exit of planariad takes the target down, a
+      # restart within the budget included: RestartMode=direct skips only the
+      # failed state and OnFailure= (so Crashed waits for the budget), not
+      # BindsTo=. The declared agent units (Requires= on the target) stop
+      # with it; the launched agents' slice is only ordered after it. The
+      # target, with planarian-posture-lift, comes back once planariad is
+      # active again (its Wants=). An in-budget crash raises no failure
+      # class by itself. Absent follows any stop of planariad outside a
+      # shutdown, `systemctl restart` included (ExecStopPost sees result
+      # `success`), and lifts once it is ready again. (VM run 41288596484:
+      # vm-posture's SIGSEGVs; crash-slow-worker-overlap's SIGKILL, then a
+      # restart of the restarting unit.)
       bindsTo = [ "planariad.service" ];
       after = [ "planariad.service" ];
       unitConfig.StopWhenUnneeded = false;
