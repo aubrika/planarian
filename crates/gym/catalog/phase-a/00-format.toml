@@ -47,6 +47,9 @@
 #   no_incident_on      no incident opened for these units
 #   interlock           "set" | "clear" at the end of the window
 #   reports             console/report items that must be emitted
+#   holds_seen          units whose traffic was held at any time in the window (§12d),
+#                       exactly ([] = none ever held)
+#   holds_at_end        units still held at the end, exactly
 #   invariants          invariants this case specifically exercises (see GLOBAL)
 #   metrics             numeric bounds (restarts per unit, attempts, ...)
 #   [[...txn]]          a transaction that must (count >= 1) or must not
@@ -126,6 +129,17 @@
 #   logout {uid}
 #   reboot
 #   advance_clock {by}                       fake only
+#   footprint {unit, change, steers, interface?}
+#                                            fake only (§12d): the kernel attributes a
+#                                            change to `unit` ("unattributed": to no
+#                                            unit). change: interface | route | rule |
+#                                            dns | proxy | firewall; steers: whether it
+#                                            currently steers traffic (a default or
+#                                            all-covering route, a catch-all rule, DNS
+#                                            on its interface, the proxy, a dropping or
+#                                            redirecting firewall rule)
+#   footprint_stale {unit}                   fake only: that unit's footprint is stale
+#   netwatch {state}                         fake only: state = attach-failed
 #   cli {argv, actor}                        `planarian ...` over the daemon socket
 #   ask {phrase, actor}
 #   approve_pending {actor, via}             via: tty (Phase A approval path)
@@ -192,6 +206,14 @@ purpose = "Routine; restart_disruption ConnectivityLoss (fake harness only so fa
 [[fixture]]
 unit = "service:gym-sync"
 purpose = "Routine; restart_disruption DataInterruption (fake harness only so far; C10)."
+
+[[fixture]]
+unit = "service:gym-netd"
+purpose = "A network tool by its systemd configuration (CAP_NET_ADMIN), whose name matches nothing; Routine; a SystemdActive probe (§12d classifier cases; fake only so far)."
+
+[[fixture]]
+unit = "service:gym-syncd"
+purpose = "A sync daemon that is a network tool by its systemd configuration (root, no capability bounding set) and steers no traffic; Routine; a SystemdActive probe (§12d classifier cases; fake only so far)."
 
 [[fixture]]
 unit = "device:snd-hda0"
