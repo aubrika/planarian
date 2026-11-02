@@ -210,7 +210,7 @@ assert builtins.all (x: x) checks;
 pkgs.runCommand "planarian-module-eval.json" {
   export = builtins.toJSON export;
   passAsFile = [ "export" ];
-  nativeBuildInputs = [ pkgs.gnused ];
+  nativeBuildInputs = [ pkgs.gnused pkgs.gawk pkgs.diffutils ];
 } ''
   root=$PWD/run
   sed "s|/run/planarian|$root|g" ${builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart)} > hold
@@ -240,5 +240,25 @@ pkgs.runCommand "planarian-module-eval.json" {
   echo "$((wall - 1)) $((up + 600))" > $R/u;                expect 0 "an expired release (wall clock) holds"
   echo "$((wall + 600)) $((up - 1))" > $R/u;                expect 0 "an expired release (boottime, a clock step) holds"
   echo boot > $R/u;                                         expect 1 "a release until boot skips"
+  echo "$((wall + 600))" > $R/u;                            expect 0 "a one-number marker (no boottime deadline) holds"
+  echo garbage > $R/u;                                      expect 0 "a garbage marker holds"
+  : > $R/u;                                                 expect 0 "an empty marker holds"
+  echo "$((wall + 600)) $((up + 600)) x" > $R/u;            expect 0 "a marker with a third field holds"
+  rm $R/u;                                                  expect 0 "no marker: the footprint decides (protecting yes holds)"
+  # The administrator snapshot's parsing (#36), on `ss` lines: the built
+  # script's own awk program, cut out of it. A dual-stack sshd's IPv4 peer
+  # ([::ffff:a.b.c.d]) is IPv4; a native IPv6 flow stays IPv6; a process
+  # outside the administrators' sessions is not taken.
+  a=$(grep -n 'ss -tunpH state established' hold | cut -d: -f1)
+  b=$(grep -n '>> "$dir/.admin"' hold | head -n1 | cut -d: -f1)
+  sed -n "$((a + 1)),''${b}p" hold | sed '$s/}'"'"' >> .*/}/' > snapshot.awk
+  printf '%s\n' \
+    'tcp 0 0 [::ffff:192.168.1.1]:22 [::ffff:192.168.1.2]:40000 users:(("sshd-session",pid=7,fd=4))' \
+    'tcp 0 0 [2001:db8::1]:22 [2001:db8::9]:40001 users:(("sshd-session",pid=7,fd=5))' \
+    'tcp 0 0 10.0.2.15:22 10.0.2.2:40002 users:(("sshd-session",pid=8,fd=5))' \
+    | awk -v pids=" 7 " -f snapshot.awk > snapshot.out
+  printf '4 tcp 192.168.1.1 22 192.168.1.2 40000\n6 tcp 2001:db8::1 22 2001:db8::9 40001\n' > snapshot.want
+  diff snapshot.want snapshot.out
+  echo "ok: the administrator snapshot (mapped IPv4, native IPv6, a non-administrator left out)"
   cp $exportPath $out
 ''
