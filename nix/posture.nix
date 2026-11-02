@@ -216,10 +216,12 @@ in
       # planariad dead. Every exit of planariad takes the target down, a
       # restart within the budget included: RestartMode=direct skips only the
       # failed state and OnFailure= (so Crashed waits for the budget), not
-      # BindsTo=. The declared agent units (Requires= on the target) stop
-      # with it; the launched agents' slice is only ordered after it. The
-      # target, with planarian-posture-lift, comes back once planariad is
-      # active again (its Wants=). An in-budget crash raises no failure
+      # BindsTo= (observed on systemd 260.5, the pinned one; the man page
+      # reads otherwise). The declared agent units require it (below), and
+      # launched agents each require it (`start_agent`), so they stop with
+      # it too; the slice itself is only ordered after it. The target, with
+      # planarian-posture-lift, comes back once planariad is active again
+      # (its Wants=). An in-budget crash raises no failure
       # class by itself. Absent follows any stop of planariad outside a
       # shutdown, `systemctl restart` included (ExecStopPost sees result
       # `success`), and lifts once it is ready again. (VM run 41288596484:
