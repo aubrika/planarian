@@ -311,3 +311,22 @@ Read #35 and §12d on #34's branch (`ccr-c64ddb68-a5g3k5`), `nix/module.nix`, `n
 | OnFailure= | `systemd.services.<x>.onFailure` would define a stub unit for a declared unit the system does not define (P13's lesson) | drop-ins in a package, `<unit>.service.d/50-planarian-hold.conf`, inert for an undefined unit |
 | WireGuard fixture | NixOS's wg-quick units are oneshots: nothing to kill, and a kill would not fail them | `wireguard-gym`, a wireguard-go daemon unit to the upstream node, for `netsec-*` entries only (no other entry gains a watched unit) |
 | Owner decisions (2 Nov, through the coordinator) | The tunnel's own traffic passes the hold (a kill switch's default), so a Readiness probe across the tunnel can lift it. Which units hold: a classifier of units whose failure would expose unprotected traffic or endanger privacy, design pending; no name list | `holdAllowsOwnInterface` on by default (internal), per-unit `holdInterfaces`; the fixture's probe crosses the tunnel again. `isNetworkSecurity` stays the one switch for the classifier; until then the fixture is tagged Security and External explicitly |
+
+## lane-daemon: #35 part 1, network security fails closed (§12d, the daemon's half), 2 Nov
+
+Built on lane-nix's `lane-nix/network-hold` (#36, `3530716`: the hold unit and
+script, `OnFailure=`, the export's `holds`/`hold_allow`, and the reviewer's
+`vm-netsec`) and #34 (`2ab358b`: §12d's text, `restarts_held_unit` in
+policy). Grants (coordinator, Nov 2): the hold calls in `schema::backend`,
+`backends/linux` and the fake; the `HoldApplied`/`HoldLifted` records and the
+fold in `crates/txn`; `UnitDef.holds`/`hold_allow`/`hold_interfaces`; the
+interim `restarts_held_unit` rule in derive; `vm.yml`'s `vm-netsec` line.
+
+| Item | At the base | Work |
+| --- | --- | --- |
+| The daemon knows which units hold | `UnitDef` had no such field; the export carried `holds` | `UnitDef.holds`, `hold_allow`, `hold_interfaces` (serde default; read straight from the export) |
+| A held unit restarts at once | policy reads `restarts_held_unit`; derive always set it `false` | `derive::stop_fact`: `holds && no override && (already failed \|\| an unattributed stop)`, marked INTERIM (B-21) |
+| Apply, alarm, lift, notify | nothing in the daemon | `Core::network_holds` each tick, before incidents open: journal `HoldApplied` (`OnFailure` if the host already holds it, else `Daemon`, then `hold`), alarm once; journal `HoldLifted` and `lift_hold` once Running with every Readiness probe passing; when repair has given up, the hold stays and administrators are told once |
+| The hold survives planariad | — | `Ledger::holds()`, from an append-only `hold_events` log (no new trusted helper), is the source of truth; reconciled with the host's `held` each tick, failing closed |
+| `planarian hold release` | — | an attested `Override` on `planarian-hold@<unit>` through the executor; the hold unit has a never-expected def carrying the held unit's sensitivity, so a non-administrator's release is AskFirst with an Administrator approver; on commit, journal `HoldLifted` and write the release marker (`boot` by default) |
+| Bypass register | — | X-13 (accepted): a posture response without `Prepared` or a lease; I15, I21 |

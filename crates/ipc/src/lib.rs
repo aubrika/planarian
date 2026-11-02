@@ -43,6 +43,13 @@ pub enum Request {
     LiftOverride {
         unit: UnitId,
     },
+    /// §12d `planarian hold release <unit> [--until]`: lift a network
+    /// hold, as an attested override on its hold unit. Administrator
+    /// authority; a non-administrator's release asks an administrator.
+    HoldRelease {
+        unit: UnitId,
+        until: Until,
+    },
     /// A `StopUnit` from the CLI; rewritten to `StopAndSuppress { NextBoot }` (§14).
     Stop {
         unit: UnitId,

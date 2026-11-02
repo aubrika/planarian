@@ -514,6 +514,26 @@ pub struct UnitDef {
     /// person's intent. Backup, sync and the desktop's own units.
     #[serde(default)]
     pub stops_are_faults: bool,
+    /// §12d *Network security fails closed*: its failure holds the machine's
+    /// traffic. Computed by the module (nix/module.nix `isNetworkSecurity`),
+    /// exported, never a manifest option. Interim (B-21): the netwatch
+    /// footprint replaces it.
+    #[serde(default)]
+    pub holds: bool,
+    /// What the hold still lets it reach (the manifest's `holdAllow`).
+    #[serde(default)]
+    pub hold_allow: Vec<HoldEndpoint>,
+    /// Its own interfaces, which the hold passes (`holdInterfaces`).
+    #[serde(default)]
+    pub hold_interfaces: Vec<String>,
+}
+
+/// An endpoint a held unit still needs to reconnect (§12d `holdAllow`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct HoldEndpoint {
+    pub address: String,
+    pub port: u16,
+    pub protocol: String,
 }
 
 pub type UnitDefs = BTreeMap<UnitId, UnitDef>;

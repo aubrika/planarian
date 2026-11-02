@@ -1415,3 +1415,162 @@ fn a_rebound_approval_that_no_longer_asks_is_logged_as_a_submission() {
     assert!(!r.core.log.iter().any(|x| x.approver.is_some()), "no approval record: {:#?}", r.core.log);
     assert!(r.core.parked_agents.is_empty());
 }
+
+// ---------- §12d network security fails closed (#35 part 1) ----------
+
+/// sshd as a network-security unit (interim: the module's `holds`), with the
+/// fake's OnFailure= stand-in holding it when it fails.
+fn rig_with_held_sshd(holds: bool) -> Rig {
+    let store = MemStore::new(8 << 20);
+    let fake = gym_world(store.clone());
+    let sshd = UnitId::service("sshd");
+    {
+        let mut w = fake.w();
+        for g in w.gens.values_mut() {
+            if let Some(d) = g.eval.units.get_mut(&sshd) {
+                d.holds = holds;
+            }
+        }
+        if let Some(d) = w.base_units.get_mut(&sshd) {
+            d.holds = holds;
+        }
+        if holds {
+            w.hold_on_failure.insert(sshd);
+        }
+        w.alive.insert(100);
+    }
+    let mut j = Journal::open(store).unwrap();
+    j.append(fake.w().now, Record::KnownGood(GenerationId(1))).unwrap();
+    let core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config());
+    let mut r = Rig { fake, core };
+    r.ticks(2);
+    r
+}
+
+fn alarms(r: &Rig) -> usize {
+    r.core
+        .notices
+        .iter()
+        .filter(|n| n.contains("stopped unexpectedly. Network traffic is blocked until it is back."))
+        .count()
+}
+
+/// §12d: a crash holds traffic (OnFailure=), the daemon journals it, alarms
+/// once and restarts the unit at once (`restarts_held_unit`, §11), and lifts
+/// the hold once it is Running and its Readiness probes pass. Without the
+/// hold, the same crash of a Security unit asks.
+#[test]
+fn a_held_unit_crash_holds_restarts_at_once_and_lifts() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().signal(&sshd, 11);
+    assert!(r.fake.w().held.contains(&sshd), "OnFailure= held it");
+    r.ticks(1);
+    assert!(r.core.ledger().holds().contains(&sshd), "journaled");
+    assert_eq!(alarms(&r), 1, "{:?}", r.core.notices);
+    r.ticks(10);
+    assert!(r.core.ex.parked.is_empty(), "restarted without asking: {:?}", r.core.notices);
+    assert_eq!(r.status("service:sshd"), UnitStatus::Running);
+    assert!(!r.fake.w().held.contains(&sshd), "lifted once back");
+    assert!(!r.core.ledger().holds().contains(&sshd));
+    assert_eq!(alarms(&r), 1, "one alarm: {:?}", r.core.notices);
+
+    // Not a network-security unit: the same crash of a Security unit asks.
+    let mut r = rig_with_held_sshd(false);
+    r.fake.w().signal(&sshd, 11);
+    r.ticks(10);
+    assert!(
+        r.core.ex.parked.values().any(|p| p.proposal.transition == Transition::RestartUnit(sshd.clone())),
+        "asks: {:?}",
+        r.core.notices
+    );
+    assert!(r.core.ledger().holds().is_empty() && alarms(&r) == 0);
+}
+
+/// §12d: a stop outside Planarian that is not attributed is the daemon's to
+/// hold (systemd's OnFailure= does not fire on a clean stop); `planarian
+/// stop`, an attested override, holds nothing.
+#[test]
+fn an_unattributed_stop_is_held_by_the_daemon_and_an_attested_one_is_not() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().stop_out_of_band(&sshd);
+    assert!(!r.fake.w().held.contains(&sshd), "OnFailure= does not fire");
+    r.ticks(1);
+    assert!(r.fake.w().calls.iter().any(|c| c.call == "hold(service:sshd)"), "the daemon held it");
+    assert!(r.core.ledger().holds().contains(&sshd));
+    r.ticks(10);
+    assert_eq!(r.status("service:sshd"), UnitStatus::Running);
+    assert!(!r.fake.w().held.contains(&sshd) && r.core.ledger().holds().is_empty(), "lifted");
+
+    let mut r = rig_with_held_sshd(true);
+    let resp = r.core.handle(ADMIN, Request::Stop { unit: sshd.clone() });
+    assert!(matches!(resp, Response::Done { .. }), "{resp:?}");
+    r.ticks(5);
+    assert!(r.fake.w().held.is_empty() && r.core.ledger().holds().is_empty(), "an attested stop holds nothing");
+    assert_eq!(alarms(&r), 0);
+}
+
+/// §12d: repair fails every attempt: the hold stays, administrators are
+/// notified once, and a restart of planariad keeps it (the journal's holds
+/// are the source of truth; a disagreement with the host fails closed).
+#[test]
+fn a_failed_repair_keeps_the_hold_and_notifies_across_a_restart() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().units.get_mut(&sshd).unwrap().fail_on_start = true;
+    r.fake.w().signal(&sshd, 11);
+    r.ticks(200);
+    assert!(r.fake.w().held.contains(&sshd), "the hold stays");
+    let told: Vec<&String> =
+        r.core.notices.iter().filter(|n| n.contains("service:sshd") && n.contains("needs a person")).collect();
+    assert!(!told.is_empty(), "{:?}", r.core.notices);
+    assert!(r.core.notices.iter().any(|n| n.contains("administrator") && n.contains("hold release")));
+
+    // The host loses its hold state (as if /run were cleared); the daemon
+    // restarts; the journal's hold puts it back.
+    r.fake.w().held.clear();
+    let store = r.fake.store.clone();
+    r.fake.w().alive.insert(101);
+    r.core = Core::start(
+        Journal::open(store).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO },
+        config(),
+    );
+    r.ticks(2);
+    assert!(r.fake.w().held.contains(&sshd), "held again: fail closed");
+    assert_eq!(alarms(&r), 0, "no new alarm for the same hold");
+}
+
+/// §12d: `planarian hold release` is an attested override on the hold
+/// unit. A non-administrator's release asks for an administrator and holds;
+/// an administrator's lifts it and marks the release (until the next boot
+/// by default).
+#[test]
+fn hold_release_needs_an_administrator() {
+    let sshd = UnitId::service("sshd");
+    let mut r = rig_with_held_sshd(true);
+    r.fake.w().units.get_mut(&sshd).unwrap().fail_on_start = true;
+    r.fake.w().signal(&sshd, 11);
+    r.ticks(2);
+    assert!(r.fake.w().held.contains(&sshd));
+
+    let release = || Request::HoldRelease { unit: UnitId::service("sshd"), until: Until::NextBoot };
+    let resp = r.core.handle(ALICE, release());
+    let Response::NeedsApproval { why, .. } = &resp else { panic!("asks: {resp:?}") };
+    let text = format!("{resp:?} {why}").to_lowercase();
+    assert!(text.contains("administrator"), "{text}");
+    r.ticks(2);
+    assert!(r.fake.w().held.contains(&sshd), "still held while it asks");
+
+    let resp = r.core.handle(ADMIN, release());
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert!(!r.fake.w().held.contains(&sshd), "lifted");
+    assert_eq!(r.fake.w().hold_released.get(&sshd), Some(&None), "released until the next boot");
+    r.ticks(5);
+    assert!(!r.fake.w().held.contains(&sshd), "not held again while released, though still failed");
+
+    let resp = r.core.handle(ADMIN, Request::HoldRelease { unit: UnitId::service("gym-web"), until: Until::NextBoot });
+    assert!(matches!(resp, Response::Error { .. }), "no hold to release: {resp:?}");
+}

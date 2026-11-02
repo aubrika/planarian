@@ -414,6 +414,14 @@ pub fn stop_fact(f: &mut DerivedFacts, t: &Transition, s: &SystemState, defs: &U
         && s.override_of(u).is_none()
         && s.expected(u, defs)
         && defs.get(u).is_some_and(|d| d.desired.status == DesiredStatus::Running);
+    // §11, §12d: a network-security unit that has failed, or been stopped
+    // outside Planarian and not attributed, is restarted at once, whatever
+    // its sensitivity: its traffic is held while it is down, so the restart
+    // ends an outage and exposes nothing. INTERIM (B-21): "network-security"
+    // is the module's exported `holds`; the netwatch footprint replaces it.
+    f.restarts_held_unit = defs.get(u).is_some_and(|d| d.holds)
+        && s.override_of(u).is_none()
+        && (already_failed(s, defs, u) || f.restores_unattributed_stop);
 }
 
 /// §12e: whether the generation a transition goes to is below the security
