@@ -342,6 +342,97 @@ mod loader_checks {
         assert!(sock.recv(&mut buf).is_err(), "exactly once");
     }
 
+    /// An unusable object (here, not ELF) is the exit-1 path: `failed`,
+    /// READY=1 once, and an error, without asking the kernel or retrying.
+    #[test]
+    fn an_unusable_object_exits_after_failed_and_ready() {
+        use std::os::unix::net::UnixDatagram;
+        let d = tempfile::tempdir().unwrap();
+        let (fp, path) = (d.path().join("footprint"), d.path().join("notify"));
+        let (export, object) = (d.path().join("export.json"), d.path().join("netwatch.bpf.o"));
+        std::fs::write(&export, r#"{"networkTools": ["wg-quick-wg0"], "units": {}}"#).unwrap();
+        std::fs::write(&object, b"not an object").unwrap();
+        let sock = UnixDatagram::bind(&path).unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let r = crate::loader::run(&export, &object, &fp, Some(&path));
+        assert!(r.unwrap_err().contains("not an eBPF object"));
+        let watch = std::fs::read_to_string(fp.join(".watch")).unwrap();
+        assert!(watch.starts_with("failed ") && watch.contains("not an eBPF object"), "{watch}");
+        let mut buf = [0u8; 32];
+        let n = sock.recv(&mut buf).expect("READY=1 was sent");
+        assert_eq!(&buf[..n], b"READY=1");
+        assert!(sock.recv(&mut buf).is_err(), "exactly once");
+    }
+
+    /// What the kernel refuses is retried: each refusal is reported (the
+    /// caller writes `failed <reason>`, READY=1 the first time) and waited
+    /// out, until an attach succeeds.
+    #[test]
+    fn a_kernel_refusal_is_retried_until_it_attaches() {
+        use crate::loader::{Start, retry};
+        let mut tries = 0;
+        let (mut refused, mut waits) = (Vec::new(), 0);
+        let r = retry(
+            || {
+                tries += 1;
+                if tries < 3 {
+                    Err(Start::Kernel(format!("attach kprobe nfnetlink_rcv_msg: try {tries}")))
+                } else {
+                    Ok(tries)
+                }
+            },
+            |why| refused.push(why.to_string()),
+            || {
+                waits += 1;
+                true
+            },
+        );
+        assert_eq!(r, Ok(3));
+        assert_eq!(refused, ["attach kprobe nfnetlink_rcv_msg: try 1", "attach kprobe nfnetlink_rcv_msg: try 2"]);
+        assert_eq!(waits, 2);
+    }
+
+    /// An unusable result during retries ends them (exit 1), and a stop
+    /// while waiting ends them without another try.
+    #[test]
+    fn retries_end_on_an_unusable_object_or_a_stop() {
+        use crate::loader::{Start, retry};
+        let mut tries = 0;
+        let r: Result<(), _> = retry(
+            || {
+                tries += 1;
+                Err(if tries == 1 { Start::Kernel("refused".into()) } else { Start::Unusable("no LOST map".into()) })
+            },
+            |_| {},
+            || true,
+        );
+        assert_eq!(r, Err(Start::Unusable("no LOST map".into())));
+        assert_eq!(tries, 2);
+
+        let mut tries = 0;
+        let r: Result<(), _> = retry(
+            || {
+                tries += 1;
+                Err(Start::Kernel("refused".into()))
+            },
+            |_| {},
+            || false,
+        );
+        assert!(matches!(r, Err(Start::Kernel(_))));
+        assert_eq!(tries, 1, "no try after the stop");
+    }
+
+    /// The two nfnetlink functions are in a module, so kprobes; the
+    /// built-in ones stay fentry (coordinator, Nov 2).
+    #[test]
+    fn module_functions_are_kprobes() {
+        use crate::loader::{Kind, PROBES};
+        for (prog, func, kind) in PROBES {
+            let want = if func.starts_with("nfnetlink_") { Kind::KProbe } else { Kind::FEntry };
+            assert_eq!(kind, want, "{prog} ({func})");
+        }
+    }
+
     /// An empty or foreign object is refused before the kernel is asked.
     #[test]
     fn an_object_without_the_programs_is_refused() {
