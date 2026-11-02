@@ -348,6 +348,7 @@ let
     # hold still lets it reach.
     network_tool = u.kind == "service" && u.scope == "system" && isNetworkSecurity name u;
     hold_allow = map (a: { inherit (a) address port protocol; }) u.holdAllow;
+    hold_interfaces = u.holdInterfaces;
     stops_are_faults = !u.inferStops;
   };
 
