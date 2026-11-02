@@ -434,7 +434,12 @@ mod tests {
         }
 
         fn result() -> impl Strategy<Value = ProbeResult> {
-            prop_oneof![Just(ProbeResult::Pass), Just(ProbeResult::Timeout), "[xy]{1,2}".prop_map(ProbeResult::Fail)]
+            prop_oneof![
+                Just(ProbeResult::Pass),
+                Just(ProbeResult::Timeout),
+                Just(ProbeResult::Abandoned),
+                "[xy]{1,2}".prop_map(ProbeResult::Fail)
+            ]
         }
 
         prop_compose! {
