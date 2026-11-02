@@ -268,5 +268,24 @@ pkgs.runCommand "planarian-module-eval.json" {
   printf '4 tcp 192.168.1.1 22 192.168.1.2 40000\n6 tcp 2001:db8::1 22 2001:db8::9 40001\n' > snapshot.want
   diff snapshot.want snapshot.out
   echo "ok: the administrator snapshot (mapped IPv4, native IPv6, a non-administrator left out)"
+  # §12d: reapply fails closed when its table will not load (a stub nft,
+  # first on the script's PATH, fails the full load and records the next).
+  root=$PWD/run2 stub=$PWD/stub
+  mkdir -p $root/hold $stub
+  cat > $stub/nft <<STUB
+  #!${pkgs.runtimeShell}
+  n=\$(cat $stub/count 2>/dev/null || echo 0); n=\$((n + 1)); echo \$n > $stub/count
+  if [ "\$*" = "-f -" ]; then cat > $stub/load.\$n; [ \$n -ge 2 ] && exit 0; exit 1; fi
+  exit 0
+  STUB
+  chmod +x $stub/nft
+  sed -e "s|/run/planarian|$root|g" -e "s|^PATH=|PATH=$stub:|" ${builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart)} > hold2
+  chmod +x hold2
+  touch $root/hold/u
+  ./hold2 reapply
+  grep -q 'set allow4' $stub/load.1 || { echo "reapply did not try the full table first" >&2; exit 1; }
+  grep -q 'iif lo accept' $stub/load.2 && grep -q 'policy drop' $stub/load.2 && ! grep -q 'set allow4' $stub/load.2 \
+    || { echo "reapply did not fall back to the lock" >&2; exit 1; }
+  echo "ok: reapply with a failing table load holds everything but loopback"
   cp $exportPath $out
 ''
