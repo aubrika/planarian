@@ -653,7 +653,9 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                             // Backoff: the k-th gap between a repair incident's
                             // attempts is at least the k-th minimum. An AskFirst
                             // attempt is timed from its approval (the approved
-                            // execution's log record, the last for its txn, C18).
+                            // execution's log record, the last for its txn, C18),
+                            // not its proposal: it cannot run before a person
+                            // approves it, so backoff must not count that delay.
                             let mins: Vec<Millis> = spec.as_array().into_iter().flatten().filter_map(dur).collect();
                             let at: BTreeMap<TxnId, Timestamp> = e
                                 .log
