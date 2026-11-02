@@ -13,7 +13,16 @@
 let
   library = rustPlatform.rustLibSrc;
   vendorCrate = rustPlatform.importCargoLock { lockFile = "${src}/Cargo.lock"; };
-  vendorStd = rustPlatform.importCargoLock { lockFile = "${library}/Cargo.lock"; };
+  # A fixed-output vendor of the library's crates: read at build time, not
+  # at evaluation (importCargoLock would read the library's lockfile at
+  # evaluation, building rust-lib-src first, which an offline evaluation,
+  # e.g. the installer's, cannot). Pinned to the rustc at the pin; a rustc
+  # bump changes the hash and fails here until it is renewed.
+  vendorStd = rustPlatform.fetchCargoVendor {
+    src = library;
+    name = "rust-lib-src";
+    hash = "sha256-5oJ/mtsJW0R3F7jgxafP23+WMLkyMKu10De5WIzb7Ro=";
+  };
   rustcLlvm = lib.versions.major (rustc.llvm.version or rustc.llvmPackages.llvm.version);
   linkerLlvm = lib.versions.major (lib.findFirst (d: lib.hasPrefix "llvm-" (d.name or "")) { version = "none"; } (bpf-linker.buildInputs ++ bpf-linker.nativeBuildInputs)).version;
 in
@@ -38,7 +47,7 @@ stdenv.mkDerivation {
     # One vendor directory for the crate's and the library's dependencies.
     mkdir vendor
     lndir -silent ${vendorCrate} vendor
-    lndir -silent ${vendorStd} vendor
+    lndir -silent ${vendorStd}/source-registry-0 vendor
     mkdir -p .cargo
     cat > .cargo/config.toml <<CFG
     [source.crates-io]

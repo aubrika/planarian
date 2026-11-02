@@ -628,6 +628,11 @@ in
     # Before networking starts, so early changes are attributed. It writes
     # `.watch failed` when it stops or cannot attach (every network tool's
     # failure then holds), and is restarted.
+    # nfnetlink is a module (CONFIG_NETFILTER_NETLINK=m): until it is loaded
+    # its functions, and their BTF, do not exist, and netwatch cannot attach
+    # to them. Loaded at boot (systemd-modules-load, before sysinit.target),
+    # not by the first nftables use, which comes after netwatch.
+    boot.kernelModules = mkIf (cfg.package.netwatch or false) [ "nfnetlink" ];
     systemd.services.planarian-netwatch = mkIf (cfg.package.netwatch or false) {
       description = "Planarian: attribute network changes to the units that make them";
       wantedBy = [ "multi-user.target" ];
@@ -636,7 +641,7 @@ in
       # the attach and read as unattributed pre-attach steering, and every
       # network tool's failure would hold.
       before = [ "network-pre.target" "firewall.service" "nftables.service" ];
-      after = [ "sysinit.target" "systemd-tmpfiles-setup.service" ];
+      after = [ "sysinit.target" "systemd-tmpfiles-setup.service" "systemd-modules-load.service" ];
       unitConfig.DefaultDependencies = false;
       restartIfChanged = false;
       serviceConfig = {
