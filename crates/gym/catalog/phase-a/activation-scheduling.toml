@@ -118,3 +118,128 @@ window = "20m"
 [fault.required_post]
 metrics = { frame_time_p99 = "no significant difference vs baseline", deferred_items_ran = 3 }
 notices_count = { match = "pipewire", count = 1 }
+
+# §12f *Rollbacks* (owner decision, Oct 31; #9). The committed update is
+# alice's font scale; its flaw shows only once it is live
+# (`break_in_generation`). In-place repair cannot fix a unit broken by its
+# generation, so the diagnoser's last candidate is a Rollback to known_good
+# (the base: a live commit is live_tested, not boot-confirmed).
+[[fault]]
+id = "rollback-repair-foreground-dependency"
+family = "activation-scheduling"
+summary = "alice's font-scale update commits; then, while a game holds Foreground in her session, the new generation's NetworkManager fails and restarts cannot fix it. Wi-Fi is something foreground work depends on, so the diagnoser's Rollback is a repair: it runs at once, during the workload, never parked in Built for a window, and Wi-Fi is back. One notice about it."
+spec = ["§12f Rollbacks", "§12f quiet mode", "§13 ordering", "§15 v4.6"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" },
+  { raw = "wait", for = { journal = "Committed" } },
+  { raw = "foreground", session = "s1", on = true },
+  { raw = "wait", for = "1m" },
+]
+inject = { raw = "break_in_generation", unit = "service:NetworkManager", generation = "candidate" }
+# Foreground holds for the whole window: whatever runs, runs during it.
+after = [{ raw = "wait", for = "15m" }]
+window = "16m"
+
+[fault.required_post]
+units = { "service:NetworkManager" = "Running" }
+generation = "known_good"
+notices_count = { match = "NetworkManager", count = 1 }
+
+[[fault.required_post.txn]]
+transition = "ApplyChange"
+terminal = "Committed"
+
+# "is not parked in Built": no waiting for a window between Built and Activating.
+[[fault.required_post.txn]]
+transition = "Rollback"
+source = "diagnoser"
+terminal = "Committed"
+
+[[fault.required_post.incident]]
+target = "service:NetworkManager"
+
+[[fault]]
+id = "rollback-repair-foreground-unrelated"
+family = "activation-scheduling"
+summary = "The same committed update, but the new generation breaks the print service, which foreground work does not depend on. While the game holds Foreground the repair is deferred in fact: no Rollback (and no other repair) is submitted, no transaction is opened, and the incident's budget does not move. When the game ends the deferred repair runs: in-place repair fails, the Rollback runs and the printer is back."
+spec = ["§12f Rollbacks", "§12f quiet mode", "§13", "§15 v4.6"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" },
+  { raw = "wait", for = { journal = "Committed" } },
+  { raw = "foreground", session = "s1", on = true },
+  { raw = "wait", for = "1m" },
+]
+inject = { raw = "break_in_generation", unit = "service:gym-printer", generation = "candidate" }
+after = [
+  { raw = "wait", for = "20m" },
+  { raw = "foreground", session = "s1", on = false },
+  { raw = "wait", for = "15m" },
+]
+window = "36m"
+
+[fault.required_post]
+units = { "service:gym-printer" = "Running" }
+generation = "known_good"
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+source = "diagnoser"
+terminal = "Committed"
+
+# The diagnoser does not submit it while Foreground holds: no transaction
+# opened, finished or parked.
+[[fault.required_post.txn]]
+transition = "Rollback"
+count = 0
+while_foreground = "s1"
+
+# Nor any other repair of this incident ("deferred in fact", §12f quiet mode).
+[[fault.required_post.txn]]
+source = "diagnoser"
+count = 0
+while_foreground = "s1"
+
+[[fault.required_post.incident]]
+target = "service:gym-printer"
+budget_steady_while_foreground = "s1"
+
+[[fault]]
+id = "rollback-repair-session-loss-asks"
+family = "activation-scheduling"
+summary = "alice's font-scale update commits; then the new generation breaks the print service and restarts cannot fix it. Switching back would also restart the display manager, which hosts her active session's compositor, so the diagnoser's Rollback would end her session: being a repair exempts it from waiting, never from asking. It is AskFirst (SessionLoss; the diagnoser is not the session's own user) and, with nobody approving, it never runs: the update stays live."
+spec = ["§12f Rollbacks", "§11 global floors", "§15 v4.6"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "session_login", uid = 1000, session = "s1", seat = "seat0" },
+  { transition = "ApplyChange", change = "font-scale", args = { scale = "1.25" }, source = "user", actor = "user:1000@s1" },
+  { raw = "wait", for = { journal = "Committed" } },
+]
+# The printer's in-place restart is Brief (Runtime), so the chain reaches the
+# Rollback; only the Rollback carries SessionLoss.
+inject = { raw = "break_in_generation", unit = "service:gym-printer", generation = "candidate", switch_restarts = ["service:display-manager"] }
+after = [{ raw = "wait", for = "15m" }]
+window = "16m"
+
+[fault.required_post]
+generation = "candidate"
+units = { "service:display-manager" = "Running" }
+
+[[fault.required_post.txn]]
+transition = "Rollback"
+source = "diagnoser"
+decision = "Allow(AskFirst)"
+facts = { disruption = "SessionLoss" }
+terminal = "pending"

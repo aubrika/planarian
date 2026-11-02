@@ -527,6 +527,22 @@ impl World {
     /// Send `sig` to a unit's main process, as `systemctl kill` does. SIGTERM,
     /// SIGINT, SIGHUP and SIGPIPE are clean exits to systemd (inactive); any
     /// other signal fails the unit.
+    /// A flaw in generation `g` that shows only once it is live: the unit
+    /// fails in `g` (and only there) from now on, and fails now if `g` runs.
+    pub fn break_in(&mut self, g: GenerationId, unit: &UnitId) {
+        let now = self.now;
+        if let Some(generation) = self.gens.get_mut(&g) {
+            generation.broken.insert(unit.clone());
+        }
+        if self.current == g
+            && let Some(sim) = self.units.get_mut(unit)
+        {
+            sim.observed = Observed::Failed(Reason::ExitCode(1));
+            sim.ended = Some(Ending::Exited(1));
+            sim.failed_at = Some(now);
+        }
+    }
+
     pub fn signal(&mut self, unit: &UnitId, sig: i32) {
         let now = self.now;
         if let Some(sim) = self.units.get_mut(unit) {

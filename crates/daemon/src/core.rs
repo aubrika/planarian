@@ -215,6 +215,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     quiet_queue: Vec<String>,
     /// Waiting generations interrupted by a restart, to prepare again (§12f).
     reprepare: Vec<(TxnId, Transition)>,
+    /// Generation transactions withdrawn from `Built` for a rollback about to
+    /// run (§12f, I6; owner decision, Nov 2), with when each began waiting,
+    /// to prepare again once no generation transaction is active.
+    withdrawn: Vec<(TxnId, Transition, Option<Timestamp>)>,
     /// From the executor log of earlier runs: each transaction's proposal and
     /// caller, so one prepared again keeps its source and caller (§12, C21).
     pub earlier: BTreeMap<TxnId, (Proposal, Actor)>,
@@ -382,6 +386,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             quiet: false,
             quiet_queue: vec![],
             reprepare: vec![],
+            withdrawn: vec![],
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
             generation_touched: false,
@@ -551,7 +556,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let pre = s.digest();
         let policy = self.ex.policy_version();
         let caller = authz.actor.clone();
+        let built = self.waiting_built();
         let result = self.ex.submit(p.clone(), authz.clone(), s, defs);
+        self.note_withdrawn(built);
         if let Some((facts, _)) = self.ex.last.clone() {
             self.touched.extend(facts.affected_units.iter().cloned());
             // §11: the affected sessions are notified either way.
@@ -653,6 +660,91 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.flush_writebacks();
         }
         result
+    }
+
+    /// Prepare again transactions interrupted before they mutated (by a
+    /// restart, or withdrawn for a repair rollback).
+    fn prepare_again(
+        &mut self,
+        list: Vec<(TxnId, Transition, Option<Timestamp>)>,
+        why: &str,
+        s: &SystemState,
+        defs: &UnitDefs,
+    ) {
+        for (id, t, since) in list {
+            // Its original source and caller (C21), so floors that depend on
+            // who asked (the own-session exemption) still apply; the daemon's
+            // own only when no record of it survives.
+            let (source, authz) = match self.earlier.get(&id).cloned() {
+                Some((p, caller @ Actor::User { .. })) => {
+                    let admin = caller.uid().is_some_and(|u| (self.admin_of)(u));
+                    (p.source, user_authorization(caller, admin))
+                }
+                Some((p, caller)) => (p.source, authorization_of(caller)),
+                None => (Source::Maintenance, authorization_of(Actor::Daemon)),
+            };
+            let incident = match &source {
+                Source::Diagnoser { incident } => Some(*incident),
+                _ => None,
+            };
+            let p = self.proposal(t.clone(), s, defs, source, format!("prepared again {why}"));
+            let r = self.submit(p, authz, s, defs);
+            // A diagnoser's repair that waits again keeps its incident with it.
+            if let (
+                Some(inc),
+                Submitted::Finished { txn, state: TxnState::Built, .. } | Submitted::Parked { txn, .. },
+            ) = (incident, &r)
+            {
+                self.incident_parked.insert(inc, *txn);
+            }
+            // A withdrawal never extends a change's parking limit (I12).
+            if let (Some(since), Submitted::Finished { txn, state: TxnState::Built, .. }) = (since, &r) {
+                self.ex.keep_waiting_since(*txn, since);
+            }
+            self.notice(format!("{}: prepared again {why}: {}", render::transition(&t), render::submitted_short(&r)));
+        }
+    }
+
+    /// Generation transactions waiting in `Built`, with when each began
+    /// waiting: what a rollback about to run would withdraw (§12f, I6).
+    fn waiting_built(&mut self) -> Vec<(TxnId, Transition, Option<Timestamp>)> {
+        let l = self.ledger();
+        l.live
+            .values()
+            .filter(|t| t.txn.transition.changes_generation() && t.txn.state == TxnState::Built)
+            .map(|t| (t.txn.id, t.txn.transition.clone(), self.ex.waiting_since(t.txn.id)))
+            .collect()
+    }
+
+    /// §12f, I6 (owner decision, Nov 2): a rollback of any source withdraws
+    /// what waits in `Built` at the moment it is about to run (admitted, and
+    /// approved if it asked; `exec::schedule`). Those of `before` the
+    /// executor withdrew are remembered, with their proposal, caller and
+    /// parking start, to prepare again once the rollback is terminal.
+    fn note_withdrawn(&mut self, before: Vec<(TxnId, Transition, Option<Timestamp>)>) {
+        if before.is_empty() {
+            return;
+        }
+        let l = self.ledger();
+        for (id, t, since) in before {
+            if l.terminal.get(&id).is_none_or(|x| x.state != TxnState::Rejected(RejectReason::Interrupted)) {
+                continue;
+            }
+            if !self.earlier.contains_key(&id) {
+                let asked = self.log.iter().chain(&self.awaiting_post).find(|r| {
+                    matches!(r.result, Submitted::Finished { txn, .. } | Submitted::Parked { txn, .. } if txn == id)
+                });
+                if let Some(r) = asked {
+                    self.earlier.insert(id, (r.proposal.clone(), r.caller.clone()));
+                }
+            }
+            self.notice(format!(
+                "{}: set aside for a rollback (transaction {}); it will be prepared again once the rollback is done",
+                render::transition(&t),
+                id.0
+            ));
+            self.withdrawn.push((id, t, since));
+        }
     }
 
     /// A generation transaction is live, in any state (I6: one waiting in
@@ -1082,25 +1174,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             return;
         }
 
-        for (id, t) in std::mem::take(&mut self.reprepare) {
-            // Its original source and caller (C21), so floors that depend on
-            // who asked (the own-session exemption) still apply; the daemon's
-            // own only when no record of it survives.
-            let (source, authz) = match self.earlier.get(&id).cloned() {
-                Some((p, caller @ Actor::User { .. })) => {
-                    let admin = caller.uid().is_some_and(|u| (self.admin_of)(u));
-                    (p.source, user_authorization(caller, admin))
-                }
-                Some((p, caller)) => (p.source, authorization_of(caller)),
-                None => (Source::Maintenance, authorization_of(Actor::Daemon)),
-            };
-            let p = self.proposal(t.clone(), &s, &defs, source, "prepared again after a restart".into());
-            let r = self.submit(p, authz, &s, &defs);
-            self.notice(format!(
-                "{}: prepared again after a restart: {}",
-                render::transition(&t),
-                render::submitted_short(&r)
-            ));
+        let again = std::mem::take(&mut self.reprepare).into_iter().map(|(id, t)| (id, t, None)).collect();
+        self.prepare_again(again, "after a restart", &s, &defs);
+        // §12f: what a rollback withdrew, once that rollback is terminal.
+        if !self.withdrawn.is_empty() && !self.generation_active() {
+            let again = std::mem::take(&mut self.withdrawn);
+            self.prepare_again(again, "after the rollback", &s, &defs);
         }
 
         // §11: stops nobody attributed, before anything treats them as faults.
@@ -2089,7 +2168,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
                 let (s, defs) = self.observe();
                 let approver = self.authz(&peer);
+                let built = self.waiting_built();
                 let r = self.ex.approve(&hash, &approver, &s, &defs);
+                self.note_withdrawn(built);
                 render::response(&r)
             }
             Request::Cancel { txn } => {
