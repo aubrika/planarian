@@ -149,16 +149,32 @@ pub fn standing(
         Err(e) => return Err(e),
     }
     for (file, pf) in [("ip_tables_names", 2), ("ip6_tables_names", 10), ("arp_tables_names", 3)] {
-        if std::fs::read_to_string(format!("/proc/net/{file}")).is_ok_and(|s| !s.trim().is_empty()) {
-            out.push(Change {
-                owner: Owner::Unattributed,
-                kind: ChangeKind::Firewall,
-                object: format!("legacy tables pf {pf}"),
-                iface: None,
-                steers: true,
-                removed: false,
-            });
-        }
+        out.extend(legacy_tables(std::fs::read_to_string(format!("/proc/net/{file}")).ok().as_deref(), pf));
     }
     Ok((out, virtual_ifaces))
+}
+
+/// What stands of a family's legacy tables, from its `/proc/net/*_names`
+/// file (`None`: no such file). Tables listed: they stand, and steer. No
+/// file at all: this kernel cannot show legacy tables for the family
+/// (`CONFIG_NETFILTER_XTABLES_LEGACY` unset), so a claim on them cannot be
+/// shown gone. It is reported as standing but not steering, so a claim
+/// made while watched (any `nf_setsockopt`, fail closed, even one the kernel
+/// refused) survives a restart, as it read before it (a restart never
+/// downgrades), and nothing unclaimed becomes `pre-attach`. An empty file:
+/// none stand, and a claim goes.
+pub fn legacy_tables(names: Option<&str>, pf: u8) -> Option<Change> {
+    let steers = match names {
+        Some(s) if s.trim().is_empty() => return None,
+        Some(_) => true,
+        None => false,
+    };
+    Some(Change {
+        owner: Owner::Unattributed,
+        kind: ChangeKind::Firewall,
+        object: format!("legacy tables pf {pf}"),
+        iface: None,
+        steers,
+        removed: false,
+    })
 }

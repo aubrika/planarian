@@ -1340,3 +1340,63 @@ mod interfaces {
         }
     }
 }
+
+/// A restart never downgrades (crate docs, "On every attach"): a legacy
+/// table claim, made by any `nf_setsockopt` while watched (fail closed,
+/// even one the kernel refused), survives when the kernel cannot show
+/// legacy tables at all; it goes when it can and none stand. vm-netwatch
+/// (g) found this on a kernel without legacy xtables.
+#[cfg(feature = "loader")]
+mod legacy_restart {
+    use crate::snapshot::legacy_tables;
+    use crate::{Change, ChangeKind, Owner, Tracker, WatchState};
+    use planarian_schema::UnitId;
+
+    const NOW: u64 = 100;
+
+    fn after_restart(names: Option<&str>) -> crate::FootprintView {
+        let u = UnitId::service("nw-sockopt");
+        let mut t = Tracker::default();
+        t.apply(&Change {
+            owner: Owner::Unit(u.clone()),
+            kind: ChangeKind::Firewall,
+            object: "legacy tables pf 2".into(),
+            iface: None,
+            steers: true,
+            removed: false,
+        });
+        assert!(t.view(WatchState::Attached { at: NOW }, std::slice::from_ref(&u), NOW).units["nw-sockopt"].protecting);
+        let standing: Vec<Change> = legacy_tables(names, 2).into_iter().collect();
+        Tracker::attach(&t.claims(), &standing, &Default::default()).view(WatchState::Attached { at: NOW }, &[u], NOW)
+    }
+
+    #[test]
+    fn a_claim_the_kernel_cannot_disprove_survives() {
+        let v = after_restart(None); // no /proc/net/ip_tables_names
+        assert!(v.units["nw-sockopt"].protecting, "a restart never downgrades");
+        assert!(v.unattributed.is_empty(), "and nothing unclaimed is pre-attach");
+    }
+
+    #[test]
+    fn a_claim_on_tables_gone_goes() {
+        let v = after_restart(Some(""));
+        assert!(!v.units["nw-sockopt"].protecting);
+        let v = after_restart(Some("filter\n"));
+        assert!(v.units["nw-sockopt"].protecting, "standing tables keep the claim");
+    }
+
+    /// Unclaimed legacy tables found at attach are pre-attach (fail
+    /// closed); where none can exist, nothing is.
+    #[test]
+    fn unclaimed_tables_are_pre_attach_only_when_they_stand() {
+        let at = |names| {
+            let standing: Vec<Change> = legacy_tables(names, 2).into_iter().collect();
+            Tracker::attach(&Default::default(), &standing, &Default::default())
+                .view(WatchState::Attached { at: NOW }, &[], NOW)
+                .unattributed
+        };
+        assert!(!at(Some("filter\n")).is_empty());
+        assert!(at(None).is_empty());
+        assert!(at(Some("")).is_empty());
+    }
+}
