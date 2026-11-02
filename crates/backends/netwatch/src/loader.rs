@@ -92,7 +92,7 @@ pub fn check_object(bytes: &[u8]) -> Result<(), String> {
     // The netns offsets the loader sets (an object from before them would
     // read every netns as 0: everything unattributed). Their names are in
     // the ELF string table, NUL-terminated.
-    for g in NETNS_GLOBALS {
+    for g in NETNS_GLOBALS.iter().chain(&CG_GLOBALS) {
         let name = [g.as_bytes(), b"\0"].concat();
         if !bytes.windows(name.len()).any(|w| w == name) {
             missing.push(g);
@@ -103,6 +103,7 @@ pub fn check_object(bytes: &[u8]) -> Result<(), String> {
 
 /// The globals the loader sets from the kernel's BTF before load.
 pub const NETNS_GLOBALS: [&str; 3] = ["NETNS_SKB_SK", "NETNS_SK_NET", "NETNS_NET_INUM"];
+pub const CG_GLOBALS: [&str; 5] = ["CG_TASK_CGROUPS", "CG_CSS_DFL", "CG_CGROUP_KN", "CG_KN_NAME", "CG_KN_PARENT"];
 
 /// `<prefix>/share/planarian/netwatch.bpf.o`, next to the running binary.
 pub fn default_object() -> String {
@@ -126,11 +127,26 @@ pub fn load_bytes(bytes: &[u8]) -> Result<Ebpf, Start> {
     let kernel = |what: String| Start::Kernel(what);
     // Where the probes find a request's netns on this kernel (no CO-RE).
     let raw = std::fs::read("/sys/kernel/btf/vmlinux").map_err(|e| kernel(format!("kernel BTF: {e}")))?;
-    let off = crate::btf::Btf::parse(&raw).and_then(|b| crate::btf::NetnsOffsets::from_btf(&b)).map_err(kernel)?;
+    let parsed = crate::btf::Btf::parse(&raw).map_err(kernel)?;
+    let off = crate::btf::NetnsOffsets::from_btf(&parsed).map_err(kernel)?;
+    // The cgroup names are a help, not a need: without them (0s), userspace
+    // attributes by cgroup id alone.
+    let cg = crate::btf::CgroupOffsets::from_btf(&parsed).unwrap_or(crate::btf::CgroupOffsets {
+        task_cgroups: 0,
+        css_dfl: 0,
+        cgroup_kn: 0,
+        kn_name: 0,
+        kn_parent: 0,
+    });
     let mut ebpf = aya::EbpfLoader::new()
         .set_global(NETNS_GLOBALS[0], &off.skb_sk, true)
         .set_global(NETNS_GLOBALS[1], &off.sk_net, true)
         .set_global(NETNS_GLOBALS[2], &off.net_inum, true)
+        .set_global(CG_GLOBALS[0], &cg.task_cgroups, true)
+        .set_global(CG_GLOBALS[1], &cg.css_dfl, true)
+        .set_global(CG_GLOBALS[2], &cg.cgroup_kn, true)
+        .set_global(CG_GLOBALS[3], &cg.kn_name, true)
+        .set_global(CG_GLOBALS[4], &cg.kn_parent, true)
         .load(bytes)
         .map_err(|e| kernel(format!("load the object: {e}")))?;
     let btf = Btf::from_sys_fs().map_err(|e| kernel(format!("kernel BTF: {e}")))?;
@@ -222,7 +238,7 @@ pub fn notify_ready(socket: Option<&Path>) {
 }
 
 pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> Result<(), String> {
-    use crate::host::{boottime_secs, expand_tools, network_tools, read_ifnames};
+    use crate::host::{boottime_secs, expand_tools, network_tools, read_ifnames, unit_of_cgroup};
     use crate::parse::take;
     use crate::{Tracker, WatchState};
     use std::sync::Arc;
@@ -332,7 +348,9 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                 }
                 ifnames.get(&i).cloned()
             };
-            take(&mut tracker, &ev, own_netns, || cgroups.unit(ev.cgroup), &mut name);
+            // The path the kernel had at the request, else the id's record.
+            let unit = || ev.cgpath.as_deref().and_then(unit_of_cgroup).or_else(|| cgroups.unit(ev.cgroup));
+            take(&mut tracker, &ev, own_netns, unit, &mut name);
         }
         // Events the ring buffer had no room for: a loss nothing can place.
         if let Ok(n) = lost_map.get(&0, 0)

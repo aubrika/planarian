@@ -95,11 +95,15 @@
 //! or found at attach; one over a virtual link, or over none, that nobody can
 //! be charged with is unattributed (fail closed).
 //!
-//! **Attribution.** The kernel reports each change with the sender's
-//! cgroup id; the unit is the first `<name>.service` under `system.slice`,
-//! past any slices (a template's instances sit in the template's slice).
-//! systemd makes a unit's cgroup before its first process starts, so
-//! netwatch records ids as cgroups are made (inotify on `system.slice` and
+//! **Attribution.** The unit is the first `<name>.service` under
+//! `system.slice`, past any slices (a template's instances sit in the
+//! template's slice). The probe reads the sender's cgroup path from kernfs
+//! at the request (`task->cgroups->dfl_cgrp->kn`, up to four names toward
+//! the root, at offsets the loader takes from BTF), so a unit is known even
+//! if its cgroup is gone before netwatch reads the event. The path is used
+//! only when whole (the walk reached the root, no name cut short); else the
+//! cgroup id is looked up. systemd makes a unit's cgroup before its first
+//! process starts, so netwatch records ids as cgroups are made (inotify on `system.slice` and
 //! the slices under it, waking the loop at once) and keeps them after the
 //! cgroup goes: a oneshot that changes something and exits at once is still
 //! charged with it. Keeping old ids is safe because cgroup ids are 64-bit

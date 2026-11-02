@@ -1,11 +1,16 @@
 //! The event the eBPF program reports (`crates/backends/netwatch-ebpf`,
 //! `Event`): `#[repr(C)] { cgroup: u64, tgid: u32, hook: u32, len: u32,
-//! captured: u32, netns: u32, _pad: u32, data: [u8; CAPTURE] }`,
-//! native-endian. Parsed by hand: no
+//! captured: u32, netns: u32, cgflags: u32, cgpath: [[u8; NAME]; LEVELS],
+//! data: [u8; CAPTURE] }`, native-endian. Parsed by hand: no
 //! unsafe, and a short buffer is an error rather than a misread.
 
 pub const CAPTURE: usize = 512;
-pub const EVENT_SIZE: usize = 8 + 4 * 6 + CAPTURE;
+pub const LEVELS: usize = 4;
+pub const NAME: usize = 96;
+/// In `cgflags`: the probe's walk reached the root, so `cgpath` is whole.
+pub const CG_ROOT: u32 = 1 << 31;
+const HEADER: usize = 8 + 4 * 6;
+pub const EVENT_SIZE: usize = HEADER + LEVELS * NAME + CAPTURE;
 
 pub const HOOK_RTNETLINK: u32 = 1;
 pub const HOOK_NFNETLINK: u32 = 2;
@@ -25,6 +30,9 @@ pub struct Event {
     /// The inode of the network namespace the request acts on; 0 if the
     /// probe could not read it.
     pub netns: u32,
+    /// The sender's cgroup path as the kernel had it at the request
+    /// (`system.slice/foo.service`), when the probe read all of it.
+    pub cgpath: Option<String>,
     /// The captured bytes of it (`captured` long).
     pub data: Vec<u8>,
 }
@@ -42,7 +50,8 @@ impl Event {
             hook: u32_at(12),
             len: u32_at(16),
             netns: u32_at(24),
-            data: b[32..32 + captured].to_vec(),
+            cgpath: cgpath(u32_at(28), &b[HEADER..HEADER + LEVELS * NAME]),
+            data: b[HEADER + LEVELS * NAME..HEADER + LEVELS * NAME + captured].to_vec(),
         })
     }
 
@@ -55,4 +64,23 @@ impl Event {
     pub fn nlmsg_type(&self) -> Option<u16> {
         self.data.get(4..6).map(|b| u16::from_ne_bytes(b.try_into().unwrap()))
     }
+}
+
+/// The whole path from the probe's leaf-first names, or `None` if the walk
+/// did not reach the root or a name filled its slot (may be cut short).
+fn cgpath(flags: u32, names: &[u8]) -> Option<String> {
+    let n = (flags & !CG_ROOT) as usize;
+    if flags & CG_ROOT == 0 || n == 0 || n > LEVELS {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(n);
+    for slot in names.chunks(NAME).take(n) {
+        let end = slot.iter().position(|&c| c == 0)?;
+        if end == 0 {
+            return None;
+        }
+        parts.push(std::str::from_utf8(&slot[..end]).ok()?);
+    }
+    parts.reverse();
+    Some(parts.join("/"))
 }

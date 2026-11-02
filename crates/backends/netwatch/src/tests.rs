@@ -185,7 +185,7 @@ mod parsing {
         d.extend(flags.to_ne_bytes());
         d.extend([0u8; 8]);
         d.extend(body);
-        Event { cgroup: 1, tgid: 2, hook, len: d.len() as u32, netns: HOST, data: d }
+        Event { cgroup: 1, tgid: 2, hook, len: d.len() as u32, netns: HOST, cgpath: None, data: d }
     }
 
     /// The host's netns inode in these tests (init_net's is 0xF0000000).
@@ -284,7 +284,45 @@ mod parsing {
 
     #[test]
     fn the_event_layout_matches_the_kernel_side() {
-        assert_eq!(crate::ebpf::EVENT_SIZE, 8 + 4 + 4 + 4 + 4 + 4 + 4 + 512);
+        // cgroup, tgid, hook, len, captured, netns, cgflags, 4 names of 96,
+        // the capture.
+        assert_eq!(crate::ebpf::EVENT_SIZE, 8 + 4 * 6 + 4 * 96 + 512);
+    }
+
+    /// An event as the ring buffer hands it over, cgroup names leaf first.
+    fn raw(cgflags: u32, names: &[&[u8]]) -> Vec<u8> {
+        let mut b = vec![0u8; crate::ebpf::EVENT_SIZE];
+        b[24..28].copy_from_slice(&0xF000_0000u32.to_ne_bytes());
+        b[28..32].copy_from_slice(&cgflags.to_ne_bytes());
+        for (i, n) in names.iter().enumerate() {
+            b[32 + 96 * i..32 + 96 * i + n.len()].copy_from_slice(n);
+        }
+        b
+    }
+
+    /// The kernel's cgroup path is used only when whole: the walk reached
+    /// the root and no name filled its slot.
+    #[test]
+    fn the_cgroup_path_is_read_only_when_whole() {
+        use crate::ebpf::{CG_ROOT, Event};
+        let ev =
+            Event::parse(&raw(3 | CG_ROOT, &[b"nw-tpl@a.service\0", b"system-nw\\x2dtpl.slice\0", b"system.slice\0"]))
+                .unwrap();
+        assert_eq!(ev.cgpath.as_deref(), Some("system.slice/system-nw\\x2dtpl.slice/nw-tpl@a.service"));
+        assert_eq!(ev.netns, 0xF000_0000);
+        assert_eq!(
+            ev.cgpath.as_deref().and_then(crate::host::unit_of_cgroup),
+            Some(planarian_schema::UnitId::service("nw-tpl@a"))
+        );
+        // Deeper than four: no root reached, so no path.
+        assert_eq!(Event::parse(&raw(4, &[b"a\0", b"b\0", b"c\0", b"d\0"])).unwrap().cgpath, None);
+        // A name that filled its slot may be cut short.
+        assert_eq!(Event::parse(&raw(1 | CG_ROOT, &[&[b'x'; 96]])).unwrap().cgpath, None);
+        // Under user.slice: a path, but no unit (unattributed).
+        let user = Event::parse(&raw(2 | CG_ROOT, &[b"user@1000.service\0", b"user.slice\0"])).unwrap();
+        assert_eq!(user.cgpath.as_deref().and_then(crate::host::unit_of_cgroup), None);
+        // No names read (the offsets were not set).
+        assert_eq!(Event::parse(&raw(0, &[])).unwrap().cgpath, None);
     }
 }
 
@@ -300,7 +338,7 @@ mod sockopt {
     fn a_legacy_table_change_is_a_steering_firewall_change() {
         let mut data = vec![2u8, 0, 0, 0];
         data.extend(64i32.to_ne_bytes()); // IPT_SO_SET_REPLACE
-        let ev = Event { cgroup: 1, tgid: 2, hook: HOOK_SOCKOPT, len: 8, netns: 0xF000_0000, data };
+        let ev = Event { cgroup: 1, tgid: 2, hook: HOOK_SOCKOPT, len: 8, netns: 0xF000_0000, cgpath: None, data };
         let owner = Owner::Unit(UnitId::service("gym-netd"));
         match parse(&ev, &owner, &mut |_| None) {
             Parsed::Changes(c) => assert!(c.len() == 1 && c[0].kind == ChangeKind::Firewall && c[0].steers, "{c:?}"),
@@ -907,9 +945,12 @@ mod btf {
     fn the_running_kernels_netns_offsets_resolve() {
         let Ok(bytes) = std::fs::read("/sys/kernel/btf/vmlinux") else { return };
         let o = NetnsOffsets::from_btf(&Btf::parse(&bytes).unwrap()).unwrap();
-        // 6.18: sk inside sk_buff's second union; skc_net after skc_prot
-        // (40); inum at 24 in ns_common, at 152 in net.
-        assert_eq!(o, NetnsOffsets { skb_sk: 24, sk_net: 48, net_inum: 176 }, "if a kernel moved these, check by hand");
+        // Where these land depends on the kernel's config (this sandbox's
+        // 6.18 gives 24, 48, 176), so only that they resolve, inside their
+        // structs: the exact layout is pinned by the synthetic kernel below.
+        assert!(o.skb_sk >= 16 && o.sk_net >= 16 && o.net_inum >= 16, "{o:?}");
+        let c = crate::btf::CgroupOffsets::from_btf(&Btf::parse(&bytes).unwrap()).unwrap();
+        assert!(c.task_cgroups > 0 && c.kn_name > 0, "{c:?}");
     }
 
     #[test]
@@ -976,6 +1017,7 @@ mod btf {
                 }
                 if let Ok(btf) = Btf::parse(&b) {
                     let _ = NetnsOffsets::from_btf(&btf);
+                    let _ = crate::btf::CgroupOffsets::from_btf(&btf);
                     let _ = btf.offset("sk_buff", &["sk", "x", "y"]);
                 }
             }
@@ -1012,7 +1054,7 @@ mod namespaces {
         d.extend(flags.to_ne_bytes());
         d.extend([0u8; 8]);
         d.extend(body);
-        Event { cgroup: 1, tgid: 2, hook: HOOK_RTNETLINK, len: d.len() as u32, netns, data: d }
+        Event { cgroup: 1, tgid: 2, hook: HOOK_RTNETLINK, len: d.len() as u32, netns, cgpath: None, data: d }
     }
 
     fn new_link(name: &str) -> Vec<u8> {
@@ -1083,6 +1125,7 @@ mod namespaces {
             hook: HOOK_SOCKOPT,
             len: 8,
             netns: CONTAINER,
+            cgpath: None,
             data: vec![2, 0, 0, 0, 64, 0, 0, 0],
         };
         take(&mut t, &sockopt, HOST, || None, &mut names);

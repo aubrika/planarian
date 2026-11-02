@@ -193,3 +193,28 @@ impl NetnsOffsets {
         })
     }
 }
+
+/// Where the probes find the sender's cgroup names (crate docs,
+/// "Attribution"): `task_struct.cgroups`, `css_set.dfl_cgrp`,
+/// `cgroup.kn`, `kernfs_node.name`, and its parent (`__parent` since 6.15,
+/// `parent` before).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CgroupOffsets {
+    pub task_cgroups: u32,
+    pub css_dfl: u32,
+    pub cgroup_kn: u32,
+    pub kn_name: u32,
+    pub kn_parent: u32,
+}
+
+impl CgroupOffsets {
+    pub fn from_btf(btf: &Btf) -> Result<CgroupOffsets, String> {
+        Ok(CgroupOffsets {
+            task_cgroups: btf.offset("task_struct", &["cgroups"])?,
+            css_dfl: btf.offset("css_set", &["dfl_cgrp"])?,
+            cgroup_kn: btf.offset("cgroup", &["kn"])?,
+            kn_name: btf.offset("kernfs_node", &["name"])?,
+            kn_parent: btf.offset("kernfs_node", &["__parent"]).or_else(|_| btf.offset("kernfs_node", &["parent"]))?,
+        })
+    }
+}

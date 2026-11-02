@@ -11,7 +11,10 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_probe_read_kernel_buf};
+use aya_ebpf::helpers::{
+    bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_current_task, bpf_probe_read_kernel_buf,
+    bpf_probe_read_kernel_str_bytes,
+};
 use aya_ebpf::macros::{fentry, kprobe, map};
 use aya_ebpf::maps::RingBuf;
 use aya_ebpf::programs::{FEntryContext, ProbeContext};
@@ -19,6 +22,13 @@ use aya_ebpf::programs::{FEntryContext, ProbeContext};
 /// Bytes of each message copied to userspace (headers and the first
 /// attributes; a longer message is flagged truncated).
 const CAP: usize = 512;
+
+/// The sender's cgroup path, leaf first: up to `LEVELS` names of `NAME`
+/// bytes each (NUL-terminated), and `CG_ROOT` in `cgflags` when the walk
+/// reached the root (so the names are the whole path).
+const LEVELS: usize = 4;
+const NAME: usize = 96;
+pub const CG_ROOT: u32 = 1 << 31;
 
 pub const HOOK_RTNETLINK: u32 = 1;
 pub const HOOK_NFNETLINK: u32 = 2;
@@ -39,8 +49,71 @@ pub struct Event {
     /// own `sock_net(skb->sk)`, or the socket's for `setsockopt`); 0 when
     /// it could not be read (userspace fails closed).
     pub netns: u32,
-    pub _pad: u32,
+    /// How many names are in `cgpath` (low bits), and `CG_ROOT`.
+    pub cgflags: u32,
+    pub cgpath: [[u8; NAME]; LEVELS],
     pub data: [u8; CAP],
+}
+
+/// Where the sender's cgroup names are, set by the loader from BTF like
+/// the netns offsets: `task->cgroups`, `css_set->dfl_cgrp`, `cgroup->kn`,
+/// `kernfs_node->name` and its parent. `CG_TASK_CGROUPS` 0 means "not
+/// set": no names are read (userspace falls back to the cgroup id).
+#[unsafe(no_mangle)]
+static CG_TASK_CGROUPS: u32 = 0;
+#[unsafe(no_mangle)]
+static CG_CSS_DFL: u32 = 0;
+#[unsafe(no_mangle)]
+static CG_CGROUP_KN: u32 = 0;
+#[unsafe(no_mangle)]
+static CG_KN_NAME: u32 = 0;
+#[unsafe(no_mangle)]
+static CG_KN_PARENT: u32 = 0;
+
+/// Fill `ev.cgpath` and `ev.cgflags` with the current task's cgroup path.
+#[inline(always)]
+fn cgroup_path(ev: *mut Event) {
+    let (cgroups, dfl, kn_off, name_off, parent_off) = unsafe {
+        (
+            core::ptr::read_volatile(&CG_TASK_CGROUPS),
+            core::ptr::read_volatile(&CG_CSS_DFL),
+            core::ptr::read_volatile(&CG_CGROUP_KN),
+            core::ptr::read_volatile(&CG_KN_NAME),
+            core::ptr::read_volatile(&CG_KN_PARENT),
+        )
+    };
+    unsafe { (*ev).cgflags = 0 };
+    if cgroups == 0 {
+        return;
+    }
+    let task = unsafe { bpf_get_current_task() } as usize as *const u8;
+    let mut kn = read_ptr(read_ptr(read_ptr(task, cgroups), dfl), kn_off);
+    let mut n = 0u32;
+    for i in 0..=LEVELS {
+        if kn.is_null() {
+            return;
+        }
+        let parent = read_ptr(kn, parent_off);
+        if parent.is_null() {
+            // `kn` is the root: the names so far are the whole path.
+            unsafe { (*ev).cgflags = n | CG_ROOT };
+            return;
+        }
+        if i == LEVELS {
+            break;
+        }
+        let name = read_ptr(kn, name_off);
+        if name.is_null() {
+            return;
+        }
+        let slot = unsafe { &mut (*ev).cgpath[i] };
+        if unsafe { bpf_probe_read_kernel_str_bytes(name, slot) }.is_err() {
+            return;
+        }
+        n += 1;
+        unsafe { (*ev).cgflags = n };
+        kn = parent;
+    }
 }
 
 /// Where a request's netns is, set by the loader from the running kernel's
@@ -92,9 +165,10 @@ fn netns_of_skb(skb: *const u8) -> u32 {
     netns_of_sock(read_ptr(skb, off))
 }
 
-/// 256 KiB of events; an overflow is reported by userspace as a lost event.
+/// 512 KiB of events (about 560 at 928 bytes each); an overflow is
+/// reported by userspace as a lost event.
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+static EVENTS: RingBuf = RingBuf::with_byte_size(512 * 1024, 0);
 
 /// Count of events that did not fit (userspace reads it: a lost event).
 #[map]
@@ -120,7 +194,7 @@ fn report(skb: *const u8, nlh: *const u8, hook: u32) -> u32 {
         (*ev).tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).hook = hook;
         (*ev).netns = netns_of_skb(skb);
-        (*ev)._pad = 0;
+        cgroup_path(ev);
         let mut len = [0u8; 4];
         let _ = bpf_probe_read_kernel_buf(nlh, &mut len);
         let len = u32::from_ne_bytes(len);
@@ -176,7 +250,7 @@ pub fn sockopt(ctx: FEntryContext) -> u32 {
         (*ev).tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
         (*ev).hook = HOOK_SOCKOPT;
         (*ev).netns = netns_of_sock(sk);
-        (*ev)._pad = 0;
+        cgroup_path(ev);
         (*ev).len = 8;
         (*ev).captured = 8;
         (*ev).data[0] = pf;
