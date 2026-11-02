@@ -44,6 +44,9 @@ pkgs.testers.runNixOSTest {
     # that would hold every network tool's failure).
     networking.firewall.enable = true;
     networking.nftables.enable = true;
+    # (o)/(p) create tun devices: load the driver at boot rather than rely
+    # on /dev/net/tun's autoload.
+    boot.kernelModules = [ "tun" ];
     virtualisation.memorySize = 2048;
     environment.systemPackages = [ pkgs.iproute2 pkgs.iptables pkgs.nftables ];
 
