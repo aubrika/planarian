@@ -185,9 +185,9 @@ let
         example = [ "wg0" ];
         description = ''
           For a network-security unit (§12d): its own network interfaces
-          (a tunnel's). Traffic over them passes the hold only while
-          `services.planarian.holdAllowsOwnInterface` is set (pending the
-          owner's decision on the tunnel's own traffic).
+          (a tunnel's). Traffic over them passes the hold, as a kill switch
+          lets the tunnel itself through (owner decision, Nov 2), so a
+          Readiness probe across the tunnel can pass and lift the hold.
         '';
       };
       runtimeRepair = mkOption {

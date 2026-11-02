@@ -172,7 +172,8 @@ let
   #
   # The table drops all traffic in and out except loopback, address
   # assignment (DHCP, DHCPv6, ICMPv6 neighbour and router discovery), the held
-  # units' holdAllow endpoints, and the established connections of
+  # units' holdAllow endpoints and their own interfaces (a tunnel's traffic is
+  # protected; owner decision, Nov 2), and the established connections of
   # administrator sessions. Those are taken when the hold is applied: every
   # socket held by a process in the scope of a logind session whose user is
   # root or in the administrators' group, matched by its exact addresses and
@@ -384,9 +385,9 @@ in
     };
     holdAllowsOwnInterface = mkOption {
       type = types.bool;
-      default = false;
+      default = true;
       internal = true;
-      description = "Whether a hold passes traffic over the held units' own interfaces (`holdInterfaces`): the switch for the owner's pending decision on the tunnel's own traffic (§12d).";
+      description = "Whether a hold passes traffic over the held units' own interfaces (`holdInterfaces`), as a kill switch does: the tunnel's own traffic is protected traffic (owner decision, Nov 2; §12d).";
     };
     holdUnits = mkOption {
       type = types.listOf types.str;

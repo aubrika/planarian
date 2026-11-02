@@ -11,8 +11,9 @@
 # a restart in progress long enough to observe the hold);
 # /run/wireguard-gym-broken makes its start fail.
 #
-# The peer's end is a kernel wg-quick interface listening on 51820. Neither
-# end runs a server: each caller brings its own. The keys are test-only.
+# The peer's end is a kernel wg-quick interface listening on 51820. The
+# caller's peer must serve TCP 9000 (the Readiness probe's target) on the
+# tunnel address; neither end runs a server itself. The keys are test-only.
 { pkgs, lib }:
 
 let
@@ -56,12 +57,11 @@ in
     services.planarian.units.wireguard-gym = {
       sensitivity = [ "Security" "External" ];
       holdAllow = [ { address = endpoint; inherit port; protocol = "udp"; } ];
-      # Its own interface: inert until the owner decides whether the tunnel's
-      # own traffic passes the hold (§12d). Until then the Readiness probe
-      # must not cross the tunnel, or a hold could never lift: it checks the
-      # daemon.
+      # Its own interface passes the hold (owner decision, Nov 2), so the
+      # Readiness probe can cross the tunnel: the hold lifts only once the
+      # tunnel carries traffic again. The peer serves 10.77.0.2:9000.
       holdInterfaces = [ "wg0" ];
-      probes = [ { id = "wireguard-gym-active"; type = "systemd-active"; establishes = "the tunnel's daemon runs"; } ];
+      probes = [ { id = "wireguard-gym-tunnel"; type = "tcp"; addr = "10.77.0.2:9000"; establishes = "the tunnel carries traffic to the peer"; } ];
     };
   };
 
