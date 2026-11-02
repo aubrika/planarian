@@ -30,7 +30,10 @@ let
           serviceConfig = { Restart = "on-failure"; RestartSec = "5s"; };
           startLimitBurst = 3;
         };
-        services.planarian.units.gym-db = { };
+        # §9 (P11): an administrator-authored Exec probe, next to typed ones.
+        services.planarian.units.gym-db.probes = [
+          { id = "gym-db-exec"; type = "exec"; argv = [ "true" ]; establishes = "gym-db answers a local query"; }
+        ];
         services.planarian.units.gym-app.probes = [
           { id = "gym-app-tcp"; type = "tcp"; addr = "127.0.0.1:8081"; establishes = "gym-app accepts connections"; }
         ];
@@ -55,17 +58,68 @@ let
     } ];
   };
   weakRefused = builtins.filter (a: !a.assertion) weakEdgeSys.config.assertions;
+  # §12d (P13): "planariad is ordered before every unit that admits a
+  # principal: the display manager (whichever unit NixOS uses for it —
+  # `display-manager.service`, or `greetd.service` where `services.greetd` is
+  # enabled …)". The pinned greetd module makes greetd.service the unit and
+  # display-manager.service only its alias.
+  ready = "planarian-ready.target";
+  afterReady = c: n: builtins.elem ready (c.systemd.services.${n}.after or [ ]);
+  # The same configuration with another display manager (SDDM), not greetd.
+  sddmSys = sys.extendModules {
+    modules = [ {
+      services.greetd.enable = pkgs.lib.mkForce false;
+      services.displayManager.cosmic-greeter.enable = pkgs.lib.mkForce false;
+      services.displayManager.sddm.enable = true;
+    } ];
+  };
+  sddm = sddmSys.config;
+  # §12d (P14): "*Restrict remote access to administrators* means Planarian's
+  # administrators (root and `planarian-admin`), not `wheel`." What the
+  # posture's responses write for sshd, read from the script they run.
+  respondScript = builtins.head (pkgs.lib.splitString " " cfg.systemd.services."planarian-respond@".serviceConfig.ExecStart);
+  allowLines = builtins.filter (pkgs.lib.hasInfix "AllowGroups") (pkgs.lib.splitString "\n" (builtins.readFile respondScript));
+  # P24 (owner decision, 1 Nov): WirePlumber is watched per user whenever
+  # PipeWire and its WirePlumber session manager are both enabled.
+  noWireplumberSys = sys.extendModules {
+    modules = [ { services.pipewire.wireplumber.enable = false; } ];
+  };
+  # The owner's "both": WirePlumber enabled on its own, PipeWire off.
+  noPipewireSys = sys.extendModules {
+    modules = [ { services.pipewire.enable = pkgs.lib.mkForce false; services.pipewire.wireplumber.enable = pkgs.lib.mkForce true; } ];
+  };
+  wireplumberIn = e: builtins.filter (u: pkgs.lib.hasSuffix ":wireplumber" u.id) (e.units ++ e.userUnits);
   external = m: pkgs.lib.hasInfix "external dependency" m.message;
   export = cfg.services.planarian.export;
   unit = id: builtins.head (builtins.filter (u: u.id == id) export.units);
   app = unit "service:gym-app";
+  # §9 (P11): "`Exec` probes … are flagged". Each exported probe carries
+  # `flagged = true` iff its kind is Exec; the key is absent otherwise.
+  probes = builtins.concatMap (u: u.probes or [ ]) (export.units ++ export.userUnits);
+  isExec = p: builtins.isAttrs p.kind && p.kind ? Exec;
   check = cond: msg: if cond then true else throw "planarian module eval: ${msg}";
   checks = [
+    (check (builtins.any isExec probes) "the configuration exports an Exec probe (P11's check is not vacuous)")
+    (check (builtins.all (p: !(isExec p) || (p.flagged or null) == true) probes) "every exported Exec probe carries flagged = true (§9, P11)")
+    (check (builtins.all (p: isExec p || !(p ? flagged)) probes) "no other exported probe carries flagged (§9, P11)")
+    (check (cfg.services.greetd.enable or false) "the reference configuration's display manager is greetd (P13's first check is not vacuous)")
+    (check (afterReady cfg "greetd") "greetd.service, the display manager's unit, is ordered after planarian-ready.target (§12d, P13)")
+    (check (!(cfg.systemd.services ? display-manager) || (cfg.systemd.services.display-manager.serviceConfig.ExecStart or null) != null) "with greetd, no ExecStart-less display-manager.service is defined beside its alias (§12d, P13)")
+    (check (!(sddm.services.greetd.enable or false) && (sddm.systemd.services.display-manager.serviceConfig.ExecStart or null) != null) "the SDDM configuration runs display-manager.service, not greetd (P13's second check is not vacuous)")
+    (check (afterReady sddm "display-manager" && !(sddm.systemd.services ? greetd && afterReady sddm "greetd")) "with SDDM, display-manager.service is ordered after planarian-ready.target (§12d, P13)")
+    (check (allowLines != [ ]) "the posture restricts sshd with AllowGroups (P14's check is not vacuous)")
+    (check (builtins.all (l: pkgs.lib.hasInfix "AllowGroups planarian-admin root" l && !(pkgs.lib.hasInfix "wheel" l)) allowLines) "every AllowGroups the posture writes is planarian-admin and root, never wheel (§12d, P14)")
+    (check (pkgs.lib.hasInfix "Include /run/planarian/sshd/*.conf" cfg.services.openssh.extraConfig) "sshd includes the posture's drop-in, so the restriction takes effect (§12d, P14)")
     (check (builtins.any (u: u.id == "service:sshd") export.units) "sshd is a canonical unit")
     (check (builtins.any (u: u.id == "device:fs-root") export.units) "fs-root is present")
     (check (builtins.any (u: u.id == "device:fs-boot") export.units) "fs-boot is present")
     (check (builtins.any (u: u.id == "target:graphical-session") export.units) "graphical-session for the desktop")
     (check (builtins.any (u: u.id == "service@0:pipewire") export.userUnits) "pipewire is per-user")
+    (check (cfg.services.pipewire.enable && cfg.services.pipewire.wireplumber.enable) "the reference configuration runs PipeWire with WirePlumber (P24's check is not vacuous)")
+    (check (builtins.map (u: u.id) (wireplumberIn export) == [ "service@0:wireplumber" ]) "wireplumber is a default per-user unit, and only that (P24)")
+    (check (builtins.elem { from = "service@0:wireplumber"; to = "service@0:pipewire"; kind = "Requires"; origin = "Manifest"; } (builtins.head (wireplumberIn export)).edges) "wireplumber requires pipewire, as upstream's BindsTo= says (P24)")
+    (check (wireplumberIn noWireplumberSys.config.services.planarian.export == [ ]) "no wireplumber unit when services.pipewire.wireplumber.enable is false (P24)")
+    (check (wireplumberIn noPipewireSys.config.services.planarian.export == [ ]) "no wireplumber unit when services.pipewire.enable is false, even with wireplumber.enable set (P24: both)")
     (check (builtins.elem { from = "service:gym-app"; to = "service:gym-db"; kind = "Requires"; origin = "SystemdRequires"; } app.edges) "Requires= became a Requires edge")
     (check (builtins.elem { from = "service:gym-app"; to = "service:gym-db"; kind = "Ordering"; origin = "SystemdAfter"; } app.edges) "After= became an Ordering edge")
     (check (app.systemd_restart.restart_sec == 5000) "RestartSec parsed")

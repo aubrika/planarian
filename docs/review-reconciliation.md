@@ -132,6 +132,173 @@ Still open, each in issue #7's lanes: §12f
 run (#12). S04 is docs only. §17a's Phase A proof obligations are met (I17
 proved; the residue classifier under Kani).
 
+## Reviewer: P21 acceptance tests (#10), 2 Nov
+
+Written from §17a (the assumptions the proofs rely on include "the journal's
+fsync is durable"), §18.12 (`fake-assumptions-conformance`: the fake is a
+second implementation of each, and the matrix covers each mutating call under
+Partial, Unknown and Fenced) and §12 (the journal is "fsync'd"), on
+`review/lane-change-path-p21`.
+
+- `crates/gym/src/tests.rs::the_conformance_matrix_covers_unbind_and_cancel`:
+  `MATRIX` has `unbind` and `cancel`, and `conformance::injected` passes for
+  each under every outcome (it already fails if the entry never makes the
+  call). On `main`: "unbind is not in the conformance matrix".
+- `crates/txn/tests/memstore_sync.rs`: `MemStore::crash()` (power loss) keeps
+  exactly what the last `sync` covered: an unsynced write is gone, a synced one
+  survives, a journal-appended record survives and replays. On `main`: does
+  not compile (no `crash`; `sync` is a no-op).
+
+Not tested, by nature: `conformance.rs`'s comment that no fake-harness entry
+makes `cancel` or `unbind` must go once the matrix covers them.
+
+## lane-nix (#11): reconciliation, 2 Nov
+
+Read #11 and its owner decision (P24, 1 Nov), this file, `nix/module.nix`,
+`nix/posture.nix`, `nix/tests/eval.nix`, and the pinned nixpkgs
+(`1f607aa`, nixos-26.05) greetd and systemd-lib modules.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P11 | `probeJSON` exports an `Exec` probe as `kind.Exec` with nothing else marking it; §9 wants it flagged. `Export` and `ProbeDef` have no `deny_unknown_fields`, so an added key is read as before | flag it in the export; assert in module-eval |
+| P13 | The greetd module aliases `display-manager.service` to `greetd.service` and sets `services.displayManager.enable = mkDefault true`. So with greetd, `principalUnits` lists both names and the posture defines a second, `ExecStart`-less `display-manager.service` unit; systemd-lib's alias `ln -sfn` overwrites its file, so the built tree is right by order of operations only (checked: `display-manager.service -> greetd.service`). The reference configuration hits this (cosmic-greeter runs on greetd). "`displayManager.enable` unset" never holds with greetd | order `display-manager.service` only when greetd is not enabled; `greetd.service` when it is; assert in module-eval that no stray unit is defined |
+| module-eval | Asserts neither the greetd ordering, the posture's SSH group, nor the Exec flag. The SSH rule lives in the `respond` script (`AllowGroups ${adminGroup} root`), reachable at eval only through the script's text | the three assertions (reviewer's case first) |
+| P24 | `wireplumber` is in `userControllable.units` and has a canonical probe, but no default unit, so nothing watches it | declare it per the owner decision; assert in module-eval |
+| posture comment | `posture.nix` said in-budget restarts keep planariad activating, so the target stays up. Run 41288596484 shows otherwise: each SIGSEGV in vm-posture logs `Stopped target Planarian is ready` with no `OnFailure=`; in crash-slow-worker-overlap the SIGKILL drops the target and a restart of the restarting unit raises Absent through `ExecStopPost` (result `success`) | comment corrected; ordering unchanged (I20; any change is the coordinator's) |
+
+## Reviewer: P11 module-eval case (#11), 2 Nov
+
+Written from §9 ("`Exec` probes … are flagged") and the coordinator's key
+decision (each exported probe carries `flagged = true` iff its kind is Exec,
+the key absent otherwise), on `review/lane-nix-p11`. `nix/tests/eval.nix`
+gives `gym-db` an Exec probe and asserts: an Exec probe is exported (so the
+check is not vacuous); every exported Exec probe has `flagged = true`; no
+other exported probe has the key. On `main`: the build throws "every exported
+Exec probe carries flagged = true".
+
+lane-nix, P11 (2 Nov): `probeJSON` in `nix/module.nix` adds `flagged = true`
+to an exported probe whose type is `exec`, and nothing to the others. The
+reviewer's case above fails on `main` ("every exported Exec probe carries
+flagged = true") and passes with it. No Rust reader denies unknown fields, so
+`Export` and `ProbeDef` read the key as before; the gym VMs' own Exec probes
+(`snd-hda0-driven`, `pipewire-has-a-card`, `wifi-associated`) carry it on
+real machines.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P11, scope (review 5731300056) | P11 flags the export only. §9's "flagged in the console and the journal" is still open: neither shows an Exec probe today. The Rust readers are to show it from `ProbeKind::Exec`, not from the `flagged` key | no code in P11; open for the console and daemon lanes |
+
+## lane-daemon (#9), reconciled 2026-11-02 at `47caca7`
+
+| Id | At `47caca7` | Evidence at head | Work |
+| --- | --- | --- | --- |
+| §12f *Rollbacks* | open, partly | `exec::schedule` parks any generation candidate in `Built` while `Foreground` holds, and a session-disturbing one whose source is not User/Intent while a session is in use: a diagnoser `Rollback` is parked in both cases, which §12f forbids. User/Intent rollbacks already skip the idle-session wait, but still wait under `Foreground`. `Core::repair_one` already skips, under quiet mode, incidents whose target fails `foreground_depends_on` (P8), so an unrelated repair rollback is not submitted and its budget does not advance. The §11 session-loss floor (`policy` AskFirst) is applied before `schedule`, so a repair rollback that ends a session is already parked for approval, not run. `Reverting` runs inside `Kernel::run` and is never deferred. A repair rollback submitted while another generation transaction is live (one waiting in `Built` counts, I6) is refused `busy` by the ledger, not held | one PR: `schedule` treats a diagnoser `Rollback` as a repair; the repair loop holds a generation repair while a generation transaction is live; the three acceptance cases |
+| P19 | open | `Core::context` sets `core_hash: Hash::ZERO`; the record exists (`nix/posture.nix` installs `/etc/planarian/core.sha256`, which `planarian-recovery` checks) but `planariad` never read it | filled from the record: `config::core_hash`, set by `main.rs` after `Core::start`; core test `the_state_carries_the_recorded_core_hash` |
+| C18 | open | no `SnapshotBackend` is wired in Phase A (the trait exists in `schema::backend`; nothing implements or calls it), so every `UserData` transaction meets the unsupported case; nothing records `NoSnapshot`. Step 6 sits between `Kernel::prepare` and the run, in `exec::submit`/`approve`; `schedule` is the point both reach | one PR, in the daemon's executor log (`LogRecord`) |
+
+## lane-change-path (#10), reconciled 2026-11-02 at `47caca7`
+
+Owner decisions in force (issue #10 comments, 1 Nov): R06 follows §10 as
+written, with one `ProbeResult` variant allowed in `crates/schema`; P24
+declares wireplumber (lane-nix, #11).
+
+| Id | Status at `47caca7` | Evidence | Crosses lanes |
+| --- | --- | --- | --- |
+| C10 | open | `exec/src/derive.rs:46` folds `restart_disruption` with `max`; `Disruption`'s `Ord` (`schema/src/unit.rs:128`) ranks ConnectivityLoss over DataInterruption and DataInterruption over SessionLoss, so ConnectivityLoss + DataInterruption keeps only ConnectivityLoss and a seated user escapes the DataInterruption floor (§11) | yes: `DerivedFacts.disruption` is one `Disruption` in `schema/src/transition.rs:173` and in SPEC §5 (`pub disruption: Disruption`); read by `policy` (floors in `lib.rs` and the Verus `proofs.rs`), `daemon/src/render.rs`, `gym/src/metrics.rs`, `tray`, `txn` tests |
+| C19 | open | `touches_manifest` (`derive.rs:104`) compares `edges`, `sensitivity`, `restart_disruption`, `synonyms` and User probes of units present in both; not `desired`, `systemd_restart`, `startup_grace`, `runtime_repair`, `stops_are_faults`, added or removed units, nor `user_units` at all | no |
+| P21 | open | `gym/src/conformance.rs:20-21` says `cancel` and `unbind` are made by no fake-harness entry, and the matrix omits them; the "Journal fsync is durable" contract cannot fail because `MemStore::sync` (`txn/src/store.rs:167`) is a no-op and a drop loses nothing unsynced. The fake's `cancel` and `unbind` already honour `World::inject` (`fake/src/lib.rs:919`, `:1057`) | yes: `conformance.rs` is in `crates/gym`, `MemStore` in `crates/txn` |
+| R06 remainder | open | `run_batch_with` (`backends/linux/src/probe.rs:271`) maps a straggler to `ProbeResult::Timeout`; §10 says "recorded `Unknown` and abandoned" | yes: a new variant breaks the exhaustive match in `daemon/src/render.rs:99`, and `daemon/src/core.rs:1189`, `:1325` match `Timeout \| Error(_)` and must also take it |
+| P24 | decided | `share/canonical.json:81` keeps `wireplumber`; the declaration is lane-nix's (`nix/module.nix`) | lane-nix |
+| P10 remainder | open | `SideEffects::Measurement { per }` is read nowhere; the scheduler's `interval` (`state/src/lib.rs:174`) ignores it. §10 binds it to the cadence scheduler only; runs on request (`request`, `reprobe`, Checking's fresh assembler) are not rate-limited (reviewer, #18) | no |
+
+## lane-nix: P24, 2 Nov
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P24 (lane-nix, 2 Nov) | Pinned nixpkgs: `services.pipewire.wireplumber.enable` defaults to `services.pipewire.enable`; the user unit `wireplumber.service` carries `BindsTo=pipewire.service` (and `Alias=pipewire-session-manager.service`). The gym VMs already declare wireplumber with that edge, at normal priority, so the module's `mkDefault` leaves them as they were | `nix/module.nix` declares `wireplumber` (`scope = "user"`, `Requires` on `service@0:pipewire`) when PipeWire and WirePlumber are both enabled. module-eval: present in the reference configuration with the edge, absent with WirePlumber off. Fails on `main` |
+
+## Reviewer: P13 and SSH-group module-eval cases (#11), 2 Nov
+
+Written from §12d ("ordered before every unit that admits a principal: the
+display manager (whichever unit NixOS uses for it …)"; "*Restrict remote
+access to administrators* means Planarian's administrators (root and
+`planarian-admin`), not `wheel`"), on `review/lane-nix-p13-sshgroup`. The
+pinned nixpkgs greetd module always aliases `display-manager.service` to
+`greetd.service`. Checks in `nix/tests/eval.nix`:
+
+- reference configuration (greetd): greetd is the DM (non-vacuous);
+  `greetd.service` is after `planarian-ready.target`; no ExecStart-less
+  `display-manager` unit is defined beside the alias. On `main` the last one
+  FAILS (the posture defines a stub `display-manager.service`).
+- the same configuration with SDDM instead: `display-manager.service` is a
+  real unit and is after the target. Passes on `main` (guard).
+- SSH: the `planarian-respond@` script writes at least one `AllowGroups` line;
+  every such line is `AllowGroups planarian-admin root` and never names
+  `wheel` (read from the script, IFD); sshd's `extraConfig` includes
+  `/run/planarian/sshd/*.conf`. Passes on `main` (guard); a mutation writing
+  `wheel` fails it.
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P13, module-eval (lane-nix, 2 Nov) | As reconciled above: with greetd on, `principalUnits` listed both `display-manager.service` and `greetd.service`, so the posture defined an `ExecStart`-less `display-manager.service`; the built tree came out right only because systemd-lib's alias `ln -sfn` runs after the unit links | `nix/posture.nix` orders `greetd.service` when greetd is enabled, else `display-manager.service` when NixOS runs one. The reviewer's case passes unedited: greetd ordered, no stub beside the alias, SDDM's `display-manager.service` ordered, and the SSH group (`AllowGroups planarian-admin root`, never `wheel`; the drop-in included) asserted. The module-eval assertions task closes with it |
+
+## Reviewer: C10 acceptance test (#10), 2 Nov
+
+Written from §11's global floors only (`review/lane-change-path-c10`).
+`crates/exec/src/tests.rs::each_disruption_keeps_its_own_floor`: a seated
+administrator's Rollback restarts a ConnectivityLoss unit (no floor for a
+local caller) and a DataInterruption unit (AskFirst unless it is the caller's
+own session). On `main` it commits without asking: `max` over `Disruption`'s
+order keeps ConnectivityLoss and the DataInterruption floor is lost. The
+control (the ConnectivityLoss unit alone) runs on `main` and must keep
+running. The test asserts the decision (Parked), not the representation of
+the combined disruption.
+
+## Reviewer: C10 catalog case (#10, against #21), 2 Nov
+
+Written from §11's global floors (`review/lane-change-path-c10-case`), at the
+coordinator's request against `main` plus #21 (`core/disruption-set`).
+`disruption-each-kind-keeps-its-floor`: a seated administrator's Rollback
+restarts a ConnectivityLoss unit and a DataInterruption unit (fixtures
+`gym-tunnel`, `gym-sync`, both Routine; step `restarts_on_switch`, fake only).
+It must carry both kinds and ask. On `main`: FAIL, committed without asking,
+disruption ConnectivityLoss only. Control
+`disruption-connectivity-alone-seated-runs` (the ConnectivityLoss unit alone)
+passes on `main` and must keep passing.
+
+### lane-change-path: C10 and the already-failed rule (#27), 2 Nov
+
+| Id | Status | What closes it | Case |
+| --- | --- | --- | --- |
+| C10 | closed by #21 (the set type, floors per member) and #27 (`unit_facts` inserts every unit's `restart_disruption`) | §11 global floors, each applied to its own kind | exec `each_disruption_keeps_its_own_floor`; catalog `disruption-each-kind-keeps-its-floor` (FAIL on `main` + #21, PASS here), control `disruption-connectivity-alone-seated-runs` |
+| §11 already-failed rule | closed by #27 | §11 as amended in #22 (owner decision, Nov 2): "A unit that has already failed (observed `Failed`, or not running while it is desired running, when the facts are derived) contributes no disruption of its own ... Every other unit the transition touches still contributes its own." `derive.rs` `already_failed` reads the observation passed to that derivation (`DeriveInput::state`), so it is current at proposal, at approval and before Activating; status `Failed`, `Stopped` or `Absent` while desired Running and expected. `Unknown` (Timeout, Error, Abandoned), Degraded, Transitioning and overridden units still contribute | exec `an_already_failed_unit_contributes_no_disruption`, `an_unknown_unit_still_contributes_its_disruption`, `a_unit_recovered_before_approval_asks_again` (the reviewer's) |
+
+## Reviewer: C19 acceptance test (#10), 2 Nov
+
+Written from §9 (a manifest entry is `desired`, `edges`, `sensitivity`,
+`restartDisruption`, `probes`, `synonyms`; the manifest is Security) and §11's
+ApplyChange row (AskFirst when `touches_manifest`), plus issue #10's C19 field
+list, on `review/lane-change-path-c19`. `crates/exec/src/derive_c19_tests.rs`
+(hooked from `derive.rs`) edits one field of one entry at a time:
+`desired` status and condition; `systemd_restart`, `startup_grace`,
+`runtime_repair`, `stops_are_faults`; an added and a removed unit; a user-scope
+entry's field, an added and a removed user-scope entry. Each must touch the
+manifest. Controls: an identical manifest does not; the fields already covered
+(synonyms, restart_disruption, sensitivity) still do. On `main`: 4 of 6 fail
+(desired, the exported fields, added/removed, user scope).
+
+### lane-change-path: C19 (#10), 2 Nov
+
+| Id | Status | What closes it | Case |
+| --- | --- | --- | --- |
+| C19 | closed by this PR | `derive.rs` `touches_manifest` compares every entry whole (canonical probes left to `touches_canonical`), system and user scope, and an added or removed entry; it had compared only `edges`, `sensitivity`, `restart_disruption`, `synonyms` and user probes of units present in both | reviewer's `crates/exec/src/derive_c19_tests.rs` (4 of 6 fail on `main`; all pass); fake verdicts unchanged |
+
+### lane-change-path: P21 (#10), 2 Nov
+
+| Id | Status | What closes it | Case |
+| --- | --- | --- | --- |
+| P21 | closed by this PR | `MemStore` keeps an undo log of log writes since the last `sync`: `sync` makes them durable, the new `crash()` (a power loss) undoes them, so the fake's "Journal fsync is durable" contract can fail. `conformance::MATRIX` adds `unbind` (`drv-bind-fails-restores-previous`: a failed bind's revert) and `cancel` (`crash-job-outlives-drain`: an unanswered activation's jobs), each under Partial, Unknown and Fenced; the comment that no fake entry makes them is corrected. The fake's `unbind` and `cancel` already honoured `World::inject` (`fake/src/lib.rs`), so `crates/fake` is unchanged | reviewer's `crates/txn/tests/memstore_sync.rs` (did not compile on `main`) and gym test `the_conformance_matrix_covers_unbind_and_cancel` (failed on `main`); both pass |
+
 ## Reviewer: §12f *Rollbacks* acceptance cases (#9), 2 Nov
 
 Written from §12f (*Rollbacks*, *Quiet mode*), §11 global floors and §13

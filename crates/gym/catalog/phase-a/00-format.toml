@@ -114,6 +114,8 @@
 #                                            is live: the unit fails there, restarts
 #                                            cannot fix it; switch_restarts are units
 #                                            a switch away from it also restarts
+#   restarts_on_switch {units}               fake only: every switch away from the
+#                                            current generation also restarts these
 #   hotunplug {device}                       QMP device_del
 #   block_network {dst, port?} / unblock_network {dst}
 #   stop_host_service {name} / start_host_service {name}
@@ -197,6 +199,14 @@ purpose = "Desired Running when DeviceConnected(device:gym-usb0); BindsTo the de
 [[fixture]]
 unit = "service:gym-printer"
 purpose = "A print service (cups stand-in, fake harness only so far): Routine, Brief, SystemdActive probe; nothing foreground work depends on (§12f gym cases)."
+
+[[fixture]]
+unit = "service:gym-tunnel"
+purpose = "Routine; restart_disruption ConnectivityLoss (fake harness only so far; C10)."
+
+[[fixture]]
+unit = "service:gym-sync"
+purpose = "Routine; restart_disruption DataInterruption (fake harness only so far; C10)."
 
 [[fixture]]
 unit = "device:snd-hda0"

@@ -58,6 +58,12 @@ struct MemInner {
     fail_next_checkpoint: bool,
     /// Fault injection: log writes fail with ENOSPC.
     enospc: bool,
+    /// P21 (§12 "fsync'd", §17a): log bytes written since the last `sync`,
+    /// as (offset, the bytes there before), oldest first. `sync` makes the
+    /// writes durable by forgetting them; `crash` undoes them. The
+    /// checkpoint, sentinel and fences are replaced atomically and durably
+    /// on write (`Store`'s contract), so they are not buffered.
+    unsynced: Vec<(usize, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +96,15 @@ impl MemStore {
 
     fn inner(&self) -> MutexGuard<'_, MemInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A power loss: the log keeps exactly what the last `sync` covered; a
+    /// write after it is gone, as if never made.
+    pub fn crash(&self) {
+        let mut inner = self.inner();
+        while let Some((off, before)) = inner.unsynced.pop() {
+            inner.log[off..off + before.len()].copy_from_slice(&before);
+        }
     }
 
     pub fn tear_next_write(&self, keep: usize) {
@@ -157,14 +172,19 @@ impl Store for MemStore {
         if let Some(keep) = inner.tear_next_write.take() {
             inner.torn = true;
             let keep = keep.min(bytes.len());
+            let before = inner.log[off..off + keep].to_vec();
+            inner.unsynced.push((off, before));
             inner.log[off..off + keep].copy_from_slice(&bytes[..keep]);
             return Err(io::Error::other("torn write (injected)"));
         }
+        let before = inner.log[off..off + bytes.len()].to_vec();
+        inner.unsynced.push((off, before));
         inner.log[off..off + bytes.len()].copy_from_slice(bytes);
         Ok(())
     }
 
     fn sync(&self) -> io::Result<()> {
+        self.inner().unsynced.clear();
         Ok(())
     }
 
@@ -258,6 +278,16 @@ impl FileStore {
         Ok(FileStore { dir: dir.to_owned(), txn_dir: txn_dir.to_owned(), journal, capacity })
     }
 
+    /// §12 step 4: a transaction's fence directory is durable before the
+    /// journal records the transaction as Prepared. `replace_atomically`
+    /// fsyncs the directory the lease is in; the entry naming that
+    /// directory lives in `txn_dir`, so `txn_dir` is fsynced once it is
+    /// created. Without it a power loss could keep Prepared and lose the
+    /// fence (fails safe, as an unfenced transaction, but not §12's intent).
+    fn sync_txn_dir(&self) -> io::Result<()> {
+        std::fs::File::open(&self.txn_dir)?.sync_all()
+    }
+
     fn replace_atomically(&self, target: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write;
         let parent = target.parent().expect("target has a parent");
@@ -341,7 +371,10 @@ impl Store for FileStore {
 
     fn set_fence(&self, txn: TxnId, epoch: u64) -> io::Result<()> {
         let d = self.txn_dir.join(txn.0.to_string());
-        std::fs::create_dir_all(&d)?;
+        if !d.is_dir() {
+            std::fs::create_dir_all(&d)?;
+            self.sync_txn_dir()?;
+        }
         self.replace_atomically(&d.join("lease"), format!("{epoch}\n").as_bytes())
     }
 
@@ -349,6 +382,7 @@ impl Store for FileStore {
         std::fs::create_dir_all(&self.txn_dir)?;
         let d = self.txn_dir.join(txn.0.to_string());
         std::fs::create_dir(&d)?;
+        self.sync_txn_dir()?;
         self.replace_atomically(&d.join("lease"), format!("{epoch}\n").as_bytes())
     }
 

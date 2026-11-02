@@ -21,19 +21,52 @@ pub struct DeriveInput<'a> {
     pub caller: Actor,
     pub tables: &'a Tables,
     pub canonical: &'a Canonical,
+    /// The observation this derivation is made against: the one passed to
+    /// it, current at proposal, approval and before Activating (§9 step 6).
+    pub state: &'a SystemState,
 }
 
 pub fn manifest_of(e: &EvaluatedGeneration) -> Manifest {
     Manifest { units: e.units.clone(), user_units: e.user_units.clone() }
 }
 
+/// §11 as amended in #22 (owner decision, Nov 2): "A unit that has already
+/// failed (observed `Failed`, or not running while it is desired running,
+/// when the facts are derived) contributes no disruption of its own". Read
+/// from `s`, the observation this derivation is made against, never from an
+/// incident or from evidence past its `stale_after` (`status` ignores that).
+/// `Unknown` counts as running (§10: "`Unknown`, never `Failed`"), so a probe
+/// that timed out, errored or was abandoned buys no exemption; so does
+/// Degraded, Transitioning, an override, or a unit not desired Running.
+fn already_failed(s: &SystemState, defs: &UnitDefs, u: &UnitId) -> bool {
+    let Some(d) = defs.get(u) else { return false };
+    d.desired.status == DesiredStatus::Running
+        && s.expected(u, defs)
+        && matches!(s.status(u, defs), UnitStatus::Failed(_) | UnitStatus::Stopped | UnitStatus::Absent)
+}
+
+/// §11, §12d: whether `u`'s traffic is held now, in the observation `s`
+/// (lane-daemon's ledger `holds`, reconciled with `/run/planarian/hold/`).
+/// §11 waives the RestartUnit row's escalations because "its traffic is
+/// held", so the waiver reads the hold itself, not the footprint that leads
+/// to it: §12d fails closed toward applying a hold, and with this a missing
+/// or stale footprint buys a waiver only once traffic is in fact blocked.
+/// STUB: `false` until lane-daemon carries the active holds in `SystemState`;
+/// then read `s` here and nowhere else.
+fn hold_in_place(_s: &SystemState, _u: &UnitId) -> bool {
+    false
+}
+
 fn unit_facts<'a>(
     units: impl IntoIterator<Item = &'a UnitId>,
     defs: &UnitDefs,
     services: &BTreeMap<String, Sensitivities>,
-) -> (Sensitivities, Disruption) {
+    already_failed: impl Fn(&UnitId) -> bool,
+) -> (Sensitivities, Disruptions) {
     let mut sens = Sensitivities::default();
-    let mut disruption = Disruption::None;
+    // C10 (§11): every kind any unit carries, not the `max` of them. The
+    // floors are not ordered, so a fold would drop one.
+    let mut disruption = Disruptions::default();
     for u in units {
         // Fail closed (§11 sensitivity completeness, B-5): a unit with no
         // sensitivity entry, or none in the manifest at all, is not taken
@@ -43,7 +76,12 @@ fn unit_facts<'a>(
         match defs.get(u) {
             Some(d) => {
                 sens = sens.union(if empty(&d.sensitivity) { &unknown } else { &d.sensitivity });
-                disruption = disruption.max(d.restart_disruption);
+                // What an already-failed unit provides is already lost:
+                // restarting it restores rather than costs. Its sensitivity
+                // still counts.
+                if !already_failed(u) {
+                    disruption.insert(d.restart_disruption);
+                }
             }
             // A user-scope unit runs with that user's rights only; an
             // undeclared one stays Routine (deviations.md).
@@ -77,6 +115,22 @@ pub fn diff(base: &OverrideSet, cand: &OverrideSet) -> ConfigDiff {
     d
 }
 
+/// The options two evaluated generations set differently (§11, §16).
+pub fn option_diff(base: &BTreeMap<String, Value>, cand: &BTreeMap<String, Value>) -> ConfigDiff {
+    let mut d = ConfigDiff::default();
+    for (k, v) in cand {
+        if base.get(k) != Some(v) {
+            d.options.insert(k.clone(), (base.get(k).cloned(), Some(v.clone())));
+        }
+    }
+    for (k, v) in base {
+        if !cand.contains_key(k) {
+            d.options.insert(k.clone(), (Some(v.clone()), None));
+        }
+    }
+    d
+}
+
 /// A generation tried to define a canonical probe differently from the core
 /// package, or dropped one from a unit that is still present (I10).
 fn touches_canonical(base: &Manifest, cand: &Manifest, canonical: &Canonical) -> bool {
@@ -101,27 +155,63 @@ fn touches_canonical(base: &Manifest, cand: &Manifest, canonical: &Canonical) ->
     false
 }
 
+/// C19 (§9, §11 ApplyChange row): whether the candidate's manifest differs
+/// from the base's in any part of any entry (`desired`, `edges`,
+/// `sensitivity`, `restart_disruption`, the user probes, `synonyms`, and the
+/// exported `systemd_restart`, `startup_grace`, `runtime_repair`,
+/// `stops_are_faults`), in user-scope entries as in system ones, or adds or
+/// removes an entry. Canonical probes are left out: they come from the core
+/// package, and redefining one is `touches_canonical`.
 fn touches_manifest(base: &Manifest, cand: &Manifest, diff: &ConfigDiff) -> bool {
     if diff.options.keys().any(|k| k.starts_with("services.planarian.")) {
         return true;
     }
-    base.units.iter().any(|(id, b)| {
-        cand.units.get(id).is_some_and(|c| {
-            c.edges != b.edges
-                || c.sensitivity != b.sensitivity
-                || c.restart_disruption != b.restart_disruption
-                || c.synonyms != b.synonyms
-                || c.probes
-                    .iter()
-                    .filter(|p| p.origin == ProbeOrigin::User)
-                    .ne(b.probes.iter().filter(|p| p.origin == ProbeOrigin::User))
-        })
-    })
+    // An entry as the manifest declares it: every field, the user probes only.
+    let entry = |d: &UnitDef| {
+        let mut d = d.clone();
+        d.probes.retain(|p| p.origin == ProbeOrigin::User);
+        d
+    };
+    let entries = |m: &Manifest| -> (BTreeMap<UnitId, UnitDef>, BTreeMap<UnitId, UnitDef>) {
+        (
+            m.units.iter().map(|(id, d)| (id.clone(), entry(d))).collect(),
+            m.user_units.iter().map(|d| (d.id.clone(), entry(d))).collect(),
+        )
+    };
+    entries(base) != entries(cand)
 }
 
 fn changes_desired(base: &Manifest, cand: &Manifest) -> bool {
     base.units.keys().ne(cand.units.keys())
         || base.units.iter().any(|(id, b)| cand.units.get(id).is_some_and(|c| c.desired != b.desired))
+}
+
+/// What a generation transition takes away (§11 Rollback row, §16): units
+/// present now and absent from the target, and units its activation stops,
+/// sorted, with their sensitivity. A removed user template's definition is in
+/// the base manifest, not in `defs` (which holds the per-session instances), so
+/// it is looked up there: an unknown unit must not count as Routine (§11
+/// sensitivity completeness, fail closed).
+pub(crate) fn removed_units(
+    base_m: &Manifest,
+    cand_m: &Manifest,
+    activation: Option<&ActivationPlan>,
+    defs: &UnitDefs,
+    services: &BTreeMap<String, Sensitivities>,
+) -> (Vec<UnitId>, Sensitivities) {
+    let mut removed: Vec<UnitId> = base_m.units.keys().filter(|u| !cand_m.units.contains_key(*u)).cloned().collect();
+    removed.extend(
+        base_m.user_units.iter().filter(|b| !cand_m.user_units.iter().any(|c| c.id == b.id)).map(|b| b.id.clone()),
+    );
+    if let Some(a) = activation {
+        removed.extend(a.stop.iter().cloned());
+    }
+    let mut known = defs.clone();
+    for b in &base_m.user_units {
+        known.entry(b.id.clone()).or_insert_with(|| b.clone());
+    }
+    let sens = unit_facts(&removed, &known, services, |_| false).0;
+    (unit_set(removed), sens)
 }
 
 pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
@@ -142,6 +232,10 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         touches_core: false,
         below_security_floor: false,
         restores_unattributed_stop: false,
+        restarts_failed_unit: false,
+        removes_sensitivity: Default::default(),
+        removes: Default::default(),
+        restarts_held_unit: false,
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
         caller: i.caller.clone(),
@@ -149,14 +243,25 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
     };
     let unit_op = |f: &mut DerivedFacts, u: &UnitId, recovery: Recovery| {
         f.affected_units = unit_set(one(u));
-        let (s, d) = unit_facts(&f.affected_units, i.defs, &i.base.services);
+        let (s, d) = unit_facts(&f.affected_units, i.defs, &i.base.services, |u| already_failed(i.state, i.defs, u));
         f.sensitivity = s;
-        f.disruption = Disruptions::of(d);
+        f.disruption = d;
         f.recovery = recovery;
         f.touches_core = f.sensitivity.contains(Sensitivity::Core);
     };
     match i.transition {
-        Transition::RestartUnit(u) => unit_op(&mut f, u, Recovery::Idempotent),
+        Transition::RestartUnit(u) => {
+            unit_op(&mut f, u, Recovery::Idempotent);
+            // §11 (owner decision, Nov 2): restarting an already-failed unit
+            // waives the RestartUnit row's External escalation (policy reads
+            // this; Security still escalates). The same reading as the
+            // disruption rule: current observation, Unknown is not failed.
+            f.restarts_failed_unit = already_failed(i.state, i.defs, u);
+            // §11, §12d (owner decision, Nov 2): a failed unit whose traffic
+            // is held: its restart only ends an outage, and waives both
+            // escalations of the RestartUnit row.
+            f.restarts_held_unit = f.restarts_failed_unit && hold_in_place(i.state, u);
+        }
         Transition::StopUnit(u) | Transition::StopAndSuppress { unit: u, .. } => {
             unit_op(&mut f, u, Recovery::Revertible)
         }
@@ -182,7 +287,16 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         Transition::BindDriver { device, .. } => unit_op(&mut f, device, Recovery::Revertible),
         Transition::SetRuntimeOption { path, .. } => {
             f.sensitivity = i.tables.option_sensitivity(&format!("runtime.{path}"));
-            f.disruption = if path == "wifi.network" {
+            // §11, §12a (owner decision, Nov 2): Wi-Fi selection's
+            // ConnectivityLoss is its providing unit's (NetworkManager's),
+            // and none while that unit has already failed. The providing
+            // units are those whose manifest entry names this option as its
+            // `runtime_repair`; with none declared, the loss stays (fail
+            // closed), and every one of them must have failed.
+            let providers: Vec<&UnitId> =
+                i.defs.values().filter(|d| d.runtime_repair.as_deref() == Some(path.as_str())).map(|d| &d.id).collect();
+            let provider_failed = !providers.is_empty() && providers.iter().all(|u| already_failed(i.state, i.defs, u));
+            f.disruption = if path == "wifi.network" && !provider_failed {
                 Disruptions::of(Disruption::ConnectivityLoss)
             } else {
                 Disruptions::default()
@@ -206,16 +320,36 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             if let Some(a) = i.activation {
                 affected.extend(a.start.iter().chain(&a.stop).chain(&a.restart).chain(&a.reload).cloned());
             }
-            let config = i.candidate_overrides.map(|c| diff(i.base_overrides, c)).unwrap_or_default();
+            let mut config = i.candidate_overrides.map(|c| diff(i.base_overrides, c)).unwrap_or_default();
+            // A generation built outside Planarian (known_good often is) has no
+            // recorded override, so for a switch, revert or rollback the
+            // evaluated option sets are compared too: an option it would
+            // restore is in the diff even without an override (§11 Rollback
+            // row, I11, §16; owner decision, Nov 2).
+            if matches!(
+                i.transition,
+                Transition::SwitchGeneration(_) | Transition::Revert { .. } | Transition::Rollback
+            ) {
+                for (k, v) in option_diff(&i.base.options, &cand.options).options {
+                    if !config.options.contains_key(&k) {
+                        config.options.insert(k, v);
+                    }
+                }
+            }
             let mut all_defs = i.defs.clone();
             for (k, v) in &cand.units {
                 all_defs.entry(k.clone()).or_insert_with(|| v.clone());
             }
             let mut services = i.base.services.clone();
             services.extend(cand.services.iter().map(|(k, v)| (k.clone(), *v)));
-            let (s, d) = unit_facts(&affected, &all_defs, &services);
+            // Kinds come from `all_defs` (a unit only the candidate adds has its
+            // definition there); the already-failed rule reads `i.defs`, the
+            // definitions `i.state` was observed against. A unit only the
+            // candidate adds is not in `i.defs` and was never observed, so it
+            // is never exempt.
+            let (s, d) = unit_facts(&affected, &all_defs, &services, |u| already_failed(i.state, i.defs, u));
             f.sensitivity = s.union(&i.tables.diff_sensitivity(&config));
-            f.disruption = Disruptions::of(d);
+            f.disruption = d;
             f.touches_manifest = touches_manifest(&base_m, &cand_m, &config);
             f.touches_canonical_probe = touches_canonical(&base_m, &cand_m, i.canonical);
             f.changes_desired = changes_desired(&base_m, &cand_m);
@@ -229,6 +363,9 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
                 f.sensitivity = f.sensitivity.union(&Sensitivities::of(&[Sensitivity::Security]));
                 f.touches_manifest = true;
             }
+            let (removes, removes_sensitivity) = removed_units(&base_m, &cand_m, i.activation, &all_defs, &services);
+            f.removes_sensitivity = removes_sensitivity;
+            f.removes = removes;
             f.affected_units = unit_set(affected);
             f.config_diff = (!config.options.is_empty()).then_some(config);
         }
@@ -337,23 +474,54 @@ mod sensitivity_completeness {
         empty.sensitivity = Sensitivities::default();
         defs.insert(empty.id.clone(), empty.clone());
         let none = BTreeMap::new();
-        let (s, _) = unit_facts([&empty.id], &defs, &none);
+        let (s, _) = unit_facts([&empty.id], &defs, &none, |_| false);
         assert!(s.external && !s.routine, "an empty sensitivity is External: {s:?}");
         let ghost = UnitId::service("not-in-the-manifest");
-        let (s, _) = unit_facts([&ghost], &defs, &none);
+        let (s, _) = unit_facts([&ghost], &defs, &none, |_| false);
         assert!(s.external && !s.routine, "an undeclared system unit is External: {s:?}");
         // One NixOS defines has the shipped tables' entry instead.
         let tables = BTreeMap::from([
             ("dbus-broker".to_string(), Sensitivities::of(&[Sensitivity::Routine])),
             ("blank".to_string(), Sensitivities::default()),
         ]);
-        let (s, _) = unit_facts([&UnitId::service("dbus-broker")], &defs, &tables);
+        let (s, _) = unit_facts([&UnitId::service("dbus-broker")], &defs, &tables, |_| false);
         assert!(s.routine && !s.external, "a defined service takes its table entry: {s:?}");
-        let (s, _) = unit_facts([&UnitId::service("blank")], &defs, &tables);
+        let (s, _) = unit_facts([&UnitId::service("blank")], &defs, &tables, |_| false);
         assert!(s.external, "an empty table entry still fails closed: {s:?}");
         let own =
             UnitId { kind: UnitKind::Service, name: "notes".into(), scope: Scope::User { uid: 1000, session: None } };
-        let (s, _) = unit_facts([&own], &defs, &none);
+        let (s, _) = unit_facts([&own], &defs, &none, |_| false);
         assert!(!s.external, "an undeclared user unit stays as it was: {s:?}");
     }
+
+    /// §11 Rollback row (owner decision, Nov 2): a removed user template
+    /// carries its own sensitivity, read from the base manifest (the per-session
+    /// instances alone would miss it), and a removed or stopped system unit
+    /// carries its own.
+    #[test]
+    fn removed_units_carry_their_sensitivity() {
+        let mut vpn = planarian_fake::fixtures::gym_user_units()[0].clone();
+        vpn.id.name = "user-vpn".into();
+        vpn.sensitivity = Sensitivities::of(&[Sensitivity::Security]);
+        let base = Manifest { units: planarian_fake::fixtures::gym_units(), user_units: vec![vpn.clone()] };
+        let mut cand = base.clone();
+        cand.user_units.clear();
+        let none = BTreeMap::new();
+        let (removed, s) = removed_units(&base, &cand, None, &UnitDefs::new(), &none);
+        assert_eq!(removed, vec![vpn.id.clone()]);
+        assert!(s.security, "the removed user template is Security: {s:?}");
+        // Nothing removed: nothing carried.
+        let (removed, s) = removed_units(&base, &base, None, &base.units, &none);
+        assert!(removed.is_empty() && s == Sensitivities::default(), "{removed:?} {s:?}");
+        // A unit the activation stops counts too.
+        let web = UnitId::service("gym-web");
+        let plan = ActivationPlan { stop: [web.clone()].into(), ..Default::default() };
+        let (removed, _) = removed_units(&base, &base, Some(&plan), &base.units, &none);
+        assert_eq!(removed, vec![web]);
+    }
 }
+
+// C19 (§9 manifest, §11 ApplyChange row): the reviewer's acceptance test.
+#[cfg(test)]
+#[path = "derive_c19_tests.rs"]
+mod c19;

@@ -25,9 +25,15 @@ let
   # Units that admit a principal (§12d): ordered after planarian-ready.target.
   principalUnits =
     lib.optional config.services.openssh.enable "sshd.service"
-    ++ lib.optional (config.services.xserver.enable || config.services.displayManager.enable or false) "display-manager.service"
-    # P13: greetd is its own unit, not display-manager.service.
-    ++ lib.optional (config.services.greetd.enable or false) "greetd.service"
+    # P13: the display manager is whichever unit NixOS runs for it. greetd
+    # is its own unit, greetd.service; NixOS's greetd module aliases
+    # display-manager.service to it (and turns services.displayManager on),
+    # so ordering that name too would define a second, ExecStart-less
+    # display-manager.service that the alias link merely overwrites.
+    ++ (if config.services.greetd.enable or false then [ "greetd.service" ]
+        else lib.optional (config.services.xserver.enable || config.services.displayManager.enable or false) "display-manager.service")
+    # The template: greetd's module disables its autovt@tty1 instance, and
+    # ordering a disabled instance does nothing.
     ++ [ "user@.service" "getty@.service" "autovt@.service" ];
 
 
@@ -213,8 +219,20 @@ in
       wantedBy = [ "multi-user.target" ];
       # BindsTo, not Requires: a required unit that fails (rather than is
       # stopped) leaves its dependents up, which would read as ready with
-      # planariad dead. Restarts within the budget keep planariad activating
-      # (RestartMode=direct), so they do not take the target down.
+      # planariad dead. Every exit of planariad takes the target down, a
+      # restart within the budget included: RestartMode=direct skips only the
+      # failed state and OnFailure= (so Crashed waits for the budget), not
+      # BindsTo= (observed on systemd 260.5, the pinned one; the man page
+      # reads otherwise). The declared agent units require it (below), and
+      # launched agents each require it (`start_agent`), so they stop with
+      # it too; the slice itself is only ordered after it. The target, with
+      # planarian-posture-lift, comes back once planariad is active again
+      # (its Wants=). An in-budget crash raises no failure
+      # class by itself. Absent follows any stop of planariad outside a
+      # shutdown, `systemctl restart` included (ExecStopPost sees result
+      # `success`), and lifts once it is ready again. (VM run 41288596484:
+      # vm-posture's SIGSEGVs; crash-slow-worker-overlap's SIGKILL, then a
+      # restart of the restarting unit.)
       bindsTo = [ "planariad.service" ];
       after = [ "planariad.service" ];
       unitConfig.StopWhenUnneeded = false;
