@@ -39,7 +39,12 @@ pkgs.testers.runNixOSTest {
   nodes.machine = { pkgs, ... }: {
     imports = [ self.nixosModules.default ];
     services.planarian.enable = true;
-    networking.firewall.enable = false;
+    # The firewall on (nftables backend): its boot ruleset is a dropping
+    # rule made at boot, and must be attributed to nftables.service, which
+    # netwatch must have attached before (not read as pre-attach steering
+    # that would hold every network tool's failure).
+    networking.firewall.enable = true;
+    networking.nftables.enable = true;
     virtualisation.memorySize = 2048;
     environment.systemPackages = [ pkgs.iproute2 pkgs.iptables pkgs.nftables ];
 
@@ -129,6 +134,14 @@ pkgs.testers.runNixOSTest {
         machine.sleep(12)
         _, t2 = machine.succeed(f"cat {FP}/.watch").split()[:2]
         assert int(t2) > int(t) and fresh(t2), (t, t2, uptime())
+
+    with subtest("(a2) the firewall's boot ruleset is attributed to it, not pre-attach"):
+        # netwatch was attached before nftables.service loaded its ruleset
+        # (ordering alone is not enough if netwatch reports started before
+        # its probes are attached).
+        machine.succeed("${nft} list ruleset | grep -q 'policy drop'")
+        protecting("nftables", "yes")
+        machine.fail(f"test -e {FP}/.unattributed")
 
     with subtest("(b) a dummy interface with a default route over it: protecting, with that interface"):
         lines = protecting("nw-route", "yes")
