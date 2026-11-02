@@ -94,6 +94,17 @@ pkgs.testers.runNixOSTest {
         ${ip} route add default dev wg0 metric 4002
       '')
       "${ip} link delete wg0";
+    # A tun made by ioctl (`ip tuntap`, as OpenVPN and wireguard-go make
+    # theirs), carrying the all-covering pair 0/1 and 128/1: protecting, for
+    # (o). The test needs no IPv4 egress on this node.
+    systemd.services.nw-tun = oneshot
+      (pkgs.writeShellScript "nw-tun-up" ''
+        ${ip} tuntap add dev nwtun0 mode tun
+        ${ip} link set nwtun0 up
+        ${ip} route add 0.0.0.0/1 dev nwtun0
+        ${ip} route add 128.0.0.0/1 dev nwtun0
+      '')
+      "${ip} tuntap del dev nwtun0 mode tun";
     systemd.services.nw-nft = oneshot
       "${nft} 'add table inet nwnft; add chain inet nwnft out { type filter hook output priority 0; }; add rule inet nwnft out ip daddr 203.0.113.80 drop'"
       "${nft} delete table inet nwnft";
@@ -169,7 +180,7 @@ pkgs.testers.runNixOSTest {
 
     machine.wait_for_unit("planarian-ready.target")
     machine.wait_for_unit("planarian-netwatch.service")
-    for u in ["nw-route", "nw-quiet", "nw-sockopt", "nw-nft", "nw-hostwg"]:
+    for u in ["nw-route", "nw-quiet", "nw-sockopt", "nw-nft", "nw-hostwg", "nw-tun"]:
         machine.wait_for_unit(f"{u}.service")
 
     with subtest("(a) the watch is attached, with a fresh CLOCK_BOOTTIME stamp"):
@@ -291,6 +302,16 @@ pkgs.testers.runNixOSTest {
         machine.succeed("${ip} link del nwmove0 && ${ip} netns del nwns")
         machine.wait_until_succeeds(f"grep -qx 'protecting no' {FP}/backdoor && ! test -e {FP}/.unattributed", timeout=30)
         protecting("nw-hostwg", "yes")
+
+    with subtest("(o) a tun made by ioctl (as OpenVPN and wireguard-go do) carrying /1 routes: protecting"):
+        # §12d: "an interface it created that carries a default or
+        # all-covering route". nw-tun creates nwtun0 with `ip tuntap add`
+        # (ioctl TUNSETIFF/TUNSETPERSIST, not netlink), then routes 0/1 and
+        # 128/1 over it: it created that interface, however it did.
+        machine.succeed("test -d /sys/devices/virtual/net/nwtun0")
+        lines = protecting("nw-tun", "yes")
+        assert "iface nwtun0" in lines, lines
+        machine.fail(f"test -e {FP}/.unattributed")
 
     with subtest("(f) a stopped watch goes stale, and a failing tool that was not protecting is held"):
         # Stopped, not killed: a killed watcher may be restarted at once, and
