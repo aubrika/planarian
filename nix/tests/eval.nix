@@ -63,6 +63,10 @@ let
   noWireplumberSys = sys.extendModules {
     modules = [ { services.pipewire.wireplumber.enable = false; } ];
   };
+  # The owner's "both": WirePlumber enabled on its own, PipeWire off.
+  noPipewireSys = sys.extendModules {
+    modules = [ { services.pipewire.enable = pkgs.lib.mkForce false; services.pipewire.wireplumber.enable = pkgs.lib.mkForce true; } ];
+  };
   wireplumberIn = e: builtins.filter (u: pkgs.lib.hasSuffix ":wireplumber" u.id) (e.units ++ e.userUnits);
   external = m: pkgs.lib.hasInfix "external dependency" m.message;
   export = cfg.services.planarian.export;
@@ -86,6 +90,7 @@ let
     (check (builtins.map (u: u.id) (wireplumberIn export) == [ "service@0:wireplumber" ]) "wireplumber is a default per-user unit, and only that (P24)")
     (check (builtins.elem { from = "service@0:wireplumber"; to = "service@0:pipewire"; kind = "Requires"; origin = "Manifest"; } (builtins.head (wireplumberIn export)).edges) "wireplumber requires pipewire, as upstream's BindsTo= says (P24)")
     (check (wireplumberIn noWireplumberSys.config.services.planarian.export == [ ]) "no wireplumber unit when services.pipewire.wireplumber.enable is false (P24)")
+    (check (wireplumberIn noPipewireSys.config.services.planarian.export == [ ]) "no wireplumber unit when services.pipewire.enable is false, even with wireplumber.enable set (P24: both)")
     (check (builtins.elem { from = "service:gym-app"; to = "service:gym-db"; kind = "Requires"; origin = "SystemdRequires"; } app.edges) "Requires= became a Requires edge")
     (check (builtins.elem { from = "service:gym-app"; to = "service:gym-db"; kind = "Ordering"; origin = "SystemdAfter"; } app.edges) "After= became an Ordering edge")
     (check (app.systemd_restart.restart_sec == 5000) "RestartSec parsed")
