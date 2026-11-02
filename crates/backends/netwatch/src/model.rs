@@ -1,6 +1,6 @@
 //! What the kernel attributed to whom, and what it means (§12d).
 
-use crate::contract::FRESH_SECS;
+use crate::contract::{AHEAD_SECS, FRESH_SECS};
 use planarian_schema::UnitId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,30 +72,33 @@ pub struct Footprint {
 pub enum WatchState {
     /// All probes attached and events flowing, confirmed at this time.
     Attached { at: u64 },
-    /// A probe failed to attach, or the watch stopped, at this time.
-    AttachFailed { at: u64 },
+    /// A probe failed to attach, or the watch was lost; why, on one line.
+    Failed { reason: String },
     /// No `.watch`, or one this crate cannot read: not known to be healthy.
     Unknown,
 }
 
 /// Everything the hold needs, read back from the files (or scripted by the
-/// fake): the watch, the global unattributed marker, and the footprint of
-/// each network tool, keyed by its file name ([`crate::file_name`]).
+/// fake): the watch, why `.unattributed` stands (empty: it is absent), and
+/// the footprint of each network tool, keyed by its file name
+/// ([`crate::file_name`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FootprintView {
     pub watch: WatchState,
-    pub unattributed: bool,
+    pub unattributed: Vec<String>,
     pub units: BTreeMap<String, Footprint>,
 }
 
 impl Default for FootprintView {
     fn default() -> Self {
-        FootprintView { watch: WatchState::Unknown, unattributed: false, units: BTreeMap::new() }
+        FootprintView { watch: WatchState::Unknown, unattributed: vec![], units: BTreeMap::new() }
     }
 }
 
-fn fresh(at: u64, now: u64) -> bool {
-    now.saturating_sub(at) <= FRESH_SECS
+/// Fresh: at most [`FRESH_SECS`] old and at most [`AHEAD_SECS`] ahead.
+pub(crate) fn fresh(at: u64, now: u64) -> bool {
+    let age = now as i128 - at as i128;
+    age <= FRESH_SECS as i128 && age >= -(AHEAD_SECS as i128)
 }
 
 impl FootprintView {
@@ -106,7 +109,7 @@ impl FootprintView {
     /// unattributed. The hold's script applies the same rules to the files.
     pub fn protecting_now(&self, unit: &str, now: u64) -> bool {
         let healthy = matches!(self.watch, WatchState::Attached { at } if fresh(at, now));
-        if !healthy || self.unattributed {
+        if !healthy || !self.unattributed.is_empty() {
             return true;
         }
         match self.units.get(unit) {
@@ -176,7 +179,7 @@ impl Tracker {
     /// The footprint of `unit` now, confirmed at `at`.
     pub fn footprint(&self, unit: &UnitId, at: u64) -> Footprint {
         let Some(s) = self.units.get(unit) else { return Footprint { at, ..Default::default() } };
-        let ifaces: BTreeSet<String> = s
+        let created: BTreeSet<String> = s
             .objects
             .iter()
             .filter(|((k, _), _)| *k == ChangeKind::Interface)
@@ -184,11 +187,13 @@ impl Tracker {
             .collect();
         // §12d: an interface the unit created that carries a default or
         // all-covering route protects, whoever added the route; its own
-        // steering changes (rules, DNS, proxy, firewall) protect too.
-        let routed_through_own = self.steering_ifaces().iter().any(|i| ifaces.contains(i));
+        // steering changes (rules, DNS, proxy, firewall, routes) protect too.
+        // `iface` lines name only the created interfaces that steer: what the
+        // hold passes (lane-nix's contract; narrower than all it created).
+        let ifaces: BTreeSet<String> = self.steering_ifaces().intersection(&created).cloned().collect();
         Footprint {
             at,
-            protecting: routed_through_own
+            protecting: !ifaces.is_empty()
                 || s.objects.iter().any(|((k, _), (_, steers))| *steers && *k != ChangeKind::Interface),
             ifaces,
             endpoints: s.endpoints.clone(),
@@ -210,6 +215,11 @@ impl Tracker {
     /// (absent from the tracker: `protecting no`), confirmed at `now`.
     pub fn view(&self, watch: WatchState, tools: &[UnitId], now: u64) -> FootprintView {
         let units = tools.iter().map(|u| (crate::file_name(u), self.footprint(u, now))).collect();
-        FootprintView { watch, unattributed: self.lost_unplaced || !self.unattributed.is_empty(), units }
+        let mut why: Vec<String> =
+            self.unattributed.iter().map(|(k, o)| format!("{k:?} {o}: no unit made it")).collect();
+        if self.lost_unplaced {
+            why.push("an event was lost and could not be placed".into());
+        }
+        FootprintView { watch, unattributed: why, units }
     }
 }

@@ -13,6 +13,8 @@ pub const DIR: &str = "/run/planarian/footprint";
 pub const CLOCK: &str = "CLOCK_BOOTTIME";
 /// A file confirmed longer ago than this is stale.
 pub const FRESH_SECS: u64 = 30;
+/// A stamp further ahead than this is not trusted either (the hold's script).
+pub const AHEAD_SECS: u64 = 5;
 /// How often netwatch rewrites every file.
 pub const TICK_SECS: u64 = 5;
 
@@ -34,7 +36,7 @@ fn proto(p: Proto) -> &'static str {
 }
 
 fn render(f: &Footprint) -> String {
-    let mut s = format!("at {}\nprotecting {}\n", f.at, if f.protecting { "yes" } else { "no" });
+    let mut s = format!("protecting {}\nat {}\n", if f.protecting { "yes" } else { "no" }, f.at);
     for i in &f.ifaces {
         s.push_str(&format!("iface {i}\n"));
     }
@@ -70,8 +72,9 @@ pub fn write(dir: &Path, view: &FootprintView) -> io::Result<()> {
             std::fs::remove_file(dir.join(&name))?;
         }
     }
-    if view.unattributed {
-        put(dir, UNATTRIBUTED, "")?;
+    if !view.unattributed.is_empty() {
+        let why: String = view.unattributed.iter().map(|r| format!("{}\n", one_line(r))).collect();
+        put(dir, UNATTRIBUTED, &why)?;
     } else {
         match std::fs::remove_file(dir.join(UNATTRIBUTED)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
@@ -79,12 +82,17 @@ pub fn write(dir: &Path, view: &FootprintView) -> io::Result<()> {
         }
     }
     // Last: the heartbeat confirms everything written before it.
-    let watch = match view.watch {
+    let watch = match &view.watch {
         WatchState::Attached { at } => format!("attached {at}\n"),
-        WatchState::AttachFailed { at } => format!("attach-failed {at}\n"),
+        WatchState::Failed { reason } => format!("failed {}\n", one_line(reason)),
         WatchState::Unknown => "unknown\n".to_string(),
     };
     put(dir, WATCH, &watch)
+}
+
+fn one_line(s: &str) -> String {
+    let s: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    if s.trim().is_empty() { "unknown".into() } else { s.trim().to_string() }
 }
 
 fn parse_footprint(text: &str) -> Option<Footprint> {
@@ -126,12 +134,21 @@ pub fn read(dir: &Path) -> FootprintView {
     view.watch = match std::fs::read_to_string(dir.join(WATCH)) {
         Ok(s) => match s.split_whitespace().collect::<Vec<_>>().as_slice() {
             ["attached", t] => t.parse().map(|at| WatchState::Attached { at }).unwrap_or(WatchState::Unknown),
-            ["attach-failed", t] => t.parse().map(|at| WatchState::AttachFailed { at }).unwrap_or(WatchState::Unknown),
+            ["failed", why @ ..] => WatchState::Failed { reason: why.join(" ") },
             _ => WatchState::Unknown,
         },
         Err(_) => WatchState::Unknown,
     };
-    view.unattributed = dir.join(UNATTRIBUTED).exists();
+    view.unattributed = match std::fs::read_to_string(dir.join(UNATTRIBUTED)) {
+        // Present: it stands, with its reasons (or one saying none was given).
+        Ok(s) => {
+            let why: Vec<String> = s.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect();
+            if why.is_empty() { vec!["unattributed".into()] } else { why }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
+        // Unreadable: fail closed, as if it stood.
+        Err(e) => vec![format!("unreadable: {e}")],
+    };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {

@@ -59,10 +59,16 @@ fn everything_unknown_counts_as_protecting() {
     let v = t.view(ATTACHED, std::slice::from_ref(&syncd), NOW);
     assert!(!v.protecting_now("gym-syncd", NOW), "healthy and clean: not protecting");
     assert!(v.protecting_now("gym-syncd", NOW + FRESH_SECS + 1), "stale footprint and watch");
+    assert!(!v.protecting_now("gym-syncd", NOW - AHEAD_SECS), "up to 5 s ahead is fresh");
+    assert!(v.protecting_now("gym-syncd", NOW - AHEAD_SECS - 1), "further ahead is not");
     let mut stale = v.clone();
     stale.units.get_mut("gym-syncd").unwrap().at = NOW - FRESH_SECS - 1;
     assert!(stale.protecting_now("gym-syncd", NOW), "stale footprint, fresh watch");
-    let failed = t.view(WatchState::AttachFailed { at: NOW }, std::slice::from_ref(&syncd), NOW);
+    let failed = t.view(
+        WatchState::Failed { reason: "fentry rtnetlink_rcv_msg: no BTF".into() },
+        std::slice::from_ref(&syncd),
+        NOW,
+    );
     assert!(failed.protecting_now("gym-syncd", NOW), "the watch failed to attach");
     assert!(FootprintView::default().protecting_now("gym-syncd", NOW), "nothing known");
     assert!(v.protecting_now("not-a-tool", NOW), "no footprint");
@@ -70,16 +76,16 @@ fn everything_unknown_counts_as_protecting() {
     let mut u = Tracker::default();
     u.apply(&change(Owner::Unattributed, ChangeKind::Route, "0.0.0.0/0", None, true));
     let v = u.view(ATTACHED, std::slice::from_ref(&syncd), NOW);
-    assert!(v.unattributed && v.protecting_now("gym-syncd", NOW), "an unattributed steering change stands");
+    assert!(!v.unattributed.is_empty() && v.protecting_now("gym-syncd", NOW), "an unattributed steering change stands");
     u.apply(&Change { removed: true, ..change(Owner::Unattributed, ChangeKind::Route, "0.0.0.0/0", None, true) });
-    assert!(!u.view(ATTACHED, std::slice::from_ref(&syncd), NOW).unattributed, "and it is gone");
+    assert!(u.view(ATTACHED, std::slice::from_ref(&syncd), NOW).unattributed.is_empty(), "and it is gone");
 
     let mut l = Tracker::default();
     l.lost(Some(&syncd));
     assert!(l.view(ATTACHED, std::slice::from_ref(&syncd), NOW).protecting_now("gym-syncd", NOW));
     let mut g = Tracker::default();
     g.lost(None);
-    assert!(g.view(ATTACHED, std::slice::from_ref(&syncd), NOW).unattributed, "an unplaced loss");
+    assert!(!g.view(ATTACHED, std::slice::from_ref(&syncd), NOW).unattributed.is_empty(), "an unplaced loss");
 }
 
 #[test]
@@ -110,12 +116,12 @@ fn the_files_round_trip() {
     let wg = std::fs::read_to_string(d.path().join("wg-quick-wg0")).unwrap();
     assert_eq!(
         wg,
-        format!("at {NOW}\nprotecting yes\niface wg0\nendpoint udp 192.0.2.7 51820\nendpoint udp 2001:db8::7 51820\n")
+        format!("protecting yes\nat {NOW}\niface wg0\nendpoint udp 192.0.2.7 51820\nendpoint udp 2001:db8::7 51820\n")
     );
     // A unit that leaves the view loses its file; the marker comes and goes.
     let mut fewer = v.clone();
     fewer.units.remove("gym-syncd");
-    fewer.unattributed = true;
+    fewer.unattributed = vec!["Route 0.0.0.0/0: no unit made it".into()];
     write(d.path(), &fewer).unwrap();
     assert!(!d.path().join("gym-syncd").exists() && d.path().join(".unattributed").exists());
     write(d.path(), &v).unwrap();
@@ -127,7 +133,7 @@ fn the_files_round_trip() {
 fn an_unreadable_footprint_reads_as_missing() {
     let d = tempfile::tempdir().unwrap();
     write(d.path(), &sample()).unwrap();
-    std::fs::write(d.path().join("gym-syncd"), "at 1000\nprotecting maybe\n").unwrap();
+    std::fs::write(d.path().join("gym-syncd"), "protecting maybe\nat 1000\n").unwrap();
     std::fs::write(d.path().join(".watch"), "attached soon\n").unwrap();
     let v = read(d.path());
     assert!(!v.units.contains_key("gym-syncd") && v.watch == WatchState::Unknown);
