@@ -45,6 +45,18 @@ fn already_failed(s: &SystemState, defs: &UnitDefs, u: &UnitId) -> bool {
         && matches!(s.status(u, defs), UnitStatus::Failed(_) | UnitStatus::Stopped | UnitStatus::Absent)
 }
 
+/// §11, §12d: whether `u`'s traffic is held now, in the observation `s`
+/// (lane-daemon's ledger `holds`, reconciled with `/run/planarian/hold/`).
+/// §11 waives the RestartUnit row's escalations because "its traffic is
+/// held", so the waiver reads the hold itself, not the footprint that leads
+/// to it: §12d fails closed toward applying a hold, and with this a missing
+/// or stale footprint buys a waiver only once traffic is in fact blocked.
+/// STUB: `false` until lane-daemon carries the active holds in `SystemState`;
+/// then read `s` here and nowhere else.
+fn hold_in_place(_s: &SystemState, _u: &UnitId) -> bool {
+    false
+}
+
 fn unit_facts<'a>(
     units: impl IntoIterator<Item = &'a UnitId>,
     defs: &UnitDefs,
@@ -97,6 +109,22 @@ pub fn diff(base: &OverrideSet, cand: &OverrideSet) -> ConfigDiff {
     }
     for (k, v) in &base.assignments {
         if !cand.assignments.contains_key(k) {
+            d.options.insert(k.clone(), (Some(v.clone()), None));
+        }
+    }
+    d
+}
+
+/// The options two evaluated generations set differently (§11, §16).
+pub fn option_diff(base: &BTreeMap<String, Value>, cand: &BTreeMap<String, Value>) -> ConfigDiff {
+    let mut d = ConfigDiff::default();
+    for (k, v) in cand {
+        if base.get(k) != Some(v) {
+            d.options.insert(k.clone(), (base.get(k).cloned(), Some(v.clone())));
+        }
+    }
+    for (k, v) in base {
+        if !cand.contains_key(k) {
             d.options.insert(k.clone(), (Some(v.clone()), None));
         }
     }
@@ -158,6 +186,38 @@ fn changes_desired(base: &Manifest, cand: &Manifest) -> bool {
         || base.units.iter().any(|(id, b)| cand.units.get(id).is_some_and(|c| c.desired != b.desired))
 }
 
+/// What a generation transition takes away (§11 Rollback row, §16): units
+/// present now and absent from the target, and units its activation stops,
+/// sorted, with their sensitivity. A removed user template's definition is in
+/// the base manifest, not in `defs` (which holds the per-session instances), so
+/// it is looked up there: an unknown unit must not count as Routine (§11
+/// sensitivity completeness, fail closed).
+pub(crate) fn removed_units(
+    base_m: &Manifest,
+    cand_m: &Manifest,
+    activation: Option<&ActivationPlan>,
+    defs: &UnitDefs,
+    services: &BTreeMap<String, Sensitivities>,
+) -> (Vec<UnitId>, Vec<Sensitivities>, Sensitivities) {
+    let mut removed: Vec<UnitId> = base_m.units.keys().filter(|u| !cand_m.units.contains_key(*u)).cloned().collect();
+    removed.extend(
+        base_m.user_units.iter().filter(|b| !cand_m.user_units.iter().any(|c| c.id == b.id)).map(|b| b.id.clone()),
+    );
+    if let Some(a) = activation {
+        removed.extend(a.stop.iter().cloned());
+    }
+    let mut known = defs.clone();
+    for b in &base_m.user_units {
+        known.entry(b.id.clone()).or_insert_with(|| b.clone());
+    }
+    let sens = unit_facts(&removed, &known, services, |_| false).0;
+    // Each one's own, from the same lookup as the decision's (§16: what the
+    // approval shows is what was decided on).
+    let removed = unit_set(removed);
+    let each = removed.iter().map(|u| unit_facts(std::iter::once(u), &known, services, |_| false).0).collect();
+    (removed, each, sens)
+}
+
 pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
     let base_m = manifest_of(i.base);
     let one = |u: &UnitId| {
@@ -176,6 +236,11 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         touches_core: false,
         below_security_floor: false,
         restores_unattributed_stop: false,
+        restarts_failed_unit: false,
+        removes_sensitivity: Default::default(),
+        removes: Default::default(),
+        removes_each: Default::default(),
+        restarts_held_unit: false,
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
         caller: i.caller.clone(),
@@ -190,7 +255,18 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         f.touches_core = f.sensitivity.contains(Sensitivity::Core);
     };
     match i.transition {
-        Transition::RestartUnit(u) => unit_op(&mut f, u, Recovery::Idempotent),
+        Transition::RestartUnit(u) => {
+            unit_op(&mut f, u, Recovery::Idempotent);
+            // §11 (owner decision, Nov 2): restarting an already-failed unit
+            // waives the RestartUnit row's External escalation (policy reads
+            // this; Security still escalates). The same reading as the
+            // disruption rule: current observation, Unknown is not failed.
+            f.restarts_failed_unit = already_failed(i.state, i.defs, u);
+            // §11, §12d (owner decision, Nov 2): a failed unit whose traffic
+            // is held: its restart only ends an outage, and waives both
+            // escalations of the RestartUnit row.
+            f.restarts_held_unit = f.restarts_failed_unit && hold_in_place(i.state, u);
+        }
         Transition::StopUnit(u) | Transition::StopAndSuppress { unit: u, .. } => {
             unit_op(&mut f, u, Recovery::Revertible)
         }
@@ -216,7 +292,16 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         Transition::BindDriver { device, .. } => unit_op(&mut f, device, Recovery::Revertible),
         Transition::SetRuntimeOption { path, .. } => {
             f.sensitivity = i.tables.option_sensitivity(&format!("runtime.{path}"));
-            f.disruption = if path == "wifi.network" {
+            // §11, §12a (owner decision, Nov 2): Wi-Fi selection's
+            // ConnectivityLoss is its providing unit's (NetworkManager's),
+            // and none while that unit has already failed. The providing
+            // units are those whose manifest entry names this option as its
+            // `runtime_repair`; with none declared, the loss stays (fail
+            // closed), and every one of them must have failed.
+            let providers: Vec<&UnitId> =
+                i.defs.values().filter(|d| d.runtime_repair.as_deref() == Some(path.as_str())).map(|d| &d.id).collect();
+            let provider_failed = !providers.is_empty() && providers.iter().all(|u| already_failed(i.state, i.defs, u));
+            f.disruption = if path == "wifi.network" && !provider_failed {
                 Disruptions::of(Disruption::ConnectivityLoss)
             } else {
                 Disruptions::default()
@@ -240,7 +325,22 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
             if let Some(a) = i.activation {
                 affected.extend(a.start.iter().chain(&a.stop).chain(&a.restart).chain(&a.reload).cloned());
             }
-            let config = i.candidate_overrides.map(|c| diff(i.base_overrides, c)).unwrap_or_default();
+            let mut config = i.candidate_overrides.map(|c| diff(i.base_overrides, c)).unwrap_or_default();
+            // A generation built outside Planarian (known_good often is) has no
+            // recorded override, so for a switch, revert or rollback the
+            // evaluated option sets are compared too: an option it would
+            // restore is in the diff even without an override (§11 Rollback
+            // row, I11, §16; owner decision, Nov 2).
+            if matches!(
+                i.transition,
+                Transition::SwitchGeneration(_) | Transition::Revert { .. } | Transition::Rollback
+            ) {
+                for (k, v) in option_diff(&i.base.options, &cand.options).options {
+                    if !config.options.contains_key(&k) {
+                        config.options.insert(k, v);
+                    }
+                }
+            }
             let mut all_defs = i.defs.clone();
             for (k, v) in &cand.units {
                 all_defs.entry(k.clone()).or_insert_with(|| v.clone());
@@ -268,6 +368,11 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
                 f.sensitivity = f.sensitivity.union(&Sensitivities::of(&[Sensitivity::Security]));
                 f.touches_manifest = true;
             }
+            let (removes, each, removes_sensitivity) =
+                removed_units(&base_m, &cand_m, i.activation, &all_defs, &services);
+            f.removes_sensitivity = removes_sensitivity;
+            f.removes = removes;
+            f.removes_each = each;
             f.affected_units = unit_set(affected);
             f.config_diff = (!config.options.is_empty()).then_some(config);
         }
@@ -394,6 +499,35 @@ mod sensitivity_completeness {
             UnitId { kind: UnitKind::Service, name: "notes".into(), scope: Scope::User { uid: 1000, session: None } };
         let (s, _) = unit_facts([&own], &defs, &none, |_| false);
         assert!(!s.external, "an undeclared user unit stays as it was: {s:?}");
+    }
+
+    /// §11 Rollback row (owner decision, Nov 2): a removed user template
+    /// carries its own sensitivity, read from the base manifest (the per-session
+    /// instances alone would miss it), and a removed or stopped system unit
+    /// carries its own.
+    #[test]
+    fn removed_units_carry_their_sensitivity() {
+        let mut vpn = planarian_fake::fixtures::gym_user_units()[0].clone();
+        vpn.id.name = "user-vpn".into();
+        vpn.sensitivity = Sensitivities::of(&[Sensitivity::Security]);
+        let base = Manifest { units: planarian_fake::fixtures::gym_units(), user_units: vec![vpn.clone()] };
+        let mut cand = base.clone();
+        cand.user_units.clear();
+        let none = BTreeMap::new();
+        let (removed, each, s) = removed_units(&base, &cand, None, &UnitDefs::new(), &none);
+        assert_eq!(removed, vec![vpn.id.clone()]);
+        assert_eq!(each.len(), removed.len(), "parallel");
+        assert!(each[0].security, "each carries its own: {each:?}");
+        assert!(s.security, "the removed user template is Security: {s:?}");
+        // Nothing removed: nothing carried.
+        let (removed, each, s) = removed_units(&base, &base, None, &base.units, &none);
+        assert!(removed.is_empty() && each.is_empty() && s == Sensitivities::default(), "{removed:?} {s:?}");
+        // A unit the activation stops counts too.
+        let web = UnitId::service("gym-web");
+        let plan = ActivationPlan { stop: [web.clone()].into(), ..Default::default() };
+        let (removed, each, _) = removed_units(&base, &base, Some(&plan), &base.units, &none);
+        assert_eq!(removed, vec![web]);
+        assert_eq!(each.len(), 1);
     }
 }
 
