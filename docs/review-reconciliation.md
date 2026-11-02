@@ -298,4 +298,3 @@ manifest. Controls: an identical manifest does not; the fields already covered
 | Id | Status | What closes it | Case |
 | --- | --- | --- | --- |
 | P21 | closed by this PR | `MemStore` keeps an undo log of log writes since the last `sync`: `sync` makes them durable, the new `crash()` (a power loss) undoes them, so the fake's "Journal fsync is durable" contract can fail. `conformance::MATRIX` adds `unbind` (`drv-bind-fails-restores-previous`: a failed bind's revert) and `cancel` (`crash-job-outlives-drain`: an unanswered activation's jobs), each under Partial, Unknown and Fenced; the comment that no fake entry makes them is corrected. The fake's `unbind` and `cancel` already honoured `World::inject` (`fake/src/lib.rs`), so `crates/fake` is unchanged | reviewer's `crates/txn/tests/memstore_sync.rs` (did not compile on `main`) and gym test `the_conformance_matrix_covers_unbind_and_cancel` (failed on `main`); both pass |
-
