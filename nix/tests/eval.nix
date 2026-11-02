@@ -34,6 +34,14 @@ let
         services.planarian.units.gym-db.probes = [
           { id = "gym-db-exec"; type = "exec"; argv = [ "true" ]; establishes = "gym-db answers a local query"; }
         ];
+        # §12d: a network-security unit (Security and External), with the
+        # endpoint its hold still lets it reach.
+        systemd.services.gym-vpn = { wantedBy = [ "multi-user.target" ]; script = "sleep infinity"; };
+        services.planarian.units.gym-vpn = {
+          sensitivity = [ "Security" "External" ];
+          holdAllow = [ { address = "192.0.2.7"; port = 51820; } ];
+          holdInterfaces = [ "wg9" ];
+        };
         services.planarian.units.gym-app.probes = [
           { id = "gym-app-tcp"; type = "tcp"; addr = "127.0.0.1:8081"; establishes = "gym-app accepts connections"; }
         ];
@@ -58,6 +66,9 @@ let
     } ];
   };
   weakRefused = builtins.filter (a: !a.assertion) weakEdgeSys.config.assertions;
+  # §12d (owner decision, Nov 2): the tunnel's own interface passes the hold
+  # by default; the switch only takes it away.
+  ownIfaceSys = sys.extendModules { modules = [ { services.planarian.holdAllowsOwnInterface = pkgs.lib.mkForce false; } ]; };
   # §12d (P13): "planariad is ordered before every unit that admits a
   # principal: the display manager (whichever unit NixOS uses for it —
   # `display-manager.service`, or `greetd.service` where `services.greetd` is
@@ -97,6 +108,13 @@ let
   # `flagged = true` iff its kind is Exec; the key is absent otherwise.
   probes = builtins.concatMap (u: u.probes or [ ]) (export.units ++ export.userUnits);
   isExec = p: builtins.isAttrs p.kind && p.kind ? Exec;
+  # §12d "Network security fails closed": the hold, its OnFailure= wiring,
+  # its re-application after nftables loads, and holdAllow in the export.
+  hold = cfg.services.planarian;
+  holdUnit = cfg.systemd.services."planarian-hold@";
+  holdScript = builtins.readFile (builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart));
+  vpn = unit "service:gym-vpn";
+  nftDropin = hold.holdDropins."nftables.service.d/50-planarian-hold.conf";
   check = cond: msg: if cond then true else throw "planarian module eval: ${msg}";
   checks = [
     (check (builtins.any isExec probes) "the configuration exports an Exec probe (P11's check is not vacuous)")
@@ -110,6 +128,23 @@ let
     (check (allowLines != [ ]) "the posture restricts sshd with AllowGroups (P14's check is not vacuous)")
     (check (builtins.all (l: pkgs.lib.hasInfix "AllowGroups planarian-admin root" l && !(pkgs.lib.hasInfix "wheel" l)) allowLines) "every AllowGroups the posture writes is planarian-admin and root, never wheel (§12d, P14)")
     (check (pkgs.lib.hasInfix "Include /run/planarian/sshd/*.conf" cfg.services.openssh.extraConfig) "sshd includes the posture's drop-in, so the restriction takes effect (§12d, P14)")
+    (check (cfg.networking.firewall.enable && builtins.sort builtins.lessThan hold.holdUnits == [ "firewall" "gym-vpn" "nftables" ]) "the network-security units are those with Security and External, and the firewall (§12d)")
+    (check (hold.holdDropins."firewall.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@firewall.service\n") "the firewall's failure applies the hold (§12d)")
+    (check (vpn.holds && vpn.hold_allow == [ { address = "192.0.2.7"; port = 51820; protocol = "udp"; } ] && vpn.hold_interfaces == [ "wg9" ]) "a network-security unit exports holds, its holdAllow and its holdInterfaces (§9, §12d)")
+    (check (builtins.all (u: builtins.elem u.id [ "service:gym-vpn" "service:firewall" "service:nftables" ] == u.holds) export.units) "exactly the network-security units hold traffic: not sshd, not any other Security unit (§12d)")
+    (check (builtins.all (u: u.holds == (pkgs.lib.hasPrefix "service:" u.id && (builtins.elem "Security" u.sensitivity && builtins.elem "External" u.sensitivity || builtins.elem u.id [ "service:firewall" "service:nftables" ]))) export.units && builtins.all (u: !u.holds) export.userUnits) "every exported unit's holds is the rule, computed: Security and External, or the firewall (§12d)")
+    (check (!(sys.options.services.planarian.units.type.getSubOptions [ ] ? holds)) "holds is not a manifest option, so no unit can opt out of the hold (§12d)")
+    (check (hold.holdDropins."gym-vpn.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@gym-vpn.service\n") "a network-security unit's failure applies the hold through OnFailure= (§12d)")
+    (check (!(cfg.systemd.services.gym-vpn ? onFailure) || !(builtins.elem "planarian-hold@gym-vpn.service" cfg.systemd.services.gym-vpn.onFailure)) "the OnFailure= is a drop-in, not a unit definition (no stub for an undefined unit)")
+    (check (pkgs.lib.hasInfix "ExecStartPost=" nftDropin && pkgs.lib.hasInfix "ExecReload=" nftDropin && pkgs.lib.hasInfix " reapply" nftDropin) "a hold is re-applied after nftables.service starts or reloads, which may flush every table (§12d)")
+    (check (cfg.environment.etc."planarian/hold/gym-vpn.allow".text == "udp 192.0.2.7 51820\niface wg9\n") "the hold passes the unit's holdAllow endpoints and its own interfaces, as a kill switch does (§12d; owner decision, Nov 2)")
+    (check (ownIfaceSys.config.environment.etc."planarian/hold/gym-vpn.allow".text == "udp 192.0.2.7 51820\n") "with the switch off, the held unit's own interfaces are held too")
+    (check (holdUnit.unitConfig.DefaultDependencies == false && !(holdUnit ? bindsTo && builtins.elem "planariad.service" holdUnit.bindsTo) && !(holdUnit ? partOf && builtins.elem "planariad.service" holdUnit.partOf)) "the hold unit does not depend on planariad, so it survives its restart (§12d)")
+    (check (pkgs.lib.hasSuffix " reapply" holdUnit.serviceConfig.ExecReload) "a reload rebuilds the hold's table without lifting it (§12d)")
+    (check (builtins.elem pkgs.nftables cfg.systemd.services.planariad.path) "planariad can check the hold's table (nft on its PATH)")
+    (check (!holdUnit.restartIfChanged && !holdUnit.stopIfChanged) "an activation (a repair rollback, undo) never stops or restarts a running hold (§12d)")
+    (check (holdUnit.serviceConfig.RemainAfterExit && pkgs.lib.hasSuffix " apply %i" holdUnit.serviceConfig.ExecStart && pkgs.lib.hasSuffix " lift %i" holdUnit.serviceConfig.ExecStop && pkgs.lib.hasSuffix " released %i" holdUnit.serviceConfig.ExecCondition) "start applies, stop lifts, an unexpired release skips (§12d)")
+    (check (pkgs.lib.hasInfix "policy drop" holdScript && pkgs.lib.hasInfix "planarian-admin" holdScript && pkgs.lib.hasInfix "/run/planarian/hold-released" holdScript) "the hold table drops by default and keeps only administrator sessions (§12d)")
     (check (builtins.any (u: u.id == "service:sshd") export.units) "sshd is a canonical unit")
     (check (builtins.any (u: u.id == "device:fs-root") export.units) "fs-root is present")
     (check (builtins.any (u: u.id == "device:fs-boot") export.units) "fs-boot is present")
@@ -139,4 +174,32 @@ let
   ];
 in
 assert builtins.all (x: x) checks;
-pkgs.writeText "planarian-module-eval.json" (builtins.toJSON export)
+# §12d: the hold fails closed when its table will not load. The real built
+# script, its root (/run/planarian) moved into the build directory and a
+# stub nft first on its PATH that fails the first load (the full table) and
+# records the next: `reapply` (after a flush) must then load the lock that
+# holds everything but loopback.
+pkgs.runCommand "planarian-module-eval.json" {
+  export = builtins.toJSON export;
+  passAsFile = [ "export" ];
+  nativeBuildInputs = [ pkgs.gnused ];
+} ''
+  root=$PWD/run stub=$PWD/stub
+  mkdir -p $root/hold $stub
+  cat > $stub/nft <<STUB
+  #!${pkgs.runtimeShell}
+  n=\$(cat $stub/count 2>/dev/null || echo 0); n=\$((n + 1)); echo \$n > $stub/count
+  if [ "\$*" = "-f -" ]; then cat > $stub/load.\$n; [ \$n -ge 2 ] && exit 0; exit 1; fi
+  exit 0
+  STUB
+  chmod +x $stub/nft
+  sed -e "s|/run/planarian|$root|g" -e "s|^PATH=|PATH=$stub:|" ${builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart)} > hold
+  chmod +x hold
+  touch $root/hold/u
+  ./hold reapply
+  grep -q 'set allow4' $stub/load.1 || { echo "reapply did not try the full table first" >&2; exit 1; }
+  grep -q 'iif lo accept' $stub/load.2 && grep -q 'policy drop' $stub/load.2 && ! grep -q 'set allow4' $stub/load.2 \
+    || { echo "reapply did not fall back to the lock" >&2; exit 1; }
+  echo "ok: reapply with a failing table load holds everything but loopback"
+  cp $exportPath $out
+''
