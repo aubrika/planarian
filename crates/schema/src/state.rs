@@ -167,7 +167,9 @@ impl SystemState {
                 Some(e) if e.fresh_at(self.observed_at) => match &e.result {
                     ProbeResult::Pass => {}
                     ProbeResult::Fail(_) => failed.push(probe.id.clone()),
-                    ProbeResult::Timeout | ProbeResult::Error(_) => return UnitStatus::Unknown,
+                    ProbeResult::Timeout | ProbeResult::Abandoned | ProbeResult::Error(_) => {
+                        return UnitStatus::Unknown;
+                    }
                 },
                 _ => return UnitStatus::Unknown,
             }
