@@ -144,6 +144,13 @@ pub struct LogRecord {
     /// was taken, because Phase A has no snapshot backend; it continued.
     #[serde(default)]
     pub no_snapshot: bool,
+    /// I7: an approved execution names who approved it and the `bound_to`
+    /// of the token used; a submission parked for approval carries the
+    /// `bound_to` it waits on.
+    #[serde(default)]
+    pub approver: Option<Actor>,
+    #[serde(default)]
+    pub bound_to: Option<Hash>,
 }
 
 /// §12 step 6 (C18): a transaction that got past step 5 (it ran, or waits
@@ -247,6 +254,9 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// Set by the daemon while a deferred change builds elsewhere: what, and since when.
     pub building: Option<(String, Timestamp)>,
     deferred: Option<(PrebuildJob<B::Gens>, Resume)>,
+    /// The agent behind each change parked for approval, for the approved
+    /// execution's log record (I7).
+    parked_agents: BTreeMap<TxnId, Option<String>>,
 }
 
 /// How to finish a request whose slow part ran elsewhere.
@@ -355,6 +365,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             _ => None,
         };
         let mut core = Core {
+            parked_agents: BTreeMap::new(),
             after_ready: deferred,
             ex,
             b,
@@ -638,9 +649,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             ),
             None => (vec![], String::new()),
         };
+        if let Submitted::Parked { txn, .. } = &result {
+            self.parked_agents.insert(*txn, self.acting_agent.clone());
+        }
         let record = LogRecord {
             at: now,
             no_snapshot: no_snapshot(&result, facts.as_ref()),
+            approver: None,
+            bound_to: match &result {
+                Submitted::Parked { approve, .. } => Some(*approve),
+                _ => None,
+            },
             proposal: p,
             caller,
             pre_digest: pre,
@@ -2112,17 +2131,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     let rec = LogRecord {
                         at: self.b.clock().now(),
                         no_snapshot: no_snapshot(&r, Some(&pk.facts)),
+                        approver: Some(approver.actor.clone()),
+                        bound_to: Some(hash),
                         proposal: pk.proposal,
                         caller: pk.authz.actor,
                         pre_digest: pre,
                         policy,
                         result: r.clone(),
                         facts: Some(pk.facts),
-                        decision: None,
+                        decision: Some(Decision::Allow { tier: Tier::AskFirst, approver: pk.class }),
                         post_digest: None,
                         path: l.path(*txn).map(<[String]>::to_vec).unwrap_or_default(),
                         why: l.terminal.get(txn).map(|x| x.why.clone()).unwrap_or_default(),
-                        agent: self.acting_agent.clone(),
+                        // The proposer's agent, not whoever is acting now.
+                        agent: self.parked_agents.remove(txn).flatten(),
                     };
                     self.awaiting_post.push(rec);
                 }

@@ -1472,6 +1472,8 @@ impl Sim {
                     why: String::new(),
                     agent: None,
                     no_snapshot: false,
+                    approver: None,
+                    bound_to: None,
                 });
                 return Ok(());
             }
@@ -1540,6 +1542,8 @@ impl Sim {
             why: String::new(),
             agent: None,
             no_snapshot: false,
+            approver: None,
+            bound_to: None,
         });
         if crashed {
             self.kill_daemon();

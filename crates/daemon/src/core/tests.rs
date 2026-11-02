@@ -1160,8 +1160,11 @@ fn a_slow_tick_is_warned() {
 }
 
 /// C18 (§12 step 6): a transaction touching user data, with no snapshot
-/// backend (Phase A), logs `NoSnapshot` and continues, on the Allow path
-/// and on the approval path; one that does not touch user data does not.
+/// backend (Phase A), logs `NoSnapshot` and continues: on the approval path
+/// (a UserData change is AskFirst in A) and on the submission path (a
+/// Runtime restart of a UserData unit); one that does not touch user data
+/// does not. The approved execution's record names the approver, the
+/// token's `bound_to` and the decision (I7).
 #[test]
 fn user_data_without_a_snapshot_backend_logs_no_snapshot() {
     let mut cfg = config();
@@ -1169,42 +1172,74 @@ fn user_data_without_a_snapshot_backend_logs_no_snapshot() {
         .tables
         .option_sensitivity
         .push(("planarian.reference.fontScale".into(), Sensitivities::of(&[Sensitivity::UserData])));
-    let mut r = Rig::with(cfg);
+    // gym-web holds user data, in every generation the fake knows.
+    let store = MemStore::new(8 << 20);
+    let fake = gym_world(store.clone());
+    let web = UnitId::service("gym-web");
+    {
+        let mut w = fake.w();
+        let user_data = Sensitivities::of(&[Sensitivity::UserData]);
+        for g in w.gens.values_mut() {
+            if let Some(d) = g.eval.units.get_mut(&web) {
+                d.sensitivity = user_data.clone();
+            }
+        }
+        // And in generations built from here on.
+        if let Some(d) = w.base_units.get_mut(&web) {
+            d.sensitivity = user_data;
+        }
+    }
+    fake.w().alive.insert(100);
+    let mut j = Journal::open(store).unwrap();
+    j.append(fake.w().now, Record::KnownGood(GenerationId(1))).unwrap();
+    let core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, cfg);
+    let mut r = Rig { fake, core };
     r.ticks(2);
     let font = |scale: &str| Request::Apply {
         change: ChangeId("font-scale".into()),
         args: [("scale".to_string(), Value::Str(scale.into()))].into(),
     };
-    let user_data_logged =
-        |r: &Rig| r.core.log.iter().filter(|x| matches!(x.result, Submitted::Finished { .. }) && x.no_snapshot).count();
+    let flagged = |r: &Rig| r.core.log.iter().filter(|x| x.no_snapshot).cloned().collect::<Vec<LogRecord>>();
 
-    // Alice asks; user data may make it AskFirst, approved by an
-    // administrator at a terminal. Either way it runs.
-    let resp = r.core.handle(ALICE, font("1.25"));
-    let resp = match resp {
-        Response::NeedsApproval { approve, .. } => {
-            r.ticks(1);
-            assert_eq!(user_data_logged(&r), 0, "not past step 5 while it waits for approval");
-            r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve })
-        }
-        other => other,
+    // Approval path: alice asks; user data makes it AskFirst.
+    let Response::NeedsApproval { approve, .. } = r.core.handle(ALICE, font("1.25")) else {
+        panic!("a UserData change asks in Phase A")
     };
+    r.ticks(1);
+    assert!(flagged(&r).is_empty(), "not past step 5 while it waits for approval");
+    let resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
     assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "continued: {resp:?}");
     r.ticks(2);
-    assert_eq!(user_data_logged(&r), 1, "{:#?}", r.core.log);
+    let f = flagged(&r);
+    assert_eq!(f.len(), 1, "{:#?}", r.core.log);
+    assert!(matches!(f[0].result, Submitted::Finished { state: TxnState::Committed, .. }));
+    assert_eq!(f[0].caller, Actor::user(1000), "the proposer");
+    assert_eq!(f[0].approver, Some(Actor::user(0)), "I7: the approver");
+    assert_eq!(f[0].bound_to, Some(approve), "I7: the token's bound_to");
+    assert!(
+        matches!(f[0].decision, Some(Decision::Allow { tier: Tier::AskFirst, .. })),
+        "the decision: {:?}",
+        f[0].decision
+    );
+
+    // Submission path: a Runtime restart of a unit holding user data.
+    let (s, defs) = r.core.observe();
+    let p = r.core.proposal(Transition::RestartUnit(web.clone()), &s, &defs, Source::User, "restart".into());
+    let got = r.core.submit(p, user_authorization(Actor::user(0), true), &s, &defs);
+    assert!(matches!(got, Submitted::Finished { .. }), "Runtime, runs at once: {got:?}");
+    r.ticks(2);
+    let f = flagged(&r);
+    assert_eq!(f.len(), 2, "{:#?}", r.core.log);
+    assert!(matches!(f[1].proposal.transition, Transition::RestartUnit(_)));
+    assert_eq!(f[1].approver, None, "no approval on this path");
 
     // Not user data: nothing to snapshot, nothing logged.
-    let resp = r.core.handle(
-        ADMIN,
-        Request::Apply {
-            change: ChangeId("listen-address".into()),
-            args: [("service", "gym-web"), ("addr", "192.0.2.10")]
-                .map(|(k, v)| (k.to_string(), Value::Str(v.into())))
-                .into(),
-        },
-    );
+    let (s, defs) = r.core.observe();
+    let p =
+        r.core.proposal(Transition::RestartUnit(UnitId::service("sshd")), &s, &defs, Source::User, "restart".into());
+    let got = r.core.submit(p, user_authorization(Actor::user(0), true), &s, &defs);
+    assert!(matches!(got, Submitted::Finished { .. } | Submitted::Parked { .. }), "{got:?}");
     r.ticks(2);
-    assert!(r.core.log.len() >= 2, "{resp:?}");
     assert!(
         r.core
             .log
@@ -1214,5 +1249,5 @@ fn user_data_without_a_snapshot_backend_logs_no_snapshot() {
         "{:#?}",
         r.core.log
     );
-    assert_eq!(user_data_logged(&r), 1);
+    assert_eq!(flagged(&r).len(), 2);
 }
