@@ -227,6 +227,10 @@ pub struct DerivedFacts {
     /// decision, Nov 2). Empty for every other transition.
     #[serde(default)]
     pub removes_sensitivity: Sensitivities,
+    /// The units behind `removes_sensitivity`, sorted: what an approval shows
+    /// as removed or stopped (§16).
+    #[serde(default)]
+    pub removes: Vec<UnitId>,
     pub caller: Actor,
     pub config_diff: Option<ConfigDiff>,
 }

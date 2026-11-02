@@ -178,6 +178,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         restores_unattributed_stop: false,
         restarts_failed_unit: false,
         removes_sensitivity: Default::default(),
+        removes: Default::default(),
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
         caller: i.caller.clone(),
@@ -285,6 +286,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
                 removed.extend(a.stop.iter().cloned());
             }
             f.removes_sensitivity = unit_facts(&removed, &all_defs, &services, |_| false).0;
+            f.removes = unit_set(removed);
             f.affected_units = unit_set(affected);
             f.config_diff = (!config.options.is_empty()).then_some(config);
         }

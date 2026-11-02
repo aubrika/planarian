@@ -429,6 +429,7 @@ pub struct DerivedFacts {
     pub other_sessions_affected: bool,       // a system-scope effect reaches another uid's online or active session (§11)
     pub restarts_failed_unit: bool,          // a RestartUnit whose unit has already failed when the facts are derived (§11; owner decision, Nov 2)
     pub removes_sensitivity: Sensitivities,  // a generation transition: the sensitivity of the units it would remove or stop (§11 Rollback row; owner decision, Nov 2)
+    pub removes: BTreeSet<UnitId>,           // those units, as an approval shows them (§16)
     pub caller: Actor,
     pub config_diff: Option<ConfigDiff>,
 }

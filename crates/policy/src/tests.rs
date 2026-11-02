@@ -54,6 +54,7 @@ fn facts(
         restores_unattributed_stop: flags & 128 != 0,
         restarts_failed_unit: false,
         removes_sensitivity: Default::default(),
+        removes: Default::default(),
         other_sessions_affected: flags & 32 != 0,
         affected_sessions: if flags & 64 != 0 { vec!["s1".into()] } else { vec![] },
         caller: Actor::Daemon,
