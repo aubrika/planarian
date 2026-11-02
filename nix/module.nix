@@ -179,6 +179,17 @@ let
           other connection is refused until the unit is back.
         '';
       };
+      holdInterfaces = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "wg0" ];
+        description = ''
+          For a network-security unit (§12d): its own network interfaces
+          (a tunnel's). Traffic over them passes the hold only while
+          `services.planarian.holdAllowsOwnInterface` is set (pending the
+          owner's decision on the tunnel's own traffic).
+        '';
+      };
       runtimeRepair = mkOption {
         type = types.nullOr (types.enum [ "wifi.network" ]);
         default = null;

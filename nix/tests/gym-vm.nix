@@ -186,8 +186,7 @@ let
       # machine's end is a userspace WireGuard daemon (wireguard-go) in its
       # own unit, so a kill fails the unit as it would a VPN daemon (NixOS's
       # kernel wg-quick units are oneshots with nothing to kill). Restart=no:
-      # restarting is Planarian's repair (§12d). The probe reaches the
-      # upstream's HTTP server across the tunnel; the hold still lets the
+      # restarting is Planarian's repair (§12d). The hold still lets the
       # unit reach the peer's endpoint.
       { config = lib.mkIf netsec {
           systemd.services.wireguard-gym = {
@@ -213,7 +212,12 @@ let
           services.planarian.units.wireguard-gym = {
             sensitivity = [ "Security" "External" ];
             holdAllow = [ { address = wg.endpoint; port = wg.port; protocol = "udp"; } ];
-            probes = [ { id = "wg0-carries-traffic"; type = "tcp"; addr = "${wg.upstream.addr}:9000"; establishes = "the tunnel carries traffic to the upstream"; } ];
+            # Its own interface: inert until the owner decides whether the
+            # tunnel's own traffic passes the hold (§12d). Until then the
+            # Readiness probe must not cross the tunnel, or a hold could
+            # never lift: it checks the daemon.
+            holdInterfaces = [ "wg0" ];
+            probes = [ { id = "wireguard-gym-active"; type = "systemd-active"; establishes = "the tunnel's daemon runs"; } ];
           };
         }; }
     ];

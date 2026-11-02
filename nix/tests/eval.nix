@@ -40,6 +40,7 @@ let
         services.planarian.units.gym-vpn = {
           sensitivity = [ "Security" "External" ];
           holdAllow = [ { address = "192.0.2.7"; port = 51820; } ];
+          holdInterfaces = [ "wg9" ];
         };
         services.planarian.units.gym-app.probes = [
           { id = "gym-app-tcp"; type = "tcp"; addr = "127.0.0.1:8081"; establishes = "gym-app accepts connections"; }
@@ -65,6 +66,9 @@ let
     } ];
   };
   weakRefused = builtins.filter (a: !a.assertion) weakEdgeSys.config.assertions;
+  # §12d, pending the owner: the tunnel's own interface passes the hold only
+  # with the switch on.
+  ownIfaceSys = sys.extendModules { modules = [ { services.planarian.holdAllowsOwnInterface = true; } ]; };
   # §12d (P13): "planariad is ordered before every unit that admits a
   # principal: the display manager (whichever unit NixOS uses for it —
   # `display-manager.service`, or `greetd.service` where `services.greetd` is
@@ -133,7 +137,8 @@ let
     (check (hold.holdDropins."gym-vpn.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@gym-vpn.service\n") "a network-security unit's failure applies the hold through OnFailure= (§12d)")
     (check (!(cfg.systemd.services.gym-vpn ? onFailure) || !(builtins.elem "planarian-hold@gym-vpn.service" cfg.systemd.services.gym-vpn.onFailure)) "the OnFailure= is a drop-in, not a unit definition (no stub for an undefined unit)")
     (check (pkgs.lib.hasInfix "ExecStartPost=" nftDropin && pkgs.lib.hasInfix "ExecReload=" nftDropin && pkgs.lib.hasInfix " reapply" nftDropin) "a hold is re-applied after nftables.service starts or reloads, which may flush every table (§12d)")
-    (check (cfg.environment.etc."planarian/hold/gym-vpn.allow".text == "udp 192.0.2.7 51820\n") "the hold reads the unit's holdAllow endpoints (§12d)")
+    (check (cfg.environment.etc."planarian/hold/gym-vpn.allow".text == "udp 192.0.2.7 51820\n") "the hold reads the unit's holdAllow endpoints, and not its own interfaces while the switch is off (§12d)")
+    (check (ownIfaceSys.config.environment.etc."planarian/hold/gym-vpn.allow".text == "udp 192.0.2.7 51820\niface wg9\n") "with the switch on, the held unit's own interfaces pass the hold (§12d, pending the owner)")
     (check (holdUnit.unitConfig.DefaultDependencies == false && !(holdUnit ? bindsTo && builtins.elem "planariad.service" holdUnit.bindsTo) && !(holdUnit ? partOf && builtins.elem "planariad.service" holdUnit.partOf)) "the hold unit does not depend on planariad, so it survives its restart (§12d)")
     (check (holdUnit.serviceConfig.RemainAfterExit && pkgs.lib.hasSuffix " apply %i" holdUnit.serviceConfig.ExecStart && pkgs.lib.hasSuffix " lift %i" holdUnit.serviceConfig.ExecStop && pkgs.lib.hasSuffix " released %i" holdUnit.serviceConfig.ExecCondition) "start applies, stop lifts, an unexpired release skips (§12d)")
     (check (pkgs.lib.hasInfix "policy drop" holdScript && pkgs.lib.hasInfix "planarian-admin" holdScript && pkgs.lib.hasInfix "/run/planarian/hold-released" holdScript) "the hold table drops by default and keeps only administrator sessions (§12d)")

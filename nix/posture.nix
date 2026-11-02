@@ -230,11 +230,12 @@ let
         rm -f "$dir/.admin"
         return 0
       fi
-      a4=""; a6=""; i4=""; o4=""; i6=""; o6=""
+      a4=""; a6=""; i4=""; o4=""; i6=""; o6=""; ifs=""
       for u in $units; do
         f=/etc/planarian/hold/$u.allow
         [ -f "$f" ] || continue
         while read -r proto addr port; do
+          if [ "$proto" = iface ]; then ifs="$ifs \"$addr\","; continue; fi
           [ -n "$port" ] || continue
           case "$addr" in *:*) a6="$a6 $proto . $addr . $port," ;; *) a4="$a4 $proto . $addr . $port," ;; esac
         done < "$f"
@@ -259,9 +260,11 @@ let
       set admin_out4 { type inet_proto . ipv4_addr . inet_service . ipv4_addr . inet_service; $(el "$o4") }
       set admin_in6 { type inet_proto . ipv6_addr . inet_service . ipv6_addr . inet_service; $(el "$i6") }
       set admin_out6 { type inet_proto . ipv6_addr . inet_service . ipv6_addr . inet_service; $(el "$o6") }
+      set ifaces { type ifname; $(el "$ifs") }
       chain input {
         type filter hook input priority -300; policy drop;
         iif lo accept
+        iifname @ifaces accept
         udp sport 67 udp dport 68 accept
         udp sport 547 udp dport 546 accept
         icmpv6 type { nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect } accept
@@ -273,6 +276,7 @@ let
       chain output {
         type filter hook output priority -300; policy drop;
         oif lo accept
+        oifname @ifaces accept
         udp sport 68 udp dport 67 accept
         udp sport 546 udp dport 547 accept
         icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
@@ -377,6 +381,12 @@ in
       default = [ ];
       example = [ "my-assistant.service" ];
       description = "Units that run an agent principal (§11). They start only after planarian-ready.target and are stopped by every failure class (I20).";
+    };
+    holdAllowsOwnInterface = mkOption {
+      type = types.bool;
+      default = false;
+      internal = true;
+      description = "Whether a hold passes traffic over the held units' own interfaces (`holdInterfaces`): the switch for the owner's pending decision on the tunnel's own traffic (§12d).";
     };
     holdUnits = mkOption {
       type = types.listOf types.str;
@@ -526,7 +536,8 @@ in
     systemd.packages = [ holdDropinPackage ];
     environment.etc = lib.listToAttrs (map (u: {
       name = "planarian/hold/${u}.allow";
-      value.text = lib.concatMapStrings (a: "${a.protocol} ${a.address} ${toString a.port}\n") cfg.units.${u}.holdAllow;
+      value.text = lib.concatMapStrings (a: "${a.protocol} ${a.address} ${toString a.port}\n") cfg.units.${u}.holdAllow
+        + lib.optionalString cfg.holdAllowsOwnInterface (lib.concatMapStrings (i: "iface ${i}\n") cfg.units.${u}.holdInterfaces);
     }) (builtins.filter (u: cfg.units ? ${u}) cfg.holdUnits));
     systemd.services."planarian-hold@" = {
       description = "Planarian: hold network traffic while %i has failed";
