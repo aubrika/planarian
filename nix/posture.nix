@@ -298,6 +298,23 @@ let
     NFT
     }
 
+    # Fail closed: when the full table does not load (and a hold stands),
+    # hold everything but loopback rather than nothing. apply, lift (other
+    # holds may stand) and reapply (after a flush) all go through it.
+    build_or_lock() {
+      build && return 0
+      log "the hold table did not load; holding all traffic but loopback"
+      nft -f - <<NFT
+    table inet planarian-hold
+    delete table inet planarian-hold
+    table inet planarian-hold {
+      chain input { type filter hook input priority -300; policy drop; iif lo accept; }
+      chain output { type filter hook output priority -300; policy drop; oif lo accept; }
+      chain forward { type filter hook forward priority -300; policy drop; }
+    }
+    NFT
+    }
+
     case "$cmd" in
       released)
         # ExecCondition: exit 1 skips the hold while an unexpired release
@@ -314,27 +331,12 @@ let
       apply)
         touch "$dir/$unit"
         snapshot
-        if build; then
-          log "traffic held: $unit has failed"
-        else
-          # Fail closed: the full table did not load; hold everything but
-          # loopback rather than nothing.
-          log "the hold table did not load; holding all traffic but loopback"
-          nft -f - <<NFT
-    table inet planarian-hold
-    delete table inet planarian-hold
-    table inet planarian-hold {
-      chain input { type filter hook input priority -300; policy drop; iif lo accept; }
-      chain output { type filter hook output priority -300; policy drop; oif lo accept; }
-      chain forward { type filter hook forward priority -300; policy drop; }
-    }
-    NFT
-        fi ;;
+        build_or_lock && log "traffic held: $unit has failed" ;;
       lift)
         rm -f "$dir/$unit"
-        build && log "hold on $unit lifted" ;;
+        build_or_lock && log "hold on $unit lifted" ;;
       reapply)
-        build ;;
+        build_or_lock ;;
       *) echo "usage: planarian-hold apply|lift|released UNIT | reapply" >&2; exit 2 ;;
     esac
   '';
