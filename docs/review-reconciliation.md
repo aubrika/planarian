@@ -381,3 +381,17 @@ Tests:
 - daemon: `records_journaled_before_the_withdrawal_fields_decode`, literals of
   main's Advance, Prepared and checkpoint `TerminalTxn`;
 - txn: `withdrawal_links_replay_and_survive_compaction`.
+
+## lane-daemon: #35 part 2, approvals show the change (§16), 2 Nov
+
+Reconciled at `main` `9f18fe7` against #35 and #34's §16 text. The
+coordinator granted `crates/ipc` (`Pending.diff`) and `crates/console` (the
+view) to this task.
+
+| Item | At `9f18fe7` | Work |
+| --- | --- | --- |
+| The diff is computed by the core | `facts.config_diff` (base override → candidate override, from `derive`) exists; per-option sensitivity is `Tables::option_sensitivity` | `approval::diff` builds `ApprovalDiff { options: [OptionChange { path, old, new, sensitivity }], removes }`, Security and External first, for generation transitions only |
+| A diff that differs at approval does not apply | `exec::binding` hashes the whole `DerivedFacts`, `config_diff` included: a re-derived difference re-binds and asks again. The diff itself is fixed by the two override hashes recorded at Prepared, so it can differ only if the override file changed, which the approval's stale check refuses (`Stale`) | no new mechanism; core test `an_approval_shows_its_diff_and_a_changed_diff_does_not_apply` |
+| Shown in `planarian approve`, the console and the notice; structured for agents | not shown anywhere; `Pending` had `facts` only | `Pending.diff` (serde default); `planarian approve [--json]` lists pending changes with their diffs (read-only, no TTY or root); `approve <hash>` prints the diff above its result; `status` and the console's banner show it; the notice and the `NeedsApproval` response carry a one-line summary (`ApprovalDiff::summary`) |
+| The units it would remove or stop | not in `DerivedFacts`; `removes_sensitivity` is #34's | `removes` is filled from `facts.removes` once #34's derive change lands (coordinator, Nov 2); empty until then |
+| Journal compatibility of `removes` (#37 review at `f7e2dc3`) | main journals `DerivedFacts.removes: Vec<UnitId>` (since 4bb9c99) inside `Prepared`; `f7e2dc3` changed it to `Vec<(UnitId, Sensitivities)>`, so a record main wrote would not decode. No journaled type uses `deny_unknown_fields` | `removes` keeps main's form; `#[serde(default)] removes_each: Vec<Sensitivities>` runs parallel to it, filled by `removed_units` from the decision's lookup. The display takes `removes_each[i]` when the lengths match, else `removes_sensitivity` for each with a note (`approval::removed`). Literal fixtures of main's form, `DerivedFacts` and a whole `Prepared` record, decode; policy test `removed_units_and_their_own_sensitivities_do_not_move_a_decision` (I14). `approval_diff`'s unused `defs` is gone |

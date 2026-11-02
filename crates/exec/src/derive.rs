@@ -198,7 +198,7 @@ pub(crate) fn removed_units(
     activation: Option<&ActivationPlan>,
     defs: &UnitDefs,
     services: &BTreeMap<String, Sensitivities>,
-) -> (Vec<UnitId>, Sensitivities) {
+) -> (Vec<UnitId>, Vec<Sensitivities>, Sensitivities) {
     let mut removed: Vec<UnitId> = base_m.units.keys().filter(|u| !cand_m.units.contains_key(*u)).cloned().collect();
     removed.extend(
         base_m.user_units.iter().filter(|b| !cand_m.user_units.iter().any(|c| c.id == b.id)).map(|b| b.id.clone()),
@@ -211,7 +211,11 @@ pub(crate) fn removed_units(
         known.entry(b.id.clone()).or_insert_with(|| b.clone());
     }
     let sens = unit_facts(&removed, &known, services, |_| false).0;
-    (unit_set(removed), sens)
+    // Each one's own, from the same lookup as the decision's (§16: what the
+    // approval shows is what was decided on).
+    let removed = unit_set(removed);
+    let each = removed.iter().map(|u| unit_facts(std::iter::once(u), &known, services, |_| false).0).collect();
+    (removed, each, sens)
 }
 
 pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
@@ -235,6 +239,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         restarts_failed_unit: false,
         removes_sensitivity: Default::default(),
         removes: Default::default(),
+        removes_each: Default::default(),
         restarts_held_unit: false,
         other_sessions_affected: false,
         affected_sessions: Vec::new(),
@@ -363,9 +368,11 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
                 f.sensitivity = f.sensitivity.union(&Sensitivities::of(&[Sensitivity::Security]));
                 f.touches_manifest = true;
             }
-            let (removes, removes_sensitivity) = removed_units(&base_m, &cand_m, i.activation, &all_defs, &services);
+            let (removes, each, removes_sensitivity) =
+                removed_units(&base_m, &cand_m, i.activation, &all_defs, &services);
             f.removes_sensitivity = removes_sensitivity;
             f.removes = removes;
+            f.removes_each = each;
             f.affected_units = unit_set(affected);
             f.config_diff = (!config.options.is_empty()).then_some(config);
         }
@@ -507,17 +514,20 @@ mod sensitivity_completeness {
         let mut cand = base.clone();
         cand.user_units.clear();
         let none = BTreeMap::new();
-        let (removed, s) = removed_units(&base, &cand, None, &UnitDefs::new(), &none);
+        let (removed, each, s) = removed_units(&base, &cand, None, &UnitDefs::new(), &none);
         assert_eq!(removed, vec![vpn.id.clone()]);
+        assert_eq!(each.len(), removed.len(), "parallel");
+        assert!(each[0].security, "each carries its own: {each:?}");
         assert!(s.security, "the removed user template is Security: {s:?}");
         // Nothing removed: nothing carried.
-        let (removed, s) = removed_units(&base, &base, None, &base.units, &none);
-        assert!(removed.is_empty() && s == Sensitivities::default(), "{removed:?} {s:?}");
+        let (removed, each, s) = removed_units(&base, &base, None, &base.units, &none);
+        assert!(removed.is_empty() && each.is_empty() && s == Sensitivities::default(), "{removed:?} {s:?}");
         // A unit the activation stops counts too.
         let web = UnitId::service("gym-web");
         let plan = ActivationPlan { stop: [web.clone()].into(), ..Default::default() };
-        let (removed, _) = removed_units(&base, &base, Some(&plan), &base.units, &none);
+        let (removed, each, _) = removed_units(&base, &base, Some(&plan), &base.units, &none);
         assert_eq!(removed, vec![web]);
+        assert_eq!(each.len(), 1);
     }
 }
 

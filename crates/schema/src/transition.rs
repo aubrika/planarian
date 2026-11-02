@@ -228,9 +228,16 @@ pub struct DerivedFacts {
     #[serde(default)]
     pub removes_sensitivity: Sensitivities,
     /// The units behind `removes_sensitivity`, sorted: what an approval shows
-    /// as removed or stopped (§16).
+    /// as removed or stopped (§16). Journaled in this form since 4bb9c99.
     #[serde(default)]
     pub removes: Vec<UnitId>,
+    /// `removes[i]`'s own sensitivity, from the decision's lookup, so the
+    /// display and the decision agree. A parallel field, not a change to
+    /// `removes`, so a record journaled before it still decodes (and an older
+    /// build ignores it). Absent or of another length: the display shows
+    /// `removes_sensitivity` for each and says so.
+    #[serde(default)]
+    pub removes_each: Vec<Sensitivities>,
     /// A RestartUnit of a network-security unit (§12d: a network tool the
     /// kernel attributes traffic-steering changes to) that has failed: its
     /// traffic is held, so the restart only ends an outage and runs at once
