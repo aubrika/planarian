@@ -11,6 +11,7 @@ name = "planarian-gym"
 path = "src/main.rs"
 
 [dependencies]
+planarian-backend-netwatch.workspace = true
 planarian-schema.workspace = true
 planarian-txn.workspace = true
 planarian-exec.workspace = true

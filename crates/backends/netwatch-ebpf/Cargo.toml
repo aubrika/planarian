@@ -1,0 +1,28 @@
+# The kernel half of netwatch (SPEC §12d "Which units"). Not a workspace
+# member: built for bpfel-unknown-none by nix/netwatch-ebpf.nix (pinned rustc,
+# RUSTC_BOOTSTRAP, -Z build-std=core, nixpkgs' bpf-linker) into
+# share/planarian/netwatch.bpf.o, which planarian-backend-netwatch loads.
+[package]
+name = "netwatch-ebpf"
+version = "0.0.0"
+edition = "2024"
+license = "MPL-2.0"
+publish = false
+
+[dependencies]
+aya-ebpf = "0.2"
+
+[[bin]]
+name = "netwatch"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+debug = 2
+codegen-units = 1
+lto = true
+
+[profile.dev]
+panic = "abort"
+
+[workspace]

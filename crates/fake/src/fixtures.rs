@@ -197,6 +197,14 @@ pub fn gym_units() -> UnitDefs {
         Disruption::DataInterruption,
         vec![user_probe("gym-sync-active", ProbeKind::SystemdActive)],
     );
+    // §12d classifier cases: two network tools by their systemd
+    // configuration (the module computes it; lane-daemon carries it), whose
+    // names match nothing. Whether they protect traffic is netwatch's,
+    // scripted by the gym's `footprint` steps.
+    let netd =
+        unit("service:gym-netd", r, Disruption::Brief, vec![user_probe("gym-netd-active", ProbeKind::SystemdActive)]);
+    let syncd =
+        unit("service:gym-syncd", r, Disruption::Brief, vec![user_probe("gym-syncd-active", ProbeKind::SystemdActive)]);
 
     [
         web,
@@ -219,6 +227,8 @@ pub fn gym_units() -> UnitDefs {
         backup,
         tunnel,
         sync,
+        netd,
+        syncd,
         fs("fs-root"),
         fs("fs-nix"),
         fs("fs-boot"),

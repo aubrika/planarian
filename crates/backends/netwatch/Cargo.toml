@@ -1,0 +1,32 @@
+[package]
+name = "planarian-backend-netwatch"
+description = "Planarian netwatch: the kernel-attributed footprint of each network tool, and its file contract (SPEC §12d \"Which units\")."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# The aya loader and the `netwatch` binary (Linux, root). The model and the
+# file contract need neither, so the fake depends on this crate without it.
+loader = ["dep:aya", "dep:aya-obj", "dep:signal-hook", "dep:rustix"]
+
+[dependencies]
+planarian-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+aya = { version = "0.13", optional = true, default-features = false }
+aya-obj = { version = "0.2", optional = true }
+signal-hook = { version = "0.3", optional = true }
+rustix = { workspace = true, optional = true, features = ["net"] }
+
+[[bin]]
+name = "planarian-netwatch"
+path = "src/main.rs"
+required-features = ["loader"]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

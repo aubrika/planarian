@@ -819,6 +819,38 @@ impl Sim {
                 self.fake.w().signal(&unit(get("unit")), sig)
             }
             "oom" => self.fake.w().oom(&unit(get("unit"))),
+            // §12d, fake only: the kernel attributes a change to a unit (or
+            // to nobody: "unattributed"), as netwatch would report it.
+            "footprint" => {
+                use planarian_backend_netwatch::{Change, ChangeKind, Owner};
+                let kind = match get("change") {
+                    "interface" => ChangeKind::Interface,
+                    "route" => ChangeKind::Route,
+                    "rule" => ChangeKind::Rule,
+                    "dns" => ChangeKind::Dns,
+                    "proxy" => ChangeKind::Proxy,
+                    "firewall" => ChangeKind::Firewall,
+                    c => return Err(Unsupported(format!("footprint change {c}"))),
+                };
+                let owner = match get("unit") {
+                    "unattributed" => Owner::Unattributed,
+                    u => Owner::Unit(unit(u)),
+                };
+                let iface = s.get("interface").and_then(T::as_str).map(str::to_string);
+                let object = format!("{} {}", get("change"), iface.as_deref().unwrap_or("-"));
+                let steers = s.get("steers").and_then(T::as_bool).unwrap_or(false);
+                self.fake.w().netwatch.apply(&Change { owner, kind, object, iface, steers, removed: false });
+            }
+            // Fake only: that unit's footprint has gone stale.
+            "footprint_stale" => {
+                self.fake.w().netwatch_stale.insert(unit(get("unit")));
+            }
+            // Fake only: the watch failed to attach (`state = "attach-failed"`).
+            "netwatch" => match get("state") {
+                "attach-failed" => self.fake.w().netwatch_failed = Some("attach failed (scripted)".into()),
+                "attached" => self.fake.w().netwatch_failed = None,
+                st => return Err(Unsupported(format!("netwatch state {st}"))),
+            },
             // Units every switch away from the current generation restarts
             // (what its dry activation reports); fake only.
             "restarts_on_switch" => {
