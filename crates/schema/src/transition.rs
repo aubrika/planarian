@@ -161,6 +161,24 @@ pub enum RejectReason {
     Other(String),
 }
 
+/// What a transition costs the user, as a set (§11, C10). A change can stop
+/// one unit's session and drop another's network: each kind it carries is a
+/// member, and each §11 floor applies when any member triggers it. A single
+/// value folded by `max` loses floors, because the floors are not ordered
+/// (the session floor spares the caller's own session, the connectivity floor
+/// spares a seated caller). Flags, not a collection: the proofs read them
+/// directly. None is the empty set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize)]
+#[verifier::external_derive]
+#[serde(from = "DisruptionsRepr")]
+pub struct Disruptions {
+    pub brief: bool,
+    pub session_loss: bool,
+    pub data_interruption: bool,
+    pub connectivity_loss: bool,
+}
+
 /// Derived by the executor from the evaluated generation, never from the
 /// proposal (I14).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,7 +188,7 @@ pub struct DerivedFacts {
     /// Sorted and unique (`unit_set`).
     pub affected_units: Vec<UnitId>,
     pub sensitivity: Sensitivities,
-    pub disruption: Disruption,
+    pub disruption: Disruptions,
     pub recovery: Recovery,
     pub touches_manifest: bool,
     /// A canonical probe's *definition* changed (protected by I10).
@@ -327,6 +345,82 @@ impl RecoveryStrategy {
 
 } // verus!
 
+impl Disruptions {
+    /// The set holding `d` alone (`None` is the empty set).
+    pub fn of(d: Disruption) -> Disruptions {
+        let mut s = Disruptions::default();
+        s.insert(d);
+        s
+    }
+
+    pub fn insert(&mut self, d: Disruption) {
+        match d {
+            Disruption::None => {}
+            Disruption::Brief => self.brief = true,
+            Disruption::SessionLoss => self.session_loss = true,
+            Disruption::DataInterruption => self.data_interruption = true,
+            Disruption::ConnectivityLoss => self.connectivity_loss = true,
+        }
+    }
+
+    pub fn contains(&self, d: Disruption) -> bool {
+        match d {
+            Disruption::None => self.is_none(),
+            Disruption::Brief => self.brief,
+            Disruption::SessionLoss => self.session_loss,
+            Disruption::DataInterruption => self.data_interruption,
+            Disruption::ConnectivityLoss => self.connectivity_loss,
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        *self == Disruptions::default()
+    }
+
+    /// Its members, cheapest first (for display and metrics).
+    pub fn members(&self) -> Vec<Disruption> {
+        [Disruption::Brief, Disruption::SessionLoss, Disruption::DataInterruption, Disruption::ConnectivityLoss]
+            .into_iter()
+            .filter(|d| self.contains(*d))
+            .collect()
+    }
+}
+
+impl From<Disruption> for Disruptions {
+    fn from(d: Disruption) -> Disruptions {
+        Disruptions::of(d)
+    }
+}
+
+/// A journal written before C10 holds one `Disruption`; it reads back as the
+/// set holding it.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DisruptionsRepr {
+    One(Disruption),
+    Set {
+        #[serde(default)]
+        brief: bool,
+        #[serde(default)]
+        session_loss: bool,
+        #[serde(default)]
+        data_interruption: bool,
+        #[serde(default)]
+        connectivity_loss: bool,
+    },
+}
+
+impl From<DisruptionsRepr> for Disruptions {
+    fn from(r: DisruptionsRepr) -> Disruptions {
+        match r {
+            DisruptionsRepr::One(d) => Disruptions::of(d),
+            DisruptionsRepr::Set { brief, session_loss, data_interruption, connectivity_loss } => {
+                Disruptions { brief, session_loss, data_interruption, connectivity_loss }
+            }
+        }
+    }
+}
+
 /// Sorted, without duplicates: the form of `DerivedFacts::affected_units`.
 pub fn unit_set(units: impl IntoIterator<Item = UnitId>) -> Vec<UnitId> {
     let set: BTreeSet<UnitId> = units.into_iter().collect();
@@ -480,6 +574,23 @@ pub enum Source {
 
 #[cfg(test)]
 mod tests {
+
+    /// C10: a journal written before the set reads its single disruption back
+    /// as the set holding it; the set round-trips; a missing member is false.
+    #[test]
+    fn disruptions_read_the_old_single_value() {
+        let old: Disruptions = serde_json::from_str("\"SessionLoss\"").unwrap();
+        assert_eq!(old, Disruptions::of(Disruption::SessionLoss));
+        let none: Disruptions = serde_json::from_str("\"None\"").unwrap();
+        assert!(none.is_none());
+        let mut both = Disruptions::of(Disruption::ConnectivityLoss);
+        both.insert(Disruption::DataInterruption);
+        let back: Disruptions = serde_json::from_str(&serde_json::to_string(&both).unwrap()).unwrap();
+        assert_eq!(back, both);
+        assert_eq!(both.members(), vec![Disruption::DataInterruption, Disruption::ConnectivityLoss]);
+        let partial: Disruptions = serde_json::from_str("{\"brief\":true}").unwrap();
+        assert_eq!(partial, Disruptions::of(Disruption::Brief));
+    }
     use super::*;
 
     #[test]
