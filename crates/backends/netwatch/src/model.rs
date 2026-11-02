@@ -172,6 +172,16 @@ pub struct Claims {
     pub unattributed_units: Vec<UnitId>,
 }
 
+impl Claims {
+    /// Every unit claimed for: an object, an endpoint, or an unattributed
+    /// mark.
+    pub fn units(&self) -> BTreeSet<UnitId> {
+        let objects = self.objects.iter().map(|o| o.0.clone());
+        let endpoints = self.endpoints.iter().map(|e| e.0.clone());
+        objects.chain(endpoints).chain(self.unattributed_units.iter().cloned()).collect()
+    }
+}
+
 impl Tracker {
     pub fn apply(&mut self, c: &Change) {
         let key = (c.kind, c.object.clone());

@@ -42,6 +42,10 @@ impl Start {
     }
 }
 
+/// How long the loop waits for a new event when the ring buffer is empty
+/// (a new cgroup wakes it at once).
+pub const IDLE_MS: i64 = 50;
+
 /// How long a refused attach waits before the next try.
 pub const RETRY_SECS: u64 = 30;
 
@@ -186,7 +190,7 @@ pub fn notify_ready(socket: Option<&Path>) {
 }
 
 pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> Result<(), String> {
-    use crate::host::{boottime_secs, expand_tools, network_tools, read_cgroups, read_ifnames};
+    use crate::host::{boottime_secs, expand_tools, network_tools, read_ifnames};
     use crate::parse::{Parsed, parse};
     use crate::{Owner, Tracker, WatchState};
     use std::sync::Arc;
@@ -232,7 +236,7 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
     };
 
     let root = Path::new("/sys/fs/cgroup");
-    let mut cgroups = read_cgroups(root).0;
+    let mut cgroups = crate::cgroups::Cgroups::new(root);
     let mut ifnames = read_ifnames();
     // Attach and reconcile (§12d, on every attach: what was claimed before
     // against what stands now; steering nobody claims was made unwatched).
@@ -272,6 +276,8 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
     let mut lost_seen = 0u64;
     let mut next_tick = Instant::now();
     while !stop.load(Ordering::Relaxed) {
+        // Cgroups made since the last pass first, so a unit's events find it.
+        cgroups.drain();
         let mut drained = 0;
         while let Some(item) = ring.next() {
             drained += 1;
@@ -279,11 +285,7 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                 tracker.lost(None);
                 continue;
             };
-            if !cgroups.contains_key(&ev.cgroup) {
-                // A service started since the last walk.
-                cgroups = read_cgroups(root).0;
-            }
-            let unit = cgroups.get(&ev.cgroup).cloned();
+            let unit = cgroups.unit(ev.cgroup);
             let owner = unit.clone().map(Owner::Unit).unwrap_or(Owner::Unattributed);
             let mut name = |i: u32| {
                 if !ifnames.contains_key(&i) {
@@ -307,10 +309,10 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         if Instant::now() >= next_tick {
             next_tick += Duration::from_secs(crate::TICK_SECS);
             let Some(now) = boottime_secs() else { return fail("no /proc/uptime".into()) };
-            let running;
-            (cgroups, running) = read_cgroups(root);
+            let claims = tracker.claims();
+            let running = cgroups.walk(&claims.units());
             let view = tracker.view(WatchState::Attached { at: now }, &expand_tools(&tools, &running), now);
-            if let Err(e) = crate::write_state(dir, &tracker.claims()).and_then(|()| crate::write(dir, &view)) {
+            if let Err(e) = crate::write_state(dir, &claims).and_then(|()| crate::write(dir, &view)) {
                 return fail(format!("write {}: {e}", dir.display()));
             }
             if !ready.replace(true) {
@@ -319,7 +321,16 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
             }
         }
         if drained == 0 {
-            std::thread::sleep(Duration::from_millis(100));
+            // Wake at once when a cgroup is made (a unit starting), else
+            // after IDLE_MS to read the ring buffer again.
+            match cgroups.fd() {
+                Some(fd) => {
+                    let mut fds = [rustix::event::PollFd::new(fd, rustix::event::PollFlags::IN)];
+                    let t = rustix::event::Timespec { tv_sec: 0, tv_nsec: IDLE_MS * 1_000_000 };
+                    let _ = rustix::event::poll(&mut fds, Some(&t));
+                }
+                None => std::thread::sleep(Duration::from_millis(IDLE_MS as u64)),
+            }
         }
     }
     write_failed(dir, "stopped (signal)");
