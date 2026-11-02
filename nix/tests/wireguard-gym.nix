@@ -85,6 +85,10 @@ in
       };
     };
     systemd.targets.multi-user.wants = [ "gym-tpl@a.service" ];
+    # dhcpcd (10.3.1) segfaults when an interface it manages is deleted,
+    # which the crash subtest does to wg0; the tunnel's address is the
+    # unit's own (ExecStartPost), so its footprint carries it.
+    networking.dhcpcd.denyInterfaces = [ "wg*" ];
 
     services.planarian.units.wireguard-gym = {
       sensitivity = [ "Security" "External" ];
@@ -99,6 +103,7 @@ in
 
   # The peer node's module.
   peer = {
+    networking.dhcpcd.denyInterfaces = [ "wg*" ];
     networking.wg-quick.interfaces.wg0 = {
       address = [ "10.77.0.2/24" ];
       listenPort = port;
