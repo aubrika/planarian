@@ -308,6 +308,131 @@ mod sockopt {
 
 #[cfg(feature = "loader")]
 mod loader_checks {
+    /// `READY=1` reaches the notify socket (a path, or an abstract `@name`).
+    #[test]
+    fn ready_reaches_the_notify_socket() {
+        use std::os::unix::net::UnixDatagram;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("notify");
+        let sock = UnixDatagram::bind(&path).unwrap();
+        crate::loader::notify_ready(Some(&path));
+        let mut buf = [0u8; 32];
+        let n = sock.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"READY=1");
+        crate::loader::notify_ready(None); // not under systemd: nothing to do
+    }
+
+    /// A watch that cannot start writes `.watch` = `failed <reason>` first,
+    /// then still tells systemd it is ready (once), so boot never waits on
+    /// the start timeout and the hold already reads it as not attached.
+    #[test]
+    fn a_failed_start_writes_failed_then_ready() {
+        use std::os::unix::net::UnixDatagram;
+        let d = tempfile::tempdir().unwrap();
+        let (fp, path) = (d.path().join("footprint"), d.path().join("notify"));
+        let sock = UnixDatagram::bind(&path).unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let r = crate::loader::run(&d.path().join("no-export.json"), &d.path().join("none.o"), &fp, Some(&path));
+        assert!(r.is_err());
+        let watch = std::fs::read_to_string(fp.join(".watch")).unwrap();
+        assert!(watch.starts_with("failed "), "{watch}");
+        let mut buf = [0u8; 32];
+        let n = sock.recv(&mut buf).expect("READY=1 was sent");
+        assert_eq!(&buf[..n], b"READY=1");
+        assert!(sock.recv(&mut buf).is_err(), "exactly once");
+    }
+
+    /// An unusable object (here, not ELF) is the exit-1 path: `failed`,
+    /// READY=1 once, and an error, without asking the kernel or retrying.
+    #[test]
+    fn an_unusable_object_exits_after_failed_and_ready() {
+        use std::os::unix::net::UnixDatagram;
+        let d = tempfile::tempdir().unwrap();
+        let (fp, path) = (d.path().join("footprint"), d.path().join("notify"));
+        let (export, object) = (d.path().join("export.json"), d.path().join("netwatch.bpf.o"));
+        std::fs::write(&export, r#"{"networkTools": ["wg-quick-wg0"], "units": {}}"#).unwrap();
+        std::fs::write(&object, b"not an object").unwrap();
+        let sock = UnixDatagram::bind(&path).unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let r = crate::loader::run(&export, &object, &fp, Some(&path));
+        assert!(r.unwrap_err().contains("not an eBPF object"));
+        let watch = std::fs::read_to_string(fp.join(".watch")).unwrap();
+        assert!(watch.starts_with("failed ") && watch.contains("not an eBPF object"), "{watch}");
+        let mut buf = [0u8; 32];
+        let n = sock.recv(&mut buf).expect("READY=1 was sent");
+        assert_eq!(&buf[..n], b"READY=1");
+        assert!(sock.recv(&mut buf).is_err(), "exactly once");
+    }
+
+    /// What the kernel refuses is retried: each refusal is reported (the
+    /// caller writes `failed <reason>`, READY=1 the first time) and waited
+    /// out, until an attach succeeds.
+    #[test]
+    fn a_kernel_refusal_is_retried_until_it_attaches() {
+        use crate::loader::{Start, retry};
+        let mut tries = 0;
+        let (mut refused, mut waits) = (Vec::new(), 0);
+        let r = retry(
+            || {
+                tries += 1;
+                if tries < 3 {
+                    Err(Start::Kernel(format!("attach kprobe nfnetlink_rcv_msg: try {tries}")))
+                } else {
+                    Ok(tries)
+                }
+            },
+            |why| refused.push(why.to_string()),
+            || {
+                waits += 1;
+                true
+            },
+        );
+        assert_eq!(r, Ok(3));
+        assert_eq!(refused, ["attach kprobe nfnetlink_rcv_msg: try 1", "attach kprobe nfnetlink_rcv_msg: try 2"]);
+        assert_eq!(waits, 2);
+    }
+
+    /// An unusable result during retries ends them (exit 1), and a stop
+    /// while waiting ends them without another try.
+    #[test]
+    fn retries_end_on_an_unusable_object_or_a_stop() {
+        use crate::loader::{Start, retry};
+        let mut tries = 0;
+        let r: Result<(), _> = retry(
+            || {
+                tries += 1;
+                Err(if tries == 1 { Start::Kernel("refused".into()) } else { Start::Unusable("no LOST map".into()) })
+            },
+            |_| {},
+            || true,
+        );
+        assert_eq!(r, Err(Start::Unusable("no LOST map".into())));
+        assert_eq!(tries, 2);
+
+        let mut tries = 0;
+        let r: Result<(), _> = retry(
+            || {
+                tries += 1;
+                Err(Start::Kernel("refused".into()))
+            },
+            |_| {},
+            || false,
+        );
+        assert!(matches!(r, Err(Start::Kernel(_))));
+        assert_eq!(tries, 1, "no try after the stop");
+    }
+
+    /// The two nfnetlink functions are in a module, so kprobes; the
+    /// built-in ones stay fentry (coordinator, Nov 2).
+    #[test]
+    fn module_functions_are_kprobes() {
+        use crate::loader::{Kind, PROBES};
+        for (prog, func, kind) in PROBES {
+            let want = if func.starts_with("nfnetlink_") { Kind::KProbe } else { Kind::FEntry };
+            assert_eq!(kind, want, "{prog} ({func})");
+        }
+    }
+
     /// An empty or foreign object is refused before the kernel is asked.
     #[test]
     fn an_object_without_the_programs_is_refused() {
@@ -494,5 +619,62 @@ mod restart {
         let c = before().claims();
         let back: Claims = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
+    }
+}
+
+/// §12d: steering is "an interface it created that carries a default or
+/// all-covering route". The same rule on both paths (coordinator, Nov 2):
+/// NetworkManager's DHCP default route over wlan0, an interface no unit
+/// created, does not make it protecting, watched or found at attach.
+mod physical_nic {
+    use super::*;
+
+    fn nm() -> UnitId {
+        UnitId::service("NetworkManager")
+    }
+
+    fn dhcp_default() -> Change {
+        change(unit(&nm()), ChangeKind::Route, "route 2 254 /0 oif 3 metric 600", Some("wlan0"), true)
+    }
+
+    #[test]
+    fn watched_a_default_route_over_a_physical_nic_is_not_protecting() {
+        let mut t = Tracker::default();
+        t.apply(&dhcp_default());
+        let v = t.view(ATTACHED, &[nm()], NOW);
+        assert!(!v.units["NetworkManager"].protecting && v.unattributed.is_empty(), "{v:?}");
+        assert!(!v.protecting_now("NetworkManager", NOW), "its failure holds nothing");
+        // Nor does one nobody can be charged with.
+        let mut u = Tracker::default();
+        u.apply(&Change { owner: Owner::Unattributed, ..dhcp_default() });
+        assert!(u.view(ATTACHED, &[nm()], NOW).unattributed.is_empty());
+        // Over a tunnel NM created, it does.
+        let mut v = Tracker::default();
+        v.apply(&change(unit(&nm()), ChangeKind::Interface, "tun0", Some("tun0"), false));
+        v.apply(&change(unit(&nm()), ChangeKind::Route, "route 2 254 /0 oif 9 metric 50", Some("tun0"), true));
+        assert!(v.footprint(&nm(), NOW).protecting);
+        // And an unattributed one over a link created while watched fails closed.
+        let mut w = Tracker::default();
+        w.apply(&change(unit(&nm()), ChangeKind::Interface, "tun0", Some("tun0"), false));
+        w.apply(&change(Owner::Unattributed, ChangeKind::Route, "route 2 254 /0 oif 9 metric 50", Some("tun0"), true));
+        assert!(!w.view(ATTACHED, &[nm()], NOW).unattributed.is_empty());
+    }
+
+    #[test]
+    fn at_attach_a_default_route_over_a_physical_nic_is_not_protecting() {
+        // Claimed by NM before the restart, still standing: kept, but steers nothing.
+        let mut before = Tracker::default();
+        before.apply(&dhcp_default());
+        let standing = vec![
+            change(Owner::Unattributed, ChangeKind::Interface, "wlan0", Some("wlan0"), false),
+            Change { owner: Owner::Unattributed, ..dhcp_default() },
+        ];
+        let physical = std::collections::BTreeSet::new();
+        let t = Tracker::attach(&before.claims(), &standing, &physical);
+        let v = t.view(ATTACHED, &[nm()], NOW);
+        assert!(!v.units["NetworkManager"].protecting && v.unattributed.is_empty(), "{v:?}");
+        // Unclaimed (the files lost): still not pre-attach.
+        let t = Tracker::attach(&Claims::default(), &standing, &physical);
+        assert!(t.view(ATTACHED, &[nm()], NOW).unattributed.is_empty());
     }
 }

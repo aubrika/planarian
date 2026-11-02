@@ -12,9 +12,9 @@
 #![no_main]
 
 use aya_ebpf::helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_probe_read_kernel_buf};
-use aya_ebpf::macros::{fentry, map};
+use aya_ebpf::macros::{fentry, kprobe, map};
 use aya_ebpf::maps::RingBuf;
-use aya_ebpf::programs::FEntryContext;
+use aya_ebpf::programs::{FEntryContext, ProbeContext};
 
 /// Bytes of each message copied to userspace (headers and the first
 /// attributes; a longer message is flagged truncated).
@@ -46,11 +46,14 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static LOST: aya_ebpf::maps::Array<u64> = aya_ebpf::maps::Array::with_max_entries(1, 0);
 
+/// Report one netlink message: `nlh` is the receive function's second
+/// argument (rtnetlink_rcv_msg, nfnetlink_rcv_msg and genl_rcv_msg take
+/// (skb, nlh, extack); nfnetlink_rcv_batch takes (skb, nlh, subsys, genid)).
+/// A null `nlh` (an argument that could not be read) reports an empty
+/// capture, which userspace reads as unreadable: the sender is marked
+/// unattributed (fail closed).
 #[inline(always)]
-fn report(ctx: &FEntryContext, hook: u32) -> u32 {
-    // rtnetlink_rcv_msg, nfnetlink_rcv_msg and genl_rcv_msg all take
-    // (struct sk_buff *skb, struct nlmsghdr *nlh, struct netlink_ext_ack *).
-    let nlh: *const u8 = ctx.arg(1);
+fn report(nlh: *const u8, hook: u32) -> u32 {
     let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
         if let Some(n) = LOST.get_ptr_mut(0) {
             unsafe { *n += 1 };
@@ -77,19 +80,23 @@ fn report(ctx: &FEntryContext, hook: u32) -> u32 {
 
 #[fentry(function = "rtnetlink_rcv_msg")]
 pub fn rtnetlink(ctx: FEntryContext) -> u32 {
-    report(&ctx, HOOK_RTNETLINK)
+    report(ctx.arg(1), HOOK_RTNETLINK)
 }
 
-#[fentry(function = "nfnetlink_rcv_msg")]
-pub fn nfnetlink(ctx: FEntryContext) -> u32 {
-    report(&ctx, HOOK_NFNETLINK)
+/// nfnetlink is a module on NixOS kernels (CONFIG_NETFILTER_NETLINK=m), so
+/// its functions are not in vmlinux's BTF and fentry cannot name them with
+/// this aya: a kprobe, by symbol, once the module is loaded (lane-nix loads
+/// it at boot). It still runs in the sender's context.
+#[kprobe(function = "nfnetlink_rcv_msg")]
+pub fn nfnetlink(ctx: ProbeContext) -> u32 {
+    report(ctx.arg(1).unwrap_or(core::ptr::null()), HOOK_NFNETLINK)
 }
 
 /// nftables batches bypass `nfnetlink_rcv_msg`: `nfnetlink_rcv_batch(skb,
 /// nlh, subsys_id, genid)` sees each one (its `nlh` is the batch's first).
-#[fentry(function = "nfnetlink_rcv_batch")]
-pub fn nfbatch(ctx: FEntryContext) -> u32 {
-    report(&ctx, HOOK_NFBATCH)
+#[kprobe(function = "nfnetlink_rcv_batch")]
+pub fn nfbatch(ctx: ProbeContext) -> u32 {
+    report(ctx.arg(1).unwrap_or(core::ptr::null()), HOOK_NFBATCH)
 }
 
 /// Legacy iptables, ip6tables, arptables and ebtables change their tables
@@ -126,7 +133,7 @@ pub fn sockopt(ctx: FEntryContext) -> u32 {
 
 #[fentry(function = "genl_rcv_msg")]
 pub fn genl(ctx: FEntryContext) -> u32 {
-    report(&ctx, HOOK_GENL)
+    report(ctx.arg(1), HOOK_GENL)
 }
 
 #[cfg(not(test))]

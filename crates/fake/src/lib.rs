@@ -535,6 +535,22 @@ impl World {
     /// Send `sig` to a unit's main process, as `systemctl kill` does. SIGTERM,
     /// SIGINT, SIGHUP and SIGPIPE are clean exits to systemd (inactive); any
     /// other signal fails the unit.
+    /// A flaw in generation `g` that shows only once it is live: the unit
+    /// fails in `g` (and only there) from now on, and fails now if `g` runs.
+    pub fn break_in(&mut self, g: GenerationId, unit: &UnitId) {
+        let now = self.now;
+        if let Some(generation) = self.gens.get_mut(&g) {
+            generation.broken.insert(unit.clone());
+        }
+        if self.current == g
+            && let Some(sim) = self.units.get_mut(unit)
+        {
+            sim.observed = Observed::Failed(Reason::ExitCode(1));
+            sim.ended = Some(Ending::Exited(1));
+            sim.failed_at = Some(now);
+        }
+    }
+
     pub fn signal(&mut self, unit: &UnitId, sig: i32) {
         let now = self.now;
         if let Some(sim) = self.units.get_mut(unit) {
@@ -677,6 +693,12 @@ impl Fake {
 }
 
 impl UnitBackend for Fake {
+    /// §12d: the scripted footprints (`footprint_view`), read as the Linux
+    /// side reads the files.
+    fn protecting(&self, tools: &[UnitId]) -> Result<BTreeSet<UnitId>, Outcome> {
+        let now = self.w().now.0 / 1000;
+        Ok(self.footprint_view(tools).protecting(tools, now))
+    }
     fn observe(&self, id: &UnitId) -> Result<Observed, Outcome> {
         let w = self.w();
         Ok(w.units.get(&World::key(id)).map(|s| s.observed.clone()).unwrap_or(Observed::Absent))

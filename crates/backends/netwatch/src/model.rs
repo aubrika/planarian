@@ -142,8 +142,14 @@ struct Standing {
 #[derive(Clone, Debug, Default)]
 pub struct Tracker {
     units: BTreeMap<UnitId, Standing>,
-    /// Steering changes that stand, attributed to nobody.
-    unattributed: BTreeSet<(ChangeKind, String)>,
+    /// Steering changes that stand, attributed to nobody, with the interface
+    /// a route goes out of.
+    unattributed: BTreeMap<(ChangeKind, String), Option<String>>,
+    /// Links that something created (a link kind; or created through
+    /// netlink while watched, which a physical NIC never is). §12d's
+    /// steering route is one over "an interface it created": a default route
+    /// over the machine's own NIC is not one, watched or found at attach.
+    virtual_ifaces: BTreeSet<String>,
     /// A lost event could not be placed: everything counts as unattributed
     /// until the watch restarts (which re-reads the kernel's state).
     lost_unplaced: bool,
@@ -177,6 +183,9 @@ impl Tracker {
             }
             self.unattributed.remove(&key);
             self.pre_attach.remove(&key);
+            if c.kind == ChangeKind::Interface {
+                self.virtual_ifaces.remove(&c.object);
+            }
             if c.kind == ChangeKind::Route {
                 self.route_through.remove(&c.object);
             }
@@ -188,16 +197,21 @@ impl Tracker {
                     s.objects.retain(|(k, _), (i, _)| !(*k == ChangeKind::Route && *i == gone));
                 }
                 self.route_through.retain(|_, i| Some(i.clone()) != gone);
+                self.unattributed.retain(|(k, _), i| !(*k == ChangeKind::Route && *i == gone));
                 self.pre_attach.retain(|(k, _), i| !(*k == ChangeKind::Route && *i == gone));
             }
             return;
         }
+        if c.kind == ChangeKind::Interface {
+            // Created through netlink: a virtual link (dummy, wireguard, tun).
+            self.virtual_ifaces.insert(c.object.clone());
+        }
         match &c.owner {
             Owner::Unattributed => {
-                if c.removed || !c.steers {
+                if !c.steers {
                     self.unattributed.remove(&key);
                 } else {
-                    self.unattributed.insert(key);
+                    self.unattributed.insert(key, c.iface.clone());
                 }
             }
             Owner::Unit(u) => {
@@ -243,7 +257,7 @@ impl Tracker {
     pub fn attach(previous: &Claims, standing: &[Change], virtual_ifaces: &BTreeSet<String>) -> Tracker {
         let present: BTreeMap<(ChangeKind, String), &Change> =
             standing.iter().map(|c| ((c.kind, c.object.clone()), c)).collect();
-        let mut t = Tracker::default();
+        let mut t = Tracker { virtual_ifaces: virtual_ifaces.clone(), ..Default::default() };
         for (u, k, o, i, steers) in &previous.objects {
             if present.contains_key(&(*k, o.clone())) {
                 t.apply(&Change {
@@ -337,15 +351,17 @@ impl Tracker {
             .map(|((_, name), _)| name.clone())
             .collect();
         // §12d: an interface the unit created that carries a default or
-        // all-covering route protects, whoever added the route; its own
-        // steering changes (rules, DNS, proxy, firewall, routes) protect too.
-        // `iface` lines name only the created interfaces that steer: what the
-        // hold passes (lane-nix's contract; narrower than all it created).
+        // all-covering route protects, whoever added the route; so do its own
+        // catch-all rules, DNS, proxy and firewall changes. A route alone
+        // does not: a default route over an interface the unit did not create
+        // (NetworkManager's DHCP route over wlan0) steers nothing of its own,
+        // watched or found at attach (coordinator, Nov 2). `iface` lines name
+        // the created interfaces that steer: what the hold passes.
         let ifaces: BTreeSet<String> = self.steering_ifaces().intersection(&created).cloned().collect();
+        let own = |k: &ChangeKind| !matches!(k, ChangeKind::Interface | ChangeKind::Route);
         Footprint {
             at,
-            protecting: !ifaces.is_empty()
-                || s.objects.iter().any(|((k, _), (_, steers))| *steers && *k != ChangeKind::Interface),
+            protecting: !ifaces.is_empty() || s.objects.iter().any(|((k, _), (_, steers))| *steers && own(k)),
             ifaces,
             endpoints: s.endpoints.clone(),
             unattributed: s.unattributed,
@@ -360,6 +376,9 @@ impl Tracker {
             .filter(|((k, _), (_, steers))| *k == ChangeKind::Route && *steers)
             .filter_map(|(_, (iface, _))| iface.clone())
             .chain(self.route_through.values().cloned())
+            .chain(
+                self.unattributed.iter().filter(|((k, _), _)| *k == ChangeKind::Route).filter_map(|(_, i)| i.clone()),
+            )
             .collect()
     }
 
@@ -367,8 +386,16 @@ impl Tracker {
     /// (absent from the tracker: `protecting no`), confirmed at `now`.
     pub fn view(&self, watch: WatchState, tools: &[UnitId], now: u64) -> FootprintView {
         let units = tools.iter().map(|u| (crate::file_name(u), self.footprint(u, now))).collect();
-        let mut why: Vec<String> =
-            self.unattributed.iter().map(|(k, o)| format!("{k:?} {o}: no unit made it")).collect();
+        // An unattributed route over a physical NIC steers nothing (the same
+        // rule as at attach); over a virtual link, or none, it fails closed.
+        let mut why: Vec<String> = self
+            .unattributed
+            .iter()
+            .filter(|((k, _), i)| {
+                !(*k == ChangeKind::Route && i.as_ref().is_some_and(|i| !self.virtual_ifaces.contains(i)))
+            })
+            .map(|((k, o), _)| format!("{k:?} {o}: no unit made it"))
+            .collect();
         why.extend(self.pre_attach.keys().map(|(k, o)| format!("pre-attach {k:?} {o}")));
         if self.lost_unplaced {
             why.push("an event was lost and could not be placed".into());

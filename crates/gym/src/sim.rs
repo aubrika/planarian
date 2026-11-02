@@ -171,6 +171,8 @@ pub struct Sim {
     /// Approvals issued and held back (`approve_pending` with `hold_token`).
     held_tokens: Vec<Hash>,
     timeline: BTreeMap<UnitId, Vec<(Timestamp, String)>>,
+    /// Each `foreground` step: when, which session, on or off.
+    foreground_steps: Vec<(Timestamp, String, bool)>,
     start_probe_defs: String,
     /// Stages and builds when the entry's steps began.
     start_work: (usize, usize),
@@ -296,6 +298,7 @@ impl Sim {
             torn_seen: false,
             held_tokens: vec![],
             timeline: BTreeMap::new(),
+            foreground_steps: vec![],
             start_probe_defs: String::new(),
             start_work: (0, 0),
             start_roots: Default::default(),
@@ -498,6 +501,7 @@ impl Sim {
             full_replay,
             effects: Some(effects),
             status_timeline: Some(self.timeline.clone()),
+            foreground: Some(self.foreground_steps.clone()),
             drivers: Some(drivers),
             options: Some(options),
             probe_defs: Some(probe_defs),
@@ -851,6 +855,24 @@ impl Sim {
                 "attached" => self.fake.w().netwatch_failed = None,
                 st => return Err(Unsupported(format!("netwatch state {st}"))),
             },
+            // A flaw in a generation that shows only once it is live (§12f
+            // gym cases: a committed update that later breaks a unit).
+            "break_in_generation" => {
+                let g = match get("generation") {
+                    "candidate" => {
+                        self.candidate.ok_or_else(|| Unsupported("break_in_generation: no candidate".into()))?
+                    }
+                    "base" => self.base,
+                    g => return Err(Unsupported(format!("break_in_generation {g}"))),
+                };
+                let mut w = self.fake.w();
+                w.break_in(g, &unit(get("unit")));
+                // Units a switch away from it also restarts (what its dry
+                // activation reports), e.g. the display manager.
+                for u in s.get("switch_restarts").and_then(T::as_array).into_iter().flatten().filter_map(T::as_str) {
+                    w.activation_restarts.insert(unit(u));
+                }
+            }
             // Units every switch away from the current generation restarts
             // (what its dry activation reports); fake only.
             "restarts_on_switch" => {
@@ -1157,6 +1179,8 @@ impl Sim {
             "foreground" => {
                 let id = get("session").to_string();
                 let on = s.get("on").and_then(T::as_bool).unwrap_or(true);
+                let now = self.now();
+                self.foreground_steps.push((now, id.clone(), on));
                 let mut w = self.fake.w();
                 if on {
                     w.foreground.insert(id);

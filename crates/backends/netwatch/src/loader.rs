@@ -1,27 +1,78 @@
 //! The aya loader (feature `loader`).
 
-use aya::programs::FEntry;
+use aya::programs::{FEntry, KProbe};
 use aya::{Btf, Ebpf};
 use std::path::Path;
 
-/// The probes and the kernel functions they attach to.
+/// How a probe attaches: fentry needs its function in vmlinux's BTF; a
+/// module's functions (nfnetlink is `=m` on NixOS kernels) are kprobes, by
+/// symbol, once the module is loaded (coordinator, Nov 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    FEntry,
+    KProbe,
+}
+
+/// The probes: program name, the kernel function, how it attaches.
 /// nftables sends its changes as a batch, which `nfnetlink_rcv_batch`
 /// dispatches itself, never through `nfnetlink_rcv_msg`; legacy iptables
 /// and its kin use `setsockopt`, all through `nf_setsockopt`.
-pub const PROBES: [(&str, &str); 5] = [
-    ("rtnetlink", "rtnetlink_rcv_msg"),
-    ("nfnetlink", "nfnetlink_rcv_msg"),
-    ("nfbatch", "nfnetlink_rcv_batch"),
-    ("sockopt", "nf_setsockopt"),
-    ("genl", "genl_rcv_msg"),
+pub const PROBES: [(&str, &str, Kind); 5] = [
+    ("rtnetlink", "rtnetlink_rcv_msg", Kind::FEntry),
+    ("nfnetlink", "nfnetlink_rcv_msg", Kind::KProbe),
+    ("nfbatch", "nfnetlink_rcv_batch", Kind::KProbe),
+    ("sockopt", "nf_setsockopt", Kind::FEntry),
+    ("genl", "genl_rcv_msg", Kind::FEntry),
 ];
+
+/// Why the watch could not start (crate docs, "Starting"): an unusable
+/// object or input, which no retry can fix (exit 1), or something the
+/// kernel refused, which can change (stay up and retry).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Start {
+    Unusable(String),
+    Kernel(String),
+}
+
+impl Start {
+    pub fn reason(&self) -> &str {
+        match self {
+            Start::Unusable(r) | Start::Kernel(r) => r,
+        }
+    }
+}
+
+/// How long a refused attach waits before the next try.
+pub const RETRY_SECS: u64 = 30;
+
+/// Try `attempt` until it succeeds or the input proves unusable: after each
+/// kernel refusal, `on_refused` is told why (write `failed <reason>`, tell
+/// systemd once) and `wait` sleeps (false: asked to stop).
+pub fn retry<T>(
+    mut attempt: impl FnMut() -> Result<T, Start>,
+    mut on_refused: impl FnMut(&str),
+    mut wait: impl FnMut() -> bool,
+) -> Result<T, Start> {
+    loop {
+        match attempt() {
+            Ok(t) => return Ok(t),
+            Err(Start::Unusable(why)) => return Err(Start::Unusable(why)),
+            Err(Start::Kernel(why)) => {
+                on_refused(&why);
+                if !wait() {
+                    return Err(Start::Kernel(format!("stopped while retrying: {why}")));
+                }
+            }
+        }
+    }
+}
 
 /// Refuse an object that lacks any of the [`PROBES`] (checked on the ELF,
 /// before the kernel is asked): a missing program must never pass as an
 /// attached watch.
 pub fn check_object(bytes: &[u8]) -> Result<(), String> {
     let obj = aya_obj::Object::parse(bytes).map_err(|e| format!("not an eBPF object: {e}"))?;
-    let missing: Vec<&str> = PROBES.iter().map(|(p, _)| *p).filter(|p| !obj.programs.contains_key(*p)).collect();
+    let missing: Vec<&str> = PROBES.iter().map(|(p, _, _)| *p).filter(|p| !obj.programs.contains_key(*p)).collect();
     if missing.is_empty() { Ok(()) } else { Err(format!("the object lacks {}", missing.join(", "))) }
 }
 
@@ -34,28 +85,46 @@ pub fn default_object() -> String {
         .unwrap_or_else(|| "/run/current-system/sw/share/planarian/netwatch.bpf.o".into())
 }
 
-/// Load the object and attach every probe; any failure is an error.
-pub fn load(object: &Path) -> Result<Ebpf, String> {
-    let bytes = std::fs::read(object).map_err(|e| format!("read {}: {e}", object.display()))?;
-    check_object(&bytes)?;
-    let mut ebpf = Ebpf::load(&bytes).map_err(|e| format!("load {}: {e}", object.display()))?;
-    let btf = Btf::from_sys_fs().map_err(|e| format!("kernel BTF: {e}"))?;
-    for (prog, func) in PROBES {
-        let p: &mut FEntry = ebpf
-            .program_mut(prog)
-            .ok_or_else(|| format!("no program {prog} in the object"))?
-            .try_into()
-            .map_err(|e| format!("{prog}: {e}"))?;
-        p.load(func, &btf).map_err(|e| format!("load fentry {func}: {e:?}"))?;
-        p.attach().map_err(|e| format!("attach fentry {func}: {e}"))?;
+/// Read the object and check it has every program: unusable otherwise.
+pub fn read_object(object: &Path) -> Result<Vec<u8>, Start> {
+    let bytes = std::fs::read(object).map_err(|e| Start::Unusable(format!("read {}: {e}", object.display())))?;
+    check_object(&bytes).map_err(Start::Unusable)?;
+    Ok(bytes)
+}
+
+/// Load the object and attach every probe. A program of the wrong type is
+/// an unusable object; anything the kernel refuses is [`Start::Kernel`].
+pub fn load_bytes(bytes: &[u8]) -> Result<Ebpf, Start> {
+    let kernel = |what: String| Start::Kernel(what);
+    let mut ebpf = Ebpf::load(bytes).map_err(|e| kernel(format!("load the object: {e}")))?;
+    let btf = Btf::from_sys_fs().map_err(|e| kernel(format!("kernel BTF: {e}")))?;
+    for (prog, func, kind) in PROBES {
+        let p = ebpf.program_mut(prog).ok_or_else(|| Start::Unusable(format!("no program {prog} in the object")))?;
+        match kind {
+            Kind::FEntry => {
+                let p: &mut FEntry = p.try_into().map_err(|e| Start::Unusable(format!("{prog}: {e}")))?;
+                p.load(func, &btf).map_err(|e| kernel(format!("load fentry {func}: {e:?}")))?;
+                p.attach().map_err(|e| kernel(format!("attach fentry {func}: {e}")))?;
+            }
+            Kind::KProbe => {
+                let p: &mut KProbe = p.try_into().map_err(|e| Start::Unusable(format!("{prog}: {e}")))?;
+                p.load().map_err(|e| kernel(format!("load kprobe {func}: {e:?}")))?;
+                p.attach(func, 0).map_err(|e| kernel(format!("attach kprobe {func}: {e}")))?;
+            }
+        }
     }
     Ok(ebpf)
+}
+
+/// [`read_object`] then [`load_bytes`].
+pub fn load(object: &Path) -> Result<Ebpf, Start> {
+    load_bytes(&read_object(object)?)
 }
 
 /// Attach, then report the first event seen within 5 s (a netlink request
 /// is made to produce one).
 pub fn attach_test(object: &Path) -> Result<String, String> {
-    let mut ebpf = load(object)?;
+    let mut ebpf = load(object).map_err(|e| e.reason().to_string())?;
     let mut ring = aya::maps::RingBuf::try_from(ebpf.take_map("EVENTS").ok_or("no EVENTS map")?)
         .map_err(|e| format!("EVENTS: {e}"))?;
     // Any rtnetlink request will do: list links.
@@ -95,7 +164,28 @@ pub fn write_failed(dir: &Path, reason: &str) {
 /// [`crate::TICK_SECS`] until SIGTERM or SIGINT, which writes `failed
 /// stopped`. Returns only with an error to report (also written to
 /// `.watch`), for a nonzero exit.
-pub fn run(export: &Path, object: &Path, dir: &Path) -> Result<(), String> {
+/// Tell systemd the watch has started (`READY=1` to `$NOTIFY_SOCKET`; the
+/// unit is `Type=notify`). Sent once: after the probes are attached, the
+/// attach snapshot is taken and the first files are written, so a unit
+/// ordered after netwatch (the firewall, `network-pre.target`) only starts
+/// once its changes will be attributed; or after `.watch` says `failed`, so
+/// boot never waits on a watch that cannot start. Best effort: without a
+/// socket (not started by systemd) it does nothing.
+pub fn notify_ready(socket: Option<&Path>) {
+    use std::os::unix::net::UnixDatagram;
+    let Some(path) = socket else { return };
+    let Ok(sock) = UnixDatagram::unbound() else { return };
+    let name = path.as_os_str().as_encoded_bytes();
+    let _ = if let Some(abstract_name) = name.strip_prefix(b"@") {
+        use std::os::linux::net::SocketAddrExt;
+        std::os::unix::net::SocketAddr::from_abstract_name(abstract_name)
+            .and_then(|a| sock.send_to_addr(b"READY=1", &a))
+    } else {
+        sock.send_to(b"READY=1", path)
+    };
+}
+
+pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> Result<(), String> {
     use crate::host::{boottime_secs, expand_tools, network_tools, read_cgroups, read_ifnames};
     use crate::parse::{Parsed, parse};
     use crate::{Owner, Tracker, WatchState};
@@ -103,47 +193,82 @@ pub fn run(export: &Path, object: &Path, dir: &Path) -> Result<(), String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    let fail = |why: String| {
-        write_failed(dir, &why);
-        Err(why)
+    // Started or not, systemd hears once; `failed` is written first.
+    let ready = std::cell::Cell::new(false);
+    let tell = |why: &str| {
+        write_failed(dir, why);
+        if !ready.replace(true) {
+            notify_ready(notify);
+        }
     };
+    // An unusable object or input: no retry can fix it.
     let tools = match std::fs::read_to_string(export).ok().as_deref().and_then(network_tools) {
         Some(t) => t,
-        None => return fail(format!("{}: no networkTools", export.display())),
+        None => {
+            let why = format!("{}: no networkTools", export.display());
+            tell(&why);
+            return Err(why);
+        }
     };
-    let mut ebpf = match load(object) {
-        Ok(e) => e,
-        Err(e) => return fail(e),
-    };
-    let mut ring = match ebpf.take_map("EVENTS").map(aya::maps::RingBuf::try_from) {
-        Some(Ok(r)) => r,
-        _ => return fail("no EVENTS ring buffer".into()),
-    };
-    let lost_map = match ebpf.take_map("LOST").map(aya::maps::Array::<_, u64>::try_from) {
-        Some(Ok(m)) => m,
-        _ => return fail("no LOST map".into()),
+    let bytes = match read_object(object) {
+        Ok(b) => b,
+        Err(e) => {
+            tell(e.reason());
+            return Err(e.reason().to_string());
+        }
     };
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(sig, Arc::clone(&stop)).map_err(|e| format!("signal: {e}"))?;
     }
+    let wait = || {
+        for _ in 0..RETRY_SECS {
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        !stop.load(Ordering::Relaxed)
+    };
 
     let root = Path::new("/sys/fs/cgroup");
     let mut cgroups = read_cgroups(root).0;
     let mut ifnames = read_ifnames();
-    // §12d, on every attach: reconcile what was claimed before with what
-    // stands now; anything steering nobody claims was made unwatched.
-    let mut name = |i: u32| {
-        if !ifnames.contains_key(&i) {
-            ifnames = read_ifnames();
+    // Attach and reconcile (§12d, on every attach: what was claimed before
+    // against what stands now; steering nobody claims was made unwatched).
+    // What the kernel refuses is retried every RETRY_SECS, saying why.
+    let attach = || -> Result<_, Start> {
+        let mut ebpf = load_bytes(&bytes)?;
+        let ring = match ebpf.take_map("EVENTS").map(aya::maps::RingBuf::try_from) {
+            Some(Ok(r)) => r,
+            _ => return Err(Start::Unusable("no EVENTS ring buffer".into())),
+        };
+        let lost_map = match ebpf.take_map("LOST").map(aya::maps::Array::<_, u64>::try_from) {
+            Some(Ok(m)) => m,
+            _ => return Err(Start::Unusable("no LOST map".into())),
+        };
+        let names = read_ifnames();
+        let (standing, virtual_ifaces) = crate::snapshot::standing(&mut |i| names.get(&i).cloned())
+            .map_err(|e| Start::Kernel(format!("snapshot: {e}")))?;
+        let tracker = Tracker::attach(&crate::read_claims(dir), &standing, &virtual_ifaces);
+        Ok((ebpf, ring, lost_map, tracker))
+    };
+    let (_ebpf, mut ring, lost_map, mut tracker) = match retry(attach, tell, wait) {
+        Ok(t) => t,
+        Err(Start::Unusable(why)) => {
+            tell(&why);
+            return Err(why);
         }
-        ifnames.get(&i).cloned()
+        // Asked to stop while the kernel kept refusing.
+        Err(Start::Kernel(_)) => {
+            write_failed(dir, "stopped (signal)");
+            return Ok(());
+        }
     };
-    let (standing, virtual_ifaces) = match crate::snapshot::standing(&mut name) {
-        Ok(s) => s,
-        Err(e) => return fail(format!("snapshot: {e}")),
+    let fail = |why: String| {
+        tell(&why);
+        Err(why)
     };
-    let mut tracker = Tracker::attach(&crate::read_claims(dir), &standing, &virtual_ifaces);
     let mut lost_seen = 0u64;
     let mut next_tick = Instant::now();
     while !stop.load(Ordering::Relaxed) {
@@ -187,6 +312,10 @@ pub fn run(export: &Path, object: &Path, dir: &Path) -> Result<(), String> {
             let view = tracker.view(WatchState::Attached { at: now }, &expand_tools(&tools, &running), now);
             if let Err(e) = crate::write_state(dir, &tracker.claims()).and_then(|()| crate::write(dir, &view)) {
                 return fail(format!("write {}: {e}", dir.display()));
+            }
+            if !ready.replace(true) {
+                // Attached, reconciled, and the first files written.
+                notify_ready(notify);
             }
         }
         if drained == 0 {

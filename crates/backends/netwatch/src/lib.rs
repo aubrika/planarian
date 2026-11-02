@@ -89,7 +89,38 @@
 //! rules that drop or redirect traffic ([`Tracker`]). Fail closed where the
 //! kernel's messages are not read in full: any nftables batch or legacy
 //! table change (`nf_setsockopt`) from a unit counts as firewall rules that
-//! steer, and the unit's own default route counts whatever its interface.
+//! steer. A route by itself makes nobody protecting: only through an
+//! interface its creator made. A default route over a physical NIC no unit
+//! created (NetworkManager's DHCP route over wlan0) steers nothing, watched
+//! or found at attach; one over a virtual link, or over none, that nobody can
+//! be charged with is unattributed (fail closed).
+//!
+//! **Starting** (coordinator, Nov 2). Whatever happens, `.watch` is
+//! written before systemd hears `READY=1`, and systemd hears it once, so
+//! boot never waits on the start timeout and the hold already reads the
+//! watch as attached or not.
+//! - An *unusable object or input* (the object missing, not ELF, a program
+//!   absent or of the wrong type, a map missing; the export unreadable or
+//!   without `networkTools`): write `failed <reason>`, send `READY=1`, exit
+//!   1. No retry can fix it.
+//! - The *kernel refuses* a load or an attach, or the snapshot fails: write
+//!   `failed <reason>`, send `READY=1`, stay up and try again every
+//!   `loader::RETRY_SECS` (30 s), rewriting the reason each time. The
+//!   first attach that succeeds reconciles (above) and writes `attached`.
+//!
+//! Probes: `rtnetlink_rcv_msg`, `nf_setsockopt` and `genl_rcv_msg` are built
+//! in, so fentry (they need vmlinux's BTF); `nfnetlink_rcv_msg` and
+//! `nfnetlink_rcv_batch` are in the `nfnetlink` module (`=m` on NixOS
+//! kernels), so kprobes by symbol, which need the module loaded: the
+//! initrd loads it (`boot.kernelModules`), since netwatch starts early in
+//! `sysinit.target`, before every network tool and ordered after nothing
+//! (lane-nix, Nov 2). If it is not loaded yet, the attach is a kernel
+//! refusal and is retried, so the watch recovers once it is
+//! (`loader::PROBES`).
+//!
+//! **Not yet observed** (docs/bypasses.md, temporary): DNS servers set
+//! through resolved (D-Bus) or `/etc/resolv.conf`, the system proxy, and
+//! WireGuard peer endpoints (generic netlink is not read).
 //!
 //! **The hold's order.** When a network tool fails, it is held unless all of
 //! these pass: (1) no unexpired release; (2) `.watch` is `attached` and
