@@ -48,7 +48,7 @@ pkgs.testers.runNixOSTest {
       extraGroups = [ "planarian-admin" ];
       openssh.authorizedKeys.keys = [ ssh.snakeOilPublicKey ];
     };
-    environment.systemPackages = [ pkgs.curl pkgs.python3 pkgs.util-linux ];
+    environment.systemPackages = [ pkgs.curl pkgs.python3 pkgs.util-linux pkgs.nftables ];
     virtualisation.memorySize = 2048;
     virtualisation.diskSize = 8192;
 
