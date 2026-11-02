@@ -190,3 +190,9 @@ declares wireplumber (lane-nix, #11).
 | R06 remainder | open | `run_batch_with` (`backends/linux/src/probe.rs:271`) maps a straggler to `ProbeResult::Timeout`; §10 says "recorded `Unknown` and abandoned" | yes: a new variant breaks the exhaustive match in `daemon/src/render.rs:99`, and `daemon/src/core.rs:1189`, `:1325` match `Timeout \| Error(_)` and must also take it |
 | P24 | decided | `share/canonical.json:81` keeps `wireplumber`; the declaration is lane-nix's (`nix/module.nix`) | lane-nix |
 | P10 remainder | open | `SideEffects::Measurement { per }` is read nowhere; the scheduler's `interval` (`state/src/lib.rs:174`) ignores it. §10 binds it to the cadence scheduler only; runs on request (`request`, `reprobe`, Checking's fresh assembler) are not rate-limited (reviewer, #18) | no |
+
+## lane-nix: P24, 2 Nov
+
+| Item | Found | Doing |
+| --- | --- | --- |
+| P24 (lane-nix, 2 Nov) | Pinned nixpkgs: `services.pipewire.wireplumber.enable` defaults to `services.pipewire.enable`; the user unit `wireplumber.service` carries `BindsTo=pipewire.service` (and `Alias=pipewire-session-manager.service`). The gym VMs already declare wireplumber with that edge, at normal priority, so the module's `mkDefault` leaves them as they were | `nix/module.nix` declares `wireplumber` (`scope = "user"`, `Requires` on `service@0:pipewire`) when PipeWire and WirePlumber are both enabled. module-eval: present in the reference configuration with the edge, absent with WirePlumber off. Fails on `main` |
