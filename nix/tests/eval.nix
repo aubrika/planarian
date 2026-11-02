@@ -203,4 +203,42 @@ let
   ];
 in
 assert builtins.all (x: x) checks;
-pkgs.writeText "planarian-module-eval.json" (builtins.toJSON export)
+# §12d: the hold's condition, run (not read). The real built script with
+# only its root (/run/planarian) moved into the build directory; the
+# condition reads files and /proc/uptime and touches no nftables, so the
+# build sandbox runs it as is. Exit 0 holds, 1 skips.
+pkgs.runCommand "planarian-module-eval.json" {
+  export = builtins.toJSON export;
+  passAsFile = [ "export" ];
+  nativeBuildInputs = [ pkgs.gnused ];
+} ''
+  root=$PWD/run
+  sed "s|/run/planarian|$root|g" ${builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart)} > hold
+  chmod +x hold
+  F=$root/footprint R=$root/hold-released
+  mkdir -p $F $R
+  up=$(cut -d. -f1 /proc/uptime); wall=$(date +%s)
+  expect() { want=$1; shift; set +e; ./hold condition u >/dev/null 2>&1; got=$?; set -e
+    [ "$got" = "$want" ] || { echo "hold condition: $* -> $got, expected $want" >&2; exit 1; }
+    echo "ok: $* -> $got"; }
+  echo "attached $up" > $F/.watch
+  printf 'protecting no\nat %s\n' "$up" > $F/u;            expect 1 "a fresh protecting no skips"
+  printf 'protecting no\nat %s\n' "$((up - 40))" > $F/u;   expect 0 "a stale stamp holds"
+  printf 'protecting no\nat %s\n' "$wall" > $F/u;          expect 0 "a wall-clock-epoch stamp holds"
+  printf 'protecting yes\nat %s\n' "$up" > $F/u;           expect 0 "protecting yes holds"
+  printf 'protecting no\nat %s\nunattributed\n' "$up" > $F/u; expect 0 "an unattributed change charged here holds"
+  printf 'protecting no\nat %s\n' "$up" > $F/u
+  echo x > $F/.unattributed;                                expect 0 "a standing unattributed change anywhere holds"
+  rm $F/.unattributed
+  echo "attached $((up - 40))" > $F/.watch;                 expect 0 "a stale watch holds"
+  echo "failed lost" > $F/.watch;                           expect 0 "a failed watch holds"
+  echo "attached $up" > $F/.watch
+  rm $F/u;                                                  expect 0 "a missing footprint holds"
+  # The release cases: the footprint protects, so only the release decides.
+  printf 'protecting yes\nat %s\n' "$up" > $F/u
+  echo "$((wall + 600)) $((up + 600))" > $R/u;              expect 1 "an unexpired release skips"
+  echo "$((wall - 1)) $((up + 600))" > $R/u;                expect 0 "an expired release (wall clock) holds"
+  echo "$((wall + 600)) $((up - 1))" > $R/u;                expect 0 "an expired release (boottime, a clock step) holds"
+  echo boot > $R/u;                                         expect 1 "a release until boot skips"
+  cp $exportPath $out
+''
