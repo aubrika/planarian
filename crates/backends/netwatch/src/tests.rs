@@ -1747,12 +1747,16 @@ mod hold_order {
     }
 
     /// The property (rule 23), over `Order`: random events, a random death,
-    /// the cgroup removed at some instant after, random passes of the loop,
-    /// random ring losses (charged as the loader does); the hold polls every 50 ms from the death until
-    /// 3 s after the removal. Returns the first round where a unit that
-    /// steered before it died was released, or one that did not was held
-    /// though a pass ran in time.
-    fn property(order: Order) -> Option<u32> {
+    /// the cgroup removed at some instant after, random passes of the loop
+    /// (a third of rounds with the last changes, death and removal inside
+    /// one pass's observe-to-ring gap), ring losses in a quarter of rounds
+    /// (charged as the loader does). The hold polls every 50 ms from the
+    /// death until 3 s after the removal, and may read any version of the
+    /// files written meanwhile (its phase is arbitrary). Returns the rounds
+    /// where a unit that steered before it died was released, or one that
+    /// did not was held though a loss-free pass ended it in time.
+    fn property(order: Order) -> Vec<u32> {
+        let mut failed = Vec::new();
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut rnd = move |n: u64| {
             seed ^= seed << 13;
@@ -1766,8 +1770,13 @@ mod hold_order {
             let born = 1_000_000 + rnd(2_000_000);
             let mut t = born;
             let steers = rnd(2) == 0;
+            // A third of rounds are tight: the tool's last changes, its death
+            // and its cgroup's removal all fall inside one pass, between
+            // where removals are observed and where the ring is read (the
+            // ordering bug that matters most; coordinator, Nov 3).
+            let tight = rnd(3) == 0;
             // A tool that steers and dies at once (vm-netsec), or slowly.
-            let fast = rnd(2) == 0;
+            let fast = tight || rnd(2) == 0;
             let gap = if fast { 3_000 } else { 400_000 };
             let mut events: Vec<(u64, Event)> = Vec::new();
             t += 1 + rnd(gap);
@@ -1785,22 +1794,46 @@ mod hold_order {
             // systemd sets the InvocationID before the unit's first process
             // starts; until netwatch reads it, `protecting unknown`.
             let readable = born + rnd(events[0].0 - born);
-            let death = t + 1 + rnd(if fast { 3_000 } else { 300_000 });
-            let soon = rnd(2) == 0;
-            let removed = death + rnd(if soon { 2_000 } else { 200_000 });
+            let (death, removed, forced) = if tight {
+                // The pass starts just before the first steering change (or
+                // the last change) and ends after the removal.
+                let first = events.len() - if steers { 2 } else { 1 };
+                let start = events[first].0 - 1 - rnd(500);
+                let e = 4_000 + rnd(16_000);
+                let death = t + 1 + rnd(start + e - t - 1);
+                let removed = death + rnd(start + e - death + 1);
+                (death, removed, Some((start, e)))
+            } else {
+                let death = t + 1 + rnd(if fast { 3_000 } else { 300_000 });
+                let soon = rnd(2) == 0;
+                (death, death + rnd(if soon { 2_000 } else { 200_000 }), None)
+            };
             let deadline = removed + 3_000_000;
             // A pass at `d`: removals observed at one instant, the ring read
             // at another `e` later (netwatch: observe first), the files
             // written at the end. Passes come at least every 50 ms when
             // idle, jittered; some late (a busy machine).
             let mut passes = Vec::new();
+            let mut forced = forced;
+            // A quarter of rounds lose events in some passes of the unit's
+            // life (a loss holds every unit until reboot, so not more).
+            let lossy = rnd(4) == 0;
             let mut d = born.saturating_sub(rnd(5_000_000));
             while d < deadline {
                 let late = rnd(10) == 0;
-                d += 1 + rnd(if late { 1_500_000 } else { 60_000 });
+                let step = 1 + rnd(if late { 1_500_000 } else { 60_000 });
                 let e = rnd(20_000);
                 // The ring overflows in this pass, losing what it reads.
-                let lost = rnd(25) == 0;
+                let lost = lossy && d + step > born && rnd(8) == 0;
+                if let Some((fd, fe)) = forced
+                    && d + step + e >= fd
+                {
+                    passes.push((fd, fe, false));
+                    d = fd + fe;
+                    forced = None;
+                    continue;
+                }
+                d += step;
                 passes.push((d, e, lost));
             }
             // Before: the last invocation's footprint, ended, `protecting no`.
@@ -1867,14 +1900,19 @@ mod hold_order {
                 tracker.set_invocation(&vpn(), inv.clone());
                 files = written_files(&tracker, end / 1_000_000);
                 written = end;
+                // A hold polls at any phase: every version of the files
+                // written while it waits is one it may read.
+                if (death..=deadline).contains(&end) && release(&files, end / 1_000_000) {
+                    released = true;
+                }
                 in_time |= inv.ended && !lost && end <= deadline;
             }
             let bad = if steers { released } else { in_time && !released && files.unattributed.is_empty() };
             if bad {
-                return Some(round);
+                failed.push(round);
             }
         }
-        None
+        failed
     }
 
     /// What the hold reads after a write: the unit's file through its text
@@ -1890,14 +1928,16 @@ mod hold_order {
 
     #[test]
     fn a_unit_that_steered_before_it_died_is_never_released() {
-        assert_eq!(property(Order::Netwatch), None);
+        assert_eq!(property(Order::Netwatch), Vec::<u32>::new());
     }
 
     /// The property is not vacuous: each mutant of the order fails it.
     #[test]
     fn the_property_catches_each_mutant() {
         for m in [Order::NotProtecting, Order::RingFirst] {
-            assert!(property(m).is_some(), "mutant {} passed", m as u8); // NotProtecting: round 3; RingFirst: 1026
+            let failed = property(m);
+            eprintln!("mutant {} fails {} rounds, first {:?}", m as u8, failed.len(), failed.first());
+            assert!(failed.first().is_some_and(|r| *r < 50), "mutant {} caught late or never", m as u8);
         }
     }
 }
