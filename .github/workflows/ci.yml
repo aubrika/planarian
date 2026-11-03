@@ -26,6 +26,10 @@ jobs:
       - name: clippy with the gym's fault-injection hooks
         run: cargo clippy -p planarian-daemon -p planarian-backend-linux --features planarian-daemon/gym-hooks -- -D warnings
       - run: cargo test --workspace
+      - name: netwatch's loader tests (the cgroups invocation property must run, not skip)
+        env:
+          NETWATCH_REQUIRE_XATTR_TESTS: "1"
+        run: cargo test -p planarian-backend-netwatch --features loader
       - name: Fault catalog, fake harness (strict, R15; fails on FAIL, PARTIAL or an unwaived UNSUPPORTED)
         run: cargo run -p planarian-gym -- run --strict
       - name: GA demonstration, fake harness
