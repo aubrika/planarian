@@ -440,6 +440,13 @@ pub enum Response {
     Ok {
         message: String,
     },
+    /// `GymCompact` (gym hooks): compacted, and the entries the compaction
+    /// discarded (the segment it checkpointed), taken in the same call, so
+    /// nothing journaled meanwhile is missing from them. As JSON, since the
+    /// journal's `Entry` lives in txn, which ipc does not depend on.
+    Compacted {
+        entries: Vec<serde_json::Value>,
+    },
     Error {
         message: String,
     },
