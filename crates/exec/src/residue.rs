@@ -82,9 +82,6 @@ pub fn classify(f: &EndingFacts) -> Residue {
         _ if f.stopped_cleanly => Ending::Signal(15),
         _ => return Residue::Fault,
     };
-    if f.held {
-        return Residue::AlarmHeld(e);
-    }
     if f.network_tool && !f.hold_tried {
         return Residue::HoldFirst(e);
     }
