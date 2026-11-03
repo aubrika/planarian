@@ -233,6 +233,24 @@ proptest! {
 /// might differ from the base's: every field a manifest entry has (§9, and
 /// the exported fields #10's C19 line names), or the entry added or removed.
 fn edit_entry(d: &mut UnitDef, field: u8, k: u8) {
+    // Every field, named (no `..`): a field added to `UnitDef` fails to
+    // compile here until it has an arm below and `FIELDS` counts it.
+    let UnitDef {
+        id: _,
+        desired: _,
+        edges: _,
+        sensitivity: _,
+        restart_disruption: _,
+        probes: _,
+        synonyms: _,
+        systemd_restart: _,
+        startup_grace: _,
+        runtime_repair: _,
+        stops_are_faults: _,
+        holds: _,
+        hold_allow: _,
+        hold_interfaces: _,
+    } = d;
     let next = |n: u8, of: u8| (n + 1 + k % (of - 1)) % of;
     match field {
         0 => {
