@@ -124,6 +124,14 @@ pub trait UnitBackend {
     fn hold(&self, _unit: &UnitId) -> Outcome {
         Outcome::Failed("this backend cannot hold traffic".into())
     }
+    /// `hold`, waiting at most `wait` for it: on the daemon's tick (§12d,
+    /// a network tool stopped outside Planarian), where a hold the host has
+    /// not confirmed within `wait` counts as held. Past `wait` it returns
+    /// `Unknown`, and the hold's job goes on in the host, so it may still
+    /// land. Backends whose `hold` cannot block keep this default.
+    fn hold_within(&self, unit: &UnitId, _wait: Millis) -> Outcome {
+        self.hold(unit)
+    }
     /// Lift a unit's hold, once it is Running and its Readiness probes pass
     /// (journaled `HoldLifted` first). Idempotent.
     fn lift_hold(&self, _unit: &UnitId) -> Outcome {

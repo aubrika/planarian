@@ -53,7 +53,14 @@ fn outcome(verb: &str, unit: &UnitId, o: Output) -> Outcome {
 }
 
 pub fn apply(unit: &UnitId) -> Outcome {
-    outcome("start", unit, run(&["systemctl", "start", &hold_unit(unit)], TIMEOUT))
+    apply_within(unit, TIMEOUT)
+}
+
+/// `apply`, waiting at most `wait`. Past it the `systemctl` client is
+/// killed and the result is `Unknown`; systemd's start job is the
+/// manager's, not the client's, and goes on, so the hold may still land.
+pub fn apply_within(unit: &UnitId, wait: Duration) -> Outcome {
+    outcome("start", unit, run(&["systemctl", "start", &hold_unit(unit)], wait.min(TIMEOUT)))
 }
 
 /// Rebuild the hold's table in place (`ExecReload` runs the script's

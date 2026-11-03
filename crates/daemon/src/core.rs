@@ -66,6 +66,10 @@ pub const NEW_DECLARATIONS_FOR: Millis = Millis::secs(24 * 3600);
 
 /// How often the running daemon re-reads its journal's hash chain (I18).
 pub const CHAIN_CHECK_EVERY: Millis = Millis::secs(3600);
+/// §12d: how long a tick waits for the host to confirm a hold the daemon
+/// asks for on a network tool's stop outside Planarian; past it the hold
+/// counts as held (fail closed) and its job goes on in the host.
+pub const HOLD_WAIT: Millis = Millis::secs(5);
 /// §12d: the first and the longest wait between re-applies of a hold whose
 /// firewall table is missing.
 pub const HOLD_RETRY_MIN: Millis = Millis::secs(10);
@@ -1271,15 +1275,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 // the host cannot confirm counts as held (fail closed: the
                 // unit is restarted, never inferred stopped). The next
                 // network_holds journals it, by the daemon.
-                // Deliberate and rare: hold() blocks the tick while the hold
-                // unit starts (its condition waits about 3 s), and the call
-                // itself (`hold::apply`, `systemctl start`) can block up to
-                // its 30 s timeout; only here (a network tool's unattributed
-                // stop outside Planarian), and P9's slow-tick warning says so
-                // by design. Bounding the daemon's wait is a follow-up. Deciding before the residue is recorded is the
+                // Deliberate and rare: the tick waits for the hold unit to
+                // start (its condition waits about 3 s), at most HOLD_WAIT;
+                // only here (a network tool's unattributed stop outside
+                // Planarian), and P9's slow-tick warning says so by design.
+                // Past HOLD_WAIT the hold counts as held (below) and its job
+                // goes on in systemd: the socket, approvals and other repairs
+                // are not stalled for `hold::apply`'s 30 s. Deciding before the residue is recorded is the
                 // point: an Inferred stop must not be written for a unit
                 // whose traffic is then held.
-                let held = match self.b.units().hold(u) {
+                let held = match self.b.units().hold_within(u, HOLD_WAIT) {
                     Outcome::Failed(_) | Outcome::Unknown(_) => true,
                     _ => self.b.units().held().map_or(true, |h| h.contains(u)),
                 };

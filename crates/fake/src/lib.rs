@@ -230,6 +230,10 @@ pub struct World {
     /// Network tools the host declines to hold: not protecting (the hold
     /// unit's condition skips, as for a tool with no footprint).
     pub hold_declines: BTreeSet<UnitId>,
+    /// A hold's start takes this long (a slow or stuck `systemctl start`):
+    /// `hold_within` gives up after its wait, the fake clock advanced by
+    /// that much, and the hold lands later, as systemd's job would.
+    pub hold_hangs: Option<Millis>,
     /// Released holds and until when (`None`: the next boot), as the
     /// `/run/planarian/hold-released` marker the hold script honours.
     pub hold_released: BTreeMap<UnitId, Option<Timestamp>>,
@@ -766,6 +770,24 @@ impl UnitBackend for Fake {
             w.held.insert(unit.clone());
         }
         Outcome::Succeeded
+    }
+
+    fn hold_within(&self, unit: &UnitId, wait: Millis) -> Outcome {
+        let hang = self.w().hold_hangs;
+        match hang {
+            Some(h) if h.0 > wait.0 => {
+                // The client gives up; the job (the hold) is still pending.
+                let now = self.w().now;
+                self.w().calls.push(Call { call: format!("hold({unit})"), op: NO_OP, at: now, fenced: false });
+                self.advance(wait);
+                Outcome::Unknown(format!("systemctl start planarian-hold@{} did not finish", unit))
+            }
+            Some(h) => {
+                self.advance(h);
+                self.hold(unit)
+            }
+            None => self.hold(unit),
+        }
     }
 
     fn lift_hold(&self, unit: &UnitId) -> Outcome {

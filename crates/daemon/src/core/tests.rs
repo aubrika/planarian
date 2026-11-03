@@ -2673,3 +2673,39 @@ fn a_network_tool_the_host_declines_to_hold_keeps_the_residue_rule() {
     );
     assert_eq!(hold_alarms(&r, &web), 0, "{:?}", r.core.notices);
 }
+
+/// §12d: a hold whose start hangs (`systemctl start` stuck past the hold
+/// unit's condition) does not stall the tick: the daemon waits HOLD_WAIT,
+/// then counts it as held (fail closed). The unit is restarted, never
+/// inferred stopped, and its traffic is held (journaled, alarmed); the
+/// socket, approvals and other repairs are not held up for `hold::apply`'s
+/// 30 s (reviewer, #55).
+#[test]
+fn a_hold_that_hangs_does_not_stall_the_tick() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, false);
+    r.fake.w().hold_hangs = Some(Millis::secs(30));
+    r.fake.w().stop_out_of_band(&web);
+    let mut longest = 0;
+    for _ in 0..12 {
+        r.fake.advance(planarian_state::TICK);
+        let t0 = r.fake.w().now.0;
+        r.core.tick();
+        longest = longest.max(r.fake.w().now.0 - t0);
+    }
+    assert!(
+        longest <= crate::core::HOLD_WAIT.0 + 1_000,
+        "a tick took {longest} ms on the fake clock (HOLD_WAIT {} ms)",
+        crate::core::HOLD_WAIT.0
+    );
+    assert!(r.fake.w().calls.iter().any(|c| c.call == "hold(service:gym-web)"), "the hold was asked for");
+    assert!(
+        !r.core.ledger().overrides.iter().any(|o| o.unit == web),
+        "inferred as intended: {:?}",
+        r.core.ledger().overrides
+    );
+    // Held (journaled) while it was down, and lifted once it was back.
+    assert_eq!(r.core.ledger().hold_events, vec![(web.clone(), true), (web.clone(), false)]);
+    assert_eq!(hold_alarms(&r, &web), 1, "{:?}", r.core.notices);
+    assert!(r.calls("restart(service:gym-web)") >= 1, "never restarted: {:?}", r.core.notices);
+}

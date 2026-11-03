@@ -7,7 +7,9 @@
 
 use crate::admitted;
 use crate::cmd::run;
-use planarian_schema::{Ending, Observed, OpId, Outcome, Reason, Scope, Timestamp, UnitBackend, UnitId, UnitKind};
+use planarian_schema::{
+    Ending, Millis, Observed, OpId, Outcome, Reason, Scope, Timestamp, UnitBackend, UnitId, UnitKind,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -256,6 +258,9 @@ impl UnitBackend for Systemd {
     // §12d: the hold, a failure posture response (crate::hold).
     fn hold(&self, unit: &UnitId) -> Outcome {
         crate::hold::apply(unit)
+    }
+    fn hold_within(&self, unit: &UnitId, wait: Millis) -> Outcome {
+        crate::hold::apply_within(unit, std::time::Duration::from_millis(wait.0))
     }
     fn lift_hold(&self, unit: &UnitId) -> Outcome {
         crate::hold::lift(unit)
