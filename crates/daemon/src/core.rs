@@ -910,8 +910,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         // the host still lists it: not a standing hold, so a flushed table
         // is not re-applied for it (reviewer, #72).
         holding.retain(|u| {
-            !lifted.contains(u)
-                && !(self.lift_unconfirmed.contains_key(u) && !hold::failed(s, defs, u) && hold::back(s, defs, u))
+            let pending = self.lift_unconfirmed.contains_key(u) && !hold::failed(s, defs, u) && hold::back(s, defs, u);
+            !(lifted.contains(u) || pending)
         });
         if holding.is_empty() {
             self.hold_table_seen = true;
