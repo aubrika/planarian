@@ -19,6 +19,9 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "planarian-netsec";
+  # A hang fails in half an hour, not the default hour. Not lower: "repair
+  # fails every attempt" alone waits out the backoff (10 + 60 + 300 s, §13).
+  globalTimeout = 1800;
 
   nodes.peer = { pkgs, ... }: {
     imports = [ wgg.peer ];
@@ -122,7 +125,9 @@ pkgs.testers.runNixOSTest {
     def up_via_tunnel():
         return f"ip route get {UP} | grep -q 'dev wg0'"
     def new_ssh(user):
-        return f"ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o ControlPath=none -i /root/key {user}@machine true"
+        # -n: stdin from /dev/null, never the backdoor console (an ssh that
+        # reads hvc0 can wedge the driver's shell; gate 41553584226).
+        return f"ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o ControlPath=none -i /root/key {user}@machine true"
     def alarms():
         return int(machine.succeed(f"journalctl -b -u planariad -o cat | grep -c '{ALARM}' || true").strip() or 0)
     def held():
@@ -184,8 +189,8 @@ pkgs.testers.runNixOSTest {
 
     with subtest("a kill holds traffic; the restart lifts the hold, with one alarm"):
         # An administrator's session, established before the failure.
-        peer.succeed("ssh -fN -M -S /tmp/bob.sock -o ControlPersist=yes -o BatchMode=yes -o StrictHostKeyChecking=no -i /root/key bob@machine")
-        peer.succeed("ssh -S /tmp/bob.sock bob@machine true")
+        peer.succeed("ssh -n -fN -M -S /tmp/bob.sock -o ControlPersist=yes -o BatchMode=yes -o StrictHostKeyChecking=no -i /root/key bob@machine")
+        peer.succeed("ssh -n -S /tmp/bob.sock bob@machine true")
         machine.succeed("echo 40 > /run/wireguard-gym-slow")
         machine.succeed("systemctl kill --signal=SIGKILL wireguard-gym.service")
         # Held: new outbound connections fail, loopback works, the admin's
@@ -199,7 +204,7 @@ pkgs.testers.runNixOSTest {
         machine.fail(up_via_tunnel())
         machine.fail(up_ok())
         machine.succeed("curl -sf --max-time 5 -o /dev/null http://127.0.0.1:8001/")
-        peer.succeed("ssh -S /tmp/bob.sock bob@machine true")
+        peer.succeed("ssh -n -S /tmp/bob.sock bob@machine true")
         peer.fail(new_ssh("alice"))
         peer.fail(new_ssh("bob"))
         # Address assignment passes the hold (§12d: "except loopback,
