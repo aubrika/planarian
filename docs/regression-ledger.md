@@ -137,7 +137,7 @@ with no features). "Nowhere" rows need the step proposed.
 | txn `journal_props::at_the_default_journal_size` (#59) | `#[ignore]` | `rust` job, by the step #59 adds (about 45 s, debug) | added in #59 |
 | txn `journal::tests::open_time_at_64_mib` (#54) | `#[ignore]` | nowhere, by design: a wall-time measurement that asserts nothing | none |
 | tray `icon::tests::dump_for_inspection` | `PLANARIAN_TRAY_DUMP` | nowhere, by design: writes icons for inspection, asserts nothing | none |
-| `gym-hooks` code (daemon `main.rs`, `core.rs`; backend-linux `nixos.rs`, `gym.rs`) | `--features gym-hooks` | no unit test sits behind the gate today. The `rust` job clippies it without `--all-targets`, and the gym VM entries (vm.yml, the `gym-hooks` package) exercise it | add `--all-targets` to the `gym-hooks` clippy step, so a future gated test is at least compiled |
+| `gym-hooks` code (daemon `main.rs`, `core.rs`; backend-linux `nixos.rs`, `gym.rs`) | `--features gym-hooks` | no unit test sits behind the gate today. The `rust` job clippies it without `--all-targets`, and the gym VM entries (vm.yml, the `gym-hooks` package) exercise it | `--all-targets` added to the `gym-hooks` clippy step in #59, so a future gated test is at least compiled |
 | Kani harnesses (txn, exec) | `cargo kani` | ci.yml `kani` job; no harness exists in another crate | none |
 | Verus proofs | nix | `checks.verus` (ci.yml `nix` job) | none |
 | NixOS VM checks (`vm-runtime`, `vm-posture`, `vm-netsec`, `vm-generations`, `installer`) | KVM | vm.yml on a push to main only, never on a pull request (vm.yml's header says so) | none; a PR's VM evidence is the reviewer's local run |
