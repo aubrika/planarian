@@ -59,7 +59,7 @@ fn u32_at(b: &[u8], o: usize) -> Option<u32> {
 
 /// The attributes after a fixed header, as (type, payload); `None` if one
 /// runs past the captured bytes.
-fn attrs(b: &[u8], from: usize) -> Option<Vec<(u16, &[u8])>> {
+pub(crate) fn attrs(b: &[u8], from: usize) -> Option<Vec<(u16, &[u8])>> {
     let mut out = vec![];
     let mut o = from;
     while o + 4 <= b.len() {

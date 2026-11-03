@@ -9,7 +9,7 @@ rust-version.workspace = true
 [features]
 # The aya loader and the `netwatch` binary (Linux, root). The model and the
 # file contract need neither, so the fake depends on this crate without it.
-loader = ["dep:aya", "dep:aya-obj", "dep:signal-hook", "dep:rustix", "dep:nix"]
+loader = ["dep:aya", "dep:aya-obj", "dep:signal-hook", "dep:rustix"]
 
 [dependencies]
 planarian-schema.workspace = true
@@ -19,8 +19,6 @@ aya = { version = "0.13", optional = true, default-features = false }
 aya-obj = { version = "0.2", optional = true }
 signal-hook = { version = "0.3", optional = true }
 rustix = { workspace = true, optional = true, features = ["net", "fs", "event"] }
-# fanotify (B-22 a): the safe wrapper; the workspace forbids unsafe, and rustix has none.
-nix = { version = "0.31", optional = true, default-features = false, features = ["fanotify"] }
 
 [[bin]]
 name = "planarian-netwatch"

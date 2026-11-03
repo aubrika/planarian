@@ -218,48 +218,48 @@
 //! refusal and is retried, so the watch recovers once it is
 //! (`loader::PROBES`).
 //!
-//! **DNS and the system proxy** (B-22 a; `dns`, `files`). A unit that points
-//! the machine's resolver at its own servers, or sets the system proxy,
-//! steers traffic through files, not netlink. Each setting is one *object*:
-//! `(Dns, "resolv.conf")`, `(Dns, "link <ifname>")` for a resolved link
-//! (`/run/systemd/resolve/netif/<ifindex>`), `(Proxy, "<file>")` for
-//! `/etc/environment`, NixOS's `/etc/set-environment` and `/etc/profile.d/*`.
-//! Whether it steers is computed from its *current content* on every read
-//! and never remembered: a name server that is not loopback (the machine's
-//! own stub: a dead one fails DNS closed rather than leaking; 127.0.0.0/8,
-//! `::1`, a zone or port or `#name` suffix allowed; an unreadable one
-//! steers), or a proxy variable (`http_proxy`, `https_proxy`, `all_proxy`,
-//! `ftp_proxy`, any case) with a value. Content that stops steering, or a
-//! file or link that goes, clears the object for *everyone*, so a charge
-//! cannot stick. The objects are singletons: a new claimant replaces the old.
-//! `dns::reconcile` decides who claims what (coordinator, Nov 3):
-//! - a steering write by a process in a unit is that unit's alone;
-//! - one by a process netwatch cannot place in a unit (gone, or in none), or
-//!   steering content with no claimant (standing at attach, or an event
-//!   missed), is charged to the network tools *running at that moment*, the
-//!   only ones that could have written it; with none running it is the
-//!   machine's baseline and charged to nobody. It is never the global
-//!   `.unattributed` marker, which on any DHCP machine would hold every
-//!   tool for good;
-//! - a resolved link's DNS is its interface's owner's (the unit with a claim
-//!   on the interface), whoever wrote it over D-Bus: the failure that matters
-//!   is a VPN dying and resolved falling back to other links' servers; with
-//!   no owner it is the running tools'.
+//! **DNS and the system proxy** (B-22 a; `dns`, `files`, `route`). SPEC §12d
+//! counts "DNS servers on *its* interface" and the system proxy: a unit that
+//! points the machine's resolver at a server reached through its tunnel
+//! steers traffic as a default route does. So the charge goes to the units
+//! whose interface *carries* the address, not to whoever wrote the setting
+//! (coordinator, Nov 3; the first design charged writers, and charged DHCP
+//! clients for the uplink's DNS). Each pass, with nothing remembered
+//! between passes:
+//! 1. read the settings (`files`): `/etc/resolv.conf`; resolved's per-link
+//!    servers (`/run/systemd/resolve/netif/<ifindex>`) and its
+//!    `/run/systemd/resolve/resolv.conf`; the proxy hosts that are IP
+//!    literals in `/etc/environment`, NixOS's `/etc/set-environment` and
+//!    `/etc/profile.d/*`. A loopback address (127/8, `::1`, v4-mapped) steers
+//!    nothing: a dead local stub fails DNS closed rather than leaking;
+//! 2. ask the kernel which interface reaches each address (`route`:
+//!    `RTM_GETROUTE` for that destination, the `ip route get` equivalent, so
+//!    policy rules and fwmark tables such as wg-quick's are honoured). An
+//!    address with a zone (`fe80::1%tun0`) and a resolved link's own servers
+//!    name their interface themselves;
+//! 3. charge the owners of that interface (`dns::charges`): for a *virtual*
+//!    interface, the units with a claim on it (its creator) and the units that
+//!    added a steering route over it. A *physical* interface (the uplink,
+//!    DHCP-learned DNS) steers for nobody and is charged to nobody, as a
+//!    default route over wlan0 is. "No route" (the kernel's network
+//!    unreachable) is no interface: nobody;
+//! 4. *unknown* fails closed, and is bound to its setting, never the global
+//!    marker: a lookup that failed, an address that cannot be read, or a
+//!    virtual interface nobody is known to own. It clears when the lookup
+//!    succeeds or the setting changes.
 //!
-//! *Who wrote.* fanotify on the directories (`FAN_CLOSE_WRITE|FAN_MODIFY` on
-//! children) hands over the file written and the writer's pid; the pid's
-//! cgroup is read at once. Replace-by-rename (resolvconf, NetworkManager) is
-//! found by inode: the temporary file's inode is the new file's (`files`). No
-//! fanotify (refused in a container) makes every change an unknown writer.
-//! The in-kernel probe that would attribute exactly (as the netlink probes
-//! do) is deferred.
+//! The pass runs when a file changed (their device, inode, size and mtime are
+//! compared; no watcher, so there is no writer to attribute), when the ring
+//! delivered anything (a route or an interface may have moved the charge),
+//! and every tick. `Tracker::set_dns` replaces every DNS and proxy object at
+//! once, so a charge cannot stick, and the invocation's latch keeps what it
+//! was charged for the invocation.
 //!
-//! *Not covered* (docs/bypasses.md, B-22): DNS or proxy content found at
-//! attach with no network tool running; the proxy anywhere but the files
-//! above (per-user dconf, a unit's own `Environment=`, an application's
-//! configuration); a local DNS proxy's own upstream configuration; and a
-//! write by a process netwatch cannot place, which is charged to the tools
-//! running then and not to one started later.
+//! *Not covered* (docs/bypasses.md, B-22): a proxy named by host *name*
+//! (resolving it would be a DNS query netwatch must not make); the proxy
+//! anywhere but those files (per-user dconf, a unit's own `Environment=`,
+//! an application's configuration); a local DNS proxy's own upstream
+//! configuration.
 //!
 //! **The hold's order.** When a network tool fails, it is held unless all of
 //! these pass: (1) no unexpired release; (a) the unit's file says
@@ -288,6 +288,8 @@ pub mod host;
 pub mod loader;
 mod model;
 pub mod parse;
+#[cfg(feature = "loader")]
+pub mod route;
 #[cfg(feature = "loader")]
 pub mod snapshot;
 

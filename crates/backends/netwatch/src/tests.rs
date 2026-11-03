@@ -2231,13 +2231,15 @@ mod hold_order {
     }
 }
 
-/// DNS and proxy steering (B-22 a), the pure half: what the files say, and
-/// who claims what. The live reads and the fanotify attribution are the VM's.
+/// DNS and the system proxy (B-22 a): what the settings name, and who the
+/// interface that carries each address belongs to (SPEC §12d: "DNS servers on
+/// *its* interface"). The live kernel lookup is the VM's.
 mod dnsproxy {
-    use crate::dns::{self, Action, Key, MUTANT, Mutant, Obs, Writer};
+    use crate::dns::{self, Charge, Key, Lookup, MUTANT, Mutant, Owners, Target, World};
     use crate::{ChangeKind, Tracker, WatchState};
     use planarian_schema::UnitId;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::net::IpAddr;
 
     const NOW: u64 = 100;
 
@@ -2252,273 +2254,457 @@ mod dnsproxy {
         &from[(next(s) % from.len() as u64) as usize]
     }
 
-    // ---- The files.
+    fn addr(a: &str, zone: Option<&str>) -> Target {
+        Target::Addr { addr: a.parse().unwrap(), zone: zone.map(String::from) }
+    }
 
-    const LOOPBACK: [&str; 6] = ["127.0.0.53", "127.0.0.1", "::1", "::ffff:127.0.0.1", "::1%lo", "::1%lo"];
-    const REMOTE: [&str; 4] = ["1.1.1.1", "2001:db8::53", "fe80::1%eth0", "not-an-address"];
+    // ---- The settings, as addresses.
 
-    /// A resolv.conf from `seed`, and whether it steers by construction:
-    /// a `nameserver` line that is not a comment names a non-loopback or
-    /// unreadable server.
-    fn resolv(seed: u64) -> (String, bool) {
+    const LOOPBACK: [&str; 6] = ["127.0.0.53", "127.0.0.1", "::1", "::ffff:127.0.0.1", "::1%lo", "[::1]:53"];
+    const REMOTE: [(&str, &str, Option<&str>); 5] = [
+        ("1.1.1.1", "1.1.1.1", None),
+        ("2001:db8::53", "2001:db8::53", None),
+        ("fe80::1%tun0", "fe80::1", Some("tun0")),
+        ("10.8.0.1:53", "10.8.0.1", None),
+        ("[2001:db8::7]:853", "2001:db8::7", None),
+    ];
+
+    /// A resolv.conf from `seed` and the targets it names, by construction.
+    fn resolv(seed: u64) -> (String, Vec<Target>) {
         let mut s = seed | 1;
-        let (mut text, mut steers) = (String::new(), false);
+        let (mut text, mut want) = (String::new(), vec![]);
         for _ in 0..(1 + next(&mut s) % 6) {
-            // Weighted toward several name servers, loopback ones before a
-            // steering one: the interleavings a first-server-only read misses.
             match next(&mut s) % 9 {
                 0 => text.push_str("search example.org\noptions edns0\n"),
-                1 => text.push_str(&format!("# nameserver {}\n", pick(&mut s, &REMOTE))),
-                2 => text.push_str(&format!("; nameserver {}\n", pick(&mut s, &REMOTE))),
+                1 => text.push_str(&format!("# nameserver {}\n", pick(&mut s, &REMOTE).0)),
+                2 => text.push_str(&format!("; nameserver {}\n", pick(&mut s, &REMOTE).0)),
                 3..=5 => text.push_str(&format!("nameserver {}\n", pick(&mut s, &LOOPBACK))),
+                6 => {
+                    text.push_str("nameserver\tnot-an-address\n");
+                    want.push(Target::Unreadable);
+                }
                 _ => {
-                    text.push_str(&format!("nameserver\t{}\n", pick(&mut s, &REMOTE)));
-                    steers = true;
+                    let (tok, a, z) = pick(&mut s, &REMOTE);
+                    text.push_str(&format!("nameserver\t{tok}\n"));
+                    want.push(addr(a, *z));
                 }
             }
         }
-        (text, steers)
+        want.sort();
+        want.dedup();
+        (text, want)
     }
 
-    fn failing_resolv() -> usize {
-        (1..=400u64)
-            .filter(|n| {
-                let (text, want) = resolv(n * 0x9E37_79B9);
-                dns::resolv_steers(&text) != want
-            })
-            .count()
-    }
-
-    /// A resolved link's state: `DNS=` tokens as resolved writes them.
-    fn netif(seed: u64) -> (String, bool) {
+    fn netif(seed: u64) -> (String, Vec<Target>) {
         let mut s = seed | 1;
         let loop_ = ["127.0.0.53", "[::1]:53", "::1#local", "::1%lo"];
-        let remote = ["1.1.1.1#cloudflare-dns.com", "[2001:db8::53]:853", "10.8.0.1", "fe80::1%tun0"];
-        let (mut toks, mut steers) = (vec![], false);
+        let remote: [(&str, &str); 3] = [
+            ("1.1.1.1#cloudflare-dns.com", "1.1.1.1"),
+            ("[2001:db8::53]:853", "2001:db8::53"),
+            ("10.8.0.1", "10.8.0.1"),
+        ];
+        let (mut toks, mut want) = (vec![], vec![]);
         for _ in 0..(1 + next(&mut s) % 4) {
             if next(&mut s).is_multiple_of(2) {
                 toks.push(pick(&mut s, &loop_).to_string());
             } else {
-                toks.push(pick(&mut s, &remote).to_string());
-                steers = true;
+                let (t, a) = pick(&mut s, &remote);
+                toks.push(t.to_string());
+                want.push(addr(a, None));
             }
         }
-        (format!("# This is private data.\nIS_MANAGED=yes\nDNS={}\nDOMAINS=~.\n", toks.join(" ")), steers)
+        want.sort();
+        want.dedup();
+        (format!("# private\nIS_MANAGED=yes\nDNS={}\nDOMAINS=~.\n", toks.join(" ")), want)
     }
 
-    fn failing_netif() -> usize {
-        (1..=400u64)
-            .filter(|n| {
-                let (text, want) = netif(n * 0x9E37_79B9);
-                dns::netif_steers(&text) != want
-            })
-            .count()
-    }
-
-    fn proxy(seed: u64) -> (String, bool) {
+    fn proxy(seed: u64) -> (String, Vec<Target>) {
         let mut s = seed | 1;
-        let (mut text, mut steers) = (String::new(), false);
-        for _ in 0..(next(&mut s) % 5) {
-            match next(&mut s) % 7 {
+        let (mut text, mut want) = (String::new(), vec![]);
+        for _ in 0..(next(&mut s) % 6) {
+            match next(&mut s) % 9 {
                 0 => text.push_str("PATH=/run/wrappers/bin\n"),
                 1 => text.push_str("no_proxy=localhost\n"),
-                2 => text.push_str("# http_proxy=http://p:3128\n"),
+                2 => text.push_str("# http_proxy=http://10.9.9.9:3128\n"),
                 3 => text.push_str("export http_proxy=\"\"\n"),
-                4 => {
-                    text.push_str("export HTTPS_PROXY=\"http://p:3128\"\n");
-                    steers = true;
-                }
+                4 => text.push_str("export https_proxy=http://proxy.example.org:3128\n"), // a name: uncovered
                 5 => {
-                    text.push_str("all_proxy=socks5://p:1080\n");
-                    steers = true;
+                    text.push_str("export HTTPS_PROXY=\"http://u:p@10.8.0.5:3128/\"\n");
+                    want.push(addr("10.8.0.5", None));
                 }
+                6 => {
+                    text.push_str("all_proxy=socks5://[2001:db8::9]:1080\n");
+                    want.push(addr("2001:db8::9", None));
+                }
+                7 => text.push_str("declare -x Http_Proxy='http://127.0.0.1:3128'\n"),
                 _ => {
-                    text.push_str("declare -x Http_Proxy='http://p:3128'\n");
-                    steers = true;
+                    text.push_str("declare -x Http_Proxy='http://192.0.2.44:3128'\n");
+                    want.push(addr("192.0.2.44", None));
                 }
             }
         }
-        (text, steers)
+        want.sort();
+        want.dedup();
+        (text, want)
     }
 
-    fn failing_proxy() -> usize {
+    fn failing(f: fn(u64) -> (String, Vec<Target>), parse: fn(&str) -> Vec<Target>) -> usize {
         (1..=400u64)
             .filter(|n| {
-                let (text, want) = proxy(n * 0x9E37_79B9);
-                dns::proxy_steers(&text) != want
+                let (text, want) = f(n * 0x9E37_79B9);
+                let mut got = parse(&text);
+                got.sort();
+                got != want
             })
             .count()
     }
 
     #[test]
-    fn the_files_mean_what_they_say() {
+    fn the_settings_name_what_they_name() {
         MUTANT.with(|m| m.set(Mutant::None));
-        assert_eq!((failing_resolv(), failing_netif(), failing_proxy()), (0, 0, 0));
+        assert_eq!(failing(resolv, dns::resolv_servers), 0);
+        assert_eq!(failing(netif, dns::netif_servers), 0);
+        assert_eq!(failing(proxy, dns::proxy_hosts), 0);
     }
 
     #[test]
-    fn the_file_mutants_are_caught() {
-        for (m, f, at_least) in [
-            (Mutant::LoopbackSteers, failing_resolv as fn() -> usize, 60),
-            (Mutant::CommentCounts, failing_resolv, 60),
-            (Mutant::FirstServerOnly, failing_resolv, 40),
-            (Mutant::NoZoneStrip, failing_resolv, 40),
-            (Mutant::LoopbackSteers, failing_netif, 60),
-            (Mutant::FirstServerOnly, failing_netif, 40),
-            (Mutant::ProxyLowerOnly, failing_proxy, 60),
+    fn the_setting_mutants_are_caught() {
+        for (m, f, parse, at_least) in [
+            (Mutant::LoopbackSteers, resolv as fn(u64) -> _, dns::resolv_servers as fn(&str) -> Vec<Target>, 60),
+            (Mutant::CommentCounts, resolv, dns::resolv_servers, 60),
+            (Mutant::FirstServerOnly, resolv, dns::resolv_servers, 60),
+            (Mutant::NoZoneStrip, resolv, dns::resolv_servers, 20),
+            (Mutant::LoopbackSteers, netif, dns::netif_servers, 60),
+            (Mutant::FirstServerOnly, netif, dns::netif_servers, 40),
+            (Mutant::ProxyLowerOnly, proxy, dns::proxy_hosts, 60),
         ] {
             MUTANT.with(|c| c.set(m));
-            let bad = f();
+            let bad = failing(f, parse);
             MUTANT.with(|c| c.set(Mutant::None));
             eprintln!("mutant {m:?} fails {bad} of 400");
-            assert!(bad >= at_least, "mutant {m:?} caught by only {bad} of 400 files");
+            assert!(bad >= at_least, "mutant {m:?} caught by only {bad} of 400 settings");
         }
     }
 
-    // ---- Who claims what.
+    // ---- Who is charged.
 
-    fn tool(i: usize) -> UnitId {
-        UnitId::service(&format!("tool{i}"))
+    fn unit(n: &str) -> UnitId {
+        UnitId::service(n)
     }
 
-    fn subset(mask: usize) -> BTreeSet<UnitId> {
-        (0..3).filter(|i| mask >> i & 1 == 1).map(tool).collect()
+    /// How the kernel reaches one address.
+    #[derive(Clone, Copy, Debug)]
+    enum Reach {
+        Tun0,
+        Tun1,
+        Eth0,
+        NoRoute,
+        Failed,
+        Unreadable,
+        ZoneTun1,
+        ZoneEth0,
     }
+    const REACHES: [Reach; 8] = [
+        Reach::Tun0,
+        Reach::Tun1,
+        Reach::Eth0,
+        Reach::NoRoute,
+        Reach::Failed,
+        Reach::Unreadable,
+        Reach::ZoneTun1,
+        Reach::ZoneEth0,
+    ];
 
-    /// One scenario: the object is `Key`, claimed by `claimed`, observed
-    /// steering or not, written by `writer`; tools in `running` are running;
-    /// a link has an owner or not. What the claimants are after, by the
-    /// coordinator's rules (Nov 3), written from them, not from `reconcile`.
-    fn check(claimed: usize, running: usize, writer: usize, steers: bool, link: usize) -> Result<(), String> {
-        let is_link = link > 0;
-        let key: Key =
-            if is_link { (ChangeKind::Dns, "link tun0".into()) } else { (ChangeKind::Dns, "resolv.conf".into()) };
-        let owner = if link >= 2 { Some(tool(link - 2)) } else { None };
-        let writer_v = match writer {
-            0..=2 => Writer::Unit(tool(writer)),
-            3 => Writer::Unknown,
-            _ => Writer::NoWrite,
+    /// `tun0` and `tun1` are virtual, `eth0` the uplink. The owners of tun0:
+    /// creators and routers each any subset of {a, b} (`mask` bits 0-1 and
+    /// 2-3); tun1: unowned, or created by c.
+    fn world_check(reaches: &[Reach], link: Option<&str>, mask: usize, tun1_owned: bool) -> Result<(), String> {
+        let subset = |m: usize| -> BTreeSet<UnitId> {
+            ["a", "b"].iter().enumerate().filter(|(i, _)| m >> i & 1 == 1).map(|(_, n)| unit(n)).collect()
         };
-        let (cur, run) = (subset(claimed), subset(running));
-        let mut t = Tracker::default();
-        if !cur.is_empty() {
-            t.apply_dns(&[Action::Claim { key: key.clone(), owners: cur.clone(), iface: None }]);
-        }
-        let observed: BTreeMap<Key, Obs> =
-            [(key.clone(), Obs { steers, iface: is_link.then(|| "tun0".to_string()) })].into();
-        let all: BTreeSet<UnitId> = (0..4).map(tool).collect();
-        let owner_of = |n: &str| if n == "tun0" { owner.clone() } else { None };
-        let actions = dns::reconcile(
-            &observed,
-            &t.dns_claimants(),
-            &[(key.clone(), writer_v.clone())].into(),
-            &run,
-            &owner_of,
-            &all,
-        );
-        t.apply_dns(&actions);
-        let got = t.dns_claimants().remove(&key).unwrap_or_default();
-        let want: BTreeSet<UnitId> = if !steers {
-            BTreeSet::new()
-        } else if let Some(o) = owner.clone().filter(|_| is_link) {
-            [o].into()
-        } else {
-            match writer_v.clone() {
-                Writer::Unit(u) => [u].into(),
-                Writer::Unknown => run.clone(),
-                Writer::NoWrite if cur.is_empty() => run.clone(),
-                Writer::NoWrite => cur.clone(),
+        let (creators0, routers0) = (subset(mask & 3), subset(mask >> 2 & 3));
+        let virt: BTreeSet<String> = ["tun0".to_string(), "tun1".to_string()].into();
+        let owners = |n: &str| match n {
+            "tun0" => Owners { creators: creators0.clone(), routers: routers0.clone() },
+            "tun1" if tun1_owned => Owners { creators: [unit("c")].into(), routers: BTreeSet::new() },
+            // The uplink has a route adder (the DHCP client) and still steers for nobody.
+            "eth0" => Owners { creators: BTreeSet::new(), routers: [unit("dhcp")].into() },
+            _ => Owners::default(),
+        };
+        // Address i is 10.0.0.i; what it reaches is its Reach.
+        let lookup = |a: &IpAddr| match a {
+            IpAddr::V4(v) => match reaches[v.octets()[3] as usize] {
+                Reach::Tun0 => Lookup::Via("tun0".into()),
+                Reach::Tun1 => Lookup::Via("tun1".into()),
+                Reach::Eth0 => Lookup::Via("eth0".into()),
+                Reach::NoRoute => Lookup::NoRoute,
+                _ => Lookup::Failed,
+            },
+            IpAddr::V6(_) => Lookup::Failed,
+        };
+        let world = World { virtual_ifaces: &virt, owners: &owners, lookup: &lookup };
+        let targets: Vec<Target> = reaches
+            .iter()
+            .enumerate()
+            .map(|(i, r)| match r {
+                Reach::Unreadable => Target::Unreadable,
+                Reach::ZoneTun1 => addr("fe80::1", Some("tun1")),
+                Reach::ZoneEth0 => addr("fe80::2", Some("eth0")),
+                _ => addr(&format!("10.0.0.{i}"), None),
+            })
+            .collect();
+        let got = dns::charges(&targets, link, &world);
+
+        // The oracle, from the rule: an address steers for the owners of the
+        // virtual interface that carries it; the uplink's carries nobody's; a
+        // virtual one nobody owns, an unreadable address and a failed lookup
+        // are unknown.
+        let (mut want, mut unknown) = (BTreeSet::new(), false);
+        let virtual_owners = |iface: &str, want: &mut BTreeSet<UnitId>, unknown: &mut bool| {
+            let o: BTreeSet<UnitId> = match iface {
+                "tun0" => creators0.union(&routers0).cloned().collect(),
+                "tun1" if tun1_owned => [unit("c")].into(),
+                _ => BTreeSet::new(),
+            };
+            *unknown |= o.is_empty();
+            want.extend(o);
+        };
+        for r in reaches {
+            let carrier = match (link, r) {
+                (_, Reach::Unreadable) => {
+                    unknown = true;
+                    continue;
+                }
+                (Some(l), _) => Some(l),
+                (None, Reach::Tun0) => Some("tun0"),
+                (None, Reach::Tun1 | Reach::ZoneTun1) => Some("tun1"),
+                (None, Reach::Eth0 | Reach::ZoneEth0) => Some("eth0"),
+                (None, Reach::NoRoute) => None,
+                (None, Reach::Failed) => {
+                    unknown = true;
+                    None
+                }
+            };
+            if let Some(i) = carrier.filter(|i| *i != "eth0") {
+                virtual_owners(i, &mut want, &mut unknown);
             }
-        };
+        }
+        let want = Charge { owners: want, unknown };
         if got == want {
             Ok(())
         } else {
-            Err(format!(
-                "claimed {cur:?} running {run:?} {writer_v:?} steers {steers} link {owner:?}: got {got:?}, want {want:?}"
-            ))
+            Err(format!("{reaches:?} link {link:?} mask {mask} tun1 {tun1_owned}: got {got:?}, want {want:?}"))
         }
     }
 
-    fn failing_claims() -> usize {
+    fn failing_charges() -> usize {
         let mut bad = 0;
-        for claimed in 0..8 {
-            for running in 0..8 {
-                for writer in 0..5 {
-                    for steers in [false, true] {
-                        for link in 0..5 {
-                            bad += check(claimed, running, writer, steers, link).is_err() as usize;
+        let mut first = None;
+        for r1 in REACHES {
+            for r2 in REACHES {
+                for link in [None, Some("tun0"), Some("eth0")] {
+                    for mask in 0..16 {
+                        for owned in [false, true] {
+                            if let Err(e) = world_check(&[r1, r2], link, mask, owned) {
+                                bad += 1;
+                                first.get_or_insert(e);
+                            }
                         }
                     }
                 }
             }
         }
+        if MUTANT.with(std::cell::Cell::get) == Mutant::None {
+            assert_eq!(first, None);
+        }
         bad
     }
 
-    /// Every combination (3,200) gives the claimants the rules say: a charge
-    /// for an unknown writer reaches only tools running at the write; every
-    /// charge clears when the content stops steering; an attributed write
-    /// replaces all running-tool charges; a link's DNS is its interface
-    /// owner's.
+    /// Every pair of addresses, however reached, with and without a resolved
+    /// link's interface, over every owner set (3,072 scenarios) is charged
+    /// as the rule says: the charge is the owner set of the interface the
+    /// kernel picks; the uplink's, even with a DHCP client's route, charges
+    /// nobody; a failed lookup, an unreadable address, or a virtual interface
+    /// nobody owns is unknown.
     #[test]
-    fn claims_follow_the_rules() {
+    fn the_charge_is_the_owners_of_the_interface_that_carries_it() {
         MUTANT.with(|m| m.set(Mutant::None));
-        let first = (0..8)
-            .flat_map(|c| {
-                (0..8).flat_map(move |r| {
-                    (0..5).flat_map(move |w| {
-                        [false, true].into_iter().flat_map(move |s| (0..5).map(move |l| (c, r, w, s, l)))
-                    })
-                })
-            })
-            .find_map(|(c, r, w, s, l)| check(c, r, w, s, l).err());
-        assert_eq!(first, None);
-        assert_eq!(failing_claims(), 0);
+        assert_eq!(failing_charges(), 0);
     }
 
     #[test]
-    fn the_claim_mutants_are_caught() {
+    fn the_charge_mutants_are_caught() {
         for (m, at_least) in [
-            (Mutant::ChargeAllTools, 100),
-            (Mutant::NeverClear, 100),
-            (Mutant::AttributedAdds, 100),
-            (Mutant::IgnoreLinkOwner, 100),
+            (Mutant::ChargeEveryOwner, 200),
+            (Mutant::PhysicalCounts, 200),
+            (Mutant::FailedIsNobody, 200),
+            (Mutant::UnownedIsNobody, 200),
+            (Mutant::CreatorOnly, 200),
+            (Mutant::LinkLooksUp, 200),
         ] {
             MUTANT.with(|c| c.set(m));
-            let bad = failing_claims();
+            let bad = failing_charges();
             MUTANT.with(|c| c.set(Mutant::None));
-            eprintln!("mutant {m:?} fails {bad} of 3200");
-            assert!(bad >= at_least, "mutant {m:?} caught by only {bad} of 3200 scenarios");
+            eprintln!("mutant {m:?} fails {bad} of 3072");
+            assert!(bad >= at_least, "mutant {m:?} caught by only {bad} of 3072 scenarios");
         }
     }
 
-    /// What the footprint says: a network tool charged with a steering DNS
-    /// object reads protecting, and keeps reading so for its invocation when
-    /// the object is cleared (the latch); a tool never charged does not.
+    // ---- The tracker.
+
+    fn settings(t: &[Target], link: Option<&str>) -> BTreeMap<Key, (Vec<Target>, Option<String>)> {
+        [((ChangeKind::Dns, "resolv.conf".to_string()), (t.to_vec(), link.map(String::from)))].into()
+    }
+
+    fn made(t: &mut Tracker, who: &str, iface: &str) {
+        t.apply(&crate::Change {
+            owner: crate::Owner::Unit(unit(who)),
+            kind: ChangeKind::Interface,
+            object: iface.into(),
+            iface: Some(iface.into()),
+            steers: false,
+            removed: false,
+        });
+    }
+
+    fn routed(t: &mut Tracker, who: &str, iface: &str) {
+        t.apply(&crate::Change {
+            owner: crate::Owner::Unit(unit(who)),
+            kind: ChangeKind::Route,
+            object: format!("route {iface}"),
+            iface: Some(iface.into()),
+            steers: true,
+            removed: false,
+        });
+    }
+
+    fn pass(t: &mut Tracker, s: &BTreeMap<Key, (Vec<Target>, Option<String>)>, via: &str) {
+        let virt = t.virtual_links().clone();
+        let owners = |n: &str| t.interface_owners(n);
+        let lookup = |_: &IpAddr| if via == "?" { Lookup::Failed } else { Lookup::Via(via.to_string()) };
+        let w = World { virtual_ifaces: &virt, owners: &owners, lookup: &lookup };
+        let c = dns::all(s, &w);
+        t.set_dns(&c);
+    }
+
+    fn view(t: &Tracker, who: &[&str]) -> crate::FootprintView {
+        t.view(WatchState::Attached { at: NOW }, &who.iter().map(|n| unit(n)).collect::<Vec<_>>(), NOW)
+    }
+
+    /// A route change moves the charge with it, the setting unchanged; the
+    /// uplink charges nobody; a failed lookup is a mark on that setting that
+    /// clears when the lookup succeeds; the global marker is never used.
     #[test]
-    fn a_charged_tool_protects_and_the_latch_holds() {
-        let (a, b) = (tool(0), tool(1));
-        let key: Key = (ChangeKind::Dns, "resolv.conf".into());
+    fn a_route_change_moves_the_charge_and_a_failure_clears() {
         let mut t = Tracker::default();
-        t.set_invocation(&a, crate::Invocation { id: Some("a".repeat(32)), ended: false });
-        t.apply_dns(&[Action::Claim { key: key.clone(), owners: [a.clone()].into(), iface: None }]);
-        let view = |t: &Tracker| t.view(WatchState::Attached { at: NOW }, &[a.clone(), b.clone()], NOW);
-        assert!(view(&t).units["tool0"].protecting);
-        assert!(view(&t).units.get("tool1").is_none_or(|f| !f.protecting), "not charged");
-        t.apply_dns(&[Action::Clear { key }]);
-        assert!(t.dns_claimants().is_empty(), "the object is gone for everyone");
-        assert!(view(&t).units["tool0"].protecting, "the invocation's latch");
-        assert!(view(&t).unattributed.is_empty(), "never a global marker");
+        made(&mut t, "vpn-a", "tun0");
+        made(&mut t, "vpn-b", "tun1");
+        t.set_virtual(["tun0".to_string(), "tun1".to_string()].into());
+        let s = settings(&[addr("10.8.0.1", None)], None);
+        pass(&mut t, &s, "tun0");
+        assert!(view(&t, &["vpn-a", "vpn-b", "dhcp"]).units["vpn-a"].protecting);
+        assert!(view(&t, &["vpn-a", "vpn-b"]).units.get("vpn-b").is_none_or(|f| !f.protecting));
+        // The route moves to tun1: the charge follows.
+        pass(&mut t, &s, "tun1");
+        let v = view(&t, &["vpn-a", "vpn-b"]);
+        assert!(v.units["vpn-b"].protecting, "{v:?}");
+        assert!(
+            !t.claims().objects.iter().any(|o| o.0 == unit("vpn-a") && o.1 == ChangeKind::Dns),
+            "vpn-a no longer carries the setting"
+        );
+        // The uplink: nobody, whoever routes over it.
+        routed(&mut t, "dhcp", "eth0");
+        pass(&mut t, &s, "eth0");
+        assert!(t.dns_charges().is_empty(), "{:?}", t.dns_charges());
+        // A failed lookup: an object-bound mark, not a global one.
+        pass(&mut t, &s, "?");
+        let v = view(&t, &["vpn-a", "vpn-b"]);
+        assert!(!v.unattributed.is_empty(), "the failed setting");
+        assert!(t.dns_charges()[&(ChangeKind::Dns, "resolv.conf".to_string())].unknown);
+        // It succeeds again: the mark clears.
+        pass(&mut t, &s, "eth0");
+        assert!(view(&t, &["vpn-a"]).unattributed.is_empty());
+        // The setting changes to loopback only: nothing stands.
+        pass(&mut t, &settings(&[], None), "tun0");
+        assert!(t.dns_charges().is_empty());
+    }
+
+    /// The latch: an invocation found protecting for a DNS charge stays so
+    /// after the setting is cleared, until it ends and a new one starts.
+    #[test]
+    fn the_latch_keeps_what_an_invocation_was_charged() {
+        let mut t = Tracker::default();
+        made(&mut t, "vpn-a", "tun0");
+        t.set_virtual(["tun0".to_string()].into());
+        t.set_invocation(&unit("vpn-a"), crate::Invocation { id: Some("a".repeat(32)), ended: false });
+        pass(&mut t, &settings(&[addr("10.8.0.1", None)], None), "tun0");
+        assert!(view(&t, &["vpn-a"]).units["vpn-a"].protecting);
+        pass(&mut t, &settings(&[], None), "tun0");
+        assert!(t.dns_charges().is_empty());
+        assert!(view(&t, &["vpn-a"]).units["vpn-a"].protecting, "the invocation's latch");
     }
 }
 
-/// The files B-22 (a) reads and watches, against a temporary tree.
+/// Which interface a route lookup answered, from the kernel's reply.
+#[cfg(feature = "loader")]
+mod route {
+    use crate::dns::Lookup;
+    use crate::route::classify;
+
+    fn reply_with_oif(oif: Option<u32>) -> Vec<u8> {
+        let mut m = vec![0u8; 16];
+        m[4..6].copy_from_slice(&24u16.to_ne_bytes()); // RTM_NEWROUTE
+        m.extend([2u8, 32, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0]); // rtmsg
+        m.extend(8u16.to_ne_bytes());
+        m.extend(1u16.to_ne_bytes()); // RTA_DST
+        m.extend([10, 0, 0, 1]);
+        if let Some(i) = oif {
+            m.extend(8u16.to_ne_bytes());
+            m.extend(4u16.to_ne_bytes()); // RTA_OIF
+            m.extend(i.to_ne_bytes());
+        }
+        let len = m.len() as u32;
+        m[0..4].copy_from_slice(&len.to_ne_bytes());
+        m
+    }
+
+    fn error(code: i32) -> Vec<u8> {
+        let mut m = vec![0u8; 16];
+        m[4..6].copy_from_slice(&2u16.to_ne_bytes());
+        m.extend(code.to_ne_bytes());
+        let len = m.len() as u32;
+        m[0..4].copy_from_slice(&len.to_ne_bytes());
+        m
+    }
+
+    fn names(i: u32) -> Option<String> {
+        (i == 9).then(|| "tun0".to_string())
+    }
+
+    /// The route through an interface is that interface; "network
+    /// unreachable" is a definite no route (no interface carries it); anything
+    /// else (no output interface, an index with no name, another error, a cut
+    /// reply) is a failed lookup, which fails closed.
+    #[test]
+    fn a_reply_is_a_lookup() {
+        assert_eq!(classify(&reply_with_oif(Some(9)), &mut names), Lookup::Via("tun0".into()));
+        assert_eq!(classify(&error(-101), &mut names), Lookup::NoRoute);
+        assert_eq!(classify(&error(-113), &mut names), Lookup::NoRoute);
+        assert_eq!(classify(&error(-1), &mut names), Lookup::Failed, "another error");
+        assert_eq!(classify(&reply_with_oif(None), &mut names), Lookup::Failed, "no output interface");
+        assert_eq!(classify(&reply_with_oif(Some(77)), &mut names), Lookup::Failed, "an index with no name");
+        let cut = reply_with_oif(Some(9));
+        assert_eq!(classify(&cut[..cut.len() - 3], &mut names), Lookup::Failed, "a cut reply");
+        assert_eq!(classify(&[], &mut names), Lookup::Failed, "nothing");
+    }
+}
+
+/// The files B-22 (a) reads, against a temporary tree.
 #[cfg(feature = "loader")]
 mod files {
     use crate::ChangeKind;
-    use crate::dns::Writer;
+    use crate::dns::Target;
     use crate::files::Files;
-    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
     fn put(root: &Path, rel: &str, text: &str) {
@@ -2531,80 +2717,54 @@ mod files {
         (i == 7).then(|| "tun0".to_string())
     }
 
+    fn a(s: &str, zone: Option<&str>) -> Target {
+        Target::Addr { addr: s.parse().unwrap(), zone: zone.map(String::from) }
+    }
+
     #[test]
-    fn the_files_are_read_into_objects() {
+    fn the_files_are_read_into_settings() {
         let d = tempfile::tempdir().unwrap();
-        put(d.path(), "etc/resolv.conf", "nameserver 10.8.0.1\n");
-        put(d.path(), "etc/environment", "export https_proxy=\"http://p:3128\"\n");
+        put(d.path(), "etc/resolv.conf", "nameserver 10.8.0.1\nnameserver 127.0.0.53\n");
+        put(
+            d.path(),
+            "etc/environment",
+            "export https_proxy=\"http://192.0.2.5:3128\"\nhttp_proxy=http://proxy.example.org:3128\n",
+        );
         put(d.path(), "etc/profile.d/a.sh", "export PATH=/x\n");
         put(d.path(), "run/systemd/resolve/netif/7", "DNS=10.8.0.1\n");
         put(d.path(), "run/systemd/resolve/netif/9", "DNS=1.1.1.1\n"); // no such interface: not read
         let f = Files::new(d.path());
         let o = f.observe(&mut names);
-        let steers = |k: (ChangeKind, &str)| o.objects.get(&(k.0, k.1.to_string())).map(|x| x.steers);
-        assert_eq!(steers((ChangeKind::Dns, "resolv.conf")), Some(true));
-        assert_eq!(steers((ChangeKind::Proxy, "/etc/environment")), Some(true));
-        assert_eq!(steers((ChangeKind::Proxy, "/etc/profile.d/a.sh")), Some(false));
-        assert_eq!(steers((ChangeKind::Dns, "link tun0")), Some(true));
-        assert_eq!(o.objects[&(ChangeKind::Dns, "link tun0".to_string())].iface.as_deref(), Some("tun0"));
-        assert_eq!(o.objects.len(), 4, "{:?}", o.objects.keys());
-        // A file that goes is no longer observed (so its claimants clear).
+        let get = |k: ChangeKind, n: &str| o.get(&(k, n.to_string())).cloned();
+        assert_eq!(get(ChangeKind::Dns, "resolv.conf"), Some((vec![a("10.8.0.1", None)], None)));
+        assert_eq!(
+            get(ChangeKind::Proxy, "/etc/environment"),
+            Some((vec![a("192.0.2.5", None)], None)),
+            "the host name is uncovered"
+        );
+        assert_eq!(get(ChangeKind::Proxy, "/etc/profile.d/a.sh"), Some((vec![], None)));
+        assert_eq!(get(ChangeKind::Dns, "link tun0"), Some((vec![a("10.8.0.1", None)], Some("tun0".into()))));
+        assert_eq!(o.len(), 4, "{:?}", o.keys());
+        // A file that goes is no longer a setting.
         std::fs::remove_file(d.path().join("etc/environment")).unwrap();
-        assert!(!f.observe(&mut names).objects.contains_key(&(ChangeKind::Proxy, "/etc/environment".to_string())));
+        assert!(!f.observe(&mut names).contains_key(&(ChangeKind::Proxy, "/etc/environment".to_string())));
     }
 
-    /// Without fanotify: the first read is no write; a changed inode (the
-    /// file replaced by a rename) is an unknown writer; the same inode again is none.
+    /// The signature changes with a replace-by-rename (a new inode) and an
+    /// in-place write (a new size or mtime), and not otherwise.
     #[test]
-    fn a_replaced_file_with_no_record_is_an_unknown_writer() {
+    fn the_signature_sees_a_rename_and_an_in_place_write() {
         let d = tempfile::tempdir().unwrap();
         put(d.path(), "etc/resolv.conf", "nameserver 127.0.0.53\n");
-        let mut f = Files::new(d.path()).without_fanotify();
-        let key = (ChangeKind::Dns, "resolv.conf".to_string());
-        let o = f.observe(&mut names);
-        assert_eq!(f.writers(&o)[&key], Writer::NoWrite);
-        put(d.path(), "etc/resolv.conf.tmp", "nameserver 10.8.0.1\n");
+        let f = Files::new(d.path());
+        let first = f.signature();
+        assert_eq!(f.signature(), first, "nothing changed");
+        put(d.path(), "etc/resolv.conf.tmp", "nameserver 127.0.0.53\n");
         std::fs::rename(d.path().join("etc/resolv.conf.tmp"), d.path().join("etc/resolv.conf")).unwrap();
-        let o = f.observe(&mut names);
-        assert_eq!(f.writers(&o)[&key], Writer::Unknown);
-        let o = f.observe(&mut names);
-        assert_eq!(f.writers(&o)[&key], Writer::NoWrite, "nothing new");
-    }
-
-    /// The real thing: a program that replaces resolv.conf writes a
-    /// temporary file and renames it over; its write is found by the new
-    /// file's inode. A skip must never read as a pass.
-    #[test]
-    fn a_rename_over_is_found_by_the_new_files_inode() {
-        let d = tempfile::tempdir().unwrap();
-        put(d.path(), "etc/resolv.conf", "nameserver 127.0.0.53\n");
-        let mut f = Files::new(d.path());
-        if let Some(why) = f.refused.clone() {
-            assert!(std::env::var_os("NETWATCH_REQUIRE_FANOTIFY_TESTS").is_none(), "required, but {why}");
-            eprintln!("skipped: {why}");
-            return;
-        }
-        f.mark();
-        put(d.path(), "etc/resolv.conf.tmp", "nameserver 10.8.0.1\n");
-        std::fs::rename(d.path().join("etc/resolv.conf.tmp"), d.path().join("etc/resolv.conf")).unwrap();
-        let ino = std::fs::metadata(d.path().join("etc/resolv.conf")).unwrap();
-        // The event is queued by the time the write returned; allow a moment.
-        let mut seen = false;
-        for _ in 0..50 {
-            f.drain();
-            if f.recorded((ino.dev(), ino.ino())) {
-                seen = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(seen, "the write to the temporary file, found by the inode it gave resolv.conf");
-        // And it is attributed to a writer (this test process: in no unit,
-        // so unknown, but a record).
-        let o = f.observe(&mut names);
-        assert!(matches!(
-            f.writers(&o)[&(ChangeKind::Dns, "resolv.conf".to_string())],
-            Writer::Unknown | Writer::Unit(_)
-        ));
+        let renamed = f.signature();
+        assert_ne!(renamed, first, "a new inode");
+        std::fs::OpenOptions::new().append(true).open(d.path().join("etc/resolv.conf")).unwrap();
+        put(d.path(), "etc/resolv.conf", "nameserver 127.0.0.53\nnameserver 10.8.0.1\n");
+        assert_ne!(f.signature(), renamed, "an in-place write");
     }
 }

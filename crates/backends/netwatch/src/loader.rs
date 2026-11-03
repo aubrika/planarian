@@ -353,18 +353,12 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         Err(why)
     };
     let mut lost_seen = 0u64;
-    // B-22 (a): the files that carry DNS and proxy steering, and who wrote
-    // them (fanotify on their directories). Read once at the start (the
-    // baseline, charged to the tools running now), then on any write and at
-    // every tick.
-    let mut files = crate::files::Files::new(Path::new("/"));
-    files.mark();
-    if let Some(why) = &files.refused {
-        eprintln!(
-            "netwatch: {why}: DNS and proxy writers cannot be attributed; every change is charged to the running tools"
-        );
-    }
-    let mut first_files = true;
+    // B-22 (a): the settings that carry DNS and proxy steering, recomputed
+    // each pass they may have changed (a file changed, or anything the ring
+    // delivered: a route or an interface may have moved the charge) and at
+    // every tick. Nothing is remembered between passes.
+    let files = crate::files::Files::new(Path::new("/"));
+    let mut files_seen = Vec::new();
     let mut next_tick = Instant::now();
     // Between ticks, the running units are refreshed at most this often.
     let mut running = std::collections::BTreeSet::new();
@@ -428,27 +422,20 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
             changed |= tracker.set_invocation(u, inv);
         }
         let tick = Instant::now() >= next_tick;
-        let written = files.drain();
-        if written || tick || first_files {
-            first_files = false;
-            files.mark();
+        let signature = files.signature();
+        if signature != files_seen || drained > 0 || tick {
+            files_seen = signature;
             let names = read_ifnames();
-            let observed = files.observe(&mut |i| names.get(&i).cloned());
-            let writers = files.writers(&observed);
-            let running_now = cgroups.running();
-            let all: std::collections::BTreeSet<_> = expand_tools(&tools, &running_now).into_iter().collect();
-            let running_tools: std::collections::BTreeSet<_> =
-                all.iter().filter(|u| running_now.contains(&crate::file_name(u))).cloned().collect();
-            let actions = crate::dns::reconcile(
-                &observed.objects,
-                &tracker.dns_claimants(),
-                &writers,
-                &running_tools,
-                &|n| tracker.interface_owner(n),
-                &all,
-            );
-            if !actions.is_empty() {
-                tracker.apply_dns(&actions);
+            let settings = files.observe(&mut |i| names.get(&i).cloned());
+            let virtual_links = tracker.virtual_links().clone();
+            let lookup = |a: &std::net::IpAddr| {
+                crate::route::get(a, &mut |i| names.get(&i).cloned().or_else(|| read_ifnames().get(&i).cloned()))
+            };
+            let owners = |n: &str| tracker.interface_owners(n);
+            let world = crate::dns::World { virtual_ifaces: &virtual_links, owners: &owners, lookup: &lookup };
+            let charges = crate::dns::all(&settings, &world);
+            if charges != tracker.dns_charges() {
+                tracker.set_dns(&charges);
                 changed = true;
             }
         }

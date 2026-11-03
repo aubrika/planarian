@@ -1,17 +1,29 @@
 //! DNS and proxy steering (B-22 a): the pure half. A unit that points the
 //! machine's resolver at its own servers, or sets the system proxy, steers
-//! traffic as surely as a default route (SPEC §12d "...DNS servers on its
-//! interface; the system proxy"), but through files, not netlink.
+//! traffic as surely as a default route, but through files, not netlink.
 //!
-//! **State model** (coordinator, Nov 3). Each setting is one *object*: `(Dns,
-//! "resolv.conf")`, `(Dns, "link <ifname>")` for a resolved link, `(Proxy,
-//! "<file>")`. Whether it steers is computed from its *current content* on
-//! every read and never remembered: a name server that is not the machine's
-//! own loopback stub, or a proxy variable with a value. Content that stops
-//! steering, or a file or link that goes, clears the object for *everyone*
-//! ([`Action::Clear`]), so a charge cannot stick (B-24's shape). The objects
-//! are singletons: a new claimant replaces the old ([`Action::Claim`]).
-//! [`reconcile`] decides, from what is observed, who claims what.
+//! **The rule** (SPEC §12d: "DNS servers on *its* interface"; coordinator,
+//! Nov 3). A name server or proxy host steers for the unit(s) whose
+//! interface *carries* it, not for whoever wrote the setting. Each pass,
+//! nothing remembered:
+//! 1. read the settings ([`resolv_servers`], [`netif_servers`],
+//!    [`proxy_hosts`]): every address they name; a loopback address steers
+//!    nothing (the machine's own stub: a dead one fails DNS closed rather
+//!    than leaking);
+//! 2. ask the kernel which interface reaches each ([`Lookup`], the `ip route
+//!    get` equivalent, policy rules and fwmark tables such as wg-quick's
+//!    honoured); an address with a zone (`fe80::1%tun0`) and a resolved
+//!    link's own servers name their interface themselves;
+//! 3. charge the owners of that interface ([`charges`]): for a *virtual*
+//!    interface, the units with a claim on it (its creator) and those that
+//!    added a steering route over it; a *physical* interface (the uplink,
+//!    DHCP-learned DNS) steers for nobody and is charged to nobody;
+//! 4. *unknown* fails closed: a lookup that failed, an address that cannot
+//!    be read, or a virtual interface nobody is known to own. The setting is
+//!    then an object-bound unattributed mark that clears as soon as the
+//!    lookup succeeds or the setting changes, never a global one.
+//!
+//! A route change moves the charge with it, because it is recomputed.
 
 use crate::model::ChangeKind;
 use planarian_schema::UnitId;
@@ -29,20 +41,24 @@ pub(crate) enum Mutant {
     CommentCounts,
     /// Only the first name server of a file is looked at.
     FirstServerOnly,
-    /// A zone suffix (`fe80::1%eth0`) makes an address unreadable... and a
-    /// loopback with one steers.
+    /// A zone suffix (`fe80::1%eth0`) is not stripped.
     NoZoneStrip,
     /// Proxy variable names are matched in lower case only.
     ProxyLowerOnly,
-    /// A charge for a write by an unknown process goes to every network tool,
-    /// running or not.
-    ChargeAllTools,
-    /// Content that stops steering does not clear its claimants.
-    NeverClear,
-    /// An attributed write adds its unit to the claimants instead of replacing them.
-    AttributedAdds,
-    /// A link's DNS goes to the running tools even when the interface has an owner.
-    IgnoreLinkOwner,
+    /// The interface the lookup picks is ignored: every virtual interface's
+    /// owners are charged.
+    ChargeEveryOwner,
+    /// A physical interface's route adder is charged (DHCP clients count).
+    PhysicalCounts,
+    /// A failed lookup charges nobody (fails open).
+    FailedIsNobody,
+    /// An unowned virtual interface charges nobody.
+    UnownedIsNobody,
+    /// Only the interface's creator is charged, not the unit that added the route.
+    CreatorOnly,
+    /// A resolved link's own servers are looked up like any address (so a
+    /// loopback-routed lookup could pick another interface).
+    LinkLooksUp,
 }
 
 #[cfg(test)]
@@ -55,24 +71,40 @@ fn mutant(m: Mutant) -> bool {
     MUTANT.with(std::cell::Cell::get) == m
 }
 
+/// One address a setting names, and the interface it names itself, if any.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Target {
+    /// A non-loopback address, with the interface its zone names.
+    Addr { addr: IpAddr, zone: Option<String> },
+    /// Something in an address position that cannot be read (fail closed).
+    Unreadable,
+}
+
 /// An address in a name server position: `1.2.3.4`, `1.2.3.4:53`, `::1`,
-/// `[::1]:53`, `fe80::1%eth0`, `1.1.1.1#cloudflare-dns.com`. `None` if it is
-/// none of those (the caller fails closed: an unreadable server steers).
-fn server(tok: &str) -> Option<IpAddr> {
+/// `[::1]:53`, `fe80::1%eth0`, `1.1.1.1#cloudflare-dns.com`. `None` is a
+/// loopback address (steers nothing).
+fn target(tok: &str) -> Option<Target> {
     let tok = tok.split('#').next().unwrap_or("");
     let tok = if let Some(rest) = tok.strip_prefix('[') { rest.split(']').next().unwrap_or("") } else { tok };
     #[cfg(test)]
-    let zone = !mutant(Mutant::NoZoneStrip);
+    let strip = !mutant(Mutant::NoZoneStrip);
     #[cfg(not(test))]
-    let zone = true;
-    let tok = if zone { tok.split('%').next().unwrap_or("") } else { tok };
-    if let Ok(a) = tok.parse::<IpAddr>() {
-        return Some(a);
+    let strip = true;
+    let (host, zone) = match tok.split_once('%') {
+        Some((h, z)) if strip => (h, Some(z.to_string())),
+        _ => (tok, None),
+    };
+    let addr = host.parse::<IpAddr>().ok().or_else(|| {
+        // `1.2.3.4:53`
+        let (h, port) = host.rsplit_once(':')?;
+        port.parse::<u16>().ok()?;
+        h.parse::<std::net::Ipv4Addr>().ok().map(IpAddr::V4)
+    });
+    match addr {
+        Some(a) if loopback(a) => None,
+        Some(addr) => Some(Target::Addr { addr, zone }),
+        None => Some(Target::Unreadable),
     }
-    // `1.2.3.4:53`
-    let (host, port) = tok.rsplit_once(':')?;
-    port.parse::<u16>().ok()?;
-    host.parse::<std::net::Ipv4Addr>().ok().map(IpAddr::V4)
 }
 
 fn loopback(a: IpAddr) -> bool {
@@ -86,58 +118,61 @@ fn loopback(a: IpAddr) -> bool {
     }
 }
 
-/// Whether any of `servers` steers: one that is not a loopback address (the
-/// machine's own stub: a dead stub fails DNS closed rather than leaking),
-/// or that cannot be read.
-fn any_steers<'a>(servers: impl Iterator<Item = &'a str>) -> bool {
+fn targets<'a>(toks: impl Iterator<Item = &'a str>) -> Vec<Target> {
     #[cfg(test)]
-    let servers: Box<dyn Iterator<Item = &'a str>> =
-        if mutant(Mutant::FirstServerOnly) { Box::new(servers.take(1)) } else { Box::new(servers) };
-    let mut servers = servers;
-    servers.any(|t| server(t).is_none_or(|a| !loopback(a)))
+    let toks: Box<dyn Iterator<Item = &'a str>> =
+        if mutant(Mutant::FirstServerOnly) { Box::new(toks.take(1)) } else { Box::new(toks) };
+    let mut out: Vec<Target> = toks.filter_map(target).collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
-/// `/etc/resolv.conf`: does a `nameserver` line name a server that is not loopback?
-pub fn resolv_steers(content: &str) -> bool {
-    let line = |l: &'_ str| -> Option<String> {
+/// `/etc/resolv.conf`: the non-loopback servers its `nameserver` lines name.
+pub fn resolv_servers(content: &str) -> Vec<Target> {
+    let line = |l: &str| -> Option<String> {
         let l = l.trim();
         #[cfg(test)]
-        let comment = !mutant(Mutant::CommentCounts);
+        let l = if mutant(Mutant::CommentCounts) { l.trim_start_matches(['#', ';']).trim() } else { l };
+        #[cfg(test)]
+        let skip = !mutant(Mutant::CommentCounts) && (l.starts_with('#') || l.starts_with(';'));
         #[cfg(not(test))]
-        let comment = true;
-        let l = if comment { l } else { l.trim_start_matches(['#', ';']).trim() };
-        if comment && (l.starts_with('#') || l.starts_with(';')) {
+        let skip = l.starts_with('#') || l.starts_with(';');
+        if skip {
             return None;
         }
         let mut it = l.split_whitespace();
         (it.next() == Some("nameserver")).then(|| it.next().unwrap_or("").to_string()).filter(|s| !s.is_empty())
     };
     let servers: Vec<String> = content.lines().filter_map(line).collect();
-    any_steers(servers.iter().map(String::as_str))
+    targets(servers.iter().map(String::as_str))
 }
 
-/// A resolved link's state file (`/run/systemd/resolve/netif/<ifindex>`): its
-/// `DNS=` (and `DNS_EX=`) lines.
-pub fn netif_steers(content: &str) -> bool {
+/// A resolved link's (or the global) state file: its `DNS=` and `DNS_EX=` lines.
+pub fn netif_servers(content: &str) -> Vec<Target> {
     let toks: Vec<&str> = content
         .lines()
         .filter_map(|l| l.trim().strip_prefix("DNS=").or_else(|| l.trim().strip_prefix("DNS_EX=")))
         .flat_map(str::split_whitespace)
         .collect();
-    any_steers(toks.into_iter())
+    targets(toks.into_iter())
 }
 
 /// A file that sets environment variables (`/etc/environment`, a profile
-/// script, NixOS's `/etc/set-environment`): does it set a proxy variable to a value?
-pub fn proxy_steers(content: &str) -> bool {
+/// script, NixOS's `/etc/set-environment`): the hosts of the proxy
+/// variables it sets to a value. An IP literal is a [`Target`]; a host *name*
+/// is left uncovered (resolving it would be a DNS query netwatch must not
+/// make; named in B-22).
+pub fn proxy_hosts(content: &str) -> Vec<Target> {
     const VARS: [&str; 4] = ["http_proxy", "https_proxy", "all_proxy", "ftp_proxy"];
-    content.lines().any(|l| {
+    let mut toks = vec![];
+    for l in content.lines() {
         let l = l.trim();
         if l.starts_with('#') {
-            return false;
+            continue;
         }
         let l = l.strip_prefix("export ").or_else(|| l.strip_prefix("declare -x ")).unwrap_or(l).trim_start();
-        let Some((k, v)) = l.split_once('=') else { return false };
+        let Some((k, v)) = l.split_once('=') else { continue };
         let k = k.trim();
         #[cfg(test)]
         let named = if mutant(Mutant::ProxyLowerOnly) {
@@ -147,114 +182,157 @@ pub fn proxy_steers(content: &str) -> bool {
         };
         #[cfg(not(test))]
         let named = VARS.iter().any(|n| n.eq_ignore_ascii_case(k));
-        named && !v.trim().trim_matches(['"', '\'']).trim().is_empty()
-    })
+        if !named {
+            continue;
+        }
+        let v = v.trim().trim_matches(['"', '\'']).trim();
+        if v.is_empty() {
+            continue;
+        }
+        // `scheme://[user[:pass]@]host[:port][/path]`
+        let rest = v.split_once("://").map_or(v, |(_, r)| r);
+        let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+        let host = rest.split('/').next().unwrap_or("");
+        toks.push(host.to_string());
+    }
+    // A name (not an IP literal) is not covered; only literals become targets.
+    let literals: Vec<&str> = toks
+        .iter()
+        .map(String::as_str)
+        .filter(|h| {
+            let bare = h.trim_start_matches('[');
+            bare.chars().next().is_some_and(|c| c.is_ascii_hexdigit() || c == ':')
+                && (h.parse::<IpAddr>().is_ok()
+                    || bare.split(']').next().is_some_and(|b| b.parse::<IpAddr>().is_ok())
+                    || h.rsplit_once(':').is_some_and(|(a, p)| a.parse::<IpAddr>().is_ok() && p.parse::<u16>().is_ok()))
+        })
+        .collect();
+    targets(literals.into_iter())
 }
 
-/// An object and what is observed of it now.
+/// What the kernel says about reaching an address (`ip route get`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lookup {
+    /// Out through this interface.
+    Via(String),
+    /// No route (the kernel's `ENETUNREACH`): no interface carries it.
+    NoRoute,
+    /// The lookup itself failed.
+    Failed,
+}
+
+/// A setting's object: `(Dns, "resolv.conf")`, `(Dns, "link <name>")`,
+/// `(Proxy, "<file>")`.
 pub type Key = (ChangeKind, String);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Obs {
-    /// It names something that steers, now.
-    pub steers: bool,
-    /// The interface it is for (a resolved link), if any.
-    pub iface: Option<String>,
+/// What one setting's addresses come to.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Charge {
+    /// The units that own the interface(s) carrying it.
+    pub owners: BTreeSet<UnitId>,
+    /// Something could not be placed (fail closed): an object-bound
+    /// unattributed mark.
+    pub unknown: bool,
 }
 
-/// Who wrote an object since the last pass.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Writer {
-    /// A write whose process was seen and is in this unit's cgroup.
-    Unit(UnitId),
-    /// A write whose process is gone or in no unit, or a change with no write
-    /// seen at all (an event missed).
-    Unknown,
-    /// Nothing was written to it.
-    NoWrite,
+/// The units that own an interface, by how.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Owners {
+    /// Those with a claim on the interface (it made it, or brought it in).
+    pub creators: BTreeSet<UnitId>,
+    /// Those that added a steering route over it.
+    pub routers: BTreeSet<UnitId>,
 }
 
-/// What the tracker should do.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Action {
-    /// Exactly these units claim the object, which steers (replacing any other claimant).
-    Claim { key: Key, owners: BTreeSet<UnitId>, iface: Option<String> },
-    /// The object no longer steers or exists: nobody claims it.
-    Clear { key: Key },
+/// What the footprints say about an interface.
+pub struct World<'a> {
+    /// A virtual link (something created it): only these have owners.
+    pub virtual_ifaces: &'a BTreeSet<String>,
+    /// Who owns an interface.
+    pub owners: &'a dyn Fn(&str) -> Owners,
+    /// The kernel's answer for an address.
+    pub lookup: &'a dyn Fn(&IpAddr) -> Lookup,
 }
 
-/// Decide, from what is observed, who claims each object (coordinator, Nov 3).
-///
-/// - An object that no longer steers (or is gone) and has claimants is cleared, for everyone.
-/// - A steering object written by a known unit is that unit's alone (replacing).
-/// - One written by an unknown process, or that steers with no claimant (found
-///   at attach, or its event missed), is charged to the network tools *running
-///   now* (`running`): the only ones that could have written it. With none
-///   running it is the machine's baseline, uncovered (B-22): no claim, and
-///   any old claimant is cleared (the content is no longer theirs).
-/// - A resolved link's DNS is its interface's owner's whoever wrote it
-///   (`link_owner`), else the running tools'.
-pub fn reconcile(
-    observed: &BTreeMap<Key, Obs>,
-    claimed: &BTreeMap<Key, BTreeSet<UnitId>>,
-    writers: &BTreeMap<Key, Writer>,
-    running: &BTreeSet<UnitId>,
-    link_owner: &dyn Fn(&str) -> Option<UnitId>,
-    all_tools: &BTreeSet<UnitId>,
-) -> Vec<Action> {
-    let mut out = vec![];
-    for (key, who) in claimed {
-        let steers = observed.get(key).is_some_and(|o| o.steers);
+/// An interface carries the setting: its owners (its creator and the units
+/// that routed over it), or unknown if it is virtual and nobody is known to
+/// own it. A physical one steers for nobody.
+fn carried(iface: &str, w: &World<'_>, c: &mut Charge) {
+    let o = (w.owners)(iface);
+    if !w.virtual_ifaces.contains(iface) {
         #[cfg(test)]
-        let steers = steers || mutant(Mutant::NeverClear);
-        if !steers && !who.is_empty() {
-            out.push(Action::Clear { key: key.clone() });
+        if mutant(Mutant::PhysicalCounts) {
+            c.owners.extend(o.creators.into_iter().chain(o.routers));
         }
+        return; // the uplink: steers for nobody
     }
-    let none = BTreeSet::new();
-    for (key, obs) in observed.iter().filter(|(_, o)| o.steers) {
-        let cur = claimed.get(key).unwrap_or(&none);
-        let writer = writers.get(key).unwrap_or(&Writer::NoWrite);
+    let mut owners = o.creators;
+    #[cfg(test)]
+    let routers = !mutant(Mutant::CreatorOnly);
+    #[cfg(not(test))]
+    let routers = true;
+    if routers {
+        owners.extend(o.routers);
+    }
+    if owners.is_empty() {
         #[cfg(test)]
-        let ignore_link = mutant(Mutant::IgnoreLinkOwner);
-        #[cfg(not(test))]
-        let ignore_link = false;
-        let link = if ignore_link { None } else { obs.iface.as_deref().and_then(link_owner) };
-        let charged = || {
-            #[cfg(test)]
-            if mutant(Mutant::ChargeAllTools) {
-                return all_tools.clone();
-            }
-            let _ = all_tools;
-            running.clone()
-        };
-        let want: Option<BTreeSet<UnitId>> = if let Some(o) = link {
-            Some([o].into())
-        } else {
-            match writer {
-                Writer::Unit(u) => {
-                    #[cfg(test)]
-                    if mutant(Mutant::AttributedAdds) {
-                        let mut s = cur.clone();
-                        s.insert(u.clone());
-                        out.push(Action::Claim { key: key.clone(), owners: s, iface: obs.iface.clone() });
-                        continue;
+        if mutant(Mutant::UnownedIsNobody) {
+            return;
+        }
+        c.unknown = true;
+    }
+    c.owners.extend(owners);
+}
+
+/// Who a setting (the addresses it names) steers for. `link`: the interface
+/// a resolved link's own servers belong to.
+pub fn charges(targets: &[Target], link: Option<&str>, w: &World<'_>) -> Charge {
+    let mut c = Charge::default();
+    for t in targets {
+        match t {
+            Target::Unreadable => c.unknown = true,
+            Target::Addr { addr, zone } => {
+                #[cfg(test)]
+                let link_lookup = mutant(Mutant::LinkLooksUp);
+                #[cfg(not(test))]
+                let link_lookup = false;
+                if let Some(l) = link.filter(|_| !link_lookup) {
+                    carried(l, w, &mut c);
+                } else if let Some(z) = zone {
+                    carried(z, w, &mut c);
+                } else {
+                    match (w.lookup)(addr) {
+                        Lookup::Via(i) => {
+                            #[cfg(test)]
+                            if mutant(Mutant::ChargeEveryOwner) {
+                                for v in w.virtual_ifaces {
+                                    carried(v, w, &mut c);
+                                }
+                                continue;
+                            }
+                            carried(&i, w, &mut c);
+                        }
+                        Lookup::NoRoute => {}
+                        Lookup::Failed => {
+                            #[cfg(test)]
+                            if mutant(Mutant::FailedIsNobody) {
+                                continue;
+                            }
+                            c.unknown = true;
+                        }
                     }
-                    Some([u.clone()].into())
                 }
-                Writer::Unknown => Some(charged()),
-                Writer::NoWrite if cur.is_empty() => Some(charged()),
-                Writer::NoWrite => None,
             }
-        };
-        match want {
-            Some(set) if set.is_empty() && !cur.is_empty() => out.push(Action::Clear { key: key.clone() }),
-            Some(set) if set.is_empty() => {}
-            Some(set) if set != *cur => {
-                out.push(Action::Claim { key: key.clone(), owners: set, iface: obs.iface.clone() });
-            }
-            _ => {}
         }
     }
-    out
+    c
+}
+
+/// Every setting's charge: the whole answer for one pass.
+pub fn all(settings: &BTreeMap<Key, (Vec<Target>, Option<String>)>, w: &World<'_>) -> BTreeMap<Key, Charge> {
+    settings
+        .iter()
+        .map(|(k, (t, link))| (k.clone(), charges(t, link.as_deref(), w)))
+        .filter(|(_, c)| !c.owners.is_empty() || c.unknown)
+        .collect()
 }
