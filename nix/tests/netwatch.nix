@@ -247,6 +247,14 @@ pkgs.testers.runNixOSTest {
         machine.succeed("test -e /run/planarian/hold/nw-quiet")
 
     def quiet_back_and_lifted():
+        # Brought back by hand: what is under test here is the hold and its
+        # lift (Running, so the hold lifts), not the repair, which vm-netsec
+        # checks. (f), (h), (i) and (k) each kill nw-quiet inside one
+        # incident's window, so by (k) §13's attempt budget is spent and no
+        # repair comes (gate 41596671872). A repair already under way is
+        # joined, not doubled.
+        machine.succeed("rm -f /run/nw-quiet-slow")
+        machine.succeed("systemctl reset-failed nw-quiet.service; systemctl start nw-quiet.service")
         machine.wait_until_succeeds("systemctl is-active nw-quiet.service", timeout=120)
         machine.wait_until_fails("systemctl is-active planarian-hold@nw-quiet.service", timeout=120)
         machine.fail("test -e /run/planarian/hold/nw-quiet")
