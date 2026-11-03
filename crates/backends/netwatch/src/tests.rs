@@ -2230,3 +2230,381 @@ mod hold_order {
         }
     }
 }
+
+/// DNS and proxy steering (B-22 a), the pure half: what the files say, and
+/// who claims what. The live reads and the fanotify attribution are the VM's.
+mod dnsproxy {
+    use crate::dns::{self, Action, Key, MUTANT, Mutant, Obs, Writer};
+    use crate::{ChangeKind, Tracker, WatchState};
+    use planarian_schema::UnitId;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const NOW: u64 = 100;
+
+    fn next(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    fn pick<'a, T>(s: &mut u64, from: &'a [T]) -> &'a T {
+        &from[(next(s) % from.len() as u64) as usize]
+    }
+
+    // ---- The files.
+
+    const LOOPBACK: [&str; 6] = ["127.0.0.53", "127.0.0.1", "::1", "::ffff:127.0.0.1", "::1%lo", "::1%lo"];
+    const REMOTE: [&str; 4] = ["1.1.1.1", "2001:db8::53", "fe80::1%eth0", "not-an-address"];
+
+    /// A resolv.conf from `seed`, and whether it steers by construction:
+    /// a `nameserver` line that is not a comment names a non-loopback or
+    /// unreadable server.
+    fn resolv(seed: u64) -> (String, bool) {
+        let mut s = seed | 1;
+        let (mut text, mut steers) = (String::new(), false);
+        for _ in 0..(1 + next(&mut s) % 6) {
+            // Weighted toward several name servers, loopback ones before a
+            // steering one: the interleavings a first-server-only read misses.
+            match next(&mut s) % 9 {
+                0 => text.push_str("search example.org\noptions edns0\n"),
+                1 => text.push_str(&format!("# nameserver {}\n", pick(&mut s, &REMOTE))),
+                2 => text.push_str(&format!("; nameserver {}\n", pick(&mut s, &REMOTE))),
+                3..=5 => text.push_str(&format!("nameserver {}\n", pick(&mut s, &LOOPBACK))),
+                _ => {
+                    text.push_str(&format!("nameserver\t{}\n", pick(&mut s, &REMOTE)));
+                    steers = true;
+                }
+            }
+        }
+        (text, steers)
+    }
+
+    fn failing_resolv() -> usize {
+        (1..=400u64)
+            .filter(|n| {
+                let (text, want) = resolv(n * 0x9E37_79B9);
+                dns::resolv_steers(&text) != want
+            })
+            .count()
+    }
+
+    /// A resolved link's state: `DNS=` tokens as resolved writes them.
+    fn netif(seed: u64) -> (String, bool) {
+        let mut s = seed | 1;
+        let loop_ = ["127.0.0.53", "[::1]:53", "::1#local", "::1%lo"];
+        let remote = ["1.1.1.1#cloudflare-dns.com", "[2001:db8::53]:853", "10.8.0.1", "fe80::1%tun0"];
+        let (mut toks, mut steers) = (vec![], false);
+        for _ in 0..(1 + next(&mut s) % 4) {
+            if next(&mut s).is_multiple_of(2) {
+                toks.push(pick(&mut s, &loop_).to_string());
+            } else {
+                toks.push(pick(&mut s, &remote).to_string());
+                steers = true;
+            }
+        }
+        (format!("# This is private data.\nIS_MANAGED=yes\nDNS={}\nDOMAINS=~.\n", toks.join(" ")), steers)
+    }
+
+    fn failing_netif() -> usize {
+        (1..=400u64)
+            .filter(|n| {
+                let (text, want) = netif(n * 0x9E37_79B9);
+                dns::netif_steers(&text) != want
+            })
+            .count()
+    }
+
+    fn proxy(seed: u64) -> (String, bool) {
+        let mut s = seed | 1;
+        let (mut text, mut steers) = (String::new(), false);
+        for _ in 0..(next(&mut s) % 5) {
+            match next(&mut s) % 7 {
+                0 => text.push_str("PATH=/run/wrappers/bin\n"),
+                1 => text.push_str("no_proxy=localhost\n"),
+                2 => text.push_str("# http_proxy=http://p:3128\n"),
+                3 => text.push_str("export http_proxy=\"\"\n"),
+                4 => {
+                    text.push_str("export HTTPS_PROXY=\"http://p:3128\"\n");
+                    steers = true;
+                }
+                5 => {
+                    text.push_str("all_proxy=socks5://p:1080\n");
+                    steers = true;
+                }
+                _ => {
+                    text.push_str("declare -x Http_Proxy='http://p:3128'\n");
+                    steers = true;
+                }
+            }
+        }
+        (text, steers)
+    }
+
+    fn failing_proxy() -> usize {
+        (1..=400u64)
+            .filter(|n| {
+                let (text, want) = proxy(n * 0x9E37_79B9);
+                dns::proxy_steers(&text) != want
+            })
+            .count()
+    }
+
+    #[test]
+    fn the_files_mean_what_they_say() {
+        MUTANT.with(|m| m.set(Mutant::None));
+        assert_eq!((failing_resolv(), failing_netif(), failing_proxy()), (0, 0, 0));
+    }
+
+    #[test]
+    fn the_file_mutants_are_caught() {
+        for (m, f, at_least) in [
+            (Mutant::LoopbackSteers, failing_resolv as fn() -> usize, 60),
+            (Mutant::CommentCounts, failing_resolv, 60),
+            (Mutant::FirstServerOnly, failing_resolv, 40),
+            (Mutant::NoZoneStrip, failing_resolv, 40),
+            (Mutant::LoopbackSteers, failing_netif, 60),
+            (Mutant::FirstServerOnly, failing_netif, 40),
+            (Mutant::ProxyLowerOnly, failing_proxy, 60),
+        ] {
+            MUTANT.with(|c| c.set(m));
+            let bad = f();
+            MUTANT.with(|c| c.set(Mutant::None));
+            eprintln!("mutant {m:?} fails {bad} of 400");
+            assert!(bad >= at_least, "mutant {m:?} caught by only {bad} of 400 files");
+        }
+    }
+
+    // ---- Who claims what.
+
+    fn tool(i: usize) -> UnitId {
+        UnitId::service(&format!("tool{i}"))
+    }
+
+    fn subset(mask: usize) -> BTreeSet<UnitId> {
+        (0..3).filter(|i| mask >> i & 1 == 1).map(tool).collect()
+    }
+
+    /// One scenario: the object is `Key`, claimed by `claimed`, observed
+    /// steering or not, written by `writer`; tools in `running` are running;
+    /// a link has an owner or not. What the claimants are after, by the
+    /// coordinator's rules (Nov 3), written from them, not from `reconcile`.
+    fn check(claimed: usize, running: usize, writer: usize, steers: bool, link: usize) -> Result<(), String> {
+        let is_link = link > 0;
+        let key: Key =
+            if is_link { (ChangeKind::Dns, "link tun0".into()) } else { (ChangeKind::Dns, "resolv.conf".into()) };
+        let owner = if link >= 2 { Some(tool(link - 2)) } else { None };
+        let writer_v = match writer {
+            0..=2 => Writer::Unit(tool(writer)),
+            3 => Writer::Unknown,
+            _ => Writer::NoWrite,
+        };
+        let (cur, run) = (subset(claimed), subset(running));
+        let mut t = Tracker::default();
+        if !cur.is_empty() {
+            t.apply_dns(&[Action::Claim { key: key.clone(), owners: cur.clone(), iface: None }]);
+        }
+        let observed: BTreeMap<Key, Obs> =
+            [(key.clone(), Obs { steers, iface: is_link.then(|| "tun0".to_string()) })].into();
+        let all: BTreeSet<UnitId> = (0..4).map(tool).collect();
+        let owner_of = |n: &str| if n == "tun0" { owner.clone() } else { None };
+        let actions = dns::reconcile(
+            &observed,
+            &t.dns_claimants(),
+            &[(key.clone(), writer_v.clone())].into(),
+            &run,
+            &owner_of,
+            &all,
+        );
+        t.apply_dns(&actions);
+        let got = t.dns_claimants().remove(&key).unwrap_or_default();
+        let want: BTreeSet<UnitId> = if !steers {
+            BTreeSet::new()
+        } else if let Some(o) = owner.clone().filter(|_| is_link) {
+            [o].into()
+        } else {
+            match writer_v.clone() {
+                Writer::Unit(u) => [u].into(),
+                Writer::Unknown => run.clone(),
+                Writer::NoWrite if cur.is_empty() => run.clone(),
+                Writer::NoWrite => cur.clone(),
+            }
+        };
+        if got == want {
+            Ok(())
+        } else {
+            Err(format!(
+                "claimed {cur:?} running {run:?} {writer_v:?} steers {steers} link {owner:?}: got {got:?}, want {want:?}"
+            ))
+        }
+    }
+
+    fn failing_claims() -> usize {
+        let mut bad = 0;
+        for claimed in 0..8 {
+            for running in 0..8 {
+                for writer in 0..5 {
+                    for steers in [false, true] {
+                        for link in 0..5 {
+                            bad += check(claimed, running, writer, steers, link).is_err() as usize;
+                        }
+                    }
+                }
+            }
+        }
+        bad
+    }
+
+    /// Every combination (3,200) gives the claimants the rules say: a charge
+    /// for an unknown writer reaches only tools running at the write; every
+    /// charge clears when the content stops steering; an attributed write
+    /// replaces all running-tool charges; a link's DNS is its interface
+    /// owner's.
+    #[test]
+    fn claims_follow_the_rules() {
+        MUTANT.with(|m| m.set(Mutant::None));
+        let first = (0..8)
+            .flat_map(|c| {
+                (0..8).flat_map(move |r| {
+                    (0..5).flat_map(move |w| {
+                        [false, true].into_iter().flat_map(move |s| (0..5).map(move |l| (c, r, w, s, l)))
+                    })
+                })
+            })
+            .find_map(|(c, r, w, s, l)| check(c, r, w, s, l).err());
+        assert_eq!(first, None);
+        assert_eq!(failing_claims(), 0);
+    }
+
+    #[test]
+    fn the_claim_mutants_are_caught() {
+        for (m, at_least) in [
+            (Mutant::ChargeAllTools, 100),
+            (Mutant::NeverClear, 100),
+            (Mutant::AttributedAdds, 100),
+            (Mutant::IgnoreLinkOwner, 100),
+        ] {
+            MUTANT.with(|c| c.set(m));
+            let bad = failing_claims();
+            MUTANT.with(|c| c.set(Mutant::None));
+            eprintln!("mutant {m:?} fails {bad} of 3200");
+            assert!(bad >= at_least, "mutant {m:?} caught by only {bad} of 3200 scenarios");
+        }
+    }
+
+    /// What the footprint says: a network tool charged with a steering DNS
+    /// object reads protecting, and keeps reading so for its invocation when
+    /// the object is cleared (the latch); a tool never charged does not.
+    #[test]
+    fn a_charged_tool_protects_and_the_latch_holds() {
+        let (a, b) = (tool(0), tool(1));
+        let key: Key = (ChangeKind::Dns, "resolv.conf".into());
+        let mut t = Tracker::default();
+        t.set_invocation(&a, crate::Invocation { id: Some("a".repeat(32)), ended: false });
+        t.apply_dns(&[Action::Claim { key: key.clone(), owners: [a.clone()].into(), iface: None }]);
+        let view = |t: &Tracker| t.view(WatchState::Attached { at: NOW }, &[a.clone(), b.clone()], NOW);
+        assert!(view(&t).units["tool0"].protecting);
+        assert!(view(&t).units.get("tool1").is_none_or(|f| !f.protecting), "not charged");
+        t.apply_dns(&[Action::Clear { key }]);
+        assert!(t.dns_claimants().is_empty(), "the object is gone for everyone");
+        assert!(view(&t).units["tool0"].protecting, "the invocation's latch");
+        assert!(view(&t).unattributed.is_empty(), "never a global marker");
+    }
+}
+
+/// The files B-22 (a) reads and watches, against a temporary tree.
+#[cfg(feature = "loader")]
+mod files {
+    use crate::ChangeKind;
+    use crate::dns::Writer;
+    use crate::files::Files;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    fn put(root: &Path, rel: &str, text: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    fn names(i: u32) -> Option<String> {
+        (i == 7).then(|| "tun0".to_string())
+    }
+
+    #[test]
+    fn the_files_are_read_into_objects() {
+        let d = tempfile::tempdir().unwrap();
+        put(d.path(), "etc/resolv.conf", "nameserver 10.8.0.1\n");
+        put(d.path(), "etc/environment", "export https_proxy=\"http://p:3128\"\n");
+        put(d.path(), "etc/profile.d/a.sh", "export PATH=/x\n");
+        put(d.path(), "run/systemd/resolve/netif/7", "DNS=10.8.0.1\n");
+        put(d.path(), "run/systemd/resolve/netif/9", "DNS=1.1.1.1\n"); // no such interface: not read
+        let f = Files::new(d.path());
+        let o = f.observe(&mut names);
+        let steers = |k: (ChangeKind, &str)| o.objects.get(&(k.0, k.1.to_string())).map(|x| x.steers);
+        assert_eq!(steers((ChangeKind::Dns, "resolv.conf")), Some(true));
+        assert_eq!(steers((ChangeKind::Proxy, "/etc/environment")), Some(true));
+        assert_eq!(steers((ChangeKind::Proxy, "/etc/profile.d/a.sh")), Some(false));
+        assert_eq!(steers((ChangeKind::Dns, "link tun0")), Some(true));
+        assert_eq!(o.objects[&(ChangeKind::Dns, "link tun0".to_string())].iface.as_deref(), Some("tun0"));
+        assert_eq!(o.objects.len(), 4, "{:?}", o.objects.keys());
+        // A file that goes is no longer observed (so its claimants clear).
+        std::fs::remove_file(d.path().join("etc/environment")).unwrap();
+        assert!(!f.observe(&mut names).objects.contains_key(&(ChangeKind::Proxy, "/etc/environment".to_string())));
+    }
+
+    /// Without fanotify: the first read is no write; a changed inode (the
+    /// file replaced by a rename) is an unknown writer; the same inode again is none.
+    #[test]
+    fn a_replaced_file_with_no_record_is_an_unknown_writer() {
+        let d = tempfile::tempdir().unwrap();
+        put(d.path(), "etc/resolv.conf", "nameserver 127.0.0.53\n");
+        let mut f = Files::new(d.path()).without_fanotify();
+        let key = (ChangeKind::Dns, "resolv.conf".to_string());
+        let o = f.observe(&mut names);
+        assert_eq!(f.writers(&o)[&key], Writer::NoWrite);
+        put(d.path(), "etc/resolv.conf.tmp", "nameserver 10.8.0.1\n");
+        std::fs::rename(d.path().join("etc/resolv.conf.tmp"), d.path().join("etc/resolv.conf")).unwrap();
+        let o = f.observe(&mut names);
+        assert_eq!(f.writers(&o)[&key], Writer::Unknown);
+        let o = f.observe(&mut names);
+        assert_eq!(f.writers(&o)[&key], Writer::NoWrite, "nothing new");
+    }
+
+    /// The real thing: a program that replaces resolv.conf writes a
+    /// temporary file and renames it over; its write is found by the new
+    /// file's inode. A skip must never read as a pass.
+    #[test]
+    fn a_rename_over_is_found_by_the_new_files_inode() {
+        let d = tempfile::tempdir().unwrap();
+        put(d.path(), "etc/resolv.conf", "nameserver 127.0.0.53\n");
+        let mut f = Files::new(d.path());
+        if let Some(why) = f.refused.clone() {
+            assert!(std::env::var_os("NETWATCH_REQUIRE_FANOTIFY_TESTS").is_none(), "required, but {why}");
+            eprintln!("skipped: {why}");
+            return;
+        }
+        f.mark();
+        put(d.path(), "etc/resolv.conf.tmp", "nameserver 10.8.0.1\n");
+        std::fs::rename(d.path().join("etc/resolv.conf.tmp"), d.path().join("etc/resolv.conf")).unwrap();
+        let ino = std::fs::metadata(d.path().join("etc/resolv.conf")).unwrap();
+        // The event is queued by the time the write returned; allow a moment.
+        let mut seen = false;
+        for _ in 0..50 {
+            f.drain();
+            if f.recorded((ino.dev(), ino.ino())) {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(seen, "the write to the temporary file, found by the inode it gave resolv.conf");
+        // And it is attributed to a writer (this test process: in no unit,
+        // so unknown, but a record).
+        let o = f.observe(&mut names);
+        assert!(matches!(
+            f.writers(&o)[&(ChangeKind::Dns, "resolv.conf".to_string())],
+            Writer::Unknown | Writer::Unit(_)
+        ));
+    }
+}

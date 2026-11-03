@@ -406,6 +406,58 @@ impl Tracker {
         self.relatch();
     }
 
+    /// DNS and proxy objects (B-22 a, `dns::reconcile`): who claims each
+    /// now, from the units' footprints.
+    pub fn dns_claimants(&self) -> BTreeMap<(ChangeKind, String), BTreeSet<UnitId>> {
+        let mut out: BTreeMap<(ChangeKind, String), BTreeSet<UnitId>> = BTreeMap::new();
+        for (u, s) in &self.units {
+            for key in s.objects.keys().filter(|(k, _)| matches!(k, ChangeKind::Dns | ChangeKind::Proxy)) {
+                out.entry(key.clone()).or_default().insert(u.clone());
+            }
+        }
+        out
+    }
+
+    /// The unit that owns interface `name`: one with a claim on it (it made it,
+    /// or brought it in). The first by name if several.
+    pub fn interface_owner(&self, name: &str) -> Option<UnitId> {
+        self.units
+            .iter()
+            .find(|(_, s)| s.objects.contains_key(&(ChangeKind::Interface, name.to_string())))
+            .map(|(u, _)| u.clone())
+    }
+
+    /// Apply what `dns::reconcile` decided. A DNS or proxy object is a
+    /// singleton: a claim makes exactly `owners` its claimants and nobody
+    /// else (not an old unit, not an unattributed mark); a clear removes it
+    /// for everyone, like a route removed.
+    pub fn apply_dns(&mut self, actions: &[crate::dns::Action]) {
+        use crate::dns::Action;
+        for a in actions {
+            match a {
+                Action::Clear { key } => self.apply_change(&Change {
+                    owner: Owner::Unattributed,
+                    kind: key.0,
+                    object: key.1.clone(),
+                    iface: None,
+                    steers: false,
+                    removed: true,
+                }),
+                Action::Claim { key, owners, iface } => {
+                    for s in self.units.values_mut() {
+                        s.objects.remove(key);
+                    }
+                    self.unattributed.remove(key);
+                    self.pre_attach.remove(key);
+                    for u in owners {
+                        self.units.entry(u.clone()).or_default().objects.insert(key.clone(), (iface.clone(), true));
+                    }
+                }
+            }
+        }
+        self.relatch();
+    }
+
     /// The unit's latest invocation as its cgroup shows it; whether it
     /// changed. A new invocation (a new id, or a new cgroup whose id is
     /// not read yet) resets the latch; an id read late, or `ended`, does not.

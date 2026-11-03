@@ -218,9 +218,48 @@
 //! refusal and is retried, so the watch recovers once it is
 //! (`loader::PROBES`).
 //!
-//! **Not yet observed** (docs/bypasses.md, temporary): DNS servers set
-//! through resolved (D-Bus) or `/etc/resolv.conf`, the system proxy, and
-//! WireGuard peer endpoints (generic netlink is not read).
+//! **DNS and the system proxy** (B-22 a; `dns`, `files`). A unit that points
+//! the machine's resolver at its own servers, or sets the system proxy,
+//! steers traffic through files, not netlink. Each setting is one *object*:
+//! `(Dns, "resolv.conf")`, `(Dns, "link <ifname>")` for a resolved link
+//! (`/run/systemd/resolve/netif/<ifindex>`), `(Proxy, "<file>")` for
+//! `/etc/environment`, NixOS's `/etc/set-environment` and `/etc/profile.d/*`.
+//! Whether it steers is computed from its *current content* on every read
+//! and never remembered: a name server that is not loopback (the machine's
+//! own stub: a dead one fails DNS closed rather than leaking; 127.0.0.0/8,
+//! `::1`, a zone or port or `#name` suffix allowed; an unreadable one
+//! steers), or a proxy variable (`http_proxy`, `https_proxy`, `all_proxy`,
+//! `ftp_proxy`, any case) with a value. Content that stops steering, or a
+//! file or link that goes, clears the object for *everyone*, so a charge
+//! cannot stick. The objects are singletons: a new claimant replaces the old.
+//! `dns::reconcile` decides who claims what (coordinator, Nov 3):
+//! - a steering write by a process in a unit is that unit's alone;
+//! - one by a process netwatch cannot place in a unit (gone, or in none), or
+//!   steering content with no claimant (standing at attach, or an event
+//!   missed), is charged to the network tools *running at that moment*, the
+//!   only ones that could have written it; with none running it is the
+//!   machine's baseline and charged to nobody. It is never the global
+//!   `.unattributed` marker, which on any DHCP machine would hold every
+//!   tool for good;
+//! - a resolved link's DNS is its interface's owner's (the unit with a claim
+//!   on the interface), whoever wrote it over D-Bus: the failure that matters
+//!   is a VPN dying and resolved falling back to other links' servers; with
+//!   no owner it is the running tools'.
+//!
+//! *Who wrote.* fanotify on the directories (`FAN_CLOSE_WRITE|FAN_MODIFY` on
+//! children) hands over the file written and the writer's pid; the pid's
+//! cgroup is read at once. Replace-by-rename (resolvconf, NetworkManager) is
+//! found by inode: the temporary file's inode is the new file's (`files`). No
+//! fanotify (refused in a container) makes every change an unknown writer.
+//! The in-kernel probe that would attribute exactly (as the netlink probes
+//! do) is deferred.
+//!
+//! *Not covered* (docs/bypasses.md, B-22): DNS or proxy content found at
+//! attach with no network tool running; the proxy anywhere but the files
+//! above (per-user dconf, a unit's own `Environment=`, an application's
+//! configuration); a local DNS proxy's own upstream configuration; and a
+//! write by a process netwatch cannot place, which is charged to the tools
+//! running then and not to one started later.
 //!
 //! **The hold's order.** When a network tool fails, it is held unless all of
 //! these pass: (1) no unexpired release; (a) the unit's file says
@@ -240,7 +279,10 @@ pub mod btf;
 #[cfg(feature = "loader")]
 pub mod cgroups;
 mod contract;
+pub mod dns;
 pub mod ebpf;
+#[cfg(feature = "loader")]
+pub mod files;
 pub mod host;
 #[cfg(feature = "loader")]
 pub mod loader;
