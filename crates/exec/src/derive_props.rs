@@ -228,3 +228,152 @@ proptest! {
         prop_assert!(f.disruption.is_none(), "LeaveAlone on {:?} carries {:?}", unit, f.disruption);
     }
 }
+
+/// One edit to one manifest entry, as a candidate generation's manifest
+/// might differ from the base's: every field a manifest entry has (§9, and
+/// the exported fields #10's C19 line names), or the entry added or removed.
+fn edit_entry(d: &mut UnitDef, field: u8, k: u8) {
+    let next = |n: u8, of: u8| (n + 1 + k % (of - 1)) % of;
+    match field {
+        0 => {
+            let all = [DesiredStatus::Running, DesiredStatus::Stopped, DesiredStatus::Bound, DesiredStatus::Absent];
+            let i = all.iter().position(|s| *s == d.desired.status).unwrap_or(0) as u8;
+            d.desired.status = all[next(i, 4) as usize];
+        }
+        1 => {
+            d.desired.when = if d.desired.when == Condition::Always {
+                Condition::SessionEstablished { uid: Some(1000 + k as u32), seated: k % 2 == 0 }
+            } else {
+                Condition::Always
+            }
+        }
+        2 => d.edges.push(Edge {
+            from: d.id.clone(),
+            to: UnitId::service(&format!("dep-{k}")),
+            kind: EdgeKind::Requires,
+            origin: EdgeOrigin::Manifest,
+        }),
+        3 => match k % 5 {
+            0 => d.sensitivity.routine = !d.sensitivity.routine,
+            1 => d.sensitivity.security = !d.sensitivity.security,
+            2 => d.sensitivity.user_data = !d.sensitivity.user_data,
+            3 => d.sensitivity.external = !d.sensitivity.external,
+            _ => d.sensitivity.core = !d.sensitivity.core,
+        },
+        4 => {
+            let all = [
+                Disruption::None,
+                Disruption::Brief,
+                Disruption::SessionLoss,
+                Disruption::DataInterruption,
+                Disruption::ConnectivityLoss,
+            ];
+            let i = all.iter().position(|x| *x == d.restart_disruption).unwrap_or(0) as u8;
+            d.restart_disruption = all[next(i, 5) as usize];
+        }
+        5 => {
+            // A user probe: one of the fixture's, as the owner's own.
+            let mut p = planarian_fake::fixtures::canonical().into_values().flatten().next().expect("a fixture probe");
+            p.origin = ProbeOrigin::User;
+            p.id = ProbeId(format!("user-{k}"));
+            d.probes.push(p);
+        }
+        6 => d.synonyms.push(format!("also-{k}")),
+        7 => {
+            d.systemd_restart = match &d.systemd_restart {
+                None => Some(SystemdRestartPolicy {
+                    restart: true,
+                    restart_sec: Millis::secs(1 + k as u64),
+                    start_limit_burst: 5,
+                }),
+                Some(_) => None,
+            }
+        }
+        8 => d.startup_grace = if d.startup_grace.is_some() { None } else { Some(Millis::secs(1 + k as u64)) },
+        9 => d.runtime_repair = if d.runtime_repair.is_some() { None } else { Some(format!("opt-{k}")) },
+        10 => d.stops_are_faults = !d.stops_are_faults,
+        11 => d.holds = !d.holds,
+        12 => d.hold_allow.push(HoldEndpoint { address: format!("192.0.2.{k}"), port: 443, protocol: "tcp".into() }),
+        _ => d.hold_interfaces.push(format!("wg{k}")),
+    }
+}
+
+const FIELDS: u8 = 14;
+
+fn manifest() -> Manifest {
+    Manifest { units: planarian_fake::fixtures::gym_units(), user_units: planarian_fake::fixtures::gym_user_units() }
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// C2 (C19, #29): `touches_manifest` compared four fields of entries in
+    /// both manifests, so a candidate that changed `desired`, the exported
+    /// restart and grace fields, an added or removed entry, or any user-scope
+    /// entry did not ask (§11 ApplyChange row). Stated whole: any edit to any
+    /// field of any entry, system or user scope, and any added or removed
+    /// entry, touches the manifest.
+    #[test]
+    fn every_edit_to_an_entry_touches_the_manifest(
+        user in any::<bool>(),
+        which in any::<prop::sample::Index>(),
+        how in 0..FIELDS + 2,
+        k in any::<u8>(),
+    ) {
+        let base = manifest();
+        let mut cand = base.clone();
+        if user {
+            let i = which.index(cand.user_units.len());
+            match how {
+                f if f < FIELDS => edit_entry(&mut cand.user_units[i], f, k),
+                f if f == FIELDS => {
+                    cand.user_units.remove(i);
+                }
+                _ => {
+                    let mut extra = cand.user_units[i].clone();
+                    extra.id.name = format!("{}-extra-{k}", extra.id.name);
+                    cand.user_units.push(extra);
+                }
+            }
+        } else {
+            let ids: Vec<UnitId> = cand.units.keys().cloned().collect();
+            let id = ids[which.index(ids.len())].clone();
+            match how {
+                f if f < FIELDS => edit_entry(cand.units.get_mut(&id).unwrap(), f, k),
+                f if f == FIELDS => {
+                    cand.units.remove(&id);
+                }
+                _ => {
+                    let mut extra = cand.units[&id].clone();
+                    extra.id.name = format!("{}-extra-{k}", extra.id.name);
+                    cand.units.insert(extra.id.clone(), extra);
+                }
+            }
+        }
+        prop_assert_ne!(&base, &cand, "the edit changes the manifest");
+        prop_assert!(
+            touches_manifest(&base, &cand, &ConfigDiff::default()),
+            "edit {} ({}) of entry {:?} did not touch the manifest",
+            how,
+            if user { "user scope" } else { "system scope" },
+            which
+        );
+    }
+
+    /// The other side: a canonical probe's definition is `touches_canonical`'s
+    /// (I10), not the manifest's; an edit to canonical probes alone, or no
+    /// edit, does not touch the manifest.
+    #[test]
+    fn canonical_probes_alone_are_not_the_manifest(which in any::<prop::sample::Index>(), k in any::<u8>()) {
+        let base = manifest();
+        let mut cand = base.clone();
+        prop_assert!(!touches_manifest(&base, &cand, &ConfigDiff::default()));
+        let ids: Vec<UnitId> = cand.units.keys().cloned().collect();
+        let d = cand.units.get_mut(&ids[which.index(ids.len())]).unwrap();
+        let mut p = planarian_fake::fixtures::canonical().into_values().flatten().next().expect("a fixture probe");
+        p.origin = ProbeOrigin::Canonical;
+        p.id = ProbeId(format!("canonical-{k}"));
+        d.probes.push(p);
+        prop_assert!(!touches_manifest(&base, &cand, &ConfigDiff::default()));
+    }
+}
