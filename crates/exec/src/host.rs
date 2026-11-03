@@ -263,11 +263,55 @@ fn space_only(u: &UnitId, s: &SystemState, defs: &UnitDefs) -> bool {
         })
 }
 
-/// Units that differ between two manifests, or exist in only one.
+/// A manifest entry as the manifest declares it: the fields the module
+/// derives cleared. Derived (computed by `nix/module.nix` from the unit's own
+/// systemd config, exported, never a `services.planarian.units` option):
+/// `holds`. A change in a derived field alone is no edit to Planarian's
+/// manifest (coordinator, Nov 3); the systemd config behind it is caught
+/// where it already is. Every field named, with no `..`: a field added to
+/// `UnitDef` does not compile here until it is put on one side.
+pub fn declared(d: &UnitDef) -> UnitDef {
+    let UnitDef {
+        id,
+        desired,
+        edges,
+        sensitivity,
+        restart_disruption,
+        probes,
+        synonyms,
+        systemd_restart,
+        startup_grace,
+        runtime_repair,
+        stops_are_faults,
+        hold_allow,
+        hold_interfaces,
+        // Derived:
+        holds: _,
+    } = d.clone();
+    UnitDef {
+        id,
+        desired,
+        edges,
+        sensitivity,
+        restart_disruption,
+        probes,
+        synonyms,
+        systemd_restart,
+        startup_grace,
+        runtime_repair,
+        stops_are_faults,
+        hold_allow,
+        hold_interfaces,
+        holds: false,
+    }
+}
+
+/// Units whose entries, as declared ([`declared`]), differ between two
+/// manifests, or that exist in only one.
 pub fn changed_units(a: &Manifest, b: &Manifest) -> BTreeSet<UnitId> {
     let mut out = BTreeSet::new();
     for (id, d) in &a.units {
-        if b.units.get(id) != Some(d) {
+        if b.units.get(id).map(declared) != Some(declared(d)) {
             out.insert(id.clone());
         }
     }
