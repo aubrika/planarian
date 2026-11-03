@@ -658,6 +658,23 @@ pkgs.testers.runNixOSTest {
         until("a proxy on the uplink still charged", lambda: claimants("/etc/environment") == [])
         replace("/etc/environment", "LANG=C.UTF-8\\n")
         settled("an unset proxy was charged", lambda: claimants("/etc/environment") == [])
+
+        # (t7) A server over a virtual interface whose maker is unknown (made
+        # while netwatch was stopped, so no unit is known to have made it):
+        # not nobody's, not a guess, but an object-bound unattributed mark,
+        # gone once the DNS is reverted. (The driver runs in backdoor.service,
+        # itself a unit, so the link is made while nobody watches.)
+        UNKNOWN = "Dns link nwun0: no unit made it"
+        machine.succeed("systemctl stop planarian-netwatch.service")
+        machine.succeed("${ip} link add nwun0 type dummy && ${ip} addr add 10.83.0.1/24 dev nwun0 && ${ip} link set nwun0 up")
+        machine.succeed("systemctl start planarian-netwatch.service")
+        watch_fresh()
+        machine.succeed("resolvectl dns nwun0 10.83.0.53")
+        until("an unknown owner's link DNS not marked", lambda: machine.execute(f"grep -qxF '{UNKNOWN}' {FP}/.unattributed")[0] == 0)
+        assert claimants("link nwun0") == [], claimants("link nwun0")
+        machine.succeed("resolvectl revert nwun0")
+        until("the mark outlived the reverted DNS", lambda: machine.execute(f"grep -qF 'nwun0' {FP}/.unattributed")[0] != 0)
+        machine.succeed("${ip} link del nwun0")
         watch_fresh()
   '';
 }
