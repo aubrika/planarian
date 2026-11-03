@@ -274,13 +274,13 @@ fn escalation_cooldown_by_reason() {
         (R::RecoveryFailed, COOLDOWN_FIRST),
     ];
     for (reason, want) in table {
-        assert_eq!(escalation_cooldown(reason.clone()), want, "{reason:?}");
+        assert_eq!(escalation_cooldown(reason), want, "{reason:?}");
         let mut sim = Sim::new(defs([service("gym-flap")]));
         sim.fail("gym-flap");
         sim.ticks(2);
         let id = sim.active("gym-flap").unwrap().id;
         let now = sim.now();
-        let inc = sim.m.escalate(id, reason.clone(), now).unwrap();
+        let inc = sim.m.escalate(id, reason, now).unwrap();
         assert_eq!(inc.state, IncidentState::Escalated { until: now.plus(want), reason }, "escalate");
     }
 }
