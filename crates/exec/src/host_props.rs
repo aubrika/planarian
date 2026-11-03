@@ -6,8 +6,9 @@
 //!   Readiness probe and the change still committed: the check compared the
 //!   unit's aggregate status only. Stated whole: whatever the unit's status
 //!   before and now, a Readiness probe that passed before and fails now is a
-//!   violation, and when nothing was lost from a unit that was not Running
-//!   before, the unit raises none.
+//!   violation (outside a revert whose only failing probes are free-space
+//!   ones, §12 ENOSPC), and when nothing was lost from a unit that was not
+//!   Running before, the unit raises none.
 //! - C5 (before the clone's history): a driver that binds but cannot drive
 //!   the device passed the check. Stated whole: a device expected Bound has
 //!   a violation exactly when one of its Readiness probes fails.
@@ -95,6 +96,20 @@ fn txn(check: CheckContext, expected: BTreeMap<UnitId, UnitStatus>) -> Transacti
     }
 }
 
+/// The fixture's units, and one more whose Readiness includes a free-space
+/// probe (`gym-store`: a TCP probe and `gym-store-space`), so the revert's
+/// space exception (§12, `space_only`) is reached.
+fn with_store(mut defs: UnitDefs) -> UnitDefs {
+    let mut store = defs[&UnitId::service("gym-db")].clone();
+    store.id = UnitId::service("gym-store");
+    let mut space = store.probes[0].clone();
+    space.id = ProbeId("gym-store-space".into());
+    space.kind = ProbeKind::FreeSpace { path: "/var/lib/gym-store".into(), min_bytes: 1 << 20, min_permille: 50 };
+    store.probes.push(space);
+    defs.insert(store.id.clone(), store);
+    defs
+}
+
 /// The fixture's units that have Readiness probes, with them.
 fn readiness_units(defs: &UnitDefs, devices: bool) -> Vec<(UnitId, Vec<ProbeId>)> {
     defs.values()
@@ -140,14 +155,21 @@ proptest! {
     #[test]
     fn a_readiness_probe_lost_is_a_violation(
         which in any::<prop::sample::Index>(),
+        // Often the unit with a free-space probe, so the space exception is
+        // reached in both phases.
+        store in prop::bool::weighted(0.3),
         was in before(),
         passed_before in any::<u8>(),
         passes_now in any::<u8>(),
         phase in prop_oneof![Just(CheckPhase::Candidate), Just(CheckPhase::Revert)],
     ) {
-        let defs = planarian_fake::fixtures::gym_units();
+        let defs = with_store(planarian_fake::fixtures::gym_units());
         let units = readiness_units(&defs, false);
-        let (u, probes) = units[which.index(units.len())].clone();
+        let (u, probes) = if store {
+            units.iter().find(|(u, _)| u.name == "gym-store").expect("gym-store").clone()
+        } else {
+            units[which.index(units.len())].clone()
+        };
         let bit = |m: u8, i: usize| m & (1 << (i % 8)) != 0;
         let before: Vec<ProbeId> = probes.iter().enumerate().filter(|(i, _)| bit(passed_before, *i)).map(|(_, p)| p.clone()).collect();
         let now: Vec<(ProbeId, bool)> = probes.iter().enumerate().map(|(i, p)| (p.clone(), bit(passes_now, i))).collect();
@@ -160,7 +182,17 @@ proptest! {
         };
         let v = host().violations(&txn(check, BTreeMap::new()), phase, &s, &defs);
         let lost: Vec<&ProbeId> = before.iter().filter(|p| now.iter().any(|(q, ok)| q == *p && !ok)).collect();
-        if !lost.is_empty() {
+        // §12 (ENOSPC): a revert neither causes nor cures a full filesystem,
+        // so when every failing Readiness probe is a free-space one, a revert
+        // reports no probe lost; the storage units' incidents take it.
+        let failing: Vec<&ProbeId> = now.iter().filter(|(_, ok)| !ok).map(|(p, _)| p).collect();
+        let space_only = !failing.is_empty() && failing.iter().all(|p| p.0.ends_with("-space"));
+        if phase == CheckPhase::Revert && space_only {
+            prop_assert!(
+                !v.iter().any(|m| m.contains("passed before and fails now")),
+                "{u}: a revert with only space probes failing reported a lost probe: {v:?}"
+            );
+        } else if !lost.is_empty() {
             prop_assert!(!v.is_empty(), "{u}, {was:?} before: lost {lost:?} and no violation");
         } else if was != UnitStatus::Running {
             prop_assert!(v.is_empty(), "{u}, {was:?} before, nothing lost: {v:?}");
