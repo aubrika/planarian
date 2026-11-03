@@ -654,13 +654,14 @@ mod dnscharge {
     struct Scene {
         creators: Vec<BTreeSet<usize>>,
         routers: Vec<BTreeSet<usize>>,
-        /// Per address: 0..4 an interface, 4 no route, 5 failed.
+        /// Per address: 0..4 an interface, 4 no route, 5 failed, 6 one of
+        /// the machine's own addresses (`local … dev lo`).
         kernel: Vec<u8>,
     }
 
     fn scene() -> impl Strategy<Value = Scene> {
         let owners = || proptest::collection::vec(proptest::collection::btree_set(0..TOOLS, 0..=2), IFACES.len());
-        (owners(), owners(), proptest::collection::vec(0u8..6, 5)).prop_map(|(creators, routers, kernel)| Scene {
+        (owners(), owners(), proptest::collection::vec(0u8..7, 5)).prop_map(|(creators, routers, kernel)| Scene {
             creators,
             routers,
             kernel,
@@ -687,6 +688,7 @@ mod dnscharge {
         let lookup = |a: &IpAddr| match addrs().iter().position(|x| x == a).map(|k| sc.kernel[k]) {
             Some(i @ 0..4) => Lookup::Via(IFACES[i as usize].to_string()),
             Some(4) => Lookup::NoRoute,
+            Some(6) => Lookup::Local,
             _ => Lookup::Failed,
         };
         dns::charges(targets, link, &World { virtual_ifaces: &virt, owners: &owners, lookup: &lookup })
@@ -724,7 +726,7 @@ mod dnscharge {
                     } else {
                         match sc.kernel[addrs().iter().position(|x| x == addr).unwrap()] {
                             i @ 0..4 => take(ride(IFACES[i as usize])),
-                            4 => {}
+                            4 | 6 => {}
                             _ => take((BTreeSet::new(), true)),
                         }
                     }
@@ -760,7 +762,7 @@ mod dnscharge {
         /// kernel answer charge the owners of the new interface (recomputed,
         /// nothing remembered), and the same input twice gives the same answer.
         #[test]
-        fn a_route_change_moves_the_charge(sc in scene(), other in proptest::collection::vec(0u8..6, 5), targets in proptest::collection::vec(target(), 1..4)) {
+        fn a_route_change_moves_the_charge(sc in scene(), other in proptest::collection::vec(0u8..7, 5), targets in proptest::collection::vec(target(), 1..4)) {
             let first = charge_of(&sc, &targets, None);
             prop_assert_eq!(&first, &charge_of(&sc, &targets, None), "same input, same charge");
             let moved = Scene { kernel: other, ..sc.clone() };
@@ -871,8 +873,9 @@ mod routeclassify {
     fn reply(kind: &Reply) -> Vec<u8> {
         let mut m = vec![0u8; 16];
         match kind {
-            Reply::Oif(i) => {
-                m.extend(vec![2u8, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // rtmsg
+            Reply::Oif(i, ty) => {
+                // rtmsg: family, dst_len, src_len, tos, table, protocol, scope, type
+                m.extend(vec![2u8, 32, 0, 0, 0, 0, 0, *ty, 0, 0, 0, 0]);
                 m.extend(nl_attr(1, &[10, 0, 0, 1])); // RTA_DST
                 m.extend(nl_attr(4, &i.to_ne_bytes())); // RTA_OIF
                 m[4..6].copy_from_slice(&24u16.to_ne_bytes());
@@ -899,7 +902,7 @@ mod routeclassify {
 
     #[derive(Clone, Debug)]
     enum Reply {
-        Oif(u32),
+        Oif(u32, u8),
         NoOif,
         Err(i32),
         Short,
@@ -916,7 +919,7 @@ mod routeclassify {
         #[test]
         fn a_route_reply_is_via_no_route_or_failed(
             r in prop_oneof![
-                3 => (1u32..8).prop_map(Reply::Oif),
+                3 => ((1u32..8), prop_oneof![Just(1u8), Just(2), Just(3), Just(7)]).prop_map(|(i, t)| Reply::Oif(i, t)),
                 1 => Just(Reply::NoOif),
                 3 => prop_oneof![Just(-101i32), Just(-113), Just(-2), Just(-1), Just(0), Just(-22)].prop_map(Reply::Err),
                 1 => Just(Reply::Short),
@@ -925,7 +928,10 @@ mod routeclassify {
             let mut names = |i: u32| (i % 2 == 1).then(|| format!("if{i}"));
             let got = crate::route::classify(&reply(&r), &mut names);
             let want = match &r {
-                Reply::Oif(i) if i % 2 == 1 => Lookup::Via(format!("if{i}")),
+                // The machine's own address (`RTN_LOCAL`) is not a path out, whether or
+                // not its interface (`lo`) has a name.
+                Reply::Oif(_, 2) => Lookup::Local,
+                Reply::Oif(i, _) if i % 2 == 1 => Lookup::Via(format!("if{i}")),
                 Reply::Err(-101) | Reply::Err(-113) => Lookup::NoRoute,
                 _ => Lookup::Failed,
             };
