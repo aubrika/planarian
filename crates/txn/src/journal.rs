@@ -106,6 +106,8 @@ pub fn chain(prev: &Hash, seq: u64, payload: &[u8]) -> Hash {
 }
 
 fn crc(body: &[u8]) -> u32 {
+    #[cfg(test)]
+    tests::CRC_BYTES.with(|c| c.set(c.get() + body.len() as u64));
     crc32c::crc32c_append(crc32c::crc32c(FORMAT), body)
 }
 
@@ -146,6 +148,31 @@ fn unframe(bytes: &[u8]) -> Option<Frame<'_>> {
     let seq = u64::from_le_bytes(body[0..8].try_into().ok()?);
     let prev = Hash(body[8..8 + PREV].try_into().ok()?);
     Some(Frame { seq, prev, payload: &body[8 + PREV..], size: HEADER + len })
+}
+
+/// Whether `bytes` could start a frame written after `last_seq`, judged on
+/// the header alone, before any CRC (the scan's search for a later record).
+/// Its length fits, and its seq is past `last_seq` by no more than the
+/// number of frames `capacity` holds: every record this segment can contain
+/// is within that, and leftovers from before a compaction carry seqs at or
+/// below the checkpoint's. And its payload starts as every appended one
+/// does, with the entry's own seq (`{"seq":<seq>,`, `Entry`'s first field):
+/// at a misaligned offset inside a leftover frame, a length and a seq can
+/// both look plausible, but not that too. Without these the search ran a
+/// CRC over the claimed length at every byte offset, quadratic in the store
+/// after a compaction (stale seqs and hashes read as plausible lengths).
+fn could_follow(bytes: &[u8], last_seq: u64, capacity: u64) -> bool {
+    if bytes.len() < HEADER {
+        return false;
+    }
+    let len = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")) as usize;
+    let seq = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
+    let most = capacity / (HEADER + PREV) as u64;
+    if len < PREV || bytes.len() < HEADER + len || seq <= last_seq || seq - last_seq > most {
+        return false;
+    }
+    let prefix = format!("{{\"seq\":{seq},");
+    bytes[HEADER + PREV..HEADER + len].starts_with(prefix.as_bytes())
 }
 
 /// Fault injection (tests and the gym): rewrite the payload of the `nth`
@@ -442,9 +469,11 @@ impl<S: Store> Journal<S> {
         let start = self.offset + 1;
         let rest = self.store.read_at(start, self.store.capacity().saturating_sub(start) as usize)?;
         let mut i = 0;
+        let (last, capacity) = (self.ledger.last_seq, self.store.capacity());
         while i + HEADER <= rest.len() {
-            if let Some(f) = unframe(&rest[i..])
-                && f.seq > self.ledger.last_seq
+            if could_follow(&rest[i..], last, capacity)
+                && let Some(f) = unframe(&rest[i..])
+                && f.seq > last
             {
                 return Ok(Some(f.seq));
             }
@@ -660,3 +689,6 @@ fn sentinel_txn(bytes: &[u8]) -> Option<TxnId> {
     let id = text.strip_prefix("RecoveryFailed txn=")?.split_whitespace().next()?;
     id.parse::<u64>().ok().map(TxnId)
 }
+
+#[cfg(test)]
+mod tests;
