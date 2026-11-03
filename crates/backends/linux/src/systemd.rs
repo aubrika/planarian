@@ -10,7 +10,7 @@ use crate::cmd::run;
 use planarian_schema::{
     Ending, Millis, Observed, OpId, Outcome, Reason, Scope, Timestamp, UnitBackend, UnitId, UnitKind,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -125,6 +125,14 @@ fn now() -> Timestamp {
 }
 
 impl UnitBackend for Systemd {
+    /// §12d: netwatch's footprints in `/run/planarian/footprint`, read with its
+    /// own fail-closed rules, at the boot clock's now.
+    fn protecting(&self, tools: &[UnitId]) -> Result<BTreeSet<UnitId>, Outcome> {
+        let now = planarian_backend_netwatch::host::boottime_secs()
+            .ok_or_else(|| Outcome::Unknown("no /proc/uptime".into()))?;
+        Ok(planarian_backend_netwatch::read(std::path::Path::new(planarian_backend_netwatch::DIR))
+            .protecting(tools, now))
+    }
     fn observe(&self, id: &UnitId) -> Result<Observed, Outcome> {
         let name = unit_name(id);
         let o = self.ctl(

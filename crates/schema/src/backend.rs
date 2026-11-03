@@ -101,6 +101,14 @@ pub trait UnitBackend {
     fn foreign_units(&self) -> Vec<String> {
         vec![]
     }
+    /// §12d "Which units": which of the network tools `tools` are protecting
+    /// traffic now, from netwatch's kernel-attributed footprints, with every
+    /// unknown counted as protecting (fail closed). `Err` means netwatch could
+    /// not be read at all; a caller counts every tool as protecting then. The
+    /// default is that error: a backend without netwatch never waives a hold.
+    fn protecting(&self, _tools: &[UnitId]) -> Result<BTreeSet<UnitId>, Outcome> {
+        Err(Outcome::Unknown("no netwatch".into()))
+    }
     fn list(&self) -> Result<Vec<UnitId>, Outcome>;
     /// Start an agent (§11, §16): the transient unit `planarian-agent-<name>`,
     /// under a dynamic uid of its own. Returns the started unit's instance
