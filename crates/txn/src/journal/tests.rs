@@ -1,0 +1,280 @@
+//! The scan's cost (§12c): opening a journal is linear in the store,
+//! whatever its history of appends and compactions.
+
+use super::*;
+use crate::store::{FileStore, MemStore};
+use planarian_schema::GenerationId;
+use proptest::prelude::*;
+use std::cell::Cell;
+
+thread_local! {
+    /// Bytes run through the frame CRC on this thread (`crc`).
+    pub(super) static CRC_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+fn crc_bytes<R>(f: impl FnOnce() -> R) -> (R, u64) {
+    let before = CRC_BYTES.with(Cell::get);
+    let r = f();
+    (r, CRC_BYTES.with(Cell::get) - before)
+}
+
+/// A record whose payload grows with `pad` (a longer generation number is
+/// not enough; a known-good generation is the smallest valid record).
+fn append(j: &mut Journal<MemStore>, i: u64) -> Result<Entry, JournalError> {
+    j.append(Timestamp(i), Record::KnownGood(GenerationId(i + 1)))
+}
+
+#[derive(Clone, Debug)]
+enum Op {
+    Append(u16),
+    Compact,
+}
+
+fn op() -> impl Strategy<Value = Op> {
+    prop_oneof![4 => (1u16..400).prop_map(Op::Append), 1 => Just(Op::Compact)]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+    /// After any appends and compactions, `Journal::open` CRCs O(capacity)
+    /// bytes: each frame in the log once, the checkpoint once, and nothing
+    /// for the leftovers past the tail. (Before the header check it CRC'd
+    /// the claimed length at every offset of the leftovers: quadratic.)
+    #[test]
+    fn open_is_linear_in_the_store(ops in proptest::collection::vec(op(), 1..12)) {
+        let capacity = 128 << 10;
+        let store = MemStore::new(capacity);
+        let mut j = Journal::open(store.clone()).unwrap();
+        let mut i = 0;
+        let mut compacted = false;
+        for o in ops {
+            match o {
+                Op::Append(n) => {
+                    for _ in 0..n {
+                        if j.needs_compaction() {
+                            j.compact().unwrap();
+                            compacted = true;
+                        }
+                        append(&mut j, i).unwrap();
+                        i += 1;
+                    }
+                }
+                Op::Compact => {
+                    j.compact().unwrap();
+                    compacted = true;
+                }
+            }
+        }
+        let checkpoint = store.read_checkpoint().unwrap().map_or(0, |c| c.len() as u64);
+        let (opened, crcd) = crc_bytes(|| Journal::open(store.clone()));
+        let opened = opened.unwrap();
+        prop_assert_eq!(opened.ledger().last_seq, j.ledger().last_seq);
+        // The log once and the checkpoint twice (loaded, and its seq read
+        // again), with one frame's slack.
+        prop_assert!(
+            crcd <= capacity + 2 * checkpoint + 4096,
+            "open CRC'd {} bytes for a {} byte store (checkpoint {}, compacted: {})",
+            crcd, capacity, checkpoint, compacted
+        );
+    }
+}
+
+/// The case behind the property, fixed: a store filled, compacted, and
+/// written a little past offset 0, so stale frames fill the rest.
+#[test]
+fn open_after_a_compaction_does_not_search_the_leftovers_quadratically() {
+    let capacity = 256 << 10;
+    let store = MemStore::new(capacity);
+    let mut j = Journal::open(store.clone()).unwrap();
+    let mut i = 0;
+    while !j.needs_compaction() {
+        append(&mut j, i).unwrap();
+        i += 1;
+    }
+    j.compact().unwrap();
+    for _ in 0..3 {
+        append(&mut j, i).unwrap();
+        i += 1;
+    }
+    let checkpoint = store.read_checkpoint().unwrap().map_or(0, |c| c.len() as u64);
+    let (opened, crcd) = crc_bytes(|| Journal::open(store.clone()));
+    assert_eq!(opened.unwrap().ledger().last_seq, j.ledger().last_seq);
+    assert!(crcd <= capacity + 2 * checkpoint + 4096, "open CRC'd {crcd} bytes for a {capacity} byte store");
+}
+
+/// The measurement for the PR: a 64 MiB FileStore filled to compaction,
+/// compacted, then a few records. Not a check (wall time); run with
+/// `cargo test -p planarian-txn --release -- --ignored --nocapture open_time`.
+#[test]
+#[ignore]
+fn open_time_at_64_mib() {
+    let dir = tempfile::tempdir().unwrap();
+    let capacity = 64 << 20;
+    let store = FileStore::open(dir.path(), &dir.path().join("txn"), capacity).unwrap();
+    let mut j = Journal::open(store).unwrap();
+    let mut i = 0;
+    while !j.needs_compaction() {
+        j.append(Timestamp(i), Record::KnownGood(GenerationId(i + 1))).unwrap();
+        i += 1;
+    }
+    j.compact().unwrap();
+    for _ in 0..3 {
+        j.append(Timestamp(i), Record::KnownGood(GenerationId(i + 1))).unwrap();
+        i += 1;
+    }
+    drop(j);
+    for _ in 0..3 {
+        let t = std::time::Instant::now();
+        let (opened, crcd) =
+            crc_bytes(|| Journal::open(FileStore::open(dir.path(), &dir.path().join("txn"), capacity).unwrap()));
+        opened.unwrap();
+        eprintln!("open_time_at_64_mib: {:?}, {crcd} bytes CRC'd, {i} records", t.elapsed());
+    }
+}
+
+/// I18 holds after a compaction too: a record in the middle of the new log
+/// damaged (its CRC fails) while a later intact record follows is Integrity,
+/// not a torn tail; and the leftovers past the tail, all at or below the
+/// checkpoint's seq, are never taken for that later record.
+#[test]
+fn after_a_compaction_a_damaged_middle_record_is_still_integrity() {
+    let capacity = 256 << 10;
+    let store = MemStore::new(capacity);
+    let mut j = Journal::open(store.clone()).unwrap();
+    let mut i = 0;
+    while !j.needs_compaction() {
+        append(&mut j, i).unwrap();
+        i += 1;
+    }
+    j.compact().unwrap();
+    let first = append(&mut j, i).unwrap();
+    let size = (HEADER + PREV + serde_json::to_vec(&first).unwrap().len()) as u64;
+    for k in 1..5 {
+        append(&mut j, i + k).unwrap();
+    }
+    // Only leftovers past the tail: the torn-tail path, no Integrity.
+    assert!(Journal::open(store.clone()).is_ok());
+    // Damage the second record's payload (its CRC no longer holds).
+    let at = size + (HEADER + PREV) as u64 + 2;
+    let b = store.read_at(at, 1).unwrap()[0];
+    store.write_at(at, &[b ^ 0x20]).unwrap();
+    match Journal::open(store.clone()) {
+        Err(JournalError::Integrity(m)) => assert!(m.contains("is damaged, but record"), "{m}"),
+        Err(e) => panic!("expected Integrity, got {e:?}"),
+        Ok(_) => panic!("expected Integrity, got an open journal"),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 400, ..ProptestConfig::default() })]
+
+    /// I18 and §12c *Format*, after a compaction or not: damage anywhere in
+    /// any record but the last (header, chain hash or payload, its first
+    /// bytes included, so it fails `could_follow` itself) is Integrity: a
+    /// later intact record is still found, so nothing is truncated as a torn
+    /// tail. Damage to the last record is the torn-tail case: truncated to
+    /// the record before it (or Integrity).
+    #[test]
+    fn any_damage_before_the_last_record_is_integrity(
+        compact in any::<bool>(),
+        n in 2usize..8,
+        which in any::<prop::sample::Index>(),
+        pos in any::<prop::sample::Index>(),
+        x in 1u8..=255,
+    ) {
+        let capacity = 64 << 10;
+        let store = MemStore::new(capacity);
+        let mut j = Journal::open(store.clone()).unwrap();
+        let mut i = 0;
+        if compact {
+            while !j.needs_compaction() {
+                append(&mut j, i).unwrap();
+                i += 1;
+            }
+            j.compact().unwrap();
+        }
+        // Each new record's offset and size in the log (it starts at 0).
+        let mut records = Vec::new();
+        let mut off = 0u64;
+        for _ in 0..n {
+            let e = append(&mut j, i).unwrap();
+            i += 1;
+            let size = (HEADER + PREV + serde_json::to_vec(&e).unwrap().len()) as u64;
+            records.push((off, size));
+            off += size;
+        }
+        let last = j.ledger().last_seq;
+        drop(j);
+        let k = which.index(n);
+        let (o, size) = records[k];
+        let at = o + pos.index(size as usize) as u64;
+        let b = store.read_at(at, 1).unwrap()[0];
+        store.write_at(at, &[b ^ x]).unwrap();
+        let r = Journal::open(store.clone());
+        if k + 1 < n {
+            prop_assert!(
+                matches!(r, Err(JournalError::Integrity(_))),
+                "record {} of {} damaged at byte {} of {} (compacted: {}): {:?}",
+                k, n, at - o, size, compact, r.as_ref().map(|j| j.ledger().last_seq)
+            );
+        } else {
+            match r {
+                Ok(j) => prop_assert_eq!(j.ledger().last_seq, last - 1),
+                Err(JournalError::Integrity(_)) => {}
+                Err(e) => prop_assert!(false, "the last record damaged gave {:?}", e),
+            }
+        }
+    }
+}
+
+/// A record of one of several kinds, of any size from tiny to a few KiB.
+fn record(kind: u8, n: u64, size: usize) -> Record {
+    let unit = planarian_schema::UnitId::service(&format!("u{}-{}", n % 7, "x".repeat(size)));
+    match kind % 6 {
+        0 => Record::KnownGood(GenerationId(n + 1)),
+        1 => Record::LiveTested(Some(GenerationId(n + 1))),
+        2 => Record::HoldApplied { unit, by: crate::ledger::HoldBy::Daemon },
+        3 => Record::HoldLifted { unit, reason: "y".repeat(size) },
+        4 => Record::AgentStarted { name: "a".repeat(size.max(1)), instance: [n as u8; 16], by: 1000 },
+        _ => Record::TokenUsed { nonce: [n as u8; 16], expires: Timestamp(n), approver: 0, txn: 0 },
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    /// The other side of `could_follow`: every frame `append` writes passes
+    /// it, for any record kind and size and before or after compactions. So
+    /// the search for a later record never skips one the journal wrote (I18:
+    /// a damaged record before it stays Integrity). A change to the frame or
+    /// the payload encoding has to keep this green.
+    #[test]
+    fn every_appended_frame_could_follow(
+        ops in proptest::collection::vec((0u8..6, 0usize..3000, proptest::bool::weighted(0.05)), 1..200)
+    ) {
+        let capacity = 256 << 10;
+        let store = MemStore::new(capacity);
+        let mut j = Journal::open(store.clone()).unwrap();
+        for (n, (kind, size, compact)) in ops.into_iter().enumerate() {
+            if compact || j.needs_compaction() {
+                j.compact().unwrap();
+            }
+            let at = j.offset();
+            let rec = record(kind, n as u64, size);
+            let e = match j.append(Timestamp(n as u64), rec) {
+                Ok(e) => e,
+                // A record the ledger refuses here (e.g. lifting no hold) or
+                // one too big for what is left: not a frame written.
+                Err(JournalError::Ledger(_) | JournalError::Full) => continue,
+                Err(e) => panic!("{e:?}"),
+            };
+            let bytes = store.read_at(at, (capacity - at) as usize).unwrap();
+            prop_assert!(
+                could_follow(&bytes, e.seq - 1, capacity),
+                "the frame of record {} (kind {}, {} bytes asked) does not pass could_follow",
+                e.seq, kind, size
+            );
+        }
+    }
+}
