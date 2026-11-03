@@ -2863,3 +2863,58 @@ fn a_forced_compaction_saves_exactly_what_it_discarded() {
     let tail = r.core.ex.kernel.journal.segment().unwrap();
     assert_eq!(&replay(&saved, &tail), r.core.ex.kernel.journal.ledger());
 }
+
+/// §12d (lift_unconfirmed): a lift the host does not answer is journaled
+/// once and noticed once, not once per tick: the next tick finds the unit
+/// held on the host and not in the journal, which looked like a hold set
+/// unseen by `OnFailure=` (a second `HoldApplied`, a second lift, a second
+/// notice, every tick). The lift completes once systemd answers.
+#[test]
+fn a_stuck_lift_is_journaled_and_noticed_once() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().stop_out_of_band(&web);
+    // Held and journaled first; then systemd stops answering, before the unit
+    // is back.
+    for _ in 0..10 {
+        if r.fake.w().held.contains(&web) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.fake.w().held.contains(&web), "never held: {:?}", r.core.notices);
+    r.fake.w().hold_hangs = Some(Millis::secs(30));
+    r.ticks(40);
+    assert!(r.fake.w().held.contains(&web), "lifted with systemd stuck");
+    let lifts = |r: &Rig| r.core.notices.iter().filter(|n| n.contains("could not be lifted")).count();
+    let events = r.core.ledger().hold_events.clone();
+    let applied = events.iter().filter(|e| e.1).count();
+    let lifted = events.iter().filter(|e| !e.1).count();
+    assert!(applied <= 1, "held again on every tick: {events:?}");
+    assert!(lifted <= 1, "lifted again on every tick: {events:?}");
+    assert!(lifts(&r) <= 1, "{:?}", r.core.notices);
+    r.fake.w().hold_hangs = None;
+    r.ticks(30);
+    assert!(!r.fake.w().held.contains(&web), "never lifted: {:?}", r.core.notices);
+    assert!(r.core.ledger().holds().is_empty(), "{events:?}");
+    assert!(lifts(&r) <= 1, "{:?}", r.core.notices);
+    assert_eq!(r.core.notices.iter().filter(|n| n.contains("flows again")).count(), 1, "{:?}", r.core.notices);
+}
+
+/// §12d (reviewer, 47aed77): a hold timeout is news again in a later
+/// episode: the unit was neither failed nor held in between.
+#[test]
+fn a_later_episodes_hold_timeout_alarms_again() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, false);
+    let unheld = |r: &Rig| r.core.notices.iter().filter(|n| n.contains("could not be held (")).count();
+    r.fake.w().hold_hangs = Some(Millis::secs(30));
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(30);
+    assert_eq!(unheld(&r), 1, "{:?}", r.core.notices);
+    assert!(r.calls("restart(service:gym-web)") >= 1, "never restarted: {:?}", r.core.notices);
+    r.ticks(30);
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(30);
+    assert_eq!(unheld(&r), 2, "{:?}", r.core.notices);
+}
