@@ -394,6 +394,41 @@ let
         if grep -qx 'protecting yes' "$f" || grep -qx 'unattributed' "$f"; then
           exit 0
         fi
+        # 3. Only this run's final footprint can skip (owner decision, Nov 3).
+        #    netwatch records the unit's InvocationID (its cgroup's
+        #    trusted.invocation_id) as `invocation <32 hex>`, and adds `ended`
+        #    once that invocation's cgroup is gone and its events are drained,
+        #    so nothing the run did can still be on its way. systemd keeps the
+        #    failed run's ID until the next start. Wait for both, bounded: 3 s
+        #    in 50 ms polls (60 x 0.05 s). A footprint from an earlier run, an
+        #    ID missing on either side, no `ended` in time, or `protecting
+        #    unknown`: hold. No timestamp is compared.
+        want=$(systemctl show -P InvocationID "$unit.service" 2>/dev/null || true)
+        if [ -z "$want" ]; then
+          log "holding for $unit: the unit has no InvocationID"
+          exit 0
+        fi
+        polls=60 step=0.05 got="" final=no
+        for _ in $(seq "$polls"); do
+          if [ -f "$f" ]; then
+            if grep -qx 'protecting yes' "$f" || grep -qx 'unattributed' "$f"; then
+              exit 0
+            fi
+            got=$(awk '$1 == "invocation" { print $2; exit }' "$f")
+            if [ "$got" = "$want" ] && grep -qx 'ended' "$f"; then
+              final=yes; break
+            fi
+          fi
+          sleep "$step"
+        done
+        if [ "$final" != yes ]; then
+          log "holding for $unit: no final footprint for this run within 3 s (footprint ''${got:-none}, unit $want)"
+          exit 0
+        fi
+        if [ -e "$footprint/.unattributed" ] || ! grep -qx 'protecting no' "$f"; then
+          log "holding for $unit: this run's footprint does not say protecting no"
+          exit 0
+        fi
         log "$unit failed but was not protecting traffic: not held"
         exit 1 ;;
       apply)

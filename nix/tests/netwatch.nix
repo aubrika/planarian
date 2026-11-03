@@ -99,7 +99,8 @@ pkgs.testers.runNixOSTest {
       "${ip} link delete wg0";
     # (o) OpenVPN's way: the unit opens /dev/net/tun itself (ioctl
     # TUNSETIFF, no netlink), holds it, and routes the all-covering pair 0/1
-    # and 128/1 over tun0. The test needs no IPv4 egress on this node.
+    # and 128/1 over nwtun0: not a name the kernel's tun%d hands out, so
+    # (q)'s kernel-named tun never collides with it. No IPv4 egress needed.
     systemd.services.nw-tun = {
       wantedBy = [ "multi-user.target" ];
       after = [ "planarian-netwatch.service" ];
@@ -116,11 +117,11 @@ pkgs.testers.runNixOSTest {
           TUNSETIFF = 0x400454CA
           IFF_TUN, IFF_NO_PI = 0x0001, 0x1000
           fd = open("/dev/net/tun", "r+b", buffering=0)
-          req = struct.pack("16sH", b"tun0", IFF_TUN | IFF_NO_PI)
+          req = struct.pack("16sH", b"nwtun0", IFF_TUN | IFF_NO_PI)
           fcntl.ioctl(fd, TUNSETIFF, req)
-          for cmd in (["link", "set", "tun0", "up"],
-                      ["route", "add", "0.0.0.0/1", "dev", "tun0"],
-                      ["route", "add", "128.0.0.0/1", "dev", "tun0"]):
+          for cmd in (["link", "set", "nwtun0", "up"],
+                      ["route", "add", "0.0.0.0/1", "dev", "nwtun0"],
+                      ["route", "add", "128.0.0.0/1", "dev", "nwtun0"]):
               subprocess.run(["ip"] + cmd, check=True)
           signal.pause()
         '';
@@ -163,7 +164,7 @@ pkgs.testers.runNixOSTest {
     };
     # (p) A setup unit makes a persistent tun (`ip tuntap add`, ioctl) and
     # routes nothing; a second unit routes 0/1 and 128/1 over it (metric 50,
-    # beside tun0's). Both count: the creator's interface carries the
+    # beside nwtun0's). Both count: the creator's interface carries the
     # routes, and the router steers over a virtual interface.
     systemd.services.nw-tunsetup = oneshot
       "${ip} tuntap add dev nwtap0 mode tun"
@@ -416,9 +417,9 @@ pkgs.testers.runNixOSTest {
         # §12d: "an interface it created that carries a default or
         # all-covering route", however it was created: here by ioctl on
         # /dev/net/tun, which netlink never sees.
-        machine.succeed("test -d /sys/devices/virtual/net/tun0")
+        machine.succeed("test -d /sys/devices/virtual/net/nwtun0")
         lines = protecting("nw-tun", "yes")
-        assert "iface tun0" in lines, lines
+        assert "iface nwtun0" in lines, lines
         machine.fail(f"test -e {FP}/.unattributed")
 
     with subtest("(p) one unit makes a persistent tun, another routes over it: both protecting"):
