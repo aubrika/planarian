@@ -31,6 +31,25 @@ let
     after = [ "planarian-netwatch.service" ];
     serviceConfig = { Type = "oneshot"; RemainAfterExit = true; ExecStart = start; ExecStop = stop; };
   };
+  # (t) A network tool that runs `init`, then each script the driver drops
+  # at /run/<name>/go, in its own cgroup, and never stops. Exit status in rc.
+  runner = name: init: {
+    wantedBy = [ "multi-user.target" ];
+    after = [ "planarian-netwatch.service" ];
+    path = [ pkgs.iproute2 pkgs.coreutils pkgs.bash ];
+    serviceConfig = { Type = "simple"; Restart = "no"; };
+    script = ''
+      ${init}
+      mkdir -p /run/${name}
+      while :; do
+        if [ -e /run/${name}/go ]; then
+          bash /run/${name}/go > /run/${name}/out 2>&1; rc=$?
+          rm -f /run/${name}/go; echo $rc > /run/${name}/rc
+        fi
+        sleep 0.2
+      done
+    '';
+  };
 in
 pkgs.testers.runNixOSTest {
   name = "planarian-netwatch";
@@ -192,40 +211,18 @@ pkgs.testers.runNixOSTest {
     # (t) DNS and the system proxy. resolved, so a link's DNS can be set
     # over D-Bus (resolvectl) by a process other than the link's owner.
     services.resolved.enable = true;
-    # nw-dnsvpn: a VPN-like tool that makes its own interface (nwdns0, no
-    # route: it steers only once DNS is set on it).
-    systemd.services.nw-dnsvpn = {
-      wantedBy = [ "multi-user.target" ];
-      after = [ "planarian-netwatch.service" ];
-      path = [ pkgs.iproute2 pkgs.coreutils ];
-      serviceConfig = { Type = "simple"; Restart = "no"; };
-      script = ''
-        ip link del nwdns0 2>/dev/null || true
-        ip link add nwdns0 type dummy
-        ip addr add 10.81.0.1/24 dev nwdns0
-        ip link set nwdns0 up
-        exec sleep infinity
-      '';
-    };
-    # nw-dnsrun: a network tool that runs, in its own cgroup, each script the
-    # driver drops at /run/nw-dnsrun/go (as resolvconf or wg-quick would
-    # write), and never stops. Exit status in rc.
-    systemd.services.nw-dnsrun = {
-      wantedBy = [ "multi-user.target" ];
-      after = [ "planarian-netwatch.service" ];
-      path = [ pkgs.coreutils pkgs.bash ];
-      serviceConfig = { Type = "simple"; Restart = "no"; };
-      script = ''
-        mkdir -p /run/nw-dnsrun
-        while :; do
-          if [ -e /run/nw-dnsrun/go ]; then
-            bash /run/nw-dnsrun/go > /run/nw-dnsrun/out 2>&1; rc=$?
-            rm -f /run/nw-dnsrun/go; echo $rc > /run/nw-dnsrun/rc
-          fi
-          sleep 0.2
-        done
-      '';
-    };
+    # nw-dnsvpn: a VPN-like tool that makes its own interface (nwdns0,
+    # 10.81.0.1/24, no default route: it steers only through what is routed
+    # over it), then, like nw-dnsrun, runs each script the driver drops at
+    # /run/nw-dnsvpn/go in its own cgroup. nw-dnsrun: a network tool that
+    # makes nothing and writes files (as resolvconf would). Neither stops.
+    systemd.services.nw-dnsvpn = runner "nw-dnsvpn" ''
+      ip link del nwdns0 2>/dev/null || true
+      ip link add nwdns0 type dummy
+      ip addr add 10.81.0.1/24 dev nwdns0
+      ip link set nwdns0 up
+    '';
+    systemd.services.nw-dnsrun = runner "nw-dnsrun" "";
     # A templated network tool, instance `a` (root, no bounding set).
     systemd.services."nw-tpl@" = {
       serviceConfig = { Type = "simple"; Restart = "no"; ExecStart = "${pkgs.coreutils}/bin/sleep infinity"; };
@@ -560,20 +557,21 @@ pkgs.testers.runNixOSTest {
         # Retried in place, not by systemd restarting it.
         assert bare.succeed("systemctl show -P NRestarts planarian-netwatch.service").strip() == n0
 
-    with subtest("(t) DNS and the system proxy: a link's DNS is its owner's, a rewrite is its writer's, an unplaced write the running tools', loopback and an uplink steer nothing"):
+    with subtest("(t) DNS and the system proxy: charged by route to the owner of what reaches the server; loopback and the uplink steer nothing"):
         # §12d: a network tool is protecting while the kernel has attributed
-        # to it "DNS servers on its interface, the system proxy"; Planarian
-        # "attributes every ... change to the unit that made it". Read through
-        # netwatch's record of what stands (`.state`'s objects, by name), since
-        # a footprint keeps an invocation's `protecting yes` (the latch).
-        # Last in the script: (t3) charges every running tool, which latches.
+        # to it "DNS servers on its interface, the system proxy". A server
+        # (or proxy host) is on the interface the kernel routes it through,
+        # so it is charged to the owner of that interface or route, whoever
+        # wrote the setting (coordinator, Nov 3). Read through netwatch's
+        # record of what stands (`.state`'s objects, by name), since a
+        # footprint keeps an invocation's `protecting yes` (the latch).
         import json
         def claimants(obj):
             out = machine.succeed(
                 f"jq -c --arg o '{obj}' '[.objects[] | select(.[2] == $o) | .[0] | tostring]' {FP}/.state")
             return json.loads(out)
         def show():
-            print(machine.execute(f"cat {FP}/.state; echo; for f in {FP}/nw-dnsvpn {FP}/nw-dnsrun {FP}/nw-quiet {FP}/.unattributed; do echo \"== $f\"; cat \"$f\" 2>&1; done; ls -l /etc/resolv.conf; cat /etc/resolv.conf; resolvectl status --no-pager")[1])
+            print(machine.execute(f"cat {FP}/.state; echo; for f in {FP}/nw-dnsvpn {FP}/nw-dnsrun {FP}/backdoor {FP}/.unattributed; do echo \"== $f\"; cat \"$f\" 2>&1; done; ls -l /etc/resolv.conf; cat /etc/resolv.conf; ip route; resolvectl status --no-pager")[1])
         def until(what, pred, timeout=30):
             for _ in range(timeout):
                 if pred():
@@ -581,77 +579,85 @@ pkgs.testers.runNixOSTest {
                 machine.sleep(1)
             show()
             raise AssertionError(what)
+        def settled(what, pred):
+            # Nothing should come: give netwatch a few passes, then check.
+            machine.sleep(12)
+            if not pred():
+                show()
+                raise AssertionError(what)
         def only(obj, unit):
             cl = claimants(obj)
             return len(cl) == 1 and unit in cl[0]
-        def runner(script):
-            machine.succeed("rm -f /run/nw-dnsrun/rc")
-            machine.succeed(f"cat > /run/nw-dnsrun/go.tmp <<'NWEOF'\nset -e\n{script}\nNWEOF\nmv /run/nw-dnsrun/go.tmp /run/nw-dnsrun/go")
-            machine.wait_until_succeeds("test -e /run/nw-dnsrun/rc", timeout=30)
-            rc = machine.succeed("cat /run/nw-dnsrun/rc").strip()
-            assert rc == "0", (rc, machine.succeed("cat /run/nw-dnsrun/out"))
-        # A rename-over, as resolvconf and NetworkManager replace the file.
+        def run_in(unit, script):
+            machine.succeed(f"rm -f /run/{unit}/rc")
+            machine.succeed(f"cat > /run/{unit}/go.tmp <<'NWEOF'\nset -e\n{script}\nNWEOF\nmv /run/{unit}/go.tmp /run/{unit}/go")
+            machine.wait_until_succeeds(f"test -e /run/{unit}/rc", timeout=30)
+            rc = machine.succeed(f"cat /run/{unit}/rc").strip()
+            assert rc == "0", (rc, machine.succeed(f"cat /run/{unit}/out"))
+        # A rename-over by nw-dnsrun, as resolvconf and NetworkManager replace the file.
         def replace(path, content):
-            runner(f"printf '{content}' > {path}.nw-tmp\nmv -f {path}.nw-tmp {path}")
+            run_in("nw-dnsrun", f"printf '{content}' > {path}.nw-tmp\nmv -f {path}.nw-tmp {path}")
+        # An address on the uplink's own subnet (eth1, the test vlan: a
+        # physical interface no unit made).
+        UPLINK = "192.168.1.254"
 
         machine.wait_for_unit("systemd-resolved.service")
         protecting("nw-dnsvpn", "no")
         protecting("nw-dnsrun", "no")
 
         # (t1) A VPN's link DNS, set over D-Bus by another process (the
-        # driver's resolvectl; resolved writes the state): the link's owner's
-        # alone. Reverted: nobody's.
-        machine.succeed("resolvectl dns nwdns0 192.0.2.53")
-        until("link DNS not charged to its owner alone", lambda: only("link nwdns0", "nw-dnsvpn"))
+        # driver's resolvectl; resolved writes the state), naming a server on
+        # the VPN's subnet: the VPN's alone. Reverted: nobody's.
+        machine.succeed("resolvectl dns nwdns0 10.81.0.53")
+        until("link DNS over the VPN not charged to it alone", lambda: only("link nwdns0", "nw-dnsvpn"))
         protecting("nw-dnsvpn", "yes")
         machine.succeed("resolvectl revert nwdns0")
         until("reverted link DNS still claimed", lambda: claimants("link nwdns0") == [])
 
-        # (t2) DNS on the uplink (eth1: a physical interface no unit made),
-        # as DHCP sets it: not "on its interface" for any tool, like a DHCP
-        # default route over it. No tool claims it.
-        machine.succeed("resolvectl dns eth1 192.0.2.56")
-        machine.sleep(12)
-        cl = claimants("link eth1")
-        if cl:
-            show()
-        assert cl == [], ("an uplink's DNS was charged", cl)
+        # (t2) DNS on the uplink, as DHCP sets it: routed through eth1, which
+        # no unit made. No tool's.
+        machine.succeed(f"resolvectl dns eth1 {UPLINK}")
+        settled("an uplink's DNS was charged", lambda: claimants("link eth1") == [])
         machine.succeed("resolvectl revert eth1")
 
-        # (t3) resolv.conf replaced by rename from a unit: loopback servers
-        # (the machine's stub) steer nothing; a real server is the writer's
-        # alone; back to loopback, nobody's.
+        # (t3) resolv.conf replaced by rename from nw-dnsrun. Loopback (the
+        # machine's stub) steers nothing. A server on the uplink is nobody's.
+        # A server on the VPN's subnet is the VPN's, not the writer's.
         replace("/etc/resolv.conf", "nameserver 127.0.0.53\\nnameserver ::1\\n")
-        machine.sleep(12)
-        assert claimants("resolv.conf") == [], claimants("resolv.conf")
-        protecting("nw-dnsrun", "no")
-        replace("/etc/resolv.conf", "nameserver 192.0.2.54\\n")
-        until("a rewrite not charged to its writer alone", lambda: only("resolv.conf", "nw-dnsrun"))
-        protecting("nw-dnsrun", "yes")
-        replace("/etc/resolv.conf", "nameserver 127.0.0.53\\n")
-        until("loopback content still claimed", lambda: claimants("resolv.conf") == [])
+        settled("loopback was charged", lambda: claimants("resolv.conf") == [])
+        replace("/etc/resolv.conf", f"nameserver {UPLINK}\\n")
+        settled("a server on the uplink was charged", lambda: claimants("resolv.conf") == [])
+        replace("/etc/resolv.conf", "nameserver 10.81.0.54\\n")
+        until("a server over the VPN not charged to the VPN alone", lambda: only("resolv.conf", "nw-dnsvpn"))
 
-        # (t4) The system proxy, set in /etc/environment by a unit: its
-        # writer's; unset, nobody's.
-        replace("/etc/environment", "https_proxy=http://192.0.2.57:3128\\n")
-        until("a proxy not charged to its writer", lambda: only("/etc/environment", "nw-dnsrun"))
-        replace("/etc/environment", "LANG=C.UTF-8\\n")
-        until("an unset proxy still claimed", lambda: claimants("/etc/environment") == [])
+        # (t4) A server the VPN routes through its tunnel (a route it adds
+        # over nwdns0, beyond its own subnet): the VPN's while that route
+        # stands; once the VPN removes it, the server is not reached through
+        # the VPN, and the charge leaves it.
+        run_in("nw-dnsvpn", "ip route add 10.82.0.0/24 dev nwdns0")
+        replace("/etc/resolv.conf", "nameserver 10.82.0.53\\n")
+        until("a server through the VPN's route not charged to the VPN", lambda: only("resolv.conf", "nw-dnsvpn"))
+        run_in("nw-dnsvpn", "ip route del 10.82.0.0/24 dev nwdns0")
+        until("the charge stayed on the VPN after its route went",
+              lambda: not any("nw-dnsvpn" in c for c in claimants("resolv.conf")))
 
-        # (t5) A writer netwatch cannot place (gone before its write is read:
-        # netwatch is paused across it): charged to the network tools
-        # running then, nw-quiet and nw-dnsvpn among them; cleared once the
-        # content reverts.
-        machine.succeed("systemctl kill --signal=SIGSTOP planarian-netwatch.service")
-        machine.succeed("sh -c 'printf \"nameserver 192.0.2.55\\n\" > /etc/resolv.conf'")
-        machine.sleep(2)
-        machine.succeed("systemctl kill --signal=SIGCONT planarian-netwatch.service")
-        def charged_running():
-            cl = claimants("resolv.conf")
-            return any("nw-quiet" in c for c in cl) and any("nw-dnsvpn" in c for c in cl)
-        until("an unplaced write not charged to the running tools", charged_running)
+        # (t5) A short-lived writer in another unit (the driver), naming a
+        # server over the VPN: the VPN's, not the writer's; loopback again
+        # clears it for everyone.
+        machine.succeed("sh -c 'printf \"nameserver 10.81.0.55\\n\" > /etc/resolv.conf'")
+        until("a driver's write over the VPN not charged to the VPN alone", lambda: only("resolv.conf", "nw-dnsvpn"))
         machine.succeed("printf 'nameserver 127.0.0.53\\n' > /etc/resolv.conf")
         until("reverted content still claimed", lambda: claimants("resolv.conf") == [])
+
+        # (t6) The system proxy, set in /etc/environment by nw-dnsrun: a proxy
+        # host over the VPN is the VPN's; one on the uplink, nobody's; unset,
+        # nobody's.
+        replace("/etc/environment", "https_proxy=http://10.81.0.57:3128\\n")
+        until("a proxy over the VPN not charged to the VPN alone", lambda: only("/etc/environment", "nw-dnsvpn"))
+        replace("/etc/environment", f"https_proxy=http://{UPLINK}:3128\\n")
+        until("a proxy on the uplink still charged", lambda: claimants("/etc/environment") == [])
+        replace("/etc/environment", "LANG=C.UTF-8\\n")
+        settled("an unset proxy was charged", lambda: claimants("/etc/environment") == [])
         watch_fresh()
   '';
 }
