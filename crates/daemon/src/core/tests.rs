@@ -2702,7 +2702,9 @@ fn a_hold_that_hangs_does_not_stall_the_tick() {
 /// hold budget. Each probe batch here takes longer than HOLD_WAIT (the hold
 /// drops the probes' traffic, so they run to their timeouts); a budget
 /// counted from the tick's start was gone before the lift was reached, and
-/// gym-web, back and Running, stayed held for good.
+/// gym-web, back and Running, stayed held for good. Counted from the first
+/// hold call (residue's), the re-observation after it spent the budget and
+/// the table check alarmed falsely.
 #[test]
 fn slow_probes_do_not_starve_a_lift() {
     let web = UnitId::service("gym-web");
@@ -2718,6 +2720,10 @@ fn slow_probes_do_not_starve_a_lift() {
     );
     assert!(!r.fake.w().held.contains(&web), "gym-web is back but still held");
     assert_eq!(r.core.ledger().hold_events, vec![(web.clone(), true), (web.clone(), false)]);
+    // One ALARM, the hold's own: no false "could not be checked" from a
+    // budget the probes spent (reviewer, 7c2edfc).
+    let alarms: Vec<_> = r.core.notices.iter().filter(|n| n.starts_with("ALARM")).collect();
+    assert_eq!(alarms, vec![&crate::hold::alarm(&web)], "{:?}", r.core.notices);
 }
 
 /// §13: the hold a third regression sets runs from the decision, after the

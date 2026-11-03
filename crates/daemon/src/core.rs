@@ -266,7 +266,7 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// other units' lifts.
     hold_unconfirmed: BTreeMap<UnitId, Timestamp>,
     /// §12d: the end of this tick's hold budget (`hold_wait`).
-    hold_deadline: Option<Timestamp>,
+    hold_left: Millis,
     /// Generation transactions withdrawn from `Built` for a rollback about to
     /// run (§12f, I6; owner decision, Nov 2), with when each began waiting,
     /// to prepare again once no generation transaction is active.
@@ -484,7 +484,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             hold_retry: None,
             daemon_held: BTreeSet::new(),
             hold_unconfirmed: BTreeMap::new(),
-            hold_deadline: None,
+            hold_left: HOLD_WAIT,
             withdrawn: vec![],
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
@@ -835,16 +835,21 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// at most this, and none is made once it is spent (the caller takes it
     /// as "cannot say", the fail-closed side). So a stuck `systemctl` or
     /// `nft` holds the tick up for HOLD_WAIT in all, not per call (reviewer,
-    /// #61). The budget starts at the tick's first hold call, not the tick's
-    /// start: probes the hold itself slows (their traffic is dropped) must
-    /// not spend it (catalog 41644729493, vm-netsec); and lifts are made
-    /// first (network_holds), so other units' calls cannot keep a unit that
-    /// is back held (a livelock).
-    fn hold_wait(&mut self) -> Option<Millis> {
-        let now = self.b.clock().boot_now();
-        let deadline = *self.hold_deadline.get_or_insert(now.plus(HOLD_WAIT));
-        let left = deadline.0.saturating_sub(now.0);
-        (left > 0).then_some(Millis(left))
+    /// #61). The budget is not counted from the tick's
+    /// start: only the time the hold calls take is spent (hold_spent), so
+    /// probes the hold itself slows (their traffic is dropped) never spend it
+    /// (catalog 41644729493, vm-netsec; reviewer, 7c2edfc); and lifts are
+    /// made first (network_holds), so other units' calls cannot keep a unit
+    /// that is back held (a livelock). A call skipped for want of budget is
+    /// not news: it is made next tick, and alarms nothing.
+    fn hold_wait(&self) -> Option<Millis> {
+        (self.hold_left.0 > 0).then_some(self.hold_left)
+    }
+
+    /// Spends what a hold call begun at `t0` took from the tick's budget.
+    fn hold_spent(&mut self, t0: Timestamp) {
+        let took = self.b.clock().boot_now().0.saturating_sub(t0.0);
+        self.hold_left = Millis(self.hold_left.0.saturating_sub(took));
     }
 
     /// Compact the journal and return the entries it discarded (the segment
@@ -890,8 +895,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 && !hold::failed(s, defs, u)
                 && hold::back(s, defs, u)
             {
-                self.lift_back(u);
-                lifted.insert(u.clone());
+                if self.lift_back(u) {
+                    lifted.insert(u.clone());
+                }
             }
         }
         holding.retain(|u| !lifted.contains(u));
@@ -949,10 +955,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     let now = self.b.clock().boot_now();
                     // Asked already and not yet due again: its job may still
                     // land, and the host is checked every tick (above).
-                    let waiting = self.hold_unconfirmed.get(&u).is_some_and(|next| now < *next);
+                    // A skip for want of budget waits too: asked next tick, quietly.
+                    let waiting =
+                        self.hold_unconfirmed.get(&u).is_some_and(|next| now < *next) || self.hold_wait().is_none();
                     let o = match self.hold_wait() {
                         _ if waiting => Outcome::Unknown("waiting for its hold job".into()),
-                        Some(w) => self.b.units().hold(&u, w),
+                        Some(w) => {
+                            let t0 = self.b.clock().boot_now();
+                            let o = self.b.units().hold(&u, w);
+                            self.hold_spent(t0);
+                            o
+                        }
                         None => Outcome::Unknown("no time left on this tick".into()),
                     };
                     match o {
@@ -994,11 +1007,21 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         applied
     }
 
-    /// Lifts a back unit's hold: journaled, then asked of the host.
-    fn lift_back(&mut self, u: &UnitId) {
+    /// Lifts a back unit's hold: journaled, then asked of the host. False
+    /// when the tick has no budget left: nothing is done, and it is lifted
+    /// on a later tick.
+    fn lift_back(&mut self, u: &UnitId) -> bool {
+        if self.hold_wait().is_none() {
+            return false;
+        }
         self.journal(Record::HoldLifted { unit: u.clone(), reason: "Running, and its Readiness probes pass".into() });
         let o = match self.hold_wait() {
-            Some(w) => self.b.units().lift_hold(u, w),
+            Some(w) => {
+                let t0 = self.b.clock().boot_now();
+                let o = self.b.units().lift_hold(u, w);
+                self.hold_spent(t0);
+                o
+            }
             None => Outcome::Unknown("no time left on this tick".into()),
         };
         match o {
@@ -1010,6 +1033,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 self.notice(format!("{u} is back; network traffic flows again"));
             }
         }
+        true
     }
 
     /// §12d: the hold's table, while a hold stands. Missing: alarm once, then
@@ -1018,8 +1042,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// alarm once and check again next tick; nothing is re-applied blind.
     fn hold_table(&mut self, holding: &BTreeSet<UnitId>, units: &[UnitId]) {
         use planarian_txn::ledger::HoldBy;
+        if self.hold_wait().is_none() {
+            // Not checked this tick, for want of budget: not "uncheckable".
+            return;
+        }
         let present = match self.hold_wait() {
-            Some(w) => self.b.units().hold_table_present(w),
+            Some(w) => {
+                let t0 = self.b.clock().boot_now();
+                let o = self.b.units().hold_table_present(w);
+                self.hold_spent(t0);
+                o
+            }
             None => Err(Outcome::Unknown("no time left on this tick".into())),
         };
         let held: Vec<UnitId> = holding.iter().filter(|u| units.contains(u)).cloned().collect();
@@ -1054,8 +1087,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::Daemon });
                 self.notice(format!("ALARM: {u}: the network hold was removed from the firewall; re-applying it"));
             }
+            if self.hold_wait().is_none() {
+                continue;
+            }
             let o = match self.hold_wait() {
-                Some(w) => self.b.units().reapply_hold(u, w),
+                Some(w) => {
+                    let t0 = self.b.clock().boot_now();
+                    let o = self.b.units().reapply_hold(u, w);
+                    self.hold_spent(t0);
+                    o
+                }
                 None => Outcome::Unknown("no time left on this tick".into()),
             };
             if let o @ (Outcome::Failed(_) | Outcome::Unknown(_)) = o
@@ -1065,7 +1106,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
         self.hold_table_seen = false;
-        if self.hold_wait().is_some_and(|w| matches!(self.b.units().hold_table_present(w), Ok(true))) {
+        let t0 = self.b.clock().boot_now();
+        let found = self.hold_wait().is_some_and(|w| matches!(self.b.units().hold_table_present(w), Ok(true)));
+        self.hold_spent(t0);
+        if found {
             self.hold_table_seen = true;
             self.hold_missing_noted = false;
             self.hold_retry = None;
@@ -1385,10 +1429,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 // point: an Inferred stop must not be written for a unit
                 // whose traffic is then held.
                 let now = self.b.clock().boot_now();
-                let waiting = self.hold_unconfirmed.get(u).is_some_and(|next| now < *next);
+                let waiting =
+                    self.hold_unconfirmed.get(u).is_some_and(|next| now < *next) || self.hold_wait().is_none();
                 let o = match self.hold_wait() {
                     _ if waiting => Outcome::Unknown("waiting for its hold job".into()),
-                    Some(w) => self.b.units().hold(u, w),
+                    Some(w) => {
+                        let t0 = self.b.clock().boot_now();
+                        let o = self.b.units().hold(u, w);
+                        self.hold_spent(t0);
+                        o
+                    }
                     None => Outcome::Unknown("no time left on this tick".into()),
                 };
                 let held = match o {
@@ -1652,9 +1702,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     pub fn tick(&mut self) {
-        // §12d: all hold calls in this tick share one HOLD_WAIT, counted
-        // from the first of them (hold_wait), not from the tick's start.
-        self.hold_deadline = None;
+        // §12d: all hold calls in this tick share one HOLD_WAIT, spent only
+        // by the hold calls themselves (hold_wait).
+        self.hold_left = HOLD_WAIT;
         // I7's agent for an approval is needed only while the change is
         // parked; a cancelled, expired, invalidated or refused one leaves.
         // An approved one leaves `ex.parked` only inside `Executor::approve`,
