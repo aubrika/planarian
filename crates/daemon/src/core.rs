@@ -894,10 +894,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 && s.override_of(&hold::hold_unit(u)).is_none()
                 && !hold::failed(s, defs, u)
                 && hold::back(s, defs, u)
+                && self.lift_back(u)
             {
-                if self.lift_back(u) {
-                    lifted.insert(u.clone());
-                }
+                lifted.insert(u.clone());
             }
         }
         holding.retain(|u| !lifted.contains(u));
