@@ -11,8 +11,9 @@
 //!   `disruption = None` over the unit alone, so an administrator could dodge
 //!   a stop's floor (SessionLoss on the display manager) by asking for an
 //!   override instead. Stated whole: for any unit, any observation of it and
-//!   any caller, an override that stops, removes or detaches it derives the
-//!   facts a stop of it derives.
+//!   any caller, an override that stops it derives the facts a stop of it
+//!   derives, one that removes or detaches it at least those (§11), and
+//!   only `LeaveAlone` derives no effect.
 
 use super::*;
 use proptest::prelude::*;
@@ -176,10 +177,54 @@ proptest! {
         });
         let a = facts_of(&stop, &defs, &state, caller.clone());
         let b = facts_of(&over, &defs, &state, caller);
-        prop_assert_eq!(&a.affected_units, &b.affected_units, "{:?}", unit);
-        prop_assert_eq!(&a.disruption, &b.disruption, "{:?}", unit);
-        prop_assert_eq!(&a.sensitivity, &b.sensitivity, "{:?}", unit);
-        prop_assert_eq!(&a.recovery, &b.recovery, "{:?}", unit);
-        prop_assert_eq!(a.touches_core, b.touches_core);
+        if desired == OverrideDesired::Stopped {
+            // An override that stops is a stop: the same facts (rule 20).
+            prop_assert_eq!(&a.affected_units, &b.affected_units, "{:?}", unit);
+            prop_assert_eq!(&a.disruption, &b.disruption, "{:?}", unit);
+            prop_assert_eq!(&a.sensitivity, &b.sensitivity, "{:?}", unit);
+            prop_assert_eq!(&a.recovery, &b.recovery, "{:?}", unit);
+            prop_assert_eq!(a.touches_core, b.touches_core);
+        } else {
+            // §11: Absent and Detected "likewise carry the effects of the
+            // disable or unbind they cause": at least a stop's, so a stop's
+            // facts bound them from below; more is allowed.
+            for u in &a.affected_units {
+                prop_assert!(b.affected_units.contains(u), "{desired:?} on {unit:?} lost {u:?}");
+            }
+            for d in a.disruption.members() {
+                prop_assert!(b.disruption.members().contains(&d), "{desired:?} on {unit:?} lost {d:?}");
+            }
+            prop_assert_eq!(b.sensitivity.union(&a.sensitivity), b.sensitivity, "{:?} on {:?}", desired, unit);
+            prop_assert!(b.touches_core || !a.touches_core);
+        }
+    }
+
+    /// §11: "Only `LeaveAlone` has no effect and no disruption": for any
+    /// unit, observation and caller, it touches the unit alone and carries
+    /// no disruption.
+    #[test]
+    fn leave_alone_has_no_effect(
+        which in any::<prop::sample::Index>(),
+        o in observed(),
+        uid in prop_oneof![Just(0u32), 1000..1002u32],
+    ) {
+        let defs = planarian_fake::fixtures::gym_units();
+        let ids: Vec<UnitId> = defs.keys().cloned().collect();
+        let unit = ids[which.index(ids.len())].clone();
+        let mut state = planarian_schema::fixtures::empty_state(1_000);
+        state.units.insert(unit.clone(), (o, Vec::new()));
+        let caller = Actor::user(uid);
+        let t = Transition::SetOverride(Override {
+            unit: unit.clone(),
+            desired: OverrideDesired::LeaveAlone,
+            until: Until::Explicit,
+            reason: "r".into(),
+            by: caller.clone(),
+            attribution: Attribution::Attested,
+            acknowledged: false,
+        });
+        let f = facts_of(&t, &defs, &state, caller);
+        prop_assert_eq!(&f.affected_units, &vec![unit.clone()]);
+        prop_assert!(f.disruption.is_none(), "LeaveAlone on {:?} carries {:?}", unit, f.disruption);
     }
 }
