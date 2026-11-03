@@ -2582,23 +2582,25 @@ fn mentions_exec(s: &str) -> bool {
     s.to_ascii_lowercase().contains("exec")
 }
 
-/// The journal: planariad's notices (which the binary writes to the system
-/// journal) name each Exec probe as one, and no typed probe as one.
+/// The journal (§12c's, Planarian's own; coordinator, Nov 3: not journald):
+/// a record names each Exec probe as one, and none names a typed probe as
+/// one. Read as each record renders, so any record kind will do; flagged,
+/// not re-journaled on every tick.
 #[test]
 fn an_exec_probe_is_flagged_in_the_journal() {
+    const TICKS: usize = 5;
     let mut r = Rig::new();
-    r.ticks(3);
+    r.ticks(TICKS);
+    let records: Vec<String> =
+        r.core.ex.kernel.journal.segment().unwrap().iter().map(|e| crate::render::record(&e.record)).collect();
     for (_, probe) in EXEC_PROBES {
-        assert!(
-            r.core.notices.iter().any(|n| n.contains(probe) && mentions_exec(n)),
-            "no notice flags the Exec probe {probe}: {:#?}",
-            r.core.notices
-        );
+        let n = records.iter().filter(|t| t.contains(probe) && mentions_exec(t)).count();
+        assert!(n >= 1, "no journal record flags the Exec probe {probe}: {records:#?}");
+        assert!(n < TICKS, "the Exec probe {probe} is journaled on every tick ({n} records)");
     }
     assert!(
-        !r.core.notices.iter().any(|n| n.contains(TYPED_PROBE.1) && mentions_exec(n)),
-        "a typed probe is flagged as Exec: {:#?}",
-        r.core.notices
+        !records.iter().any(|t| t.contains(TYPED_PROBE.1) && mentions_exec(t)),
+        "a typed probe is flagged as Exec in the journal: {records:#?}"
     );
 }
 
