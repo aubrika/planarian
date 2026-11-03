@@ -590,6 +590,16 @@ mod cgroups {
     const NEW: &str = "fedcba9876543210fedcba9876543210";
     const NEXT: &str = "00112233445566778899aabbccddeeff";
 
+    /// A test that needs user xattrs (on tmpfs, for the property) and has
+    /// none here: skipped, saying so, unless `NETWATCH_REQUIRE_XATTR_TESTS`
+    /// is set (where CI must run them), when it fails instead.
+    fn skipped(why: &str) {
+        if std::env::var_os("NETWATCH_REQUIRE_XATTR_TESTS").is_some() {
+            panic!("cannot run: {why} (NETWATCH_REQUIRE_XATTR_TESTS is set)");
+        }
+        eprintln!("skipped: {why}");
+    }
+
     /// A unit cgroup with its InvocationID (as `user.invocation_id`, which
     /// an unprivileged test can set); `false` if this filesystem refuses.
     fn start(dir: &std::path::Path, id: Option<&str>) -> bool {
@@ -615,7 +625,7 @@ mod cgroups {
         let (d, slice) = tree();
         let vpn = slice.join("wg-gym.service");
         if !start(&vpn, Some(NEW)) {
-            eprintln!("skipped: no user xattrs here");
+            skipped("no user xattrs here");
             return;
         }
         let mut c = Cgroups::new(d.path());
@@ -646,7 +656,7 @@ mod cgroups {
         let (d, slice) = tree();
         let vpn = slice.join("wg-gym.service");
         if !start(&vpn, Some(NEW)) {
-            eprintln!("skipped: no user xattrs here");
+            skipped("no user xattrs here");
             return;
         }
         let mut c = Cgroups::new(d.path()).without_inotify();
@@ -859,7 +869,7 @@ mod cgroups {
     #[test]
     fn invocations_end_only_once_seen_gone() {
         let Some(failed) = invocation_property(crate::cgroups::Mutant::None, 300) else {
-            eprintln!("skipped: no tmpfs with user xattrs at /dev/shm");
+            skipped("no tmpfs with user xattrs at /dev/shm");
             return;
         };
         assert!(failed.is_empty(), "{:?}", &failed[..failed.len().min(3)]);
@@ -871,7 +881,7 @@ mod cgroups {
         use crate::cgroups::Mutant;
         for m in [Mutant::FinishAll, Mutant::EndAtRemoval] {
             let Some(failed) = invocation_property(m, 300) else {
-                eprintln!("skipped: no tmpfs with user xattrs at /dev/shm");
+                skipped("no tmpfs with user xattrs at /dev/shm");
                 return;
             };
             eprintln!("{m:?} fails {} rounds, first {:?}", failed.len(), failed.first());
