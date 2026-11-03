@@ -17,6 +17,7 @@ let
     "kprobe/nfnetlink_rcv_batch"
     "fentry/nf_setsockopt"
     "fentry/genl_rcv_msg"
+    "fexit/register_netdevice"
   ];
   netwatchEbpf =
     if builtins.pathExists (netwatchCrate + "/Cargo.toml")

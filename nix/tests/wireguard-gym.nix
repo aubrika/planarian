@@ -11,9 +11,18 @@
 # a restart in progress long enough to observe the hold);
 # /run/wireguard-gym-broken makes its start fail.
 #
-# The peer's end is a kernel wg-quick interface listening on 51820. The
-# caller's peer must serve TCP 9000 (the Readiness probe's target) on the
-# tunnel address; neither end runs a server itself. The keys are test-only.
+# A full-tunnel VPN, as §12d's network tools are: its start sends all
+# traffic it is not more specifically routed through wg0 (0.0.0.0/1 and
+# 128.0.0.0/1, as wg-quick and OpenVPN's def1 do), after a host route to the
+# peer's endpoint by the path it had, so the tunnel's own UDP does not
+# loop. The unit adds those routes itself, so they are its claims and its
+# footprint reads `protecting yes`. Connected subnets (the LAN, the user
+# network's DHCP) stay direct; the hold decides them.
+#
+# The peer's end is a kernel wg-quick interface listening on 51820; it
+# forwards and masquerades what the tunnel brings. The caller's peer must
+# serve TCP 9000 (the Readiness probe's target) on the tunnel address;
+# neither end runs a server itself. The keys are test-only.
 { pkgs, lib }:
 
 let
@@ -22,8 +31,28 @@ let
     peer = { priv = "cNk4txfT3ovozycRTDaecu2vEpRnGpg4406CWwi+nXU="; pub = "l7HFMh19jc6/K32cwArdHyKr/tgskXKDvmM3wutKvA0="; };
   };
   port = 51820;
+  # An address beyond the LAN, held by the peer: what a full tunnel exists
+  # to carry. The machine's plain default route reaches it too (via the
+  # peer on the LAN), so with wg0 gone only the hold keeps it from leaving.
+  upstream = "198.51.100.1";
+  # The machine's tunnel up, after wireguard-go has made wg0 (its
+  # ExecStartPost); module-eval reads this text.
+  machineUp = endpoint: ''
+    for _ in $(seq 100); do [ -S /var/run/wireguard/wg0.sock ] && break; sleep 0.1; done
+    wg set wg0 private-key ${pkgs.writeText "wg-machine.key" keys.machine.priv} \
+      peer ${keys.peer.pub} endpoint ${endpoint}:${toString port} \
+      allowed-ips 0.0.0.0/0 persistent-keepalive 5
+    ip address add 10.77.0.1/24 dev wg0
+    ip link set wg0 up
+    # The endpoint by the path it has now, before the tunnel takes the rest.
+    path=$(ip -o route get ${endpoint} | sed -E 's/^[^ ]+ //; s/ (src|uid|cache) .*//')
+    ip route replace ${endpoint}/32 $path
+    ip route replace 0.0.0.0/1 dev wg0
+    ip route replace 128.0.0.0/1 dev wg0
+  '';
 in
 {
+  inherit machineUp upstream;
   machineAddress = "10.77.0.1";
   peerAddress = "10.77.0.2";
   inherit port;
@@ -34,7 +63,7 @@ in
       description = "WireGuard tunnel to the gym peer (wireguard-go)";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
-      path = [ pkgs.wireguard-tools pkgs.iproute2 pkgs.coreutils ];
+      path = [ pkgs.wireguard-tools pkgs.iproute2 pkgs.coreutils pkgs.gnused ];
       serviceConfig = {
         Type = "simple";
         Restart = "no";
@@ -52,14 +81,9 @@ in
           echo "wireguard-go exited (status $?)" >&2
           exit 1
         '';
-        ExecStartPost = pkgs.writeShellScript "wireguard-gym-up" ''
-          for _ in $(seq 100); do [ -S /var/run/wireguard/wg0.sock ] && break; sleep 0.1; done
-          wg set wg0 private-key ${pkgs.writeText "wg-machine.key" keys.machine.priv} \
-            peer ${keys.peer.pub} endpoint ${endpoint}:${toString port} \
-            allowed-ips 10.77.0.2/32 persistent-keepalive 5
-          ip address add 10.77.0.1/24 dev wg0
-          ip link set wg0 up
-        '';
+        ExecStartPost = pkgs.writeShellScript "wireguard-gym-up" (machineUp endpoint);
+        # The /1 routes go with wg0; the endpoint's host route does not.
+        ExecStopPost = "-${pkgs.iproute2}/bin/ip route del ${endpoint}/32";
       };
     };
     # A templated network tool (§12d: templates are classified like any
@@ -85,6 +109,14 @@ in
       };
     };
     systemd.targets.multi-user.wants = [ "gym-tpl@a.service" ];
+    # dhcpcd (10.3.1) segfaults when an interface it manages is deleted,
+    # which the crash subtest does to wg0; the tunnel's address is the
+    # unit's own (ExecStartPost), so its footprint carries it.
+    networking.dhcpcd.denyInterfaces = [ "wg*" ];
+    # The plain default route, via the peer on the LAN (below dhcpcd's on
+    # the user network): the tunnel's /1 routes are more specific while it
+    # is up; with wg0 gone, upstream would leave this way, unless held.
+    networking.defaultGateway = { address = endpoint; interface = "eth1"; metric = 10; };
 
     services.planarian.units.wireguard-gym = {
       sensitivity = [ "Security" "External" ];
@@ -99,6 +131,31 @@ in
 
   # The peer node's module.
   peer = {
+    networking.dhcpcd.denyInterfaces = [ "wg*" ];
+    # The tunnel's upstream: what the machine sends through it is forwarded
+    # and masqueraded out of the peer's other interfaces.
+    boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
+    # Upstream on lo, by a unit of its own: networking.interfaces.lo would
+    # never apply, since network-addresses-lo starts with lo's device unit
+    # and udev tags no `lo` for systemd (99-systemd.rules: KERNEL!="lo"),
+    # so the address was never there (gate run 41545741182).
+    systemd.services.wg-gym-upstream = {
+      description = "The gym's upstream address (${upstream} on lo)";
+      wantedBy = [ "multi-user.target" ];
+      before = [ "network.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${pkgs.iproute2}/bin/ip address replace ${upstream}/32 dev lo";
+      };
+    };
+    networking.nftables.enable = true;
+    networking.nftables.tables.wg-gym-nat = {
+      family = "ip";
+      content = ''
+        chain post { type nat hook postrouting priority srcnat; policy accept; iifname "wg0" oifname != "wg0" masquerade; }
+      '';
+    };
     networking.wg-quick.interfaces.wg0 = {
       address = [ "10.77.0.2/24" ];
       listenPort = port;

@@ -654,6 +654,9 @@ in
       # nix/netwatch-unordered.nix): their early changes may precede its
       # attach, and read as pre-attach steering (§12d).
       inherit (cfg) networkToolsUnordered;
+      # The network tools the systemd initrd also runs: their initrd run
+      # precedes netwatch; a stage-2 start is ordered after it (§12d).
+      inherit (cfg) networkToolsInitrd;
       userUnits = unitsOf "user";
       coreUnits = {
         "planariad.service" = unitHash "planariad.service";

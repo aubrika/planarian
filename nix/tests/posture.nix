@@ -35,6 +35,14 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    def settled():
+        # After planariad restarts: the posture jobs it queued (respond@,
+        # lift; queued --no-block) have run, and no alarm stands. A bare
+        # "no alarm" check can pass before respond has written one.
+        machine.wait_until_succeeds(
+            "test -z \"$(systemctl list-jobs --no-legend 'planarian-*')\" && test ! -e /run/planarian/alarm",
+            timeout=120)
+
     def alarm():
         return machine.succeed("cat /run/planarian/alarm 2>/dev/null || true").strip()
 
@@ -114,14 +122,14 @@ pkgs.testers.runNixOSTest {
         machine.succeed("/run/current-system/specialisation/lower/bin/switch-to-configuration test")
         machine.succeed("grep -q '\"posture\": *\"Relaxed\"' /etc/planarian/config.json || grep -q '\"posture\":\"Relaxed\"' /etc/planarian/config.json")
         machine.succeed("systemctl restart planariad.service")
-        machine.wait_until_succeeds("test ! -e /run/planarian/alarm", timeout=120)
+        settled()
         out = machine.succeed("planarian posture")
         assert out.strip().startswith("posture: Standard, boot-ready timeout 20 s"), out
         assert "declares Relaxed, 600 s" in out and "next boot" in out, out
         machine.succeed("/run/booted-system/bin/switch-to-configuration test")
         machine.succeed("systemctl restart planariad.service")
-        machine.wait_until_succeeds("test ! -e /run/planarian/alarm", timeout=120)
-        machine.wait_for_unit("gym-agent.service")
+        settled()
+        machine.wait_until_succeeds("systemctl is-active --quiet gym-agent.service", timeout=120)
 
     with subtest("Integrity: an external desired-state document with an invalid signature"):
         machine.succeed("mkdir -p /var/lib/planarian/external")
@@ -136,7 +144,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed("rm -r /var/lib/planarian/external")
         machine.succeed("planarian-ack")
         machine.succeed("systemctl restart planariad.service")
-        machine.wait_until_succeeds("test ! -e /run/planarian/alarm", timeout=120)
+        settled()
         machine.succeed("systemctl start gym-agent.service")
 
     with subtest("Integrity: a retained journal record edited on disk"):

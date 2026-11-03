@@ -97,7 +97,9 @@ let
     # the target's start failed (After= orders, it does not require).
     systemctl is-active --quiet planarian-ready.target || exit 0
     systemctl is-active --quiet planariad.service || exit 0
-    if [ -e /run/planarian/alarm ]; then
+    # A respond that has marked its class but not yet written the alarm
+    # counts: both are cleared together, so they cannot diverge.
+    if [ -e /run/planarian/alarm ] || [ -e /run/planarian/failed-absent ] || [ -e /run/planarian/failed-crashed ]; then
       rm -f /run/planarian/alarm /run/issue.d/50-planarian.issue /run/planarian/failed-absent /run/planarian/failed-crashed
       rm -f /run/planarian/sshd/posture.conf
       ${optionalString config.services.openssh.enable "systemctl try-reload-or-restart sshd.service || true"}
@@ -437,6 +439,11 @@ let
     in (ign == true || ign == "yes" || ign == "true") && !(lib.any (c: builtins.elem c [ "initrd-switch-root.target" "initrd-switch-root.service" ]) conf);
   initrdSurvivors = lib.optionals config.boot.initrd.systemd.enable
     (unordered.initrdSurvivors ++ lib.attrNames (lib.filterAttrs (_: initrdSurvives) config.boot.initrd.systemd.services));
+  # Every service the systemd initrd runs: the upstream list, the
+  # configuration's additional upstream units, and those it declares.
+  initrdRuns = lib.optionals config.boot.initrd.systemd.enable (unordered.initrdUpstream
+    ++ map (lib.removeSuffix ".service") (lib.filter (lib.hasSuffix ".service") (config.boot.initrd.systemd.additionalUpstreamUnits or [ ]))
+    ++ lib.attrNames config.boot.initrd.systemd.services);
   unorderedTools = lib.unique (unordered.cycle ++ lib.optionals netwatchOn initrdSurvivors);
   # The units ordered before planarian-netwatch.service in this
   # configuration, transitively (its After=, and every unit whose Before=
@@ -517,6 +524,12 @@ in
       readOnly = true;
       internal = true;
       description = "The network tools that do not start after planarian-netwatch.service (nix/netwatch-unordered.nix: its startup chain, and the systemd initrd's survivors), for the export.";
+    };
+    networkToolsInitrd = mkOption {
+      type = types.listOf types.str;
+      readOnly = true;
+      internal = true;
+      description = "The network tools the systemd initrd also runs, before netwatch exists (a template covers its instances), for the export.";
     };
     netwatchInitrdSurvivors = mkOption {
       type = types.listOf types.str;
@@ -611,7 +624,11 @@ in
     systemd.services.planarian-posture-lift = {
       description = "Planarian failure posture: lift restrictions once ready";
       wantedBy = [ "planarian-ready.target" ];
-      after = [ "planarian-ready.target" ];
+      # After the responses it lifts: a restart of planariad queues Absent
+      # (stopPost, --no-block) and reaches ready again before respond has
+      # finished; unordered, lift ran first, found nothing, and Absent
+      # stayed raised (VM run 41507137168, P16).
+      after = [ "planarian-ready.target" "planarian-respond@absent.service" "planarian-respond@crashed.service" ];
       serviceConfig = { Type = "oneshot"; ExecStart = lift; };
     };
 
@@ -671,6 +688,7 @@ in
     services.planarian.holdDropins = holdDropins;
     services.planarian.networkToolsUnordered = lib.filter (u: builtins.elem u unorderedTools) cfg.holdUnits;
     services.planarian.netwatchInitrdSurvivors = lib.filter (u: builtins.elem u initrdSurvivors) cfg.holdUnits;
+    services.planarian.networkToolsInitrd = lib.optionals netwatchOn (lib.filter (u: builtins.elem u initrdRuns) cfg.holdUnits);
     services.planarian.netwatchCycle = if netwatchOn then cyclicTools else [ ];
     assertions = lib.optional netwatchOn {
       assertion = lib.all (u: builtins.elem u unordered.cycle) cyclicTools;
@@ -732,7 +750,11 @@ in
         # footprints outlive netwatch's restarts).
         RuntimeDirectory = "planarian/footprint";
         RuntimeDirectoryPreserve = true;
-        CapabilityBoundingSet = [ "CAP_BPF" "CAP_PERFMON" "CAP_SYS_ADMIN" "CAP_NET_ADMIN" "CAP_DAC_READ_SEARCH" ];
+        # CAP_SYS_PTRACE: netwatch refuses to start outside the host's
+        # network namespace, checked against /proc/1/ns/net; reading it is
+        # a ptrace READ access, which a bounded root passes only with this
+        # (its permitted set is not a superset of pid 1's).
+        CapabilityBoundingSet = [ "CAP_BPF" "CAP_PERFMON" "CAP_SYS_ADMIN" "CAP_NET_ADMIN" "CAP_DAC_READ_SEARCH" "CAP_SYS_PTRACE" ];
       };
     };
     systemd.services."planarian-hold@" = {

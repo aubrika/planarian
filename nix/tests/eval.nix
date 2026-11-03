@@ -132,6 +132,13 @@ let
   ownSet = import ../own-units.nix;
   # planarian-netwatch exists only with the netwatch package; its ordering
   # is read from the definition the module would make.
+  # The shared netsec fixture (nix/tests/wireguard-gym.nix): a full-tunnel
+  # VPN, whose own start adds the routes that steer traffic, so its
+  # footprint protects and its failure holds (§12d).
+  wgg = import ./wireguard-gym.nix { inherit pkgs; inherit (pkgs) lib; };
+  wgUp = wgg.machineUp "192.0.2.1";
+  wgUnit = ((wgg.machine { endpoint = "192.0.2.1"; }).systemd.services.wireguard-gym).serviceConfig;
+  wgUpstream = wgg.peer.systemd.services.wg-gym-upstream;
   withNetwatch = s: s.extendModules { modules = [ { services.planarian.package = pkgs.lib.mkForce (s.config.services.planarian.package // { netwatch = true; }); } ]; };
   nwSys = withNetwatch sys;
   nwCfg = nwSys.config;
@@ -181,6 +188,7 @@ let
     (check (allowLines != [ ]) "the posture restricts sshd with AllowGroups (P14's check is not vacuous)")
     (check (builtins.all (l: pkgs.lib.hasInfix "AllowGroups planarian-admin root" l && !(pkgs.lib.hasInfix "wheel" l)) allowLines) "every AllowGroups the posture writes is planarian-admin and root, never wheel (§12d, P14)")
     (check (pkgs.lib.hasInfix "Include /run/planarian/sshd/*.conf" cfg.services.openssh.extraConfig) "sshd includes the posture's drop-in, so the restriction takes effect (§12d, P14)")
+    (check (builtins.all (r: builtins.elem "planarian-respond@${r}.service" cfg.systemd.services.planarian-posture-lift.after) [ "absent" "crashed" ] && pkgs.lib.hasInfix "[ -e /run/planarian/failed-absent ]" (builtins.readFile "${cfg.systemd.services.planarian-posture-lift.serviceConfig.ExecStart}")) "the lift runs after the Absent and Crashed responses and counts their markers, so a restart's Absent is lifted (§12d, P16)")
     (check (builtins.all (n: builtins.elem n hold.holdUnits) [ "gym-vpn" "nt-ambient" "nt-tun" "nt-inverted" "nt-root-bounded" "wg-quick-wg7" "firewall" ]) "each branch of the network-tool rule classifies (§12d): root with no bounding set, ambient CAP_NET_ADMIN, DeviceAllow /dev/net/tun, an inverted bounding set, a bounding set with CAP_NET_RAW, a netdev from the wg-quick tree, the firewall")
     (check (builtins.elem "planarian-test-vpn" hold.holdUnits) "a foreign unit named planarian-* is classified: Planarian's own units are excluded by the set the module declares, not by name (§12d)")
     (check (builtins.all (n: cfg.systemd.services ? ${n} || (n == "planarian-netwatch" && !(cfg.services.planarian.package.netwatch or false))) ownSet && builtins.all (n: !(builtins.elem n hold.holdUnits)) ownSet && !(sys.options.services.planarian ? ownUnits)) "every unit in the module's own set exists and none is classified; the set is no option, so no configuration can widen it")
@@ -203,12 +211,15 @@ let
     (check (holdUnit.serviceConfig.RemainAfterExit && pkgs.lib.hasSuffix " apply %i" holdUnit.serviceConfig.ExecStart && pkgs.lib.hasSuffix " lift %i" holdUnit.serviceConfig.ExecStop && pkgs.lib.hasSuffix " condition %i" holdUnit.serviceConfig.ExecCondition) "start applies, stop lifts, an unexpired release skips (§12d)")
     (check (nwUnit.serviceConfig.Type == "notify" && nwUnit.serviceConfig.NotifyAccess == "main" && nwUnit.serviceConfig.TimeoutStartSec == 30) "netwatch is ready only once attached (Type=notify), and boot never waits on it unbounded (§12d)")
     (check (builtins.all (u: builtins.elem u nwBefore) [ "network-pre.target" "firewall.service" "nftables.service" ]) "netwatch attaches before networking and the firewall, so their boot changes are attributed (§12d)")
+    (check (!(nwUnit.serviceConfig ? PrivateNetwork && nwUnit.serviceConfig.PrivateNetwork != false) && !(nwUnit.serviceConfig ? User && nwUnit.serviceConfig.User != "root") && !(nwUnit.serviceConfig ? NetworkNamespacePath) && !(nwUnit.serviceConfig.DynamicUser or false) && builtins.elem "CAP_SYS_PTRACE" nwUnit.serviceConfig.CapabilityBoundingSet) "netwatch runs as root in the host's network namespace, and may read pid 1's: it refuses to start in any other, and reads /proc/1/ns/net to check (§12d)")
+    (check (builtins.all (l: pkgs.lib.hasInfix l wgUp) [ "allowed-ips 0.0.0.0/0" "ip route replace 192.0.2.1/32 $path" "ip route replace 0.0.0.0/1 dev wg0" "ip route replace 128.0.0.0/1 dev wg0" ] && toString wgUnit.ExecStartPost == toString (pkgs.writeShellScript "wireguard-gym-up" wgUp) && pkgs.lib.hasSuffix "ip address replace ${wgg.upstream}/32 dev lo" wgUpstream.serviceConfig.ExecStart && builtins.elem "multi-user.target" wgUpstream.wantedBy && !(wgg.peer ? networking && wgg.peer.networking ? interfaces)) "the netsec fixture is a full-tunnel VPN: its own start routes 0.0.0.0/1 and 128.0.0.0/1 through wg0, after the endpoint's host route, so its footprint steers; the peer holds upstream on lo by a unit of its own (§12d)")
     (check (nwUnit.after == [ ] && !(nwUnit.unitConfig ? After) && nwUnit.unitConfig.DefaultDependencies == false && builtins.elem "nfnetlink" nwCfg.boot.initrd.kernelModules && builtins.elem "nfnetlink" nwCfg.boot.kernelModules && !(builtins.elem "nfnetlink" (nwSys.extendModules { modules = [ { boot.kernelModules = pkgs.lib.mkForce [ ]; } ]; }).config.boot.initrd.kernelModules) && nwUnit.serviceConfig.RuntimeDirectory == "planarian/footprint") "netwatch is ordered after nothing: nfnetlink comes from the initrd, its directory is its own (owner decision, Nov 2)")
     (check (builtins.elem "systemd-modules-load" nwHold.holdUnits && builtins.elem "systemd-udevd" nwHold.holdUnits && builtins.elem "nt-vpn@" nwHold.holdUnits) "early-boot and templated network tools exist here (the ordering check is not vacuous)")
     (check (builtins.all (u: builtins.elem u nwHold.networkToolsUnordered || nwOrdered u) nwHold.holdUnits) "every network tool not in nix/netwatch-unordered.nix starts after planarian-netwatch.service, a template's instances through its drop-in (owner decision, Nov 2)")
     (check (sortU nwHold.networkToolsUnordered == sortU (nwHold.netwatchCycle ++ nwHold.netwatchInitrdSurvivors) && builtins.all (u: builtins.elem u nwHold.holdUnits && (builtins.elem u unorderedSets.cycle || builtins.elem u (unorderedSets.initrdSurvivors ++ builtins.attrNames nwCfg.boot.initrd.systemd.services))) nwHold.networkToolsUnordered && nwCfg.services.planarian.export.networkToolsUnordered == nwHold.networkToolsUnordered) "the tools that do not start after netwatch are exactly those in its startup chain and the systemd initrd's survivors, and the export lists them")
     (check (bootHold.netwatchInitrdSurvivors != [ ] && builtins.elem "systemd-journald" bootHold.networkToolsUnordered && builtins.all nwOrderedIn bootHold.holdUnits) "on the demo VM (systemd initrd) journald, kept across switch-root, is listed as not starting after netwatch, and still carries the After= (a stage-2 restart is ordered)")
     (check ((nwSys.extendModules { modules = [ { boot.initrd.systemd.enable = pkgs.lib.mkForce false; } ]; }).config.services.planarian.networkToolsUnordered == nwHold.netwatchCycle) "with the scripted initrd, which keeps no unit across switch-root, only the startup chain is listed")
+    (check (builtins.elem "modprobe@" bootHold.networkToolsInitrd && builtins.elem "systemd-udevd" bootHold.networkToolsInitrd && bootSys.services.planarian.export.networkToolsInitrd == bootHold.networkToolsInitrd && (nwSys.extendModules { modules = [ { boot.initrd.systemd.enable = pkgs.lib.mkForce false; } ]; }).config.services.planarian.networkToolsInitrd == [ ]) "the network tools the systemd initrd also runs are exported (modprobe@ and udevd on the demo VM; none with the scripted initrd)")
     (check (builtins.filter (a: !a.assertion) nwCfg.assertions == [ ] && cycleSys.config.services.planarian.netwatchCycle == [ "nt-early" ] && builtins.any (a: pkgs.lib.hasInfix "would be a cycle: nt-early." a.message) cycleRefused) "a network tool ordered before netwatch, transitively, fails evaluation, naming it")
     (check (builtins.all (u: !(pkgs.lib.hasInfix "planarian-netwatch" hold.holdDropins."${u}.service.d/50-planarian-hold.conf")) hold.holdUnits) "without netwatch, no tool is ordered after it")
     (check (pkgs.lib.hasInfix "/run/planarian/footprint" holdScript && pkgs.lib.hasInfix "protecting yes" holdScript && pkgs.lib.hasInfix "unattributed" holdScript && pkgs.lib.hasInfix "-le 30" holdScript && pkgs.lib.hasInfix "/proc/uptime" holdScript && pkgs.lib.hasInfix "-ge -5" holdScript && pkgs.lib.hasInfix ".unattributed" holdScript && pkgs.lib.hasInfix "its footprint is stale" holdScript) "the hold's condition reads the footprint and fails closed on a stale watch, a stale footprint, or a standing unattributed change (§12d)")
@@ -361,5 +372,12 @@ pkgs.runCommand "planarian-module-eval.json" {
   printf '%s\n' ${pkgs.lib.escapeShellArgs (bootHold.netwatchCycle ++ bootHold.networkToolsUnordered)} | grep -v '^$' | sort -u > got
   diff want got || { echo "networkToolsUnordered differs from the initrd's survivors among the network tools (above: < from the files, > exported)" >&2; exit 1; }
   echo "ok: the systemd initrd's survivors that are network tools ($(tr '\n' ' ' < want)) are exactly networkToolsUnordered"
+  # Every service the initrd ships, among the network tools, is exactly
+  # networkToolsInitrd.
+  for f in $initrd/*.service; do basename "$f" .service; done | sort > initrd-all
+  comm -12 initrd-all tools > want-initrd
+  printf '%s\n' ${pkgs.lib.escapeShellArgs bootHold.networkToolsInitrd} | grep -v '^$' | sort -u > got-initrd
+  diff want-initrd got-initrd || { echo "networkToolsInitrd differs from the initrd's services among the network tools (< files, > exported)" >&2; exit 1; }
+  echo "ok: the network tools the systemd initrd runs ($(wc -l < want-initrd)) are exactly networkToolsInitrd"
   cp $exportPath $out
 ''

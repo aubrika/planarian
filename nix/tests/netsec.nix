@@ -112,6 +112,15 @@ pkgs.testers.runNixOSTest {
         return "curl -sf --max-time 5 -o /dev/null http://peer:8000/"
     def tunnel_ok():
         return "curl -sf --max-time 5 -o /dev/null http://10.77.0.2:9000/"
+    # Upstream: an address beyond the LAN, served by the peer (wgg.upstream).
+    # A full-tunnel VPN carries it over wg0 (0/1 and 128/1); with wg0 gone,
+    # the machine's plain default route still reaches it, so a held machine
+    # failing to reach it is the hold's doing, not a missing route.
+    UP = "${wgg.upstream or "198.51.100.1"}"
+    def up_ok():
+        return f"curl -sf --max-time 5 -o /dev/null http://{UP}:8000/"
+    def up_via_tunnel():
+        return f"ip route get {UP} | grep -q 'dev wg0'"
     def new_ssh(user):
         return f"ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o ControlPath=none -i /root/key {user}@machine true"
     def alarms():
@@ -149,6 +158,9 @@ pkgs.testers.runNixOSTest {
     with subtest("baseline: the tunnel, the LAN and new SSH logins all work"):
         machine.wait_until_succeeds(tunnel_ok(), timeout=60)
         machine.succeed(lan_ok())
+        # Full tunnel: upstream goes over wg0, and arrives.
+        machine.succeed(up_via_tunnel())
+        machine.wait_until_succeeds(up_ok(), timeout=30)
         peer.succeed(new_ssh("alice"))
         not_held()
         assert alarms() == 0
@@ -182,10 +194,22 @@ pkgs.testers.runNixOSTest {
         held()
         # The unit is down (killed; its restart still starting): no tunnel.
         machine.fail(tunnel_ok())
+        # The leak a kill switch exists for: wg0 is gone, so upstream would
+        # leave by the plain default route; held, it does not arrive.
+        machine.fail(up_via_tunnel())
+        machine.fail(up_ok())
         machine.succeed("curl -sf --max-time 5 -o /dev/null http://127.0.0.1:8001/")
         peer.succeed("ssh -S /tmp/bob.sock bob@machine true")
         peer.fail(new_ssh("alice"))
         peer.fail(new_ssh("bob"))
+        # Address assignment passes the hold (§12d: "except loopback,
+        # address assignment (DHCP, …)"): a lease renewed while held
+        # succeeds, so a held machine never loses its address.
+        leased = "journalctl -b -u dhcpcd -o cat | grep -c 'eth0: leased' || true"
+        n0 = int(machine.succeed(leased).strip() or 0)
+        machine.succeed("dhcpcd --rebind eth0")
+        machine.wait_until_succeeds(f"[ $({leased}) -gt {n0} ]", timeout=20)
+        held()
         # Restarted by Planarian at once; the hold lifts once it is Running
         # and its Readiness probe passes. That probe crosses the tunnel
         # (wireguard-gym-tunnel, 10.77.0.2:9000), so the lift itself shows the
@@ -195,6 +219,8 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds("systemctl is-active wireguard-gym.service", timeout=120)
         machine.wait_until_succeeds(lan_ok(), timeout=60)
         machine.wait_until_succeeds(tunnel_ok(), timeout=60)
+        machine.succeed(up_via_tunnel())
+        machine.wait_until_succeeds(up_ok(), timeout=30)
         peer.succeed(new_ssh("alice"))
         not_held()
         assert alarms() == 1, alarms()
