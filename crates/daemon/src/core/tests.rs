@@ -2937,3 +2937,60 @@ fn a_hold_stands_until_the_unit_is_back_even_if_it_stopped_protecting() {
     assert!(!r.fake.w().held.contains(&web), "still held: {:?}", r.core.notices);
     assert!(r.core.ledger().holds().is_empty(), "{:?}", r.core.ledger().hold_events);
 }
+
+/// The gate over every state of the feed, not a sample of them: a tool that
+/// stops outside Planarian is held exactly when the kernel attributes
+/// steering to it or the feed cannot be read (4 combinations, 2 lengths).
+#[test]
+fn the_gate_is_exact_over_every_state_of_the_feed() {
+    let web = UnitId::service("gym-web");
+    for steers in [false, true] {
+        for unreadable in [false, true] {
+            for ticks in [3, 9] {
+                let mut r = rig_with_tool(true, false, steers);
+                r.fake.w().protecting_unreadable = unreadable;
+                r.fake.w().stop_out_of_band(&web);
+                r.ticks(ticks);
+                let asked = r.fake.w().calls.iter().any(|c| c.call.starts_with("hold(service:gym-web)"));
+                let journaled = r.core.ledger().hold_events.iter().any(|e| e.0 == web && e.1);
+                let want = steers || unreadable;
+                assert_eq!((asked, journaled), (want, want), "steers {steers} unreadable {unreadable} {ticks} ticks");
+            }
+        }
+    }
+}
+
+/// A hold that landed on the host (OnFailure=) before the tool stopped
+/// protecting, and that the daemon has not journaled yet, is still looked
+/// after: journaled, then lifted once the tool is back.
+#[test]
+fn a_hold_only_the_host_has_is_still_lifted_when_the_tool_stops_protecting() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_tool(true, true, true);
+    r.fake.w().kill(&web);
+    r.fake.w().stops_steering(&web);
+    r.ticks(40);
+    assert!(!r.fake.w().held.contains(&web), "stranded on the host: {:?}", r.core.notices);
+    assert!(r.core.ledger().holds().is_empty(), "{:?}", r.core.ledger().hold_events);
+}
+
+/// A hold the journal has but the host no longer shows (flushed) for a tool
+/// that has stopped protecting is still looked after, and the journal's hold
+/// is lifted once the tool is back.
+#[test]
+fn a_hold_only_the_journal_has_is_still_lifted_when_the_tool_stops_protecting() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_tool(true, false, true);
+    r.fake.w().stop_out_of_band(&web);
+    for _ in 0..10 {
+        if r.core.ledger().hold_events.iter().any(|e| e.0 == web && e.1) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.core.ledger().holds().contains(&web), "never journaled: {:?}", r.core.notices);
+    r.fake.w().held.remove(&web);
+    r.fake.w().stops_steering(&web);
+    r.ticks(40);
+    assert!(r.core.ledger().holds().is_empty(), "left in the journal: {:?}", r.core.ledger().hold_events);
+}
