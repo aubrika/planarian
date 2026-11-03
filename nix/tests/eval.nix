@@ -46,6 +46,14 @@ let
         # A templated network tool (an openvpn@-style VPN): classified, its
         # instances carry the hold.
         systemd.services."nt-vpn@" = { script = "true"; };
+        # Its instances: one known only to the manifest (classified by its
+        # template), one with its own definition laid over the template.
+        services.planarian.units."nt-vpn@office" = { };
+        systemd.services."nt-vpn@home" = { overrideStrategy = "asDropin"; serviceConfig.Environment = "NT_HOME=1"; };
+        services.planarian.units."nt-vpn@home" = { };
+        # An instance of a template that is not a network tool.
+        systemd.services."not-tpl@" = { script = "true"; serviceConfig = { DynamicUser = true; CapabilityBoundingSet = ""; }; };
+        services.planarian.units."not-tpl@a" = { };
         # A foreign unit named like Planarian's: classified like any other.
         systemd.services.planarian-test-vpn = { script = "true"; serviceConfig = { DynamicUser = true; AmbientCapabilities = [ "CAP_NET_ADMIN" ]; }; };
         systemd.services.not-bounded-empty = { script = "true"; serviceConfig.CapabilityBoundingSet = ""; };
@@ -185,6 +193,10 @@ let
     after = builtins.elemAt (builtins.split "pub struct UnitDef [{]" (builtins.readFile ../../crates/schema/src/unit.rs)) 2;
   in builtins.head (builtins.split "\n}\n" after);
   unitDefFields = map builtins.head (builtins.filter builtins.isList (builtins.split "pub ([a-z_]+):" unitDefBody));
+  # The set planariad must read as network tools: the module's list, each
+  # template standing for its instances.
+  toolOrInstance = n: builtins.elem n hold.holdUnits
+    || (let m = builtins.match "([^@]+@).+" n; in m != null && builtins.elem (builtins.head m) hold.holdUnits);
   unitKeysRead = u: builtins.all (k: builtins.elem k unitDefFields) (builtins.attrNames u);
   checks = [
     (check (builtins.any isExec probes) "the configuration exports an Exec probe (P11's check is not vacuous)")
@@ -207,7 +219,8 @@ let
     (check (hold.holdDropins."firewall.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "the firewall is a network tool from its configuration, not its name (§12d)")
     (check (builtins.sort builtins.lessThan export.networkTools == builtins.sort builtins.lessThan hold.holdUnits) "the export lists every network tool, declared or not (netwatch's footprints)")
     (check (vpn.holds && vpn.hold_allow == [ { address = "192.0.2.7"; port = 51820; protocol = "udp"; } ] && vpn.hold_interfaces == [ "wg9" ]) "a network tool exports holds, its holdAllow and its holdInterfaces (§9, §12d)")
-    (check (builtins.all (u: u.holds == (builtins.elem (pkgs.lib.removePrefix "service:" u.id) hold.holdUnits)) export.units && builtins.all (u: !u.holds) export.userUnits) "every exported unit's holds is the computed rule")
+    (check (builtins.all (u: u.holds == toolOrInstance (pkgs.lib.removePrefix "service:" u.id)) export.units && builtins.all (u: !u.holds) export.userUnits) "every exported unit's holds is the computed rule: a network tool, or an instance of a templated one")
+    (check ((unit "service:nt-vpn@office").holds && (unit "service:nt-vpn@home").holds && !(unit "service:not-tpl@a").holds) "a templated network tool's instances export holds, declared or not; a non-tool template's do not (§12d)")
     (check (builtins.length unitDefFields > 10 && builtins.elem "holds" unitDefFields && !(pkgs.lib.hasInfix "rename" unitDefBody) && !(pkgs.lib.hasInfix "alias" unitDefBody) && !(pkgs.lib.hasInfix "flatten" unitDefBody)) "the daemon's UnitDef is read from its source, and its field names are the export's keys")
     (check (builtins.all unitKeysRead (export.units ++ export.userUnits) && !(unitKeysRead (vpn // { network_tool = true; }))) "the daemon's field: every key the export gives a unit is a UnitDef field, so none is dropped and read as its default (a renamed key is refused)")
     (check (!(sys.options.services.planarian.units.type.getSubOptions [ ] ? holds) && !(sys.options.services.planarian.units.type.getSubOptions [ ] ? networkTool)) "holds is not a manifest option, so no unit can opt out of the hold (§12d)")

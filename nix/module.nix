@@ -130,10 +130,23 @@ let
     || grants (sc.AmbientCapabilities or [ ]) netCaps
     || (root && (bounding == null || grants bounding netCaps))
     || lib.any (d: lib.hasInfix "/dev/net/tun" d || lib.hasInfix "/dev/ppp" d) devices;
-  isNetworkTool = name:
-    if ownUnits name || !(config.systemd.services ? ${name}) then false
-    else let r = builtins.tryEval (builtins.deepSeq (isNetworkToolUnchecked name) (isNetworkToolUnchecked name)); in
+  # Classified from its own definition; a failed evaluation is a tool.
+  isNetworkToolDefined = name:
+    let r = builtins.tryEval (builtins.deepSeq (isNetworkToolUnchecked name) (isNetworkToolUnchecked name)); in
       !r.success || r.value;
+  # `prefix@inst` -> `prefix@`, else null.
+  templateOf = name: let m = builtins.match "([^@]+@).+" name; in if m == null then null else builtins.head m;
+  # A unit, or an instance of a template. An instance runs its template's
+  # configuration, with any `systemd.services."prefix@inst"` definition
+  # laid over it as a drop-in, so it is a tool when its template is or its
+  # own definition is (failing closed: an override that removes the
+  # template's capabilities still counts). Own units, and own templates'
+  # instances, never are.
+  isNetworkTool = name:
+    let t = templateOf name; in
+    if ownUnits name || (t != null && ownUnits t) then false
+    else (config.systemd.services ? ${name} && isNetworkToolDefined name)
+      || (t != null && config.systemd.services ? ${t} && isNetworkToolDefined t);
   # The build-time half of "network-security unit" (§12d); the runtime half
   # is the footprint, read by the hold's condition. The one rule: it feeds
   # the export's `holds` (computed, never settable; `UnitDef.holds` reads
