@@ -1,0 +1,83 @@
+# The eBPF half of netwatch (§12d "Which units"; crates/backends/netwatch):
+# `src` is a no_std aya-ebpf crate, built for bpfel-unknown-none to
+# $out/share/planarian/netwatch.bpf.o (core package, coreFiles; I2).
+#
+# Built with the pinned rustc (nixpkgs) and RUSTC_BOOTSTRAP=1 for
+# -Z build-std=core, and nixpkgs' bpf-linker (coordinator, Nov 2;
+# docs/pins.md): no second toolchain. bpf-linker must use rustc's LLVM:
+# the build fails if their majors differ, rather than producing a broken
+# object. -Z build-std resolves the standard library's own lockfile, so its
+# crates are vendored next to the crate's.
+{ lib, stdenv, rustPlatform, rustc, cargo, bpf-linker, lndir, binutils-unwrapped, src, name ? "netwatch", sections ? [ ] }:
+
+let
+  library = rustPlatform.rustLibSrc;
+  vendorCrate = rustPlatform.importCargoLock { lockFile = "${src}/Cargo.lock"; };
+  # A fixed-output vendor of the library's crates: read at build time, not
+  # at evaluation (importCargoLock would read the library's lockfile at
+  # evaluation, building rust-lib-src first, which an offline evaluation,
+  # e.g. the installer's, cannot). Pinned to the rustc at the pin; a rustc
+  # bump changes the hash and fails here until it is renewed.
+  vendorStd = rustPlatform.fetchCargoVendor {
+    src = library;
+    name = "rust-lib-src";
+    hash = "sha256-5oJ/mtsJW0R3F7jgxafP23+WMLkyMKu10De5WIzb7Ro=";
+  };
+  rustcLlvm = lib.versions.major (rustc.llvm.version or rustc.llvmPackages.llvm.version);
+  linkerLlvm = lib.versions.major (lib.findFirst (d: lib.hasPrefix "llvm-" (d.name or "")) { version = "none"; } (bpf-linker.buildInputs ++ bpf-linker.nativeBuildInputs)).version;
+in
+assert lib.assertMsg (sections != [ ])
+  "netwatch-ebpf: name the loader's program sections, so a missing program fails the build";
+assert lib.assertMsg (rustcLlvm == linkerLlvm)
+  "netwatch-ebpf: rustc's LLVM (${rustcLlvm}) and bpf-linker's (${linkerLlvm}) differ; the eBPF object would be broken";
+stdenv.mkDerivation {
+  pname = "${name}-ebpf";
+  version = "0";
+  inherit src;
+  nativeBuildInputs = [ rustc cargo bpf-linker lndir binutils-unwrapped ];
+  dontConfigure = true;
+  buildPhase = ''
+    runHook preBuild
+    # A sysroot carrying the library sources, for -Z build-std.
+    mkdir -p sysroot/lib/rustlib/src/rust
+    for d in ${rustc.unwrapped or rustc}/lib/rustlib/*; do ln -s "$d" sysroot/lib/rustlib/; done
+    ln -s ${library} sysroot/lib/rustlib/src/rust/library
+    printf '#!${stdenv.shell}\nexec ${rustc}/bin/rustc --sysroot %s "$@"\n' "$PWD/sysroot" > rustc-sysroot
+    chmod +x rustc-sysroot
+    # One vendor directory for the crate's and the library's dependencies.
+    mkdir vendor
+    lndir -silent ${vendorCrate} vendor
+    lndir -silent ${vendorStd}/source-registry-0 vendor
+    mkdir -p .cargo
+    cat > .cargo/config.toml <<CFG
+    [source.crates-io]
+    replace-with = "vendored"
+    [source.vendored]
+    directory = "$PWD/vendor"
+    CFG
+    export CARGO_HOME=$PWD/.cargo-home RUSTC=$PWD/rustc-sysroot RUSTC_BOOTSTRAP=1
+    cargo build --offline --frozen --release --target bpfel-unknown-none -Z build-std=core
+    runHook postBuild
+  '';
+  installPhase = ''
+    runHook preInstall
+    # The crate's [[bin]] is the object (`netwatch`; lane-change-path's
+    # contract). Not "the first file there": that was cargo's empty
+    # .cargo-lock.
+    obj=target/bpfel-unknown-none/release/${name}
+    # It must be a non-empty ELF object for eBPF (e_machine 247, EM_BPF), or
+    # the build fails rather than shipping an object netwatch cannot load.
+    [ -s "$obj" ] || { echo "netwatch-ebpf: $obj is missing or empty" >&2; exit 1; }
+    [ "$(od -An -tx1 -N4 "$obj" | tr -d ' \n')" = 7f454c46 ] || { echo "netwatch-ebpf: $obj is not ELF" >&2; exit 1; }
+    [ "$(od -An -tu2 -j18 -N2 --endian=little "$obj" | tr -d ' ')" = 247 ] || { echo "netwatch-ebpf: $obj is not an eBPF object" >&2; exit 1; }
+    # Every program section the loader expects (e.g. fentry/<function>).
+    for sec in ${lib.escapeShellArgs sections}; do
+      readelf -SW "$obj" | grep -qF " $sec " || { echo "netwatch-ebpf: $obj has no section $sec" >&2; exit 1; }
+    done
+    install -Dm444 "$obj" $out/share/planarian/${name}.bpf.o
+    runHook postInstall
+  '';
+  # An eBPF object: nothing to patch, and stripping would drop its BTF.
+  dontFixup = true;
+  meta.description = "The eBPF object of Planarian's netwatch";
+}
