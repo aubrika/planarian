@@ -1271,10 +1271,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 // the host cannot confirm counts as held (fail closed: the
                 // unit is restarted, never inferred stopped). The next
                 // network_holds journals it, by the daemon.
-                // Deliberate and rare: hold() blocks the tick for up to its
-                // 3 s timeout, only here (a network tool's unattributed stop
-                // outside Planarian), and P9's slow-tick warning says so by
-                // design. Deciding before the residue is recorded is the
+                // Deliberate and rare: hold() blocks the tick while the hold
+                // unit starts (its condition waits about 3 s), and the call
+                // itself (`hold::apply`, `systemctl start`) can block up to
+                // its 30 s timeout; only here (a network tool's unattributed
+                // stop outside Planarian), and P9's slow-tick warning says so
+                // by design. Bounding the daemon's wait is a follow-up. Deciding before the residue is recorded is the
                 // point: an Inferred stop must not be written for a unit
                 // whose traffic is then held.
                 let held = match self.b.units().hold(u) {
