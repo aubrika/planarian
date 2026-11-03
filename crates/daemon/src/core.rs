@@ -1679,7 +1679,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     for inc in linked {
                         self.incident_parked.remove(&inc);
                         if let Submitted::Finished { state, .. } = &r
-                            && let Some(i) = self.incidents.record_attempt(inc, id, outcome_of(state), now)
+                            && let Some(i) =
+                                self.incidents.record_attempt(inc, id, outcome_of(state), self.b.clock().now())
                         {
                             self.journal(Record::Incident(i));
                         }
@@ -1882,9 +1883,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     .then(|| (u.clone(), diagnose::root_cause(u, &inputs), st))
             })
             .collect();
+        // §13: a cooldown or hold set here runs from the decision, read
+        // after the work before it, as an attempt's backoff does (not from
+        // the observation's start).
         match diagnose::next(&inc, &inputs) {
             None => {
-                if let Some(i) = self.incidents.exhausted(inc.id, now) {
+                if let Some(i) = self.incidents.exhausted(inc.id, self.b.clock().now()) {
                     self.journal(Record::Incident(i));
                 }
                 self.notice(format!(
@@ -1896,7 +1900,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             Some(c)
                 if c.transition == Transition::Rollback && s.security_floor.is_some_and(|f| s.known_good.0 < f.0) =>
             {
-                if let Some(i) = self.incidents.escalate(inc.id, EscalationReason::RevertBlockedByFloor, now) {
+                if let Some(i) =
+                    self.incidents.escalate(inc.id, EscalationReason::RevertBlockedByFloor, self.b.clock().now())
+                {
                     self.journal(Record::Incident(i));
                 }
                 self.notice(format!(
@@ -1949,7 +1955,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         self.incident_parked.insert(inc.id, txn);
                     }
                     Submitted::Finished { txn, state, .. } => {
-                        if let Some(i) = self.incidents.record_attempt(inc.id, txn, outcome_of(&state), now) {
+                        // §13: the backoff runs from the attempt itself, not
+                        // from the observation that found it actionable
+                        // (which may have taken a while): read after it ran,
+                        // so the next attempt is never closer than the floor.
+                        let at = self.b.clock().now();
+                        if let Some(i) = self.incidents.record_attempt(inc.id, txn, outcome_of(&state), at) {
                             if matches!(i.state, IncidentState::Cooldown { .. }) {
                                 self.notice(format!(
                                     "{}: tried {} time(s) and it keeps failing; it needs a person (I'll try once more in {} min)",
@@ -1999,7 +2010,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         ));
                     }
                     Submitted::Rejected { reason, detail, .. } => {
-                        if let Some(i) = self.incidents.exhausted(inc.id, now) {
+                        if let Some(i) = self.incidents.exhausted(inc.id, self.b.clock().now()) {
                             self.journal(Record::Incident(i));
                         }
                         self.notice(format!(
