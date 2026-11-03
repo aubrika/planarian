@@ -1817,7 +1817,7 @@ mod hold_order {
             let mut poll = death;
             let release = |v: &FootprintView, now: u64| match order {
                 Order::NotProtecting => !v.protecting_now("wireguard-gym", now),
-                _ => hold_may_release(&v, &vpn(), Some(NEW), now),
+                _ => hold_may_release(v, &vpn(), Some(NEW), now),
             };
             let mut in_time = false;
             for &(d, e, lost) in &passes {
