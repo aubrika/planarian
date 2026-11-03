@@ -569,7 +569,7 @@ mod loader_checks {
 /// with its change; a cgroup never seen fails closed.
 #[cfg(feature = "loader")]
 mod cgroups {
-    use crate::cgroups::Cgroups;
+    use crate::cgroups::{Cgroups, Via};
     use crate::{Change, ChangeKind, Owner, Tracker, WatchState};
     use planarian_schema::UnitId;
     use std::collections::BTreeSet;
@@ -623,7 +623,12 @@ mod cgroups {
         std::fs::remove_dir(&vpn).unwrap();
         c.drain();
         assert_eq!(state(&c, "wg-gym"), inv(Some(NEW), false), "not ended before the ring drain");
-        assert_eq!(c.finish(), vec![UnitId::service("wg-gym")]);
+        let ended = c.finish();
+        assert_eq!(
+            ended.iter().map(|e| (&e.unit, e.via)).collect::<Vec<_>>(),
+            vec![(&UnitId::service("wg-gym"), Via::InDelete)]
+        );
+        assert_eq!(ended[0].id.as_deref(), Some(NEW));
         assert_eq!(state(&c, "wg-gym"), inv(Some(NEW), true));
         assert!(c.finish().is_empty(), "once");
         assert!(start(&vpn, Some(NEXT)));
@@ -647,7 +652,11 @@ mod cgroups {
         let mut c = Cgroups::new(d.path()).without_inotify();
         std::fs::remove_dir(&vpn).unwrap();
         c.drain();
-        assert_eq!(c.finish(), vec![UnitId::service("wg-gym")]);
+        let ended = c.finish();
+        assert_eq!(
+            ended.iter().map(|e| (&e.unit, e.via)).collect::<Vec<_>>(),
+            vec![(&UnitId::service("wg-gym"), Via::Stat)]
+        );
         assert_eq!(state(&c, "wg-gym"), inv(Some(NEW), true));
     }
 
