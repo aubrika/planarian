@@ -394,6 +394,19 @@ let
         if grep -qx 'protecting yes' "$f" || grep -qx 'unattributed' "$f"; then
           exit 0
         fi
+        # 3. The footprint must be this run's (owner decision, Nov 3): netwatch
+        #    records the unit's InvocationID (its cgroup's
+        #    trusted.invocation_id) as `invocation <32 hex>`, and systemd keeps
+        #    the failed run's ID until the next start. A footprint from an
+        #    earlier run (a restart that steered and died before netwatch
+        #    rewrote it), or an ID missing on either side, says nothing about
+        #    this run: hold.
+        want=$(systemctl show -P InvocationID "$unit.service" 2>/dev/null || true)
+        got=$(awk '$1 == "invocation" { print $2; exit }' "$f")
+        if [ -z "$want" ] || [ -z "$got" ] || [ "$got" != "$want" ]; then
+          log "holding for $unit: its footprint is not this run's (footprint ''${got:-none}, unit ''${want:-none})"
+          exit 0
+        fi
         log "$unit failed but was not protecting traffic: not held"
         exit 1 ;;
       apply)

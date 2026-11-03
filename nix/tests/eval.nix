@@ -264,7 +264,12 @@ pkgs.runCommand "planarian-module-eval.json" {
   nativeBuildInputs = [ pkgs.gnused pkgs.gawk pkgs.diffutils ];
 } ''
   root=$PWD/run
-  sed "s|/run/planarian|$root|g" ${builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart)} > hold
+  # A stub systemctl, first on the script's PATH: the unit's InvocationID
+  # is $STUB_INV (empty: the unit has none).
+  cstub=$PWD/cstub; mkdir -p $cstub
+  printf '#!${pkgs.runtimeShell}\nprintf "%%s\\n" "$STUB_INV"\n' > $cstub/systemctl; chmod +x $cstub/systemctl
+  I=0123456789abcdef0123456789abcdef; export STUB_INV=$I
+  sed -e "s|/run/planarian|$root|g" -e "s|^PATH=|PATH=$cstub:|" ${builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart)} > hold
   chmod +x hold
   F=$root/footprint R=$root/hold-released
   mkdir -p $F $R
@@ -273,20 +278,28 @@ pkgs.runCommand "planarian-module-eval.json" {
     [ "$got" = "$want" ] || { echo "hold condition: $* -> $got, expected $want" >&2; exit 1; }
     echo "ok: $* -> $got"; }
   echo "attached $up" > $F/.watch
-  printf 'protecting no\nat %s\n' "$up" > $F/u;            expect 1 "a fresh protecting no skips"
-  printf 'protecting no\nat %s\n' "$((up - 40))" > $F/u;   expect 0 "a stale stamp holds"
-  printf 'protecting no\nat %s\n' "$wall" > $F/u;          expect 0 "a wall-clock-epoch stamp holds"
-  printf 'protecting yes\nat %s\n' "$up" > $F/u;           expect 0 "protecting yes holds"
-  printf 'protecting no\nat %s\nunattributed\n' "$up" > $F/u; expect 0 "an unattributed change charged here holds"
-  printf 'protecting no\nat %s\n' "$up" > $F/u
+  printf 'protecting no\nat %s\ninvocation %s\n' "$up" "$I" > $F/u;            expect 1 "a fresh protecting no skips"
+  printf 'protecting no\nat %s\ninvocation %s\n' "$((up - 40))" "$I" > $F/u;   expect 0 "a stale stamp holds"
+  printf 'protecting no\nat %s\ninvocation %s\n' "$wall" "$I" > $F/u;          expect 0 "a wall-clock-epoch stamp holds"
+  printf 'protecting yes\nat %s\ninvocation %s\n' "$up" "$I" > $F/u;           expect 0 "protecting yes holds"
+  printf 'protecting no\nat %s\ninvocation %s\nunattributed\n' "$up" "$I" > $F/u; expect 0 "an unattributed change charged here holds"
+  printf 'protecting no\nat %s\ninvocation %s\n' "$up" "$I" > $F/u
   echo x > $F/.unattributed;                                expect 0 "a standing unattributed change anywhere holds"
   rm $F/.unattributed
   echo "attached $((up - 40))" > $F/.watch;                 expect 0 "a stale watch holds"
   echo "failed lost" > $F/.watch;                           expect 0 "a failed watch holds"
   echo "attached $up" > $F/.watch
   rm $F/u;                                                  expect 0 "a missing footprint holds"
+  # This run's footprint only (owner decision, Nov 3): InvocationID.
+  printf 'protecting no\nat %s\ninvocation %s\n' "$up" "$I" > $F/u; expect 1 "this run's fresh protecting no skips"
+  printf 'protecting no\nat %s\ninvocation %s\n' "$up" "fedcba9876543210fedcba9876543210" > $F/u
+  expect 0 "an earlier run's footprint (another InvocationID) holds"
+  printf 'protecting no\nat %s\n' "$up" > $F/u;            expect 0 "a footprint without an InvocationID holds"
+  printf 'protecting no\nat %s\ninvocation %s\n' "$up" "$I" > $F/u
+  export STUB_INV=; expect 0 "a unit with no InvocationID holds"; export STUB_INV=$I
+  rm $F/u
   # The release cases: the footprint protects, so only the release decides.
-  printf 'protecting yes\nat %s\n' "$up" > $F/u
+  printf 'protecting yes\nat %s\ninvocation %s\n' "$up" "$I" > $F/u
   echo "$((wall + 600)) $((up + 600))" > $R/u;              expect 1 "an unexpired release skips"
   echo "$((wall - 1)) $((up + 600))" > $R/u;                expect 0 "an expired release (wall clock) holds"
   echo "$((wall + 600)) $((up - 1))" > $R/u;                expect 0 "an expired release (boottime, a clock step) holds"
