@@ -621,3 +621,199 @@ mod cg {
         }
     }
 }
+
+// ---- B-22 (b): what the tracker does with a WireGuard device read ---------
+
+mod wgfold {
+    use super::*;
+    use crate::wg::Device;
+    use crate::{Endpoint, Invocation, Proto};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    const UNITS: usize = 3;
+    const DEVS: usize = 3;
+
+    fn unit(i: usize) -> UnitId {
+        u(&format!("wg-quick-{i}"))
+    }
+
+    fn dev_name(d: usize) -> String {
+        format!("wg{d}")
+    }
+
+    fn ep(n: u8) -> Endpoint {
+        Endpoint { proto: Proto::Udp, addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, n)), port: 51_000 + n as u16 }
+    }
+
+    /// One read of the kernel: the devices that exist, each with its peers'
+    /// endpoints (numbers standing for addresses).
+    type Read = Vec<(usize, BTreeSet<u8>)>;
+
+    fn devices(r: &Read) -> Vec<Device> {
+        r.iter()
+            .map(|(d, eps)| Device {
+                name: dev_name(*d),
+                ifindex: 10 + *d as u32,
+                endpoints: eps.iter().map(|n| ep(*n)).collect(),
+            })
+            .collect()
+    }
+
+    fn read() -> impl Strategy<Value = Read> {
+        proptest::collection::btree_map(0..DEVS, proptest::collection::btree_set(1u8..5, 0..4), 0..=DEVS)
+            .prop_map(|m| m.into_iter().collect())
+    }
+
+    #[derive(Clone, Debug)]
+    enum Step {
+        /// A unit sent a request configuring a device.
+        Bind(usize, usize),
+        /// The loop read the devices.
+        Set(Read),
+        /// An endpoint restored from the footprint files after a restart that
+        /// lost `.state` (no binding with it).
+        Restore(usize, u8),
+    }
+
+    fn steps() -> impl Strategy<Value = Vec<Step>> {
+        proptest::collection::vec(
+            prop_oneof![
+                2 => (0..UNITS, 0..DEVS).prop_map(|(a, b)| Step::Bind(a, b)),
+                3 => read().prop_map(Step::Set),
+                1 => (0..UNITS, 1u8..5).prop_map(|(a, n)| Step::Restore(a, n)),
+            ],
+            0..16,
+        )
+    }
+
+    fn endpoints(t: &Tracker, i: usize) -> BTreeSet<Endpoint> {
+        t.footprint(&unit(i), NOW).endpoints
+    }
+
+    proptest! {
+        #![proptest_config(cfg(512))]
+
+        /// A unit's endpoints are exactly those of the devices it
+        /// configured, as the last read has them: a peer that moved
+        /// follows, a device that is gone takes its endpoints with it, and a
+        /// unit that configured nothing (even one that made the tunnel)
+        /// carries none. `set_wireguard` says it changed something exactly
+        /// when some unit's endpoints did.
+        #[test]
+        fn a_unit_carries_exactly_the_endpoints_of_the_devices_it_configured(steps in steps()) {
+            let mut t = Tracker::default();
+            let mut bound: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); UNITS];
+            let mut want: Vec<BTreeSet<Endpoint>> = vec![BTreeSet::new(); UNITS];
+            for s in &steps {
+                match s {
+                    Step::Bind(a, d) => {
+                        t.bind_wireguard(&unit(*a), &dev_name(*d));
+                        bound[*a].insert(*d);
+                    }
+                    Step::Restore(a, n) => {
+                        t.add_endpoint(&unit(*a), ep(*n));
+                        want[*a].insert(ep(*n));
+                    }
+                    Step::Set(r) => {
+                        let before = want.clone();
+                        for i in 0..UNITS {
+                            if !bound[i].is_empty() {
+                                want[i] = r.iter().filter(|(d, _)| bound[i].contains(d)).flat_map(|(_, e)| e.iter().map(|n| ep(*n))).collect();
+                            }
+                        }
+                        let changed = t.set_wireguard(&devices(r));
+                        prop_assert_eq!(changed, before != want, "the return value, on {:?}", r);
+                    }
+                }
+                for i in 0..UNITS {
+                    prop_assert_eq!(endpoints(&t, i), want[i].clone(), "unit {} after {:?}", i, s);
+                }
+            }
+        }
+
+        /// What a restart keeps (`.state`): a unit that configured a device
+        /// still takes that device's endpoints after `attach`, as it would
+        /// have without the restart.
+        #[test]
+        fn a_restart_keeps_which_device_a_unit_configured(steps in steps(), last in read()) {
+            let mut t = Tracker::default();
+            for s in &steps {
+                match s {
+                    Step::Bind(a, d) => t.bind_wireguard(&unit(*a), &dev_name(*d)),
+                    Step::Set(r) => { t.set_wireguard(&devices(r)); }
+                    Step::Restore(a, n) => t.add_endpoint(&unit(*a), ep(*n)),
+                }
+            }
+            let mut after = Tracker::attach(&t.claims(), &[], &BTreeSet::new());
+            t.set_wireguard(&devices(&last));
+            after.set_wireguard(&devices(&last));
+            for i in 0..UNITS {
+                prop_assert_eq!(endpoints(&after, i), endpoints(&t, i), "unit {}", i);
+            }
+        }
+
+        /// The latch: what a protecting invocation had, it keeps passing
+        /// for the hold, though the device (and so its peers) is gone from
+        /// every later read: a tunnel whose interface leaves with its last
+        /// process still names its peer.
+        #[test]
+        fn a_protecting_invocation_keeps_every_endpoint_it_had(reads in proptest::collection::vec(read(), 1..8)) {
+            let a = unit(0);
+            let mut t = Tracker::default();
+            let ch = |kind, object: &str, steers| Change { owner: Owner::Unit(a.clone()), kind, object: object.into(), iface: Some("wg0".into()), steers, removed: false };
+            t.apply(&ch(ChangeKind::Interface, "wg0", false));
+            t.apply(&ch(ChangeKind::Route, "route-wg0-0", true));
+            t.set_virtual(["wg0".to_string()].into());
+            t.set_invocation(&a, Invocation { id: Some("a".repeat(32)), ended: false });
+            t.bind_wireguard(&a, "wg0");
+            let mut seen: BTreeSet<Endpoint> = BTreeSet::new();
+            for r in &reads {
+                t.set_wireguard(&devices(r));
+                seen.extend(r.iter().filter(|(d, _)| *d == 0).flat_map(|(_, e)| e.iter().map(|n| ep(*n))));
+                let f = t.footprint(&a, NOW);
+                prop_assert!(f.protecting);
+                prop_assert!(seen.is_subset(&f.endpoints), "lost {:?} of {:?}", seen.difference(&f.endpoints).collect::<Vec<_>>(), f.endpoints);
+            }
+        }
+    }
+}
+
+/// The two cases the first drafts of the wg tests let through (prop-auditor's
+/// mutants on #71): a request naming its device by an empty name is
+/// unnamed, and a peer whose own attributes are cut is an error, never a
+/// smaller list.
+mod wgcases {
+    use super::*;
+    use crate::ebpf::HOOK_GENL;
+    use crate::wg::{self, Genl};
+
+    const FAMILY: u16 = 0x21;
+
+    fn request(attrs: &[Vec<u8>]) -> Event {
+        let mut body = vec![1u8, 1, 0, 0]; // WG_CMD_SET_DEVICE
+        body.extend(attrs.concat());
+        event(HOOK_GENL, OWN_NETNS, FAMILY, 0, &body)
+    }
+
+    #[test]
+    fn an_empty_device_name_is_unnamed_not_a_device() {
+        let name = nl_attr(2, b"\0");
+        assert_eq!(wg::classify(&request(std::slice::from_ref(&name)), FAMILY), Genl::SetUnnamed);
+        let index = nl_attr(1, &7u32.to_ne_bytes());
+        assert_eq!(wg::classify(&request(&[name, index]), FAMILY), Genl::SetIndex(7), "the index still names it");
+    }
+
+    #[test]
+    fn a_peer_with_a_cut_attribute_is_an_error_not_a_smaller_list() {
+        // The peer's own attribute claims 100 bytes and has 4.
+        let mut cut = 100u16.to_ne_bytes().to_vec();
+        cut.extend(4u16.to_ne_bytes());
+        let peers = nl_attr(8, &nl_attr(0, &cut));
+        let mut body = vec![0u8, 1, 0, 0];
+        body.extend([nl_attr(2, b"wg0\0"), peers].concat());
+        let mut m = ((16 + body.len()) as u32).to_ne_bytes().to_vec();
+        m.extend([0x21, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        m.extend(body);
+        assert!(wg::devices(&[m]).is_err());
+    }
+}
