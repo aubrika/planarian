@@ -2311,6 +2311,7 @@ dependencies = [
  "aya",
  "aya-obj",
  "planarian-schema",
+ "proptest",
  "rustix 1.1.5",
  "serde",
  "serde_json",

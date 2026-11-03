@@ -194,6 +194,10 @@ pkgs.testers.runNixOSTest {
         return f"ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o ControlPath=none -i /root/key {user}@machine true"
     def alarms():
         return int(machine.succeed(f"journalctl -b -u planariad -o cat | grep -c '{ALARM}' || true").strip() or 0)
+    def all_alarms():
+        # Every administrator alarm, whatever its text. §12d's kill case
+        # wants exactly one: a spurious "could not be checked" one is a fault.
+        return int(machine.succeed("journalctl -b -u planariad -o cat | grep -c 'ALARM: ' || true").strip() or 0)
     def held():
         machine.succeed("nft list table inet planarian-hold")
         machine.succeed("systemctl is-active planarian-hold@wireguard-gym.service")
@@ -301,6 +305,7 @@ pkgs.testers.runNixOSTest {
         peer.succeed(new_ssh("alice"))
         not_held()
         assert alarms() == 1, alarms()
+        assert all_alarms() == 1, machine.succeed("journalctl -b -u planariad -o cat | grep 'ALARM: ' || true")
         machine.succeed("rm -f /run/wireguard-gym-slow")
 
     # Before "repair fails every attempt": that spends wireguard-gym's
