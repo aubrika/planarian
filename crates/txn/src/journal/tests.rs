@@ -227,3 +227,54 @@ proptest! {
         }
     }
 }
+
+/// A record of one of several kinds, of any size from tiny to a few KiB.
+fn record(kind: u8, n: u64, size: usize) -> Record {
+    let unit = planarian_schema::UnitId::service(&format!("u{}-{}", n % 7, "x".repeat(size)));
+    match kind % 6 {
+        0 => Record::KnownGood(GenerationId(n + 1)),
+        1 => Record::LiveTested(Some(GenerationId(n + 1))),
+        2 => Record::HoldApplied { unit, by: crate::ledger::HoldBy::Daemon },
+        3 => Record::HoldLifted { unit, reason: "y".repeat(size) },
+        4 => Record::AgentStarted { name: "a".repeat(size.max(1)), instance: [n as u8; 16], by: 1000 },
+        _ => Record::TokenUsed { nonce: [n as u8; 16], expires: Timestamp(n), approver: 0, txn: 0 },
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    /// The other side of `could_follow`: every frame `append` writes passes
+    /// it, for any record kind and size and before or after compactions. So
+    /// the search for a later record never skips one the journal wrote (I18:
+    /// a damaged record before it stays Integrity). A change to the frame or
+    /// the payload encoding has to keep this green.
+    #[test]
+    fn every_appended_frame_could_follow(
+        ops in proptest::collection::vec((0u8..6, 0usize..3000, proptest::bool::weighted(0.05)), 1..200)
+    ) {
+        let capacity = 256 << 10;
+        let store = MemStore::new(capacity);
+        let mut j = Journal::open(store.clone()).unwrap();
+        for (n, (kind, size, compact)) in ops.into_iter().enumerate() {
+            if compact || j.needs_compaction() {
+                j.compact().unwrap();
+            }
+            let at = j.offset();
+            let rec = record(kind, n as u64, size);
+            let e = match j.append(Timestamp(n as u64), rec) {
+                Ok(e) => e,
+                // A record the ledger refuses here (e.g. lifting no hold) or
+                // one too big for what is left: not a frame written.
+                Err(JournalError::Ledger(_) | JournalError::Full) => continue,
+                Err(e) => panic!("{e:?}"),
+            };
+            let bytes = store.read_at(at, (capacity - at) as usize).unwrap();
+            prop_assert!(
+                could_follow(&bytes, e.seq - 1, capacity),
+                "the frame of record {} (kind {}, {} bytes asked) does not pass could_follow",
+                e.seq, kind, size
+            );
+        }
+    }
+}
