@@ -29,6 +29,16 @@ const FR_ACT_TO_TBL: u8 = 1;
 /// nfnetlink's nftables subsystem (`NFNL_SUBSYS_NFTABLES`).
 const NFNL_SUBSYS_NFTABLES: u16 = 10;
 
+/// The nftables messages that only read (`enum nf_tables_msg_types`):
+/// GETTABLE 1, GETCHAIN 4, GETRULE 7, GETSET 10, GETSETELEM 13, GETGEN 16,
+/// GETOBJ 19, GETOBJ_RESET 21, GETFLOWTABLE 23, GETRULE_RESET 25,
+/// GETSETELEM_RESET 33 (the resets zero counters; they do not change where
+/// traffic goes). Listed, not computed: the numbering stopped following a
+/// pattern at NFT_MSG_GETOBJ_RESET. Any other type, a later kernel's
+/// included, is a change (fail closed). vm-netwatch (n) found GETFLOWTABLE
+/// read as a change: `nft list` made its caller protecting.
+const NFT_READS: [u16; 11] = [1, 4, 7, 10, 13, 16, 19, 21, 23, 25, 33];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Parsed {
     /// Nothing that can change how traffic leaves (a read, an address).
@@ -258,8 +268,8 @@ pub fn parse(ev: &Event, owner: &Owner, ifname: &mut dyn FnMut(u32) -> Option<St
             if ev.hook == HOOK_NFNETLINK && ty >> 8 != NFNL_SUBSYS_NFTABLES {
                 return Parsed::Nothing;
             }
-            if ev.hook == HOOK_NFNETLINK && (ty & 0xff) % 3 == 1 {
-                // NFT_MSG_GET*: a read.
+            if ev.hook == HOOK_NFNETLINK && NFT_READS.contains(&(ty & 0xff)) {
+                // NFT_MSG_GET*: a read (as `nft list` sends to fill its cache).
                 return Parsed::Nothing;
             }
             Parsed::Changes(vec![change(ChangeKind::Firewall, "nftables".into(), None, true, false)])
