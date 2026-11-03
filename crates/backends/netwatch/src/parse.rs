@@ -31,13 +31,14 @@ const NFNL_SUBSYS_NFTABLES: u16 = 10;
 
 /// The nftables messages that only read (`enum nf_tables_msg_types`):
 /// GETTABLE 1, GETCHAIN 4, GETRULE 7, GETSET 10, GETSETELEM 13, GETGEN 16,
-/// GETOBJ 19, GETOBJ_RESET 21, GETFLOWTABLE 23, GETRULE_RESET 25,
-/// GETSETELEM_RESET 33 (the resets zero counters; they do not change where
-/// traffic goes). Listed, not computed: the numbering stopped following a
-/// pattern at NFT_MSG_GETOBJ_RESET. Any other type, a later kernel's
-/// included, is a change (fail closed). vm-netwatch (n) found GETFLOWTABLE
-/// read as a change: `nft list` made its caller protecting.
-const NFT_READS: [u16; 11] = [1, 4, 7, 10, 13, 16, 19, 21, 23, 25, 33];
+/// GETOBJ 19, GETFLOWTABLE 23. Listed, not computed: the numbering stopped
+/// following a pattern at NFT_MSG_GETOBJ_RESET. Any other type, a later
+/// kernel's included, is a change (fail closed). The resets (GETOBJ_RESET
+/// 21, GETRULE_RESET 25, GETSETELEM_RESET 33) are changes too: zeroing a
+/// quota or limit can flip a verdict (reviewer, coordinator, Nov 3).
+/// vm-netwatch (n) found GETFLOWTABLE read as a change: `nft list` made its
+/// caller protecting.
+const NFT_READS: [u16; 8] = [1, 4, 7, 10, 13, 16, 19, 23];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Parsed {

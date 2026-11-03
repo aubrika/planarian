@@ -275,9 +275,10 @@ mod parsing {
     }
 
     /// Every nftables message type, by name (`enum nf_tables_msg_types`):
-    /// the GETs (and resets) read, everything else changes, an unknown
-    /// later type included (fail closed). vm-netwatch (n): `nft list` sends
-    /// GETFLOWTABLE (23), which the old `% 3 == 1` rule took for a change.
+    /// the GETs read; everything else changes, the resets (a zeroed quota
+    /// can flip a verdict) and an unknown later type included (fail
+    /// closed). vm-netwatch (n): `nft list` sends GETFLOWTABLE (23), which
+    /// the old `% 3 == 1` rule took for a change.
     #[test]
     fn every_nftables_read_is_a_read_and_the_rest_change() {
         let reads = [
@@ -288,10 +289,7 @@ mod parsing {
             ("GETSETELEM", 13),
             ("GETGEN", 16),
             ("GETOBJ", 19),
-            ("GETOBJ_RESET", 21),
             ("GETFLOWTABLE", 23),
-            ("GETRULE_RESET", 25),
-            ("GETSETELEM_RESET", 33),
         ];
         let changes = [
             ("NEWTABLE", 0),
@@ -315,6 +313,9 @@ mod parsing {
             ("DESTROYSETELEM", 30),
             ("DESTROYOBJ", 31),
             ("DESTROYFLOWTABLE", 32),
+            ("GETOBJ_RESET", 21),
+            ("GETRULE_RESET", 25),
+            ("GETSETELEM_RESET", 33),
             ("a later kernel's", 40),
         ];
         let ty = |n: u16| (10u16 << 8) | n;
