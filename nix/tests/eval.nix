@@ -46,6 +46,14 @@ let
         # A templated network tool (an openvpn@-style VPN): classified, its
         # instances carry the hold.
         systemd.services."nt-vpn@" = { script = "true"; };
+        # Its instances: one known only to the manifest (classified by its
+        # template), one with its own definition laid over the template.
+        services.planarian.units."nt-vpn@office" = { };
+        systemd.services."nt-vpn@home" = { overrideStrategy = "asDropin"; serviceConfig.Environment = "NT_HOME=1"; };
+        services.planarian.units."nt-vpn@home" = { };
+        # An instance of a template that is not a network tool.
+        systemd.services."not-tpl@" = { script = "true"; serviceConfig = { DynamicUser = true; CapabilityBoundingSet = ""; }; };
+        services.planarian.units."not-tpl@a" = { };
         # A foreign unit named like Planarian's: classified like any other.
         systemd.services.planarian-test-vpn = { script = "true"; serviceConfig = { DynamicUser = true; AmbientCapabilities = [ "CAP_NET_ADMIN" ]; }; };
         systemd.services.not-bounded-empty = { script = "true"; serviceConfig.CapabilityBoundingSet = ""; };
@@ -176,6 +184,23 @@ let
   # trampolines, x86_64 direct-call ftrace) and a ring buffer.
   netwatchKernel = [ "BPF" "BPF_SYSCALL" "BPF_JIT" "DEBUG_INFO_BTF" "FTRACE" "FUNCTION_TRACER" "DYNAMIC_FTRACE" "DYNAMIC_FTRACE_WITH_DIRECT_CALLS" "CGROUPS" ];
   check = cond: msg: if cond then true else throw "planarian module eval: ${msg}";
+  # The other side of the export's unit keys: planarian_schema::UnitDef,
+  # read from its source. serde drops a key it does not know and defaults a
+  # field it does not find, so a key the module renames is read as the
+  # default, silently (`holds` read false for every unit once). The struct
+  # has no rename, alias or flatten, so its field names are the keys.
+  unitDefBody = let
+    after = builtins.elemAt (builtins.split "pub struct UnitDef [{]" (builtins.readFile ../../crates/schema/src/unit.rs)) 2;
+  in builtins.head (builtins.split "\n}\n" after);
+  unitDefFields = map builtins.head (builtins.filter builtins.isList (builtins.split "pub ([a-z_]+):" unitDefBody));
+  # The set planariad must read as network tools: the module's list, each
+  # template standing for its instances.
+  toolOrInstance = n: builtins.elem n hold.holdUnits
+    || (let m = builtins.match "([^@]+@).+" n; in m != null && builtins.elem (builtins.head m) hold.holdUnits);
+  # Which exported units planariad must read as network tools: by id from
+  # the module's list (not from the export's own flag).
+  expectedHolds = builtins.filter (id: toolOrInstance (pkgs.lib.removePrefix "service:" id)) (map (u: u.id) export.units);
+  unitKeysRead = u: builtins.all (k: builtins.elem k unitDefFields) (builtins.attrNames u);
   checks = [
     (check (builtins.any isExec probes) "the configuration exports an Exec probe (P11's check is not vacuous)")
     (check (builtins.all (p: !(isExec p) || (p.flagged or null) == true) probes) "every exported Exec probe carries flagged = true (§9, P11)")
@@ -196,9 +221,13 @@ let
     (check (builtins.elem "nt-vpn@" hold.holdUnits && hold.holdDropins."nt-vpn@.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "a templated network tool is classified, and each instance's failure holds as planarian-hold@<instance> (§12d)")
     (check (hold.holdDropins."firewall.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "the firewall is a network tool from its configuration, not its name (§12d)")
     (check (builtins.sort builtins.lessThan export.networkTools == builtins.sort builtins.lessThan hold.holdUnits) "the export lists every network tool, declared or not (netwatch's footprints)")
-    (check (vpn.network_tool && vpn.hold_allow == [ { address = "192.0.2.7"; port = 51820; protocol = "udp"; } ] && vpn.hold_interfaces == [ "wg9" ]) "a network tool exports network_tool, its holdAllow and its holdInterfaces (§9, §12d)")
-    (check (builtins.all (u: u.network_tool == (builtins.elem (pkgs.lib.removePrefix "service:" u.id) hold.holdUnits)) export.units && builtins.all (u: !u.network_tool) export.userUnits) "every exported unit's network_tool is the computed rule")
-    (check (!(sys.options.services.planarian.units.type.getSubOptions [ ] ? network_tool) && !(sys.options.services.planarian.units.type.getSubOptions [ ] ? networkTool)) "network_tool is not a manifest option, so no unit can opt out of the hold (§12d)")
+    (check (vpn.holds && vpn.hold_allow == [ { address = "192.0.2.7"; port = 51820; protocol = "udp"; } ] && vpn.hold_interfaces == [ "wg9" ]) "a network tool exports holds, its holdAllow and its holdInterfaces (§9, §12d)")
+    (check (builtins.all (u: u.holds == toolOrInstance (pkgs.lib.removePrefix "service:" u.id)) export.units && builtins.all (u: !u.holds) export.userUnits) "every exported unit's holds is the computed rule: a network tool, or an instance of a templated one")
+    (check (expectedHolds != [ ] && builtins.elem "service:nt-vpn@office" expectedHolds && builtins.elem "service:gym-vpn" expectedHolds) "the set planariad must read as network tools is not empty and holds an undeclared template instance")
+    (check ((unit "service:nt-vpn@office").holds && (unit "service:nt-vpn@home").holds && !(unit "service:not-tpl@a").holds) "a templated network tool's instances export holds, declared or not; a non-tool template's do not (§12d)")
+    (check (builtins.length unitDefFields > 10 && builtins.elem "holds" unitDefFields && !(pkgs.lib.hasInfix "rename" unitDefBody) && !(pkgs.lib.hasInfix "alias" unitDefBody) && !(pkgs.lib.hasInfix "flatten" unitDefBody)) "the daemon's UnitDef is read from its source, and its field names are the export's keys")
+    (check (builtins.all unitKeysRead (export.units ++ export.userUnits) && !(unitKeysRead (vpn // { network_tool = true; }))) "the daemon's field: every key the export gives a unit is a UnitDef field, so none is dropped and read as its default (a renamed key is refused)")
+    (check (!(sys.options.services.planarian.units.type.getSubOptions [ ] ? holds) && !(sys.options.services.planarian.units.type.getSubOptions [ ] ? networkTool)) "holds is not a manifest option, so no unit can opt out of the hold (§12d)")
     (check (hold.holdDropins."gym-vpn.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "a network-security unit's failure applies the hold through OnFailure= (§12d)")
     (check (!(cfg.systemd.services.gym-vpn ? onFailure) || !(builtins.elem "planarian-hold@gym-vpn.service" cfg.systemd.services.gym-vpn.onFailure)) "the OnFailure= is a drop-in, not a unit definition (no stub for an undefined unit)")
     (check (pkgs.lib.hasInfix "ExecStartPost=" nftDropin && pkgs.lib.hasInfix "ExecReload=" nftDropin && pkgs.lib.hasInfix " reapply" nftDropin) "a hold is re-applied after nftables.service starts or reloads, which may flush every table (§12d)")
@@ -261,8 +290,38 @@ assert builtins.all (x: x) checks;
 pkgs.runCommand "planarian-module-eval.json" {
   export = builtins.toJSON export;
   passAsFile = [ "export" ];
-  nativeBuildInputs = [ pkgs.gnused pkgs.gawk pkgs.diffutils ];
+  nativeBuildInputs = [ pkgs.gnused pkgs.gawk pkgs.diffutils pkgs.jq ];
 } ''
+  # The export as planariad reads it (§12d; review of #38): parsed with its
+  # own `nixos::Export` (`planariad --check-export`), the units it reads as
+  # network tools are the module's, each template standing for its declared
+  # instances, and include an instance; and no unit key is dropped or filled
+  # by default on the way. Both fail on c5e9a7d (`network_tool`, and
+  # instances read false).
+  ${cfg.services.planarian.package}/bin/planariad --check-export $exportPath > parsed.json
+  jq -c '[.units[] | select(.holds) | .id] | sort' parsed.json > holds-read
+  echo '${builtins.toJSON expectedHolds}' | jq -c 'sort' > holds-want
+  diff holds-want holds-read || { echo "export: the units planariad reads as network tools differ (above: want, read)" >&2; exit 1; }
+  echo "ok: planariad reads $(jq length holds-read) network tools from the export, as the module classifies them, an instance among them"
+  # Every key path (array indices folded), both ways (the reviewer's diff):
+  # one only in the export is dropped by planariad, one only in the round
+  # trip is filled by its default. The top-level network-tool lists are
+  # read raw by netwatch and the module, not through Export.
+  # (paths(scalars) would skip false and null: paths takes a predicate.)
+  kp='[paths(type != "object" and type != "array") | map(if type == "number" then 0 else . end)] | unique'
+  jq -c "del(.networkTools, .networkToolsInitrd, .networkToolsUnordered) | $kp" $exportPath > keys-export
+  jq -c "$kp" parsed.json > keys-read
+  # Exempt by name, one path: an Exec probe's `flagged` (§9, P11) is for
+  # whoever reads the manifest; Rust readers show Exec from ProbeKind::Exec,
+  # not from the key, so ProbeDef has no field for it (docs/
+  # review-reconciliation.md, "Reviewer: P11 module-eval case", row
+  # "P11, scope").
+  jq -r '.[] | map(tostring) | join(".")' keys-export | grep -vxE '(units|userUnits)\.0\.probes\.0\.flagged' > paths-export
+  jq -r '.[] | map(tostring) | join(".")' keys-read > paths-read
+  diff paths-export paths-read || { echo "export: key paths differ between the export (<) and planariad's round trip (>): < is dropped, > is defaulted" >&2; exit 1; }
+  [ -s paths-export ] || { echo "export: no key paths (the diff would be vacuous)" >&2; exit 1; }
+  echo "ok: every key path in the export survives planariad's Export, and none is filled by default ($(wc -l < paths-export) paths)"
+
   root=$PWD/run
   # A stub systemctl, first on the script's PATH: the unit's InvocationID
   # is $STUB_INV (empty: the unit has none).

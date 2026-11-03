@@ -1599,7 +1599,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         // daemon just applied is in the state the repair is derived from.
         let (s, defs) = if self.network_holds(&s, &defs) { self.observe() } else { (s, defs) };
 
-        for inc in self.incidents.tick(now, &s, &defs) {
+        // §13: a hold opened here runs from the decision, after the probes.
+        let decided = self.b.clock().now();
+        for inc in self.incidents.tick_at(now, decided, &s, &defs) {
             if matches!(inc.state, IncidentState::Escalated { .. }) && inc.attempts.is_empty() {
                 self.notice(format!(
                     "{}: escalated: it failed again soon after each of {} repairs; it needs a person (no automatic action for an hour)",
