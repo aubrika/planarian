@@ -2258,6 +2258,7 @@ dependencies = [
  "planarian-schema",
  "planarian-state",
  "planarian-txn",
+ "proptest",
  "rand_core 0.6.4",
  "rustix 1.1.5",
  "serde",

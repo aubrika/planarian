@@ -40,6 +40,7 @@ gym-hooks = ["planarian-backend-linux/gym-hooks"]
 [dev-dependencies]
 planarian-fake.workspace = true
 planarian-schema = { workspace = true, features = ["fixtures"] }
+proptest.workspace = true
 
 [lints]
 workspace = true
