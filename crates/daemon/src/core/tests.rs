@@ -2661,6 +2661,71 @@ fn a_network_tool_the_host_declines_to_hold_keeps_the_residue_rule() {
     assert_eq!(hold_alarms(&r, &web), 0, "{:?}", r.core.notices);
 }
 
+/// §12d: hold calls that hang (`systemctl start`/`stop`, `nft list`, all
+/// stuck: the fake's `hold_hangs` applies to every one) do not stall the
+/// tick: all of a tick's hold calls share one HOLD_WAIT, then the hold
+/// counts as held (fail closed). The unit is restarted, never
+/// inferred stopped, and its traffic is held (journaled, alarmed); the
+/// socket, approvals and other repairs are not held up for `hold::apply`'s
+/// 30 s (reviewer, #55).
+#[test]
+fn a_hold_that_hangs_does_not_stall_the_tick() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, false);
+    r.fake.w().hold_hangs = Some(Millis::secs(30));
+    r.fake.w().stop_out_of_band(&web);
+    let mut longest = 0;
+    for _ in 0..12 {
+        r.fake.advance(planarian_state::TICK);
+        let t0 = r.fake.w().now.0;
+        r.core.tick();
+        longest = longest.max(r.fake.w().now.0 - t0);
+    }
+    assert!(
+        longest <= crate::core::HOLD_WAIT.0 + 1_000,
+        "a tick took {longest} ms on the fake clock (HOLD_WAIT {} ms)",
+        crate::core::HOLD_WAIT.0
+    );
+    assert!(r.fake.w().calls.iter().any(|c| c.call.starts_with("hold(service:gym-web)")), "the hold was asked for");
+    assert!(
+        !r.core.ledger().overrides.iter().any(|o| o.unit == web),
+        "inferred as intended: {:?}",
+        r.core.ledger().overrides
+    );
+    // Held (journaled) while it was down, and lifted once it was back.
+    assert_eq!(r.core.ledger().hold_events, vec![(web.clone(), true), (web.clone(), false)]);
+    assert_eq!(hold_alarms(&r, &web), 1, "{:?}", r.core.notices);
+    assert!(r.calls("restart(service:gym-web)") >= 1, "never restarted: {:?}", r.core.notices);
+}
+
+/// §12d (catalog 41644729493, vm-netsec): probe time does not spend the
+/// hold budget. Each probe batch here takes longer than HOLD_WAIT (the hold
+/// drops the probes' traffic, so they run to their timeouts); a budget
+/// counted from the tick's start was gone before the lift was reached, and
+/// gym-web, back and Running, stayed held for good. Counted from the first
+/// hold call (residue's), the re-observation after it spent the budget and
+/// the table check alarmed falsely.
+#[test]
+fn slow_probes_do_not_starve_a_lift() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, false);
+    r.fake.w().probe_batch_ms = crate::core::HOLD_WAIT.0 + 1_000;
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(12);
+    assert!(r.calls("restart(service:gym-web)") >= 1, "never restarted: {:?}", r.core.notices);
+    assert!(
+        r.fake.w().calls.iter().any(|c| c.call == "lift_hold(service:gym-web)"),
+        "the lift was never asked for: {:?}",
+        r.core.notices
+    );
+    assert!(!r.fake.w().held.contains(&web), "gym-web is back but still held");
+    assert_eq!(r.core.ledger().hold_events, vec![(web.clone(), true), (web.clone(), false)]);
+    // One ALARM, the hold's own: no false "could not be checked" from a
+    // budget the probes spent (reviewer, 7c2edfc).
+    let alarms: Vec<_> = r.core.notices.iter().filter(|n| n.starts_with("ALARM")).collect();
+    assert_eq!(alarms, vec![&crate::hold::alarm(&web)], "{:?}", r.core.notices);
+}
+
 /// §13: the hold a third regression sets runs from the decision, after the
 /// probes, like every cooldown and backoff (prop-auditor's Relapse(369):
 /// gym-flap fails 369 s after each start, so each repair stabilizes past
@@ -2696,6 +2761,65 @@ fn a_regression_hold_runs_from_the_decision() {
         }
     }
     panic!("no escalation: {:#?}", r.core.notices);
+}
+
+/// §12d (reviewer, #61): a unit whose hold job is wedged is not asked for
+/// again on every tick, where it would spend the whole hold budget and
+/// starve another unit's lift: gym-app (wedged, and failing on every start)
+/// comes before gym-web in the network tools, and gym-web, stopped outside
+/// Planarian and repaired, still has its hold lifted once it is back.
+#[test]
+fn a_wedged_hold_does_not_starve_another_units_lift() {
+    let store = MemStore::new(8 << 20);
+    let fake = gym_world(store.clone());
+    let app = UnitId::service("gym-app");
+    let web = UnitId::service("gym-web");
+    {
+        let mut w = fake.w();
+        for u in [&app, &web] {
+            for g in w.gens.values_mut() {
+                if let Some(d) = g.eval.units.get_mut(u) {
+                    d.holds = true;
+                }
+            }
+            if let Some(d) = w.base_units.get_mut(u) {
+                d.holds = true;
+            }
+        }
+        w.hold_wedged.insert(app.clone());
+        w.alive.insert(100);
+    }
+    let mut j = Journal::open(store).unwrap();
+    j.append(fake.w().now, Record::KnownGood(GenerationId(1))).unwrap();
+    let core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config());
+    let mut r = Rig { fake, core };
+    r.ticks(2);
+    // gym-app goes down for good; its hold never lands.
+    r.fake.w().units.get_mut(&app).unwrap().fail_on_start = true;
+    r.fake.w().stop_out_of_band(&app);
+    r.ticks(3);
+    assert!(!r.fake.w().held.contains(&app), "precondition: gym-app's hold is wedged");
+    // gym-web is stopped too, then repaired: its hold must lift.
+    r.fake.w().stop_out_of_band(&web);
+    let mut lifted_after = None;
+    for k in 0..40 {
+        r.ticks(1);
+        if r.fake.w().held.contains(&web) {
+            continue;
+        }
+        if r.fake.w().calls.iter().any(|c| c.call == "lift_hold(service:gym-web)") {
+            lifted_after = Some(k);
+            break;
+        }
+    }
+    assert!(
+        lifted_after.is_some(),
+        "gym-web's hold never lifted while gym-app's was wedged: {:?}",
+        r.core.notices.iter().filter(|n| n.contains("gym-web")).collect::<Vec<_>>()
+    );
+    // gym-app's hold was asked for at most once per retry, not every tick.
+    let tries = r.fake.w().calls.iter().filter(|c| c.call == "hold(service:gym-app) timed out").count();
+    assert!(tries <= 3, "gym-app's wedged hold asked for {tries} times");
 }
 
 /// The gym's forced compaction (gate 41604917858, `replay_equivalent`): the
