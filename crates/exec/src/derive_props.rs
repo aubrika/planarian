@@ -16,11 +16,11 @@
 
 use super::*;
 use proptest::prelude::*;
-use proptest::test_runner::{Config, FailurePersistence};
+use proptest::test_runner::Config;
 
 fn config() -> Config {
     let cases = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(256);
-    Config { cases, failure_persistence: None::<Box<dyn FailurePersistence>>, ..Config::default() }
+    Config { cases, failure_persistence: None, ..Config::default() }
 }
 
 fn disruption() -> impl Strategy<Value = Disruption> {
