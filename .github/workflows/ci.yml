@@ -28,6 +28,10 @@ jobs:
       - run: cargo test --workspace
       - name: Journal properties at the default journal size (64 MiB; #[ignore] in cargo test)
         run: cargo test -p planarian-txn --test journal_props -- --ignored at_the_default_journal_size
+      - name: netwatch's loader tests (the cgroups invocation property must run, not skip)
+        env:
+          NETWATCH_REQUIRE_XATTR_TESTS: "1"
+        run: cargo test -p planarian-backend-netwatch --features loader
       - name: Fault catalog, fake harness (strict, R15; fails on FAIL, PARTIAL or an unwaived UNSUPPORTED)
         run: cargo run -p planarian-gym -- run --strict
       - name: GA demonstration, fake harness
