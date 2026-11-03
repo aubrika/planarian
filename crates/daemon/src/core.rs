@@ -813,6 +813,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// reconciled with the host's (`held`), and any disagreement keeps the
     /// hold (fail closed).
     /// Returns whether it applied a hold the observed state does not show.
+    /// Compact the journal and return the entries it discarded (the segment
+    /// it checkpointed), read in the same core call: no tick of this daemon
+    /// can journal between the two, so they are exactly what the checkpoint
+    /// replaced. The gym's forced compaction saves them for the judge's
+    /// full-history replay (`replay_equivalent`); reading the segment from
+    /// outside first left a gap a tick could journal into.
+    pub fn compact_saving(
+        &mut self,
+    ) -> Result<Vec<planarian_txn::ledger::Entry>, planarian_txn::journal::JournalError> {
+        let segment = self.ex.kernel.journal.segment()?;
+        self.ex.kernel.journal.compact()?;
+        Ok(segment)
+    }
+
     fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {
         use crate::hold;
         use planarian_txn::ledger::HoldBy;
@@ -2854,8 +2868,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 self.respond(&r)
             }
             #[cfg(feature = "gym-hooks")]
-            Request::GymCompact => match self.ex.kernel.journal.compact() {
-                Ok(_) => Response::Ok { message: "compacted".into() },
+            Request::GymCompact => match self.compact_saving() {
+                Ok(entries) => Response::Compacted {
+                    entries: entries.iter().filter_map(|e| serde_json::to_value(e).ok()).collect(),
+                },
                 Err(e) => Response::Error { message: format!("{e:?}") },
             },
             #[cfg(not(feature = "gym-hooks"))]

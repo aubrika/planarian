@@ -2697,3 +2697,45 @@ fn a_regression_hold_runs_from_the_decision() {
     }
     panic!("no escalation: {:#?}", r.core.notices);
 }
+
+/// The gym's forced compaction (gate 41604917858, `replay_equivalent`): the
+/// history it saves plus the journal's tail must replay to the daemon's
+/// ledger. Reading the segment from outside, then compacting, left a gap a
+/// tick could journal into (here an out-of-band stop: its inferred
+/// override), and the saved history fell short; `compact_saving` reads the
+/// segment in the same call as the compaction, so it cannot.
+#[test]
+fn a_forced_compaction_saves_exactly_what_it_discarded() {
+    use planarian_txn::ledger::{Entry, Ledger};
+    let replay = |saved: &[Entry], tail: &[Entry]| {
+        let mut l = Ledger::default();
+        for e in saved.iter().chain(tail) {
+            let _ = l.apply(e.clone());
+        }
+        l
+    };
+    let web = UnitId::service("gym-web");
+    // The old way: the segment read first, a tick journals, then compact.
+    let mut r = Rig::new();
+    r.ticks(2);
+    let saved = r.core.ex.kernel.journal.segment().unwrap();
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(2);
+    r.core.ex.kernel.journal.compact().unwrap();
+    r.ticks(1);
+    let tail = r.core.ex.kernel.journal.segment().unwrap();
+    assert_ne!(
+        &replay(&saved, &tail),
+        r.core.ex.kernel.journal.ledger(),
+        "the old way falls short (the case is not vacuous)"
+    );
+    // compact_saving: what it returns is exactly what the checkpoint replaced.
+    let mut r = Rig::new();
+    r.ticks(2);
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(2);
+    let saved = r.core.compact_saving().unwrap();
+    r.ticks(1);
+    let tail = r.core.ex.kernel.journal.segment().unwrap();
+    assert_eq!(&replay(&saved, &tail), r.core.ex.kernel.journal.ledger());
+}
