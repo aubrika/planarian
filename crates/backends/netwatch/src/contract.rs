@@ -23,6 +23,22 @@ const WATCH: &str = ".watch";
 /// dot-file: the hold reads only `.watch` and `.unattributed`).
 const STATE: &str = ".state";
 const UNATTRIBUTED: &str = ".unattributed";
+/// The hold's condition on a failure, as lane-nix's script implements it
+/// (crate docs, "The hold's order"): it may release only when the unit's
+/// footprint describes the invocation that failed (`invocation`, systemd's
+/// `InvocationID`), that invocation has `ended` (its cgroup is gone and the
+/// ring drained after, so nothing it did is still to come), and the
+/// footprint reads `protecting no` at `now`, with nothing unattributed.
+/// Anything else holds. The reference the property tests check.
+pub fn hold_may_release(view: &FootprintView, unit: &UnitId, invocation: Option<&str>, now: u64) -> bool {
+    let name = file_name(unit);
+    let Some(f) = view.units.get(&name) else { return false };
+    invocation.is_some()
+        && f.invocation.as_deref() == invocation
+        && f.ended
+        && !f.unknown
+        && !view.protecting_now(&name, now)
+}
 
 /// The file name of a unit's footprint: systemd's `%N` (the unit name with
 /// any `@instance`, without `.service`). Network tools are system services.
@@ -39,7 +55,20 @@ fn proto(p: Proto) -> &'static str {
 }
 
 pub(crate) fn render(f: &Footprint) -> String {
-    let mut s = format!("protecting {}\nat {}\n", if f.protecting { "yes" } else { "no" }, f.at);
+    let protecting = if f.unknown {
+        "unknown"
+    } else if f.protecting {
+        "yes"
+    } else {
+        "no"
+    };
+    let mut s = format!("protecting {protecting}\nat {}\n", f.at);
+    if let Some(i) = &f.invocation {
+        s.push_str(&format!("invocation {i}\n"));
+    }
+    if f.ended {
+        s.push_str("ended\n");
+    }
     for i in &f.ifaces {
         s.push_str(&format!("iface {i}\n"));
     }
@@ -98,15 +127,24 @@ fn one_line(s: &str) -> String {
     if s.trim().is_empty() { "unknown".into() } else { s.trim().to_string() }
 }
 
-fn parse_footprint(text: &str) -> Option<Footprint> {
+pub(crate) fn parse_footprint(text: &str) -> Option<Footprint> {
     let mut f = Footprint::default();
     let mut at = None;
     for line in text.lines() {
         let w: Vec<&str> = line.split_whitespace().collect();
         match w.as_slice() {
             ["at", t] => at = Some(t.parse().ok()?),
+            ["invocation", i] if i.len() == 32 && i.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) => {
+                f.invocation = Some((*i).to_string());
+            }
             ["protecting", "yes"] => f.protecting = true,
             ["protecting", "no"] => f.protecting = false,
+            // Unknown counts as protecting (fail closed).
+            ["protecting", "unknown"] => {
+                f.protecting = true;
+                f.unknown = true;
+            }
+            ["ended"] => f.ended = true,
             ["iface", i] => {
                 f.ifaces.insert((*i).to_string());
             }
