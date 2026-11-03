@@ -274,6 +274,65 @@ mod parsing {
         assert_eq!(parse(&msg(HOOK_NFNETLINK, ctnetlink, 0x1, &[0u8; 4]), &owner(), &mut names), Parsed::Nothing);
     }
 
+    /// Every nftables message type, by name (`enum nf_tables_msg_types`):
+    /// the GETs (and resets) read, everything else changes, an unknown
+    /// later type included (fail closed). vm-netwatch (n): `nft list` sends
+    /// GETFLOWTABLE (23), which the old `% 3 == 1` rule took for a change.
+    #[test]
+    fn every_nftables_read_is_a_read_and_the_rest_change() {
+        let reads = [
+            ("GETTABLE", 1),
+            ("GETCHAIN", 4),
+            ("GETRULE", 7),
+            ("GETSET", 10),
+            ("GETSETELEM", 13),
+            ("GETGEN", 16),
+            ("GETOBJ", 19),
+            ("GETOBJ_RESET", 21),
+            ("GETFLOWTABLE", 23),
+            ("GETRULE_RESET", 25),
+            ("GETSETELEM_RESET", 33),
+        ];
+        let changes = [
+            ("NEWTABLE", 0),
+            ("DELTABLE", 2),
+            ("NEWCHAIN", 3),
+            ("DELCHAIN", 5),
+            ("NEWRULE", 6),
+            ("DELRULE", 8),
+            ("NEWSET", 9),
+            ("DELSET", 11),
+            ("NEWSETELEM", 12),
+            ("DELSETELEM", 14),
+            ("NEWOBJ", 18),
+            ("DELOBJ", 20),
+            ("NEWFLOWTABLE", 22),
+            ("DELFLOWTABLE", 24),
+            ("DESTROYTABLE", 26),
+            ("DESTROYCHAIN", 27),
+            ("DESTROYRULE", 28),
+            ("DESTROYSET", 29),
+            ("DESTROYSETELEM", 30),
+            ("DESTROYOBJ", 31),
+            ("DESTROYFLOWTABLE", 32),
+            ("a later kernel's", 40),
+        ];
+        let ty = |n: u16| (10u16 << 8) | n;
+        for (name, n) in reads {
+            assert_eq!(
+                parse(&msg(HOOK_NFNETLINK, ty(n), 0x301, &[0u8; 4]), &owner(), &mut names),
+                Parsed::Nothing,
+                "{name}"
+            );
+        }
+        for (name, n) in changes {
+            assert!(
+                matches!(parse(&msg(HOOK_NFNETLINK, ty(n), 0x1, &[0u8; 4]), &owner(), &mut names), Parsed::Changes(_)),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn a_route_past_the_capture_is_unreadable() {
         let mut e = msg(HOOK_RTNETLINK, 24, 0x400, &route(0, 7));
