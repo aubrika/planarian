@@ -20,6 +20,7 @@ gym-hooks = []
 
 [dev-dependencies]
 tempfile.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true
