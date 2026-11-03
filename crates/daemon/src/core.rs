@@ -1679,7 +1679,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     for inc in linked {
                         self.incident_parked.remove(&inc);
                         if let Submitted::Finished { state, .. } = &r
-                            && let Some(i) = self.incidents.record_attempt(inc, id, outcome_of(state), now)
+                            && let Some(i) =
+                                self.incidents.record_attempt(inc, id, outcome_of(state), self.b.clock().now())
                         {
                             self.journal(Record::Incident(i));
                         }
@@ -1949,7 +1950,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         self.incident_parked.insert(inc.id, txn);
                     }
                     Submitted::Finished { txn, state, .. } => {
-                        if let Some(i) = self.incidents.record_attempt(inc.id, txn, outcome_of(&state), now) {
+                        // §13: the backoff runs from the attempt itself, not
+                        // from the observation that found it actionable
+                        // (which may have taken a while): read after it ran,
+                        // so the next attempt is never closer than the floor.
+                        let at = self.b.clock().now();
+                        if let Some(i) = self.incidents.record_attempt(inc.id, txn, outcome_of(&state), at) {
                             if matches!(i.state, IncidentState::Cooldown { .. }) {
                                 self.notice(format!(
                                     "{}: tried {} time(s) and it keeps failing; it needs a person (I'll try once more in {} min)",

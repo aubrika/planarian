@@ -2166,3 +2166,53 @@ fn an_ordinary_submission_prepares_nothing_again() {
     let t = &l.live.values().find(|t| t.txn.id == waiting).expect("live").txn;
     assert_eq!(t.prepared_again_from, None);
 }
+
+/// §13 backoff floor: an incident's attempts are at least the backoff
+/// apart by their own times (the log record's `at`, which the gym's
+/// `attempt_gaps_min` reads), not by the observations that found them
+/// actionable. A slow observation before one attempt and a quick one
+/// before the next must not bring them closer (catalog run 41535954746,
+/// flap-30s: 59 967 ms for a 60 s minimum).
+#[test]
+fn backoff_is_kept_between_attempts_even_after_a_slow_observation() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let flap = UnitId::service("gym-flap");
+    {
+        let mut w = r.fake.w();
+        let now = w.now;
+        let sim = w.units.get_mut(&flap).unwrap();
+        sim.fail_after = Some(Millis::secs(30));
+        sim.started_at = now;
+    }
+    let restarts = |r: &Rig| -> Vec<u64> {
+        r.core
+            .log
+            .iter()
+            .chain(r.core.awaiting_post.iter())
+            .filter(|x| {
+                matches!(&x.proposal.transition, Transition::RestartUnit(u) if *u == flap)
+                    && matches!(x.result, Submitted::Finished { .. })
+            })
+            .map(|x| x.at.0)
+            .collect()
+    };
+    // Observations are slow until the second attempt has run, then quick.
+    r.fake.w().probe_batch_ms = 7_000;
+    let mut n = 0;
+    while restarts(&r).len() < 2 {
+        r.ticks(1);
+        n += 1;
+        assert!(n < 200, "no second attempt");
+    }
+    r.fake.w().probe_batch_ms = 0;
+    while restarts(&r).len() < 3 {
+        r.ticks(1);
+        n += 1;
+        assert!(n < 400, "no third attempt");
+    }
+    let at = restarts(&r);
+    for (k, (w, min)) in at.windows(2).zip([10_000u64, 60_000]).enumerate() {
+        assert!(w[1] - w[0] >= min, "attempts {} and {} {} ms apart (min {min} ms): {at:?}", k + 1, k + 2, w[1] - w[0]);
+    }
+}
