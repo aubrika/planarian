@@ -242,7 +242,7 @@ fn edit_entry(d: &mut UnitDef, field: u8, k: u8) {
         }
         1 => {
             d.desired.when = if d.desired.when == Condition::Always {
-                Condition::SessionEstablished { uid: Some(1000 + k as u32), seated: k % 2 == 0 }
+                Condition::SessionEstablished { uid: Some(1000 + k as u32), seated: k.is_multiple_of(2) }
             } else {
                 Condition::Always
             }
