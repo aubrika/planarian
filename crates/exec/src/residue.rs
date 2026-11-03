@@ -147,8 +147,41 @@ mod tests {
             )
     }
 
+    /// main's classifier before #55, verbatim (the reference for the frame
+    /// condition: where #55 does not apply, nothing changes).
+    fn classify_before(f: &EndingFacts) -> Residue {
+        let went_down_unexplained =
+            f.was_up && f.now_down && f.service && !f.touched_by_planarian && f.expected && !f.requirement_crashed;
+        if !went_down_unexplained {
+            return Residue::NotAStop;
+        }
+        let e = match f.ended {
+            Some(e) if e.is_termination() => e,
+            _ if f.stopped_cleanly => Ending::Signal(15),
+            _ => return Residue::Fault,
+        };
+        if f.security {
+            return Residue::AlarmSecurity(e);
+        }
+        if f.stops_are_faults {
+            return Residue::AlarmMustRun(e);
+        }
+        if f.lenient && !f.systemd_restarts { Residue::Intended(e) } else { Residue::Fault }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig { cases: 1024, ..ProptestConfig::default() })]
+
+        /// The frame condition (prop-auditor, #55): a unit not held, and not
+        /// a network tool awaiting its hold attempt (not one, or asked and
+        /// declined), is classified exactly as before. So #55 holds only what
+        /// §12d holds: not every network tool, not every lenient unit.
+        #[test]
+        fn outside_a_hold_the_classifier_is_unchanged(f in facts()) {
+            if !f.held && (!f.network_tool || f.hold_tried) {
+                prop_assert_eq!(classify(&f), classify_before(&f), "{:?}", f);
+            }
+        }
 
         /// §12d, §11: a unit whose traffic is held is never taken as
         /// intended; and a network tool's stop is never taken as intended

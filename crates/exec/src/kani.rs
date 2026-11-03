@@ -64,6 +64,25 @@ fn any_facts() -> EndingFacts {
 fn residue_held_is_never_intended() {
     let f = any_facts();
     let r = classify(&f);
+    // The antecedent is reachable: a held unit, or a network tool not yet
+    // asked, whose stop the rule before #55 took as intended (an untagged,
+    // unexplained, lenient stop systemd does not restart).
+    let intended_before = f.was_up
+        && f.now_down
+        && f.service
+        && !f.touched_by_planarian
+        && f.expected
+        && !f.requirement_crashed
+        && (f.stopped_cleanly || f.ended.is_some_and(|e| e.is_termination()))
+        && !f.security
+        && !f.stops_are_faults
+        && f.lenient
+        && !f.systemd_restarts;
+    kani::cover!(f.held && intended_before, "a held unit the old rule took as intended");
+    kani::cover!(
+        f.network_tool && !f.hold_tried && !f.held && intended_before,
+        "an unasked network tool the old rule took as intended"
+    );
     if f.held || (f.network_tool && !f.hold_tried) {
         assert!(!matches!(r, Residue::Intended(_)));
     }

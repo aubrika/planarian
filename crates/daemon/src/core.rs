@@ -837,6 +837,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             self.hold_table(&holding, &units);
         }
         for u in units {
+            // Taken every tick, so an entry never outlives the tick that set it.
+            let asked = self.daemon_held.remove(&u);
             let in_journal = journaled.contains(&u);
             // None: the host cannot say; a failed unit is then held again
             // (the call is idempotent).
@@ -862,11 +864,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 if !in_journal {
                     // systemd's OnFailure= already holds a crash or a kill;
                     // a stop outside Planarian is the daemon's to hold.
-                    let by = if self.daemon_held.remove(&u) || on_host != Some(true) {
-                        HoldBy::Daemon
-                    } else {
-                        HoldBy::OnFailure
-                    };
+                    // Daemon when the daemon asked (residue): also when its
+                    // hold job merged with OnFailure='s for the same unit
+                    // (systemd merges the two starts into one job), which is
+                    // fine: the hold is the same either way.
+                    let by = if asked || on_host != Some(true) { HoldBy::Daemon } else { HoldBy::OnFailure };
                     self.journal(Record::HoldApplied { unit: u.clone(), by });
                     self.notice(hold::alarm(&u));
                 }
@@ -1269,6 +1271,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 // the host cannot confirm counts as held (fail closed: the
                 // unit is restarted, never inferred stopped). The next
                 // network_holds journals it, by the daemon.
+                // Deliberate and rare: hold() blocks the tick for up to its
+                // 3 s timeout, only here (a network tool's unattributed stop
+                // outside Planarian), and P9's slow-tick warning says so by
+                // design. Deciding before the residue is recorded is the
+                // point: an Inferred stop must not be written for a unit
+                // whose traffic is then held.
                 let held = match self.b.units().hold(u) {
                     Outcome::Failed(_) | Outcome::Unknown(_) => true,
                     _ => self.b.units().held().map_or(true, |h| h.contains(u)),
