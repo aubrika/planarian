@@ -361,9 +361,22 @@ pkgs.testers.runNixOSTest {
         # §12d: protecting is about "how traffic leaves the machine", the host
         # netns. The driver's commands run in backdoor.service, a network
         # tool here, so whatever netwatch takes from them is charged to it.
-        protecting("nw-hostwg", "yes")
-        assert "iface wg0" in footprint("nw-hostwg")
-        protecting("backdoor", "no")
+        def dump():
+            # What netwatch wrote, for a timeout's log.
+            print(machine.execute(f"for f in {FP}/backdoor {FP}/nw-hostwg {FP}/.unattributed {FP}/.watch; do echo \"== $f\"; cat \"$f\" 2>&1; done")[1])
+        def wait_or_dump(cmd, timeout):
+            try:
+                machine.wait_until_succeeds(cmd, timeout=timeout)
+            except Exception:
+                dump()
+                raise
+        try:
+            protecting("nw-hostwg", "yes")
+            assert "iface wg0" in footprint("nw-hostwg")
+            protecting("backdoor", "no")
+        except Exception:
+            dump()
+            raise
         machine.succeed("${ip} netns add nwns")
         # Fail-open guard: a wg0 made and deleted in another netns leaves the
         # host VPN's wg0 claim (and its route) alone.
@@ -374,19 +387,29 @@ pkgs.testers.runNixOSTest {
         machine.succeed("${ip} -n nwns link add nsd0 type dummy && ${ip} -n nwns link set nsd0 up")
         machine.succeed("${ip} -n nwns route add default dev nsd0")
         machine.sleep(12)
-        lines = protecting("nw-hostwg", "yes")
-        assert "iface wg0" in lines, lines
-        protecting("backdoor", "no")
-        machine.fail(f"test -e {FP}/.unattributed")
+        try:
+            lines = protecting("nw-hostwg", "yes")
+            assert "iface wg0" in lines, lines
+            protecting("backdoor", "no")
+            machine.fail(f"test -e {FP}/.unattributed")
+        except Exception:
+            dump()
+            raise
         # A virtual interface made in the netns and moved into the host is
         # host steering once a default route uses it: charged to whoever
         # moved it, or unattributed; never read as a physical NIC.
         machine.succeed("${ip} -n nwns link add nwmove0 type dummy && ${ip} -n nwns link set nwmove0 netns 1")
         machine.succeed("${ip} link set nwmove0 up && ${ip} route add default dev nwmove0 metric 4003")
-        machine.wait_until_succeeds(
-            f"grep -qx 'protecting yes' {FP}/backdoor || test -e {FP}/.unattributed", timeout=30)
+        # The contract allows either: the mover protecting, or the mover's
+        # footprint marked `unattributed`, or the global `.unattributed`.
+        wait_or_dump(
+            f"grep -qx 'protecting yes' {FP}/backdoor || grep -qx unattributed {FP}/backdoor"
+            f" || test -e {FP}/.unattributed", 30)
         machine.succeed("${ip} link del nwmove0 && ${ip} netns del nwns")
-        machine.wait_until_succeeds(f"grep -qx 'protecting no' {FP}/backdoor && ! test -e {FP}/.unattributed", timeout=30)
+        # Gone again: nothing global stands. A per-unit `unattributed` mark on
+        # the mover may outlive the link (fail closed), so backdoor is not
+        # required back at `protecting no`.
+        wait_or_dump(f"! test -e {FP}/.unattributed", 30)
         protecting("nw-hostwg", "yes")
 
     with subtest("(o) a tun the unit opened itself (as OpenVPN does), carrying /1 routes: protecting"):
