@@ -242,6 +242,9 @@ pub struct World {
     /// every hold call gives up after its wait, the fake clock advanced by
     /// that much, and the hold lands later, as systemd's job would.
     pub hold_hangs: Option<Millis>,
+    /// Like `hold_hangs`, for `lift_hold` alone (it takes precedence there):
+    /// the table check and the holds still answer.
+    pub lift_hangs: Option<Millis>,
     /// Units whose hold job is wedged: starting their hold never finishes
     /// (every `hold` for them times out, whatever its wait).
     pub hold_wedged: BTreeSet<UnitId>,
@@ -710,7 +713,13 @@ impl Fake {
     /// call takes its time and goes on.
     fn hung(&self, verb: &str, unit: &UnitId, wait: Millis) -> Option<Outcome> {
         let wedged = verb == "hold" && self.w().hold_wedged.contains(unit);
-        let h = if wedged { Millis(u64::MAX) } else { self.w().hold_hangs? };
+        let h = if wedged {
+            Millis(u64::MAX)
+        } else if verb == "lift_hold" && self.w().lift_hangs.is_some() {
+            self.w().lift_hangs?
+        } else {
+            self.w().hold_hangs?
+        };
         if h.0 > wait.0 {
             let now = self.w().now;
             self.w().calls.push(Call { call: format!("{verb}({unit}) timed out"), op: NO_OP, at: now, fenced: false });

@@ -265,6 +265,12 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// every tick, where it would spend the whole hold budget and starve
     /// other units' lifts.
     hold_unconfirmed: BTreeMap<UnitId, Timestamp>,
+    /// §12d: units whose lift the host has not confirmed (`HoldLifted` is
+    /// journaled; the host may still hold them), and when to ask again. While
+    /// one stands, the unit is not journaled as held again, and its lift is
+    /// retried quietly at `HOLD_UNCONFIRMED_RETRY`'s cadence, so a hung lift
+    /// neither churns the journal nor spends every tick's budget.
+    lift_unconfirmed: BTreeMap<UnitId, Timestamp>,
     /// §12d: the end of this tick's hold budget (`hold_wait`).
     hold_left: Millis,
     /// Generation transactions withdrawn from `Built` for a rollback about to
@@ -484,6 +490,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             hold_retry: None,
             daemon_held: BTreeSet::new(),
             hold_unconfirmed: BTreeMap::new(),
+            lift_unconfirmed: BTreeMap::new(),
             hold_left: HOLD_WAIT,
             withdrawn: vec![],
             earlier: BTreeMap::new(),
@@ -897,7 +904,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 lifted.insert(u.clone());
             }
         }
-        holding.retain(|u| !lifted.contains(u));
+        // A unit whose lift is pending is back and journaled as lifted, though
+        // the host still lists it: not a standing hold, so a flushed table
+        // is not re-applied for it (reviewer, #72).
+        holding.retain(|u| {
+            let pending = self.lift_unconfirmed.contains_key(u) && !hold::failed(s, defs, u) && hold::back(s, defs, u);
+            !(lifted.contains(u) || pending)
+        });
         if holding.is_empty() {
             self.hold_table_seen = true;
             self.hold_missing_noted = false;
@@ -916,8 +929,42 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 // The host has it: a later timeout is news again.
                 self.hold_unconfirmed.remove(&u);
             }
+            if on_host == Some(false) && !hold::failed(s, defs, &u) {
+                // Neither failed nor held: the next episode's timeout alarms again.
+                self.hold_unconfirmed.remove(&u);
+            }
             if lifted.contains(&u) {
                 continue;
+            }
+            // (`!in_journal` is defensive: a unit journaled as held has its entry
+            // dropped by the failed-again arm first.)
+            if self.lift_unconfirmed.contains_key(&u) && !in_journal {
+                match on_host {
+                    // The host cannot say: the entry stands, and the unit is
+                    // handled as below (the lift is asked again when it can).
+                    None => {}
+                    // The lift landed after all.
+                    Some(false) if !hold::failed(s, defs, &u) => {
+                        self.lift_unconfirmed.remove(&u);
+                        self.hold_notified.remove(&u);
+                        self.notice(format!("{u} is back; network traffic flows again"));
+                        continue;
+                    }
+                    // Still held on the host only because its lift is
+                    // pending: not a new hold. Retried when due.
+                    Some(true) if !hold::failed(s, defs, &u) && hold::back(s, defs, &u) => {
+                        let now = self.b.clock().boot_now();
+                        if self.lift_unconfirmed.get(&u).is_some_and(|next| now >= *next) && self.hold_wait().is_some()
+                        {
+                            self.lift_host(&u);
+                        }
+                        continue;
+                    }
+                    // Failed again, or not back: the hold is real again.
+                    Some(_) => {
+                        self.lift_unconfirmed.remove(&u);
+                    }
+                }
             }
             // An attested release (an override on the hold unit) lifts it
             // until the release ends.
@@ -1012,6 +1059,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             return false;
         }
         self.journal(Record::HoldLifted { unit: u.clone(), reason: "Running, and its Readiness probes pass".into() });
+        self.lift_host(u);
+        true
+    }
+
+    /// Asks the host to lift a hold already journaled as lifted. A lift the
+    /// host has not confirmed is noticed once, then retried quietly.
+    fn lift_host(&mut self, u: &UnitId) {
         let o = match self.hold_wait() {
             Some(w) => {
                 let t0 = self.b.clock().boot_now();
@@ -1023,14 +1077,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         };
         match o {
             o @ (Outcome::Failed(_) | Outcome::Unknown(_)) => {
-                self.notice(format!("{u}: the hold could not be lifted ({o:?}); its traffic stays blocked"))
+                let later = self.b.clock().boot_now().plus(HOLD_UNCONFIRMED_RETRY);
+                if self.lift_unconfirmed.insert(u.clone(), later).is_none() {
+                    self.notice(format!("{u}: the hold could not be lifted ({o:?}); its traffic stays blocked"))
+                }
             }
             _ => {
+                self.lift_unconfirmed.remove(u);
                 self.hold_notified.remove(u);
                 self.notice(format!("{u} is back; network traffic flows again"));
             }
         }
-        true
     }
 
     /// §12d: the hold's table, while a hold stands. Missing: alarm once, then
@@ -1103,14 +1160,22 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
         self.hold_table_seen = false;
-        let t0 = self.b.clock().boot_now();
-        let found = self.hold_wait().is_some_and(|w| matches!(self.b.units().hold_table_present(w), Ok(true)));
-        self.hold_spent(t0);
-        if found {
+        // No budget left: the check is skipped, which is not "not found", and
+        // leaves the backoff alone.
+        let found = match self.hold_wait() {
+            Some(w) => {
+                let t0 = self.b.clock().boot_now();
+                let r = matches!(self.b.units().hold_table_present(w), Ok(true));
+                self.hold_spent(t0);
+                Some(r)
+            }
+            None => None,
+        };
+        if found == Some(true) {
             self.hold_table_seen = true;
             self.hold_missing_noted = false;
             self.hold_retry = None;
-        } else {
+        } else if found == Some(false) {
             let wait =
                 self.hold_retry.map_or(HOLD_RETRY_MIN, |(_, w)| Millis(w.0.saturating_mul(2).min(HOLD_RETRY_MAX.0)));
             self.hold_retry = Some((Timestamp(now.0.saturating_add(wait.0)), wait));

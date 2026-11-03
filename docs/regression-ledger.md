@@ -75,6 +75,7 @@ carries a property test for the invariant it changes.
 | D12 | P19: `core_hash` was always `Hash::ZERO` | #19 (`ce55165`) | daemon::config::core_hash | `the_state_carries_the_recorded_core_hash` | unit | none recorded | covered |
 | D13 | P23: the first residue kill taught nothing | `8a0e523` (#2) | daemon::Core (residue) | `residue-first-kill-teaches-stop`; Kani residue harnesses | gym-fake + Kani | recorded: "fails with the lesson removed" | covered |
 | D14 | Network hold (#36/#40): a flushed hold table failed open; a restart lifted the hold; a failed re-apply was never retried; an uncheckable table re-applied every tick; mapped IPv4 flows were cut; the scope walk was unbounded | #36, #40 (`80edb77`, `6f68d55`, `d147ec6`, `bc38cc8`, `3f8cb25`, `504a43a`) | daemon::hold, backends-linux::hold, `planarian-hold@` | `a_flushed_hold_table_is_put_back`, `a_failed_reapply_is_retried_with_backoff`, `an_uncheckable_hold_table_alarms_once_and_is_checked_again`, `reapply_reloads_an_active_hold_and_starts_an_inactive_one`; vm-netsec; module-eval | proptest + unit + VM + eval | `holds_are_the_last_event_per_unit` (journal_props.rs) for the fold across compactions and reopens (1 MiB stores; 64 MiB in `at_the_default_journal_size`, ignored); the rest recorded per commit | covered |
+| D15 | A lift the host did not answer (a stuck `systemctl stop`) was journaled `HoldLifted`, then next tick looked like a hold set unseen by `OnFailure=`: a second `HoldApplied`, a second lift and a second notice, every tick; also a hold timeout stayed silenced across episodes, and a skipped table check stepped the re-apply backoff | lane-daemon/lift-unconfirmed (this PR; reviewer's optionals 47aed77, 4418da9) | daemon::Core::lift_back/lift_host (`lift_unconfirmed`), hold_table | `a_stuck_lift_is_journaled_and_noticed_once`, `a_later_episodes_hold_timeout_alarms_again`, `a_flush_while_a_lift_is_pending_does_not_hold_again` (reviewer's), `a_lift_that_alone_hangs_is_retried_quietly_once_a_minute` (fake `lift_hangs`) and prop-auditor's `hold_episode_props` property (core/tests.rs; fake `hold_hangs`, cleared part-way) | unit | verified: with core.rs from main, the stuck-lift test fails (repeated hold events) and the two-episode test sees one timeout alarm, not two; with the retry gate or the once-only notice removed, the lift-only-hangs case fails (30 attempts in 5 minutes; 5 notices); the skipped-check backoff has no test of its own | covered |
 
 ## Change path: derive, policy, exec (`crates/exec`, `crates/policy`)
 
@@ -96,6 +97,7 @@ carries a property test for the invariant it changes.
 | C14 | C14: the model was authorized as the daemon, not as an agent | `ced94fa` (#2) | policy::authorized | Verus `agents_and_unattributed_are_refused` | Verus | proved | covered |
 | C15 | B-5 fail-closed made every undeclared system unit External, so routine changes waited and vm-generations timed out | `69b1e9e` | exec::derive (sensitivity lookup) | derive test in `69b1e9e`; module-eval | unit + eval | none recorded | covered |
 | C16 | P10: `SideEffects::Measurement { per }` was read nowhere; a measurement probe could run on every tick | #18 (`33294f7`, `6f2a407`) | state::Assembler::within_rate | `a_measurement_probe_runs_at_most_once_per_its_per` (state/src/tests.rs) | unit | none recorded | gap: timing property (at most one cadence run per `per` window, over random tick times) |
+| C17 | `holds` (derived by the module from the unit's systemd config, never a manifest option) was compared as a manifest field: with the base's network tools carrying `holds: true` and the gym's candidate facts not, every tool read as changed and as a manifest edit, so the change asked (AskFirst) and the crash cases parked at Prepared (gate 41596671872, 18 catalog/ga-demo failures; the reviewer's root cause) | #64 (`95f7803`) | exec::derive::touches_manifest; exec::host::changed_units (through `host::declared`, an exhaustive destructure: a new `UnitDef` field must be put on one side) | `derive::props::derived_fields_alone_are_not_the_manifest`; `every_edit_to_an_entry_touches_the_manifest` (now over the declared fields, with a derived edit alongside, and `changed_units` asserted) (exec/src/derive_props.rs) | proptest | verified: with main's `touches_manifest`, "a derived edit touched the manifest", minimal one system entry; with main's `changed_units` alone, `left: {service:NetworkManager}, right: {}` | covered |
 
 ## Backends, identity, gym (`crates/backends/linux`, `crates/gym`)
 
@@ -133,8 +135,8 @@ with no features). "Nowhere" rows need the step proposed.
 | Test surface | Gate | Where it runs | Step proposed |
 | --- | --- | --- | --- |
 | netwatch `loader` tests: the cgroups invocation property, `loader_checks`, `legacy_restart`, and `props.rs`'s cgroups and legacy-table properties (#42) | `--features loader` | `rust` job, the step "netwatch's loader tests" (`NETWATCH_REQUIRE_XATTR_TESTS=1`, so a skip fails); not the nix package check | none (landed in #42) |
-| backend-linux `nixos::tests::git_owner_edit_after_staging_is_stale` | skips unless both `nix-hash` and `git` are on PATH | **nowhere**: the `rust` job has no `nix-hash` and the nix package check has no `git` (`nativeCheckInputs = [ nix ]`). Shown: with either missing it prints `SKIPPED` and passes | add `git` to `nativeCheckInputs` in nix/package.nix (lane-nix) |
-| backend-linux `nixos::tests::stage_copies_tracked_files_and_hashes_like_nix` | skips without `nix-hash` | nix package check only (skipped in the `rust` job) | none |
+| backend-linux `nixos::tests::git_owner_edit_after_staging_is_stale` | skips unless both `nix-hash` and `git` are on PATH | nix package check, since #62 (`1d9a48d`): `git` is in `nativeCheckInputs` and `preCheck` sets `PLANARIAN_REQUIRE_NIX_GIT_TESTS=1`, so a missing tool fails the test instead of skipping it (shown: with the variable set and git off PATH it fails with that message; without it, it prints `SKIPPED` and passes). Still skipped in the `rust` job, which has no `nix-hash` | none (landed in #62) |
+| backend-linux `nixos::tests::stage_copies_tracked_files_and_hashes_like_nix` | skips without `nix-hash` | nix package check, since #62 (`a04107a`): it fails instead of skipping when `PLANARIAN_REQUIRE_NIX_GIT_TESTS` is set (skipped in the `rust` job) | none (landed in #62) |
 | gym `site::tests::the_repository_resolves` | skips without the source tree | `rust` job (skipped in the nix package check, which copies only the crates) | none |
 | txn `journal_props::at_the_default_journal_size` (#59) | `#[ignore]` | `rust` job, by the step #59 adds (about 45 s, debug) | added in #59 |
 | txn `journal::tests::open_time_at_64_mib` (#54) | `#[ignore]` | nowhere, by design: a wall-time measurement that asserts nothing | none |
@@ -171,8 +173,8 @@ in a debug build).
 
 ## Counts
 
-76 rows for bugs fixed on `main`: 18 journal and kernel (J), 14 daemon (D),
-16 change path (C), 17 backends, identity and gym (B), 11 netwatch (N).
+78 rows for bugs fixed on `main`: 18 journal and kernel (J), 15 daemon (D),
+17 change path (C), 17 backends, identity and gym (B), 11 netwatch (N).
 Three rows still owe a property test (status **gap**):
 - J4 and J7: each waits on a lane's extraction of a pure function from the
   daemon or the kernel.
