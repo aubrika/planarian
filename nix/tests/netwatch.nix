@@ -257,7 +257,9 @@ pkgs.testers.runNixOSTest {
         machine.succeed("systemctl reset-failed nw-quiet.service; systemctl start nw-quiet.service")
         machine.wait_until_succeeds("systemctl is-active nw-quiet.service", timeout=120)
         machine.wait_until_fails("systemctl is-active planarian-hold@nw-quiet.service", timeout=120)
-        machine.fail("test -e /run/planarian/hold/nw-quiet")
+        # is-active fails as soon as the hold unit is deactivating, before
+        # its ExecStop (`lift`) has removed the marker: wait for that too.
+        machine.wait_until_fails("test -e /run/planarian/hold/nw-quiet", timeout=30)
         machine.succeed("rm -f /run/nw-quiet-slow")
 
     machine.wait_for_unit("planarian-ready.target")
