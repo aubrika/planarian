@@ -278,7 +278,7 @@ pkgs.runCommand "planarian-module-eval.json" {
     [ "$got" = "$want" ] || { echo "hold condition: $* -> $got, expected $want" >&2; exit 1; }
     echo "ok: $* -> $got"; }
   echo "attached $up" > $F/.watch
-  printf 'protecting no\nat %s\ninvocation %s\n' "$up" "$I" > $F/u;            expect 1 "a fresh protecting no skips"
+  printf 'protecting no\nat %s\ninvocation %s\nended\n' "$up" "$I" > $F/u;            expect 1 "a fresh protecting no skips"
   printf 'protecting no\nat %s\ninvocation %s\n' "$((up - 40))" "$I" > $F/u;   expect 0 "a stale stamp holds"
   printf 'protecting no\nat %s\ninvocation %s\n' "$wall" "$I" > $F/u;          expect 0 "a wall-clock-epoch stamp holds"
   printf 'protecting yes\nat %s\ninvocation %s\n' "$up" "$I" > $F/u;           expect 0 "protecting yes holds"
@@ -291,11 +291,17 @@ pkgs.runCommand "planarian-module-eval.json" {
   echo "attached $up" > $F/.watch
   rm $F/u;                                                  expect 0 "a missing footprint holds"
   # This run's footprint only (owner decision, Nov 3): InvocationID.
-  printf 'protecting no\nat %s\ninvocation %s\n' "$up" "$I" > $F/u; expect 1 "this run's fresh protecting no skips"
-  printf 'protecting no\nat %s\ninvocation %s\n' "$up" "fedcba9876543210fedcba9876543210" > $F/u
-  expect 0 "an earlier run's footprint (another InvocationID) holds"
-  printf 'protecting no\nat %s\n' "$up" > $F/u;            expect 0 "a footprint without an InvocationID holds"
+  printf 'protecting no\nat %s\ninvocation %s\nended\n' "$up" "$I" > $F/u; expect 1 "this run, protecting no, ended: skips"
   printf 'protecting no\nat %s\ninvocation %s\n' "$up" "$I" > $F/u
+  t0=$(date +%s%N); expect 0 "this run, protecting no, no ended: holds after the bounded wait"
+  waited=$(( ($(date +%s%N) - t0) / 1000000 ))
+  [ "$waited" -ge 2500 ] || { echo "the hold did not wait for ended ($waited ms)" >&2; exit 1; }
+  echo "ok: it waited $waited ms (bound 3 s) before holding"
+  printf 'protecting no\nat %s\ninvocation %s\nended\n' "$up" "fedcba9876543210fedcba9876543210" > $F/u
+  expect 0 "an earlier run's footprint (another InvocationID, ended) holds"
+  printf 'protecting no\nat %s\nended\n' "$up" > $F/u;     expect 0 "a footprint without an InvocationID holds"
+  printf 'protecting unknown\nat %s\ninvocation %s\nended\n' "$up" "$I" > $F/u; expect 0 "this run, protecting unknown, ended: holds"
+  printf 'protecting no\nat %s\ninvocation %s\nended\n' "$up" "$I" > $F/u
   export STUB_INV=; expect 0 "a unit with no InvocationID holds"; export STUB_INV=$I
   rm $F/u
   # The release cases: the footprint protects, so only the release decides.
