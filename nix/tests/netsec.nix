@@ -373,7 +373,7 @@ pkgs.testers.runNixOSTest {
         # Declared with no tag: only the kernel's attribution (the helper ran
         # in gym-vpn-untagged's cgroup) makes it protecting.
         machine.succeed("nft list table inet gymvpn")
-        machine.fail("pgrep -f gym-vpn-untagged-helper")
+        machine.fail("pgrep -f '[g]ym-vpn-untagged-helper'")
         machine.succeed("echo 30 > /run/gym-vpn-untagged-slow")
         machine.succeed("systemctl kill --signal=SIGKILL gym-vpn-untagged.service")
         machine.wait_until_fails(lan_ok(), timeout=20)
@@ -479,13 +479,13 @@ pkgs.testers.runNixOSTest {
         machine.succeed("rm -f /run/gym-linger-release")
         machine.wait_for_unit("gym-linger.service")
         machine.succeed("nft list table inet gymlinger")
-        machine.succeed("pgrep -f gym-linger-child")
+        machine.succeed("pgrep -f '[g]ym-linger-child'")
         not_held("gym-linger")
         machine.succeed("echo 30 > /run/gym-linger-slow")
         machine.succeed("systemctl kill --kill-whom=main --signal=SIGKILL gym-linger.service")
         machine.wait_until_fails("systemctl is-active gym-linger.service", timeout=10)
         # Precondition: the old run's cgroup still holds the child.
-        machine.succeed("pgrep -f gym-linger-child")
+        machine.succeed("pgrep -f '[g]ym-linger-child'")
         try:
             machine.wait_until_succeeds("nft list table inet planarian-hold && systemctl is-active planarian-hold@gym-linger.service && test -e /run/planarian/hold/gym-linger", timeout=10)
         except Exception:
@@ -495,9 +495,9 @@ pkgs.testers.runNixOSTest {
         for _ in range(12):
             assert is_held("gym-linger"), "lifted while the child lingers:\n" + footprint("gym-linger")
             time.sleep(0.5)
-        machine.succeed("pgrep -f gym-linger-child")
+        machine.succeed("pgrep -f '[g]ym-linger-child'")
         machine.succeed("touch /run/gym-linger-release")
-        machine.wait_until_fails("pgrep -f gym-linger-child", timeout=10)
+        machine.wait_until_fails("pgrep -f '[g]ym-linger-child'", timeout=10)
         # Held after the run has ended, too: it steered, so it was protecting.
         for _ in range(10):
             assert is_held("gym-linger"), "lifted when the run ended:\n" + footprint("gym-linger")
