@@ -841,7 +841,13 @@ impl Sim {
                     u => Owner::Unit(unit(u)),
                 };
                 let iface = s.get("interface").and_then(T::as_str).map(str::to_string);
-                let object = format!("{} {}", get("change"), iface.as_deref().unwrap_or("-"));
+                // An interface is named by its name (a route's `iface` is that
+                // name, which is how a tool's created interface carries its
+                // route); any other object by its kind and interface.
+                let object = match (kind, iface.as_deref()) {
+                    (ChangeKind::Interface, Some(i)) => i.to_string(),
+                    _ => format!("{} {}", get("change"), iface.as_deref().unwrap_or("-")),
+                };
                 let steers = s.get("steers").and_then(T::as_bool).unwrap_or(false);
                 self.fake.w().netwatch.apply(&Change { owner, kind, object, iface, steers, removed: false });
             }

@@ -238,6 +238,9 @@ pub struct World {
     /// Network tools the host declines to hold: not protecting (the hold
     /// unit's condition skips, as for a tool with no footprint).
     pub hold_declines: BTreeSet<UnitId>,
+    /// The footprint files cannot be read (`UnitBackend::protecting` is an
+    /// `Err`): the daemon counts every network tool as protecting.
+    pub protecting_unreadable: bool,
     /// A hold's start takes this long (a slow or stuck `systemctl start`):
     /// every hold call gives up after its wait, the fake clock advanced by
     /// that much, and the hold lands later, as systemd's job would.
@@ -300,6 +303,38 @@ pub struct World {
 }
 
 impl World {
+    /// §12d: the steering route attributed by `steers_traffic` is gone.
+    pub fn stops_steering(&mut self, unit: &UnitId) {
+        use planarian_backend_netwatch::{Change, ChangeKind, Owner};
+        self.netwatch.apply(&Change {
+            owner: Owner::Unit(unit.clone()),
+            kind: ChangeKind::Route,
+            object: "route steer0".into(),
+            iface: Some("steer0".into()),
+            steers: true,
+            removed: true,
+        });
+    }
+
+    /// §12d: the kernel has attributed a default route that steers traffic
+    /// to `unit` (the scripted footprint feed, as the gym's `footprint`
+    /// step does): it is now protecting traffic.
+    pub fn steers_traffic(&mut self, unit: &UnitId) {
+        use planarian_backend_netwatch::{Change, ChangeKind, Owner};
+        for (kind, steers, object) in
+            [(ChangeKind::Interface, false, "steer0"), (ChangeKind::Route, true, "route steer0")]
+        {
+            self.netwatch.apply(&Change {
+                owner: Owner::Unit(unit.clone()),
+                kind,
+                object: object.into(),
+                iface: Some("steer0".into()),
+                steers,
+                removed: false,
+            });
+        }
+    }
+
     /// The fake store's NAR hash of a path.
     pub fn nar_of(path: &StorePath) -> Hash {
         Hash::of(path.0.as_bytes())
@@ -761,6 +796,9 @@ impl UnitBackend for Fake {
     /// §12d: the scripted footprints (`footprint_view`), read as the Linux
     /// side reads the files.
     fn protecting(&self, tools: &[UnitId]) -> Result<BTreeSet<UnitId>, Outcome> {
+        if self.w().protecting_unreadable {
+            return Err(Outcome::Unknown("the footprint files cannot be read (scripted)".into()));
+        }
         let now = self.w().now.0 / 1000;
         Ok(self.footprint_view(tools).protecting(tools, now))
     }

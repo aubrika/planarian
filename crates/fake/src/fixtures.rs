@@ -211,10 +211,12 @@ pub fn gym_units() -> UnitDefs {
     // configuration (the module computes it; lane-daemon carries it), whose
     // names match nothing. Whether they protect traffic is netwatch's,
     // scripted by the gym's `footprint` steps.
-    let netd =
+    let mut netd =
         unit("service:gym-netd", r, Disruption::Brief, vec![user_probe("gym-netd-active", ProbeKind::SystemdActive)]);
-    let syncd =
+    netd.holds = true;
+    let mut syncd =
         unit("service:gym-syncd", r, Disruption::Brief, vec![user_probe("gym-syncd-active", ProbeKind::SystemdActive)]);
+    syncd.holds = true;
 
     [
         web,

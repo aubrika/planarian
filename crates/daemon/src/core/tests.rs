@@ -1435,6 +1435,7 @@ fn rig_with_held_sshd(holds: bool) -> Rig {
             d.holds = holds;
         }
         if holds {
+            w.steers_traffic(&sshd);
             w.hold_on_failure.insert(sshd);
         }
         w.alive.insert(100);
@@ -2536,6 +2537,13 @@ mod limit_props {
 /// gym-web as a network tool (`holds`), held by OnFailure= when it fails
 /// (`hold_on_failure`) if `on_failure`.
 fn rig_with_network_tool(holds: bool, on_failure: bool) -> Rig {
+    rig_with_tool(holds, on_failure, holds)
+}
+
+/// As `rig_with_network_tool`, with the kernel's attribution scripted:
+/// `steers`, the tool has a default route over an interface it created
+/// (it is protecting traffic); otherwise it has steered nothing.
+fn rig_with_tool(holds: bool, on_failure: bool, steers: bool) -> Rig {
     let store = MemStore::new(8 << 20);
     let fake = gym_world(store.clone());
     let web = UnitId::service("gym-web");
@@ -2548,6 +2556,11 @@ fn rig_with_network_tool(holds: bool, on_failure: bool) -> Rig {
         }
         if let Some(d) = w.base_units.get_mut(&web) {
             d.holds = holds;
+        }
+        if steers {
+            // §12d: a network tool holds traffic only while it is protecting
+            // it: the kernel has attributed a steering route to it.
+            w.steers_traffic(&web);
         }
         if on_failure {
             w.hold_on_failure.insert(web);
@@ -2786,6 +2799,8 @@ fn a_wedged_hold_does_not_starve_another_units_lift() {
                 d.holds = true;
             }
         }
+        w.steers_traffic(&app);
+        w.steers_traffic(&web);
         w.hold_wedged.insert(app.clone());
         w.alive.insert(100);
     }
@@ -2862,4 +2877,63 @@ fn a_forced_compaction_saves_exactly_what_it_discarded() {
     r.ticks(1);
     let tail = r.core.ex.kernel.journal.segment().unwrap();
     assert_eq!(&replay(&saved, &tail), r.core.ex.kernel.journal.ledger());
+}
+
+/// §12d *Which units* (coordinator, Nov 3): the hold gate is `UnitDef::holds`
+/// (a network tool, from the build) and `SystemState::protecting` (from the
+/// kernel-attributed footprints). A tool that is not protecting traffic is
+/// never held by the daemon when it stops outside Planarian; one that is,
+/// is; and an unreadable footprint feed (`Err`) counts every tool as
+/// protecting.
+mod gate_props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as PConfig, FailurePersistence};
+
+    fn pconfig() -> PConfig {
+        let cases = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(16);
+        PConfig { cases, failure_persistence: None::<Box<dyn FailurePersistence>>, ..PConfig::default() }
+    }
+
+    proptest! {
+        #![proptest_config(pconfig())]
+
+        #[test]
+        fn a_tool_is_held_exactly_when_it_protects_or_the_feed_is_unreadable(
+            steers in any::<bool>(),
+            unreadable in any::<bool>(),
+            ticks in 3..12usize,
+        ) {
+            let web = UnitId::service("gym-web");
+            let mut r = rig_with_tool(true, false, steers);
+            r.fake.w().protecting_unreadable = unreadable;
+            r.fake.w().stop_out_of_band(&web);
+            r.ticks(ticks);
+            let asked = r.fake.w().calls.iter().any(|c| c.call.starts_with("hold(service:gym-web)"));
+            let journaled = r.core.ledger().hold_events.iter().any(|e| e.0 == web && e.1);
+            let protecting = steers || unreadable;
+            prop_assert_eq!(asked, protecting, "{:#?}", r.core.notices);
+            prop_assert_eq!(journaled, protecting, "{:#?}", r.core.notices);
+            if !protecting {
+                // Repaired as any unit is (or left stopped as intended), never held.
+                prop_assert!(!r.fake.w().held.contains(&web));
+            }
+        }
+    }
+}
+
+/// §12d: a hold that stands for a tool that has stopped protecting is still
+/// lifted once the unit is back (the gate does not strand it).
+#[test]
+fn a_hold_stands_until_the_unit_is_back_even_if_it_stopped_protecting() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(1);
+    assert!(r.fake.w().held.contains(&web), "held first: {:?}", r.core.notices);
+    // The route goes: the tool no longer protects anything.
+    r.fake.w().stops_steering(&web);
+    r.ticks(30);
+    assert!(!r.fake.w().held.contains(&web), "still held: {:?}", r.core.notices);
+    assert!(r.core.ledger().holds().is_empty(), "{:?}", r.core.ledger().hold_events);
 }

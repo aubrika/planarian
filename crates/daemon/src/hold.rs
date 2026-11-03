@@ -50,9 +50,18 @@ pub fn hold_def(held: &UnitDef) -> UnitDef {
     d
 }
 
-/// The units whose failure holds traffic (interim: the exported `holds`).
-pub fn network_security(defs: &UnitDefs) -> impl Iterator<Item = &UnitDef> {
+/// The network tools: units able to change how traffic leaves the machine
+/// (the build-time half; the exported `holds`). Each has a hold unit.
+pub fn network_tools(defs: &UnitDefs) -> impl Iterator<Item = &UnitDef> {
     defs.values().filter(|d| d.holds)
+}
+
+/// §12d *Which units*: a network-security unit is a network tool that is
+/// protecting traffic now (`SystemState::protecting`, from the kernel-
+/// attributed footprints; an unreadable watch counts every tool as
+/// protecting). Only its failure holds traffic.
+pub fn network_security<'a>(s: &'a SystemState, defs: &'a UnitDefs) -> impl Iterator<Item = &'a UnitDef> {
+    network_tools(defs).filter(|d| s.protecting.contains(&d.id))
 }
 
 /// It has failed in §12d's sense: observed failed, or not running while it

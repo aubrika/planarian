@@ -668,9 +668,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             s.holds.extend(h);
         }
         let mut defs = self.asm.defs();
+        // §12d: the network tools that protect traffic now. Fail closed: an
+        // unreadable watch counts every tool as protecting.
+        let tools: Vec<UnitId> = crate::hold::network_tools(&defs).map(|d| d.id.clone()).collect();
+        s.protecting = if tools.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.b.units().protecting(&tools).unwrap_or_else(|_| tools.iter().cloned().collect())
+        };
         // §12d: each network-security unit's hold unit, known (so releasing
         // it derives the held unit's sensitivity) but never expected.
-        let holds: Vec<UnitDef> = crate::hold::network_security(&defs).map(crate::hold::hold_def).collect();
+        let holds: Vec<UnitDef> = crate::hold::network_tools(&defs).map(crate::hold::hold_def).collect();
         for d in holds {
             defs.entry(d.id.clone()).or_insert(d);
         }
@@ -869,13 +877,25 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {
         use crate::hold;
         use planarian_txn::ledger::HoldBy;
-        let units: Vec<UnitId> = hold::network_security(defs).map(|d| d.id.clone()).collect();
-        if units.is_empty() {
-            return false;
-        }
         let mut applied = false;
         let journaled = self.ledger().holds();
         let host = self.b.units().held();
+        // The units this tick looks after: network-security units (tools
+        // protecting traffic), and any tool whose hold stands (journaled or
+        // on the host) whether or not it still protects, so that hold is
+        // lifted once the unit is back. A tool that is not protecting is
+        // never held.
+        let units: Vec<UnitId> = hold::network_tools(defs)
+            .filter(|d| {
+                s.protecting.contains(&d.id)
+                    || journaled.contains(&d.id)
+                    || host.as_ref().is_ok_and(|h| h.contains(&d.id))
+            })
+            .map(|d| d.id.clone())
+            .collect();
+        if units.is_empty() {
+            return false;
+        }
         // Anything else flushing the ruleset removes the hold's table while
         // the units stay held: put it back (journal, alarm, re-apply).
         let mut holding = journaled.clone();
@@ -1405,7 +1425,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 stops_are_faults: def.stops_are_faults,
                 systemd_restarts: def.systemd_restart.as_ref().is_some_and(|p| p.restart),
                 lenient,
-                network_tool: def.holds,
+                network_tool: def.holds && s.protecting.contains(u),
                 held: s.holds.contains(u) || host_held.as_ref().is_ok_and(|h| h.contains(u)),
                 hold_tried: false,
             };
