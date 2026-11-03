@@ -135,7 +135,20 @@ in
     # The tunnel's upstream: what the machine sends through it is forwarded
     # and masqueraded out of the peer's other interfaces.
     boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
-    networking.interfaces.lo.ipv4.addresses = [ { address = upstream; prefixLength = 32; } ];
+    # Upstream on lo, by a unit of its own: networking.interfaces.lo would
+    # never apply, since network-addresses-lo starts with lo's device unit
+    # and udev tags no `lo` for systemd (99-systemd.rules: KERNEL!="lo"),
+    # so the address was never there (gate run 41545741182).
+    systemd.services.wg-gym-upstream = {
+      description = "The gym's upstream address (${upstream} on lo)";
+      wantedBy = [ "multi-user.target" ];
+      before = [ "network.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${pkgs.iproute2}/bin/ip address replace ${upstream}/32 dev lo";
+      };
+    };
     networking.nftables.enable = true;
     networking.nftables.tables.wg-gym-nat = {
       family = "ip";
