@@ -2245,3 +2245,128 @@ fn an_exhausted_cooldown_runs_from_the_decision() {
     }
     panic!("no cooldown: {:#?}", r.core.notices);
 }
+
+/// Property tests for the repair loop's timing anchors (#44; the ledger's D2
+/// and D3). Each attempt's backoff is timed from the clock read after the
+/// attempt ran, and each cooldown or hold from the clock read at its
+/// decision, never from the start of the observation before it, so a slow
+/// observation can never bring two attempts closer than the floor, or end a
+/// cooldown early. `PROPTEST_CASES` goes deeper.
+mod timing_props {
+    use super::*;
+    use planarian_incident::{BACKOFF, COOLDOWN_FIRST, COOLDOWN_LATER};
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as PConfig, FailurePersistence};
+
+    fn pconfig() -> PConfig {
+        let cases = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(64);
+        PConfig { cases, failure_persistence: None::<Box<dyn FailurePersistence>>, ..PConfig::default() }
+    }
+
+    /// A probe batch's length on each tick, cycled: quick, or slow enough to
+    /// matter against a 10 s floor.
+    fn batches() -> impl Strategy<Value = Vec<u64>> {
+        proptest::collection::vec(prop_oneof![Just(0u64), 500..9_000u64], 1..8)
+    }
+
+    /// The fault: a unit that fails some seconds after each start (attempts,
+    /// then a cooldown when the budget is spent), or a device whose driver
+    /// was never known (the diagnoser has nothing: `exhausted`).
+    #[derive(Clone, Debug)]
+    enum Fault {
+        Flap(u64),
+        UnknownDriver,
+    }
+
+    fn fault() -> impl Strategy<Value = Fault> {
+        prop_oneof![3 => (5..40u64).prop_map(Fault::Flap), 1 => Just(Fault::UnknownDriver)]
+    }
+
+    /// What the tick's clock bounds: the decision came after the tick's
+    /// first probe batch ran and before the tick ended.
+    fn decided_within(until: Timestamp, durations: &[Millis], earliest: u64, latest: u64) -> bool {
+        durations.iter().any(|d| until.0 >= earliest + d.0 && until.0 <= latest + d.0)
+    }
+
+    proptest! {
+        #![proptest_config(pconfig())]
+
+        #[test]
+        fn slow_observations_never_shorten_a_backoff_or_a_cooldown(f in fault(), batch in batches()) {
+            let mut r = Rig::new();
+            r.ticks(2);
+            let target = match f {
+                Fault::Flap(secs) => {
+                    let flap = UnitId::service("gym-flap");
+                    let mut w = r.fake.w();
+                    let now = w.now;
+                    let sim = w.units.get_mut(&flap).unwrap();
+                    sim.fail_after = Some(Millis::secs(secs));
+                    sim.started_at = now;
+                    drop(w);
+                    flap
+                }
+                Fault::UnknownDriver => {
+                    let dev = UnitId::device("snd-hda0");
+                    r.fake.w().devices.insert(dev.clone(), None);
+                    r.core.asm.known_drivers.clear();
+                    dev
+                }
+            };
+            let mut seen: Option<IncidentState> = None;
+            for k in 0..240 {
+                let slow = batch[k % batch.len()];
+                r.fake.w().probe_batch_ms = slow;
+                r.fake.advance(planarian_state::TICK);
+                let start = r.fake.now().0;
+                r.core.tick();
+                let end = r.fake.now().0;
+                if matches!(f, Fault::UnknownDriver) {
+                    r.core.asm.known_drivers.clear();
+                }
+                let state = r.core.incidents.active_for(&target).map(|i| i.state.clone());
+                if state != seen {
+                    // D3: a cooldown or hold set on this tick runs from its
+                    // decision: after the tick's probes, before its end.
+                    match &state {
+                        Some(IncidentState::Cooldown { until }) => prop_assert!(
+                            decided_within(*until, &[COOLDOWN_FIRST, COOLDOWN_LATER], start + slow, end),
+                            "cooldown until {} set on a tick from {start} (+{slow} ms of probes) to {end}",
+                            until.0
+                        ),
+                        Some(IncidentState::Escalated { until, .. }) => prop_assert!(
+                            decided_within(*until, &[COOLDOWN_LATER], start + slow, end),
+                            "hold until {} set on a tick from {start} (+{slow} ms of probes) to {end}",
+                            until.0
+                        ),
+                        _ => {}
+                    }
+                    if let Some(s) = &state {
+                        seen = Some(s.clone());
+                    }
+                }
+            }
+            // D2: consecutive attempts on the target, by their log records'
+            // times (what the gym's `attempt_gaps_min` reads), are at least
+            // the backoff apart; regressions only lengthen it.
+            let at: Vec<u64> = r
+                .core
+                .log
+                .iter()
+                .chain(r.core.awaiting_post.iter())
+                .filter(|x| {
+                    matches!(&x.proposal.transition, Transition::RestartUnit(u) if *u == target)
+                        && matches!(x.result, Submitted::Finished { .. })
+                })
+                .map(|x| x.at.0)
+                .collect();
+            for (k, w) in at.windows(2).enumerate().take(BACKOFF.len() - 1) {
+                let min = BACKOFF[k].0;
+                prop_assert!(w[1] - w[0] >= min, "attempts {} and {} {} ms apart (min {min} ms): {at:?}", k + 1, k + 2, w[1] - w[0]);
+            }
+            if let Fault::Flap(_) = f {
+                prop_assert!(at.len() >= 2, "the flap was never repaired twice: {at:?}");
+            }
+        }
+    }
+}

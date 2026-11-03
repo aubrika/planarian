@@ -59,8 +59,8 @@ carries a property test for the invariant it changes.
 | # | Bug | Fixed in | Crate::function | Test that catches it | Kind | Fails on revert | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | D1 | P16 race: after a planariad restart, `planarian-posture-lift` could run before `planarian-respond@absent`, find no alarm, and leave Absent raised | #43 (`862ea72`; VM wait `a206de6`) | nix/posture.nix (lift `After=` respond@absent/@crashed; counts the markers) | vm-posture subtest P16 (nix/tests/posture.nix); module-eval ordering + marker check (nix/tests/eval.nix) | VM + eval | recorded: VM run 41507137168 failed P16 | covered (systemd ordering; no pure function) |
-| D2 | flap-30s: the repair backoff was anchored at the tick's `observed_at` (observation start, before the probes ran), so after a slow observation two attempts came 59 967 ms apart for a 60 s floor. Fixed by anchoring at the clock read after the attempt | #44 (`ec10006`) | daemon::Core::repair_one/activate_waiting → incident::Manager::record_attempt | `backoff_is_kept_between_attempts_even_after_a_slow_observation` (core/tests.rs) | unit | recorded: "57 000 ms apart on main, at least 60 s with the fix" | gap: proptest over random observation durations: consecutive attempts (by the log's clock) are never closer than the backoff |
-| D3 | The 1 h / 6 h cooldowns and the 6 h hold were anchored the same wrong way | #44 (`da88be7`) | daemon::Core::repair_one → Manager::exhausted/escalate | `an_exhausted_cooldown_runs_from_the_decision` (core/tests.rs) | unit | recorded: "fails with the old anchor" | gap: same property, for cooldown and hold `until` |
+| D2 | flap-30s: the repair backoff was anchored at the tick's `observed_at` (observation start, before the probes ran), so after a slow observation two attempts came 59 967 ms apart for a 60 s floor. Fixed by anchoring at the clock read after the attempt | #44 (`ec10006`) | daemon::Core::repair_one/activate_waiting → incident::Manager::record_attempt | `timing_props::slow_observations_never_shorten_a_backoff_or_a_cooldown` (daemon core/tests.rs); `backoff_is_kept_between_attempts_even_after_a_slow_observation` | proptest + unit | verified: with `ec10006` reverted, "attempts 2 and 3 55000 ms apart (min 60000 ms)" (cooldown check disabled to isolate it); with the cooldown check on, it fails first on the cooldown's anchor | covered |
+| D3 | The 1 h / 6 h cooldowns and the 6 h hold were anchored the same wrong way | #44 (`da88be7`) | daemon::Core::repair_one → Manager::exhausted/escalate | `timing_props::slow_observations_never_shorten_a_backoff_or_a_cooldown`; `an_exhausted_cooldown_runs_from_the_decision` | proptest + unit | verified: with `da88be7` reverted, "cooldown until 1700003620500 set on a tick from 1700000020500 (+500 ms of probes)", minimal `f = UnknownDriver` | covered for cooldowns; the hold (`escalate`, RevertBlockedByFloor) is checked by the same property but none of its faults reach it, so its anchor rests on the unit test of `da88be7` |
 | D4 | P9's slow-tick warning fired on nearly every VM tick | `6ad8521` (#6) | daemon::Core::tick (`last_slow_warning`) | `a_slow_tick_is_warned` (core/tests.rs) | unit | none recorded | gap: rate-limit property (at most one a minute, none lost from the count) |
 | D5 | Notices stopped reaching the journal once 64 had accumulated | before history | daemon::Core::say/notices_since | `notices_keep_reaching_the_journal_once_the_deque_is_full` (core/tests.rs) | unit | recorded (ga-status, generic) | gap: ring-buffer cursor property over random say/drain interleavings |
 | D6 | Status requests ran the probes, starving the repair loop (a killed service restarted 100 s late) | before history | daemon::Core::handle | `status_requests_do_not_run_the_probes` (core/tests.rs) | unit | recorded (ga-status, generic) | covered |
@@ -140,9 +140,9 @@ the coordinator's list:
 
 62 rows for bugs fixed on `main`: 15 journal and kernel (J), 14 daemon (D),
 16 change path (C), 17 backends, identity and gym (B). Another 9 netwatch
-rows are pending #42. 18 rows still owe a property test (status **gap**).
+rows are pending #42. 16 rows still owe a property test (status **gap**).
 J4 and J7 wait on lane-daemon's extraction of pure functions. The rest, in
-the coordinator's order: D2 and D3 (daemon timing), D14, C1, C3, J8, J9, then
-D4, D5, C2, C4, C5, C11, C16, B6 and B13.
+the coordinator's order: D14, C1, C3, J8, J9, then D4, D5, C2, C4, C5, C11,
+C16, B6 and B13.
 The rest are covered by the strongest cheap test their shape allows; for
 bugs that depend on the kernel or systemd, that is a VM test.
