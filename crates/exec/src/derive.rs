@@ -160,14 +160,16 @@ fn touches_canonical(base: &Manifest, cand: &Manifest, canonical: &Canonical) ->
 /// exported `systemd_restart`, `startup_grace`, `runtime_repair`,
 /// `stops_are_faults`), in user-scope entries as in system ones, or adds or
 /// removes an entry. Canonical probes are left out: they come from the core
-/// package, and redefining one is `touches_canonical`.
+/// package, and redefining one is `touches_canonical`. So are the fields the
+/// module derives (`holds`; [`crate::host::declared`]).
 fn touches_manifest(base: &Manifest, cand: &Manifest, diff: &ConfigDiff) -> bool {
     if diff.options.keys().any(|k| k.starts_with("services.planarian.")) {
         return true;
     }
-    // An entry as the manifest declares it: every field, the user probes only.
+    // An entry as the manifest declares it: every declared field, the user
+    // probes only.
     let entry = |d: &UnitDef| {
-        let mut d = d.clone();
+        let mut d = crate::host::declared(d);
         d.probes.retain(|p| p.origin == ProbeOrigin::User);
         d
     };
