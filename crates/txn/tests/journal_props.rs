@@ -10,10 +10,10 @@
 //!
 //! `PROPTEST_CASES` raises the case counts for a deeper local run.
 //!
-//! Stores here are small (16 KiB where a history compacts): `Journal::open`
-//! after a compaction searches the stale bytes past the log's end at a cost
-//! quadratic in the store's size (ledger row J16, lane-daemon fixing). A
-//! follow-up raises the sizes once that fix lands.
+//! Stores are 1 MiB (`store`): J16's fix (#54) made `Journal::open` after a
+//! compaction linear in the store, so histories that compact run at a size
+//! with real leftovers past the tail. `at_the_default_journal_size` reruns
+//! the properties that compact at the 64 MiB default, behind `#[ignore]`.
 
 mod common;
 
@@ -26,16 +26,30 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, FailurePersistence};
 use std::collections::BTreeMap;
 
+thread_local! {
+    /// Overrides for `at_the_default_journal_size`: the store's size, and
+    /// the cases per property.
+    static STORE: std::cell::Cell<u64> = const { std::cell::Cell::new(1 << 20) };
+    static CASES: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The store's size for a property whose history compacts.
+fn store() -> MemStore {
+    MemStore::new(STORE.with(std::cell::Cell::get))
+}
+
 fn config(cases: u32) -> Config {
-    let cases = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(cases);
+    let cases = CASES
+        .with(std::cell::Cell::get)
+        .or_else(|| std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()))
+        .unwrap_or(cases);
     Config { cases, failure_persistence: None::<Box<dyn FailurePersistence>>, ..Config::default() }
 }
 
 /// `n` simple records (incidents), each appended and fsync'd. Returns the
 /// store and each record's [start, end) byte range in the log.
 fn written(n: usize) -> (MemStore, Vec<(u64, u64)>) {
-    // Small, so open's search for a later intact record stays quick (J16).
-    let store = MemStore::new(1 << 14);
+    let store = store();
     let mut j = Journal::open(store.clone()).unwrap();
     let mut frames = Vec::new();
     for i in 0..n {
@@ -309,7 +323,9 @@ fn held_unit(u: u8) -> UnitId {
 }
 
 proptest! {
-    #![proptest_config(config(256))]
+    // Every step reopens a 1 MiB store twice; 32 cases keep CI near ten
+    // seconds. `PROPTEST_CASES` goes deeper.
+    #![proptest_config(config(32))]
 
     /// D14 (§12d, #35/#40): the journal's holds are its recovery source of
     /// truth after a restart. For any sequence of applies and lifts (either
@@ -319,9 +335,7 @@ proptest! {
     #[test]
     fn holds_are_the_last_event_per_unit(steps in proptest::collection::vec(hold_step(), 1..40)) {
         use planarian_txn::ledger::HoldBy;
-        // Small (J16): after a compaction, open searches the stale bytes
-        // past the log's end for a later intact record, byte by byte.
-        let store = MemStore::new(1 << 14);
+        let store = store();
         let mut j = Journal::open(store.clone()).unwrap();
         let mut model: BTreeMap<u8, bool> = BTreeMap::new();
         for (k, s) in steps.into_iter().enumerate() {
@@ -509,8 +523,7 @@ proptest! {
     /// exactly the appends that returned `Ok`.
     #[test]
     fn an_accepted_append_survives_any_crash(steps in proptest::collection::vec(crash_step(), 1..24)) {
-        // Small, as the others (J16).
-        let store = MemStore::new(1 << 14);
+        let store = store();
         let mut j = Journal::open(store.clone()).unwrap();
         let mut accepted = 0u64;
         for s in steps {
@@ -534,4 +547,17 @@ proptest! {
             prop_assert_eq!(Journal::open(store.clone()).unwrap().ledger().last_seq, accepted);
         }
     }
+}
+
+/// The properties whose histories compact (D14, J8, J9), at the daemon's
+/// default journal size (64 MiB, `DEFAULT_CAPACITY`), a few cases each.
+/// `cargo test --release -p planarian-txn --test journal_props -- --ignored`.
+#[test]
+#[ignore]
+fn at_the_default_journal_size() {
+    STORE.with(|s| s.set(planarian_txn::store::DEFAULT_CAPACITY));
+    CASES.with(|c| c.set(Some(4)));
+    holds_are_the_last_event_per_unit();
+    a_damaged_checkpoint_is_integrity();
+    an_accepted_append_survives_any_crash();
 }
