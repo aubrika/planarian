@@ -37,7 +37,12 @@ pub fn renew_due<S: Store>(j: &mut Journal<S>, due: &[Due], now: Timestamp, boot
 
 /// One renewal: catch up, then renew what `me` holds mid-flight. An error
 /// catching up leaves the handle to be dropped and opened again.
-pub fn renew<S: Store>(j: &mut Journal<S>, me: &OwnerId, now: Timestamp, boot_at: Timestamp) -> Result<usize, JournalError> {
+pub fn renew<S: Store>(
+    j: &mut Journal<S>,
+    me: &OwnerId,
+    now: Timestamp,
+    boot_at: Timestamp,
+) -> Result<usize, JournalError> {
     let d = due(j.sync_ledger()?, me);
     Ok(renew_due(j, &d, now, boot_at))
 }
