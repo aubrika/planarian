@@ -725,8 +725,8 @@ mod wgfold {
                         prop_assert_eq!(changed, before != want, "the return value, on {:?}", r);
                     }
                 }
-                for i in 0..UNITS {
-                    prop_assert_eq!(endpoints(&t, i), want[i].clone(), "unit {} after {:?}", i, s);
+                for (i, w) in want.iter().enumerate() {
+                    prop_assert_eq!(&endpoints(&t, i), w, "unit {} after {:?}", i, s);
                 }
             }
         }
