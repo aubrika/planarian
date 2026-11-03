@@ -2245,3 +2245,114 @@ fn an_exhausted_cooldown_runs_from_the_decision() {
     }
     panic!("no cooldown: {:#?}", r.core.notices);
 }
+
+// ---- §12d/§11: the residue of a held network tool (reviewer's case,
+// gate 41571048192, vm-netwatch (f)). A network tool whose stop outside
+// Planarian is not attributed is "always a fault, §11 residue" (§12d), and
+// "A network-security unit (§12d) that has failed, or been stopped outside
+// Planarian and not attributed, is restarted at once, without asking,
+// whatever its sensitivity, and alarmed (`restarts_held_unit`)" (§11). The
+// unit here is gym-web, Routine: not Security, so the residue's
+// AlarmSecurity arm does not cover it.
+
+/// gym-web as a network tool (`holds`), held by OnFailure= when it fails
+/// (`hold_on_failure`) if `on_failure`.
+fn rig_with_network_tool(holds: bool, on_failure: bool) -> Rig {
+    let store = MemStore::new(8 << 20);
+    let fake = gym_world(store.clone());
+    let web = UnitId::service("gym-web");
+    {
+        let mut w = fake.w();
+        for g in w.gens.values_mut() {
+            if let Some(d) = g.eval.units.get_mut(&web) {
+                d.holds = holds;
+            }
+        }
+        if let Some(d) = w.base_units.get_mut(&web) {
+            d.holds = holds;
+        }
+        if on_failure {
+            w.hold_on_failure.insert(web);
+        }
+        w.alive.insert(100);
+    }
+    let mut j = Journal::open(store).unwrap();
+    j.append(fake.w().now, Record::KnownGood(GenerationId(1))).unwrap();
+    let core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config());
+    let mut r = Rig { fake, core };
+    r.ticks(2);
+    r
+}
+
+fn hold_alarms(r: &Rig, u: &UnitId) -> usize {
+    r.core.notices.iter().filter(|n| **n == crate::hold::alarm(u)).count()
+}
+
+/// Killed outside Planarian (SIGKILL; OnFailure= holds it): a fault, never
+/// the inferred intent of the residue rule. Restarted at once without
+/// asking, alarmed once, and the hold lifts once it is back.
+#[test]
+fn a_held_network_tool_killed_outside_planarian_is_restarted_at_once() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().kill(&web);
+    r.ticks(1);
+    assert!(r.fake.w().held.contains(&web), "precondition: OnFailure= held it");
+    r.ticks(10);
+    assert!(
+        !r.core.ledger().overrides.iter().any(|o| o.unit == web),
+        "inferred as intended: {:?}\n{:?}",
+        r.core.ledger().overrides,
+        r.core.notices
+    );
+    assert!(r.core.ex.parked.is_empty(), "the restart asked: {:?}", r.core.ex.parked);
+    assert!(r.calls("restart(service:gym-web)") >= 1, "never restarted: {:?}", r.core.notices);
+    assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
+    assert_eq!(hold_alarms(&r, &web), 1, "{:?}", r.core.notices);
+    r.ticks(10);
+    assert!(!r.fake.w().held.contains(&web), "the hold lifts once it is back");
+}
+
+/// Stopped cleanly outside Planarian (`systemctl stop`: no OnFailure=):
+/// §12d's other half, "by `planariad` for a stop outside Planarian that is
+/// not attributed (always a fault, §11 residue)". Held by the daemon,
+/// restarted at once, alarmed; never an inferred override.
+#[test]
+fn a_network_tool_stopped_outside_planarian_is_held_and_restarted() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(2);
+    assert!(
+        r.fake.w().calls.iter().any(|c| c.call == "hold(service:gym-web)"),
+        "the daemon never held it: {:?}\n{:?}",
+        r.core.ledger().overrides,
+        r.core.notices
+    );
+    r.ticks(10);
+    assert!(
+        !r.core.ledger().overrides.iter().any(|o| o.unit == web),
+        "inferred as intended: {:?}",
+        r.core.ledger().overrides
+    );
+    assert!(r.core.ex.parked.is_empty(), "the restart asked: {:?}", r.core.ex.parked);
+    assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
+    assert_eq!(hold_alarms(&r, &web), 1, "{:?}", r.core.notices);
+}
+
+/// The control: the same kill of a unit that is not a network tool keeps
+/// the residue rule (Standard: intended until the next boot, an undo).
+#[test]
+fn a_unit_that_is_not_a_network_tool_keeps_the_residue_rule() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(false, false);
+    r.fake.w().kill(&web);
+    r.ticks(10);
+    assert!(!r.fake.w().held.contains(&web));
+    assert!(
+        r.core.ledger().overrides.iter().any(|o| o.unit == web && o.attribution == Attribution::Inferred),
+        "{:?}",
+        r.core.notices
+    );
+    assert_eq!(r.calls("restart(service:gym-web)"), 0);
+}
