@@ -70,6 +70,10 @@ pub const CHAIN_CHECK_EVERY: Millis = Millis::secs(3600);
 /// asks for on a network tool's stop outside Planarian; past it the hold
 /// counts as held (fail closed) and its job goes on in the host.
 pub const HOLD_WAIT: Millis = Millis::secs(5);
+/// §12d: how long a hold the host has not confirmed waits before it is
+/// asked for again (its job may still land meanwhile; the host is checked
+/// every tick).
+pub const HOLD_UNCONFIRMED_RETRY: Millis = Millis::secs(60);
 /// §12d: the first and the longest wait between re-applies of a hold whose
 /// firewall table is missing.
 pub const HOLD_RETRY_MIN: Millis = Millis::secs(10);
@@ -256,8 +260,11 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// §12d: units the daemon itself asked the host to hold for a stop
     /// outside Planarian (the residue path); their `HoldApplied` is by it.
     daemon_held: BTreeSet<UnitId>,
-    /// §12d: units whose hold the host has not confirmed in time; alarmed once.
-    hold_unconfirmed: BTreeSet<UnitId>,
+    /// §12d: units whose hold the host has not confirmed in time (alarmed
+    /// once), and when to ask again: a wedged hold job is not re-called on
+    /// every tick, where it would spend the whole hold budget and starve
+    /// other units' lifts.
+    hold_unconfirmed: BTreeMap<UnitId, Timestamp>,
     /// §12d: the end of this tick's hold budget (`hold_wait`).
     hold_deadline: Timestamp,
     /// Generation transactions withdrawn from `Built` for a rollback about to
@@ -476,7 +483,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             hold_missing_noted: false,
             hold_retry: None,
             daemon_held: BTreeSet::new(),
-            hold_unconfirmed: BTreeSet::new(),
+            hold_unconfirmed: BTreeMap::new(),
             hold_deadline: Timestamp(0),
             withdrawn: vec![],
             earlier: BTreeMap::new(),
@@ -902,7 +909,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     self.notice(hold::alarm(&u));
                 }
                 if on_host != Some(true) {
+                    let now = self.b.clock().boot_now();
+                    // Asked already and not yet due again: its job may still
+                    // land, and the host is checked every tick (above).
+                    let waiting = self.hold_unconfirmed.get(&u).is_some_and(|next| now < *next);
                     let o = match self.hold_wait() {
+                        _ if waiting => Outcome::Unknown("waiting for its hold job".into()),
                         Some(w) => self.b.units().hold(&u, w),
                         None => Outcome::Unknown("no time left on this tick".into()),
                     };
@@ -912,8 +924,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         o @ Outcome::Failed(_) => {
                             self.notice(format!("ALARM: {u}: its traffic could not be held ({o:?})"))
                         }
+                        _ if waiting => {}
                         o @ Outcome::Unknown(_) => {
-                            if self.hold_unconfirmed.insert(u.clone()) {
+                            let later = self.b.clock().boot_now().plus(HOLD_UNCONFIRMED_RETRY);
+                            if self.hold_unconfirmed.insert(u.clone(), later).is_none() {
                                 self.notice(format!("ALARM: {u}: its traffic could not be held ({o:?})"))
                             }
                         }
@@ -1331,11 +1345,23 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 // are not stalled for `hold::apply`'s 30 s. Deciding before the residue is recorded is the
                 // point: an Inferred stop must not be written for a unit
                 // whose traffic is then held.
+                let now = self.b.clock().boot_now();
+                let waiting = self.hold_unconfirmed.get(u).is_some_and(|next| now < *next);
                 let o = match self.hold_wait() {
+                    _ if waiting => Outcome::Unknown("waiting for its hold job".into()),
                     Some(w) => self.b.units().hold(u, w),
                     None => Outcome::Unknown("no time left on this tick".into()),
                 };
                 let held = match o {
+                    Outcome::Unknown(_) if !waiting => {
+                        // Not confirmed: alarmed once, and asked for again
+                        // only after the retry (network_holds checks the host
+                        // every tick meanwhile).
+                        if self.hold_unconfirmed.insert(u.clone(), now.plus(HOLD_UNCONFIRMED_RETRY)).is_none() {
+                            self.notice(format!("ALARM: {u}: its traffic could not be held ({o:?})"));
+                        }
+                        true
+                    }
                     Outcome::Failed(_) | Outcome::Unknown(_) => true,
                     _ => self.b.units().held().map_or(true, |h| h.contains(u)),
                 };

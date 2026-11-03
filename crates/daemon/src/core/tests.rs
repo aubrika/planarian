@@ -2734,3 +2734,62 @@ fn a_regression_hold_runs_from_the_decision() {
     }
     panic!("no escalation: {:#?}", r.core.notices);
 }
+
+/// §12d (reviewer, #61): a unit whose hold job is wedged is not asked for
+/// again on every tick, where it would spend the whole hold budget and
+/// starve another unit's lift: gym-app (wedged, and failing on every start)
+/// comes before gym-web in the network tools, and gym-web, stopped outside
+/// Planarian and repaired, still has its hold lifted once it is back.
+#[test]
+fn a_wedged_hold_does_not_starve_another_units_lift() {
+    let store = MemStore::new(8 << 20);
+    let fake = gym_world(store.clone());
+    let app = UnitId::service("gym-app");
+    let web = UnitId::service("gym-web");
+    {
+        let mut w = fake.w();
+        for u in [&app, &web] {
+            for g in w.gens.values_mut() {
+                if let Some(d) = g.eval.units.get_mut(u) {
+                    d.holds = true;
+                }
+            }
+            if let Some(d) = w.base_units.get_mut(u) {
+                d.holds = true;
+            }
+        }
+        w.hold_wedged.insert(app.clone());
+        w.alive.insert(100);
+    }
+    let mut j = Journal::open(store).unwrap();
+    j.append(fake.w().now, Record::KnownGood(GenerationId(1))).unwrap();
+    let core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config());
+    let mut r = Rig { fake, core };
+    r.ticks(2);
+    // gym-app goes down for good; its hold never lands.
+    r.fake.w().units.get_mut(&app).unwrap().fail_on_start = true;
+    r.fake.w().stop_out_of_band(&app);
+    r.ticks(3);
+    assert!(!r.fake.w().held.contains(&app), "precondition: gym-app's hold is wedged");
+    // gym-web is stopped too, then repaired: its hold must lift.
+    r.fake.w().stop_out_of_band(&web);
+    let mut lifted_after = None;
+    for k in 0..40 {
+        r.ticks(1);
+        if r.fake.w().held.contains(&web) {
+            continue;
+        }
+        if r.fake.w().calls.iter().any(|c| c.call == "lift_hold(service:gym-web)") {
+            lifted_after = Some(k);
+            break;
+        }
+    }
+    assert!(
+        lifted_after.is_some(),
+        "gym-web's hold never lifted while gym-app's was wedged: {:?}",
+        r.core.notices.iter().filter(|n| n.contains("gym-web")).collect::<Vec<_>>()
+    );
+    // gym-app's hold was asked for at most once per retry, not every tick.
+    let tries = r.fake.w().calls.iter().filter(|c| c.call == "hold(service:gym-app) timed out").count();
+    assert!(tries <= 3, "gym-app's wedged hold asked for {tries} times");
+}
