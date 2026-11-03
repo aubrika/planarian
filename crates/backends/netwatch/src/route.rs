@@ -43,9 +43,12 @@ fn request(addr: &IpAddr) -> Vec<u8> {
     req
 }
 
-/// The answer in a reply: the output interface's index, or the kernel's error
-/// code. `Err(0)` is a reply with neither (a malformed one).
-fn answer(reply: &[u8]) -> Result<u32, i32> {
+const RTN_LOCAL: u8 = 2;
+
+/// The answer in a reply: the output interface's index and the route type
+/// (`rtm_type`), or the kernel's error code. `Err(0)` is a reply with
+/// neither (a malformed one).
+fn answer(reply: &[u8]) -> Result<(u32, u8), i32> {
     let mut o = 0;
     while o + NLMSG_HDRLEN <= reply.len() {
         let len = u32::from_ne_bytes(reply[o..o + 4].try_into().unwrap()) as usize;
@@ -61,7 +64,7 @@ fn answer(reply: &[u8]) -> Result<u32, i32> {
             && let Some((_, v)) = attrs.into_iter().find(|(t, _)| *t == RTA_OIF)
             && let Some(b) = v.get(0..4)
         {
-            return Ok(u32::from_ne_bytes([b[0], b[1], b[2], b[3]]));
+            return Ok((u32::from_ne_bytes([b[0], b[1], b[2], b[3]]), reply[o + NLMSG_HDRLEN + 7]));
         }
         o += (len + 3) & !3;
     }
@@ -86,7 +89,9 @@ pub fn get(addr: &IpAddr, ifname: &mut dyn FnMut(u32) -> Option<String>) -> Look
 /// unreachable"), or failed. Separate from the socket so it can be tested.
 pub fn classify(reply: &[u8], ifname: &mut dyn FnMut(u32) -> Option<String>) -> Lookup {
     match answer(reply) {
-        Ok(index) => ifname(index).map_or(Lookup::Failed, Lookup::Via),
+        // The machine's own address routes `local ... dev lo`: not a path out.
+        Ok((_, RTN_LOCAL)) => Lookup::Local,
+        Ok((index, _)) => ifname(index).map_or(Lookup::Failed, Lookup::Via),
         Err(ENETUNREACH | EHOSTUNREACH) => Lookup::NoRoute,
         Err(_) => Lookup::Failed,
     }

@@ -56,6 +56,9 @@ pub(crate) enum Mutant {
     UnownedIsNobody,
     /// Only the interface's creator is charged, not the unit that added the route.
     CreatorOnly,
+    /// A local address is taken for a route over `lo` (a virtual link
+    /// nobody owns: unknown, which holds every tool).
+    LocalIsUnknown,
     /// A resolved link's own servers are looked up like any address (so a
     /// loopback-routed lookup could pick another interface).
     LinkLooksUp,
@@ -217,6 +220,11 @@ pub enum Lookup {
     Via(String),
     /// No route (the kernel's `ENETUNREACH`): no interface carries it.
     NoRoute,
+    /// One of the machine's own addresses (`local ... dev lo`, route type
+    /// `RTN_LOCAL`): a server on this machine (dnsmasq, a Pi-hole on the
+    /// host's LAN address, libvirt's virbr0), not a path out. Charges
+    /// nobody, as loopback does.
+    Local,
     /// The lookup itself failed.
     Failed,
 }
@@ -313,6 +321,9 @@ pub fn charges(targets: &[Target], link: Option<&str>, w: &World<'_>) -> Charge 
                             carried(&i, w, &mut c);
                         }
                         Lookup::NoRoute => {}
+                        #[cfg(test)]
+                        Lookup::Local if mutant(Mutant::LocalIsUnknown) => c.unknown = true,
+                        Lookup::Local => {}
                         Lookup::Failed => {
                             #[cfg(test)]
                             if mutant(Mutant::FailedIsNobody) {

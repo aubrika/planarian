@@ -242,7 +242,12 @@
 //!    added a steering route over it. A *physical* interface (the uplink,
 //!    DHCP-learned DNS) steers for nobody and is charged to nobody, as a
 //!    default route over wlan0 is. "No route" (the kernel's network
-//!    unreachable) is no interface: nobody;
+//!    unreachable) is no interface: nobody. So is one of the machine's own
+//!    addresses (`local ... dev lo`, route type `RTN_LOCAL`: dnsmasq, a
+//!    Pi-hole on the host's LAN address, libvirt's virbr0): a server on this
+//!    machine is not a path out, as loopback is not (reviewer, #74), and
+//!    `lo` is a virtual link nobody owns, which would otherwise hold every
+//!    tool;
 //! 4. *unknown* fails closed, and is bound to its setting, never the global
 //!    marker: a lookup that failed, an address that cannot be read, or a
 //!    virtual interface nobody is known to own. It clears when the lookup

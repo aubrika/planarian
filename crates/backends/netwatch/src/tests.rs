@@ -2403,8 +2403,10 @@ mod dnsproxy {
         Unreadable,
         ZoneTun1,
         ZoneEth0,
+        /// The machine's own address (`local ... dev lo`).
+        Local,
     }
-    const REACHES: [Reach; 8] = [
+    const REACHES: [Reach; 9] = [
         Reach::Tun0,
         Reach::Tun1,
         Reach::Eth0,
@@ -2413,6 +2415,7 @@ mod dnsproxy {
         Reach::Unreadable,
         Reach::ZoneTun1,
         Reach::ZoneEth0,
+        Reach::Local,
     ];
 
     /// `tun0` and `tun1` are virtual, `eth0` the uplink. The owners of tun0:
@@ -2438,6 +2441,7 @@ mod dnsproxy {
                 Reach::Tun1 => Lookup::Via("tun1".into()),
                 Reach::Eth0 => Lookup::Via("eth0".into()),
                 Reach::NoRoute => Lookup::NoRoute,
+                Reach::Local => Lookup::Local,
                 _ => Lookup::Failed,
             },
             IpAddr::V6(_) => Lookup::Failed,
@@ -2479,7 +2483,7 @@ mod dnsproxy {
                 (None, Reach::Tun0) => Some("tun0"),
                 (None, Reach::Tun1 | Reach::ZoneTun1) => Some("tun1"),
                 (None, Reach::Eth0 | Reach::ZoneEth0) => Some("eth0"),
-                (None, Reach::NoRoute) => None,
+                (None, Reach::NoRoute | Reach::Local) => None,
                 (None, Reach::Failed) => {
                     unknown = true;
                     None
@@ -2521,7 +2525,7 @@ mod dnsproxy {
     }
 
     /// Every pair of addresses, however reached, with and without a resolved
-    /// link's interface, over every owner set (3,072 scenarios) is charged
+    /// link's interface, over every owner set (7,776 scenarios) is charged
     /// as the rule says: the charge is the owner set of the interface the
     /// kernel picks; the uplink's, even with a DHCP client's route, charges
     /// nobody; a failed lookup, an unreadable address, or a virtual interface
@@ -2541,12 +2545,13 @@ mod dnsproxy {
             (Mutant::UnownedIsNobody, 200),
             (Mutant::CreatorOnly, 200),
             (Mutant::LinkLooksUp, 200),
+            (Mutant::LocalIsUnknown, 200),
         ] {
             MUTANT.with(|c| c.set(m));
             let bad = failing_charges();
             MUTANT.with(|c| c.set(Mutant::None));
-            eprintln!("mutant {m:?} fails {bad} of 3072");
-            assert!(bad >= at_least, "mutant {m:?} caught by only {bad} of 3072 scenarios");
+            eprintln!("mutant {m:?} fails {bad} of 7776");
+            assert!(bad >= at_least, "mutant {m:?} caught by only {bad} of 7776 scenarios");
         }
     }
 
@@ -2652,9 +2657,14 @@ mod route {
     use crate::route::classify;
 
     fn reply_with_oif(oif: Option<u32>) -> Vec<u8> {
+        reply_of_type(oif, 1)
+    }
+
+    /// A reply for a route of type `rtm_type` (1 unicast, 2 local, 3 broadcast, 7 unreachable).
+    fn reply_of_type(oif: Option<u32>, rtm_type: u8) -> Vec<u8> {
         let mut m = vec![0u8; 16];
         m[4..6].copy_from_slice(&24u16.to_ne_bytes()); // RTM_NEWROUTE
-        m.extend([2u8, 32, 0, 0, 254, 3, 0, 1, 0, 0, 0, 0]); // rtmsg
+        m.extend([2u8, 32, 0, 0, 254, 3, 0, rtm_type, 0, 0, 0, 0]); // rtmsg
         m.extend(8u16.to_ne_bytes());
         m.extend(1u16.to_ne_bytes()); // RTA_DST
         m.extend([10, 0, 0, 1]);
@@ -2688,6 +2698,11 @@ mod route {
     #[test]
     fn a_reply_is_a_lookup() {
         assert_eq!(classify(&reply_with_oif(Some(9)), &mut names), Lookup::Via("tun0".into()));
+        // The machine's own address routes `local ... dev lo`: not a path out,
+        // whichever interface the kernel names (lo, or the interface it is on).
+        assert_eq!(classify(&reply_of_type(Some(9), 2), &mut names), Lookup::Local);
+        assert_eq!(classify(&reply_of_type(Some(1), 2), &mut names), Lookup::Local, "lo has no name here: still local");
+        assert_eq!(classify(&reply_of_type(Some(9), 3), &mut names), Lookup::Via("tun0".into()), "only RTN_LOCAL");
         assert_eq!(classify(&error(-101), &mut names), Lookup::NoRoute);
         assert_eq!(classify(&error(-113), &mut names), Lookup::NoRoute);
         assert_eq!(classify(&error(-1), &mut names), Lookup::Failed, "another error");
