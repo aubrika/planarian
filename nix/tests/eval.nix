@@ -312,8 +312,10 @@ pkgs.runCommand "planarian-module-eval.json" {
   jq -c "del(.networkTools, .networkToolsInitrd, .networkToolsUnordered) | $kp" $exportPath > keys-export
   jq -c "$kp" parsed.json > keys-read
   # Exempt by name, one path: an Exec probe's `flagged` (§9, P11) is for
-  # whoever reads the manifest; planariad flags Exec probes by their kind,
-  # so ProbeDef has no field for it.
+  # whoever reads the manifest; Rust readers show Exec from ProbeKind::Exec,
+  # not from the key, so ProbeDef has no field for it (docs/
+  # review-reconciliation.md, "Reviewer: P11 module-eval case", row
+  # "P11, scope").
   jq -r '.[] | map(tostring) | join(".")' keys-export | grep -vxE '(units|userUnits)\.0\.probes\.0\.flagged' > paths-export
   jq -r '.[] | map(tostring) | join(".")' keys-read > paths-read
   diff paths-export paths-read || { echo "export: key paths differ between the export (<) and planariad's round trip (>): < is dropped, > is defaulted" >&2; exit 1; }
