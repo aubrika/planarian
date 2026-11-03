@@ -132,7 +132,7 @@ with no features). "Nowhere" rows need the step proposed.
 
 | Test surface | Gate | Where it runs | Step proposed |
 | --- | --- | --- | --- |
-| netwatch `loader` tests: the cgroups invocation property, `loader_checks`, `legacy_restart` (#42) | `--features loader` | **nowhere** (`cargo test --workspace` enables no feature) | lane-change-path adds a `cargo test -p planarian-backend-netwatch --features loader` step in #42 |
+| netwatch `loader` tests: the cgroups invocation property, `loader_checks`, `legacy_restart`, and `props.rs`'s cgroups and legacy-table properties (#42) | `--features loader` | `rust` job, the step "netwatch's loader tests" (`NETWATCH_REQUIRE_XATTR_TESTS=1`, so a skip fails); not the nix package check | none (landed in #42) |
 | backend-linux `nixos::tests::git_owner_edit_after_staging_is_stale` | skips unless both `nix-hash` and `git` are on PATH | **nowhere**: the `rust` job has no `nix-hash` and the nix package check has no `git` (`nativeCheckInputs = [ nix ]`). Shown: with either missing it prints `SKIPPED` and passes | add `git` to `nativeCheckInputs` in nix/package.nix (lane-nix) |
 | backend-linux `nixos::tests::stage_copies_tracked_files_and_hashes_like_nix` | skips without `nix-hash` | nix package check only (skipped in the `rust` job) | none |
 | gym `site::tests::the_repository_resolves` | skips without the source tree | `rust` job (skipped in the nix package check, which copies only the crates) | none |
@@ -145,29 +145,35 @@ with no features). "Nowhere" rows need the step proposed.
 | NixOS VM checks (`vm-runtime`, `vm-posture`, `vm-netsec`, `vm-generations`, `installer`) | KVM | vm.yml on a push to main only, never on a pull request (vm.yml's header says so) | none; a PR's VM evidence is the reviewer's local run |
 | the whole VM gym catalog | `catalog=true` | vm.yml by hand (`workflow_dispatch`) | none (documented) |
 
-## netwatch (PR #42, not merged)
+## netwatch (`crates/backends/netwatch`, #42)
 
-Rows are written when #42 merges, with its fixes' commits. Expected, from
-the coordinator's list:
+The properties are `crates/backends/netwatch/src/props.rs`, with oracles
+written from the spec or the kernel's numbering. Fails on revert is
+*verified* for every row marked so: each fix was reintroduced as a mutation
+on a scratch tree and the named property failed (`cargo test -p
+planarian-backend-netwatch --features loader`, the `rust` job's step). The
+mutations are listed in each row. `PROPTEST_CASES=4000` passes (about 25 s
+in a debug build).
 
-| # | Bug | Test owed | Status |
-| --- | --- | --- | --- |
-| N1 | inotify `IN_CREATE` against the cgroup walk: the attribution map was replaced, not merged | proptest: any interleaving of create events and walks gives the union of claims | pending |
-| N2 | Template slices | parser proptest over unit/slice names | pending |
-| N3 | A claim pruned before 2 walks without it | proptest over walk sequences: pruned iff absent from 2 consecutive walks | pending |
-| N4 | netns scoping: only host-netns events count; an unreadable netns is `.unattributed` | classifier proptest | pending |
-| N5 | Interface names with `%d` | parser proptest | pending |
-| N6 | Restart: loaded sockopt claims dropped; unclaimed steering pre-attach must go to `.unattributed` | model proptest across a restart | pending |
-| N7 | `nft list` counted as a change (8 pure GETs are reads; RESETs are changes) | classifier proptest over the nft message types | pending |
-| N8 | `unattributed` must imply `protecting yes` | proptest over the fold's output | pending |
-| N9 | A route over a virtual interface the unit did not create | classifier proptest | pending |
+| # | Bug | Fixed in | Crate::function | Test that catches it | Kind | Fails on revert | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| N1 | The cgroup-id map was rebuilt by each walk, so the id of a short-lived unit's cgroup was lost before its event was read and the change was charged to nobody | #42 (`1039fee`, `87d61fe`) | netwatch::cgroups::Cgroups::walk/drain/unit | `the_map_keeps_what_was_seen_and_prunes_after_two_walks` (props.rs, over create/remove/drain/walk steps, against a model of "known once seen, forgotten once absent twice"); `the_map_merges_and_does_not_replace`, `a_unit_gone_before_its_event_is_read_is_still_attributed` (tests.rs) | proptest + unit | verified: `walk` with `self.ids = ids` instead of `extend` fails the property | covered |
+| N2 | A template's instances live in the template's own slice (`system.slice/system-openvpn.slice/openvpn@work.service`); `unit_of_cgroup` did not look into slices | #42 (`1039fee`) | netwatch::host::unit_of_cgroup | `a_cgroup_belongs_to_the_first_service_below_system_slice` (props.rs: any slices above, sub-cgroups below, with and without the leading `/`; a slice and a path outside `system.slice` belong to no unit); `a_cgroup_belongs_to_its_service` (tests.rs) | proptest + unit | verified: `parts.next()` (no slice skip) and "the last service wins" each fail it | covered |
+| N3 | Ids were never forgotten, or forgotten at once: the map must be bounded without losing an id whose event is unread | #42 (`87d61fe`) | netwatch::cgroups::Cgroups::walk | `the_map_keeps_what_was_seen_and_prunes_after_two_walks` (props.rs: forgotten exactly when absent from two consecutive walks and its unit claimed nothing at the second); `gone_unclaimed_ids_are_forgotten_and_claimed_ones_kept` (tests.rs) | proptest + unit | verified: pruning after one walk, ignoring claims, and never pruning each fail it | covered |
+| N4 | Events from every network namespace were applied as the host's: a container's `wg-quick down` removed the host VPN's claim (fail open); a container's default route held every tool's failure; a link moved in from elsewhere could be dropped | #42 (`307b412`, `b321007`, `1f40227`) | netwatch::parse::scope/take | `events_in_other_namespaces_change_nothing_here`, `an_unknown_namespace_fails_closed`, `host_events_are_parsed_and_applied`, `a_link_request_elsewhere_that_reaches_here_is_never_dropped` (props.rs; the reaching link requests are built with and without IFLA_NET_NS_PID/FD/TARGET_NETNSID); the netns cases in tests.rs; `vm-netwatch` (n) | proptest + unit + VM | verified: applying `Elsewhere` events, ignoring an unknown netns, and ignoring `Reaches` each fail a property (the last only the link-request one; the first draft of the properties let it survive) | covered |
+| N5 | An interface registered through `ioctl(TUNSETIFF)` with an empty name was seen at `fentry` with its template name (`tun%d`), which `register_netdevice` resolves itself | #42 (`d17f13b`: `register_netdevice` at `fexit`) | netwatch-ebpf probe, netwatch::loader (`Kind::FExit`) | `vm-netwatch` (q) (a kernel-named tun is claimed by its final name); the probe-kinds case (`register_netdevice => Kind::FExit`, tests.rs) | VM + unit | recorded: the reviewer's blocker on #42 at `939819f`. **No property**: the bug is in what the kernel hands the probe, which only a kernel shows; the parser takes the name it is given | covered (VM only) |
+| N6 | After a restart, claims were lost or invented: a loaded sockopt claim was dropped on a kernel with no legacy tables; unclaimed steering made while nobody watched must read `pre-attach`; a claim whose object is gone must go | #42 (`838ccc0`, `5a929a7`) | netwatch::Tracker::attach, snapshot::legacy_tables | `a_restart_never_downgrades_and_the_gap_fails_closed`, `a_claim_survives_a_restart_exactly_while_its_object_stands`, `a_legacy_claim_survives_unless_the_kernel_shows_no_tables` (props.rs; the kernel's state is replayed independently of the tracker); `vm-netwatch` (g) | proptest + unit + VM | verified: dropping firewall claims, keeping claims whose object is gone, no `pre-attach`, a physical-NIC route counted as `pre-attach`, `legacy_tables(None)` dropping the claim and an empty file keeping it each fail one of them | covered |
+| N7 | `nft list` counted as a change: the parser took a message for a read when `type % 3 == 1`, which `GETFLOWTABLE` (23) breaks; the resets (21, 25, 33) zero counters and are changes | #42 (`8311802`, `c3a7f8d`) | netwatch::parse::parse (`NFT_READS`) | `nftables_reads_are_exactly_the_listed_gets` (props.rs: every type 0..=255, a batch, and other subsystems, against the kernel's `enum nf_tables_msg_types` written out); `every_nftables_read_is_a_read_and_the_rest_change` (tests.rs); `vm-netwatch` (n) | proptest (exhaustive) + unit + VM | verified: the `% 3 == 1` rule, the resets as reads, `GETFLOWTABLE` as a change, and a batch taken for a read each fail it | covered |
+| N8 | A footprint with an `unattributed` line did not say `protecting yes` (only the hold's reading made it protecting) | #42 (`d1a4334`) | netwatch::Tracker::footprint, contract::render | `unattributed_implies_protecting` (props.rs: any history of changes and losses; the rendered text reads back the same and says `protecting yes`); `unattributed_reads_protecting_yes` (tests.rs) | proptest + unit | verified: without `s.unattributed \|\|` in `standing` it fails | covered |
+| N9 | A default route a unit added over a virtual link it did not create (another unit's, moved in, or made before the watch) did not make it protecting; one over a physical NIC must still not The property reads what stands now; what an ended invocation's latch keeps protecting is N11's | #42 (`939819f`, `d1a4334`) | netwatch::Tracker::standing | `a_route_over_a_virtual_link_protects_exactly_its_adder_and_the_links_creator` (props.rs: both directions for both units; creator, adder, virtual or physical, steering or not, route or link removed); `a_route_over_a_moved_in_link_protects_its_maker`, `a_route_over_a_physical_nic_still_protects_nobody` (tests.rs); `vm-netwatch` (n) | proptest + unit + VM | verified: dropping the rule, counting a physical NIC, and a creator needing no virtual link each fail it | covered |
+| N10 | An ioctl-made tun (classic OpenVPN, wireguard-go) was never seen: no netlink message announces it | #42 (`939819f`) | netwatch::parse (`HOOK_NETDEV`), netwatch-ebpf `register_netdevice` | `a_tun_made_by_ioctl_protects`, `a_physical_nic_is_never_created_by_a_tool` (tests.rs); `vm-netwatch` (o) | unit + VM | recorded: the commit; the N9 property covers what the claim then does | covered |
+| N11 | A tool's work could be read as over before its invocation had ended, or a restarted invocation inherited the old one's footprint; the hold must wait for the invocation's end | #42 (`1058551`, `bb4a81b`, `4fa57b6`) | netwatch::Tracker::set_invocation, cgroups::finish | `invocations_end_only_once_seen_gone`, `the_invocation_property_catches_each_mutant`, `the_property_catches_each_mutant` (tests.rs: hand-rolled properties with mutants in the code, run in the `rust` job with `NETWATCH_REQUIRE_XATTR_TESTS`) | property (hand-rolled) + unit | recorded in the tests (`FinishAll`, `EndAtRemoval`, `no_latch`, `no_carry` each caught) | covered |
 
 ## Counts
 
-64 rows for bugs fixed on `main`: 17 journal and kernel (J), 14 daemon (D),
-16 change path (C), 17 backends, identity and gym (B). Another 9 netwatch
-rows are pending #42. Three rows still owe a property test (status
-**gap**):
+75 rows for bugs fixed on `main`: 17 journal and kernel (J), 14 daemon (D),
+16 change path (C), 17 backends, identity and gym (B), 11 netwatch (N).
+Three rows still owe a property test (status **gap**):
 - J4 and J7: each waits on a lane's extraction of a pure function from the
   daemon or the kernel.
 - C16: the property is in #53, held for the owner's decision on whether
