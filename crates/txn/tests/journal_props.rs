@@ -9,6 +9,11 @@
 //!   to the live ledger, and every link written is read back.
 //!
 //! `PROPTEST_CASES` raises the case counts for a deeper local run.
+//!
+//! Stores here are small (16 KiB where a history compacts): `Journal::open`
+//! after a compaction searches the stale bytes past the log's end at a cost
+//! quadratic in the store's size (ledger row J16, lane-daemon fixing). A
+//! follow-up raises the sizes once that fix lands.
 
 mod common;
 
@@ -29,7 +34,7 @@ fn config(cases: u32) -> Config {
 /// `n` simple records (incidents), each appended and fsync'd. Returns the
 /// store and each record's [start, end) byte range in the log.
 fn written(n: usize) -> (MemStore, Vec<(u64, u64)>) {
-    // Small, so open's search for a later intact record stays quick.
+    // Small, so open's search for a later intact record stays quick (J16).
     let store = MemStore::new(1 << 14);
     let mut j = Journal::open(store.clone()).unwrap();
     let mut frames = Vec::new();
@@ -314,8 +319,8 @@ proptest! {
     #[test]
     fn holds_are_the_last_event_per_unit(steps in proptest::collection::vec(hold_step(), 1..40)) {
         use planarian_txn::ledger::HoldBy;
-        // Small: after a compaction, open searches the stale bytes past the
-        // log's end for a later intact record, byte by byte.
+        // Small (J16): after a compaction, open searches the stale bytes
+        // past the log's end for a later intact record, byte by byte.
         let store = MemStore::new(1 << 14);
         let mut j = Journal::open(store.clone()).unwrap();
         let mut model: BTreeMap<u8, bool> = BTreeMap::new();
@@ -504,6 +509,7 @@ proptest! {
     /// exactly the appends that returned `Ok`.
     #[test]
     fn an_accepted_append_survives_any_crash(steps in proptest::collection::vec(crash_step(), 1..24)) {
+        // Small, as the others (J16).
         let store = MemStore::new(1 << 14);
         let mut j = Journal::open(store.clone()).unwrap();
         let mut accepted = 0u64;
