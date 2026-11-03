@@ -154,6 +154,9 @@ impl FootprintView {
 struct Standing {
     objects: BTreeMap<(ChangeKind, String), (Option<String>, bool)>,
     endpoints: BTreeSet<Endpoint>,
+    /// WireGuard devices this unit configured (its generic netlink requests
+    /// named them): where its `endpoints` come from (B-22 b).
+    wireguard: BTreeSet<String>,
     unattributed: bool,
 }
 
@@ -228,6 +231,9 @@ pub struct Claims {
     pub objects: Vec<(UnitId, ChangeKind, String, Option<String>, bool)>,
     pub endpoints: Vec<(UnitId, Endpoint)>,
     pub unattributed_units: Vec<UnitId>,
+    /// (unit, WireGuard device it configured).
+    #[serde(default)]
+    pub wireguard: Vec<(UnitId, String)>,
 }
 
 impl Claims {
@@ -236,7 +242,8 @@ impl Claims {
     pub fn units(&self) -> BTreeSet<UnitId> {
         let objects = self.objects.iter().map(|o| o.0.clone());
         let endpoints = self.endpoints.iter().map(|e| e.0.clone());
-        objects.chain(endpoints).chain(self.unattributed_units.iter().cloned()).collect()
+        let wireguard = self.wireguard.iter().map(|w| w.0.clone());
+        objects.chain(endpoints).chain(wireguard).chain(self.unattributed_units.iter().cloned()).collect()
     }
 }
 
@@ -306,6 +313,7 @@ impl Tracker {
                 c.objects.push((u.clone(), *k, o.clone(), i.clone(), *steers));
             }
             c.endpoints.extend(s.endpoints.iter().map(|e| (u.clone(), *e)));
+            c.wireguard.extend(s.wireguard.iter().map(|d| (u.clone(), d.clone())));
             if s.unattributed {
                 c.unattributed_units.push(u.clone());
             }
@@ -345,6 +353,9 @@ impl Tracker {
         }
         for (u, e) in &previous.endpoints {
             t.add_endpoint(u, *e);
+        }
+        for (u, d) in &previous.wireguard {
+            t.bind_wireguard(u, d);
         }
         for u in &previous.unattributed_units {
             t.lost(Some(u));
@@ -404,6 +415,41 @@ impl Tracker {
     pub fn add_endpoint(&mut self, unit: &UnitId, e: Endpoint) {
         self.units.entry(unit.clone()).or_default().endpoints.insert(e);
         self.relatch();
+    }
+
+    /// B-22 (b): `unit` sent a generic netlink request that configures the
+    /// WireGuard device `dev`. Its `endpoint` lines come from that device's
+    /// peers, whoever owns the device now (coordinator, Nov 3): the claim
+    /// goes to the unit the request's cgroup names.
+    pub fn bind_wireguard(&mut self, unit: &UnitId, dev: &str) {
+        self.units.entry(unit.clone()).or_default().wireguard.insert(dev.to_string());
+    }
+
+    /// B-22 (b): each unit that configured WireGuard devices takes exactly
+    /// the endpoints of those devices' peers, as the kernel has them now: a
+    /// peer changed with `wg set` follows, and a device that is gone has
+    /// none (the latch keeps what an invocation found protecting with, for
+    /// the hold to pass its peer). Returns whether anything changed.
+    pub fn set_wireguard(&mut self, devices: &[crate::wg::Device]) -> bool {
+        let mut changed = false;
+        for s in self.units.values_mut() {
+            if s.wireguard.is_empty() {
+                continue;
+            }
+            let now: BTreeSet<Endpoint> = devices
+                .iter()
+                .filter(|d| s.wireguard.contains(&d.name))
+                .flat_map(|d| d.endpoints.iter().copied())
+                .collect();
+            if s.endpoints != now {
+                s.endpoints = now;
+                changed = true;
+            }
+        }
+        if changed {
+            self.relatch();
+        }
+        changed
     }
 
     /// The unit's latest invocation as its cgroup shows it; whether it

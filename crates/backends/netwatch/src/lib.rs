@@ -218,9 +218,29 @@
 //! refusal and is retried, so the watch recovers once it is
 //! (`loader::PROBES`).
 //!
+//! **Peer endpoints** (B-22 b). A WireGuard tunnel's `endpoint` lines are the
+//! endpoints of the peers of the devices its unit *configured*. The probe
+//! sees the generic netlink request (`wg::classify`: WireGuard's family id,
+//! `WG_CMD_SET_DEVICE`, the device named by `IFNAME` or `IFINDEX` among the
+//! first attributes) and the unit its cgroup names is bound to that device
+//! (`Tracker::bind_wireguard`; kept in `.state`): the claim goes to the
+//! sender, never to whoever owns the device now. The peers themselves are
+//! read as the kernel has them, after any such request and at every tick
+//! (`WG_CMD_GET_DEVICE`, a dump: `snapshot::wireguard`, parsed by
+//! `wg::devices`; the probe's 512-byte capture cannot hold several peers). A
+//! unit takes exactly its devices' peers, so a peer changed by `wg set`
+//! follows and a device that is gone has none; the latch keeps them for the
+//! invocation, so the hold can still pass the peer. A request naming no
+//! device the capture shows is a loss for its unit (`unattributed`); a
+//! request from no unit (an administrator's `wg set`) has no one to charge,
+//! and the tunnel's own unit simply carries no endpoint it did not
+//! configure (the hold then keeps it: fail closed). A dump that fails
+//! (anything but "no wireguard family": the module is not loaded) is a loss
+//! nothing can place: nothing is derived from a failed tool. The reply
+//! carries the device's keys; nothing here copies or keeps them.
+//!
 //! **Not yet observed** (docs/bypasses.md, temporary): DNS servers set
-//! through resolved (D-Bus) or `/etc/resolv.conf`, the system proxy, and
-//! WireGuard peer endpoints (generic netlink is not read).
+//! through resolved (D-Bus) or `/etc/resolv.conf`, and the system proxy.
 //!
 //! **The hold's order.** When a network tool fails, it is held unless all of
 //! these pass: (1) no unexpired release; (a) the unit's file says
@@ -248,6 +268,7 @@ mod model;
 pub mod parse;
 #[cfg(feature = "loader")]
 pub mod snapshot;
+pub mod wg;
 
 pub use contract::{
     AHEAD_SECS, CLOCK, DIR, FRESH_SECS, TICK_SECS, file_name, hold_may_release, read, read_claims, write, write_state,

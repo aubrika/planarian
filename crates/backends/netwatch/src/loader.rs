@@ -353,6 +353,8 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         Err(why)
     };
     let mut lost_seen = 0u64;
+    // WireGuard's generic netlink family id, once known (read each tick).
+    let mut wg_family: Option<u16> = crate::snapshot::wireguard_family().unwrap_or(None);
     let mut next_tick = Instant::now();
     // Between ticks, the running units are refreshed at most this often.
     let mut running = std::collections::BTreeSet::new();
@@ -367,12 +369,51 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
             changed |= tracker.set_invocation(u, inv);
         }
         let mut drained = 0;
+        // A generic netlink request may have configured a WireGuard peer.
+        let mut genl = false;
+        let mut family_checked = false;
         while let Some(item) = ring.next() {
             drained += 1;
             let Some(ev) = crate::ebpf::Event::parse(&item) else {
                 tracker.lost(None);
                 continue;
             };
+            if ev.hook == crate::ebpf::HOOK_GENL {
+                genl = true;
+                // WireGuard's family id is assigned when its module loads:
+                // an id this watch does not know is looked up again (once a
+                // drain) before the request is set aside as another family's.
+                if ev.nlmsg_type().is_some_and(|t| Some(t) != wg_family) && !family_checked {
+                    family_checked = true;
+                    match crate::snapshot::wireguard_family() {
+                        Ok(f) => wg_family = f,
+                        Err(why) => {
+                            eprintln!("netwatch: {why}");
+                            tracker.lost(None);
+                        }
+                    }
+                }
+                if let Some(family) = wg_family {
+                    let unit = ev.cgpath.as_deref().and_then(unit_of_cgroup).or_else(|| cgroups.unit(ev.cgroup));
+                    match (crate::wg::classify(&ev, family), unit) {
+                        // A request from no unit (an administrator's `wg set`)
+                        // has no one to charge: the tunnel's own unit simply
+                        // carries no endpoint it did not configure (fail closed).
+                        (crate::wg::Genl::Other, _) | (_, None) => {}
+                        (crate::wg::Genl::Set(dev), Some(u)) => tracker.bind_wireguard(&u, &dev),
+                        (crate::wg::Genl::SetIndex(i), Some(u)) => {
+                            match ifnames.get(&i).cloned().or_else(|| {
+                                ifnames = read_ifnames();
+                                ifnames.get(&i).cloned()
+                            }) {
+                                Some(dev) => tracker.bind_wireguard(&u, &dev),
+                                None => tracker.lost(Some(&u)),
+                            }
+                        }
+                        (crate::wg::Genl::SetUnnamed, Some(u)) => tracker.lost(Some(&u)),
+                    }
+                }
+            }
             let mut name = |i: u32| {
                 if !ifnames.contains_key(&i) {
                     ifnames = read_ifnames();
@@ -416,6 +457,24 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
             changed |= tracker.set_invocation(u, inv);
         }
         let tick = Instant::now() >= next_tick;
+        // B-22 (b): the peers' endpoints are read as the kernel has them,
+        // after any generic netlink request and at every tick (a peer set
+        // by anything else, or a tunnel that came up since). A read that
+        // fails is a loss nothing can place: nothing is derived from a
+        // failed tool.
+        if genl || tick {
+            match crate::snapshot::wireguard() {
+                Ok((family, devices)) => {
+                    wg_family = family;
+                    changed |= tracker.set_wireguard(&devices);
+                }
+                Err(why) => {
+                    eprintln!("netwatch: {why}");
+                    tracker.lost(None);
+                    changed = true;
+                }
+            }
+        }
         if tick || changed {
             // A change is written at once, not at the next tick: a tool that
             // steers and dies between ticks must not read as before.

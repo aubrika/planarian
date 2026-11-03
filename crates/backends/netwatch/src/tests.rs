@@ -2230,3 +2230,392 @@ mod hold_order {
         }
     }
 }
+
+/// WireGuard peers' endpoints (B-22 b): the pure read of the kernel's
+/// `WG_CMD_GET_DEVICE` reply, and what the tracker does with it. The live
+/// dump is the VM's.
+mod wireguard {
+    use crate::wg::{self, Device, MUTANT, Mutant};
+    use crate::{ChangeKind, Endpoint, Owner, Proto, Tracker, WatchState};
+    use planarian_schema::UnitId;
+    use std::collections::BTreeSet;
+    use std::net::IpAddr;
+
+    const NOW: u64 = 100;
+
+    fn attr(ty: u16, nested: bool, v: &[u8]) -> Vec<u8> {
+        let mut a = ((4 + v.len()) as u16).to_ne_bytes().to_vec();
+        a.extend((ty | if nested { 0x8000 } else { 0 }).to_ne_bytes());
+        a.extend(v);
+        while !a.len().is_multiple_of(4) {
+            a.push(0);
+        }
+        a
+    }
+
+    fn sockaddr(e: &Endpoint) -> Vec<u8> {
+        match e.addr {
+            IpAddr::V4(a) => {
+                let mut b = 2u16.to_ne_bytes().to_vec();
+                b.extend(e.port.to_be_bytes());
+                b.extend(a.octets());
+                b.extend([0u8; 8]);
+                b
+            }
+            IpAddr::V6(a) => {
+                let mut b = 10u16.to_ne_bytes().to_vec();
+                b.extend(e.port.to_be_bytes());
+                b.extend([0u8; 4]);
+                b.extend(a.octets());
+                b.extend([0u8; 4]);
+                b
+            }
+        }
+    }
+
+    fn udp(addr: &str, port: u16) -> Endpoint {
+        Endpoint { proto: Proto::Udp, addr: addr.parse().unwrap(), port }
+    }
+
+    /// One reply message for a device with these peers; `keys` puts the
+    /// device's private key and each peer's keys in, as the kernel does for
+    /// root, with `mix` shuffling the attribute order within a peer.
+    fn message(name: &str, ifindex: u32, peers: &[Option<Endpoint>], mix: u64) -> Vec<u8> {
+        let mut body = vec![0u8, 1, 0, 0]; // WG_CMD_GET_DEVICE reply: cmd, version, reserved
+        body.extend(attr(1, false, &ifindex.to_ne_bytes()));
+        body.extend(attr(2, false, format!("{name}\0").as_bytes()));
+        body.extend(attr(3, false, &[0xAA; 32])); // private key
+        body.extend(attr(5, false, &51820u16.to_ne_bytes())); // listen port
+        let mut list = vec![];
+        for (i, ep) in peers.iter().enumerate() {
+            let mut fields = vec![
+                attr(1, false, &[0xBB; 32]),          // public key
+                attr(2, false, &[0xCC; 32]),          // preshared key
+                attr(5, false, &25u16.to_ne_bytes()), // keepalive
+                attr(
+                    9,
+                    true,
+                    &[
+                        attr(0, true, &[attr(1, false, &[2, 0]), attr(2, false, &[0, 0, 0, 0, 0, 0, 0, 0])].concat()),
+                        attr(1, true, &[]),
+                    ]
+                    .concat(),
+                ), // allowed ips
+            ];
+            if let Some(e) = ep {
+                fields.push(attr(4, false, &sockaddr(e)));
+            }
+            let n = fields.len() as u64;
+            fields.rotate_left(((mix >> (i * 3)) % n) as usize);
+            list.extend(attr(i as u16, true, &fields.concat()));
+        }
+        body.extend(attr(8, true, &list));
+        let mut m = ((16 + body.len()) as u32).to_ne_bytes().to_vec();
+        m.extend(0x21u16.to_ne_bytes()); // the family id
+        m.extend(2u16.to_ne_bytes()); // NLM_F_MULTI
+        m.extend([0u8; 8]);
+        m.extend(body);
+        m
+    }
+
+    /// A small deterministic generator.
+    fn next(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// The endpoints each device must give, in order.
+    type Expected = Vec<(String, BTreeSet<Endpoint>)>;
+
+    /// A reply built from `seed`, and the endpoints per device it must give.
+    fn reply(seed: u64) -> (Vec<Vec<u8>>, Expected) {
+        let mut s = seed | 1;
+        let (mut msgs, mut want) = (vec![], vec![]);
+        for d in 0..=(next(&mut s) % 3) {
+            let name = format!("wg{d}");
+            let mut all = BTreeSet::new();
+            // A device may arrive in two messages (more peers in the second).
+            for part in 0..=(next(&mut s) % 2) {
+                let mut peers = vec![];
+                for _ in 0..(next(&mut s) % 4) {
+                    let ep = match next(&mut s) % 3 {
+                        0 => None,
+                        1 => {
+                            Some(udp(&format!("192.0.2.{}", 1 + next(&mut s) % 200), 1 + (next(&mut s) % 65000) as u16))
+                        }
+                        _ => Some(udp(
+                            &format!("2001:db8::{:x}", 1 + next(&mut s) % 200),
+                            1 + (next(&mut s) % 65000) as u16,
+                        )),
+                    };
+                    all.extend(ep);
+                    peers.push(ep);
+                }
+                let _ = part;
+                msgs.push(message(&name, 10 + d as u32, &peers, next(&mut s)));
+            }
+            want.push((name, all));
+        }
+        (msgs, want)
+    }
+
+    /// The oracle is the construction: every endpoint put in is read back,
+    /// under its own device, and nothing else (no key, no allowed-ip) is.
+    fn check(seed: u64) -> Result<(), String> {
+        let (msgs, want) = reply(seed);
+        let got = wg::devices(&msgs)?;
+        let got: Expected = got.iter().map(|d| (d.name.clone(), d.endpoints.iter().copied().collect())).collect();
+        if got != want {
+            return Err(format!("seed {seed}: got {got:?}, expected {want:?}"));
+        }
+        Ok(())
+    }
+
+    fn failing() -> usize {
+        (1..=300u64).filter(|s| check(*s * 0x9E37_79B9).is_err()).count()
+    }
+
+    #[test]
+    fn a_reply_is_read_as_built() {
+        MUTANT.with(|m| m.set(Mutant::None));
+        assert_eq!(failing(), 0, "{:?}", (1..=300u64).map(|s| check(s * 0x9E37_79B9)).find(Result::is_err));
+    }
+
+    /// Each deliberate bug is caught by many replies, not a stray one.
+    #[test]
+    fn the_wireguard_mutants_are_caught() {
+        for (m, at_least) in [
+            (Mutant::NoV6, 100),
+            (Mutant::PortHostOrder, 150),
+            (Mutant::FirstPeerOnly, 100),
+            (Mutant::FirstMessageOnly, 100),
+        ] {
+            MUTANT.with(|c| c.set(m));
+            let bad = failing();
+            MUTANT.with(|c| c.set(Mutant::None));
+            eprintln!("mutant {m:?} fails {bad} of 300 replies");
+            assert!(bad >= at_least, "mutant {m:?} caught by only {bad} of 300 replies");
+        }
+    }
+
+    /// A reply message from raw attributes.
+    fn raw(attrs: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = vec![0u8, 1, 0, 0];
+        body.extend(attrs.concat());
+        let mut m = ((16 + body.len()) as u32).to_ne_bytes().to_vec();
+        m.extend(0x21u16.to_ne_bytes());
+        m.extend(2u16.to_ne_bytes());
+        m.extend([0u8; 8]);
+        m.extend(body);
+        m
+    }
+
+    /// A reply that cannot be read is an error (the caller fails closed),
+    /// never a smaller list: a cut attribute, a peer endpoint that is not an
+    /// address, a message naming no device.
+    #[test]
+    fn an_unreadable_reply_is_an_error_not_a_smaller_list() {
+        let name = || attr(2, false, b"wg0\0");
+        let peer = |ep: Vec<u8>| attr(8, true, &attr(0, true, &attr(4, false, &ep)));
+        // Control: a good peer reads.
+        let good = raw(&[name(), peer(sockaddr(&udp("192.0.2.1", 51820)))]);
+        assert_eq!(wg::devices(std::slice::from_ref(&good)).unwrap()[0].endpoints, vec![udp("192.0.2.1", 51820)]);
+        // A cut attribute (the peer list runs past the message).
+        assert!(wg::devices(&[good[..good.len() - 6].to_vec()]).is_err(), "cut");
+        // An endpoint that is no sockaddr_in or sockaddr_in6: too short, or another family.
+        assert!(wg::devices(&[raw(&[name(), peer(vec![2, 0, 0, 80, 1, 2])])]).is_err(), "short sockaddr");
+        let mut other = sockaddr(&udp("192.0.2.1", 1));
+        other[0] = 99;
+        assert!(wg::devices(&[raw(&[name(), peer(other)])]).is_err(), "family 99");
+        // A message that names no device (no ifname, no ifindex).
+        assert!(wg::devices(&[raw(&[attr(5, false, &51820u16.to_ne_bytes())])]).is_err(), "no device named");
+    }
+
+    fn created_wg(unit: &UnitId, name: &str) -> Tracker {
+        let mut t = Tracker::default();
+        t.apply(&crate::Change {
+            owner: Owner::Unit(unit.clone()),
+            kind: ChangeKind::Interface,
+            object: name.into(),
+            iface: Some(name.into()),
+            steers: false,
+            removed: false,
+        });
+        t.apply(&crate::Change {
+            owner: Owner::Unit(unit.clone()),
+            kind: ChangeKind::Route,
+            object: format!("route {name}"),
+            iface: Some(name.into()),
+            steers: true,
+            removed: false,
+        });
+        t.set_virtual([name.to_string()].into());
+        t
+    }
+
+    fn dev(name: &str, eps: &[Endpoint]) -> Device {
+        Device { name: name.into(), ifindex: 10, endpoints: eps.to_vec() }
+    }
+
+    /// The footprint of the unit that configured a tunnel carries that
+    /// tunnel's peers' endpoints (what the hold passes), follows a changed
+    /// peer, is cleared with the device, and is kept by the latch for the
+    /// invocation. The claim goes to the sender of the request, not to
+    /// whoever owns the device.
+    #[test]
+    fn a_tunnels_footprint_carries_its_peers_endpoints() {
+        let (a, b, owner) =
+            (UnitId::service("wg-quick-a"), UnitId::service("wg-quick-b"), UnitId::service("tun-setup"));
+        // `owner` made wga and routes over it; `a` configured it; `b` configured wgb.
+        let mut t = created_wg(&owner, "wga");
+        t.bind_wireguard(&a, "wga");
+        t.bind_wireguard(&b, "wgb");
+        let (e1, e2, e3) = (udp("192.0.2.7", 51820), udp("2001:db8::7", 51821), udp("198.51.100.9", 1));
+        assert!(t.set_wireguard(&[dev("wga", &[e1, e2]), dev("wgb", &[e3])]));
+        let view = |t: &Tracker| t.view(WatchState::Attached { at: NOW }, &[a.clone(), b.clone(), owner.clone()], NOW);
+        let v = view(&t);
+        assert_eq!(v.units["wg-quick-a"].endpoints, [e1, e2].into(), "the sender of the request");
+        assert_eq!(v.units["wg-quick-b"].endpoints, [e3].into());
+        assert!(v.units["tun-setup"].endpoints.is_empty(), "not whoever owns the device now");
+        // `wg set peer … endpoint`: the peer moved.
+        assert!(t.set_wireguard(&[dev("wga", &[e3]), dev("wgb", &[e3])]));
+        assert_eq!(view(&t).units["wg-quick-a"].endpoints, [e3].into());
+        assert!(!t.set_wireguard(&[dev("wga", &[e3]), dev("wgb", &[e3])]), "unchanged: no change");
+        // The device is gone: its standing endpoints clear.
+        assert!(t.set_wireguard(&[dev("wgb", &[e3])]));
+        assert!(view(&t).units["wg-quick-a"].endpoints.is_empty());
+        // Kept across a restart in `.state`.
+        let claims = t.claims();
+        assert!(claims.wireguard.contains(&(a.clone(), "wga".to_string())));
+    }
+
+    /// The latch keeps what an invocation found protecting with: a tunnel
+    /// whose device leaves with its last process still names its peer.
+    #[test]
+    fn the_latch_keeps_a_gone_tunnels_endpoints() {
+        let a = UnitId::service("wg-quick-a");
+        let mut t = created_wg(&a, "wga");
+        t.set_invocation(&a, crate::Invocation { id: Some("a".repeat(32)), ended: false });
+        t.bind_wireguard(&a, "wga");
+        let e1 = udp("192.0.2.7", 51820);
+        t.set_wireguard(&[dev("wga", &[e1])]);
+        assert!(t.view(WatchState::Attached { at: NOW }, std::slice::from_ref(&a), NOW).units["wg-quick-a"].protecting);
+        t.set_wireguard(&[]); // the device is gone
+        let f = &t.view(WatchState::Attached { at: NOW }, std::slice::from_ref(&a), NOW).units["wg-quick-a"];
+        assert!(f.protecting && f.endpoints == [e1].into(), "{f:?}");
+    }
+
+    // ---- The request: which device did the unit configure?
+
+    const FAMILY: u16 = 0x21;
+
+    /// A captured generic netlink request: family, command, attributes,
+    /// cut to `cut` bytes (the probe's capture window).
+    fn request(family: u16, cmd: u8, attrs: &[Vec<u8>], cut: usize) -> crate::ebpf::Event {
+        let mut d = vec![0u8; 16];
+        d[4..6].copy_from_slice(&family.to_ne_bytes());
+        d.extend([cmd, 1, 0, 0]);
+        d.extend(attrs.concat());
+        let len = d.len() as u32;
+        d[0..4].copy_from_slice(&len.to_ne_bytes());
+        d.truncate(cut);
+        crate::ebpf::Event {
+            cgroup: 1,
+            tgid: 2,
+            hook: crate::ebpf::HOOK_GENL,
+            len,
+            netns: 0xF000_0000,
+            cgpath: None,
+            data: d,
+        }
+    }
+
+    /// What a request is to WireGuard, by construction: a configuration
+    /// (command 1) of the family, naming the device in its attributes (by
+    /// name or index, anywhere before the capture's cut); anything else (a
+    /// read, another family) is not.
+    fn check_request(seed: u64) -> Result<(), String> {
+        let mut s = seed | 1;
+        let by_name = next(&mut s).is_multiple_of(2);
+        let others = next(&mut s) % 3;
+        let mut attrs = vec![];
+        for i in 0..others {
+            attrs.push(attr(5 + i as u16, false, &[1, 2, 3, 4])); // listen port, fwmark, …
+        }
+        let name_at = attrs.len();
+        let naming = if by_name { attr(2, false, b"wgtest\0") } else { attr(1, false, &7u32.to_ne_bytes()) };
+        attrs.insert(name_at, naming);
+        attrs.extend([attr(8, true, &[0u8; 64])]);
+        let first_len = 16 + 4 + attrs[..name_at].iter().map(Vec::len).sum::<usize>();
+        let (family, cmd) = match next(&mut s) % 4 {
+            0 => (FAMILY, 1),     // a configuration
+            1 => (FAMILY, 0),     // a read
+            2 => (FAMILY + 1, 1), // another family's command 1
+            _ => (FAMILY, 1),
+        };
+        // The capture ends before the naming attribute, inside it, or after.
+        let named_end = first_len + attrs[name_at].len();
+        let cut = [first_len, first_len + 2, named_end, named_end + 10, usize::MAX][(next(&mut s) % 5) as usize];
+        let ev = request(family, cmd, &attrs, cut);
+        let got = wg::classify(&ev, FAMILY);
+        let named = cut >= named_end;
+        let want = if family != FAMILY || cmd != 1 {
+            wg::Genl::Other
+        } else if !named {
+            wg::Genl::SetUnnamed
+        } else if by_name {
+            wg::Genl::Set("wgtest".into())
+        } else {
+            wg::Genl::SetIndex(7)
+        };
+        if got == want { Ok(()) } else { Err(format!("seed {seed}: got {got:?}, expected {want:?}")) }
+    }
+
+    fn failing_requests() -> usize {
+        (1..=400u64).filter(|s| check_request(*s * 0x9E37_79B9).is_err()).count()
+    }
+
+    #[test]
+    fn a_request_is_classified_as_built() {
+        MUTANT.with(|m| m.set(Mutant::None));
+        assert_eq!(
+            failing_requests(),
+            0,
+            "{:?}",
+            (1..=400u64).map(|s| check_request(s * 0x9E37_79B9)).find(Result::is_err)
+        );
+    }
+
+    #[test]
+    fn the_request_mutants_are_caught() {
+        for (m, at_least) in [(Mutant::SetIsAnyCommand, 40), (Mutant::NameMustBeFirst, 40)] {
+            MUTANT.with(|c| c.set(m));
+            let bad = failing_requests();
+            MUTANT.with(|c| c.set(Mutant::None));
+            eprintln!("mutant {m:?} fails {bad} of 400 requests");
+            assert!(bad >= at_least, "mutant {m:?} caught by only {bad} of 400 requests");
+        }
+    }
+
+    /// A unit that made a tunnel but sent no request configuring it carries
+    /// no endpoint: they are the configurer's.
+    #[test]
+    fn a_unit_that_did_not_configure_the_device_carries_no_endpoint() {
+        let a = UnitId::service("wg-quick-a");
+        let mut t = Tracker::default();
+        t.apply(&crate::Change {
+            owner: Owner::Unit(a.clone()),
+            kind: ChangeKind::Interface,
+            object: "wga".into(),
+            iface: Some("wga".into()),
+            steers: false,
+            removed: false,
+        });
+        t.set_virtual(["wga".to_string()].into());
+        assert!(!t.set_wireguard(&[dev("wga", &[udp("192.0.2.7", 1)])]));
+        let v = t.view(WatchState::Attached { at: NOW }, &[a], NOW);
+        assert!(!v.units["wg-quick-a"].protecting && v.units["wg-quick-a"].endpoints.is_empty());
+    }
+}
