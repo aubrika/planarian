@@ -352,6 +352,33 @@ fn segment(cfg: &FileConfig) -> Vec<Entry> {
 /// Journal entries saved before a forced compaction discarded them.
 const SAVED: &str = "entries-saved.json";
 
+/// Force a compaction and save what it discarded, from the daemon's own
+/// answer (`Response::Compacted`: the segment, read in the same core call as
+/// the compaction). Reading the segment here first left a gap the daemon's
+/// tick could journal into, so the saved history fell short of what the
+/// checkpoint holds (gate 41604917858, `replay_equivalent`).
+fn compact_and_save() -> Result<(), String> {
+    let resp = call(&Request::GymCompact)?;
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(PathBuf::from(RUN).join("responses.jsonl")) {
+        let _ = writeln!(f, "{}", serde_json::to_string(&resp).expect("serializes"));
+    }
+    let entries = match resp {
+        Response::Compacted { entries } => entries,
+        Response::Error { message } => return Err(format!("GymCompact: {message}")),
+        _ => return Err("GymCompact: an unexpected answer".into()),
+    };
+    let path = PathBuf::from(RUN).join(SAVED);
+    let mut saved: Vec<Entry> = read_json(&path).unwrap_or_default();
+    for v in entries {
+        let e: Entry = serde_json::from_value(v).map_err(|e| format!("GymCompact: an entry: {e}"))?;
+        if saved.last().is_none_or(|l| l.seq < e.seq) {
+            saved.push(e);
+        }
+    }
+    write_json(&path, &saved);
+    Ok(())
+}
+
 fn journal_copy(cfg: &FileConfig) -> Option<Journal<FileStore>> {
     let paths = Paths { state: cfg.state_dir.clone(), ..Default::default() };
     let tmp = PathBuf::from(format!("{RUN}/journal-copy"));
@@ -1239,7 +1266,7 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                             },
                         )?;
                         request_as("root", &Request::LiftOverride { unit: u.clone() })?;
-                        request_as("root", &Request::GymCompact)?;
+                        compact_and_save()?;
                     }
                     return Ok(());
                 }
@@ -1466,17 +1493,7 @@ fn run_step(cfg: &FileConfig, st: &T, actor: &str) -> Result<(), String> {
                 ));
             }
         }
-        "force_compaction" => {
-            let cfg = config();
-            let mut saved: Vec<Entry> = read_json(&PathBuf::from(RUN).join(SAVED)).unwrap_or_default();
-            for e in segment(&cfg) {
-                if saved.last().is_none_or(|l| l.seq < e.seq) {
-                    saved.push(e);
-                }
-            }
-            write_json(&PathBuf::from(RUN).join(SAVED), &saved);
-            request_as("root", &Request::GymCompact)?
-        }
+        "force_compaction" => compact_and_save()?,
         "advance_clock" => {
             let d = st.get("by").and_then(dur).ok_or("advance_clock")?;
             sh(&format!("timedatectl set-ntp false 2>/dev/null; date -s \"+{} seconds\"", d.0 / 1000));

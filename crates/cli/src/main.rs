@@ -317,6 +317,8 @@ fn print(resp: &Response, json: bool) -> i32 {
             return 1;
         }
         Response::Ok { message } => println!("{message}"),
+        // Only the gym's forced compaction asks for this (gym hooks).
+        Response::Compacted { entries } => println!("compacted ({} entries)", entries.len()),
         Response::Error { message } => {
             eprintln!("error: {message}");
             return 1;
