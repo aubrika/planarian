@@ -184,6 +184,40 @@ pub struct Tracker {
     /// Steering routes found standing on attach over an interface a unit
     /// claims (object → interface): they protect through that interface.
     route_through: BTreeMap<String, String>,
+    /// Per unit with an invocation: what made its current invocation
+    /// protecting at any point (crate docs, "The hold's order").
+    latched: BTreeMap<UnitId, Latch>,
+    /// Per unit: what made it protecting while it had no live invocation
+    /// (none known yet, or the current one ended). An ended invocation does
+    /// nothing more, so this is the next one's, applied before its cgroup
+    /// was seen (made between the cgroups drain and the ring drain).
+    next_latch: BTreeMap<UnitId, Latch>,
+    /// Bugs the hold-order property must catch (tests only): no latch at
+    /// all; no carry to the next invocation.
+    #[cfg(test)]
+    pub(crate) no_latch: bool,
+    #[cfg(test)]
+    pub(crate) no_carry: bool,
+}
+
+/// The latch: an invocation found protecting once stays protecting, with
+/// the `iface` and `endpoint` lines that justified it, until a new
+/// invocation replaces it (reviewer, coordinator, Nov 3). What stands after
+/// a tool dies is not what it did: a tun-based VPN's interface leaves with
+/// its last process, before its cgroup goes, with no netlink request.
+#[derive(Clone, Debug, Default)]
+struct Latch {
+    protecting: bool,
+    ifaces: BTreeSet<String>,
+    endpoints: BTreeSet<Endpoint>,
+}
+
+impl Latch {
+    fn merge(&mut self, other: Latch) {
+        self.protecting |= other.protecting;
+        self.ifaces.extend(other.ifaces);
+        self.endpoints.extend(other.endpoints);
+    }
 }
 
 /// The tracker's claims, as `.state` keeps them across a restart of the
@@ -208,6 +242,11 @@ impl Claims {
 
 impl Tracker {
     pub fn apply(&mut self, c: &Change) {
+        self.apply_change(c);
+        self.relatch();
+    }
+
+    fn apply_change(&mut self, c: &Change) {
         let key = (c.kind, c.object.clone());
         if c.removed {
             // An object gone is gone for everyone who claimed it, whoever
@@ -364,27 +403,81 @@ impl Tracker {
 
     pub fn add_endpoint(&mut self, unit: &UnitId, e: Endpoint) {
         self.units.entry(unit.clone()).or_default().endpoints.insert(e);
+        self.relatch();
     }
 
-    /// An event was lost. With the unit known, its footprint is marked
-    /// unattributed; without, the global marker stands.
     /// The unit's latest invocation as its cgroup shows it; whether it
-    /// changed.
+    /// changed. A new invocation (a new id, or a new cgroup whose id is
+    /// not read yet) resets the latch; an id read late, or `ended`, does not.
     pub fn set_invocation(&mut self, unit: &UnitId, inv: Invocation) -> bool {
-        if self.invocations.get(unit) == Some(&inv) {
+        let before = self.invocations.get(unit);
+        if before == Some(&inv) {
             return false;
         }
+        let new = match (before.and_then(|b| b.id.as_ref()), inv.id.as_ref()) {
+            (Some(a), Some(b)) => a != b,
+            (Some(_), None) => true,
+            (None, _) => before.is_none(),
+        };
+        if new {
+            // The new invocation starts from what was seen while there was
+            // no live one; one replaced before it ended (its removal and the
+            // next start seen at once) passes on its latch too: whose events
+            // those were is not known, so fail closed.
+            let ended = before.is_none_or(|b| b.ended);
+            let mut l = self.next_latch.remove(unit).unwrap_or_default();
+            #[cfg(test)]
+            if self.no_carry {
+                l = Latch::default();
+            }
+            if let Some(old) = self.latched.remove(unit).filter(|_| !ended) {
+                l.merge(old);
+            }
+            if l.protecting {
+                self.latched.insert(unit.clone(), l);
+            }
+        }
         self.invocations.insert(unit.clone(), inv);
+        self.relatch();
         true
     }
 
     /// The virtual links standing now (`host::read_virtual_ifaces`): read
     /// live each tick, so a tun made by ioctl or a link moved in from
-    /// another netns is never taken for a physical NIC.
+    /// another netns is never taken for a physical NIC. An interface gone
+    /// from it no longer counts for what stands, but stays in the latch of
+    /// an invocation it made protecting.
     pub fn set_virtual(&mut self, live: BTreeSet<String>) {
         self.virtual_ifaces = live;
+        self.relatch();
     }
 
+    /// Latch what makes each unit protecting now: into its current
+    /// invocation's latch, and while it has no live one, into the next's.
+    fn relatch(&mut self) {
+        #[cfg(test)]
+        if self.no_latch {
+            return;
+        }
+        let units: Vec<UnitId> = self.units.keys().cloned().collect();
+        for u in units {
+            let (protecting, ifaces, endpoints) = self.standing(&u);
+            if !protecting {
+                continue;
+            }
+            let l = Latch { protecting, ifaces, endpoints };
+            let inv = self.invocations.get(&u);
+            if inv.is_none_or(|i| i.ended) {
+                self.next_latch.entry(u.clone()).or_default().merge(l.clone());
+            }
+            if inv.is_some() {
+                self.latched.entry(u).or_default().merge(l);
+            }
+        }
+    }
+
+    /// An event was lost. With the unit known, its footprint is marked
+    /// unattributed; without, the global marker stands.
     pub fn lost(&mut self, unit: Option<&UnitId>) {
         match unit {
             Some(u) => self.units.entry(u.clone()).or_default().unattributed = true,
@@ -392,14 +485,39 @@ impl Tracker {
         }
     }
 
-    /// The footprint of `unit` now, confirmed at `at`.
+    /// The footprint of `unit` now, confirmed at `at`: what stands, and
+    /// what its current invocation latched.
     pub fn footprint(&self, unit: &UnitId, at: u64) -> Footprint {
         let inv = self.invocations.get(unit);
         let invocation = inv.and_then(|i| i.id.clone());
         let ended = inv.is_some_and(|i| i.ended && i.id.is_some());
+        // A cgroup whose id is not read yet reads as protecting, but is not
+        // latched: it says nothing of what the invocation did.
         let unknown = inv.is_some_and(|i| i.id.is_none());
+        let (protecting, mut ifaces, mut endpoints) = self.standing(unit);
+        let latch = self.latched.get(unit).filter(|_| inv.is_some());
+        if let Some(l) = latch {
+            ifaces.extend(l.ifaces.iter().cloned());
+            endpoints.extend(l.endpoints.iter().cloned());
+        }
+        let unattributed = self.units.get(unit).is_some_and(|s| s.unattributed);
+        Footprint {
+            at,
+            protecting: unknown || protecting || latch.is_some_and(|l| l.protecting),
+            ifaces,
+            endpoints,
+            unattributed,
+            invocation,
+            ended,
+            unknown,
+        }
+    }
+
+    /// Whether what stands of `unit`'s changes protects, and the `iface`
+    /// and `endpoint` lines that go with it.
+    fn standing(&self, unit: &UnitId) -> (bool, BTreeSet<String>, BTreeSet<Endpoint>) {
         let Some(s) = self.units.get(unit) else {
-            return Footprint { at, protecting: unknown, invocation, ended, unknown, ..Default::default() };
+            return (false, BTreeSet::new(), BTreeSet::new());
         };
         // Only a virtual link can be one a tool created; a physical NIC is
         // registered by its driver, whoever's context that runs in.
@@ -435,22 +553,12 @@ impl Tracker {
             }
         }
         let own = |k: &ChangeKind| !matches!(k, ChangeKind::Interface | ChangeKind::Route);
-        Footprint {
-            at,
-            // A change charged here that could not be fully attributed counts
-            // as protecting (fail closed), and the file says so: `protecting
-            // yes` with its `unattributed` line, as the hold reads it anyway.
-            protecting: unknown
-                || s.unattributed
-                || !ifaces.is_empty()
-                || s.objects.iter().any(|((k, _), (_, steers))| *steers && own(k)),
-            ifaces,
-            endpoints: s.endpoints.clone(),
-            unattributed: s.unattributed,
-            invocation,
-            ended,
-            unknown,
-        }
+        // A change charged here that could not be fully attributed counts as
+        // protecting (fail closed), and the file says so: `protecting yes`
+        // with its `unattributed` line, as the hold reads it anyway.
+        let protecting =
+            s.unattributed || !ifaces.is_empty() || s.objects.iter().any(|((k, _), (_, steers))| *steers && own(k));
+        (protecting, ifaces, s.endpoints.clone())
     }
 
     /// Interfaces some standing steering route goes out of, whoever made it.

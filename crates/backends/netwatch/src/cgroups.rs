@@ -36,12 +36,30 @@ pub struct Cgroups {
     pending: BTreeSet<PathBuf>,
     /// When absence was last checked (the fallback for a missed IN_DELETE).
     absence_at: Option<std::time::Instant>,
+    /// A deliberate bug, for the property to show it catches (tests only).
+    #[cfg(test)]
+    pub(crate) mutant: Mutant,
+}
+
+/// The bugs the cgroups property must catch (tests only).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Mutant {
+    #[default]
+    None,
+    /// `finish` ends every live invocation, not only those seen removed.
+    FinishAll,
+    /// A removal seen ends the invocation at once, before the ring drain.
+    EndAtRemoval,
 }
 
 /// A unit's latest invocation, as its cgroup shows it.
 #[derive(Clone, Debug)]
 struct Inv {
     dir: PathBuf,
+    /// Its cgroup's inode (the cgroup id): a cgroup made again at the same
+    /// path is another one.
+    ino: Option<u64>,
     id: Option<String>,
     /// Its cgroup was seen gone at the start of this drain: `ended` once
     /// the ring has been drained after ([`Cgroups::finish`]).
@@ -66,6 +84,8 @@ impl Cgroups {
             invocations: BTreeMap::new(),
             pending: BTreeSet::new(),
             absence_at: None,
+            #[cfg(test)]
+            mutant: Mutant::None,
         };
         c.watch_tree(&root.join("system.slice"));
         c.merge();
@@ -120,6 +140,11 @@ impl Cgroups {
     /// cgroup removed: in order, so a stop then a start of the same unit is
     /// a removal then a new invocation.
     pub fn drain(&mut self) {
+        self.drain_at(std::time::Instant::now());
+    }
+
+    /// [`Cgroups::drain`], as if at `now` (the absence check's clock).
+    pub(crate) fn drain_at(&mut self, now: std::time::Instant) {
         let mut seen = Vec::new();
         if let Some(fd) = self.inotify.as_ref() {
             let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
@@ -154,13 +179,19 @@ impl Cgroups {
         }
         // The fallback for an IN_DELETE not delivered (the queue overflowed,
         // or no inotify): a live invocation whose cgroup is gone is removed.
-        let due = self.absence_at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(ABSENCE_MS));
+        let due = self
+            .absence_at
+            .is_none_or(|t| now.saturating_duration_since(t) >= std::time::Duration::from_millis(ABSENCE_MS));
         if due {
-            self.absence_at = Some(std::time::Instant::now());
+            self.absence_at = Some(now);
             let gone: Vec<PathBuf> = self
                 .invocations
                 .values()
-                .filter(|i| !i.ended && !i.removing && !i.dir.exists())
+                .filter(|i| {
+                    !i.ended
+                        && !i.removing
+                        && (i.ino.is_none() || std::fs::metadata(&i.dir).ok().map(|m| m.ino()) != i.ino)
+                })
                 .map(|i| i.dir.clone())
                 .collect();
             for dir in gone {
@@ -175,8 +206,12 @@ impl Cgroups {
     /// be removed). Returns those units.
     pub fn finish(&mut self) -> Vec<UnitId> {
         let mut ended = Vec::new();
+        #[cfg(test)]
+        let all = self.mutant == Mutant::FinishAll;
+        #[cfg(not(test))]
+        let all = false;
         for (u, i) in self.invocations.iter_mut() {
-            if i.removing {
+            if i.removing || (all && !i.ended) {
                 i.removing = false;
                 i.ended = true;
                 ended.push(u.clone());
@@ -196,6 +231,11 @@ impl Cgroups {
     fn removed(&mut self, dir: &Path) {
         if let Some(i) = self.invocations.values_mut().find(|i| i.dir == dir && !i.ended) {
             i.removing = true;
+            #[cfg(test)]
+            if self.mutant == Mutant::EndAtRemoval {
+                i.removing = false;
+                i.ended = true;
+            }
         }
         self.pending.remove(dir);
     }
@@ -241,17 +281,18 @@ impl Cgroups {
             return;
         };
         let id = invocation_of(dir);
-        let stands = dir.exists();
+        let ino = std::fs::metadata(dir).ok().map(|m| m.ino());
+        let stands = ino.is_some();
         if id.is_none() && stands {
             self.pending.insert(dir.to_path_buf());
         }
-        let fresh = Inv { dir: dir.to_path_buf(), id: id.clone(), removing: false, ended: false };
+        let fresh = Inv { dir: dir.to_path_buf(), ino, id: id.clone(), removing: false, ended: false };
         match self.invocations.get_mut(&u) {
             None if id.is_some() || created => {
                 self.invocations.insert(u, fresh);
             }
             None => {}
-            Some(i) if created || (id.is_some() && id != i.id) || (i.ended && stands && id != i.id) => *i = fresh,
+            Some(i) if created || (id.is_some() && id != i.id) || (stands && ino != i.ino && !i.removing) => *i = fresh,
             Some(i) if i.id.is_none() && !i.ended && !i.removing => i.id = id,
             Some(_) => {}
         }
