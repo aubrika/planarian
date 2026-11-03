@@ -11,7 +11,6 @@ use planarian_exec::{PrebuildJob, Prebuilt};
 use planarian_ipc::{Request, Response, SOCKET};
 use planarian_schema::{Backends, Clock, Hash, OwnerId, PinnedSource, SourceKind};
 use planarian_txn::journal::{Journal, JournalError};
-use planarian_txn::ledger::Record;
 use planarian_txn::store::FileStore;
 use std::collections::VecDeque;
 use std::io::Write;
@@ -266,27 +265,21 @@ fn append_log(state: &Path, lines: &[String]) {
 
 /// Keep the leases this daemon holds fresh while it is busy in a long
 /// backend call, so the watchdog does not take over from a live daemon.
+/// One journal handle, kept: each renewal catches up on what was appended
+/// since, not the journal's size (`renew`). It is opened again only after
+/// an error.
 fn renewer(store_dir: PathBuf, txn_dir: PathBuf, capacity: u64, me: OwnerId) {
     std::thread::spawn(move || {
+        let mut j: Option<Journal<FileStore>> = None;
         loop {
             std::thread::sleep(RENEW_EVERY);
-            let Ok(store) = FileStore::open(&store_dir, &txn_dir, capacity) else { continue };
-            let Ok(mut j) = Journal::open(store) else { continue };
-            let Ok(l) = j.sync_ledger().cloned() else { continue };
+            if j.is_none() {
+                j = FileStore::open(&store_dir, &txn_dir, capacity).ok().and_then(|s| Journal::open(s).ok());
+            }
+            let Some(handle) = j.as_mut() else { continue };
             let clock = planarian_backend_linux::process::Processes;
-            let (now, boot_at) = (clock.now(), clock.boot_now());
-            for t in l.live.values() {
-                if t.txn.lease.owner == me && !t.txn.state.is_pre_mutation() {
-                    let _ = j.append(
-                        now,
-                        Record::Renew {
-                            txn: t.txn.id,
-                            epoch: t.txn.lease.epoch,
-                            worker_pid: t.txn.lease.worker_pid,
-                            boot_at,
-                        },
-                    );
-                }
+            if planarian_daemon::renew::renew(handle, &me, clock.now(), clock.boot_now()).is_err() {
+                j = None;
             }
         }
     });
@@ -329,7 +322,35 @@ enum Event {
     Built(Resume, Box<Prebuilt>, Reply),
 }
 
+/// `planariad --check-export <path>`: an export.json read exactly as
+/// planariad reads a generation's (`nixos::Export`, which `evaluate_built`
+/// deserializes), for the module's cross-boundary check (#38). The round
+/// trip is what planariad would see: keys it drops, and defaults it fills.
+fn check_export(text: &str) -> Result<String, String> {
+    let export: planarian_backend_linux::nixos::Export = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    serde_json::to_string(&export).map_err(|e| e.to_string())
+}
+
 fn main() {
+    // Before anything else (no config, no journal): a pure check.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--check-export") {
+        let Some(path) = args.get(2) else {
+            eprintln!("usage: planariad --check-export <path>");
+            std::process::exit(2);
+        };
+        let out = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}")).and_then(|t| check_export(&t));
+        match out {
+            Ok(json) => {
+                println!("{json}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("planariad --check-export: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let cfg_path = std::env::var("PLANARIAN_CONFIG").unwrap_or_else(|_| CONFIG.into());
     let file = match FileConfig::load(Path::new(&cfg_path)) {
         Ok(c) => c,
@@ -681,6 +702,22 @@ fn hooks_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--check-export` (#38's cross-boundary check): the round trip of an
+    /// export as planariad reads it. Keys it does not know are dropped,
+    /// missing ones come back as their defaults, and what it cannot read is
+    /// an error; the round trip is stable.
+    #[test]
+    fn check_export_round_trips_what_planariad_reads() {
+        let out = check_export(r#"{"units": [], "notAField": 1}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("notAField").is_none(), "an unknown key is dropped: {out}");
+        assert_eq!(v["userUnits"], serde_json::json!([]), "a missing key is its default: {out}");
+        assert_eq!(check_export(&out).unwrap(), out, "the round trip is stable");
+        // What planariad cannot read is an error, not an empty export.
+        assert!(check_export(r#"{"units": 5}"#).is_err());
+        assert!(check_export("not json").is_err());
+    }
 
     #[test]
     fn a_peer_is_read_through_its_pidfd() {

@@ -14,6 +14,7 @@ members = [
     "crates/ipc",
     "crates/daemon",
     "crates/backends/linux",
+    "crates/backends/netwatch",
     "crates/watchdog",
     "crates/cli",
     "crates/gym",
@@ -41,6 +42,7 @@ planarian-exec = { path = "crates/exec" }
 planarian-ipc = { path = "crates/ipc" }
 planarian-daemon = { path = "crates/daemon" }
 planarian-backend-linux = { path = "crates/backends/linux" }
+planarian-backend-netwatch = { path = "crates/backends/netwatch" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

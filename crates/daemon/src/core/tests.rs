@@ -2386,19 +2386,6 @@ mod timing_props {
                             "cooldown until {} set on a tick from {start} (+{slow} ms of probes) to {end}",
                             until.0
                         ),
-                        // A regression's hold, set when the observation
-                        // reopens the incident, is still anchored at the
-                        // observation's start: the strict form waits on
-                        // lane-daemon's escalation-anchor fix (ledger D3).
-                        // Until then, at least an hour from the tick.
-                        Some(IncidentState::Escalated { until, reason: EscalationReason::Regressed }) => {
-                            held = true;
-                            prop_assert!(
-                                until.0 >= start + COOLDOWN_FIRST.0 && until.0 <= end + COOLDOWN_FIRST.0,
-                                "regression hold until {} set on a tick from {start} to {end}",
-                                until.0
-                            )
-                        }
                         Some(IncidentState::Escalated { until, .. }) => {
                             held = true;
                             prop_assert!(
@@ -2535,4 +2522,83 @@ mod limit_props {
             }
         }
     }
+}
+
+/// §13: the hold a third regression sets runs from the decision, after the
+/// probes, like every cooldown and backoff (prop-auditor's Relapse(369):
+/// gym-flap fails 369 s after each start, so each repair stabilizes past
+/// 5 min and regresses inside 30 min; probe batches take 500 ms).
+#[test]
+fn a_regression_hold_runs_from_the_decision() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let flap = UnitId::service("gym-flap");
+    {
+        let mut w = r.fake.w();
+        let now = w.now;
+        let sim = w.units.get_mut(&flap).unwrap();
+        sim.fail_after = Some(Millis::secs(369));
+        sim.started_at = now;
+    }
+    r.fake.w().probe_batch_ms = 500;
+    for _ in 0..2000 {
+        r.fake.advance(planarian_state::TICK);
+        let observed = r.fake.now();
+        r.core.tick();
+        if let Some(IncidentState::Escalated { until, reason }) =
+            r.core.incidents.active_for(&flap).map(|i| i.state.clone())
+        {
+            assert_eq!(reason, EscalationReason::Regressed);
+            assert!(
+                until.0 >= observed.0 + 500 + planarian_incident::COOLDOWN_FIRST.0,
+                "hold until {} set on a tick observed at {}",
+                until.0,
+                observed.0
+            );
+            return;
+        }
+    }
+    panic!("no escalation: {:#?}", r.core.notices);
+}
+
+/// The gym's forced compaction (gate 41604917858, `replay_equivalent`): the
+/// history it saves plus the journal's tail must replay to the daemon's
+/// ledger. Reading the segment from outside, then compacting, left a gap a
+/// tick could journal into (here an out-of-band stop: its inferred
+/// override), and the saved history fell short; `compact_saving` reads the
+/// segment in the same call as the compaction, so it cannot.
+#[test]
+fn a_forced_compaction_saves_exactly_what_it_discarded() {
+    use planarian_txn::ledger::{Entry, Ledger};
+    let replay = |saved: &[Entry], tail: &[Entry]| {
+        let mut l = Ledger::default();
+        for e in saved.iter().chain(tail) {
+            let _ = l.apply(e.clone());
+        }
+        l
+    };
+    let web = UnitId::service("gym-web");
+    // The old way: the segment read first, a tick journals, then compact.
+    let mut r = Rig::new();
+    r.ticks(2);
+    let saved = r.core.ex.kernel.journal.segment().unwrap();
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(2);
+    r.core.ex.kernel.journal.compact().unwrap();
+    r.ticks(1);
+    let tail = r.core.ex.kernel.journal.segment().unwrap();
+    assert_ne!(
+        &replay(&saved, &tail),
+        r.core.ex.kernel.journal.ledger(),
+        "the old way falls short (the case is not vacuous)"
+    );
+    // compact_saving: what it returns is exactly what the checkpoint replaced.
+    let mut r = Rig::new();
+    r.ticks(2);
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(2);
+    let saved = r.core.compact_saving().unwrap();
+    r.ticks(1);
+    let tail = r.core.ex.kernel.journal.segment().unwrap();
+    assert_eq!(&replay(&saved, &tail), r.core.ex.kernel.journal.ledger());
 }

@@ -10,6 +10,7 @@ rust-version.workspace = true
 planarian-schema.workspace = true
 planarian-changes.workspace = true
 planarian-txn.workspace = true
+planarian-backend-netwatch.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
