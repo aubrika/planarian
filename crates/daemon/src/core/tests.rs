@@ -2863,3 +2863,259 @@ fn a_forced_compaction_saves_exactly_what_it_discarded() {
     let tail = r.core.ex.kernel.journal.segment().unwrap();
     assert_eq!(&replay(&saved, &tail), r.core.ex.kernel.journal.ledger());
 }
+
+/// §12d (lift_unconfirmed): a lift the host does not answer is journaled
+/// once and noticed once, not once per tick: the next tick finds the unit
+/// held on the host and not in the journal, which looked like a hold set
+/// unseen by `OnFailure=` (a second `HoldApplied`, a second lift, a second
+/// notice, every tick). The lift completes once systemd answers.
+#[test]
+fn a_stuck_lift_is_journaled_and_noticed_once() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().stop_out_of_band(&web);
+    // Held and journaled first; then systemd stops answering, before the unit
+    // is back.
+    for _ in 0..10 {
+        if r.fake.w().held.contains(&web) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.fake.w().held.contains(&web), "never held: {:?}", r.core.notices);
+    r.fake.w().hold_hangs = Some(Millis::secs(30));
+    r.ticks(40);
+    assert!(r.fake.w().held.contains(&web), "lifted with systemd stuck");
+    let lifts = |r: &Rig| r.core.notices.iter().filter(|n| n.contains("could not be lifted")).count();
+    let events = r.core.ledger().hold_events.clone();
+    let applied = events.iter().filter(|e| e.1).count();
+    let lifted = events.iter().filter(|e| !e.1).count();
+    assert!(applied <= 1, "held again on every tick: {events:?}");
+    assert!(lifted <= 1, "lifted again on every tick: {events:?}");
+    assert!(lifts(&r) <= 1, "{:?}", r.core.notices);
+    r.fake.w().hold_hangs = None;
+    r.ticks(30);
+    assert!(!r.fake.w().held.contains(&web), "never lifted: {:?}", r.core.notices);
+    assert!(r.core.ledger().holds().is_empty(), "{events:?}");
+    assert!(lifts(&r) <= 1, "{:?}", r.core.notices);
+    assert_eq!(r.core.notices.iter().filter(|n| n.contains("flows again")).count(), 1, "{:?}", r.core.notices);
+}
+
+/// §12d (reviewer, 47aed77): a hold timeout is news again in a later
+/// episode: the unit was neither failed nor held in between.
+#[test]
+fn a_later_episodes_hold_timeout_alarms_again() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, false);
+    let unheld = |r: &Rig| r.core.notices.iter().filter(|n| n.contains("could not be held (")).count();
+    r.fake.w().hold_hangs = Some(Millis::secs(30));
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(30);
+    assert_eq!(unheld(&r), 1, "{:?}", r.core.notices);
+    assert!(r.calls("restart(service:gym-web)") >= 1, "never restarted: {:?}", r.core.notices);
+    r.ticks(30);
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(30);
+    assert_eq!(unheld(&r), 2, "{:?}", r.core.notices);
+}
+
+#[test]
+fn a_flush_while_a_lift_is_pending_does_not_hold_again() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().stop_out_of_band(&web);
+    for _ in 0..10 {
+        if r.fake.w().held.contains(&web) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.fake.w().held.contains(&web));
+    r.fake.w().hold_fails = Some("systemctl stop: job failed".into());
+    for _ in 0..40 {
+        if r.core.notices.iter().any(|n| n.contains("could not be lifted")) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.core.notices.iter().any(|n| n.contains("could not be lifted")), "{:?}", r.core.notices);
+    let before = r.core.notices.len();
+    r.fake.w().hold_table_flushed = true;
+    r.ticks(3);
+    let after: Vec<String> = r.core.notices.iter().skip(before).cloned().collect();
+    assert!(!after.iter().any(|n| n.contains("removed from the firewall")), "{after:?}");
+    assert!(r.calls("reapply_hold(service:gym-web)") == 0, "re-held a unit that is back");
+}
+
+/// The hold/lift state machine of a network tool (§12d), whatever the host
+/// does: a stop or a kill outside Planarian, a host that stops answering its
+/// hold and lift calls (`hold_hangs`) and answers again.
+mod hold_episode_props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::Config as PConfig;
+
+    fn pconfig(cases: u32) -> PConfig {
+        let cases = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(cases);
+        PConfig { cases, failure_persistence: None, ..PConfig::default() }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Step {
+        Ticks(usize),
+        Hang(bool),
+        /// `systemctl stop` outside Planarian (no OnFailure=).
+        Stop,
+        /// SIGKILL (OnFailure= holds it).
+        Kill,
+    }
+
+    fn steps() -> impl Strategy<Value = Vec<Step>> {
+        proptest::collection::vec(
+            prop_oneof![
+                3 => (1usize..12).prop_map(Step::Ticks),
+                2 => (12usize..40).prop_map(Step::Ticks),
+                2 => any::<bool>().prop_map(Step::Hang),
+                2 => Just(Step::Stop),
+                1 => Just(Step::Kill),
+            ],
+            1..14,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(pconfig(24))]
+
+        /// Per tool, per run: every outside stop or kill of a running tool is
+        /// one episode, and an episode is held at most once and lifted at
+        /// most once, however long the host hangs (a lift the host has not
+        /// answered is journaled once, noticed once, and retried at a
+        /// cadence, not every tick); once the host answers again and the
+        /// tool is back, nothing stays held or in the journal's holds.
+        #[test]
+        fn an_episode_is_held_once_lifted_once_and_noticed_once(steps in steps(), on_failure in any::<bool>()) {
+            let web = UnitId::service("gym-web");
+            let mut r = rig_with_network_tool(true, on_failure);
+            let start = r.fake.now().0;
+            let mut episodes = 0usize;
+            for s in &steps {
+                match s {
+                    Step::Ticks(n) => {
+                        r.ticks(*n);
+                        // Fail closed: a tool still down after a few ticks has its
+                        // traffic held (journaled held, or held on the host).
+                        if *n >= 3 && r.status("service:gym-web") != UnitStatus::Running {
+                            let journaled = r.core.ledger().holds().contains(&web);
+                            prop_assert!(journaled || r.fake.w().held.contains(&web), "down and not held: {:?}", r.core.notices);
+                        }
+                    }
+                    Step::Hang(on) => r.fake.w().hold_hangs = on.then(|| Millis::secs(30)),
+                    Step::Stop | Step::Kill => {
+                        // Two at most: a third regression in a row is a different
+                        // path (the repair is held back, §13).
+                        if episodes < 2 && r.status("service:gym-web") == UnitStatus::Running {
+                            episodes += 1;
+                            if matches!(s, Step::Stop) { r.fake.w().stop_out_of_band(&web) } else { r.fake.w().kill(&web) }
+                        }
+                    }
+                }
+            }
+            // The attempts at a lift: a call that answered, or timed out.
+            let attempts = r.calls("lift_hold(");
+            let elapsed_s = (r.fake.now().0 - start) / 1000;
+            let events: Vec<bool> = r.core.ledger().hold_events.iter().filter(|e| e.0 == web).map(|e| e.1).collect();
+            let applied = events.iter().filter(|e| **e).count();
+            let lifted = events.len() - applied;
+            let notice = |s: &str| r.core.notices.iter().filter(|n| n.contains(s) && n.contains("gym-web")).count();
+            prop_assert!(applied <= episodes, "held {applied} times in {episodes} episodes: {events:?}");
+            prop_assert!(lifted <= episodes, "lifted {lifted} times in {episodes} episodes: {events:?}");
+            prop_assert!(notice("could not be lifted") <= lifted, "{:?}", r.core.notices);
+            prop_assert!(notice("flows again") <= lifted, "{:?}", r.core.notices);
+            // A lift is asked for once per lift journaled, and then once a
+            // minute while it stands unanswered.
+            prop_assert!(
+                (attempts as u64) <= lifted as u64 * 2 + elapsed_s / 60 + 1,
+                "{attempts} lift calls for {lifted} lifts in {elapsed_s} s"
+            );
+            // The host answers again and the tool is back: everything is
+            // lifted, and nothing is left in the journal as held.
+            r.fake.w().hold_hangs = None;
+            r.ticks(40);
+            prop_assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
+            prop_assert!(!r.fake.w().held.contains(&web), "still held on the host");
+            prop_assert!(r.core.ledger().holds().is_empty(), "{:?}", r.core.ledger().hold_events);
+        }
+    }
+}
+
+/// A path the property above reaches only by luck (prop-auditor's mutant on
+/// #72): a lift still pending when the tool fails again is forgotten, so a
+/// second stuck lift is noticed again. The hold must land before the host
+/// stops answering the lift, so the hang is switched on once it has.
+#[test]
+fn a_second_stuck_lift_is_noticed_again() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, false);
+    let stuck = |r: &Rig| r.core.notices.iter().filter(|n| n.contains("could not be lifted")).count();
+    for episode in 1..=2usize {
+        r.fake.w().hold_hangs = None;
+        r.fake.w().stop_out_of_band(&web);
+        for _ in 0..30 {
+            if r.fake.w().held.contains(&web) {
+                break;
+            }
+            r.ticks(1);
+        }
+        assert!(r.fake.w().held.contains(&web), "episode {episode}: never held: {:?}", r.core.notices);
+        // systemd stops answering before the tool is back.
+        r.fake.w().hold_hangs = Some(Millis::secs(30));
+        for _ in 0..60 {
+            if stuck(&r) == episode {
+                break;
+            }
+            r.ticks(1);
+        }
+        assert_eq!(stuck(&r), episode, "episode {episode}: {:?}", r.core.notices);
+    }
+    r.fake.w().hold_hangs = None;
+    r.ticks(30);
+    assert!(!r.fake.w().held.contains(&web), "still held: {:?}", r.core.notices);
+    assert!(r.core.ledger().holds().is_empty(), "{:?}", r.core.ledger().hold_events);
+}
+
+/// §12d (prop-auditor, #72): only the lift hangs (`lift_hangs`), for
+/// minutes. The lift is journaled and noticed once, asked for at most once
+/// a minute (a retry on every tick, or a notice on every retry, are the
+/// failures this exists to prevent), and the hold's table check still
+/// answers every tick.
+#[test]
+fn a_lift_that_alone_hangs_is_retried_quietly_once_a_minute() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().stop_out_of_band(&web);
+    for _ in 0..10 {
+        if r.fake.w().held.contains(&web) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.fake.w().held.contains(&web), "never held: {:?}", r.core.notices);
+    r.fake.w().lift_hangs = Some(Millis::secs(30));
+    let t0 = r.fake.now().0;
+    // Five minutes at a tick every 5 s (each hung lift also spends its wait).
+    while r.fake.now().0 < t0 + 300_000 {
+        r.ticks(1);
+    }
+    let timed_out = r.calls("lift_hold(service:gym-web) timed out");
+    assert!((1..=6).contains(&timed_out), "{timed_out} lift attempts in 5 minutes: {:?}", r.core.notices);
+    let stuck = |r: &Rig| r.core.notices.iter().filter(|n| n.contains("could not be lifted")).count();
+    assert_eq!(stuck(&r), 1, "{:?}", r.core.notices);
+    assert!(!r.core.notices.iter().any(|n| n.contains("could not be checked")), "{:?}", r.core.notices);
+    let events = r.core.ledger().hold_events.clone();
+    assert_eq!(events.iter().filter(|e| e.1).count(), 1, "{events:?}");
+    assert_eq!(events.iter().filter(|e| !e.1).count(), 1, "{events:?}");
+    r.fake.w().lift_hangs = None;
+    r.ticks(15);
+    assert!(!r.fake.w().held.contains(&web), "never lifted: {:?}", r.core.notices);
+    assert_eq!(r.core.notices.iter().filter(|n| n.contains("flows again")).count(), 1, "{:?}", r.core.notices);
+}
