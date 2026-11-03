@@ -227,6 +227,9 @@ pub struct World {
     pub hold_on_failure: BTreeSet<UnitId>,
     /// The units whose traffic is held now (`/run/planarian/hold`).
     pub held: BTreeSet<UnitId>,
+    /// Network tools the host declines to hold: not protecting (the hold
+    /// unit's condition skips, as for a tool with no footprint).
+    pub hold_declines: BTreeSet<UnitId>,
     /// Released holds and until when (`None`: the next boot), as the
     /// `/run/planarian/hold-released` marker the hold script honours.
     pub hold_released: BTreeMap<UnitId, Option<Timestamp>>,
@@ -759,7 +762,7 @@ impl UnitBackend for Fake {
         // A posture response carries no op (docs/bypasses.md): op 0.
         w.calls.push(Call { call: format!("hold({unit})"), op: NO_OP, at: now, fenced: false });
         // The script honours an unexpired release (nix/posture.nix).
-        if !w.hold_released.get(unit).is_some_and(|t| t.is_none_or(|t| t > now)) {
+        if !w.hold_released.get(unit).is_some_and(|t| t.is_none_or(|t| t > now)) && !w.hold_declines.contains(unit) {
             w.held.insert(unit.clone());
         }
         Outcome::Succeeded

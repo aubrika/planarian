@@ -52,6 +52,20 @@ fn any_facts() -> EndingFacts {
         stops_are_faults: kani::any(),
         systemd_restarts: kani::any(),
         lenient: kani::any(),
+        network_tool: kani::any(),
+        held: kani::any(),
+        hold_tried: kani::any(),
+    }
+}
+
+/// §12d, §11: a held unit's stop is never taken as intended, whatever its
+/// tags; a network tool's, never before the host was asked to hold it.
+#[kani::proof]
+fn residue_held_is_never_intended() {
+    let f = any_facts();
+    let r = classify(&f);
+    if f.held || (f.network_tool && !f.hold_tried) {
+        assert!(!matches!(r, Residue::Intended(_)));
     }
 }
 

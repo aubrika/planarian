@@ -2356,3 +2356,29 @@ fn a_unit_that_is_not_a_network_tool_keeps_the_residue_rule() {
     );
     assert_eq!(r.calls("restart(service:gym-web)"), 0);
 }
+
+/// The host declines the hold (the tool is not protecting: its hold unit's
+/// condition skips): not a network-security unit (§12d), so the residue rule
+/// applies after the attempt, and a stop outside Planarian is taken as
+/// intended (Standard: until the next boot). The hold was asked for first.
+#[test]
+fn a_network_tool_the_host_declines_to_hold_keeps_the_residue_rule() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, false);
+    r.fake.w().hold_declines.insert(web.clone());
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(3);
+    assert!(
+        r.fake.w().calls.iter().any(|c| c.call == "hold(service:gym-web)"),
+        "the hold was not asked for first: {:?}",
+        r.core.notices
+    );
+    assert!(!r.fake.w().held.contains(&web));
+    assert!(r.core.ledger().holds().is_empty(), "no hold journaled: {:?}", r.core.ledger().hold_events);
+    assert!(
+        r.core.ledger().overrides.iter().any(|o| o.unit == web && o.attribution == Attribution::Inferred),
+        "{:?}",
+        r.core.notices
+    );
+    assert_eq!(hold_alarms(&r, &web), 0, "{:?}", r.core.notices);
+}
