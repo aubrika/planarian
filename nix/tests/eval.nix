@@ -303,10 +303,18 @@ pkgs.runCommand "planarian-module-eval.json" {
   echo '${builtins.toJSON expectedHolds}' | jq -c 'sort' > holds-want
   diff holds-want holds-read || { echo "export: the units planariad reads as network tools differ (above: want, read)" >&2; exit 1; }
   echo "ok: planariad reads $(jq length holds-read) network tools from the export, as the module classifies them, an instance among them"
-  jq -c '[(.units + .userUnits)[] | keys]' $exportPath > keys-export
-  jq -c '[(.units + .userUnits)[] | keys]' parsed.json > keys-read
-  diff keys-export keys-read || { echo "export: a unit key is dropped or defaulted by planariad's Export (above: export, read)" >&2; exit 1; }
-  echo "ok: every unit key in the export survives planariad's Export unchanged"
+  # Every key path (array indices folded), both ways (the reviewer's diff):
+  # one only in the export is dropped by planariad, one only in the round
+  # trip is filled by its default. The top-level network-tool lists are
+  # read raw by netwatch and the module, not through Export.
+  kp='[paths(scalars) | map(if type == "number" then 0 else . end)] | unique'
+  jq -c "del(.networkTools, .networkToolsInitrd, .networkToolsUnordered) | $kp" $exportPath > keys-export
+  jq -c "$kp" parsed.json > keys-read
+  jq -r '.[] | map(tostring) | join(".")' keys-export > paths-export
+  jq -r '.[] | map(tostring) | join(".")' keys-read > paths-read
+  diff paths-export paths-read || { echo "export: key paths differ between the export (<) and planariad's round trip (>): < is dropped, > is defaulted" >&2; exit 1; }
+  [ -s paths-export ] || { echo "export: no key paths (the diff would be vacuous)" >&2; exit 1; }
+  echo "ok: every key path in the export survives planariad's Export, and none is filled by default ($(wc -l < paths-export) paths)"
 
   root=$PWD/run
   # A stub systemctl, first on the script's PATH: the unit's InvocationID
