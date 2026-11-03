@@ -855,15 +855,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// Compact the journal and return the entries it discarded (the segment
     /// it checkpointed), read in the same core call: no tick of this daemon
     /// can journal between the two, so they are exactly what the checkpoint
-    /// replaced. The gym's forced compaction saves them for the judge's
-    /// full-history replay (`replay_equivalent`); reading the segment from
-    /// outside first left a gap a tick could journal into.
+    /// replaced (under one hold of the store lock, so another handle's
+    /// append cannot fall between either). The gym's forced compaction saves
+    /// them for the judge's full-history replay (`replay_equivalent`).
     pub fn compact_saving(
         &mut self,
     ) -> Result<Vec<planarian_txn::ledger::Entry>, planarian_txn::journal::JournalError> {
-        let segment = self.ex.kernel.journal.segment()?;
-        self.ex.kernel.journal.compact()?;
-        Ok(segment)
+        self.ex.kernel.journal.compact_returning_segment()
     }
 
     fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {

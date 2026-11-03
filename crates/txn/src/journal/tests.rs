@@ -534,3 +534,41 @@ proptest! {
         prop_assert!(new.1 == old.1, "the bytes left on disk differ");
     }
 }
+
+/// `compact_returning_segment` (reviewer, #65): the entries it returns are
+/// exactly those its checkpoint replaced, even while another handle (the
+/// renewer's `Renew`, the watchdog) appends. `segment()` then `compact()`
+/// each take the store lock alone, so an append between them is
+/// checkpointed but missing from what was saved.
+#[test]
+fn a_returned_segment_is_exactly_what_the_checkpoint_replaced() {
+    let store = MemStore::new(1 << 20);
+    let mut a = Journal::open(store.clone()).unwrap();
+    append(&mut a, 0).unwrap();
+    let mut b = Journal::open(store.clone()).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let writer = std::thread::spawn(move || {
+        let mut i = 1;
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = append(&mut b, i);
+            i += 1;
+        }
+    });
+    let mut previous = a.checkpoint_seq;
+    let mut failure = None;
+    for _ in 0..300 {
+        let segment = a.compact_returning_segment().unwrap();
+        let replaced = segment.last().map_or(previous, |e| e.seq);
+        let contiguous = segment.windows(2).all(|w| w[0].seq + 1 == w[1].seq)
+            && segment.first().is_none_or(|e| e.seq == previous + 1);
+        if a.checkpoint_seq != replaced || !contiguous {
+            failure = Some((a.checkpoint_seq, replaced, segment.len(), previous));
+            break;
+        }
+        previous = a.checkpoint_seq;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(failure.is_none(), "(checkpoint, last returned, returned, previous) = {failure:?}");
+}

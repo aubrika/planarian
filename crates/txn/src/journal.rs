@@ -610,6 +610,11 @@ impl<S: Store> Journal<S> {
     /// checkpoint), in order.
     pub fn segment(&mut self) -> Result<Vec<Entry>, JournalError> {
         let _g = self.store.lock()?;
+        self.segment_locked()
+    }
+
+    /// `segment`, with the store lock already held by the caller.
+    fn segment_locked(&mut self) -> Result<Vec<Entry>, JournalError> {
         let mut out = vec![];
         let mut off = 0u64;
         loop {
@@ -650,6 +655,22 @@ impl<S: Store> Journal<S> {
     /// Checkpoint-then-truncate. If the checkpoint write fails, nothing changes.
     pub fn compact(&mut self) -> Result<(), JournalError> {
         let _g = self.store.lock()?;
+        self.compact_locked()
+    }
+
+    /// `compact`, returning the segment it discards, both under one hold of
+    /// the store lock: another handle (the renewer's `Renew`, the watchdog)
+    /// cannot append between the read and the checkpoint, so the entries
+    /// returned are exactly those the checkpoint replaced.
+    pub fn compact_returning_segment(&mut self) -> Result<Vec<Entry>, JournalError> {
+        let _g = self.store.lock()?;
+        let segment = self.segment_locked()?;
+        self.compact_locked()?;
+        Ok(segment)
+    }
+
+    /// `compact`, with the store lock already held by the caller.
+    fn compact_locked(&mut self) -> Result<(), JournalError> {
         self.refresh()?;
         let payload = serde_json::to_vec(&self.ledger).map_err(|e| JournalError::Corrupt(e.to_string()))?;
         self.store.write_checkpoint(&frame(self.ledger.last_seq, &self.head, &payload))?;
