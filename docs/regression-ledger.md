@@ -21,6 +21,15 @@ bug on a scratch tree and watched the test fail; the output is quoted.
 *recorded* means the fix's author or the reviewer recorded it, in the commit
 or the cited doc. *none recorded* means nobody has shown it yet.
 
+**Adding a row** (§18 rule 23, owner decision, Nov 3): a PR that fixes a bug
+adds its row here in the same PR, in the section for its area, with the next
+free number. Fill in the bug, the fix (the PR number; the commit once merged),
+the crate and function, the test that fails on the unfixed code, the test's
+kind, and the evidence it fails on revert (the failing output or minimal
+case). A bug that only a kernel or a VM can show cites its VM test. A PR that
+changes a pure fold, parser, classifier, ordering or state machine also
+carries a property test for the invariant it changes.
+
 **Status:** **covered** (the strongest cheap test exists and bites), **gap**
 (a property-shaped bug held only by fixed cases; a property test is owed),
 **pending** (the fix is not on `main` yet).
