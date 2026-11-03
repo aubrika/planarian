@@ -470,3 +470,67 @@ proptest! {
         prop_assert!(new.1 == old.1, "the bytes left on disk differ");
     }
 }
+
+/// What a catch-up did (`sync_ledger`: `refresh`, then `scan(false)`, or a
+/// reload after another handle's compaction): a reader opens `base`'s copy,
+/// a writer appends `n` more (compacting at `compact_at`, if any), the
+/// damage is applied, and the reader catches up, with the old scan or the
+/// new; its ledger's last seq and head or its error, and the bytes left.
+fn catch_up_outcome(
+    base: &MemStore,
+    n: u64,
+    compact_at: Option<u64>,
+    damage: &[(prop::sample::Index, u8)],
+    old: bool,
+) -> (Result<(u64, Hash), String>, Vec<u8>) {
+    let c = copy(base);
+    let mut r = Journal::open(c.clone()).unwrap();
+    let mut w = Journal::open(c.clone()).unwrap();
+    for k in 0..n {
+        if compact_at == Some(k) || w.needs_compaction() {
+            w.compact().unwrap();
+        }
+        append(&mut w, 10_000 + k).unwrap();
+    }
+    drop(w);
+    for (at, x) in damage {
+        let at = at.index(c.capacity() as usize) as u64;
+        let b = c.read_at(at, 1).unwrap()[0];
+        c.write_at(at, &[b ^ x]).unwrap();
+    }
+    OLD_SCAN.with(|o| o.set(old));
+    let res = r.sync_ledger().map(|l| l.last_seq).map(|s| (s, r.head())).map_err(|e| format!("{e:?}"));
+    OLD_SCAN.with(|o| o.set(false));
+    (res, c.read_at(0, c.capacity() as usize).unwrap())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 400, ..ProptestConfig::default() })]
+
+    /// The reviewer's (#57): the catch-up path a kept handle runs (the
+    /// renewer's, every 20 s; the watchdog's) has the same outcomes with the
+    /// new scan as with the old: after appends, a compaction by the other
+    /// handle (leftovers past the tail), and damage anywhere. Same ledger
+    /// and head, or the same error, and the same bytes left.
+    #[test]
+    fn catch_up_outcomes_are_unchanged(
+        before in 0u64..300,
+        n in 0u64..120,
+        compact_at in proptest::option::of(0u64..120),
+        damage in proptest::collection::vec((any::<prop::sample::Index>(), 1u8..=255), 0..3),
+    ) {
+        let store = MemStore::new(32 << 10);
+        let mut j = Journal::open(store.clone()).unwrap();
+        for i in 0..before {
+            if j.needs_compaction() {
+                j.compact().unwrap();
+            }
+            append(&mut j, i).unwrap();
+        }
+        drop(j);
+        let old = catch_up_outcome(&store, n, compact_at, &damage, true);
+        let new = catch_up_outcome(&store, n, compact_at, &damage, false);
+        prop_assert_eq!(&new.0, &old.0);
+        prop_assert!(new.1 == old.1, "the bytes left on disk differ");
+    }
+}
