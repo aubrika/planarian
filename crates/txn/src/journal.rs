@@ -372,7 +372,22 @@ impl<S: Store> Journal<S> {
             } else {
                 0
             };
-            let bytes = if len == 0 { header } else { self.store.read_at(self.offset, HEADER + len)? };
+            // Read the body only for a header that could be the next record:
+            // its length fits, and its seq follows (or, skipping, is at or
+            // below it). Past the tail after a compaction the bytes are
+            // leftovers whose "length" can claim most of the store; reading
+            // it on every catch-up made each append and renewal cost the
+            // rest of the store. A header that could not be the next record
+            // takes the same path as a frame that is not intact.
+            let next = header.len() == HEADER && {
+                let seq = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
+                let fits = len >= PREV && self.offset.saturating_add((HEADER + len) as u64) <= self.store.capacity();
+                fits && (seq == self.ledger.last_seq.wrapping_add(1) || (skipping && seq <= self.ledger.last_seq))
+            };
+            // Tests compare against the scan before this check (`OLD_SCAN`).
+            #[cfg(test)]
+            let next = next || tests::OLD_SCAN.with(std::cell::Cell::get);
+            let bytes = if len == 0 || !next { header } else { self.store.read_at(self.offset, HEADER + len)? };
             let Some(f) = unframe(&bytes) else {
                 if truncate && bytes.iter().take(HEADER).any(|b| *b != 0) {
                     return self.stop_at_tail(truncate);
