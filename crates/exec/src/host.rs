@@ -307,7 +307,9 @@ pub fn declared(d: &UnitDef) -> UnitDef {
 }
 
 /// Units whose entries, as declared ([`declared`]), differ between two
-/// manifests, or that exist in only one.
+/// manifests, or that exist in only one. Only system-scope entries
+/// (`Manifest::units`) are compared; a change to a user-scope template
+/// (`user_units`) is `touches_manifest`'s alone.
 pub fn changed_units(a: &Manifest, b: &Manifest) -> BTreeSet<UnitId> {
     let mut out = BTreeSet::new();
     for (id, d) in &a.units {
