@@ -121,20 +121,19 @@ pub trait UnitBackend {
     /// ever restricts traffic; docs/bypasses.md). Idempotent. Unlike the
     /// other mutations here it takes no `OpId`; the daemon journals
     /// `HoldApplied` before calling it.
-    fn hold(&self, _unit: &UnitId) -> Outcome {
+    ///
+    /// Every hold call here runs on the daemon's tick (or a request on its
+    /// core) and waits at most `wait`: past it the call returns `Unknown`
+    /// (or, for `hold_table_present`, an error: cannot say), and what it
+    /// started goes on in the host. A hold not confirmed within `wait`
+    /// counts as held; the socket, approvals and repairs are never stalled
+    /// for a stuck `systemctl` (reviewer, #61).
+    fn hold(&self, _unit: &UnitId, _wait: Millis) -> Outcome {
         Outcome::Failed("this backend cannot hold traffic".into())
     }
-    /// `hold`, waiting at most `wait` for it: on the daemon's tick (§12d,
-    /// a network tool stopped outside Planarian), where a hold the host has
-    /// not confirmed within `wait` counts as held. Past `wait` it returns
-    /// `Unknown`, and the hold's job goes on in the host, so it may still
-    /// land. Backends whose `hold` cannot block keep this default.
-    fn hold_within(&self, unit: &UnitId, _wait: Millis) -> Outcome {
-        self.hold(unit)
-    }
     /// Lift a unit's hold, once it is Running and its Readiness probes pass
-    /// (journaled `HoldLifted` first). Idempotent.
-    fn lift_hold(&self, _unit: &UnitId) -> Outcome {
+    /// (journaled `HoldLifted` first). Idempotent. At most `wait`.
+    fn lift_hold(&self, _unit: &UnitId, _wait: Millis) -> Outcome {
         Outcome::Failed("this backend cannot hold traffic".into())
     }
     /// The units whose traffic is held now, as the host says (§12d: the
@@ -145,8 +144,9 @@ pub trait UnitBackend {
     }
     /// `planarian hold release` (an attested Override, decided before this):
     /// mark the unit's hold released until `until` (`None`: the next boot),
-    /// then lift it. While the mark stands, a new failure does not hold.
-    fn release_hold(&self, _unit: &UnitId, _until: Option<Timestamp>) -> Outcome {
+    /// then lift it, waiting at most `wait`. While the mark stands, a new
+    /// failure does not hold.
+    fn release_hold(&self, _unit: &UnitId, _until: Option<Timestamp>, _wait: Millis) -> Outcome {
         Outcome::Failed("this backend cannot hold traffic".into())
     }
     /// The release ended (expired, or the override lifted): remove the mark.
@@ -156,14 +156,15 @@ pub trait UnitBackend {
     /// Whether the hold's nftables table is in place. Anything else that
     /// flushes the ruleset (`nft flush ruleset`) removes it and would fail
     /// open; the daemon checks this while a hold is active. An error means
-    /// "cannot say".
-    fn hold_table_present(&self) -> Result<bool, Outcome> {
+    /// "cannot say" (also past `wait`).
+    fn hold_table_present(&self, _wait: Millis) -> Result<bool, Outcome> {
         Ok(true)
     }
     /// Build a unit's hold again (the table was removed under it): restart
-    /// its hold unit, since starting an active one does nothing.
-    fn reapply_hold(&self, unit: &UnitId) -> Outcome {
-        self.hold(unit)
+    /// its hold unit, since starting an active one does nothing. At most
+    /// `wait`.
+    fn reapply_hold(&self, unit: &UnitId, wait: Millis) -> Outcome {
+        self.hold(unit, wait)
     }
 }
 

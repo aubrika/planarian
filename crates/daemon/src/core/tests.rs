@@ -2661,9 +2661,10 @@ fn a_network_tool_the_host_declines_to_hold_keeps_the_residue_rule() {
     assert_eq!(hold_alarms(&r, &web), 0, "{:?}", r.core.notices);
 }
 
-/// §12d: a hold whose start hangs (`systemctl start` stuck past the hold
-/// unit's condition) does not stall the tick: the daemon waits HOLD_WAIT,
-/// then counts it as held (fail closed). The unit is restarted, never
+/// §12d: hold calls that hang (`systemctl start`/`stop`, `nft list`, all
+/// stuck: the fake's `hold_hangs` applies to every one) do not stall the
+/// tick: all of a tick's hold calls share one HOLD_WAIT, then the hold
+/// counts as held (fail closed). The unit is restarted, never
 /// inferred stopped, and its traffic is held (journaled, alarmed); the
 /// socket, approvals and other repairs are not held up for `hold::apply`'s
 /// 30 s (reviewer, #55).
@@ -2685,7 +2686,7 @@ fn a_hold_that_hangs_does_not_stall_the_tick() {
         "a tick took {longest} ms on the fake clock (HOLD_WAIT {} ms)",
         crate::core::HOLD_WAIT.0
     );
-    assert!(r.fake.w().calls.iter().any(|c| c.call == "hold(service:gym-web)"), "the hold was asked for");
+    assert!(r.fake.w().calls.iter().any(|c| c.call.starts_with("hold(service:gym-web)")), "the hold was asked for");
     assert!(
         !r.core.ledger().overrides.iter().any(|o| o.unit == web),
         "inferred as intended: {:?}",

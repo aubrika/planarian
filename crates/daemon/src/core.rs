@@ -256,6 +256,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// §12d: units the daemon itself asked the host to hold for a stop
     /// outside Planarian (the residue path); their `HoldApplied` is by it.
     daemon_held: BTreeSet<UnitId>,
+    /// §12d: units whose hold the host has not confirmed in time; alarmed once.
+    hold_unconfirmed: BTreeSet<UnitId>,
+    /// §12d: the end of this tick's hold budget (`hold_wait`).
+    hold_deadline: Timestamp,
     /// Generation transactions withdrawn from `Built` for a rollback about to
     /// run (§12f, I6; owner decision, Nov 2), with when each began waiting,
     /// to prepare again once no generation transaction is active.
@@ -472,6 +476,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             hold_missing_noted: false,
             hold_retry: None,
             daemon_held: BTreeSet::new(),
+            hold_unconfirmed: BTreeSet::new(),
+            hold_deadline: Timestamp(0),
             withdrawn: vec![],
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
@@ -817,6 +823,21 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// reconciled with the host's (`held`), and any disagreement keeps the
     /// hold (fail closed).
     /// Returns whether it applied a hold the observed state does not show.
+    /// What is left of this tick's hold budget: every hold call on the tick
+    /// (apply, lift, the table check, a re-apply) waits at most this, and
+    /// none is made once it is spent (the caller takes it as "cannot say",
+    /// the fail-closed side). So a stuck `systemctl` or `nft` holds the tick
+    /// up for HOLD_WAIT in all, not per call (reviewer, #61). Outside a
+    /// tick (a request), a whole HOLD_WAIT.
+    fn hold_wait(&self) -> Option<Millis> {
+        let now = self.b.clock().boot_now();
+        if self.hold_deadline.0 == 0 {
+            return Some(HOLD_WAIT);
+        }
+        let left = self.hold_deadline.0.saturating_sub(now.0);
+        (left > 0).then_some(Millis(left))
+    }
+
     fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {
         use crate::hold;
         use planarian_txn::ledger::HoldBy;
@@ -847,6 +868,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             // None: the host cannot say; a failed unit is then held again
             // (the call is idempotent).
             let on_host = host.as_ref().ok().map(|h| h.contains(&u));
+            if on_host == Some(true) {
+                // The host has it: a later timeout is news again.
+                self.hold_unconfirmed.remove(&u);
+            }
             // An attested release (an override on the hold unit) lifts it
             // until the release ends.
             if s.override_of(&hold::hold_unit(&u)).is_some() {
@@ -877,9 +902,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     self.notice(hold::alarm(&u));
                 }
                 if on_host != Some(true) {
-                    match self.b.units().hold(&u) {
-                        o @ (Outcome::Failed(_) | Outcome::Unknown(_)) => {
+                    let o = match self.hold_wait() {
+                        Some(w) => self.b.units().hold(&u, w),
+                        None => Outcome::Unknown("no time left on this tick".into()),
+                    };
+                    match o {
+                        // A failure alarms each time; a hold the host has not
+                        // confirmed in time (its job may still land), once.
+                        o @ Outcome::Failed(_) => {
                             self.notice(format!("ALARM: {u}: its traffic could not be held ({o:?})"))
+                        }
+                        o @ Outcome::Unknown(_) => {
+                            if self.hold_unconfirmed.insert(u.clone()) {
+                                self.notice(format!("ALARM: {u}: its traffic could not be held ({o:?})"))
+                            }
                         }
                         _ => applied |= !s.holds.contains(&u),
                     }
@@ -904,7 +940,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         unit: u.clone(),
                         reason: "Running, and its Readiness probes pass".into(),
                     });
-                    match self.b.units().lift_hold(&u) {
+                    let o = match self.hold_wait() {
+                        Some(w) => self.b.units().lift_hold(&u, w),
+                        None => Outcome::Unknown("no time left on this tick".into()),
+                    };
+                    match o {
                         o @ (Outcome::Failed(_) | Outcome::Unknown(_)) => {
                             self.notice(format!("{u}: the hold could not be lifted ({o:?}); its traffic stays blocked"))
                         }
@@ -925,7 +965,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// alarm once and check again next tick; nothing is re-applied blind.
     fn hold_table(&mut self, holding: &BTreeSet<UnitId>, units: &[UnitId]) {
         use planarian_txn::ledger::HoldBy;
-        let present = self.b.units().hold_table_present();
+        let present = match self.hold_wait() {
+            Some(w) => self.b.units().hold_table_present(w),
+            None => Err(Outcome::Unknown("no time left on this tick".into())),
+        };
         let held: Vec<UnitId> = holding.iter().filter(|u| units.contains(u)).cloned().collect();
         match &present {
             Ok(true) => {
@@ -958,14 +1001,18 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::Daemon });
                 self.notice(format!("ALARM: {u}: the network hold was removed from the firewall; re-applying it"));
             }
-            if let o @ (Outcome::Failed(_) | Outcome::Unknown(_)) = self.b.units().reapply_hold(u)
+            let o = match self.hold_wait() {
+                Some(w) => self.b.units().reapply_hold(u, w),
+                None => Outcome::Unknown("no time left on this tick".into()),
+            };
+            if let o @ (Outcome::Failed(_) | Outcome::Unknown(_)) = o
                 && first
             {
                 self.notice(format!("ALARM: {u}: its traffic could not be held again ({o:?}); retrying"));
             }
         }
         self.hold_table_seen = false;
-        if matches!(self.b.units().hold_table_present(), Ok(true)) {
+        if self.hold_wait().is_some_and(|w| matches!(self.b.units().hold_table_present(w), Ok(true))) {
             self.hold_table_seen = true;
             self.hold_missing_noted = false;
             self.hold_retry = None;
@@ -1284,7 +1331,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 // are not stalled for `hold::apply`'s 30 s. Deciding before the residue is recorded is the
                 // point: an Inferred stop must not be written for a unit
                 // whose traffic is then held.
-                let held = match self.b.units().hold_within(u, HOLD_WAIT) {
+                let o = match self.hold_wait() {
+                    Some(w) => self.b.units().hold(u, w),
+                    None => Outcome::Unknown("no time left on this tick".into()),
+                };
+                let held = match o {
                     Outcome::Failed(_) | Outcome::Unknown(_) => true,
                     _ => self.b.units().held().map_or(true, |h| h.contains(u)),
                 };
@@ -1536,6 +1587,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     pub fn tick(&mut self) {
+        // §12d: all hold calls in this tick share one HOLD_WAIT.
+        self.hold_deadline = self.b.clock().boot_now().plus(HOLD_WAIT);
         // I7's agent for an approval is needed only while the change is
         // parked; a cancelled, expired, invalidated or refused one leaves.
         // An approved one leaves `ex.parked` only inside `Executor::approve`,
@@ -2481,7 +2534,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                             reason: format!("released by uid {}", peer.uid),
                         });
                     }
-                    let _ = self.b.units().release_hold(&unit, crate::hold::release_until(&until));
+                    let _ = self.b.units().release_hold(&unit, crate::hold::release_until(&until), HOLD_WAIT);
                     self.hold_released.insert(unit);
                 }
                 r

@@ -231,7 +231,7 @@ pub struct World {
     /// unit's condition skips, as for a tool with no footprint).
     pub hold_declines: BTreeSet<UnitId>,
     /// A hold's start takes this long (a slow or stuck `systemctl start`):
-    /// `hold_within` gives up after its wait, the fake clock advanced by
+    /// every hold call gives up after its wait, the fake clock advanced by
     /// that much, and the hold lands later, as systemd's job would.
     pub hold_hangs: Option<Millis>,
     /// Released holds and until when (`None`: the next boot), as the
@@ -673,6 +673,22 @@ impl Fake {
         self.world.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// `hold_hangs`: a hold call (`systemctl start`/`stop`, `nft`) that
+    /// takes that long. Past `wait` the client gives up (`Unknown`, the
+    /// fake clock advanced by `wait`) and nothing lands; within it, the
+    /// call takes its time and goes on.
+    fn hung(&self, verb: &str, unit: &UnitId, wait: Millis) -> Option<Outcome> {
+        let h = self.w().hold_hangs?;
+        if h.0 > wait.0 {
+            let now = self.w().now;
+            self.w().calls.push(Call { call: format!("{verb}({unit}) timed out"), op: NO_OP, at: now, fenced: false });
+            self.advance(wait);
+            return Some(Outcome::Unknown(format!("{verb} for {unit} did not finish")));
+        }
+        self.advance(h);
+        None
+    }
+
     pub fn advance(&self, d: Millis) {
         let mut w = self.w();
         let t = w.now.plus(d);
@@ -757,7 +773,10 @@ impl UnitBackend for Fake {
         w.units.get(&World::key(&id)).is_some_and(|u| matches!(u.observed, Observed::Active))
     }
 
-    fn hold(&self, unit: &UnitId) -> Outcome {
+    fn hold(&self, unit: &UnitId, wait: Millis) -> Outcome {
+        if let Some(o) = self.hung("hold", unit, wait) {
+            return o;
+        }
         let mut w = self.w();
         if let Some(why) = w.hold_fails.take() {
             return Outcome::Failed(why);
@@ -772,25 +791,10 @@ impl UnitBackend for Fake {
         Outcome::Succeeded
     }
 
-    fn hold_within(&self, unit: &UnitId, wait: Millis) -> Outcome {
-        let hang = self.w().hold_hangs;
-        match hang {
-            Some(h) if h.0 > wait.0 => {
-                // The client gives up; the job (the hold) is still pending.
-                let now = self.w().now;
-                self.w().calls.push(Call { call: format!("hold({unit})"), op: NO_OP, at: now, fenced: false });
-                self.advance(wait);
-                Outcome::Unknown(format!("systemctl start planarian-hold@{} did not finish", unit))
-            }
-            Some(h) => {
-                self.advance(h);
-                self.hold(unit)
-            }
-            None => self.hold(unit),
+    fn lift_hold(&self, unit: &UnitId, wait: Millis) -> Outcome {
+        if let Some(o) = self.hung("lift_hold", unit, wait) {
+            return o;
         }
-    }
-
-    fn lift_hold(&self, unit: &UnitId) -> Outcome {
         let mut w = self.w();
         if let Some(why) = w.hold_fails.take() {
             return Outcome::Failed(why);
@@ -805,9 +809,9 @@ impl UnitBackend for Fake {
         Ok(self.w().held.clone())
     }
 
-    fn release_hold(&self, unit: &UnitId, until: Option<Timestamp>) -> Outcome {
+    fn release_hold(&self, unit: &UnitId, until: Option<Timestamp>, wait: Millis) -> Outcome {
         self.w().hold_released.insert(unit.clone(), until);
-        self.lift_hold(unit)
+        self.lift_hold(unit, wait)
     }
 
     fn end_release(&self, unit: &UnitId) -> Outcome {
@@ -815,7 +819,11 @@ impl UnitBackend for Fake {
         Outcome::Succeeded
     }
 
-    fn hold_table_present(&self) -> Result<bool, Outcome> {
+    fn hold_table_present(&self, wait: Millis) -> Result<bool, Outcome> {
+        let hold_unit = UnitId::service("planarian-hold");
+        if let Some(o) = self.hung("nft list", &hold_unit, wait) {
+            return Err(o);
+        }
         let w = self.w();
         if w.hold_table_unreadable {
             return Err(Outcome::Failed("nft: No such file or directory".into()));
@@ -823,7 +831,10 @@ impl UnitBackend for Fake {
         Ok(w.held.is_empty() || !w.hold_table_flushed)
     }
 
-    fn reapply_hold(&self, unit: &UnitId) -> Outcome {
+    fn reapply_hold(&self, unit: &UnitId, wait: Millis) -> Outcome {
+        if let Some(o) = self.hung("reapply_hold", unit, wait) {
+            return o;
+        }
         let mut w = self.w();
         let now = w.now;
         w.calls.push(Call { call: format!("reapply_hold({unit})"), op: NO_OP, at: now, fenced: false });
