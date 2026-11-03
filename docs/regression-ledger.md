@@ -165,9 +165,12 @@ the coordinator's list:
 
 64 rows for bugs fixed on `main`: 17 journal and kernel (J), 14 daemon (D),
 16 change path (C), 17 backends, identity and gym (B). Another 9 netwatch
-rows are pending #42. 16 rows still owe a property test (status **gap**).
-J4 and J7 wait on lane-daemon's extraction of pure functions. The rest, in
-the coordinator's order: D14, C1, C3, J8, J9, then D4, D5, C2, C4, C5, C11,
-C16, B6 and B13.
+rows are pending #42. Three rows still owe a property test (status
+**gap**):
+- J4 and J7: each waits on a lane's extraction of a pure function from the
+  daemon or the kernel.
+- C16: the property is in #53, held for the owner's decision on whether
+  `per` binds requested runs.
+
 The rest are covered by the strongest cheap test their shape allows; for
 bugs that depend on the kernel or systemd, that is a VM test.
