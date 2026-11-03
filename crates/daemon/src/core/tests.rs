@@ -2272,14 +2272,23 @@ mod timing_props {
     /// The fault: a unit that fails some seconds after each start (attempts,
     /// then a cooldown when the budget is spent), or a device whose driver
     /// was never known (the diagnoser has nothing: `exhausted`).
+    /// Or, for the hold (`escalate`, RevertBlockedByFloor): a committed
+    /// change raises the security floor above known_good, then a unit fails
+    /// every start, so the diagnoser's only candidate is a Rollback below
+    /// the floor (§12e, I16; the catalog's `floor-revert-blocked`).
     #[derive(Clone, Debug)]
     enum Fault {
         Flap(u64),
         UnknownDriver,
+        FloorBlocksRollback,
     }
 
     fn fault() -> impl Strategy<Value = Fault> {
-        prop_oneof![3 => (5..40u64).prop_map(Fault::Flap), 1 => Just(Fault::UnknownDriver)]
+        prop_oneof![
+            3 => (5..40u64).prop_map(Fault::Flap),
+            1 => Just(Fault::UnknownDriver),
+            1 => Just(Fault::FloorBlocksRollback),
+        ]
     }
 
     /// What the tick's clock bounds: the decision came after the tick's
@@ -2312,7 +2321,20 @@ mod timing_props {
                     r.core.asm.known_drivers.clear();
                     dev
                 }
+                Fault::FloorBlocksRollback => {
+                    let args = [("scale".to_string(), Value::Str("1.25".into()))].into();
+                    let resp = r.core.handle(ADMIN, Request::Apply { change: ChangeId("font-scale".into()), args });
+                    prop_assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+                    let floor = r.fake.w().current;
+                    let now = r.fake.now();
+                    r.core.ex.kernel.journal.append(now, Record::SecurityFloor(Some(floor))).unwrap();
+                    let web = UnitId::service("gym-web");
+                    r.fake.w().units.get_mut(&web).unwrap().fail_on_start = true;
+                    r.fake.w().signal(&web, 11);
+                    web
+                }
             };
+            let mut held = false;
             let mut seen: Option<IncidentState> = None;
             for k in 0..240 {
                 let slow = batch[k % batch.len()];
@@ -2334,11 +2356,14 @@ mod timing_props {
                             "cooldown until {} set on a tick from {start} (+{slow} ms of probes) to {end}",
                             until.0
                         ),
-                        Some(IncidentState::Escalated { until, .. }) => prop_assert!(
-                            decided_within(*until, &[COOLDOWN_LATER], start + slow, end),
-                            "hold until {} set on a tick from {start} (+{slow} ms of probes) to {end}",
-                            until.0
-                        ),
+                        Some(IncidentState::Escalated { until, .. }) => {
+                            held = true;
+                            prop_assert!(
+                                decided_within(*until, &[COOLDOWN_LATER], start + slow, end),
+                                "hold until {} set on a tick from {start} (+{slow} ms of probes) to {end}",
+                                until.0
+                            )
+                        }
                         _ => {}
                     }
                     if let Some(s) = &state {
@@ -2366,6 +2391,9 @@ mod timing_props {
             }
             if let Fault::Flap(_) = f {
                 prop_assert!(at.len() >= 2, "the flap was never repaired twice: {at:?}");
+            }
+            if let Fault::FloorBlocksRollback = f {
+                prop_assert!(held, "the rollback below the floor never escalated: {:#?}", r.core.notices);
             }
         }
     }
