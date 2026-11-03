@@ -2918,3 +2918,31 @@ fn a_later_episodes_hold_timeout_alarms_again() {
     r.ticks(30);
     assert_eq!(unheld(&r), 2, "{:?}", r.core.notices);
 }
+
+#[test]
+fn a_flush_while_a_lift_is_pending_does_not_hold_again() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().stop_out_of_band(&web);
+    for _ in 0..10 {
+        if r.fake.w().held.contains(&web) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.fake.w().held.contains(&web));
+    r.fake.w().hold_fails = Some("systemctl stop: job failed".into());
+    for _ in 0..40 {
+        if r.core.notices.iter().any(|n| n.contains("could not be lifted")) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.core.notices.iter().any(|n| n.contains("could not be lifted")), "{:?}", r.core.notices);
+    let before = r.core.notices.len();
+    r.fake.w().hold_table_flushed = true;
+    r.ticks(3);
+    let after: Vec<String> = r.core.notices.iter().skip(before).cloned().collect();
+    assert!(!after.iter().any(|n| n.contains("removed from the firewall")), "{after:?}");
+    assert!(r.calls("reapply_hold(service:gym-web)") == 0, "re-held a unit that is back");
+}

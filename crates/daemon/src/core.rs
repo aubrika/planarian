@@ -906,7 +906,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 lifted.insert(u.clone());
             }
         }
-        holding.retain(|u| !lifted.contains(u));
+        // A unit whose lift is pending is back and journaled as lifted, though
+        // the host still lists it: not a standing hold, so a flushed table
+        // is not re-applied for it (reviewer, #72).
+        holding.retain(|u| {
+            !lifted.contains(u)
+                && !(self.lift_unconfirmed.contains_key(u) && !hold::failed(s, defs, u) && hold::back(s, defs, u))
+        });
         if holding.is_empty() {
             self.hold_table_seen = true;
             self.hold_missing_noted = false;
@@ -934,8 +940,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
             if self.lift_unconfirmed.contains_key(&u) && !in_journal {
                 match on_host {
+                    // The host cannot say: the entry stands, and the unit is
+                    // handled as below (the lift is asked again when it can).
+                    None => {}
                     // The lift landed after all.
-                    Some(false) => {
+                    Some(false) if !hold::failed(s, defs, &u) => {
                         self.lift_unconfirmed.remove(&u);
                         self.hold_notified.remove(&u);
                         self.notice(format!("{u} is back; network traffic flows again"));
@@ -952,7 +961,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         continue;
                     }
                     // Failed again, or not back: the hold is real again.
-                    _ => {
+                    Some(_) => {
                         self.lift_unconfirmed.remove(&u);
                     }
                 }
