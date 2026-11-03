@@ -689,8 +689,10 @@ mod cgroups {
     /// - with inotify, a cgroup standing whose id is set is its unit's
     ///   latest invocation (a new id, or a cgroup made again, is a new one).
     ///
-    /// Returns the rounds that broke one, with why.
-    fn invocation_property(mutant: crate::cgroups::Mutant, rounds: u32) -> Vec<(u32, String)> {
+    /// Returns the rounds that broke one, with why; `None` if this machine
+    /// cannot run it (no tmpfs at /dev/shm, or no user xattrs on it), so a
+    /// skip never reads as a pass or a catch.
+    fn invocation_property(mutant: crate::cgroups::Mutant, rounds: u32) -> Option<Vec<(u32, String)>> {
         use crate::cgroups::ABSENCE_MS;
         use std::time::{Duration, Instant};
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -707,8 +709,7 @@ mod cgroups {
             // reused in a boot), and unlike ext4, it does not give a
             // directory made again the inode of the one just removed.
             let Ok(d) = tempfile::tempdir_in("/dev/shm") else {
-                eprintln!("skipped: no /dev/shm");
-                return failed;
+                return None;
             };
             let slice = d.path().join("system.slice");
             std::fs::create_dir(&slice).unwrap();
@@ -756,8 +757,7 @@ mod cgroups {
                             )
                             .is_ok();
                         if when == 0 && !now_set {
-                            eprintln!("skipped: no user xattrs here");
-                            return failed;
+                            return None;
                         }
                         set.push(now_set);
                         late.push(when == 1);
@@ -853,12 +853,15 @@ mod cgroups {
                 }
             }
         }
-        failed
+        Some(failed)
     }
 
     #[test]
     fn invocations_end_only_once_seen_gone() {
-        let failed = invocation_property(crate::cgroups::Mutant::None, 300);
+        let Some(failed) = invocation_property(crate::cgroups::Mutant::None, 300) else {
+            eprintln!("skipped: no tmpfs with user xattrs at /dev/shm");
+            return;
+        };
         assert!(failed.is_empty(), "{:?}", &failed[..failed.len().min(3)]);
     }
 
@@ -867,7 +870,10 @@ mod cgroups {
     fn the_invocation_property_catches_each_mutant() {
         use crate::cgroups::Mutant;
         for m in [Mutant::FinishAll, Mutant::EndAtRemoval] {
-            let failed = invocation_property(m, 300);
+            let Some(failed) = invocation_property(m, 300) else {
+                eprintln!("skipped: no tmpfs with user xattrs at /dev/shm");
+                return;
+            };
             eprintln!("{m:?} fails {} rounds, first {:?}", failed.len(), failed.first());
             assert!(failed.first().is_some_and(|(r, _)| *r < 20), "{m:?} caught late or never");
         }
