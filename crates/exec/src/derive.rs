@@ -534,3 +534,8 @@ mod sensitivity_completeness {
 #[cfg(test)]
 #[path = "derive_c19_tests.rs"]
 mod c19;
+
+// Catch-up property tests (docs/regression-ledger.md: C1).
+#[cfg(test)]
+#[path = "derive_props.rs"]
+mod props;

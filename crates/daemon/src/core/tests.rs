@@ -2166,3 +2166,397 @@ fn an_ordinary_submission_prepares_nothing_again() {
     let t = &l.live.values().find(|t| t.txn.id == waiting).expect("live").txn;
     assert_eq!(t.prepared_again_from, None);
 }
+
+/// §13 backoff floor: an incident's attempts are at least the backoff
+/// apart by their own times (the log record's `at`, which the gym's
+/// `attempt_gaps_min` reads), not by the observations that found them
+/// actionable. A slow observation before one attempt and a quick one
+/// before the next must not bring them closer (catalog run 41535954746,
+/// flap-30s: 59 967 ms for a 60 s minimum).
+#[test]
+fn backoff_is_kept_between_attempts_even_after_a_slow_observation() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let flap = UnitId::service("gym-flap");
+    {
+        let mut w = r.fake.w();
+        let now = w.now;
+        let sim = w.units.get_mut(&flap).unwrap();
+        sim.fail_after = Some(Millis::secs(30));
+        sim.started_at = now;
+    }
+    let restarts = |r: &Rig| -> Vec<u64> {
+        r.core
+            .log
+            .iter()
+            .chain(r.core.awaiting_post.iter())
+            .filter(|x| {
+                matches!(&x.proposal.transition, Transition::RestartUnit(u) if *u == flap)
+                    && matches!(x.result, Submitted::Finished { .. })
+            })
+            .map(|x| x.at.0)
+            .collect()
+    };
+    // Observations are slow until the second attempt has run, then quick.
+    r.fake.w().probe_batch_ms = 7_000;
+    let mut n = 0;
+    while restarts(&r).len() < 2 {
+        r.ticks(1);
+        n += 1;
+        assert!(n < 200, "no second attempt");
+    }
+    r.fake.w().probe_batch_ms = 0;
+    while restarts(&r).len() < 3 {
+        r.ticks(1);
+        n += 1;
+        assert!(n < 400, "no third attempt");
+    }
+    let at = restarts(&r);
+    for (k, (w, min)) in at.windows(2).zip([10_000u64, 60_000]).enumerate() {
+        assert!(w[1] - w[0] >= min, "attempts {} and {} {} ms apart (min {min} ms): {at:?}", k + 1, k + 2, w[1] - w[0]);
+    }
+}
+
+/// §13: a cooldown runs from the decision that set it, like an attempt's
+/// backoff, not from the start of the observation before it. The
+/// diagnoser has nothing for a device whose driver was never known, so the
+/// incident cools down for 1 h, counted from after the slow probes.
+#[test]
+fn an_exhausted_cooldown_runs_from_the_decision() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let dev = UnitId::device("snd-hda0");
+    r.fake.w().probe_batch_ms = 7_000;
+    r.fake.w().devices.insert(dev.clone(), None);
+    r.core.asm.known_drivers.clear();
+    for _ in 0..200 {
+        r.fake.advance(planarian_state::TICK);
+        let observed = r.fake.now();
+        r.core.tick();
+        r.core.asm.known_drivers.clear();
+        if let Some(IncidentState::Cooldown { until }) = r.core.incidents.active_for(&dev).map(|i| i.state.clone()) {
+            assert!(
+                until.0 >= observed.0 + 7_000 + planarian_incident::COOLDOWN_FIRST.0,
+                "cooldown until {} from an observation at {observed:?}",
+                until.0
+            );
+            return;
+        }
+    }
+    panic!("no cooldown: {:#?}", r.core.notices);
+}
+
+/// Property tests for the repair loop's timing anchors (#44; the ledger's D2
+/// and D3). Each attempt's backoff is timed from the clock read after the
+/// attempt ran, and each cooldown or hold from the clock read at its
+/// decision, never from the start of the observation before it, so a slow
+/// observation can never bring two attempts closer than the floor, or end a
+/// cooldown early. `PROPTEST_CASES` goes deeper.
+mod timing_props {
+    use super::*;
+    use planarian_incident::{COOLDOWN_FIRST, COOLDOWN_LATER};
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as PConfig, FailurePersistence};
+
+    fn pconfig() -> PConfig {
+        let cases = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(64);
+        PConfig { cases, failure_persistence: None::<Box<dyn FailurePersistence>>, ..PConfig::default() }
+    }
+
+    /// A probe batch's length on each tick, cycled: quick, or slow enough to
+    /// matter against a 10 s floor.
+    fn batches() -> impl Strategy<Value = Vec<u64>> {
+        proptest::collection::vec(prop_oneof![Just(0u64), 500..9_000u64], 1..8)
+    }
+
+    /// The fault: a unit that fails some seconds after each start (attempts,
+    /// then a cooldown when the budget is spent), or a device whose driver
+    /// was never known (the diagnoser has nothing: `exhausted`).
+    /// Or, for the hold (`escalate`, RevertBlockedByFloor): a committed
+    /// change raises the security floor above known_good, then a unit fails
+    /// every start, so the diagnoser's only candidate is a Rollback below
+    /// the floor (§12e, I16; the catalog's `floor-revert-blocked`).
+    #[derive(Clone, Debug)]
+    enum Fault {
+        Flap(u64),
+        /// A unit that stays up past the stabilization window after each
+        /// start, then fails inside the regression window: Regressed.
+        Relapse(u64),
+        UnknownDriver,
+        FloorBlocksRollback,
+    }
+
+    fn fault() -> impl Strategy<Value = Fault> {
+        prop_oneof![
+            3 => (5..40u64).prop_map(Fault::Flap),
+            2 => (330..1_200u64).prop_map(Fault::Relapse),
+            1 => Just(Fault::UnknownDriver),
+            1 => Just(Fault::FloorBlocksRollback),
+        ]
+    }
+
+    /// The target's repair attempts, by their log records' times (what the
+    /// gym's `attempt_gaps_min` reads).
+    fn attempts(r: &Rig, target: &UnitId) -> Vec<u64> {
+        r.core
+            .log
+            .iter()
+            .chain(r.core.awaiting_post.iter())
+            .filter(|x| {
+                matches!(&x.proposal.transition, Transition::RestartUnit(u) if u == target)
+                    && matches!(x.result, Submitted::Finished { .. })
+            })
+            .map(|x| x.at.0)
+            .collect()
+    }
+
+    /// What the tick's clock bounds: the decision came after the tick's
+    /// first probe batch ran and before the tick ended.
+    fn decided_within(until: Timestamp, durations: &[Millis], earliest: u64, latest: u64) -> bool {
+        durations.iter().any(|d| until.0 >= earliest + d.0 && until.0 <= latest + d.0)
+    }
+
+    proptest! {
+        #![proptest_config(pconfig())]
+
+        #[test]
+        fn slow_observations_never_shorten_a_backoff_or_a_cooldown(f in fault(), batch in batches()) {
+            let mut r = Rig::new();
+            r.ticks(2);
+            let target = match f {
+                Fault::Flap(secs) | Fault::Relapse(secs) => {
+                    let flap = UnitId::service("gym-flap");
+                    let mut w = r.fake.w();
+                    let now = w.now;
+                    let sim = w.units.get_mut(&flap).unwrap();
+                    sim.fail_after = Some(Millis::secs(secs));
+                    sim.started_at = now;
+                    drop(w);
+                    flap
+                }
+                Fault::UnknownDriver => {
+                    let dev = UnitId::device("snd-hda0");
+                    r.fake.w().devices.insert(dev.clone(), None);
+                    r.core.asm.known_drivers.clear();
+                    dev
+                }
+                Fault::FloorBlocksRollback => {
+                    let args = [("scale".to_string(), Value::Str("1.25".into()))].into();
+                    let resp = r.core.handle(ADMIN, Request::Apply { change: ChangeId("font-scale".into()), args });
+                    prop_assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+                    let floor = r.fake.w().current;
+                    let now = r.fake.now();
+                    r.core.ex.kernel.journal.append(now, Record::SecurityFloor(Some(floor))).unwrap();
+                    let web = UnitId::service("gym-web");
+                    r.fake.w().units.get_mut(&web).unwrap().fail_on_start = true;
+                    r.fake.w().signal(&web, 11);
+                    web
+                }
+            };
+            let mut held = false;
+            let mut seen: Option<IncidentState> = None;
+            // Each attempt: its time, its incident, and the backoff that
+            // attempt set (read after the tick that made it).
+            let mut made: Vec<(u64, IncidentId, Millis, u8)> = Vec::new();
+            let ticks = if matches!(f, Fault::Relapse(_)) { 720 } else { 240 };
+            for k in 0..ticks {
+                let before = attempts(&r, &target).len();
+                let slow = batch[k % batch.len()];
+                r.fake.w().probe_batch_ms = slow;
+                r.fake.advance(planarian_state::TICK);
+                let start = r.fake.now().0;
+                r.core.tick();
+                let end = r.fake.now().0;
+                if matches!(f, Fault::UnknownDriver) {
+                    r.core.asm.known_drivers.clear();
+                }
+                let inc = r.core.incidents.active_for(&target).cloned();
+                for t in attempts(&r, &target).into_iter().skip(before) {
+                    if let Some(i) = &inc {
+                        made.push((t, i.id, i.backoff, i.regressions));
+                    }
+                }
+                let state = inc.as_ref().map(|i| i.state.clone());
+                if state != seen {
+                    // D3: a cooldown or hold set on this tick runs from its
+                    // decision: after the tick's probes, before its end.
+                    match &state {
+                        Some(IncidentState::Cooldown { until }) => prop_assert!(
+                            decided_within(*until, &[COOLDOWN_FIRST, COOLDOWN_LATER], start + slow, end),
+                            "cooldown until {} set on a tick from {start} (+{slow} ms of probes) to {end}",
+                            until.0
+                        ),
+                        Some(IncidentState::Escalated { until, .. }) => {
+                            held = true;
+                            prop_assert!(
+                                // The anchor, not the length: 1 h after a
+                                // regression, 6 h for a floor (§13).
+                                decided_within(*until, &[COOLDOWN_FIRST, COOLDOWN_LATER], start + slow, end),
+                                "hold until {} set on a tick from {start} (+{slow} ms of probes) to {end}",
+                                until.0
+                            )
+                        }
+                        _ => {}
+                    }
+                    if let Some(s) = &state {
+                        seen = Some(s.clone());
+                    }
+                }
+            }
+            // D2: within each incident, consecutive attempts (by their log
+            // records' times) are at least the backoff the earlier one set
+            // apart: BACKOFF[k] at first, longer after a regression (§13).
+            for w in made.windows(2) {
+                let ((t0, i0, backoff, regressions), (t1, i1, _, _)) = (w[0], w[1]);
+                // §13: a regression only lengthens the backoff.
+                let floor = planarian_incident::BACKOFF[(regressions as usize).min(planarian_incident::BACKOFF.len() - 1)];
+                prop_assert!(backoff.0 >= floor.0, "{i0:?} after {regressions} regression(s) set a {} ms backoff", backoff.0);
+                if i0 == i1 {
+                    prop_assert!(
+                        t1 - t0 >= backoff.0,
+                        "attempts of {i0:?} {} ms apart (backoff {} ms): {made:?}",
+                        t1 - t0,
+                        backoff.0
+                    );
+                }
+            }
+            let at: Vec<u64> = made.iter().map(|(t, _, _, _)| *t).collect();
+            if let Fault::Flap(_) = f {
+                prop_assert!(at.len() >= 2, "the flap was never repaired twice: {at:?}");
+            }
+            if let Fault::FloorBlocksRollback = f {
+                prop_assert!(held, "the rollback below the floor never escalated: {:#?}", r.core.notices);
+            }
+        }
+    }
+}
+
+/// Property tests for the daemon's rate limits and its notice cursor
+/// (catch-up coverage, `docs/regression-ledger.md` D4 and D5).
+/// `PROPTEST_CASES` goes deeper.
+mod limit_props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::Config as PConfig;
+
+    fn pconfig(cases: u32) -> PConfig {
+        let cases = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(cases);
+        PConfig { cases, failure_persistence: None, ..PConfig::default() }
+    }
+
+    proptest! {
+        #![proptest_config(pconfig(48))]
+
+        /// D4 (P9, `6ad8521`): the slow-tick warning fired on nearly every VM
+        /// tick. For any run of quick and slow ticks: two warnings are at
+        /// least `SLOW_TICK_WARN_EVERY` apart; a slow tick that late after
+        /// the last warning (or with none before) is warned at once; and the
+        /// count carried to the next warning is exactly the slow ticks since
+        /// the last one, so none goes uncounted.
+        #[test]
+        fn slow_ticks_are_warned_at_most_once_a_minute_and_all_counted(
+            batches in proptest::collection::vec(prop_oneof![2 => Just(0u64), 3 => 600..3_000u64], 1..60),
+        ) {
+            let mut r = Rig::new();
+            r.ticks(2);
+            let mut last: Option<u64> = None;
+            let mut since = 0u64;
+            for b in batches {
+                r.fake.w().probe_batch_ms = b;
+                r.fake.advance(planarian_state::TICK);
+                let at = r.fake.now().0;
+                let warned = r.core.slow_tick_warnings;
+                r.core.tick();
+                let now_warned = r.core.slow_tick_warnings > warned;
+                // Slow by the tick's own length on the fake clock, not by
+                // the counters under test.
+                let slow = r.fake.now().0 - at > planarian_state::TICK_BUDGET.0;
+                prop_assert!(!now_warned || slow, "a quick tick at {at} was warned");
+                if slow {
+                    since += 1;
+                }
+                let due = last.is_none_or(|t| at >= t + SLOW_TICK_WARN_EVERY.0);
+                if now_warned {
+                    prop_assert!(due, "a warning at {at}, {} ms after the last", at - last.unwrap());
+                    last = Some(at);
+                    since = 0;
+                } else if slow {
+                    prop_assert!(!due, "a slow tick at {at} was due a warning (last {last:?}) and got none");
+                }
+                prop_assert_eq!(r.core.slow_ticks_unwarned, since);
+            }
+        }
+
+        /// D5 (before the clone's history): notices stopped reaching the
+        /// journal once 64 had accumulated. For any interleaving of notices
+        /// and drains (the binary journals `notices_since(printed)`, then
+        /// moves `printed` to `notices_total`), each drain returns exactly
+        /// the notices made since the last one, oldest first, or the newest
+        /// `NOTICES_KEPT` of them when more were made in between.
+        #[test]
+        fn each_notice_is_drained_once_in_order(
+            steps in proptest::collection::vec(prop_oneof![3 => (1..90usize).prop_map(Some), 1 => Just(None)], 1..30),
+        ) {
+            let mut r = Rig::new();
+            let base = r.core.notices_total;
+            let mut printed = base;
+            let mut made: Vec<String> = Vec::new();
+            for s in steps {
+                match s {
+                    Some(k) => {
+                        for _ in 0..k {
+                            let n = format!("notice {}", made.len());
+                            r.core.say(n.clone());
+                            made.push(n);
+                        }
+                    }
+                    None => {
+                        let got: Vec<String> = r.core.notices_since(printed).cloned().collect();
+                        let new = (r.core.notices_total - printed) as usize;
+                        let from = made.len() - new.min(NOTICES_KEPT).min(made.len());
+                        prop_assert_eq!(&got, &made[from..].to_vec(), "drain after {} made, {} printed", made.len(), printed - base);
+                        printed = r.core.notices_total;
+                    }
+                }
+                prop_assert_eq!(r.core.notices_total - base, made.len() as u64);
+            }
+        }
+    }
+}
+
+/// §13: the hold a third regression sets runs from the decision, after the
+/// probes, like every cooldown and backoff (prop-auditor's Relapse(369):
+/// gym-flap fails 369 s after each start, so each repair stabilizes past
+/// 5 min and regresses inside 30 min; probe batches take 500 ms).
+#[test]
+fn a_regression_hold_runs_from_the_decision() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let flap = UnitId::service("gym-flap");
+    {
+        let mut w = r.fake.w();
+        let now = w.now;
+        let sim = w.units.get_mut(&flap).unwrap();
+        sim.fail_after = Some(Millis::secs(369));
+        sim.started_at = now;
+    }
+    r.fake.w().probe_batch_ms = 500;
+    for _ in 0..2000 {
+        r.fake.advance(planarian_state::TICK);
+        let observed = r.fake.now();
+        r.core.tick();
+        if let Some(IncidentState::Escalated { until, reason }) =
+            r.core.incidents.active_for(&flap).map(|i| i.state.clone())
+        {
+            assert_eq!(reason, EscalationReason::Regressed);
+            assert!(
+                until.0 >= observed.0 + 500 + planarian_incident::COOLDOWN_FIRST.0,
+                "hold until {} set on a tick observed at {}",
+                until.0,
+                observed.0
+            );
+            return;
+        }
+    }
+    panic!("no escalation: {:#?}", r.core.notices);
+}
