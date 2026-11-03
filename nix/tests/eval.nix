@@ -197,6 +197,9 @@ let
   # template standing for its instances.
   toolOrInstance = n: builtins.elem n hold.holdUnits
     || (let m = builtins.match "([^@]+@).+" n; in m != null && builtins.elem (builtins.head m) hold.holdUnits);
+  # Which exported units planariad must read as network tools: by id from
+  # the module's list (not from the export's own flag).
+  expectedHolds = builtins.filter (id: toolOrInstance (pkgs.lib.removePrefix "service:" id)) (map (u: u.id) export.units);
   unitKeysRead = u: builtins.all (k: builtins.elem k unitDefFields) (builtins.attrNames u);
   checks = [
     (check (builtins.any isExec probes) "the configuration exports an Exec probe (P11's check is not vacuous)")
@@ -220,6 +223,7 @@ let
     (check (builtins.sort builtins.lessThan export.networkTools == builtins.sort builtins.lessThan hold.holdUnits) "the export lists every network tool, declared or not (netwatch's footprints)")
     (check (vpn.holds && vpn.hold_allow == [ { address = "192.0.2.7"; port = 51820; protocol = "udp"; } ] && vpn.hold_interfaces == [ "wg9" ]) "a network tool exports holds, its holdAllow and its holdInterfaces (§9, §12d)")
     (check (builtins.all (u: u.holds == toolOrInstance (pkgs.lib.removePrefix "service:" u.id)) export.units && builtins.all (u: !u.holds) export.userUnits) "every exported unit's holds is the computed rule: a network tool, or an instance of a templated one")
+    (check (expectedHolds != [ ] && builtins.elem "service:nt-vpn@office" expectedHolds && builtins.elem "service:gym-vpn" expectedHolds) "the set planariad must read as network tools is not empty and holds an undeclared template instance")
     (check ((unit "service:nt-vpn@office").holds && (unit "service:nt-vpn@home").holds && !(unit "service:not-tpl@a").holds) "a templated network tool's instances export holds, declared or not; a non-tool template's do not (§12d)")
     (check (builtins.length unitDefFields > 10 && builtins.elem "holds" unitDefFields && !(pkgs.lib.hasInfix "rename" unitDefBody) && !(pkgs.lib.hasInfix "alias" unitDefBody) && !(pkgs.lib.hasInfix "flatten" unitDefBody)) "the daemon's UnitDef is read from its source, and its field names are the export's keys")
     (check (builtins.all unitKeysRead (export.units ++ export.userUnits) && !(unitKeysRead (vpn // { network_tool = true; }))) "the daemon's field: every key the export gives a unit is a UnitDef field, so none is dropped and read as its default (a renamed key is refused)")
@@ -286,8 +290,24 @@ assert builtins.all (x: x) checks;
 pkgs.runCommand "planarian-module-eval.json" {
   export = builtins.toJSON export;
   passAsFile = [ "export" ];
-  nativeBuildInputs = [ pkgs.gnused pkgs.gawk pkgs.diffutils ];
+  nativeBuildInputs = [ pkgs.gnused pkgs.gawk pkgs.diffutils pkgs.jq ];
 } ''
+  # The export as planariad reads it (§12d; review of #38): parsed with its
+  # own `nixos::Export` (`planariad --check-export`), the units it reads as
+  # network tools are the module's, each template standing for its declared
+  # instances, and include an instance; and no unit key is dropped or filled
+  # by default on the way. Both fail on c5e9a7d (`network_tool`, and
+  # instances read false).
+  ${cfg.services.planarian.package}/bin/planariad --check-export $exportPath > parsed.json
+  jq -c '[.units[] | select(.holds) | .id] | sort' parsed.json > holds-read
+  echo '${builtins.toJSON expectedHolds}' | jq -c 'sort' > holds-want
+  diff holds-want holds-read || { echo "export: the units planariad reads as network tools differ (above: want, read)" >&2; exit 1; }
+  echo "ok: planariad reads $(jq length holds-read) network tools from the export, as the module classifies them, an instance among them"
+  jq -c '[(.units + .userUnits)[] | keys]' $exportPath > keys-export
+  jq -c '[(.units + .userUnits)[] | keys]' parsed.json > keys-read
+  diff keys-export keys-read || { echo "export: a unit key is dropped or defaulted by planariad's Export (above: export, read)" >&2; exit 1; }
+  echo "ok: every unit key in the export survives planariad's Export unchanged"
+
   root=$PWD/run
   # A stub systemctl, first on the script's PATH: the unit's InvocationID
   # is $STUB_INV (empty: the unit has none).
