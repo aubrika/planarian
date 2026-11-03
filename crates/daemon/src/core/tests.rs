@@ -2560,3 +2560,74 @@ fn a_regression_hold_runs_from_the_decision() {
     }
     panic!("no escalation: {:#?}", r.core.notices);
 }
+
+// ---- §9: "`Exec` probes, which run arbitrary commands, are permitted only
+// in manifest entries authored by a principal with administrator authority;
+// they are flagged in the console and the journal" (reviewer's case; P11's
+// scope row in docs/review-reconciliation.md: read from `ProbeKind::Exec`,
+// not from the export's `flagged` key). The gym's manifest has two Exec
+// probes, NetworkManager's `wifi-associated` and snd-hda0's
+// `snd-hda0-driven`, and typed ones (gym-web's `gym-web-http`, `-tcp`).
+
+const EXEC_PROBES: [(&str, &str); 2] =
+    [("service:NetworkManager", "wifi-associated"), ("device:snd-hda0", "snd-hda0-driven")];
+const TYPED_PROBE: (&str, &str) = ("service:gym-web", "gym-web-http");
+
+/// The part of a unit row's detail about `probe` (`<probe>: …`, `; `-separated).
+fn probe_part<'a>(detail: &'a str, probe: &str) -> Option<&'a str> {
+    detail.split("; ").find(|p| p.starts_with(&format!("{probe}:")) || p.starts_with(&format!("{probe} ")))
+}
+
+fn mentions_exec(s: &str) -> bool {
+    s.to_ascii_lowercase().contains("exec")
+}
+
+/// The journal: planariad's notices (which the binary writes to the system
+/// journal) name each Exec probe as one, and no typed probe as one.
+#[test]
+fn an_exec_probe_is_flagged_in_the_journal() {
+    let mut r = Rig::new();
+    r.ticks(3);
+    for (_, probe) in EXEC_PROBES {
+        assert!(
+            r.core.notices.iter().any(|n| n.contains(probe) && mentions_exec(n)),
+            "no notice flags the Exec probe {probe}: {:#?}",
+            r.core.notices
+        );
+    }
+    assert!(
+        !r.core.notices.iter().any(|n| n.contains(TYPED_PROBE.1) && mentions_exec(n)),
+        "a typed probe is flagged as Exec: {:#?}",
+        r.core.notices
+    );
+}
+
+/// The console and the CLI: both render the status report's unit rows (the
+/// console embeds the same `StatusReport`); each Exec probe's part of its
+/// unit's row says it is one, and a typed probe's does not.
+#[test]
+fn an_exec_probe_is_flagged_in_the_console_and_status() {
+    let mut r = Rig::new();
+    r.ticks(3);
+    let Response::Console(c) = r.core.handle(ADMIN, Request::Console) else { panic!("console") };
+    let Response::Status(st) = r.core.handle(ADMIN, Request::Status) else { panic!("status") };
+    for (rows, what) in [(&c.status.units, "console"), (&st.units, "status")] {
+        let detail = |u: &str| {
+            rows.iter().find(|row| row.unit.to_string() == u).map(|row| row.detail.clone()).unwrap_or_default()
+        };
+        for (unit, probe) in EXEC_PROBES {
+            let d = detail(unit);
+            let part = probe_part(&d, probe);
+            assert!(
+                part.is_some_and(mentions_exec),
+                "{what}: {unit}'s row does not flag its Exec probe {probe}: {d:?}"
+            );
+        }
+        let d = detail(TYPED_PROBE.0);
+        assert!(
+            !probe_part(&d, TYPED_PROBE.1).is_some_and(mentions_exec),
+            "{what}: the typed probe {} is flagged as Exec: {d:?}",
+            TYPED_PROBE.1
+        );
+    }
+}
