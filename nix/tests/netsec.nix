@@ -114,6 +114,44 @@ pkgs.testers.runNixOSTest {
         ''}";
       };
     };
+    # A network tool (CAP_NET_ADMIN) that never steers anything and dies
+    # 100 ms after it starts. Started only by its subtest; undeclared, so
+    # nothing repairs it.
+    systemd.services.gym-fastdie = {
+      serviceConfig = {
+        Type = "simple";
+        Restart = "no";
+        DynamicUser = true;
+        AmbientCapabilities = [ "CAP_NET_ADMIN" ];
+        CapabilityBoundingSet = [ "CAP_NET_ADMIN" ];
+        ExecStart = "${pkgs.bash}/bin/bash -c 'sleep 0.1; exit 1'";
+      };
+    };
+    # A network tool that steers (a dropping rule for 203.0.113.79, which no
+    # test traffic uses) and has a child that ignores SIGTERM and outlives
+    # the main process until /run/gym-linger-release exists. KillMode=process,
+    # so a kill of the main process fails the unit while its cgroup still
+    # holds the child. Markers: /run/gym-linger-slow (seconds its start
+    # takes) and /run/gym-linger-release (the child exits).
+    systemd.services.gym-linger = {
+      wantedBy = [ "multi-user.target" ];
+      path = [ pkgs.nftables pkgs.coreutils ];
+      serviceConfig = {
+        Type = "simple";
+        Restart = "no";
+        KillMode = "process";
+        ExecStartPre = "${pkgs.bash}/bin/bash -c 'sleep $(cat /run/gym-linger-slow 2>/dev/null || echo 0)'";
+        ExecStart = pkgs.writeShellScript "gym-linger" ''
+          nft 'add table inet gymlinger; add chain inet gymlinger out { type filter hook output priority 0; }; add rule inet gymlinger out ip daddr 203.0.113.79 drop'
+          ${pkgs.writeShellScript "gym-linger-child" ''
+            trap "" TERM
+            until [ -e /run/gym-linger-release ]; do sleep 0.1; done
+          ''} &
+          exec sleep infinity
+        '';
+      };
+    };
+    services.planarian.units.gym-linger = { };
     # Declared, but with no sensitivity tag: only the kernel's attribution of
     # its helper's rule makes it a network-security unit. TODO (#35, parked
     # with the owner): the same with no entry at all, once §12d says what
@@ -131,6 +169,7 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import re
+    import time
 
     ALARM = "${alarmText}"
 
@@ -164,6 +203,14 @@ pkgs.testers.runNixOSTest {
         machine.succeed("nft list table inet planarian-hold")
         machine.succeed(f"systemctl is-active planarian-hold@{unit}.service")
         machine.succeed(f"test -e /run/planarian/hold/{unit}")
+    def footprint(unit):
+        # What netwatch wrote for the unit (its `invocation` and `ended`
+        # lines among them), for failure messages only.
+        return machine.execute(f"grep -H . /run/planarian/footprint/{unit}* /run/planarian/footprint/.watch 2>&1; systemctl show -p InvocationID {unit}.service")[1]
+    def is_held(unit):
+        return machine.execute(f"nft list table inet planarian-hold >/dev/null 2>&1 && systemctl is-active planarian-hold@{unit}.service && test -e /run/planarian/hold/{unit}")[0] == 0
+    def any_hold(unit):
+        return machine.execute(f"systemctl is-active planarian-hold@{unit}.service || test -e /run/planarian/hold/{unit}")[0] == 0
     def as_alice(cmd):
         return machine.execute(f"su alice -c '{cmd}' 2>&1")
     def as_bob(cmd):
@@ -395,5 +442,62 @@ pkgs.testers.runNixOSTest {
             machine.wait_until_succeeds(lan_ok(), timeout=120)
             machine.wait_until_succeeds(tunnel_ok(), timeout=60)
             not_held()
+
+    # The other side of the restart loop: waiting for a run's end must not
+    # turn into holding every failure. A network tool that steered nothing
+    # is not protecting (§12d), so its death holds nothing, once netwatch
+    # has seen its run end (the hold waits about 3 s for that; 10 s here).
+    with subtest("a network tool that never steered and dies fast is not held"):
+        machine.succeed("systemctl show -p OnFailure gym-fastdie.service | grep -q 'planarian-hold@'")
+        machine.succeed("systemctl start --no-block gym-fastdie.service")
+        machine.wait_until_succeeds("systemctl is-failed gym-fastdie.service", timeout=30)
+        for _ in range(20):
+            assert not any_hold("gym-fastdie"), "held:\n" + footprint("gym-fastdie")
+            time.sleep(0.5)
+        # Never held at all, not held and lifted between polls.
+        entered = machine.succeed("systemctl show -p ActiveEnterTimestampMonotonic --value planarian-hold@gym-fastdie.service").strip()
+        assert entered in ("", "0"), f"the hold was active at {entered}:\n" + footprint("gym-fastdie")
+        machine.succeed(lan_ok())
+        peer.succeed(new_ssh("alice"))
+
+    # The run's end can lag its failure: with KillMode=process, killing the
+    # main process fails the unit while its cgroup still holds a child, so
+    # netwatch cannot yet say the run has ended. Held regardless (by the
+    # wait running out, or by the end once it comes), and the hold is never
+    # lifted early: not while the child lingers, not when it exits, only
+    # once the unit is Running again (§12d).
+    with subtest("a lingering cgroup: a killed tool whose child outlives it is held until it is back"):
+        machine.succeed("rm -f /run/gym-linger-release")
+        machine.wait_for_unit("gym-linger.service")
+        machine.succeed("nft list table inet gymlinger")
+        machine.succeed("pgrep -f gym-linger-child")
+        not_held("gym-linger")
+        machine.succeed("echo 30 > /run/gym-linger-slow")
+        machine.succeed("systemctl kill --kill-whom=main --signal=SIGKILL gym-linger.service")
+        machine.wait_until_fails("systemctl is-active gym-linger.service", timeout=10)
+        # Precondition: the old run's cgroup still holds the child.
+        machine.succeed("pgrep -f gym-linger-child")
+        try:
+            machine.wait_until_succeeds("nft list table inet planarian-hold && systemctl is-active planarian-hold@gym-linger.service && test -e /run/planarian/hold/gym-linger", timeout=10)
+        except Exception:
+            raise AssertionError("not held:\n" + footprint("gym-linger"))
+        machine.fail(lan_ok())
+        # Held while the child lingers, past the wait.
+        for _ in range(12):
+            assert is_held("gym-linger"), "lifted while the child lingers:\n" + footprint("gym-linger")
+            time.sleep(0.5)
+        machine.succeed("pgrep -f gym-linger-child")
+        machine.succeed("touch /run/gym-linger-release")
+        machine.wait_until_fails("pgrep -f gym-linger-child", timeout=10)
+        # Held after the run has ended, too: it steered, so it was protecting.
+        for _ in range(10):
+            assert is_held("gym-linger"), "lifted when the run ended:\n" + footprint("gym-linger")
+            time.sleep(0.5)
+        machine.fail(lan_ok())
+        # The repair (its start slowed to 30 s) brings it back; the hold lifts.
+        machine.wait_until_succeeds("systemctl is-active gym-linger.service", timeout=120)
+        machine.wait_until_succeeds(lan_ok(), timeout=60)
+        not_held("gym-linger")
+        machine.succeed("rm -f /run/gym-linger-slow")
   '';
 }
