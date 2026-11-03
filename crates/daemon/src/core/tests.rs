@@ -2439,6 +2439,94 @@ mod timing_props {
             }
             if let Fault::FloorBlocksRollback = f {
                 prop_assert!(held, "the rollback below the floor never escalated: {:#?}", r.core.notices);
+/// Property tests for the daemon's rate limits and its notice cursor
+/// (catch-up coverage, `docs/regression-ledger.md` D4 and D5).
+/// `PROPTEST_CASES` goes deeper.
+mod limit_props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::Config as PConfig;
+
+    fn pconfig(cases: u32) -> PConfig {
+        let cases = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(cases);
+        PConfig { cases, failure_persistence: None, ..PConfig::default() }
+    }
+
+    proptest! {
+        #![proptest_config(pconfig(48))]
+
+        /// D4 (P9, `6ad8521`): the slow-tick warning fired on nearly every VM
+        /// tick. For any run of quick and slow ticks: two warnings are at
+        /// least `SLOW_TICK_WARN_EVERY` apart; a slow tick that late after
+        /// the last warning (or with none before) is warned at once; and the
+        /// count carried to the next warning is exactly the slow ticks since
+        /// the last one, so none goes uncounted.
+        #[test]
+        fn slow_ticks_are_warned_at_most_once_a_minute_and_all_counted(
+            batches in proptest::collection::vec(prop_oneof![2 => Just(0u64), 3 => 600..3_000u64], 1..60),
+        ) {
+            let mut r = Rig::new();
+            r.ticks(2);
+            let mut last: Option<u64> = None;
+            let mut since = 0u64;
+            for b in batches {
+                r.fake.w().probe_batch_ms = b;
+                r.fake.advance(planarian_state::TICK);
+                let at = r.fake.now().0;
+                let warned = r.core.slow_tick_warnings;
+                r.core.tick();
+                let now_warned = r.core.slow_tick_warnings > warned;
+                // Slow by the tick's own length on the fake clock, not by
+                // the counters under test.
+                let slow = r.fake.now().0 - at > planarian_state::TICK_BUDGET.0;
+                prop_assert!(!now_warned || slow, "a quick tick at {at} was warned");
+                if slow {
+                    since += 1;
+                }
+                let due = last.is_none_or(|t| at >= t + SLOW_TICK_WARN_EVERY.0);
+                if now_warned {
+                    prop_assert!(due, "a warning at {at}, {} ms after the last", at - last.unwrap());
+                    last = Some(at);
+                    since = 0;
+                } else if slow {
+                    prop_assert!(!due, "a slow tick at {at} was due a warning (last {last:?}) and got none");
+                }
+                prop_assert_eq!(r.core.slow_ticks_unwarned, since);
+            }
+        }
+
+        /// D5 (before the clone's history): notices stopped reaching the
+        /// journal once 64 had accumulated. For any interleaving of notices
+        /// and drains (the binary journals `notices_since(printed)`, then
+        /// moves `printed` to `notices_total`), each drain returns exactly
+        /// the notices made since the last one, oldest first, or the newest
+        /// `NOTICES_KEPT` of them when more were made in between.
+        #[test]
+        fn each_notice_is_drained_once_in_order(
+            steps in proptest::collection::vec(prop_oneof![3 => (1..90usize).prop_map(Some), 1 => Just(None)], 1..30),
+        ) {
+            let mut r = Rig::new();
+            let base = r.core.notices_total;
+            let mut printed = base;
+            let mut made: Vec<String> = Vec::new();
+            for s in steps {
+                match s {
+                    Some(k) => {
+                        for _ in 0..k {
+                            let n = format!("notice {}", made.len());
+                            r.core.say(n.clone());
+                            made.push(n);
+                        }
+                    }
+                    None => {
+                        let got: Vec<String> = r.core.notices_since(printed).cloned().collect();
+                        let new = (r.core.notices_total - printed) as usize;
+                        let from = made.len() - new.min(NOTICES_KEPT).min(made.len());
+                        prop_assert_eq!(&got, &made[from..].to_vec(), "drain after {} made, {} printed", made.len(), printed - base);
+                        printed = r.core.notices_total;
+                    }
+                }
+                prop_assert_eq!(r.core.notices_total - base, made.len() as u64);
             }
         }
     }
