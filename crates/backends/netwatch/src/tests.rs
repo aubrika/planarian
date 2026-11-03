@@ -2061,10 +2061,12 @@ mod hold_order {
             let readable = born + rnd(events[0].0 - born);
             let (death, removed, forced) = if tight {
                 // The pass starts just before the first steering change (or
-                // the last change) and ends after the removal.
+                // the last change), or in half of them just before the cgroup
+                // is made (its whole life between the cgroups read and the
+                // ring read: the carry), and ends after the removal.
                 let first = events.len() - if steers { 2 } else { 1 };
-                let start = events[first].0 - 1 - rnd(500);
-                let e = 4_000 + rnd(16_000);
+                let start = if rnd(2) == 0 { born - 1 - rnd(500) } else { events[first].0 - 1 - rnd(500) };
+                let e = (t - start) + 2_000 + rnd(16_000);
                 let death = t + 1 + rnd(start + e - t - 1);
                 let removed = death + rnd(start + e - death + 1);
                 (death, removed, Some((start, e)))

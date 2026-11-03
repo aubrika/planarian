@@ -329,6 +329,11 @@ impl Cgroups {
                 self.invocations.insert(u, fresh);
             }
             None => {}
+            // A cgroup made again (another inode) is a new invocation even
+            // before its id is read. Without this arm the old record would
+            // stand in for it; that still never releases a hold (its id is
+            // not the one systemd gives the hold), but `protecting unknown`
+            // is what the new one should read until its id is.
             Some(i) if created || (id.is_some() && id != i.id) || (stands && ino != i.ino && !i.removing) => *i = fresh,
             Some(i) if i.id.is_none() && !i.ended && !i.removing => i.id = id,
             Some(_) => {}
