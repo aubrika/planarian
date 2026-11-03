@@ -1441,6 +1441,11 @@ mod tests {
     #[test]
     fn stage_copies_tracked_files_and_hashes_like_nix() {
         if run(&["nix-hash", "--version"], QUICK).status != Some(0) {
+            // The package's check sets this, so a missing tool fails there.
+            assert!(
+                std::env::var_os("PLANARIAN_REQUIRE_NIX_GIT_TESTS").is_none(),
+                "PLANARIAN_REQUIRE_NIX_GIT_TESTS is set, and nix-hash is not on PATH"
+            );
             eprintln!("SKIPPED: nix-hash not on PATH");
             return;
         }
@@ -1475,6 +1480,11 @@ mod tests {
         if run(&["nix-hash", "--version"], QUICK).status != Some(0)
             || run(&["git", "--version"], QUICK).status != Some(0)
         {
+            // The package's check sets this, so a missing tool fails there.
+            assert!(
+                std::env::var_os("PLANARIAN_REQUIRE_NIX_GIT_TESTS").is_none(),
+                "PLANARIAN_REQUIRE_NIX_GIT_TESTS is set, and nix-hash or git is not on PATH"
+            );
             eprintln!("SKIPPED: nix-hash or git not on PATH");
             return;
         }
