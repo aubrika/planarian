@@ -120,6 +120,29 @@ carries a property test for the invariant it changes.
 Harness and fixture bugs (the VM harness, catalog typos, test waits) are in
 `docs/ga-status.md`; they are not Planarian's and are left out.
 
+## Tests that may not run (audit, Nov 3)
+
+A test that never runs passes and proves nothing. For every test behind a
+feature, `#[ignore]`, or a skip at run time, this section says where CI
+compiles and runs it: the `rust` and `nix` jobs of ci.yml, vm.yml, or the
+nix package check (`checks.package`, which runs `cargo test --workspace`
+with no features). "Nowhere" rows need the step proposed.
+
+| Test surface | Gate | Where it runs | Step proposed |
+| --- | --- | --- | --- |
+| netwatch `loader` tests: the cgroups invocation property, `loader_checks`, `legacy_restart` (#42) | `--features loader` | **nowhere** (`cargo test --workspace` enables no feature) | lane-change-path adds a `cargo test -p planarian-backend-netwatch --features loader` step in #42 |
+| backend-linux `nixos::tests::git_owner_edit_after_staging_is_stale` | skips unless both `nix-hash` and `git` are on PATH | **nowhere**: the `rust` job has no `nix-hash` and the nix package check has no `git` (`nativeCheckInputs = [ nix ]`). Shown: with either missing it prints `SKIPPED` and passes | add `git` to `nativeCheckInputs` in nix/package.nix (lane-nix) |
+| backend-linux `nixos::tests::stage_copies_tracked_files_and_hashes_like_nix` | skips without `nix-hash` | nix package check only (skipped in the `rust` job) | none |
+| gym `site::tests::the_repository_resolves` | skips without the source tree | `rust` job (skipped in the nix package check, which copies only the crates) | none |
+| txn `journal_props::at_the_default_journal_size` (#59) | `#[ignore]` | `rust` job, by the step #59 adds (about 45 s, debug) | added in #59 |
+| txn `journal::tests::open_time_at_64_mib` (#54) | `#[ignore]` | nowhere, by design: a wall-time measurement that asserts nothing | none |
+| tray `icon::tests::dump_for_inspection` | `PLANARIAN_TRAY_DUMP` | nowhere, by design: writes icons for inspection, asserts nothing | none |
+| `gym-hooks` code (daemon `main.rs`, `core.rs`; backend-linux `nixos.rs`, `gym.rs`) | `--features gym-hooks` | no unit test sits behind the gate today. The `rust` job clippies it without `--all-targets`, and the gym VM entries (vm.yml, the `gym-hooks` package) exercise it | add `--all-targets` to the `gym-hooks` clippy step, so a future gated test is at least compiled |
+| Kani harnesses (txn, exec) | `cargo kani` | ci.yml `kani` job; no harness exists in another crate | none |
+| Verus proofs | nix | `checks.verus` (ci.yml `nix` job) | none |
+| NixOS VM checks (`vm-runtime`, `vm-posture`, `vm-netsec`, `vm-generations`, `installer`) | KVM | vm.yml on a push to main only, never on a pull request (vm.yml's header says so) | none; a PR's VM evidence is the reviewer's local run |
+| the whole VM gym catalog | `catalog=true` | vm.yml by hand (`workflow_dispatch`) | none (documented) |
+
 ## netwatch (PR #42, not merged)
 
 Rows are written when #42 merges, with its fixes' commits. Expected, from

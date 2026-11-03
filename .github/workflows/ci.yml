@@ -26,6 +26,8 @@ jobs:
       - name: clippy with the gym's fault-injection hooks
         run: cargo clippy -p planarian-daemon -p planarian-backend-linux --features planarian-daemon/gym-hooks -- -D warnings
       - run: cargo test --workspace
+      - name: Journal properties at the default journal size (64 MiB; #[ignore] in cargo test)
+        run: cargo test -p planarian-txn --test journal_props -- --ignored at_the_default_journal_size
       - name: Fault catalog, fake harness (strict, R15; fails on FAIL, PARTIAL or an unwaived UNSUPPORTED)
         run: cargo run -p planarian-gym -- run --strict
       - name: GA demonstration, fake harness
