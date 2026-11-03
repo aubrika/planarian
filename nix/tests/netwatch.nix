@@ -189,6 +189,25 @@ pkgs.testers.runNixOSTest {
       privateKeyFile = "${pkgs.writeText "wgnw.key" "uJhR8JkZjr32TbqdjI+D0hftWxS1UzsOHfr1VRjvLWA="}";
       peers = [ ];
     };
+    # (r) The mover: a network tool (root, no bounding set) that runs, in its
+    # own cgroup, each script the driver drops at /run/nw-mover/go, and
+    # never stops (so no stop of it is under test). Exit status in rc.
+    systemd.services.nw-mover = {
+      wantedBy = [ "multi-user.target" ];
+      after = [ "planarian-netwatch.service" ];
+      path = [ pkgs.iproute2 pkgs.coreutils pkgs.bash ];
+      serviceConfig = { Type = "simple"; Restart = "no"; };
+      script = ''
+        mkdir -p /run/nw-mover
+        while :; do
+          if [ -e /run/nw-mover/go ]; then
+            bash /run/nw-mover/go > /run/nw-mover/out 2>&1; rc=$?
+            rm -f /run/nw-mover/go; echo $rc > /run/nw-mover/rc
+          fi
+          sleep 0.2
+        done
+      '';
+    };
     # A templated network tool, instance `a` (root, no bounding set).
     systemd.services."nw-tpl@" = {
       serviceConfig = { Type = "simple"; Restart = "no"; ExecStart = "${pkgs.coreutils}/bin/sleep infinity"; };
@@ -264,7 +283,7 @@ pkgs.testers.runNixOSTest {
 
     machine.wait_for_unit("planarian-ready.target")
     machine.wait_for_unit("planarian-netwatch.service")
-    for u in ["nw-route", "nw-quiet", "nw-sockopt", "nw-nft", "nw-hostwg", "nw-tun", "nw-tunsetup", "nw-tunroute", "nw-tunauto"]:
+    for u in ["nw-mover", "nw-route", "nw-quiet", "nw-sockopt", "nw-nft", "nw-hostwg", "nw-tun", "nw-tunsetup", "nw-tunroute", "nw-tunauto"]:
         machine.wait_for_unit(f"{u}.service")
 
     with subtest("(a) the watch is attached, with a fresh CLOCK_BOOTTIME stamp"):
@@ -422,6 +441,90 @@ pkgs.testers.runNixOSTest {
         # required back at `protecting no`.
         wait_or_dump(f"! test -e {FP}/.unattributed", 30)
         protecting("nw-hostwg", "yes")
+
+    with subtest("(r) moves between namespaces: into the host a claim by its host name, out of it gone, between others nothing"):
+        # §12d: "Planarian attributes every routing, interface, rule and
+        # nftables change to the unit that made it"; "an interface it created
+        # that carries a default or all-covering route" is protecting. A move
+        # into the host makes a host interface, so it is the mover's, under
+        # the name it has in the host; once that device is gone, nothing it
+        # made steers traffic, and the mover is not protecting (B-24: no
+        # unattributed mark that outlives the device). A move out removes the
+        # host interface, by its host name. A move between two other netns
+        # does not touch the host.
+        def mover(script):
+            machine.succeed("rm -f /run/nw-mover/rc")
+            machine.succeed(f"cat > /run/nw-mover/go.tmp <<'NWEOF'\nset -e\n{script}\nNWEOF\nmv /run/nw-mover/go.tmp /run/nw-mover/go")
+            machine.wait_until_succeeds("test -e /run/nw-mover/rc", timeout=30)
+            rc = machine.succeed("cat /run/nw-mover/rc").strip()
+            assert rc == "0", (rc, machine.succeed("cat /run/nw-mover/out"))
+        def show():
+            print(machine.execute(f"for f in {FP}/nw-mover {FP}/.unattributed; do echo \"== $f\"; cat \"$f\" 2>&1; done; ip -br link")[1])
+        def check(fn):
+            try:
+                fn()
+            except Exception:
+                show()
+                raise
+        def clean(lines, *gone):
+            # No unattributed mark on the mover, none global, no claim by these names.
+            assert "unattributed" not in lines, lines
+            machine.fail(f"test -e {FP}/.unattributed")
+            for n in gone:
+                assert f"iface {n}" not in lines, (n, lines)
+        def quiet_mover(*gone):
+            lines = protecting("nw-mover", "no")
+            clean(lines, *gone)
+
+        check(lambda: quiet_mover())
+        machine.succeed("${ip} netns add nwa && ${ip} netns add nwb")
+
+        # (a) Into the host, renamed on the way (the host name is not the one
+        # it had in nwa), from inside nwa: `netns 1` is PID 1's, the host's.
+        mover("""
+        ip -n nwa link add nwin_ns type dummy
+        ip netns exec nwa ip link set dev nwin_ns netns 1 name nwin0
+        ip link set nwin0 up
+        ip route add default dev nwin0 metric 4005
+        """)
+        def moved_in():
+            lines = protecting("nw-mover", "yes")
+            assert "iface nwin0" in lines, lines
+            clean(lines, "nwin_ns")
+        check(moved_in)
+        # Deleted in the host by another unit (the driver): the claim goes
+        # with the device, and the mover is quiet again.
+        machine.succeed("${ip} link del nwin0")
+        check(lambda: quiet_mover("nwin0", "nwin_ns"))
+
+        # (b) A host interface it made, carrying a default route, moved out
+        # to nwb with a new name: removed by its host name.
+        mover("""
+        ip link add nwout0 type dummy
+        ip link set nwout0 up
+        ip route add default dev nwout0 metric 4006
+        """)
+        def made():
+            lines = protecting("nw-mover", "yes")
+            assert "iface nwout0" in lines, lines
+            clean(lines)
+        check(made)
+        mover("ip link set dev nwout0 netns nwb name nwout_b")
+        check(lambda: quiet_mover("nwout0", "nwout_b"))
+        machine.succeed("${ip} -n nwb link show nwout_b")
+
+        # (c) Between two other netns: nothing in the host changes.
+        mover("""
+        ip -n nwa link add nwab0 type dummy
+        ip -n nwa link set dev nwab0 netns nwb name nwab1
+        ip -n nwb link set nwab1 up
+        ip -n nwb route add default dev nwab1
+        """)
+        machine.sleep(12)
+        check(lambda: quiet_mover("nwab0", "nwab1"))
+
+        machine.succeed("${ip} netns del nwa && ${ip} netns del nwb")
+        check(lambda: quiet_mover())
 
     with subtest("(o) a tun the unit opened itself (as OpenVPN does), carrying /1 routes: protecting"):
         # §12d: "an interface it created that carries a default or
