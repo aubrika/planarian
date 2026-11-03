@@ -165,3 +165,65 @@ fn after_a_compaction_a_damaged_middle_record_is_still_integrity() {
         Ok(_) => panic!("expected Integrity, got an open journal"),
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 400, ..ProptestConfig::default() })]
+
+    /// I18 and §12c *Format*, after a compaction or not: damage anywhere in
+    /// any record but the last (header, chain hash or payload, its first
+    /// bytes included, so it fails `could_follow` itself) is Integrity: a
+    /// later intact record is still found, so nothing is truncated as a torn
+    /// tail. Damage to the last record is the torn-tail case: truncated to
+    /// the record before it (or Integrity).
+    #[test]
+    fn any_damage_before_the_last_record_is_integrity(
+        compact in any::<bool>(),
+        n in 2usize..8,
+        which in any::<prop::sample::Index>(),
+        pos in any::<prop::sample::Index>(),
+        x in 1u8..=255,
+    ) {
+        let capacity = 64 << 10;
+        let store = MemStore::new(capacity);
+        let mut j = Journal::open(store.clone()).unwrap();
+        let mut i = 0;
+        if compact {
+            while !j.needs_compaction() {
+                append(&mut j, i).unwrap();
+                i += 1;
+            }
+            j.compact().unwrap();
+        }
+        // Each new record's offset and size in the log (it starts at 0).
+        let mut records = Vec::new();
+        let mut off = 0u64;
+        for _ in 0..n {
+            let e = append(&mut j, i).unwrap();
+            i += 1;
+            let size = (HEADER + PREV + serde_json::to_vec(&e).unwrap().len()) as u64;
+            records.push((off, size));
+            off += size;
+        }
+        let last = j.ledger().last_seq;
+        drop(j);
+        let k = which.index(n);
+        let (o, size) = records[k];
+        let at = o + pos.index(size as usize) as u64;
+        let b = store.read_at(at, 1).unwrap()[0];
+        store.write_at(at, &[b ^ x]).unwrap();
+        let r = Journal::open(store.clone());
+        if k + 1 < n {
+            prop_assert!(
+                matches!(r, Err(JournalError::Integrity(_))),
+                "record {} of {} damaged at byte {} of {} (compacted: {}): {:?}",
+                k, n, at - o, size, compact, r.as_ref().map(|j| j.ledger().last_seq)
+            );
+        } else {
+            match r {
+                Ok(j) => prop_assert_eq!(j.ledger().last_seq, last - 1),
+                Err(JournalError::Integrity(_)) => {}
+                Err(e) => prop_assert!(false, "the last record damaged gave {:?}", e),
+            }
+        }
+    }
+}
