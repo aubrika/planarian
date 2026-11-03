@@ -32,6 +32,9 @@ jobs:
         env:
           NETWATCH_REQUIRE_XATTR_TESTS: "1"
           NETWATCH_REQUIRE_FANOTIFY_TESTS: "1"
+          # fanotify_init needs CAP_SYS_ADMIN (EPERM for the runner user):
+          # cargo runs the test binaries under sudo; the build stays the user's.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "sudo -E"
         run: cargo test -p planarian-backend-netwatch --features loader
       - name: Fault catalog, fake harness (strict, R15; fails on FAIL, PARTIAL or an unwaived UNSUPPORTED)
         run: cargo run -p planarian-gym -- run --strict
