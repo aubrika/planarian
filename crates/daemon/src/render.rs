@@ -91,6 +91,7 @@ pub fn record(r: &Record) -> String {
         Record::AgentStarted { name, by, .. } => format!("agent {name} started by uid {by}, acting for it"),
         Record::HoldApplied { unit, by } => format!("traffic held for {unit} ({by:?})"),
         Record::HoldLifted { unit, reason } => format!("traffic hold on {unit} lifted: {reason}"),
+        Record::NotPreparedAgain { txn, reason } => format!("txn {}: not prepared again: {reason}", txn.0),
     }
 }
 

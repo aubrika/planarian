@@ -1126,6 +1126,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             if let (Some(since), Submitted::Finished { txn, state: TxnState::Built, .. }) = (since, &r) {
                 self.ex.keep_waiting_since(*txn, since);
             }
+            // Refused: say so in the journal, so a later restart does not
+            // try it again (`restart::prepare_again`).
+            if let Submitted::Rejected { reason, detail, .. } = &r {
+                self.journal(Record::NotPreparedAgain { txn: id, reason: format!("{reason:?}: {detail}") });
+            }
             self.notice(format!("{}: prepared again {why}: {}", render::transition(&t), render::submitted_short(&r)));
         }
     }

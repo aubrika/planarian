@@ -2863,3 +2863,44 @@ fn a_forced_compaction_saves_exactly_what_it_discarded() {
     let tail = r.core.ex.kernel.journal.segment().unwrap();
     assert_eq!(&replay(&saved, &tail), r.core.ex.kernel.journal.ledger());
 }
+
+/// §12f, Decision A: a restart that decided not to prepare a withdrawn update
+/// again (`NotPreparedAgain`) said so in the journal, and the next restart
+/// does not try it: the same scenario as
+/// `a_withdrawn_update_is_prepared_again_after_a_restart`, with the record.
+#[test]
+fn a_withdrawn_update_that_was_not_prepared_again_stays_so_after_a_restart() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    r.fake.w().activation_restarts.clear();
+    let resp = r.core.handle(ADMIN, Request::Undo);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let now = r.fake.now();
+    r.core
+        .ex
+        .kernel
+        .journal
+        .append(now, Record::NotPreparedAgain { txn: waiting, reason: "Refused: scripted".into() })
+        .unwrap();
+    let log = r.core.log.clone();
+    r.fake.w().alive.remove(&100);
+    r.fake.w().alive.insert(101);
+    let mut core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO },
+        config(),
+    );
+    core.remember(log);
+    r.core = core;
+    r.ticks(3);
+    let l = r.core.ledger();
+    let again = l
+        .terminal
+        .iter()
+        .map(|(id, t)| (*id, t.transition.clone()))
+        .chain(l.live.values().map(|t| (t.txn.id, t.txn.transition.clone())))
+        .any(|(id, t)| id > waiting && matches!(t, Transition::ApplyChange { .. }));
+    assert!(!again, "prepared again despite the record: {:?}", r.core.notices);
+    assert_eq!(l.not_prepared_again(), [waiting].into_iter().collect());
+}

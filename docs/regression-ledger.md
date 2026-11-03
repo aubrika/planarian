@@ -74,6 +74,7 @@ carries a property test for the invariant it changes.
 | D12 | P19: `core_hash` was always `Hash::ZERO` | #19 (`ce55165`) | daemon::config::core_hash | `the_state_carries_the_recorded_core_hash` | unit | none recorded | covered |
 | D13 | P23: the first residue kill taught nothing | `8a0e523` (#2) | daemon::Core (residue) | `residue-first-kill-teaches-stop`; Kani residue harnesses | gym-fake + Kani | recorded: "fails with the lesson removed" | covered |
 | D14 | Network hold (#36/#40): a flushed hold table failed open; a restart lifted the hold; a failed re-apply was never retried; an uncheckable table re-applied every tick; mapped IPv4 flows were cut; the scope walk was unbounded | #36, #40 (`80edb77`, `6f68d55`, `d147ec6`, `bc38cc8`, `3f8cb25`, `504a43a`) | daemon::hold, backends-linux::hold, `planarian-hold@` | `a_flushed_hold_table_is_put_back`, `a_failed_reapply_is_retried_with_backoff`, `an_uncheckable_hold_table_alarms_once_and_is_checked_again`, `reapply_reloads_an_active_hold_and_starts_an_inactive_one`; vm-netsec; module-eval | proptest + unit + VM + eval | `holds_are_the_last_event_per_unit` (journal_props.rs) for the fold across compactions and reopens (1 MiB stores; 64 MiB in `at_the_default_journal_size`, ignored); the rest recorded per commit | covered |
+| D15 | §12f: a restart whose new proposal for an interrupted or withdrawn transaction was refused left no trace, so every later restart tried (and was refused) again | lane-daemon/not-prepared-again (this PR; #26's follow-up, Decision A) | daemon::restart::prepare_again, Core::prepare_again, txn::Record::NotPreparedAgain | `restart::tests::a_declined_transaction_is_never_prepared_again` (proptest over ledgers, with a reference copy of the earlier function as the frame), `a_withdrawn_update_that_was_not_prepared_again_stays_so_after_a_restart` (core/tests.rs) | proptest + unit | verified: with the exclusion dropped from `reprepare`, or from `withdrawn`, the property fails; with both dropped, the restart test fails too. Journaling the record on a refusal has no test of its own | covered |
 
 ## Change path: derive, policy, exec (`crates/exec`, `crates/policy`)
 
@@ -170,7 +171,7 @@ in a debug build).
 
 ## Counts
 
-75 rows for bugs fixed on `main`: 17 journal and kernel (J), 14 daemon (D),
+76 rows for bugs fixed on `main`: 17 journal and kernel (J), 15 daemon (D),
 16 change path (C), 17 backends, identity and gym (B), 11 netwatch (N).
 Three rows still owe a property test (status **gap**):
 - J4 and J7: each waits on a lane's extraction of a pure function from the
