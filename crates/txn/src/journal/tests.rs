@@ -486,13 +486,11 @@ fn catch_up_outcome(
     let c = copy(base);
     let mut r = Journal::open(c.clone()).unwrap();
     let mut w = Journal::open(c.clone()).unwrap();
-    let mut i = 10_000;
     for k in 0..n {
         if compact_at == Some(k) || w.needs_compaction() {
             w.compact().unwrap();
         }
-        append(&mut w, i).unwrap();
-        i += 1;
+        append(&mut w, 10_000 + k).unwrap();
     }
     drop(w);
     for (at, x) in damage {
