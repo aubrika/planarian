@@ -11,7 +11,6 @@ use planarian_exec::{PrebuildJob, Prebuilt};
 use planarian_ipc::{Request, Response, SOCKET};
 use planarian_schema::{Backends, Clock, Hash, OwnerId, PinnedSource, SourceKind};
 use planarian_txn::journal::{Journal, JournalError};
-use planarian_txn::ledger::Record;
 use planarian_txn::store::FileStore;
 use std::collections::VecDeque;
 use std::io::Write;
@@ -266,27 +265,21 @@ fn append_log(state: &Path, lines: &[String]) {
 
 /// Keep the leases this daemon holds fresh while it is busy in a long
 /// backend call, so the watchdog does not take over from a live daemon.
+/// One journal handle, kept: each renewal catches up on what was appended
+/// since, not the journal's size (`renew`). It is opened again only after
+/// an error.
 fn renewer(store_dir: PathBuf, txn_dir: PathBuf, capacity: u64, me: OwnerId) {
     std::thread::spawn(move || {
+        let mut j: Option<Journal<FileStore>> = None;
         loop {
             std::thread::sleep(RENEW_EVERY);
-            let Ok(store) = FileStore::open(&store_dir, &txn_dir, capacity) else { continue };
-            let Ok(mut j) = Journal::open(store) else { continue };
-            let Ok(l) = j.sync_ledger().cloned() else { continue };
+            if j.is_none() {
+                j = FileStore::open(&store_dir, &txn_dir, capacity).ok().and_then(|s| Journal::open(s).ok());
+            }
+            let Some(handle) = j.as_mut() else { continue };
             let clock = planarian_backend_linux::process::Processes;
-            let (now, boot_at) = (clock.now(), clock.boot_now());
-            for t in l.live.values() {
-                if t.txn.lease.owner == me && !t.txn.state.is_pre_mutation() {
-                    let _ = j.append(
-                        now,
-                        Record::Renew {
-                            txn: t.txn.id,
-                            epoch: t.txn.lease.epoch,
-                            worker_pid: t.txn.lease.worker_pid,
-                            boot_at,
-                        },
-                    );
-                }
+            if planarian_daemon::renew::renew(handle, &me, clock.now(), clock.boot_now()).is_err() {
+                j = None;
             }
         }
     });
