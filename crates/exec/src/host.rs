@@ -278,3 +278,8 @@ pub fn changed_units(a: &Manifest, b: &Manifest) -> BTreeSet<UnitId> {
     }
     out
 }
+
+// Catch-up property tests (docs/regression-ledger.md: C4, C5).
+#[cfg(test)]
+#[path = "host_props.rs"]
+mod props;
