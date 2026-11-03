@@ -301,6 +301,30 @@ pkgs.testers.runNixOSTest {
         assert alarms() == 1, alarms()
         machine.succeed("rm -f /run/wireguard-gym-slow")
 
+    # Before "repair fails every attempt": that spends wireguard-gym's
+    # attempt budget and starts §13's cooldown, during which no repair runs
+    # (the hold stays, §12d), so a restart "at once" is only promised while
+    # the budget lasts (gate 41596671872).
+    with subtest("a crashed (exit 1, not killed) VPN restarts at once under the hold"):
+        machine.wait_until_succeeds(tunnel_ok(), timeout=60)
+        machine.succeed("echo 30 > /run/wireguard-gym-slow")
+        asked = "journalctl -b -u planariad -o cat | grep -c 'wireguard-gym.*needs approval' || true"
+        before = int(machine.succeed(asked).strip() or 0)
+        # wireguard-go exits with an error when its TUN device goes away: a
+        # crash, not a kill. (Precondition: the unit ended by its exit code.)
+        machine.succeed("ip link delete wg0")
+        machine.wait_until_succeeds("journalctl -b -u wireguard-gym -o cat | grep -q 'status=1/FAILURE'", timeout=30)
+        machine.wait_until_fails(lan_ok(), timeout=20)
+        held()
+        # Restarted at once, without asking (§11: restarts_held_unit).
+        machine.wait_until_succeeds("systemctl is-active wireguard-gym.service", timeout=120)
+        machine.wait_until_succeeds(lan_ok(), timeout=60)
+        machine.wait_until_succeeds(tunnel_ok(), timeout=60)
+        not_held()
+        after = int(machine.succeed(asked).strip() or 0)
+        assert after == before, f"the restart asked: {before} -> {after}"
+        machine.succeed("rm -f /run/wireguard-gym-slow")
+
     with subtest("repair fails every attempt: the hold stays, administrators are notified"):
         machine.succeed("touch /run/wireguard-gym-broken")
         machine.succeed("systemctl kill --signal=SIGKILL wireguard-gym.service")
@@ -357,26 +381,6 @@ pkgs.testers.runNixOSTest {
         not_held("gym-vpn-untagged")
         machine.succeed("rm -f /run/gym-vpn-untagged-slow")
         machine.succeed("journalctl -b -u planariad -o cat | grep gym-vpn-untagged | grep -q 'stopped unexpectedly'")
-
-    with subtest("a crashed (exit 1, not killed) VPN restarts at once under the hold"):
-        machine.wait_until_succeeds(tunnel_ok(), timeout=60)
-        machine.succeed("echo 30 > /run/wireguard-gym-slow")
-        asked = "journalctl -b -u planariad -o cat | grep -c 'wireguard-gym.*needs approval' || true"
-        before = int(machine.succeed(asked).strip() or 0)
-        # wireguard-go exits with an error when its TUN device goes away: a
-        # crash, not a kill. (Precondition: the unit ended by its exit code.)
-        machine.succeed("ip link delete wg0")
-        machine.wait_until_succeeds("journalctl -b -u wireguard-gym -o cat | grep -q 'status=1/FAILURE'", timeout=30)
-        machine.wait_until_fails(lan_ok(), timeout=20)
-        held()
-        # Restarted at once, without asking (§11: restarts_held_unit).
-        machine.wait_until_succeeds("systemctl is-active wireguard-gym.service", timeout=120)
-        machine.wait_until_succeeds(lan_ok(), timeout=60)
-        machine.wait_until_succeeds(tunnel_ok(), timeout=60)
-        not_held()
-        after = int(machine.succeed(asked).strip() or 0)
-        assert after == before, f"the restart asked: {before} -> {after}"
-        machine.succeed("rm -f /run/wireguard-gym-slow")
 
     with subtest("a templated tool's instance holds as planarian-hold@<instance>, and the restart lifts it (%N)"):
         machine.wait_for_unit("gym-tpl@a.service")
