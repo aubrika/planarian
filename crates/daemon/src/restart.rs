@@ -156,6 +156,9 @@ mod tests {
         /// transaction that does not exist).
         Prepare(Option<u8>),
         Move(prop::sample::Index, To),
+        /// A restart declined to prepare this transaction again
+        /// (`NotPreparedAgain`): an id of the script, or one it never made.
+        Declined(u8),
     }
 
     fn ops() -> impl Strategy<Value = Vec<Op>> {
@@ -170,6 +173,7 @@ mod tests {
             prop_oneof![
                 3 => proptest::option::weighted(0.4, 1u8..8).prop_map(Op::Prepare),
                 7 => (any::<prop::sample::Index>(), to).prop_map(|(i, t)| Op::Move(i, t)),
+                2 => (1u8..10).prop_map(Op::Declined),
             ],
             1..30,
         )
@@ -182,6 +186,7 @@ mod tests {
         history: BTreeMap<TxnId, Vec<TxnState>>,
         withdrawn_for: BTreeMap<TxnId, TxnId>,
         again: BTreeMap<TxnId, TxnId>,
+        declined: BTreeSet<TxnId>,
     }
 
     use std::collections::BTreeMap;
@@ -213,6 +218,12 @@ mod tests {
                         if let Some(a) = again {
                             m.again.insert(id, a);
                         }
+                    }
+                }
+                Op::Declined(n) => {
+                    let id = TxnId(*n as u64);
+                    if apply(&mut l, Record::NotPreparedAgain { txn: id, reason: "refused".into() }) {
+                        m.declined.insert(id);
                     }
                 }
                 Op::Move(i, to) => {
@@ -297,13 +308,28 @@ mod tests {
                 let h = &m.history[id];
                 h.len() >= 2 && matches!(h[h.len() - 2], TxnState::Built | TxnState::Prepared)
             };
-            let want_re: BTreeSet<TxnId> = m.history.keys().filter(|i| interrupted(i) && !before.contains(i) && was_waiting(i)).copied().collect();
+            let want_re: BTreeSet<TxnId> = m.history.keys().filter(|i| interrupted(i) && !before.contains(i) && !m.declined.contains(i) && was_waiting(i)).copied().collect();
             let want_wd: BTreeSet<TxnId> = m
                 .history
                 .keys()
-                .filter(|i| interrupted(i) && m.withdrawn_for.contains_key(i) && !named.contains(i) && !want_re.contains(i))
+                .filter(|i| {
+                    interrupted(i)
+                        && m.withdrawn_for.contains_key(i)
+                        && !named.contains(i)
+                        && !m.declined.contains(i)
+                        && !want_re.contains(i)
+                })
                 .copied()
                 .collect();
+            // A declined transaction is in neither list, and the ledger's fold
+            // holds exactly the ids the journal declined, across compaction too.
+            prop_assert!(re_set.is_disjoint(&m.declined) && wd_set.is_disjoint(&m.declined), "declined but prepared again");
+            prop_assert_eq!(ledger.not_prepared_again(), m.declined.clone(), "the fold");
+            prop_assert_eq!(serde_json::from_slice::<Ledger>(&serde_json::to_vec(&ledger).unwrap()).unwrap().not_prepared_again(), m.declined.clone(), "the fold, after compaction");
+            // A checkpoint from before the record existed has none.
+            let mut old = serde_json::to_value(&ledger).unwrap();
+            old.as_object_mut().unwrap().remove("not_prepared_again");
+            prop_assert!(serde_json::from_value::<Ledger>(old).unwrap().not_prepared_again().is_empty(), "an old checkpoint");
             prop_assert_eq!(&re_set, &want_re, "reprepare");
             prop_assert_eq!(&wd_set, &want_wd, "withdrawn");
 
