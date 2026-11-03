@@ -2439,6 +2439,11 @@ mod timing_props {
             }
             if let Fault::FloorBlocksRollback = f {
                 prop_assert!(held, "the rollback below the floor never escalated: {:#?}", r.core.notices);
+            }
+        }
+    }
+}
+
 /// Property tests for the daemon's rate limits and its notice cursor
 /// (catch-up coverage, `docs/regression-ledger.md` D4 and D5).
 /// `PROPTEST_CASES` goes deeper.
