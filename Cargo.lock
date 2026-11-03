@@ -2206,6 +2206,7 @@ dependencies = [
  "planarian-changes",
  "planarian-schema",
  "planarian-txn",
+ "proptest",
  "rustix 1.1.5",
  "serde",
  "serde_json",
