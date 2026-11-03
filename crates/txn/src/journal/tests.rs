@@ -583,6 +583,7 @@ struct LockWatch {
     bare: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
+#[allow(dead_code)] // field 0 is held for its Drop (the store lock), never read
 struct WatchGuard(<MemStore as Store>::Guard, std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
 impl Drop for WatchGuard {
