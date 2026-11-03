@@ -126,8 +126,42 @@ fn open_time_at_64_mib() {
     drop(j);
     for _ in 0..3 {
         let t = std::time::Instant::now();
-        let (opened, crcd) = crc_bytes(|| Journal::open(FileStore::open(dir.path(), &dir.path().join("txn"), capacity).unwrap()));
+        let (opened, crcd) =
+            crc_bytes(|| Journal::open(FileStore::open(dir.path(), &dir.path().join("txn"), capacity).unwrap()));
         opened.unwrap();
         eprintln!("open_time_at_64_mib: {:?}, {crcd} bytes CRC'd, {i} records", t.elapsed());
+    }
+}
+
+/// I18 holds after a compaction too: a record in the middle of the new log
+/// damaged (its CRC fails) while a later intact record follows is Integrity,
+/// not a torn tail; and the leftovers past the tail, all at or below the
+/// checkpoint's seq, are never taken for that later record.
+#[test]
+fn after_a_compaction_a_damaged_middle_record_is_still_integrity() {
+    let capacity = 256 << 10;
+    let store = MemStore::new(capacity);
+    let mut j = Journal::open(store.clone()).unwrap();
+    let mut i = 0;
+    while !j.needs_compaction() {
+        append(&mut j, i).unwrap();
+        i += 1;
+    }
+    j.compact().unwrap();
+    let first = append(&mut j, i).unwrap();
+    let size = (HEADER + PREV + serde_json::to_vec(&first).unwrap().len()) as u64;
+    for k in 1..5 {
+        append(&mut j, i + k).unwrap();
+    }
+    // Only leftovers past the tail: the torn-tail path, no Integrity.
+    assert!(Journal::open(store.clone()).is_ok());
+    // Damage the second record's payload (its CRC no longer holds).
+    let at = size + (HEADER + PREV) as u64 + 2;
+    let b = store.read_at(at, 1).unwrap()[0];
+    store.write_at(at, &[b ^ 0x20]).unwrap();
+    match Journal::open(store.clone()) {
+        Err(JournalError::Integrity(m)) => assert!(m.contains("is damaged, but record"), "{m}"),
+        Err(e) => panic!("expected Integrity, got {e:?}"),
+        Ok(_) => panic!("expected Integrity, got an open journal"),
     }
 }
