@@ -261,3 +261,26 @@ fn a_unit_may_set_its_own_grace_and_a_restart_starts_it_again() {
     sim.ticks(2);
     assert_eq!(sim.m.actionable(sim.now()).len(), 1);
 }
+
+/// How long each escalation holds (§13, §12e), and `escalate` uses it.
+#[test]
+fn escalation_cooldown_by_reason() {
+    use EscalationReason as R;
+    let table = [
+        (R::Regressed, COOLDOWN_FIRST),
+        (R::BudgetExhausted, COOLDOWN_FIRST),
+        (R::DiagnoserExhausted, COOLDOWN_FIRST),
+        (R::RevertBlockedByFloor, COOLDOWN_LATER),
+        (R::RecoveryFailed, COOLDOWN_FIRST),
+    ];
+    for (reason, want) in table {
+        assert_eq!(escalation_cooldown(reason.clone()), want, "{reason:?}");
+        let mut sim = Sim::new(defs([service("gym-flap")]));
+        sim.fail("gym-flap");
+        sim.ticks(2);
+        let id = sim.active("gym-flap").unwrap().id;
+        let now = sim.now();
+        let inc = sim.m.escalate(id, reason.clone(), now).unwrap();
+        assert_eq!(inc.state, IncidentState::Escalated { until: now.plus(want), reason }, "escalate");
+    }
+}

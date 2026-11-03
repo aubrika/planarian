@@ -2245,3 +2245,40 @@ fn an_exhausted_cooldown_runs_from_the_decision() {
     }
     panic!("no cooldown: {:#?}", r.core.notices);
 }
+
+/// §13: the hold a third regression sets runs from the decision, after the
+/// probes, like every cooldown and backoff (prop-auditor's Relapse(369):
+/// gym-flap fails 369 s after each start, so each repair stabilizes past
+/// 5 min and regresses inside 30 min; probe batches take 500 ms).
+#[test]
+fn a_regression_hold_runs_from_the_decision() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let flap = UnitId::service("gym-flap");
+    {
+        let mut w = r.fake.w();
+        let now = w.now;
+        let sim = w.units.get_mut(&flap).unwrap();
+        sim.fail_after = Some(Millis::secs(369));
+        sim.started_at = now;
+    }
+    r.fake.w().probe_batch_ms = 500;
+    for _ in 0..2000 {
+        r.fake.advance(planarian_state::TICK);
+        let observed = r.fake.now();
+        r.core.tick();
+        if let Some(IncidentState::Escalated { until, reason }) =
+            r.core.incidents.active_for(&flap).map(|i| i.state.clone())
+        {
+            assert_eq!(reason, EscalationReason::Regressed);
+            assert!(
+                until.0 >= observed.0 + 500 + planarian_incident::COOLDOWN_FIRST.0,
+                "hold until {} set on a tick observed at {}",
+                until.0,
+                observed.0
+            );
+            return;
+        }
+    }
+    panic!("no escalation: {:#?}", r.core.notices);
+}

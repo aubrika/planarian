@@ -17,6 +17,25 @@ pub const REGRESSION_WINDOW: Millis = Millis::secs(30 * 60);
 pub const ESCALATE_AT: u8 = 3;
 pub const COOLDOWN_FIRST: Millis = Millis::secs(3600);
 pub const COOLDOWN_LATER: Millis = Millis::secs(6 * 3600);
+
+/// How long an escalation holds the incident before Planarian looks again
+/// (§13: no autonomous action until the hold ends or someone acts).
+/// - `Regressed`: 1 h, §13's hold for the third regression.
+/// - `RevertBlockedByFloor`: 6 h. §12e names no cooldown; a revert below the
+///   floor needs an administrator, which an hour does not change
+///   (docs/deviations.md).
+/// - The others have no escalation today (budget and diagnoser exhaustion
+///   cool down, `Cooldown`, through `cool`'s 1 h then 6 h; RecoveryFailed sets
+///   the interlock): 1 h, §13's first cooldown, should one arise.
+pub fn escalation_cooldown(reason: EscalationReason) -> Millis {
+    match reason {
+        EscalationReason::Regressed => COOLDOWN_FIRST,
+        EscalationReason::RevertBlockedByFloor => COOLDOWN_LATER,
+        EscalationReason::BudgetExhausted | EscalationReason::DiagnoserExhausted | EscalationReason::RecoveryFailed => {
+            COOLDOWN_FIRST
+        }
+    }
+}
 pub const SETTLE: Millis = Millis::secs(15);
 /// Consecutive ticks of divergence before an incident opens.
 pub const OPEN_AFTER: u8 = 2;
@@ -122,6 +141,21 @@ impl Manager {
 
     /// Observe one tick. Returns every incident that opened, changed or closed.
     pub fn tick(&mut self, now: Timestamp, state: &SystemState, defs: &UnitDefs) -> Vec<Incident> {
+        self.tick_at(now, now, state, defs)
+    }
+
+    /// `tick`, with the decision's own time: `now` is the observation's
+    /// (what the evidence is timed by), `decided` the clock read after it,
+    /// once the probes have run. A hold set here (a third regression's
+    /// escalation) runs from `decided`, as every cooldown and backoff does
+    /// (§13), so a slow observation never shortens it.
+    pub fn tick_at(
+        &mut self,
+        now: Timestamp,
+        decided: Timestamp,
+        state: &SystemState,
+        defs: &UnitDefs,
+    ) -> Vec<Incident> {
         let mut changed = vec![];
 
         // Targets that left the definitions close.
@@ -234,10 +268,8 @@ impl Manager {
                 };
                 let mut inc = self.open(id, IncidentKind::Repair, (desired, status), now, next_attempt, regressions);
                 if regressions >= ESCALATE_AT {
-                    inc.state = IncidentState::Escalated {
-                        until: now.plus(COOLDOWN_FIRST),
-                        reason: EscalationReason::Regressed,
-                    };
+                    let reason = EscalationReason::Regressed;
+                    inc.state = IncidentState::Escalated { until: decided.plus(escalation_cooldown(reason)), reason };
                 } else if regressions > 0 {
                     inc.state = IncidentState::Regressed { count: regressions };
                 }
@@ -350,7 +382,7 @@ impl Manager {
     /// until the hold ends or someone acts on the target.
     pub fn escalate(&mut self, id: IncidentId, reason: EscalationReason, now: Timestamp) -> Option<Incident> {
         let i = self.incidents.get_mut(&id)?;
-        i.state = IncidentState::Escalated { until: now.plus(COOLDOWN_LATER), reason };
+        i.state = IncidentState::Escalated { until: now.plus(escalation_cooldown(reason)), reason };
         Some(i.clone())
     }
 
