@@ -176,6 +176,16 @@ let
   # trampolines, x86_64 direct-call ftrace) and a ring buffer.
   netwatchKernel = [ "BPF" "BPF_SYSCALL" "BPF_JIT" "DEBUG_INFO_BTF" "FTRACE" "FUNCTION_TRACER" "DYNAMIC_FTRACE" "DYNAMIC_FTRACE_WITH_DIRECT_CALLS" "CGROUPS" ];
   check = cond: msg: if cond then true else throw "planarian module eval: ${msg}";
+  # The other side of the export's unit keys: planarian_schema::UnitDef,
+  # read from its source. serde drops a key it does not know and defaults a
+  # field it does not find, so a key the module renames is read as the
+  # default, silently (`holds` read false for every unit once). The struct
+  # has no rename, alias or flatten, so its field names are the keys.
+  unitDefBody = let
+    after = builtins.elemAt (builtins.split "pub struct UnitDef [{]" (builtins.readFile ../../crates/schema/src/unit.rs)) 2;
+  in builtins.head (builtins.split "\n}\n" after);
+  unitDefFields = map builtins.head (builtins.filter builtins.isList (builtins.split "pub ([a-z_]+):" unitDefBody));
+  unitKeysRead = u: builtins.all (k: builtins.elem k unitDefFields) (builtins.attrNames u);
   checks = [
     (check (builtins.any isExec probes) "the configuration exports an Exec probe (P11's check is not vacuous)")
     (check (builtins.all (p: !(isExec p) || (p.flagged or null) == true) probes) "every exported Exec probe carries flagged = true (§9, P11)")
@@ -196,9 +206,11 @@ let
     (check (builtins.elem "nt-vpn@" hold.holdUnits && hold.holdDropins."nt-vpn@.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "a templated network tool is classified, and each instance's failure holds as planarian-hold@<instance> (§12d)")
     (check (hold.holdDropins."firewall.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "the firewall is a network tool from its configuration, not its name (§12d)")
     (check (builtins.sort builtins.lessThan export.networkTools == builtins.sort builtins.lessThan hold.holdUnits) "the export lists every network tool, declared or not (netwatch's footprints)")
-    (check (vpn.network_tool && vpn.hold_allow == [ { address = "192.0.2.7"; port = 51820; protocol = "udp"; } ] && vpn.hold_interfaces == [ "wg9" ]) "a network tool exports network_tool, its holdAllow and its holdInterfaces (§9, §12d)")
-    (check (builtins.all (u: u.network_tool == (builtins.elem (pkgs.lib.removePrefix "service:" u.id) hold.holdUnits)) export.units && builtins.all (u: !u.network_tool) export.userUnits) "every exported unit's network_tool is the computed rule")
-    (check (!(sys.options.services.planarian.units.type.getSubOptions [ ] ? network_tool) && !(sys.options.services.planarian.units.type.getSubOptions [ ] ? networkTool)) "network_tool is not a manifest option, so no unit can opt out of the hold (§12d)")
+    (check (vpn.holds && vpn.hold_allow == [ { address = "192.0.2.7"; port = 51820; protocol = "udp"; } ] && vpn.hold_interfaces == [ "wg9" ]) "a network tool exports holds, its holdAllow and its holdInterfaces (§9, §12d)")
+    (check (builtins.all (u: u.holds == (builtins.elem (pkgs.lib.removePrefix "service:" u.id) hold.holdUnits)) export.units && builtins.all (u: !u.holds) export.userUnits) "every exported unit's holds is the computed rule")
+    (check (builtins.length unitDefFields > 10 && builtins.elem "holds" unitDefFields && !(pkgs.lib.hasInfix "rename" unitDefBody) && !(pkgs.lib.hasInfix "alias" unitDefBody) && !(pkgs.lib.hasInfix "flatten" unitDefBody)) "the daemon's UnitDef is read from its source, and its field names are the export's keys")
+    (check (builtins.all unitKeysRead (export.units ++ export.userUnits) && !(unitKeysRead (vpn // { network_tool = true; }))) "the daemon's field: every key the export gives a unit is a UnitDef field, so none is dropped and read as its default (a renamed key is refused)")
+    (check (!(sys.options.services.planarian.units.type.getSubOptions [ ] ? holds) && !(sys.options.services.planarian.units.type.getSubOptions [ ] ? networkTool)) "holds is not a manifest option, so no unit can opt out of the hold (§12d)")
     (check (hold.holdDropins."gym-vpn.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "a network-security unit's failure applies the hold through OnFailure= (§12d)")
     (check (!(cfg.systemd.services.gym-vpn ? onFailure) || !(builtins.elem "planarian-hold@gym-vpn.service" cfg.systemd.services.gym-vpn.onFailure)) "the OnFailure= is a drop-in, not a unit definition (no stub for an undefined unit)")
     (check (pkgs.lib.hasInfix "ExecStartPost=" nftDropin && pkgs.lib.hasInfix "ExecReload=" nftDropin && pkgs.lib.hasInfix " reapply" nftDropin) "a hold is re-applied after nftables.service starts or reloads, which may flush every table (§12d)")

@@ -136,7 +136,8 @@ let
       !r.success || r.value;
   # The build-time half of "network-security unit" (§12d); the runtime half
   # is the footprint, read by the hold's condition. The one rule: it feeds
-  # the export's `network_tool` (computed, never settable) and OnFailure=.
+  # the export's `holds` (computed, never settable; `UnitDef.holds` reads
+  # it) and OnFailure=.
   isNetworkSecurity = name: _u: isNetworkTool name;
   networkTools = builtins.filter isNetworkTool (lib.attrNames config.systemd.services);
   defaultDisruption = name:
@@ -356,8 +357,10 @@ let
     startup_grace = if u.startupGrace == null then null else u.startupGrace * 1000;
     runtime_repair = u.runtimeRepair;
     # §12d: whether its failure holds the machine's traffic, and what the
-    # hold still lets it reach.
-    network_tool = u.kind == "service" && u.scope == "system" && isNetworkSecurity name u;
+    # hold still lets it reach. The key is `holds`: planarian_schema::UnitDef
+    # reads it, with a default of false, so a renamed key fails open
+    # (module-eval's "the daemon's field" check).
+    holds = u.kind == "service" && u.scope == "system" && isNetworkSecurity name u;
     hold_allow = map (a: { inherit (a) address port protocol; }) u.holdAllow;
     hold_interfaces = u.holdInterfaces;
     stops_are_faults = !u.inferStops;
