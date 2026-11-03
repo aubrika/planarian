@@ -938,6 +938,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             if lifted.contains(&u) {
                 continue;
             }
+            // (`!in_journal` is defensive: a unit journaled as held has its entry
+            // dropped by the failed-again arm first.)
             if self.lift_unconfirmed.contains_key(&u) && !in_journal {
                 match on_host {
                     // The host cannot say: the entry stands, and the unit is

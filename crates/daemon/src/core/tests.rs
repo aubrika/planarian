@@ -3082,3 +3082,40 @@ fn a_second_stuck_lift_is_noticed_again() {
     assert!(!r.fake.w().held.contains(&web), "still held: {:?}", r.core.notices);
     assert!(r.core.ledger().holds().is_empty(), "{:?}", r.core.ledger().hold_events);
 }
+
+/// §12d (prop-auditor, #72): only the lift hangs (`lift_hangs`), for
+/// minutes. The lift is journaled and noticed once, asked for at most once
+/// a minute (a retry on every tick, or a notice on every retry, are the
+/// failures this exists to prevent), and the hold's table check still
+/// answers every tick.
+#[test]
+fn a_lift_that_alone_hangs_is_retried_quietly_once_a_minute() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().stop_out_of_band(&web);
+    for _ in 0..10 {
+        if r.fake.w().held.contains(&web) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.fake.w().held.contains(&web), "never held: {:?}", r.core.notices);
+    r.fake.w().lift_hangs = Some(Millis::secs(30));
+    let t0 = r.fake.now().0;
+    // Five minutes at a tick every 5 s (each hung lift also spends its wait).
+    while r.fake.now().0 < t0 + 300_000 {
+        r.ticks(1);
+    }
+    let timed_out = r.calls("lift_hold(service:gym-web) timed out");
+    assert!((1..=6).contains(&timed_out), "{timed_out} lift attempts in 5 minutes: {:?}", r.core.notices);
+    let stuck = |r: &Rig| r.core.notices.iter().filter(|n| n.contains("could not be lifted")).count();
+    assert_eq!(stuck(&r), 1, "{:?}", r.core.notices);
+    assert!(!r.core.notices.iter().any(|n| n.contains("could not be checked")), "{:?}", r.core.notices);
+    let events = r.core.ledger().hold_events.clone();
+    assert_eq!(events.iter().filter(|e| e.1).count(), 1, "{events:?}");
+    assert_eq!(events.iter().filter(|e| !e.1).count(), 1, "{events:?}");
+    r.fake.w().lift_hangs = None;
+    r.ticks(15);
+    assert!(!r.fake.w().held.contains(&web), "never lifted: {:?}", r.core.notices);
+    assert_eq!(r.core.notices.iter().filter(|n| n.contains("flows again")).count(), 1, "{:?}", r.core.notices);
+}
