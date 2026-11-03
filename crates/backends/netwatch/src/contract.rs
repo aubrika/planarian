@@ -38,7 +38,7 @@ fn proto(p: Proto) -> &'static str {
     }
 }
 
-fn render(f: &Footprint) -> String {
+pub(crate) fn render(f: &Footprint) -> String {
     let mut s = format!("protecting {}\nat {}\n", if f.protecting { "yes" } else { "no" }, f.at);
     for i in &f.ifaces {
         s.push_str(&format!("iface {i}\n"));

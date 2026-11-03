@@ -275,9 +275,10 @@ mod parsing {
     }
 
     /// Every nftables message type, by name (`enum nf_tables_msg_types`):
-    /// the GETs (and resets) read, everything else changes, an unknown
-    /// later type included (fail closed). vm-netwatch (n): `nft list` sends
-    /// GETFLOWTABLE (23), which the old `% 3 == 1` rule took for a change.
+    /// the GETs read; everything else changes, the resets (a zeroed quota
+    /// can flip a verdict) and an unknown later type included (fail
+    /// closed). vm-netwatch (n): `nft list` sends GETFLOWTABLE (23), which
+    /// the old `% 3 == 1` rule took for a change.
     #[test]
     fn every_nftables_read_is_a_read_and_the_rest_change() {
         let reads = [
@@ -288,10 +289,7 @@ mod parsing {
             ("GETSETELEM", 13),
             ("GETGEN", 16),
             ("GETOBJ", 19),
-            ("GETOBJ_RESET", 21),
             ("GETFLOWTABLE", 23),
-            ("GETRULE_RESET", 25),
-            ("GETSETELEM_RESET", 33),
         ];
         let changes = [
             ("NEWTABLE", 0),
@@ -315,6 +313,9 @@ mod parsing {
             ("DESTROYSETELEM", 30),
             ("DESTROYOBJ", 31),
             ("DESTROYFLOWTABLE", 32),
+            ("GETOBJ_RESET", 21),
+            ("GETRULE_RESET", 25),
+            ("GETSETELEM_RESET", 33),
             ("a later kernel's", 40),
         ];
         let ty = |n: u16| (10u16 << 8) | n;
@@ -1373,8 +1374,13 @@ mod interfaces {
         take(&mut t, &registered("tun0", 0xF000_1234), HOST, by(&vpn), &mut names);
         take(&mut t, &route([0, 0, 0, 0], 1, 9), HOST, by(&vpn), &mut names);
         t.set_virtual(set(&["tun0"]));
+        // The registration elsewhere made no claim: the unit created nothing.
+        let claims = t.claims();
+        assert!(!claims.objects.iter().any(|o| o.1 == crate::ChangeKind::Interface), "{claims:?}");
+        // Its own all-covering route over the host's virtual tun0 (made by
+        // nobody it knows of) still protects (coordinator, Nov 3).
         let v = t.view(WatchState::Attached { at: NOW }, std::slice::from_ref(&vpn), NOW);
-        assert!(!v.units["openvpn-work"].protecting, "the host's tun0 was not made by it");
+        assert!(v.units["openvpn-work"].protecting);
         let owner = Owner::Unit(vpn);
         assert!(matches!(parse(&registered("", HOST), &owner, &mut names), Parsed::Unreadable(_)));
     }
@@ -1457,5 +1463,61 @@ mod legacy_restart {
         assert!(!at(Some("filter\n")).is_empty());
         assert!(at(None).is_empty());
         assert!(at(Some("")).is_empty());
+    }
+}
+
+/// The coordinator's two rulings, Nov 3 (vm-netwatch (n3)).
+mod rulings_nov3 {
+    use crate::{Change, ChangeKind, Owner, Tracker, WatchState};
+    use planarian_schema::UnitId;
+    use std::collections::BTreeSet;
+
+    const NOW: u64 = 100;
+
+    fn route(u: &UnitId, iface: &str) -> Change {
+        Change {
+            owner: Owner::Unit(u.clone()),
+            kind: ChangeKind::Route,
+            object: format!("route 2 254 0.0.0.0/0 oif {iface} metric 4003"),
+            iface: Some(iface.into()),
+            steers: true,
+            removed: false,
+        }
+    }
+
+    /// (a) A footprint with an `unattributed` line says `protecting yes`.
+    #[test]
+    fn unattributed_reads_protecting_yes() {
+        let u = UnitId::service("backdoor");
+        let mut t = Tracker::default();
+        t.lost(Some(&u));
+        let f = t.footprint(&u, NOW);
+        assert!(f.unattributed && f.protecting, "{f:?}");
+        let text = crate::contract::render(&f);
+        assert!(text.contains("protecting yes") && text.contains("unattributed"), "{text}");
+    }
+
+    /// (b) A default route the unit added over a virtual link it did not
+    /// create: moved in from another netns (nothing registered it here).
+    #[test]
+    fn a_route_over_a_moved_in_link_protects_its_maker() {
+        let u = UnitId::service("backdoor");
+        let mut t = Tracker::default();
+        t.apply(&route(&u, "nwmove0"));
+        t.set_virtual(["nwmove0".to_string()].into());
+        let v = t.view(WatchState::Attached { at: NOW }, std::slice::from_ref(&u), NOW);
+        assert!(v.units["backdoor"].protecting);
+        assert_eq!(v.units["backdoor"].ifaces, BTreeSet::from(["nwmove0".to_string()]));
+    }
+
+    /// ...but over a physical NIC it still steers nothing of its own.
+    #[test]
+    fn a_route_over_a_physical_nic_still_protects_nobody() {
+        let nm = UnitId::service("NetworkManager");
+        let mut t = Tracker::default();
+        t.apply(&route(&nm, "wlan0"));
+        t.set_virtual(["lo".to_string()].into());
+        let v = t.view(WatchState::Attached { at: NOW }, std::slice::from_ref(&nm), NOW);
+        assert!(!v.units["NetworkManager"].protecting);
     }
 }

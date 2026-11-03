@@ -50,7 +50,9 @@
 //! - `endpoint <udp|tcp> <address> <port>`: one per peer endpoint it needs
 //!   (zero or more; IPv4 or IPv6 without brackets);
 //! - `unattributed`: a change charged here that the kernel could not fully
-//!   attribute, or a lost event that touched it.
+//!   attribute, or a lost event that touched it. A file with this line
+//!   always says `protecting yes` too (coordinator, Nov 3): fail closed, and
+//!   the file says what the hold reads.
 //!
 //! **On every attach** (boot or restart of the watch; coordinator, Nov 2,
 //! from the reviewer's #38 finding 3c), in this order, so a restart never
@@ -90,10 +92,12 @@
 //! *virtual* link can be one a tool created; virtual is read live each
 //! tick (`/sys/class/net/<if>` under `/sys/devices/virtual/`), so a tun made
 //! by ioctl or a link moved in from another netns is never taken for a
-//! physical NIC. And (coordinator, Nov 2; the owner is told, since §12d
-//! says "it created") a unit's own steering route over a virtual link that
-//! another unit created makes it protecting too, as well as the creator:
-//! OpenVPN on a persistent tun a setup unit made, both hold.
+//! physical NIC. And (coordinator, Nov 2 and 3; the spec reads "...over a
+//! virtual interface it did not create...") a default or all-covering route
+//! the unit added over a virtual link it did not create makes it protecting
+//! too: one another unit made (OpenVPN on a persistent tun a setup unit
+//! made: both hold), one moved in from another netns, one made before the
+//! watch attached. Routes over a physical NIC stay exempt.
 //!
 //! **Protecting** means the footprint includes, now: an interface the unit
 //! created that carries a default or all-covering route (a `/0` or `/1`, in
