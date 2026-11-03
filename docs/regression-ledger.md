@@ -171,8 +171,8 @@ in a debug build).
 
 ## Counts
 
-75 rows for bugs fixed on `main`: 17 journal and kernel (J), 14 daemon (D),
-16 change path (C), 17 backends, identity and gym (B), 11 netwatch (N).
+76 rows for bugs fixed on `main`: 17 journal and kernel (J), 14 daemon (D),
+17 change path (C), 17 backends, identity and gym (B), 11 netwatch (N).
 Three rows still owe a property test (status **gap**):
 - J4 and J7: each waits on a lane's extraction of a pure function from the
   daemon or the kernel.
