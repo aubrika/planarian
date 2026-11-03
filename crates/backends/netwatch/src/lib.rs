@@ -50,7 +50,17 @@
 //! - `protecting yes`, `protecting no`, or `protecting unknown`: the
 //!   unit's latest invocation has a cgroup whose InvocationID netwatch has
 //!   not read yet (systemd sets it just after making the cgroup, before the
-//!   unit's first process). `unknown` reads as protecting;
+//!   unit's first process). `unknown` reads as protecting. `yes` is a
+//!   latch per invocation (reviewer and coordinator, Nov 3): an invocation
+//!   found protecting at any point stays `protecting yes`, with the `iface`
+//!   and `endpoint` lines that made it so, until a new invocation replaces
+//!   it; neither `ended` nor its interface or routes going clear it. A
+//!   tun-based VPN's interface leaves with its last process, before its
+//!   cgroup goes and with no netlink request, so what stands at `ended`
+//!   is not what it did. Steering seen while a unit has no live invocation
+//!   (none known yet, or the last one ended) is the next one's: its cgroup
+//!   was made between netwatch's cgroups read and its ring read. One
+//!   replaced before it ended passes its latch on (fail closed);
 //! - `at <t>`: when netwatch last confirmed it, refreshed at least with
 //!   every heartbeat;
 //! - `invocation <32 lowercase hex>`: the unit's latest systemd
@@ -58,7 +68,9 @@
 //!   `user.invocation_id`), kept after the cgroup goes. A file whose
 //!   `invocation` is not 32 lowercase hex is not trusted;
 //! - `ended`: that invocation's cgroup is gone (IN_DELETE seen, or found
-//!   absent at the start of a drain) and the ring has been drained after.
+//!   absent at the start of a drain: no directory at its path, or one with
+//!   another inode, which on cgroupfs is the cgroup id, never reused in a
+//!   boot) and the ring has been drained after.
 //!   A probe runs inside the syscall, and a cgroup can be removed only once
 //!   its last process has exited, so everything the invocation did is in
 //!   the file. Written only for an invocation whose id this netwatch read

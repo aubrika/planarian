@@ -569,7 +569,7 @@ mod loader_checks {
 /// with its change; a cgroup never seen fails closed.
 #[cfg(feature = "loader")]
 mod cgroups {
-    use crate::cgroups::Cgroups;
+    use crate::cgroups::{Cgroups, Via};
     use crate::{Change, ChangeKind, Owner, Tracker, WatchState};
     use planarian_schema::UnitId;
     use std::collections::BTreeSet;
@@ -623,7 +623,12 @@ mod cgroups {
         std::fs::remove_dir(&vpn).unwrap();
         c.drain();
         assert_eq!(state(&c, "wg-gym"), inv(Some(NEW), false), "not ended before the ring drain");
-        assert_eq!(c.finish(), vec![UnitId::service("wg-gym")]);
+        let ended = c.finish();
+        assert_eq!(
+            ended.iter().map(|e| (&e.unit, e.via)).collect::<Vec<_>>(),
+            vec![(&UnitId::service("wg-gym"), Via::InDelete)]
+        );
+        assert_eq!(ended[0].id.as_deref(), Some(NEW));
         assert_eq!(state(&c, "wg-gym"), inv(Some(NEW), true));
         assert!(c.finish().is_empty(), "once");
         assert!(start(&vpn, Some(NEXT)));
@@ -647,7 +652,11 @@ mod cgroups {
         let mut c = Cgroups::new(d.path()).without_inotify();
         std::fs::remove_dir(&vpn).unwrap();
         c.drain();
-        assert_eq!(c.finish(), vec![UnitId::service("wg-gym")]);
+        let ended = c.finish();
+        assert_eq!(
+            ended.iter().map(|e| (&e.unit, e.via)).collect::<Vec<_>>(),
+            vec![(&UnitId::service("wg-gym"), Via::Stat)]
+        );
         assert_eq!(state(&c, "wg-gym"), inv(Some(NEW), true));
     }
 
@@ -662,6 +671,206 @@ mod cgroups {
         assert_eq!(state(&c, "wg-gym"), None);
         assert!(c.finish().is_empty());
         let _ = slice;
+    }
+
+    /// The cgroups invocation property (rule 23; prop-auditor, coordinator,
+    /// Nov 3) over random sequences on a real directory tree: unit cgroups
+    /// made and removed (stop then start on the same path included), an
+    /// InvocationID set at once, late or never, drains at random instants
+    /// with `finish` after each, inotify on or off (the absence fallback
+    /// alone), walks, and restarts of netwatch (a fresh `Cgroups`).
+    ///
+    /// - `ended` only at `finish`, never at the drain itself;
+    /// - an invocation with an id is `ended` only if its cgroup is gone, and
+    ///   stood at some point while this `Cgroups` ran (a restarted netwatch
+    ///   never ends one already gone when it started);
+    /// - one whose cgroup is gone, with its id read, is `ended` once a drain
+    ///   has run [`ABSENCE_MS`] after the removal;
+    /// - with inotify, a cgroup standing whose id is set is its unit's
+    ///   latest invocation (a new id, or a cgroup made again, is a new one).
+    ///
+    /// Returns the rounds that broke one, with why.
+    fn invocation_property(mutant: crate::cgroups::Mutant, rounds: u32) -> Vec<(u32, String)> {
+        use crate::cgroups::ABSENCE_MS;
+        use std::time::{Duration, Instant};
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n.max(1)
+        };
+        let names = ["wg-a", "wg-b", "ovpn"];
+        let mut failed = Vec::new();
+        'round: for round in 0..rounds {
+            // On tmpfs: like cgroupfs (whose inode is the cgroup id, never
+            // reused in a boot), and unlike ext4, it does not give a
+            // directory made again the inode of the one just removed.
+            let Ok(d) = tempfile::tempdir_in("/dev/shm") else {
+                eprintln!("skipped: no /dev/shm");
+                return failed;
+            };
+            let slice = d.path().join("system.slice");
+            std::fs::create_dir(&slice).unwrap();
+            let base = Instant::now();
+            let mut now = 0u64; // ms
+            // Per unit: the current generation standing (if any), each
+            // generation's id, whether it is set yet, and when removed.
+            let mut standing: [Option<u32>; 3] = [None; 3];
+            let mut ids: Vec<String> = Vec::new();
+            let mut set: Vec<bool> = Vec::new();
+            let mut late: Vec<bool> = Vec::new();
+            let mut removed_at: Vec<Option<u64>> = Vec::new();
+            let fresh = |inotify: bool| {
+                let mut c = Cgroups::new(d.path());
+                if !inotify {
+                    c = c.without_inotify();
+                }
+                c.mutant = mutant;
+                c
+            };
+            let mut inotify = rnd(4) != 0;
+            let mut c = fresh(inotify);
+            // Generations standing at some point while this `Cgroups` ran
+            // (not already gone when netwatch last restarted).
+            let mut seen: Vec<bool> = Vec::new();
+            // What happened, for the failure message.
+            let mut log: Vec<String> = Vec::new();
+            let mut fail =
+                |why: String, log: &[String]| failed.push((round, format!("{why}; after {}", log.join(", "))));
+            for _ in 0..40 {
+                let u = rnd(3) as usize;
+                let dir = slice.join(format!("{}.service", names[u]));
+                match rnd(10) {
+                    0..=2 if standing[u].is_none() => {
+                        let g = ids.len() as u32;
+                        ids.push(format!("{:032x}", (round as u128) << 64 | g as u128 | 1 << 40));
+                        let when = rnd(3); // 0: at once, 1: late, 2: never
+                        std::fs::create_dir(&dir).unwrap();
+                        let now_set = when == 0
+                            && rustix::fs::setxattr(
+                                &dir,
+                                "user.invocation_id",
+                                ids[g as usize].as_bytes(),
+                                rustix::fs::XattrFlags::empty(),
+                            )
+                            .is_ok();
+                        if when == 0 && !now_set {
+                            eprintln!("skipped: no user xattrs here");
+                            return failed;
+                        }
+                        set.push(now_set);
+                        late.push(when == 1);
+                        removed_at.push(None);
+                        seen.push(true);
+                        standing[u] = Some(g);
+                        log.push(format!("make {} g{g} {}", names[u], ["id", "late", "never"][when as usize]));
+                    }
+                    3 => {
+                        if let Some(g) = standing[u]
+                            && late[g as usize]
+                            && !set[g as usize]
+                        {
+                            set[g as usize] = rustix::fs::setxattr(
+                                &dir,
+                                "user.invocation_id",
+                                ids[g as usize].as_bytes(),
+                                rustix::fs::XattrFlags::empty(),
+                            )
+                            .is_ok();
+                            log.push(format!("id g{g}"));
+                        }
+                    }
+                    4..=5 => {
+                        if let Some(g) = standing[u].take() {
+                            std::fs::remove_dir(&dir).unwrap();
+                            removed_at[g as usize] = Some(now);
+                            log.push(format!("rm {} g{g} @{now}", names[u]));
+                        }
+                    }
+                    6 => {
+                        c.walk(&BTreeSet::new());
+                        log.push("walk".into());
+                    }
+                    7 if rnd(4) == 0 => {
+                        // netwatch restarts: what it knew is gone.
+                        inotify = rnd(4) != 0;
+                        c = fresh(inotify);
+                        log.push(format!("restart inotify {inotify}"));
+                        seen.iter_mut().for_each(|s| *s = false);
+                        for g in standing.iter().flatten() {
+                            seen[*g as usize] = true;
+                        }
+                    }
+                    _ => {
+                        now += rnd(2 * ABSENCE_MS);
+                        let before: Vec<_> = c.invocations().map(|(u, i)| (u.clone(), i.ended)).collect();
+                        c.drain_at(base + Duration::from_millis(now));
+                        log.push(format!("drain @{now}"));
+                        for (u, i) in c.invocations() {
+                            if i.ended && !before.iter().any(|(b, e)| b == u && *e) {
+                                fail(format!("{u:?} ended at the drain, before the ring drain"), &log);
+                                continue 'round;
+                            }
+                        }
+                        c.finish();
+                        for (k, name) in names.iter().enumerate() {
+                            let Some(inv) = state(&c, name) else { continue };
+                            let Some(id) = &inv.id else { continue };
+                            let Some(g) = ids.iter().position(|x| x == id) else {
+                                fail(format!("{name}: an id never set: {id}"), &log);
+                                continue 'round;
+                            };
+                            let gone = removed_at[g];
+                            if inv.ended && (gone.is_none() || !seen[g]) {
+                                fail(
+                                    format!(
+                                        "{name}: generation {g} ended, standing {} seen {}",
+                                        gone.is_none(),
+                                        seen[g]
+                                    ),
+                                    &log,
+                                );
+                                continue 'round;
+                            }
+                            if !inv.ended
+                                && let Some(r) = gone
+                                && now >= r + ABSENCE_MS
+                            {
+                                fail(format!("{name}: generation {g} gone at {r}, not ended at {now}"), &log);
+                                continue 'round;
+                            }
+                            if let Some(s) = standing[k]
+                                && s as usize != g
+                                && inotify
+                                && set[s as usize]
+                            {
+                                fail(format!("{name}: generation {s} stands and was seen, latest is {g}"), &log);
+                                continue 'round;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        failed
+    }
+
+    #[test]
+    fn invocations_end_only_once_seen_gone() {
+        let failed = invocation_property(crate::cgroups::Mutant::None, 300);
+        assert!(failed.is_empty(), "{:?}", &failed[..failed.len().min(3)]);
+    }
+
+    /// The property is not vacuous: each mutant of the state machine fails.
+    #[test]
+    fn the_invocation_property_catches_each_mutant() {
+        use crate::cgroups::Mutant;
+        for m in [Mutant::FinishAll, Mutant::EndAtRemoval] {
+            let failed = invocation_property(m, 300);
+            eprintln!("{m:?} fails {} rounds, first {:?}", failed.len(), failed.first());
+            assert!(failed.first().is_some_and(|(r, _)| *r < 20), "{m:?} caught late or never");
+        }
     }
 
     #[test]
@@ -1651,6 +1860,10 @@ mod hold_order {
         assert!(!ok(&file("no", Some(NEW), false), Some(NEW)), "not ended: the ring not drained after");
         assert!(!ok(&file("unknown", None, false), Some(NEW)), "a new cgroup whose id is not readable yet");
         assert!(!ok(&file("yes", Some(NEW), true), Some(NEW)), "protecting");
+        assert!(
+            !ok("protecting unknown\nat 100\ninvocation fedcba9876543210fedcba9876543210\nended\n", Some(NEW)),
+            "unknown alone: its invocation, ended, but unknown"
+        );
         assert!(!ok("", Some(NEW)), "no file");
         // Stale: written too long ago to trust.
         assert!(!hold_may_release(&view(&file("no", Some(NEW), true), 100), &vpn(), Some(NEW), 100 + 3600));
@@ -1675,6 +1888,52 @@ mod hold_order {
         t.lost(Some(&vpn()));
         let text = render(&f(&t));
         assert!(!hold_may_release(&view(&text, 100), &vpn(), Some(NEW), 100), "{text}");
+    }
+
+    /// The reviewer's case (Nov 3): a tun-based VPN steers over wg0, its
+    /// process exits and the kernel deletes the tun (no netlink request),
+    /// then its cgroup goes. The ended footprint still reads `protecting
+    /// yes` with `iface wg0` (the latch), so the hold holds and passes wg0.
+    #[test]
+    fn a_vpn_whose_interface_dies_with_it_is_held() {
+        use crate::{ChangeKind, Owner};
+        let unit = || Owner::Unit(vpn());
+        let mut t = Tracker::default();
+        t.set_invocation(&vpn(), Invocation { id: Some(NEW.into()), ended: false });
+        t.apply(&super::change(unit(), ChangeKind::Interface, "wg0", Some("wg0"), false));
+        t.apply(&super::change(unit(), ChangeKind::Route, "0.0.0.0/1", Some("wg0"), true));
+        t.apply(&super::change(unit(), ChangeKind::Route, "128.0.0.0/1", Some("wg0"), true));
+        t.set_virtual(["wg0".to_string()].into());
+        t.set_virtual(Default::default());
+        t.set_invocation(&vpn(), Invocation { id: Some(NEW.into()), ended: true });
+        let f = t.footprint(&vpn(), 100);
+        assert!(f.protecting && f.ended && f.ifaces.contains("wg0"), "{f:?}");
+        let text = render(&f);
+        assert!(!hold_may_release(&view(&text, 100), &vpn(), Some(NEW), 100), "{text}");
+        // A new invocation resets the latch: it reads what it does itself.
+        t.set_invocation(&vpn(), Invocation { id: None, ended: false });
+        t.set_invocation(&vpn(), Invocation { id: Some(OLD.into()), ended: false });
+        let f = t.footprint(&vpn(), 100);
+        assert!(!f.protecting && f.ifaces.is_empty(), "{f:?}");
+        // An id read late is the same invocation: the latch stays.
+        let mut t = Tracker::default();
+        t.set_invocation(&vpn(), Invocation { id: None, ended: false });
+        t.apply(&super::change(unit(), ChangeKind::Interface, "wg0", Some("wg0"), false));
+        t.apply(&super::change(unit(), ChangeKind::Route, "0.0.0.0/0", Some("wg0"), true));
+        t.set_virtual(Default::default());
+        t.set_invocation(&vpn(), Invocation { id: Some(NEW.into()), ended: false });
+        assert!(t.footprint(&vpn(), 100).protecting, "latched before its id was read");
+        // Its first events applied before its cgroup was seen (made between
+        // the cgroups drain and the ring drain), the last run long ended.
+        let mut t = Tracker::default();
+        t.set_invocation(&vpn(), Invocation { id: Some(OLD.into()), ended: true });
+        t.apply(&super::change(unit(), ChangeKind::Interface, "wg0", Some("wg0"), false));
+        t.apply(&super::change(unit(), ChangeKind::Route, "0.0.0.0/0", Some("wg0"), true));
+        t.set_virtual(Default::default());
+        t.set_invocation(&vpn(), Invocation { id: None, ended: false });
+        t.set_invocation(&vpn(), Invocation { id: Some(NEW.into()), ended: true });
+        let f = t.footprint(&vpn(), 100);
+        assert!(f.protecting && f.ifaces.contains("wg0"), "carried to the new invocation: {f:?}");
     }
 
     /// The formats: `invocation` is 32 lowercase hex, `ended` and
@@ -1744,15 +2003,25 @@ mod hold_order {
         /// Drain the ring, then observe removals: `ended` before the events
         /// submitted between the two are applied.
         RingFirst,
+        /// No latch: what stands when `ended` is written decides, and a
+        /// tun-based VPN's interface has left with its process by then.
+        NoLatch,
+        /// A latch, but none carried to an invocation whose cgroup was seen
+        /// after its first events were applied.
+        NoCarry,
     }
 
     /// The property (rule 23), over `Order`: random events, a random death,
-    /// the cgroup removed at some instant after, random passes of the loop,
-    /// random ring losses (charged as the loader does); the hold polls every 50 ms from the death until
-    /// 3 s after the removal. Returns the first round where a unit that
-    /// steered before it died was released, or one that did not was held
-    /// though a pass ran in time.
-    fn property(order: Order) -> Option<u32> {
+    /// the cgroup removed at some instant after, random passes of the loop
+    /// (a third of rounds with the last changes, death and removal inside
+    /// one pass's observe-to-ring gap), ring losses in a quarter of rounds
+    /// (charged as the loader does). The hold polls every 50 ms from the
+    /// death until 3 s after the removal, and may read any version of the
+    /// files written meanwhile (its phase is arbitrary). Returns the rounds
+    /// where a unit that steered before it died was released, or one that
+    /// did not was held though a loss-free pass ended it in time.
+    fn property(order: Order) -> Vec<u32> {
+        let mut failed = Vec::new();
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut rnd = move |n: u64| {
             seed ^= seed << 13;
@@ -1766,8 +2035,13 @@ mod hold_order {
             let born = 1_000_000 + rnd(2_000_000);
             let mut t = born;
             let steers = rnd(2) == 0;
+            // A third of rounds are tight: the tool's last changes, its death
+            // and its cgroup's removal all fall inside one pass, between
+            // where removals are observed and where the ring is read (the
+            // ordering bug that matters most; coordinator, Nov 3).
+            let tight = rnd(3) == 0;
             // A tool that steers and dies at once (vm-netsec), or slowly.
-            let fast = rnd(2) == 0;
+            let fast = tight || rnd(2) == 0;
             let gap = if fast { 3_000 } else { 400_000 };
             let mut events: Vec<(u64, Event)> = Vec::new();
             t += 1 + rnd(gap);
@@ -1785,28 +2059,56 @@ mod hold_order {
             // systemd sets the InvocationID before the unit's first process
             // starts; until netwatch reads it, `protecting unknown`.
             let readable = born + rnd(events[0].0 - born);
-            let death = t + 1 + rnd(if fast { 3_000 } else { 300_000 });
-            let soon = rnd(2) == 0;
-            let removed = death + rnd(if soon { 2_000 } else { 200_000 });
+            let (death, removed, forced) = if tight {
+                // The pass starts just before the first steering change (or
+                // the last change), or in half of them just before the cgroup
+                // is made (its whole life between the cgroups read and the
+                // ring read: the carry), and ends after the removal.
+                let first = events.len() - if steers { 2 } else { 1 };
+                let start = if rnd(2) == 0 { born - 1 - rnd(500) } else { events[first].0 - 1 - rnd(500) };
+                let e = (t - start) + 2_000 + rnd(16_000);
+                let death = t + 1 + rnd(start + e - t - 1);
+                let removed = death + rnd(start + e - death + 1);
+                (death, removed, Some((start, e)))
+            } else {
+                let death = t + 1 + rnd(if fast { 3_000 } else { 300_000 });
+                let soon = rnd(2) == 0;
+                (death, death + rnd(if soon { 2_000 } else { 200_000 }), None)
+            };
             let deadline = removed + 3_000_000;
             // A pass at `d`: removals observed at one instant, the ring read
             // at another `e` later (netwatch: observe first), the files
             // written at the end. Passes come at least every 50 ms when
             // idle, jittered; some late (a busy machine).
             let mut passes = Vec::new();
+            let mut forced = forced;
+            // A quarter of rounds lose events in some passes of the unit's
+            // life (a loss holds every unit until reboot, so not more).
+            let lossy = rnd(4) == 0;
             let mut d = born.saturating_sub(rnd(5_000_000));
             while d < deadline {
                 let late = rnd(10) == 0;
-                d += 1 + rnd(if late { 1_500_000 } else { 60_000 });
+                let step = 1 + rnd(if late { 1_500_000 } else { 60_000 });
                 let e = rnd(20_000);
                 // The ring overflows in this pass, losing what it reads.
-                let lost = rnd(25) == 0;
+                let lost = lossy && d + step > born && rnd(8) == 0;
+                if let Some((fd, fe)) = forced
+                    && d + step + e >= fd
+                {
+                    passes.push((fd, fe, false));
+                    d = fd + fe;
+                    forced = None;
+                    continue;
+                }
+                d += step;
                 passes.push((d, e, lost));
             }
             // Before: the last invocation's footprint, ended, `protecting no`.
             let mut files = view(&file("no", Some(OLD), true), 0);
             let mut written = 0u64;
             let mut tracker = Tracker::default();
+            tracker.no_latch = order == Order::NoLatch;
+            tracker.no_carry = order == Order::NoCarry;
             tracker.set_virtual(["wg0".to_string()].into());
             tracker.set_invocation(&vpn(), Invocation { id: Some(OLD.into()), ended: true });
             let mut inv = Invocation { id: Some(OLD.into()), ended: true };
@@ -1865,16 +2167,25 @@ mod hold_order {
                     }
                 }
                 tracker.set_invocation(&vpn(), inv.clone());
+                // The write reads sysfs: wg0 is a tun, gone with the tool's
+                // last process, with no netlink request (reviewer, Nov 3).
+                let live = if end < death { vec!["wg0".to_string()] } else { vec![] };
+                tracker.set_virtual(live.into_iter().collect());
                 files = written_files(&tracker, end / 1_000_000);
                 written = end;
+                // A hold polls at any phase: every version of the files
+                // written while it waits is one it may read.
+                if (death..=deadline).contains(&end) && release(&files, end / 1_000_000) {
+                    released = true;
+                }
                 in_time |= inv.ended && !lost && end <= deadline;
             }
             let bad = if steers { released } else { in_time && !released && files.unattributed.is_empty() };
             if bad {
-                return Some(round);
+                failed.push(round);
             }
         }
-        None
+        failed
     }
 
     /// What the hold reads after a write: the unit's file through its text
@@ -1890,14 +2201,16 @@ mod hold_order {
 
     #[test]
     fn a_unit_that_steered_before_it_died_is_never_released() {
-        assert_eq!(property(Order::Netwatch), None);
+        assert_eq!(property(Order::Netwatch), Vec::<u32>::new());
     }
 
     /// The property is not vacuous: each mutant of the order fails it.
     #[test]
     fn the_property_catches_each_mutant() {
-        for m in [Order::NotProtecting, Order::RingFirst] {
-            assert!(property(m).is_some(), "mutant {} passed", m as u8); // NotProtecting: round 3; RingFirst: 1026
+        for m in [Order::NotProtecting, Order::RingFirst, Order::NoLatch, Order::NoCarry] {
+            let failed = property(m);
+            eprintln!("mutant {} fails {} rounds, first {:?}", m as u8, failed.len(), failed.first());
+            assert!(failed.first().is_some_and(|r| *r < 50), "mutant {} caught late or never", m as u8);
         }
     }
 }

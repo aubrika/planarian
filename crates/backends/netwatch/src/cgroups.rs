@@ -36,17 +36,65 @@ pub struct Cgroups {
     pending: BTreeSet<PathBuf>,
     /// When absence was last checked (the fallback for a missed IN_DELETE).
     absence_at: Option<std::time::Instant>,
+    /// A deliberate bug, for the property to show it catches (tests only).
+    #[cfg(test)]
+    pub(crate) mutant: Mutant,
+}
+
+/// The bugs the cgroups property must catch (tests only).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Mutant {
+    #[default]
+    None,
+    /// `finish` ends every live invocation, not only those seen removed.
+    FinishAll,
+    /// A removal seen ends the invocation at once, before the ring drain.
+    EndAtRemoval,
 }
 
 /// A unit's latest invocation, as its cgroup shows it.
 #[derive(Clone, Debug)]
 struct Inv {
     dir: PathBuf,
+    /// Its cgroup's inode (the cgroup id): a cgroup made again at the same
+    /// path is another one.
+    ino: Option<u64>,
     id: Option<String>,
     /// Its cgroup was seen gone at the start of this drain: `ended` once
     /// the ring has been drained after ([`Cgroups::finish`]).
     removing: bool,
     ended: bool,
+    /// How and when its removal was seen.
+    gone: Option<(Via, std::time::Instant)>,
+}
+
+/// How an invocation's removal was seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Via {
+    /// IN_DELETE on its slice.
+    InDelete,
+    /// The absence check's `stat` (IN_DELETE not delivered).
+    Stat,
+}
+
+impl Via {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Via::InDelete => "in_delete",
+            Via::Stat => "stat",
+        }
+    }
+}
+
+/// An invocation that has just `ended` ([`Cgroups::finish`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ended {
+    pub unit: UnitId,
+    pub id: Option<String>,
+    pub via: Via,
+    /// From its removal seen to `ended`: the ring drain between.
+    pub after: std::time::Duration,
 }
 
 /// How often, at most, the unit cgroups' absence is checked by `stat`.
@@ -66,6 +114,8 @@ impl Cgroups {
             invocations: BTreeMap::new(),
             pending: BTreeSet::new(),
             absence_at: None,
+            #[cfg(test)]
+            mutant: Mutant::None,
         };
         c.watch_tree(&root.join("system.slice"));
         c.merge();
@@ -120,6 +170,11 @@ impl Cgroups {
     /// cgroup removed: in order, so a stop then a start of the same unit is
     /// a removal then a new invocation.
     pub fn drain(&mut self) {
+        self.drain_at(std::time::Instant::now());
+    }
+
+    /// [`Cgroups::drain`], as if at `now` (the absence check's clock).
+    pub(crate) fn drain_at(&mut self, now: std::time::Instant) {
         let mut seen = Vec::new();
         if let Some(fd) = self.inotify.as_ref() {
             let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 4096];
@@ -141,7 +196,7 @@ impl Cgroups {
         }
         for (deleted, dir) in seen {
             if deleted {
-                self.removed(&dir);
+                self.removed(&dir, Via::InDelete, now);
                 continue;
             }
             self.record(&dir);
@@ -154,17 +209,23 @@ impl Cgroups {
         }
         // The fallback for an IN_DELETE not delivered (the queue overflowed,
         // or no inotify): a live invocation whose cgroup is gone is removed.
-        let due = self.absence_at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(ABSENCE_MS));
+        let due = self
+            .absence_at
+            .is_none_or(|t| now.saturating_duration_since(t) >= std::time::Duration::from_millis(ABSENCE_MS));
         if due {
-            self.absence_at = Some(std::time::Instant::now());
+            self.absence_at = Some(now);
             let gone: Vec<PathBuf> = self
                 .invocations
                 .values()
-                .filter(|i| !i.ended && !i.removing && !i.dir.exists())
+                .filter(|i| {
+                    !i.ended
+                        && !i.removing
+                        && (i.ino.is_none() || std::fs::metadata(&i.dir).ok().map(|m| m.ino()) != i.ino)
+                })
                 .map(|i| i.dir.clone())
                 .collect();
             for dir in gone {
-                self.removed(&dir);
+                self.removed(&dir, Via::Stat, now);
             }
         }
     }
@@ -172,14 +233,24 @@ impl Cgroups {
     /// Called once the ring has been drained after [`Cgroups::drain`]: every
     /// invocation seen removed at that drain has `ended` (all it did was
     /// submitted before its last process exited, so before its cgroup could
-    /// be removed). Returns those units.
-    pub fn finish(&mut self) -> Vec<UnitId> {
+    /// be removed). Returns those invocations.
+    pub fn finish(&mut self) -> Vec<Ended> {
+        self.finish_at(std::time::Instant::now())
+    }
+
+    /// [`Cgroups::finish`], as if at `now`.
+    pub(crate) fn finish_at(&mut self, now: std::time::Instant) -> Vec<Ended> {
         let mut ended = Vec::new();
+        #[cfg(test)]
+        let all = self.mutant == Mutant::FinishAll;
+        #[cfg(not(test))]
+        let all = false;
         for (u, i) in self.invocations.iter_mut() {
-            if i.removing {
+            if i.removing || (all && !i.ended) {
                 i.removing = false;
                 i.ended = true;
-                ended.push(u.clone());
+                let (via, at) = i.gone.unwrap_or((Via::Stat, now));
+                ended.push(Ended { unit: u.clone(), id: i.id.clone(), via, after: now.saturating_duration_since(at) });
             }
         }
         ended
@@ -193,9 +264,15 @@ impl Cgroups {
     /// A unit cgroup seen gone: its live invocation is being removed. Only
     /// an invocation this netwatch read while its cgroup stood is ever
     /// ended, so a restarted netwatch never ends one it did not see go.
-    fn removed(&mut self, dir: &Path) {
+    fn removed(&mut self, dir: &Path, via: Via, now: std::time::Instant) {
         if let Some(i) = self.invocations.values_mut().find(|i| i.dir == dir && !i.ended) {
             i.removing = true;
+            i.gone.get_or_insert((via, now));
+            #[cfg(test)]
+            if self.mutant == Mutant::EndAtRemoval {
+                i.removing = false;
+                i.ended = true;
+            }
         }
         self.pending.remove(dir);
     }
@@ -241,17 +318,23 @@ impl Cgroups {
             return;
         };
         let id = invocation_of(dir);
-        let stands = dir.exists();
+        let ino = std::fs::metadata(dir).ok().map(|m| m.ino());
+        let stands = ino.is_some();
         if id.is_none() && stands {
             self.pending.insert(dir.to_path_buf());
         }
-        let fresh = Inv { dir: dir.to_path_buf(), id: id.clone(), removing: false, ended: false };
+        let fresh = Inv { dir: dir.to_path_buf(), ino, id: id.clone(), removing: false, ended: false, gone: None };
         match self.invocations.get_mut(&u) {
             None if id.is_some() || created => {
                 self.invocations.insert(u, fresh);
             }
             None => {}
-            Some(i) if created || (id.is_some() && id != i.id) || (i.ended && stands && id != i.id) => *i = fresh,
+            // A cgroup made again (another inode) is a new invocation even
+            // before its id is read. Without this arm the old record would
+            // stand in for it; that still never releases a hold (its id is
+            // not the one systemd gives the hold), but `protecting unknown`
+            // is what the new one should read until its id is.
+            Some(i) if created || (id.is_some() && id != i.id) || (stands && ino != i.ino && !i.removing) => *i = fresh,
             Some(i) if i.id.is_none() && !i.ended && !i.removing => i.id = id,
             Some(_) => {}
         }

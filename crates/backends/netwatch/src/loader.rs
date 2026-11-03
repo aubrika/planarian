@@ -397,10 +397,20 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         // Everything the invocations seen gone did is in the tracker now.
         // A loss in this drain may have been theirs: each is unattributed,
         // so `protecting yes`, and its hold holds.
-        for u in cgroups.finish() {
+        for e in cgroups.finish() {
             if lost_rose {
-                tracker.lost(Some(&u));
+                tracker.lost(Some(&e.unit));
             }
+            // One line per invocation ended (to the journal): how its
+            // removal was seen, and the ring drain it waited for.
+            eprintln!(
+                "netwatch: {}.service invocation {} ended via {} after {} ms{}",
+                crate::file_name(&e.unit),
+                e.id.as_deref().unwrap_or("unknown"),
+                e.via.as_str(),
+                e.after.as_millis(),
+                if lost_rose { " (events lost: unattributed)" } else { "" },
+            );
         }
         for (u, inv) in cgroups.invocations() {
             changed |= tracker.set_invocation(u, inv);
