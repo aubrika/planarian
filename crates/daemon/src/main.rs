@@ -739,3 +739,68 @@ mod tests {
         assert_eq!(session_of_cgroup(user_manager, 1000), None);
     }
 }
+
+/// Property test for the connection cap's reserve (catch-up coverage,
+/// `docs/regression-ledger.md` B13). B-15 (`db5b0f4`): many dynamic-uid
+/// services could fill the global cap. Stated whole: for any order of
+/// arrivals and departures, connections from callers neither administrators
+/// nor in a login session never hold more than `MAX_CONNS - RESERVED`, so an
+/// administrator or a session caller under its per-uid limit is admitted
+/// whenever the cap has room. `PROPTEST_CASES` goes deeper.
+#[cfg(test)]
+mod admit_props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::Config;
+
+    fn config() -> Config {
+        let cases = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(256);
+        Config { cases, failure_persistence: None, ..Config::default() }
+    }
+
+    /// Who arrives: a service with its own dynamic uid (many of them), an
+    /// administrator, or a user in a login session.
+    fn peer(kind: u8, n: u8) -> Peer {
+        match kind % 3 {
+            0 => Peer::new(61184 + n as u32, false),
+            1 => Peer::new(0, true),
+            _ => Peer::new(1000 + (n % 4) as u32, false).in_session("3"),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+
+        #[test]
+        fn the_reserve_is_never_a_services(
+            // Arrivals outnumber departures and are mostly services', so the cap
+            // is reached and the reserve pressed.
+            steps in proptest::collection::vec(
+                (prop_oneof![3 => Just(true), 1 => Just(false)], prop_oneof![6 => Just(0u8), 1 => Just(1), 1 => Just(2)], any::<u8>(), any::<prop::sample::Index>()),
+                1..400,
+            ),
+        ) {
+            // Open connections: (uid, privileged).
+            let mut open: Vec<(u32, bool)> = Vec::new();
+            for (arrive, kind, n, which) in steps {
+                if arrive || open.is_empty() {
+                    let p = peer(kind, n);
+                    let mine = open.iter().filter(|(u, _)| *u == p.uid).count();
+                    let privileged = p.admin || p.session.is_some();
+                    let ok = admits(&p, mine, open.len());
+                    if privileged && mine < PER_UID && open.len() < MAX_CONNS {
+                        prop_assert!(ok, "a privileged caller refused with {} open", open.len());
+                    }
+                    if ok {
+                        open.push((p.uid, privileged));
+                    }
+                } else {
+                    open.remove(which.index(open.len()));
+                }
+                let services = open.iter().filter(|(_, p)| !p).count();
+                prop_assert!(services <= MAX_CONNS - RESERVED, "{services} service connections hold the reserve");
+                prop_assert!(open.len() <= MAX_CONNS);
+            }
+        }
+    }
+}
