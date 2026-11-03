@@ -377,3 +377,81 @@ proptest! {
         prop_assert!(!touches_manifest(&base, &cand, &ConfigDiff::default()));
     }
 }
+
+fn option_value() -> impl Strategy<Value = Option<Value>> {
+    prop_oneof![
+        Just(None),
+        Just(Some(Value::Bool(true))),
+        Just(Some(Value::Bool(false))),
+        "[a-c]{1,2}".prop_map(|s| Some(Value::Str(s))),
+    ]
+}
+
+/// Option paths: one under a Security-sensitive tree, the rest Routine.
+const PATHS: [&str; 4] = ["services.openssh.enable", "services.openssh.ports", "fonts.scale", "time.zone"];
+
+fn options(values: &[Option<Value>]) -> BTreeMap<String, Value> {
+    PATHS.iter().zip(values).filter_map(|(k, v)| v.clone().map(|v| (k.to_string(), v))).collect()
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// C11 (`3f24a2d`): a Rollback to a generation built outside Planarian
+    /// (no recorded override) compared only the overrides, so one that only
+    /// restored a Security-sensitive option did not ask. Stated whole: for a
+    /// switch, revert or rollback with no overrides recorded, and any option
+    /// sets on either side, the facts' diff is exactly the options set
+    /// differently, and the facts are Security exactly when one of those is.
+    #[test]
+    fn a_generation_transition_carries_every_option_it_changes(
+        before in proptest::collection::vec(option_value(), 4),
+        after in proptest::collection::vec(option_value(), 4),
+        t in prop_oneof![
+            Just(Transition::Rollback),
+            Just(Transition::SwitchGeneration(GenerationId(1))),
+            Just(Transition::Revert { to: GenerationId(1) }),
+        ],
+    ) {
+        let defs = planarian_fake::fixtures::gym_units();
+        let mut base = eval(defs.clone());
+        base.options = options(&before);
+        let mut cand = eval(defs.clone());
+        cand.options = options(&after);
+        let tables = Tables {
+            catalog: Default::default(),
+            runtime_allowlist: Default::default(),
+            option_sensitivity: vec![("services.openssh".into(), Sensitivities::of(&[Sensitivity::Security]))],
+            model_catalog: Default::default(),
+        };
+        let canonical = planarian_fake::fixtures::canonical();
+        let state = planarian_schema::fixtures::empty_state(1_000);
+        let f = derive(&DeriveInput {
+            transition: &t,
+            defs: &defs,
+            base: &base,
+            candidate: Some(&cand),
+            activation: None,
+            base_overrides: &OverrideSet::default(),
+            candidate_overrides: None,
+            caller: Actor::user(0),
+            tables: &tables,
+            canonical: &canonical,
+            state: &state,
+        });
+        let changed: Vec<&str> = PATHS
+            .iter()
+            .zip(before.iter().zip(&after))
+            .filter(|(_, (b, a))| b != a)
+            .map(|(k, _)| *k)
+            .collect();
+        let got: Vec<String> = f.config_diff.as_ref().map(|d| d.options.keys().cloned().collect()).unwrap_or_default();
+        let mut want: Vec<String> = changed.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        let mut got_sorted = got.clone();
+        got_sorted.sort();
+        prop_assert_eq!(got_sorted, want, "{:?}: {:?} → {:?}", t, before, after);
+        let security = changed.iter().any(|k| k.starts_with("services.openssh"));
+        prop_assert_eq!(f.sensitivity.security, security, "{:?}: {:?} → {:?}", t, before, after);
+    }
+}
