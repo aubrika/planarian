@@ -341,3 +341,191 @@ proptest! {
         }
     }
 }
+
+/// How a checkpoint is damaged: bytes flipped or cut off, as a bad disk or
+/// a torn write leaves it, or its payload edited and re-framed with a valid
+/// CRC, as a naive editor would.
+#[derive(Clone, Debug)]
+enum Damage {
+    Flip(prop::sample::Index, u8),
+    Truncate(prop::sample::Index),
+    Reframe(prop::sample::Index, u8),
+}
+
+fn damage() -> impl Strategy<Value = Damage> {
+    prop_oneof![
+        (any::<prop::sample::Index>(), 1..=255u8).prop_map(|(i, x)| Damage::Flip(i, x)),
+        any::<prop::sample::Index>().prop_map(Damage::Truncate),
+        (any::<prop::sample::Index>(), any::<u8>()).prop_map(|(i, b)| Damage::Reframe(i, b)),
+    ]
+}
+
+/// The frame format (journal.rs's header): `len | crc32c | seq | prev |
+/// payload`, the CRC over the format tag, `seq`, `prev` and the payload.
+fn reframe(bytes: &[u8], edit: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let (seq, prev) = (&bytes[8..16], &bytes[16..48]);
+    let mut payload = bytes[48..].to_vec();
+    edit(&mut payload);
+    let mut body = Vec::new();
+    body.extend_from_slice(seq);
+    body.extend_from_slice(prev);
+    body.extend_from_slice(&payload);
+    let mut out = Vec::new();
+    out.extend_from_slice(&((32 + payload.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&crc32c::crc32c_append(crc32c::crc32c(b"planarian-journal-2"), &body).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+proptest! {
+    #![proptest_config(config(256))]
+
+    /// J8 (C16, `7059f7d`): a damaged checkpoint opens as `Integrity`, the
+    /// posture's input, never as a fresh start or another error. Before the
+    /// fix it was `Corrupt`. Only a re-framed payload that still parses,
+    /// agrees with its seq and keeps the ledger invariant can open: the
+    /// unkeyed chain cannot see that edit (B-8).
+    #[test]
+    fn a_damaged_checkpoint_is_integrity(n in 1..10usize, after in 0..4usize, d in damage()) {
+        let (store, _) = written(n);
+        let mut j = Journal::open(store.clone()).unwrap();
+        j.compact().unwrap();
+        for k in 0..after {
+            j.append(Timestamp(5_000 + k as u64), incident(50 + k as u64)).unwrap();
+        }
+        drop(j);
+        let good = store.read_checkpoint().unwrap().expect("a checkpoint");
+        let mut may_open = false;
+        let bad = match d {
+            Damage::Flip(i, x) => {
+                let mut b = good.clone();
+                let k = i.index(b.len());
+                b[k] ^= x;
+                b
+            }
+            Damage::Truncate(i) => good[..i.index(good.len())].to_vec(),
+            Damage::Reframe(i, byte) => {
+                let b = reframe(&good, |p| {
+                    let k = i.index(p.len());
+                    p[k] = if p[k] == byte { byte ^ 1 } else { byte };
+                });
+                let seq = u64::from_le_bytes(b[8..16].try_into().unwrap());
+                may_open = serde_json::from_slice::<Ledger>(&b[48..])
+                    .is_ok_and(|l| l.last_seq == seq && l.well_formed());
+                b
+            }
+        };
+        store.write_checkpoint(&bad).unwrap();
+        match Journal::open(store.clone()) {
+            Err(JournalError::Integrity(_)) => {}
+            Ok(_) if may_open => {}
+            Ok(j) => {
+                return Err(TestCaseError::fail(format!(
+                    "a damaged checkpoint ({d:?}) opened, at seq {}",
+                    j.ledger().last_seq
+                )));
+            }
+            Err(e) => return Err(TestCaseError::fail(format!("a damaged checkpoint ({d:?}) gave {e:?}, not Integrity"))),
+        }
+    }
+}
+
+/// A step against the store directly: a write (possibly overlapping
+/// earlier ones), a sync, or a power loss.
+#[derive(Clone, Debug)]
+enum IoStep {
+    Write(u8, u8, u8),
+    Sync,
+    Crash,
+}
+
+fn io_step() -> impl Strategy<Value = IoStep> {
+    prop_oneof![
+        5 => (0..200u8, 1..56u8, any::<u8>()).prop_map(|(o, l, b)| IoStep::Write(o, l, b)),
+        2 => Just(IoStep::Sync),
+        2 => Just(IoStep::Crash),
+    ]
+}
+
+/// A step against the journal: an append, a torn append, or a power loss.
+#[derive(Clone, Debug)]
+enum CrashStep {
+    Append,
+    TornAppend(prop::sample::Index),
+    Crash,
+}
+
+fn crash_step() -> impl Strategy<Value = CrashStep> {
+    prop_oneof![
+        5 => Just(CrashStep::Append),
+        1 => any::<prop::sample::Index>().prop_map(CrashStep::TornAppend),
+        2 => Just(CrashStep::Crash),
+    ]
+}
+
+proptest! {
+    #![proptest_config(config(256))]
+
+    /// J9 (P21, #32): the fake's "journal fsync is durable" contract can
+    /// fail. Against a model of the disk (what a read sees, and what the
+    /// last sync made durable), for any sequence of overlapping writes,
+    /// syncs and power losses, `MemStore` reads back the model: a crash
+    /// keeps exactly what the last sync covered. Before the fix `sync` was a
+    /// no-op and nothing was ever lost.
+    #[test]
+    fn a_crash_keeps_exactly_what_was_synced(steps in proptest::collection::vec(io_step(), 1..40)) {
+        const SIZE: usize = 256;
+        let store = MemStore::new(SIZE as u64);
+        let mut current = vec![0u8; SIZE];
+        let mut durable = current.clone();
+        for s in steps {
+            match s {
+                IoStep::Write(off, len, b) => {
+                    let (off, len) = (off as usize, len as usize);
+                    store.write_at(off as u64, &vec![b; len]).unwrap();
+                    current[off..off + len].fill(b);
+                }
+                IoStep::Sync => {
+                    store.sync().unwrap();
+                    durable = current.clone();
+                }
+                IoStep::Crash => {
+                    store.crash();
+                    current = durable.clone();
+                }
+            }
+            prop_assert_eq!(store.read_at(0, SIZE).unwrap(), current.clone());
+        }
+    }
+
+    /// J9, the journal's side: every append is fsync'd before it is applied
+    /// (§12 write-ahead), so a power loss after it keeps it, and a torn
+    /// append is lost whole. After any sequence, the journal reopens to
+    /// exactly the appends that returned `Ok`.
+    #[test]
+    fn an_accepted_append_survives_any_crash(steps in proptest::collection::vec(crash_step(), 1..24)) {
+        let store = MemStore::new(1 << 14);
+        let mut j = Journal::open(store.clone()).unwrap();
+        let mut accepted = 0u64;
+        for s in steps {
+            match s {
+                CrashStep::Append => {
+                    j.append(Timestamp(1_000 + accepted), incident(accepted)).unwrap();
+                    accepted += 1;
+                }
+                CrashStep::TornAppend(keep) => {
+                    store.tear_next_write(keep.index(64));
+                    prop_assert!(j.append(Timestamp(1_000 + accepted), incident(accepted)).is_err(), "a torn append is refused");
+                    store.crash();
+                    j = Journal::open(store.clone()).unwrap();
+                }
+                CrashStep::Crash => {
+                    store.crash();
+                    j = Journal::open(store.clone()).unwrap();
+                }
+            }
+            prop_assert_eq!(j.ledger().last_seq, accepted);
+            prop_assert_eq!(Journal::open(store.clone()).unwrap().ledger().last_seq, accepted);
+        }
+    }
+}
