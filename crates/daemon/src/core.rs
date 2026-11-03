@@ -249,6 +249,9 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// §12d: while the table is missing, the next re-apply (boot clock) and
     /// the wait after it, doubling to `HOLD_RETRY_MAX`.
     hold_retry: Option<(Timestamp, Millis)>,
+    /// §12d: units the daemon itself asked the host to hold for a stop
+    /// outside Planarian (the residue path); their `HoldApplied` is by it.
+    daemon_held: BTreeSet<UnitId>,
     /// Generation transactions withdrawn from `Built` for a rollback about to
     /// run (§12f, I6; owner decision, Nov 2), with when each began waiting,
     /// to prepare again once no generation transaction is active.
@@ -464,6 +467,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             hold_table_seen: true,
             hold_missing_noted: false,
             hold_retry: None,
+            daemon_held: BTreeSet::new(),
             withdrawn: vec![],
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
@@ -858,7 +862,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 if !in_journal {
                     // systemd's OnFailure= already holds a crash or a kill;
                     // a stop outside Planarian is the daemon's to hold.
-                    let by = if on_host == Some(true) { HoldBy::OnFailure } else { HoldBy::Daemon };
+                    let by = if self.daemon_held.remove(&u) || on_host != Some(true) {
+                        HoldBy::Daemon
+                    } else {
+                        HoldBy::OnFailure
+                    };
                     self.journal(Record::HoldApplied { unit: u.clone(), by });
                     self.notice(hold::alarm(&u));
                 }
@@ -1206,6 +1214,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             })
             .cloned()
             .collect();
+        use planarian_exec::residue::EndingFacts;
+        let host_held = self.b.units().held();
+        let mut tried_hold = false;
         for (u, def) in defs {
             let st = s.status(u, defs);
             // A Security unit killed by a termination signal that systemd
@@ -1229,7 +1240,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             let now_down = matches!(st, UnitStatus::Failed(_) | UnitStatus::Stopped);
             current.insert(u.clone(), st.clone());
             // The decision is the pure classifier's (U3; Kani: exec::kani).
-            let facts = planarian_exec::residue::EndingFacts {
+            let facts = EndingFacts {
                 was_up,
                 now_down,
                 stopped_cleanly: st == UnitStatus::Stopped,
@@ -1245,10 +1256,36 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 stops_are_faults: def.stops_are_faults,
                 systemd_restarts: def.systemd_restart.as_ref().is_some_and(|p| p.restart),
                 lenient,
+                network_tool: def.holds,
+                held: s.holds.contains(u) || host_held.as_ref().is_ok_and(|h| h.contains(u)),
+                hold_tried: false,
             };
             use planarian_exec::residue::Residue;
-            match planarian_exec::residue::classify(&facts) {
+            let mut r = planarian_exec::residue::classify(&facts);
+            if let Residue::HoldFirst(_) = r {
+                // §12d: "by planariad for a stop outside Planarian that is
+                // not attributed": ask the host, whose condition (the
+                // footprint, a release) decides, as OnFailure= does. A hold
+                // the host cannot confirm counts as held (fail closed: the
+                // unit is restarted, never inferred stopped). The next
+                // network_holds journals it, by the daemon.
+                let held = match self.b.units().hold(u) {
+                    Outcome::Failed(_) | Outcome::Unknown(_) => true,
+                    _ => self.b.units().held().map_or(true, |h| h.contains(u)),
+                };
+                if held {
+                    self.daemon_held.insert(u.clone());
+                }
+                tried_hold = true;
+                r = planarian_exec::residue::classify(&EndingFacts { held, hold_tried: true, ..facts });
+            }
+            match r {
                 Residue::NotAStop | Residue::Fault => {}
+                // The hold's own alarm (network_holds) is the alarm; the
+                // incident manager restarts it, without asking
+                // (`restarts_held_unit`).
+                Residue::AlarmHeld(_) => {}
+                Residue::HoldFirst(_) => unreachable!("classified again with hold_tried"),
                 Residue::AlarmSecurity(e) => self.notice(format!(
                     "ALARM: {u}, which is security-sensitive, was stopped outside Planarian ({}); starting it again",
                     signal_name(e)
@@ -1268,7 +1305,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         self.touched.clear();
         self.generation_touched = false;
         if down.is_empty() {
-            return false;
+            return tried_hold;
         }
         // The units whose stop no other stop in this batch explains.
         let roots: Vec<UnitId> = down
