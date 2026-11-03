@@ -2698,6 +2698,28 @@ fn a_hold_that_hangs_does_not_stall_the_tick() {
     assert!(r.calls("restart(service:gym-web)") >= 1, "never restarted: {:?}", r.core.notices);
 }
 
+/// §12d (catalog 41644729493, vm-netsec): probe time does not spend the
+/// hold budget. Each probe batch here takes longer than HOLD_WAIT (the hold
+/// drops the probes' traffic, so they run to their timeouts); a budget
+/// counted from the tick's start was gone before the lift was reached, and
+/// gym-web, back and Running, stayed held for good.
+#[test]
+fn slow_probes_do_not_starve_a_lift() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, false);
+    r.fake.w().probe_batch_ms = crate::core::HOLD_WAIT.0 + 1_000;
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(12);
+    assert!(r.calls("restart(service:gym-web)") >= 1, "never restarted: {:?}", r.core.notices);
+    assert!(
+        r.fake.w().calls.iter().any(|c| c.call == "lift_hold(service:gym-web)"),
+        "the lift was never asked for: {:?}",
+        r.core.notices
+    );
+    assert!(!r.fake.w().held.contains(&web), "gym-web is back but still held");
+    assert_eq!(r.core.ledger().hold_events, vec![(web.clone(), true), (web.clone(), false)]);
+}
+
 /// §13: the hold a third regression sets runs from the decision, after the
 /// probes, like every cooldown and backoff (prop-auditor's Relapse(369):
 /// gym-flap fails 369 s after each start, so each repair stabilizes past

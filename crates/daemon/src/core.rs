@@ -266,7 +266,7 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// other units' lifts.
     hold_unconfirmed: BTreeMap<UnitId, Timestamp>,
     /// §12d: the end of this tick's hold budget (`hold_wait`).
-    hold_deadline: Timestamp,
+    hold_deadline: Option<Timestamp>,
     /// Generation transactions withdrawn from `Built` for a rollback about to
     /// run (§12f, I6; owner decision, Nov 2), with when each began waiting,
     /// to prepare again once no generation transaction is active.
@@ -484,7 +484,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             hold_retry: None,
             daemon_held: BTreeSet::new(),
             hold_unconfirmed: BTreeMap::new(),
-            hold_deadline: Timestamp(0),
+            hold_deadline: None,
             withdrawn: vec![],
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
@@ -831,17 +831,19 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// hold (fail closed).
     /// Returns whether it applied a hold the observed state does not show.
     /// What is left of this tick's hold budget: every hold call on the tick
-    /// (apply, lift, the table check, a re-apply) waits at most this, and
-    /// none is made once it is spent (the caller takes it as "cannot say",
-    /// the fail-closed side). So a stuck `systemctl` or `nft` holds the tick
-    /// up for HOLD_WAIT in all, not per call (reviewer, #61). Outside a
-    /// tick (a request), a whole HOLD_WAIT.
-    fn hold_wait(&self) -> Option<Millis> {
+    /// (apply, lift, the table check, a re-apply) waits
+    /// at most this, and none is made once it is spent (the caller takes it
+    /// as "cannot say", the fail-closed side). So a stuck `systemctl` or
+    /// `nft` holds the tick up for HOLD_WAIT in all, not per call (reviewer,
+    /// #61). The budget starts at the tick's first hold call, not the tick's
+    /// start: probes the hold itself slows (their traffic is dropped) must
+    /// not spend it (catalog 41644729493, vm-netsec); and lifts are made
+    /// first (network_holds), so other units' calls cannot keep a unit that
+    /// is back held (a livelock).
+    fn hold_wait(&mut self) -> Option<Millis> {
         let now = self.b.clock().boot_now();
-        if self.hold_deadline.0 == 0 {
-            return Some(HOLD_WAIT);
-        }
-        let left = self.hold_deadline.0.saturating_sub(now.0);
+        let deadline = *self.hold_deadline.get_or_insert(now.plus(HOLD_WAIT));
+        let left = deadline.0.saturating_sub(now.0);
         (left > 0).then_some(Millis(left))
     }
 
@@ -875,6 +877,24 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         if let Ok(h) = &host {
             holding.extend(h.iter().cloned());
         }
+        // Lifts first, before the table check and any unit's hold: a unit
+        // that is back is never kept held because the tick's hold budget
+        // went on other units' calls (catalog 41644729493). A unit whose
+        // release just ended, or that OnFailure= held unseen, takes the
+        // loop below (it has its own bookkeeping first).
+        let mut lifted = BTreeSet::new();
+        for u in &units {
+            if journaled.contains(u)
+                && !self.hold_released.contains(u)
+                && s.override_of(&hold::hold_unit(u)).is_none()
+                && !hold::failed(s, defs, u)
+                && hold::back(s, defs, u)
+            {
+                self.lift_back(u);
+                lifted.insert(u.clone());
+            }
+        }
+        holding.retain(|u| !lifted.contains(u));
         if holding.is_empty() {
             self.hold_table_seen = true;
             self.hold_missing_noted = false;
@@ -892,6 +912,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             if on_host == Some(true) {
                 // The host has it: a later timeout is news again.
                 self.hold_unconfirmed.remove(&u);
+            }
+            if lifted.contains(&u) {
+                continue;
             }
             // An attested release (an override on the hold unit) lifts it
             // until the release ends.
@@ -964,27 +987,29 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::OnFailure });
                 }
                 if hold::back(s, defs, &u) {
-                    self.journal(Record::HoldLifted {
-                        unit: u.clone(),
-                        reason: "Running, and its Readiness probes pass".into(),
-                    });
-                    let o = match self.hold_wait() {
-                        Some(w) => self.b.units().lift_hold(&u, w),
-                        None => Outcome::Unknown("no time left on this tick".into()),
-                    };
-                    match o {
-                        o @ (Outcome::Failed(_) | Outcome::Unknown(_)) => {
-                            self.notice(format!("{u}: the hold could not be lifted ({o:?}); its traffic stays blocked"))
-                        }
-                        _ => {
-                            self.hold_notified.remove(&u);
-                            self.notice(format!("{u} is back; network traffic flows again"));
-                        }
-                    }
+                    self.lift_back(&u);
                 }
             }
         }
         applied
+    }
+
+    /// Lifts a back unit's hold: journaled, then asked of the host.
+    fn lift_back(&mut self, u: &UnitId) {
+        self.journal(Record::HoldLifted { unit: u.clone(), reason: "Running, and its Readiness probes pass".into() });
+        let o = match self.hold_wait() {
+            Some(w) => self.b.units().lift_hold(u, w),
+            None => Outcome::Unknown("no time left on this tick".into()),
+        };
+        match o {
+            o @ (Outcome::Failed(_) | Outcome::Unknown(_)) => {
+                self.notice(format!("{u}: the hold could not be lifted ({o:?}); its traffic stays blocked"))
+            }
+            _ => {
+                self.hold_notified.remove(u);
+                self.notice(format!("{u} is back; network traffic flows again"));
+            }
+        }
     }
 
     /// §12d: the hold's table, while a hold stands. Missing: alarm once, then
@@ -1627,8 +1652,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     }
 
     pub fn tick(&mut self) {
-        // §12d: all hold calls in this tick share one HOLD_WAIT.
-        self.hold_deadline = self.b.clock().boot_now().plus(HOLD_WAIT);
+        // §12d: all hold calls in this tick share one HOLD_WAIT, counted
+        // from the first of them (hold_wait), not from the tick's start.
+        self.hold_deadline = None;
         // I7's agent for an approval is needed only while the change is
         // parked; a cancelled, expired, invalidated or refused one leaves.
         // An approved one leaves `ex.parked` only inside `Executor::approve`,
