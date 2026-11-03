@@ -2535,6 +2535,7 @@ mod limit_props {
             }
         }
     }
+}
 
 // ---- §12d/§11: the residue of a held network tool (reviewer's case,
 // gate 41571048192, vm-netwatch (f)). A network tool whose stop outside
