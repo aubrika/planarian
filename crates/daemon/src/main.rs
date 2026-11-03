@@ -322,7 +322,35 @@ enum Event {
     Built(Resume, Box<Prebuilt>, Reply),
 }
 
+/// `planariad --check-export <path>`: an export.json read exactly as
+/// planariad reads a generation's (`nixos::Export`, which `evaluate_built`
+/// deserializes), for the module's cross-boundary check (#38). The round
+/// trip is what planariad would see: keys it drops, and defaults it fills.
+fn check_export(text: &str) -> Result<String, String> {
+    let export: planarian_backend_linux::nixos::Export = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    serde_json::to_string(&export).map_err(|e| e.to_string())
+}
+
 fn main() {
+    // Before anything else (no config, no journal): a pure check.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--check-export") {
+        let Some(path) = args.get(2) else {
+            eprintln!("usage: planariad --check-export <path>");
+            std::process::exit(2);
+        };
+        let out = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}")).and_then(|t| check_export(&t));
+        match out {
+            Ok(json) => {
+                println!("{json}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("planariad --check-export: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let cfg_path = std::env::var("PLANARIAN_CONFIG").unwrap_or_else(|_| CONFIG.into());
     let file = match FileConfig::load(Path::new(&cfg_path)) {
         Ok(c) => c,
@@ -674,6 +702,22 @@ fn hooks_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--check-export` (#38's cross-boundary check): the round trip of an
+    /// export as planariad reads it. Keys it does not know are dropped,
+    /// missing ones come back as their defaults, and what it cannot read is
+    /// an error; the round trip is stable.
+    #[test]
+    fn check_export_round_trips_what_planariad_reads() {
+        let out = check_export(r#"{"units": [], "notAField": 1}"#).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("notAField").is_none(), "an unknown key is dropped: {out}");
+        assert_eq!(v["userUnits"], serde_json::json!([]), "a missing key is its default: {out}");
+        assert_eq!(check_export(&out).unwrap(), out, "the round trip is stable");
+        // What planariad cannot read is an error, not an empty export.
+        assert!(check_export(r#"{"units": 5}"#).is_err());
+        assert!(check_export("not json").is_err());
+    }
 
     #[test]
     fn a_peer_is_read_through_its_pidfd() {
