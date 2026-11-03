@@ -69,6 +69,23 @@ pub struct Footprint {
     /// lowercase hex), from its cgroup's `trusted.invocation_id`.
     #[serde(default)]
     pub invocation: Option<String>,
+    /// That invocation's cgroup is gone and the ring was drained after:
+    /// nothing it did is still to come (crate docs, "The hold's order").
+    #[serde(default)]
+    pub ended: bool,
+    /// A new invocation's cgroup exists but its id is not read yet:
+    /// `protecting unknown` (and `protecting` is true: fail closed).
+    #[serde(default)]
+    pub unknown: bool,
+}
+
+/// What netwatch knows of a unit's latest invocation, from its cgroup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Invocation {
+    /// Its InvocationID, once read; `None` while systemd has not set it.
+    pub id: Option<String>,
+    /// Its cgroup is gone and the ring was drained after.
+    pub ended: bool,
 }
 
 /// The watch's state, as `.watch` carries it.
@@ -154,9 +171,9 @@ pub struct Tracker {
     /// steering route is one over "an interface it created": a default route
     /// over the machine's own NIC is not one, watched or found at attach.
     virtual_ifaces: BTreeSet<String>,
-    /// Each unit's latest InvocationID seen (not kept across restarts: the
+    /// Each unit's latest invocation seen (not kept across restarts: the
     /// cgroups are read again on attach).
-    invocations: BTreeMap<UnitId, String>,
+    invocations: BTreeMap<UnitId, Invocation>,
     /// A lost event could not be placed: everything counts as unattributed
     /// until the watch restarts (which re-reads the kernel's state).
     lost_unplaced: bool,
@@ -351,12 +368,13 @@ impl Tracker {
 
     /// An event was lost. With the unit known, its footprint is marked
     /// unattributed; without, the global marker stands.
-    /// The unit's InvocationID as its cgroup carries it; whether it changed.
-    pub fn set_invocation(&mut self, unit: &UnitId, id: &str) -> bool {
-        if self.invocations.get(unit).is_some_and(|i| i == id) {
+    /// The unit's latest invocation as its cgroup shows it; whether it
+    /// changed.
+    pub fn set_invocation(&mut self, unit: &UnitId, inv: Invocation) -> bool {
+        if self.invocations.get(unit) == Some(&inv) {
             return false;
         }
-        self.invocations.insert(unit.clone(), id.to_string());
+        self.invocations.insert(unit.clone(), inv);
         true
     }
 
@@ -376,8 +394,13 @@ impl Tracker {
 
     /// The footprint of `unit` now, confirmed at `at`.
     pub fn footprint(&self, unit: &UnitId, at: u64) -> Footprint {
-        let invocation = self.invocations.get(unit).cloned();
-        let Some(s) = self.units.get(unit) else { return Footprint { at, invocation, ..Default::default() } };
+        let inv = self.invocations.get(unit);
+        let invocation = inv.and_then(|i| i.id.clone());
+        let ended = inv.is_some_and(|i| i.ended && i.id.is_some());
+        let unknown = inv.is_some_and(|i| i.id.is_none());
+        let Some(s) = self.units.get(unit) else {
+            return Footprint { at, protecting: unknown, invocation, ended, unknown, ..Default::default() };
+        };
         // Only a virtual link can be one a tool created; a physical NIC is
         // registered by its driver, whoever's context that runs in.
         let created: BTreeSet<String> = s
@@ -417,13 +440,16 @@ impl Tracker {
             // A change charged here that could not be fully attributed counts
             // as protecting (fail closed), and the file says so: `protecting
             // yes` with its `unattributed` line, as the hold reads it anyway.
-            protecting: s.unattributed
+            protecting: unknown
+                || s.unattributed
                 || !ifaces.is_empty()
                 || s.objects.iter().any(|((k, _), (_, steers))| *steers && own(k)),
             ifaces,
             endpoints: s.endpoints.clone(),
             unattributed: s.unattributed,
             invocation,
+            ended,
+            unknown,
         }
     }
 

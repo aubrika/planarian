@@ -23,54 +23,20 @@ const WATCH: &str = ".watch";
 /// dot-file: the hold reads only `.watch` and `.unattributed`).
 const STATE: &str = ".state";
 const UNATTRIBUTED: &str = ".unattributed";
-const DRAINED: &str = ".drained";
-
-/// The ring buffer's watermark (`.drained`): both clocks, read together
-/// *before* a drain began, written once that drain's changes were applied
-/// and the footprint files written. So every event submitted before
-/// `monotonic_us` is in the files (crate docs, "The hold's order").
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Drained {
-    pub boottime_us: u64,
-    pub monotonic_us: u64,
-}
-
-/// Write `.drained` atomically: `<boottime_us> <monotonic_us>`.
-pub fn write_drained(dir: &Path, d: Drained) -> io::Result<()> {
-    put(dir, DRAINED, &format!("{} {}\n", d.boottime_us, d.monotonic_us))
-}
-
-/// `.drained`, if it reads.
-pub fn read_drained(dir: &Path) -> Option<Drained> {
-    parse_drained(&std::fs::read_to_string(dir.join(DRAINED)).ok()?)
-}
-
-pub(crate) fn parse_drained(s: &str) -> Option<Drained> {
-    match s.split_whitespace().collect::<Vec<_>>().as_slice() {
-        [b, m] => Some(Drained { boottime_us: b.parse().ok()?, monotonic_us: m.parse().ok()? }),
-        _ => None,
-    }
-}
-
 /// The hold's condition on a failure, as lane-nix's script implements it
-/// (crate docs, "The hold's order"): it may release only when (a) the ring
-/// was drained past the unit's death (`death_monotonic_us`, systemd's
-/// `InactiveEnterTimestampMonotonic`), (b) the footprint describes the
-/// invocation that died (`invocation`, systemd's `InvocationID`), and (c)
-/// the footprint reads not protecting at `now`. Anything else holds. The
-/// reference the property tests check the files against.
-pub fn hold_may_release(
-    view: &FootprintView,
-    drained: Option<Drained>,
-    unit: &UnitId,
-    death_monotonic_us: u64,
-    invocation: Option<&str>,
-    now: u64,
-) -> bool {
+/// (crate docs, "The hold's order"): it may release only when the unit's
+/// footprint describes the invocation that failed (`invocation`, systemd's
+/// `InvocationID`), that invocation has `ended` (its cgroup is gone and the
+/// ring drained after, so nothing it did is still to come), and the
+/// footprint reads `protecting no` at `now`, with nothing unattributed.
+/// Anything else holds. The reference the property tests check.
+pub fn hold_may_release(view: &FootprintView, unit: &UnitId, invocation: Option<&str>, now: u64) -> bool {
     let name = file_name(unit);
-    drained.is_some_and(|d| d.monotonic_us >= death_monotonic_us)
-        && invocation.is_some()
-        && view.units.get(&name).and_then(|f| f.invocation.as_deref()) == invocation
+    let Some(f) = view.units.get(&name) else { return false };
+    invocation.is_some()
+        && f.invocation.as_deref() == invocation
+        && f.ended
+        && !f.unknown
         && !view.protecting_now(&name, now)
 }
 
@@ -89,9 +55,19 @@ fn proto(p: Proto) -> &'static str {
 }
 
 pub(crate) fn render(f: &Footprint) -> String {
-    let mut s = format!("protecting {}\nat {}\n", if f.protecting { "yes" } else { "no" }, f.at);
+    let protecting = if f.unknown {
+        "unknown"
+    } else if f.protecting {
+        "yes"
+    } else {
+        "no"
+    };
+    let mut s = format!("protecting {protecting}\nat {}\n", f.at);
     if let Some(i) = &f.invocation {
         s.push_str(&format!("invocation {i}\n"));
+    }
+    if f.ended {
+        s.push_str("ended\n");
     }
     for i in &f.ifaces {
         s.push_str(&format!("iface {i}\n"));
@@ -163,6 +139,12 @@ pub(crate) fn parse_footprint(text: &str) -> Option<Footprint> {
             }
             ["protecting", "yes"] => f.protecting = true,
             ["protecting", "no"] => f.protecting = false,
+            // Unknown counts as protecting (fail closed).
+            ["protecting", "unknown"] => {
+                f.protecting = true;
+                f.unknown = true;
+            }
+            ["ended"] => f.ended = true,
             ["iface", i] => {
                 f.ifaces.insert((*i).to_string());
             }

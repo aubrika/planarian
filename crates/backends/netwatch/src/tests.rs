@@ -587,6 +587,83 @@ mod cgroups {
     }
 
     /// A tick's walk merges: a unit whose cgroup went is still known.
+    const NEW: &str = "fedcba9876543210fedcba9876543210";
+    const NEXT: &str = "00112233445566778899aabbccddeeff";
+
+    /// A unit cgroup with its InvocationID (as `user.invocation_id`, which
+    /// an unprivileged test can set); `false` if this filesystem refuses.
+    fn start(dir: &std::path::Path, id: Option<&str>) -> bool {
+        std::fs::create_dir(dir).unwrap();
+        id.is_none_or(|id| {
+            rustix::fs::setxattr(dir, "user.invocation_id", id.as_bytes(), rustix::fs::XattrFlags::empty()).is_ok()
+        })
+    }
+
+    fn state(c: &Cgroups, u: &str) -> Option<crate::Invocation> {
+        c.invocations().find(|(x, _)| **x == UnitId::service(u)).map(|(_, i)| i)
+    }
+
+    fn inv(id: Option<&str>, ended: bool) -> Option<crate::Invocation> {
+        Some(crate::Invocation { id: id.map(str::to_string), ended })
+    }
+
+    /// An invocation ends on IN_DELETE, and only at `finish` (after the
+    /// ring drain); a restart is a new invocation; a cgroup whose id is not
+    /// readable yet is a new one with none (`protecting unknown`).
+    #[test]
+    fn an_invocation_ends_when_its_cgroup_goes() {
+        let (d, slice) = tree();
+        let vpn = slice.join("wg-gym.service");
+        if !start(&vpn, Some(NEW)) {
+            eprintln!("skipped: no user xattrs here");
+            return;
+        }
+        let mut c = Cgroups::new(d.path());
+        assert_eq!(state(&c, "wg-gym"), inv(Some(NEW), false), "read at the walk");
+        std::fs::remove_dir(&vpn).unwrap();
+        c.drain();
+        assert_eq!(state(&c, "wg-gym"), inv(Some(NEW), false), "not ended before the ring drain");
+        assert_eq!(c.finish(), vec![UnitId::service("wg-gym")]);
+        assert_eq!(state(&c, "wg-gym"), inv(Some(NEW), true));
+        assert!(c.finish().is_empty(), "once");
+        assert!(start(&vpn, Some(NEXT)));
+        c.drain();
+        assert_eq!(state(&c, "wg-gym"), inv(Some(NEXT), false), "restarted: a new invocation");
+        assert!(start(&slice.join("late.service"), None));
+        c.drain();
+        assert_eq!(state(&c, "late"), inv(None, false), "made, id not set yet");
+    }
+
+    /// Without IN_DELETE (refused, or the queue overflowed), the absence
+    /// check at a drain sees the cgroup gone.
+    #[test]
+    fn an_invocation_ends_by_absence_without_inotify() {
+        let (d, slice) = tree();
+        let vpn = slice.join("wg-gym.service");
+        if !start(&vpn, Some(NEW)) {
+            eprintln!("skipped: no user xattrs here");
+            return;
+        }
+        let mut c = Cgroups::new(d.path()).without_inotify();
+        std::fs::remove_dir(&vpn).unwrap();
+        c.drain();
+        assert_eq!(c.finish(), vec![UnitId::service("wg-gym")]);
+        assert_eq!(state(&c, "wg-gym"), inv(Some(NEW), true));
+    }
+
+    /// After a netwatch restart, an invocation whose cgroup was already gone
+    /// is not known at all, so never `ended`: its hold holds.
+    #[test]
+    fn a_restart_never_ends_an_invocation_it_did_not_see_go() {
+        let (d, slice) = tree();
+        let mut c = Cgroups::new(d.path());
+        assert!(start(&slice.join("other.service"), None));
+        c.drain();
+        assert_eq!(state(&c, "wg-gym"), None);
+        assert!(c.finish().is_empty());
+        let _ = slice;
+    }
+
     #[test]
     fn the_map_merges_and_does_not_replace() {
         let (d, slice) = tree();
@@ -1524,14 +1601,15 @@ mod rulings_nov3 {
 
 /// The hold's order on a failure (coordinator, Nov 3; vm-netsec: a VPN that
 /// steered and died before netwatch's next write read as not protecting).
-/// The files say which invocation they describe and `.drained` how far the
-/// ring is applied; the hold releases only when both line up and the
-/// footprint reads not protecting (`hold_may_release`).
+/// Each footprint names the unit's latest invocation, and says `ended` once
+/// that invocation's cgroup is gone and the ring has been drained after; the
+/// hold releases only on its own invocation, `ended`, and not protecting
+/// (`hold_may_release`).
 mod hold_order {
-    use crate::contract::{parse_drained, parse_footprint, render};
+    use crate::contract::{parse_footprint, render};
     use crate::ebpf::{Event, HOOK_NETDEV, HOOK_RTNETLINK};
     use crate::parse::take;
-    use crate::{Drained, FootprintView, Tracker, WatchState, hold_may_release};
+    use crate::{FootprintView, Invocation, Tracker, WatchState, hold_may_release};
     use planarian_schema::UnitId;
 
     const HOST: u32 = 0xF000_0000;
@@ -1550,48 +1628,71 @@ mod hold_order {
         v
     }
 
-    fn file(protecting: &str, invocation: Option<&str>) -> String {
+    fn file(protecting: &str, invocation: Option<&str>, ended: bool) -> String {
         let mut s = format!("protecting {protecting}\nat 100\n");
         if let Some(i) = invocation {
             s.push_str(&format!("invocation {i}\n"));
         }
+        if ended {
+            s.push_str("ended\n");
+        }
         s
     }
 
-    fn at(m: u64) -> Option<Drained> {
-        Some(Drained { boottime_us: m + 7, monotonic_us: m })
-    }
-
-    /// The table: (b) the invocation, (a) the watermark, (c) protecting.
+    /// The table: the invocation, `ended`, and protecting.
     #[test]
     fn the_hold_releases_only_when_everything_lines_up() {
-        let death = 80_130_000;
-        let ok = |f: &str, d: Option<Drained>, inv: Option<&str>| {
-            hold_may_release(&view(f, 100), d, &vpn(), death, inv, 100)
-        };
-        assert!(ok(&file("no", Some(NEW)), at(death), Some(NEW)), "matching, drained at the death, not protecting");
-        assert!(!ok(&file("no", Some(OLD)), at(death + 1), Some(NEW)), "stale: the last invocation's");
-        assert!(!ok(&file("no", None), at(death + 1), Some(NEW)), "no invocation in the file");
-        assert!(!ok(&file("no", Some(NEW)), at(death + 1), None), "systemd gave none");
-        assert!(!ok(&file("no", Some(NEW)), at(death - 1), Some(NEW)), "drained before the death");
-        assert!(!ok(&file("no", Some(NEW)), None, Some(NEW)), "no watermark");
-        assert!(!ok(&file("yes", Some(NEW)), at(death + 1), Some(NEW)), "protecting");
-        assert!(!ok("", at(death + 1), Some(NEW)), "no file");
+        let ok = |f: &str, inv: Option<&str>| hold_may_release(&view(f, 100), &vpn(), inv, 100);
+        assert!(ok(&file("no", Some(NEW), true), Some(NEW)), "its invocation, ended, not protecting");
+        assert!(!ok(&file("no", Some(OLD), true), Some(NEW)), "stale: the last invocation's");
+        assert!(!ok(&file("no", None, false), Some(NEW)), "no invocation in the file");
+        assert!(!ok(&file("no", Some(NEW), true), None), "systemd gave none");
+        assert!(!ok(&file("no", Some(NEW), true), Some(OLD)), "another invocation");
+        assert!(!ok(&file("no", Some(NEW), false), Some(NEW)), "not ended: the ring not drained after");
+        assert!(!ok(&file("unknown", None, false), Some(NEW)), "a new cgroup whose id is not readable yet");
+        assert!(!ok(&file("yes", Some(NEW), true), Some(NEW)), "protecting");
+        assert!(!ok("", Some(NEW)), "no file");
+        // Stale: written too long ago to trust.
+        assert!(!hold_may_release(&view(&file("no", Some(NEW), true), 100), &vpn(), Some(NEW), 100 + 3600));
     }
 
-    /// The formats: `invocation` is 32 lowercase hex or the file is not
-    /// trusted; `.drained` is two integers.
+    /// The footprint the tracker gives for each invocation state.
+    #[test]
+    fn the_tracker_writes_the_invocation_state() {
+        let mut t = Tracker::default();
+        let f = |t: &Tracker| t.footprint(&vpn(), 100);
+        assert!(f(&t).invocation.is_none() && !f(&t).ended && !f(&t).unknown);
+        assert!(t.set_invocation(&vpn(), Invocation { id: None, ended: false }));
+        assert!(f(&t).unknown && f(&t).protecting, "an unread id is protecting unknown");
+        assert!(render(&f(&t)).starts_with("protecting unknown\n"));
+        assert!(t.set_invocation(&vpn(), Invocation { id: Some(NEW.into()), ended: false }));
+        assert!(!t.set_invocation(&vpn(), Invocation { id: Some(NEW.into()), ended: false }), "unchanged");
+        assert_eq!(f(&t).invocation.as_deref(), Some(NEW));
+        assert!(!f(&t).ended && !f(&t).unknown && !f(&t).protecting);
+        assert!(t.set_invocation(&vpn(), Invocation { id: Some(NEW.into()), ended: true }));
+        assert!(f(&t).ended);
+        // A loss in the drain that ended it: unattributed, so it holds.
+        t.lost(Some(&vpn()));
+        let text = render(&f(&t));
+        assert!(!hold_may_release(&view(&text, 100), &vpn(), Some(NEW), 100), "{text}");
+    }
+
+    /// The formats: `invocation` is 32 lowercase hex, `ended` and
+    /// `protecting unknown` bare, or the file is not trusted.
     #[test]
     fn the_formats_parse_strictly() {
-        let f = parse_footprint(&file("no", Some(NEW))).unwrap();
+        let f = parse_footprint(&file("no", Some(NEW), true)).unwrap();
         assert_eq!(f.invocation.as_deref(), Some(NEW));
+        assert!(f.ended && !f.unknown && !f.protecting);
         assert_eq!(parse_footprint(&render(&f)), Some(f), "round trip");
+        let u = parse_footprint("protecting unknown\nat 1\n").unwrap();
+        assert!(u.unknown && u.protecting);
+        assert_eq!(parse_footprint(&render(&u)), Some(u), "round trip");
         for bad in ["FEDCBA9876543210FEDCBA9876543210", "fedcba98", "fedcba9876543210fedcba987654321g"] {
             assert_eq!(parse_footprint(&format!("protecting no\nat 1\ninvocation {bad}\n")), None, "{bad}");
         }
-        assert_eq!(parse_drained("12 34\n"), Some(Drained { boottime_us: 12, monotonic_us: 34 }));
-        for bad in ["", "12", "12 x", "12 34 56"] {
-            assert_eq!(parse_drained(bad), None, "{bad:?}");
+        for bad in ["ended yes", "invocation", "protecting maybe"] {
+            assert_eq!(parse_footprint(&format!("protecting no\nat 1\n{bad}\n")), None, "{bad}");
         }
         // The xattr's value, as systemd writes it (raw bytes or hex).
         #[cfg(feature = "loader")]
@@ -1633,13 +1734,25 @@ mod hold_order {
         (i == 9).then(|| "wg0".into())
     }
 
-    /// The property (rule 23): random event times, a random death and a
-    /// random drain schedule, netwatch's order (stamp, drain, write the
-    /// files, then the watermark) and the hold polling until 2 s after the
-    /// death. Never released if the unit steered before it died; released
-    /// once a drain after the death has run if it did not.
-    #[test]
-    fn a_unit_that_steered_before_it_died_is_never_released() {
+    /// What the property runs: netwatch's order, or one of its mutants.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Order {
+        /// Observe removals, drain the ring, then `ended` (the loader's).
+        Netwatch,
+        /// Release on `protecting no` alone (the rule before Nov 3).
+        NotProtecting,
+        /// Drain the ring, then observe removals: `ended` before the events
+        /// submitted between the two are applied.
+        RingFirst,
+    }
+
+    /// The property (rule 23), over `Order`: random events, a random death,
+    /// the cgroup removed at some instant after, random passes of the loop,
+    /// random ring losses (charged as the loader does); the hold polls every 50 ms from the death until
+    /// 3 s after the removal. Returns the first round where a unit that
+    /// steered before it died was released, or one that did not was held
+    /// though a pass ran in time.
+    fn property(order: Order) -> Option<u32> {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut rnd = move |n: u64| {
             seed ^= seed << 13;
@@ -1648,48 +1761,71 @@ mod hold_order {
             seed % n.max(1)
         };
         for round in 0..3000 {
-            // The invocation's cgroup appears at `born`; its events follow;
-            // it dies at `death`. Times in µs of CLOCK_MONOTONIC.
+            // Times in µs. The cgroup is made at `born`, its events follow, its last process exits at
+            // `death`, and its cgroup is removed at `removed`.
             let born = 1_000_000 + rnd(2_000_000);
             let mut t = born;
             let steers = rnd(2) == 0;
+            // A tool that steers and dies at once (vm-netsec), or slowly.
+            let fast = rnd(2) == 0;
+            let gap = if fast { 3_000 } else { 400_000 };
             let mut events: Vec<(u64, Event)> = Vec::new();
-            t += 1 + rnd(400_000);
+            t += 1 + rnd(gap);
             events.push((t, registered("wg0")));
             for _ in 0..rnd(4) {
-                t += 1 + rnd(400_000);
+                t += 1 + rnd(gap);
                 events.push((t, route(10, 24))); // steers nothing
             }
             if steers {
                 for dst in [0u8, 128] {
-                    t += 1 + rnd(400_000);
+                    t += 1 + rnd(gap);
                     events.push((t, route(dst, 1)));
                 }
             }
-            let death = t + 1 + rnd(300_000);
-            // Drains: one at least every 50 ms when idle (the loop's wait),
-            // jittered; some may be late (a busy machine).
-            let mut drains = Vec::new();
+            // systemd sets the InvocationID before the unit's first process
+            // starts; until netwatch reads it, `protecting unknown`.
+            let readable = born + rnd(events[0].0 - born);
+            let death = t + 1 + rnd(if fast { 3_000 } else { 300_000 });
+            let soon = rnd(2) == 0;
+            let removed = death + rnd(if soon { 2_000 } else { 200_000 });
+            let deadline = removed + 3_000_000;
+            // A pass at `d`: removals observed at one instant, the ring read
+            // at another `e` later (netwatch: observe first), the files
+            // written at the end. Passes come at least every 50 ms when
+            // idle, jittered; some late (a busy machine).
+            let mut passes = Vec::new();
             let mut d = born.saturating_sub(rnd(5_000_000));
-            while d < death + 3_000_000 {
+            while d < deadline {
                 let late = rnd(10) == 0;
                 d += 1 + rnd(if late { 1_500_000 } else { 60_000 });
-                drains.push(d);
+                let e = rnd(20_000);
+                // The ring overflows in this pass, losing what it reads.
+                let lost = rnd(25) == 0;
+                passes.push((d, e, lost));
             }
-            // Before: the last invocation's footprint, `protecting no`.
-            let mut files = file("no", Some(OLD));
-            let mut watermark: Option<Drained> = at(born.saturating_sub(1));
+            // Before: the last invocation's footprint, ended, `protecting no`.
+            let mut files = view(&file("no", Some(OLD), true), 0);
+            let mut written = 0u64;
             let mut tracker = Tracker::default();
             tracker.set_virtual(["wg0".to_string()].into());
+            tracker.set_invocation(&vpn(), Invocation { id: Some(OLD.into()), ended: true });
+            let mut inv = Invocation { id: Some(OLD.into()), ended: true };
+            let mut seen_born = false;
+            let mut removing = false;
             let mut next = 0;
             let mut released = false;
             let mut poll = death;
-            let deadline = death + 2_000_000;
-            for &d in &drains {
-                // The hold polls (every 50 ms) what was written before `d`.
-                while poll < d && poll <= deadline {
-                    let now = poll / 1_000_000;
-                    if hold_may_release(&view(&files, now), watermark, &vpn(), death, Some(NEW), now) {
+            let release = |v: &FootprintView, now: u64| match order {
+                Order::NotProtecting => !v.protecting_now("wireguard-gym", now),
+                _ => hold_may_release(&v, &vpn(), Some(NEW), now),
+            };
+            let mut in_time = false;
+            for &(d, e, lost) in &passes {
+                let (observe, ring) = if order == Order::RingFirst { (d + e, d) } else { (d, d + e) };
+                let end = d + e;
+                // The hold polls what was written before each instant.
+                while poll < end && poll <= deadline {
+                    if poll >= written && release(&files, poll / 1_000_000) {
                         released = true;
                     }
                     poll += 50_000;
@@ -1697,24 +1833,71 @@ mod hold_order {
                 if poll > deadline {
                     break;
                 }
-                // A drain stamped `d`: the cgroup's invocation if it exists,
-                // then every event submitted before `d`, then the files,
-                // then the watermark.
-                if d > born {
-                    tracker.set_invocation(&vpn(), NEW);
+                // The cgroups: made (an unread id first), then removed.
+                if !seen_born && observe > born {
+                    seen_born = true;
+                    inv = Invocation { id: None, ended: false };
                 }
-                while next < events.len() && events[next].0 < d {
-                    take(&mut tracker, &events[next].1, HOST, || Some(vpn()), &mut names);
+                if seen_born && inv.id.is_none() && !inv.ended && observe > readable {
+                    inv.id = Some(NEW.into());
+                }
+                if seen_born && !inv.ended && observe >= removed {
+                    removing = true;
+                }
+                tracker.set_invocation(&vpn(), inv.clone());
+                // The ring: every event submitted before it is read.
+                while next < events.len() && events[next].0 < ring {
+                    if !lost {
+                        take(&mut tracker, &events[next].1, HOST, || Some(vpn()), &mut names);
+                    }
                     next += 1;
                 }
-                files = render(&tracker.footprint(&vpn(), d / 1_000_000));
-                watermark = at(d);
+                if lost {
+                    tracker.lost(None);
+                }
+                if removing {
+                    removing = false;
+                    inv.ended = true;
+                    // (Today a loss also holds every unit until reboot, via
+                    // `.unattributed`; this charge does not rely on that.)
+                    if lost {
+                        tracker.lost(Some(&vpn()));
+                    }
+                }
+                tracker.set_invocation(&vpn(), inv.clone());
+                files = written_files(&tracker, end / 1_000_000);
+                written = end;
+                in_time |= inv.ended && !lost && end <= deadline;
             }
-            if steers {
-                assert!(!released, "round {round}: released a unit that steered (death {death}, drains {drains:?})");
-            } else if drains.iter().any(|&d| d >= death && d <= deadline) {
-                assert!(released, "round {round}: held a unit that never steered, though drained in time");
+            let bad = if steers { released } else { in_time && !released && files.unattributed.is_empty() };
+            if bad {
+                return Some(round);
             }
+        }
+        None
+    }
+
+    /// What the hold reads after a write: the unit's file through its text
+    /// form, and `.unattributed` (a loss nothing could place holds every
+    /// unit until reboot).
+    fn written_files(t: &Tracker, at: u64) -> FootprintView {
+        let mut v = t.view(WatchState::Attached { at }, &[vpn()], at);
+        for f in v.units.values_mut() {
+            *f = parse_footprint(&render(f)).expect("netwatch's own file parses");
+        }
+        v
+    }
+
+    #[test]
+    fn a_unit_that_steered_before_it_died_is_never_released() {
+        assert_eq!(property(Order::Netwatch), None);
+    }
+
+    /// The property is not vacuous: each mutant of the order fails it.
+    #[test]
+    fn the_property_catches_each_mutant() {
+        for m in [Order::NotProtecting, Order::RingFirst] {
+            assert!(property(m).is_some(), "mutant {} passed", m as u8); // NotProtecting: round 3; RingFirst: 1026
         }
     }
 }
