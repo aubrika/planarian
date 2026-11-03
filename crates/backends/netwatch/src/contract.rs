@@ -23,6 +23,56 @@ const WATCH: &str = ".watch";
 /// dot-file: the hold reads only `.watch` and `.unattributed`).
 const STATE: &str = ".state";
 const UNATTRIBUTED: &str = ".unattributed";
+const DRAINED: &str = ".drained";
+
+/// The ring buffer's watermark (`.drained`): both clocks, read together
+/// *before* a drain began, written once that drain's changes were applied
+/// and the footprint files written. So every event submitted before
+/// `monotonic_us` is in the files (crate docs, "The hold's order").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Drained {
+    pub boottime_us: u64,
+    pub monotonic_us: u64,
+}
+
+/// Write `.drained` atomically: `<boottime_us> <monotonic_us>`.
+pub fn write_drained(dir: &Path, d: Drained) -> io::Result<()> {
+    put(dir, DRAINED, &format!("{} {}\n", d.boottime_us, d.monotonic_us))
+}
+
+/// `.drained`, if it reads.
+pub fn read_drained(dir: &Path) -> Option<Drained> {
+    parse_drained(&std::fs::read_to_string(dir.join(DRAINED)).ok()?)
+}
+
+pub(crate) fn parse_drained(s: &str) -> Option<Drained> {
+    match s.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [b, m] => Some(Drained { boottime_us: b.parse().ok()?, monotonic_us: m.parse().ok()? }),
+        _ => None,
+    }
+}
+
+/// The hold's condition on a failure, as lane-nix's script implements it
+/// (crate docs, "The hold's order"): it may release only when (a) the ring
+/// was drained past the unit's death (`death_monotonic_us`, systemd's
+/// `InactiveEnterTimestampMonotonic`), (b) the footprint describes the
+/// invocation that died (`invocation`, systemd's `InvocationID`), and (c)
+/// the footprint reads not protecting at `now`. Anything else holds. The
+/// reference the property tests check the files against.
+pub fn hold_may_release(
+    view: &FootprintView,
+    drained: Option<Drained>,
+    unit: &UnitId,
+    death_monotonic_us: u64,
+    invocation: Option<&str>,
+    now: u64,
+) -> bool {
+    let name = file_name(unit);
+    drained.is_some_and(|d| d.monotonic_us >= death_monotonic_us)
+        && invocation.is_some()
+        && view.units.get(&name).and_then(|f| f.invocation.as_deref()) == invocation
+        && !view.protecting_now(&name, now)
+}
 
 /// The file name of a unit's footprint: systemd's `%N` (the unit name with
 /// any `@instance`, without `.service`). Network tools are system services.
@@ -40,6 +90,9 @@ fn proto(p: Proto) -> &'static str {
 
 pub(crate) fn render(f: &Footprint) -> String {
     let mut s = format!("protecting {}\nat {}\n", if f.protecting { "yes" } else { "no" }, f.at);
+    if let Some(i) = &f.invocation {
+        s.push_str(&format!("invocation {i}\n"));
+    }
     for i in &f.ifaces {
         s.push_str(&format!("iface {i}\n"));
     }
@@ -98,13 +151,16 @@ fn one_line(s: &str) -> String {
     if s.trim().is_empty() { "unknown".into() } else { s.trim().to_string() }
 }
 
-fn parse_footprint(text: &str) -> Option<Footprint> {
+pub(crate) fn parse_footprint(text: &str) -> Option<Footprint> {
     let mut f = Footprint::default();
     let mut at = None;
     for line in text.lines() {
         let w: Vec<&str> = line.split_whitespace().collect();
         match w.as_slice() {
             ["at", t] => at = Some(t.parse().ok()?),
+            ["invocation", i] if i.len() == 32 && i.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')) => {
+                f.invocation = Some((*i).to_string());
+            }
             ["protecting", "yes"] => f.protecting = true,
             ["protecting", "no"] => f.protecting = false,
             ["iface", i] => {

@@ -25,6 +25,11 @@ pub struct Cgroups {
     watched: BTreeMap<i32, PathBuf>,
     /// Ids whose cgroup was gone at the last walk.
     gone: BTreeSet<u64>,
+    /// Each unit's latest InvocationID, from its cgroup's
+    /// `trusted.invocation_id` (kept after the cgroup goes).
+    invocations: BTreeMap<UnitId, String>,
+    /// Unit cgroups made whose InvocationID systemd had not set yet.
+    pending: BTreeSet<PathBuf>,
 }
 
 impl Cgroups {
@@ -38,6 +43,8 @@ impl Cgroups {
             inotify,
             watched: BTreeMap::new(),
             gone: BTreeSet::new(),
+            invocations: BTreeMap::new(),
+            pending: BTreeSet::new(),
         };
         c.watch_tree(&root.join("system.slice"));
         c.merge();
@@ -59,6 +66,7 @@ impl Cgroups {
         self.ids.retain(|i, u| !(before.contains(i) && gone.contains(i) && !claimed.contains(u)));
         self.gone = gone.into_iter().filter(|i| self.ids.contains_key(i)).collect();
         self.ids.extend(ids);
+        self.read_invocations();
         running
     }
 
@@ -92,6 +100,11 @@ impl Cgroups {
                 created.push(dir.join(name.to_string_lossy().as_ref()));
             }
         }
+        // InvocationIDs systemd had not yet set when their cgroup was made.
+        let pending = std::mem::take(&mut self.pending);
+        for dir in pending {
+            self.read_invocation(&dir);
+        }
         for dir in created {
             self.record(&dir);
             if dir.extension().is_some_and(|e| e == "slice") {
@@ -118,6 +131,60 @@ impl Cgroups {
             && let Some(u) = unit_of_cgroup(&rel.to_string_lossy())
         {
             self.ids.insert(meta.ino(), u);
+            self.read_invocation(dir);
+        }
+    }
+
+    /// Each unit's latest InvocationID seen.
+    pub fn invocations(&self) -> &BTreeMap<UnitId, String> {
+        &self.invocations
+    }
+
+    /// The units running now, merging what stands (forgetting nothing, and
+    /// unlike a tick's walk, pruning nothing), with their InvocationIDs.
+    pub fn running(&mut self) -> BTreeSet<String> {
+        let (ids, running) = read_cgroups(&self.root);
+        self.ids.extend(ids);
+        self.read_invocations();
+        running
+    }
+
+    /// Read the InvocationID of a unit's own cgroup (`<name>.service`; its
+    /// sub-cgroups carry none). Not set yet (systemd sets it just after
+    /// making the cgroup): retried at the next drain.
+    fn read_invocation(&mut self, dir: &Path) {
+        if dir.extension().is_none_or(|e| e != "service") {
+            return;
+        }
+        let Some(u) = dir.strip_prefix(&self.root).ok().and_then(|r| unit_of_cgroup(&r.to_string_lossy())) else {
+            return;
+        };
+        match invocation_of(dir) {
+            Some(id) => {
+                self.invocations.insert(u, id);
+            }
+            None if dir.exists() => {
+                self.pending.insert(dir.to_path_buf());
+            }
+            None => {}
+        }
+    }
+
+    /// Re-read the InvocationIDs of every unit cgroup standing.
+    fn read_invocations(&mut self) {
+        let mut stack = vec![self.root.join("system.slice")];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                if p.extension().is_some_and(|x| x == "slice") {
+                    stack.push(p);
+                } else {
+                    self.read_invocation(&p);
+                }
+            }
         }
     }
 
@@ -137,5 +204,30 @@ impl Cgroups {
                 self.watch_tree(&p);
             }
         }
+    }
+}
+
+/// A cgroup's systemd InvocationID (`trusted.invocation_id`, 16 bytes), as
+/// 32 lowercase hex; also `user.invocation_id`, which newer systemd sets
+/// too. `None` if neither is set (yet) or it is malformed.
+pub fn invocation_of(dir: &Path) -> Option<String> {
+    for name in ["trusted.invocation_id", "user.invocation_id"] {
+        let mut buf = [0u8; 64];
+        if let Ok(n) = rustix::fs::getxattr(dir, name, &mut buf[..])
+            && let Some(id) = invocation_hex(&buf[..n])
+        {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// The xattr's value as 32 lowercase hex: 16 raw bytes, or (as some
+/// systemd versions write it) the 32 hex characters themselves.
+pub fn invocation_hex(v: &[u8]) -> Option<String> {
+    match v.len() {
+        16 => Some(v.iter().map(|b| format!("{b:02x}")).collect()),
+        32 if v.iter().all(u8::is_ascii_hexdigit) => Some(String::from_utf8_lossy(v).to_ascii_lowercase()),
+        _ => None,
     }
 }

@@ -49,6 +49,24 @@ impl Start {
     }
 }
 
+/// How often, at most, the running units are re-read between ticks.
+pub const RUNNING_MS: u64 = 250;
+
+/// How often, at least, `.drained` is rewritten when nothing changed.
+pub const DRAINED_MS: u64 = 100;
+
+/// Both clocks, read back to back, truncated to microseconds.
+pub fn clocks() -> crate::Drained {
+    let us = |id| {
+        let t = rustix::time::clock_gettime(id);
+        t.tv_sec as u64 * 1_000_000 + t.tv_nsec as u64 / 1_000
+    };
+    crate::Drained {
+        boottime_us: us(rustix::time::ClockId::Boottime),
+        monotonic_us: us(rustix::time::ClockId::Monotonic),
+    }
+}
+
 /// How long the loop waits for a new event when the ring buffer is empty
 /// (a new cgroup wakes it at once).
 pub const IDLE_MS: i64 = 50;
@@ -351,9 +369,21 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
     };
     let mut lost_seen = 0u64;
     let mut next_tick = Instant::now();
+    // Between ticks, the running units are refreshed at most this often.
+    let mut running = std::collections::BTreeSet::new();
+    let mut running_at: Option<Instant> = None;
+    let mut drained_at: Option<Instant> = None;
     while !stop.load(Ordering::Relaxed) {
+        // Both clocks, before the drain: every event submitted before this
+        // instant is in the ring now, and will be in the files before
+        // `.drained` says this instant (crate docs, "The hold's order").
+        let start = clocks();
+        let mut changed = false;
         // Cgroups made since the last pass first, so a unit's events find it.
         cgroups.drain();
+        for (u, id) in cgroups.invocations() {
+            changed |= tracker.set_invocation(u, id);
+        }
         let mut drained = 0;
         while let Some(item) = ring.next() {
             drained += 1;
@@ -371,19 +401,33 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
             let unit = || ev.cgpath.as_deref().and_then(unit_of_cgroup).or_else(|| cgroups.unit(ev.cgroup));
             take(&mut tracker, &ev, own_netns, unit, &mut name);
         }
+        changed |= drained > 0;
         // Events the ring buffer had no room for: a loss nothing can place.
         if let Ok(n) = lost_map.get(&0, 0)
             && n > lost_seen
         {
             lost_seen = n;
             tracker.lost(None);
+            changed = true;
         }
-        if Instant::now() >= next_tick {
-            next_tick += Duration::from_secs(crate::TICK_SECS);
+        let tick = Instant::now() >= next_tick;
+        if tick || changed {
+            // A change is written at once, not at the next tick: a tool that
+            // steers and dies between ticks must not read as before.
             let Some(now) = boottime_secs() else { return fail("no /proc/uptime".into()) };
             tracker.set_virtual(read_virtual_ifaces(Path::new("/sys/class/net")));
             let claims = tracker.claims();
-            let running = cgroups.walk(&claims.units());
+            if tick {
+                next_tick += Duration::from_secs(crate::TICK_SECS);
+                running = cgroups.walk(&claims.units());
+                running_at = Some(Instant::now());
+            } else if running_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(RUNNING_MS)) {
+                running = cgroups.running();
+                running_at = Some(Instant::now());
+            }
+            for (u, id) in cgroups.invocations() {
+                tracker.set_invocation(u, id);
+            }
             let view = tracker.view(WatchState::Attached { at: now }, &expand_tools(&tools, &running), now);
             if let Err(e) = crate::write_state(dir, &claims).and_then(|()| crate::write(dir, &view)) {
                 return fail(format!("write {}: {e}", dir.display()));
@@ -392,6 +436,14 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                 // Attached, reconciled, and the first files written.
                 notify_ready(notify);
             }
+        }
+        // The watermark, only after the files: a reader that sees it past an
+        // instant sees every change made before it.
+        if tick || changed || drained_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(DRAINED_MS)) {
+            if let Err(e) = crate::write_drained(dir, start) {
+                return fail(format!("write {}: {e}", dir.display()));
+            }
+            drained_at = Some(Instant::now());
         }
         if drained == 0 {
             // Wake at once when a cgroup is made (a unit starting), else

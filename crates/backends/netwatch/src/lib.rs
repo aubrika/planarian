@@ -33,6 +33,18 @@
 //! Anything else, a missing file, or a stale `attached` means the watch is
 //! not known to be healthy.
 //!
+//! **`.drained`**, one line: `<boottime_us> <monotonic_us>`, both clocks
+//! read back to back, truncated to microseconds, *before* a drain of the
+//! ring began, and written only after that drain's changes were applied
+//! and the footprint files written. So once it says monotonic `T`, every
+//! event submitted before `T` is in the files. A probe runs inside the
+//! syscall, so a unit's events are all submitted before it can die; a
+//! `.drained` at or past its death (`InactiveEnterTimestampMonotonic`)
+//! means its footprint is complete. Rewritten after every drain that
+//! changed something, else at least every 100 ms, and at each tick. The
+//! footprint files themselves are written whenever a drain changed
+//! anything, not only on the tick (coordinator, Nov 3).
+//!
 //! **`.unattributed`**: present while any change that steers traffic stands
 //! that netwatch could not charge to a unit, or after a lost event
 //! (ring-buffer overflow, dropped receive) it could not place. Its content
@@ -45,6 +57,12 @@
 //! - `protecting yes` or `protecting no`;
 //! - `at <t>`: when netwatch last confirmed it, refreshed at least with
 //!   every heartbeat;
+//! - `invocation <32 lowercase hex>`: the unit's latest systemd
+//!   InvocationID netwatch has seen, from its cgroup's
+//!   `trusted.invocation_id` (or `user.invocation_id`), kept after the
+//!   cgroup goes; absent until read (systemd sets it just after making the
+//!   cgroup). A file whose `invocation` is not 32 lowercase hex is not
+//!   trusted;
 //! - `iface <name>`: one per interface the unit created that steers
 //!   traffic (zero or more): what the hold passes;
 //! - `endpoint <udp|tcp> <address> <port>`: one per peer endpoint it needs
@@ -191,11 +209,18 @@
 //! WireGuard peer endpoints (generic netlink is not read).
 //!
 //! **The hold's order.** When a network tool fails, it is held unless all of
-//! these pass: (1) no unexpired release; (2) `.watch` is `attached` and
-//! fresh; (3) no `.unattributed`; (4) the unit's file exists; (5) its `at` is
-//! fresh; (6) it says `protecting no`, with no `unattributed` line.
-//! [`FootprintView::protecting_now`] is (2) to (6); the release is the
-//! hold's own.
+//! these pass: (1) no unexpired release; (a) `.drained`'s monotonic is at
+//! or past the unit's `InactiveEnterTimestampMonotonic`, waited for at
+//! most about 2 s (same clock: BOOTTIME runs ahead of MONOTONIC by the
+//! time suspended, so comparing across them could pass before the death);
+//! (b) the file's `invocation` equals the unit's `InvocationID` (else it
+//! describes another run); (2) `.watch` is `attached` and fresh; (3) no
+//! `.unattributed`; (4) the unit's file exists; (5) its `at` is fresh; (6)
+//! it says `protecting no`, with no `unattributed` line (coordinator, Nov 3:
+//! a VPN that steered and died before the next write read as the last
+//! run's `protecting no`). [`FootprintView::protecting_now`] is (2) to (6);
+//! [`hold_may_release`] is (a), (b) and (2) to (6), the reference the
+//! property tests check; the release is the hold's own.
 
 pub mod btf;
 #[cfg(feature = "loader")]
@@ -210,7 +235,10 @@ pub mod parse;
 #[cfg(feature = "loader")]
 pub mod snapshot;
 
-pub use contract::{AHEAD_SECS, CLOCK, DIR, FRESH_SECS, TICK_SECS, file_name, read, read_claims, write, write_state};
+pub use contract::{
+    AHEAD_SECS, CLOCK, DIR, Drained, FRESH_SECS, TICK_SECS, file_name, hold_may_release, read, read_claims,
+    read_drained, write, write_drained, write_state,
+};
 pub use model::{Change, ChangeKind, Claims, Endpoint, Footprint, FootprintView, Owner, Proto, Tracker, WatchState};
 
 #[cfg(test)]

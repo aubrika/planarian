@@ -65,6 +65,10 @@ pub struct Footprint {
     pub endpoints: BTreeSet<Endpoint>,
     /// A lost event may have touched this unit.
     pub unattributed: bool,
+    /// The unit's latest systemd InvocationID netwatch has seen (32
+    /// lowercase hex), from its cgroup's `trusted.invocation_id`.
+    #[serde(default)]
+    pub invocation: Option<String>,
 }
 
 /// The watch's state, as `.watch` carries it.
@@ -150,6 +154,9 @@ pub struct Tracker {
     /// steering route is one over "an interface it created": a default route
     /// over the machine's own NIC is not one, watched or found at attach.
     virtual_ifaces: BTreeSet<String>,
+    /// Each unit's latest InvocationID seen (not kept across restarts: the
+    /// cgroups are read again on attach).
+    invocations: BTreeMap<UnitId, String>,
     /// A lost event could not be placed: everything counts as unattributed
     /// until the watch restarts (which re-reads the kernel's state).
     lost_unplaced: bool,
@@ -344,6 +351,15 @@ impl Tracker {
 
     /// An event was lost. With the unit known, its footprint is marked
     /// unattributed; without, the global marker stands.
+    /// The unit's InvocationID as its cgroup carries it; whether it changed.
+    pub fn set_invocation(&mut self, unit: &UnitId, id: &str) -> bool {
+        if self.invocations.get(unit).is_some_and(|i| i == id) {
+            return false;
+        }
+        self.invocations.insert(unit.clone(), id.to_string());
+        true
+    }
+
     /// The virtual links standing now (`host::read_virtual_ifaces`): read
     /// live each tick, so a tun made by ioctl or a link moved in from
     /// another netns is never taken for a physical NIC.
@@ -360,7 +376,8 @@ impl Tracker {
 
     /// The footprint of `unit` now, confirmed at `at`.
     pub fn footprint(&self, unit: &UnitId, at: u64) -> Footprint {
-        let Some(s) = self.units.get(unit) else { return Footprint { at, ..Default::default() } };
+        let invocation = self.invocations.get(unit).cloned();
+        let Some(s) = self.units.get(unit) else { return Footprint { at, invocation, ..Default::default() } };
         // Only a virtual link can be one a tool created; a physical NIC is
         // registered by its driver, whoever's context that runs in.
         let created: BTreeSet<String> = s
@@ -406,6 +423,7 @@ impl Tracker {
             ifaces,
             endpoints: s.endpoints.clone(),
             unattributed: s.unattributed,
+            invocation,
         }
     }
 

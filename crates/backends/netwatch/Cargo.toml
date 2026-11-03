@@ -18,7 +18,7 @@ serde_json.workspace = true
 aya = { version = "0.13", optional = true, default-features = false }
 aya-obj = { version = "0.2", optional = true }
 signal-hook = { version = "0.3", optional = true }
-rustix = { workspace = true, optional = true, features = ["net", "fs", "event"] }
+rustix = { workspace = true, optional = true, features = ["net", "fs", "event", "time"] }
 
 [[bin]]
 name = "planarian-netwatch"
