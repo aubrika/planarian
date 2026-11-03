@@ -307,10 +307,14 @@ pkgs.runCommand "planarian-module-eval.json" {
   # one only in the export is dropped by planariad, one only in the round
   # trip is filled by its default. The top-level network-tool lists are
   # read raw by netwatch and the module, not through Export.
-  kp='[paths(scalars) | map(if type == "number" then 0 else . end)] | unique'
+  # (paths(scalars) would skip false and null: paths takes a predicate.)
+  kp='[paths(type != "object" and type != "array") | map(if type == "number" then 0 else . end)] | unique'
   jq -c "del(.networkTools, .networkToolsInitrd, .networkToolsUnordered) | $kp" $exportPath > keys-export
   jq -c "$kp" parsed.json > keys-read
-  jq -r '.[] | map(tostring) | join(".")' keys-export > paths-export
+  # Exempt by name, one path: an Exec probe's `flagged` (§9, P11) is for
+  # whoever reads the manifest; planariad flags Exec probes by their kind,
+  # so ProbeDef has no field for it.
+  jq -r '.[] | map(tostring) | join(".")' keys-export | grep -vxE '(units|userUnits)\.0\.probes\.0\.flagged' > paths-export
   jq -r '.[] | map(tostring) | join(".")' keys-read > paths-read
   diff paths-export paths-read || { echo "export: key paths differ between the export (<) and planariad's round trip (>): < is dropped, > is defaulted" >&2; exit 1; }
   [ -s paths-export ] || { echo "export: no key paths (the diff would be vacuous)" >&2; exit 1; }
