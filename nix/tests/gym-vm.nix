@@ -539,11 +539,15 @@ let
 
   # Facts per candidate: the export and the option values Planarian reads.
   facts = c: lib.foldl' lib.recursiveUpdate
-    # The network-tool fields (§12d) are computed from every service's
+    # The network-tool lists (§12d) are computed from every service's
     # configuration, and gym-owner's script carries these facts: a cycle.
     # The daemon reads them from the running generation's export.json.
+    # Each unit's `holds` stays: it reads only that unit's configuration,
+    # and planariad compares it with the running generation's, so a
+    # candidate without it differs in every network tool (an AskFirst
+    # change that parks at Prepared; gate 41596671872).
     { services.planarian.export = let e = c.services.planarian.export; in
-        removeAttrs e [ "networkTools" "networkToolsUnordered" "networkToolsInitrd" ] // { units = map (u: removeAttrs u [ "holds" ]) e.units; }; }
+        removeAttrs e [ "networkTools" "networkToolsUnordered" "networkToolsInitrd" ]; }
     (map (p: let path = lib.splitString "." p; in lib.setAttrByPath path (lib.attrByPath path null c)) optionPaths);
 
   shim = pkgs.writeText "flake.nix" ''
