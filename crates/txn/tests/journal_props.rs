@@ -280,3 +280,64 @@ proptest! {
         }
     }
 }
+
+/// One hold event, or a compaction, or a reopen (the daemon restarting).
+#[derive(Clone, Debug)]
+enum HoldStep {
+    Apply(u8, bool),
+    Lift(u8),
+    Compact,
+    Reopen,
+}
+
+fn hold_step() -> impl Strategy<Value = HoldStep> {
+    prop_oneof![
+        4 => (0..4u8, any::<bool>()).prop_map(|(u, f)| HoldStep::Apply(u, f)),
+        3 => (0..4u8).prop_map(HoldStep::Lift),
+        1 => Just(HoldStep::Compact),
+        1 => Just(HoldStep::Reopen),
+    ]
+}
+
+fn held_unit(u: u8) -> UnitId {
+    UnitId::service(&format!("vpn-{u}"))
+}
+
+proptest! {
+    #![proptest_config(config(256))]
+
+    /// D14 (§12d, #35/#40): the journal's holds are its recovery source of
+    /// truth after a restart. For any sequence of applies and lifts (either
+    /// may repeat), with compactions and reopens anywhere, `holds()` is the
+    /// set of units whose last event is an apply, on the live handle and on a
+    /// journal reopened from its bytes.
+    #[test]
+    fn holds_are_the_last_event_per_unit(steps in proptest::collection::vec(hold_step(), 1..40)) {
+        use planarian_txn::ledger::HoldBy;
+        // Small: after a compaction, open searches the stale bytes past the
+        // log's end for a later intact record, byte by byte.
+        let store = MemStore::new(1 << 14);
+        let mut j = Journal::open(store.clone()).unwrap();
+        let mut model: BTreeMap<u8, bool> = BTreeMap::new();
+        for (k, s) in steps.into_iter().enumerate() {
+            let at = Timestamp(1_000 + k as u64);
+            match s {
+                HoldStep::Apply(u, on_failure) => {
+                    let by = if on_failure { HoldBy::OnFailure } else { HoldBy::Daemon };
+                    j.append(at, Record::HoldApplied { unit: held_unit(u), by }).unwrap();
+                    model.insert(u, true);
+                }
+                HoldStep::Lift(u) => {
+                    j.append(at, Record::HoldLifted { unit: held_unit(u), reason: "Readiness passes".into() }).unwrap();
+                    model.insert(u, false);
+                }
+                HoldStep::Compact => j.compact().unwrap(),
+                HoldStep::Reopen => j = Journal::open(store.clone()).unwrap(),
+            }
+            let expect: std::collections::BTreeSet<UnitId> =
+                model.iter().filter(|(_, on)| **on).map(|(u, _)| held_unit(*u)).collect();
+            prop_assert_eq!(j.ledger().holds(), expect.clone(), "live");
+            prop_assert_eq!(Journal::open(store.clone()).unwrap().ledger().holds(), expect, "reopened");
+        }
+    }
+}
