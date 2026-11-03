@@ -377,24 +377,19 @@ impl Tracker {
         // watched or found at attach (coordinator, Nov 2). `iface` lines name
         // the created interfaces that steer: what the hold passes.
         let mut ifaces: BTreeSet<String> = self.steering_ifaces().intersection(&created).cloned().collect();
-        // The coordinator's narrow reading (Nov 2; the owner is told, since
-        // §12d says "an interface it created"): the unit's own steering
-        // route over a virtual link that ANOTHER unit created makes it
-        // protecting too, as well as the creator. OpenVPN on a persistent
-        // tun that a setup unit made: both hold. It leans fail-closed.
-        let by_others: BTreeSet<&String> = self
-            .units
-            .iter()
-            .filter(|(u, _)| *u != unit)
-            .flat_map(|(_, o)| o.objects.keys())
-            .filter(|(k, name)| *k == ChangeKind::Interface && self.virtual_ifaces.contains(name))
-            .map(|(_, name)| name)
-            .collect();
+        // (coordinator, Nov 2 and 3; the spec reads "...over a virtual
+        // interface it did not create...") A default or all-covering route
+        // the unit added over a *virtual* link it did not create makes it
+        // protecting too: one another unit made (OpenVPN on a persistent tun
+        // a setup unit made: both hold), one moved in from another netns, one
+        // made before the watch attached. Virtual is the live sysfs check, so
+        // a route over a physical NIC (NetworkManager's DHCP default over
+        // wlan0) still steers nothing of the unit's own. Leans fail-closed.
         for ((k, _), (i, steers)) in &s.objects {
             if *k == ChangeKind::Route
                 && *steers
                 && let Some(i) = i
-                && by_others.contains(i)
+                && self.virtual_ifaces.contains(i)
             {
                 ifaces.insert(i.clone());
             }
@@ -402,7 +397,12 @@ impl Tracker {
         let own = |k: &ChangeKind| !matches!(k, ChangeKind::Interface | ChangeKind::Route);
         Footprint {
             at,
-            protecting: !ifaces.is_empty() || s.objects.iter().any(|((k, _), (_, steers))| *steers && own(k)),
+            // A change charged here that could not be fully attributed counts
+            // as protecting (fail closed), and the file says so: `protecting
+            // yes` with its `unattributed` line, as the hold reads it anyway.
+            protecting: s.unattributed
+                || !ifaces.is_empty()
+                || s.objects.iter().any(|((k, _), (_, steers))| *steers && own(k)),
             ifaces,
             endpoints: s.endpoints.clone(),
             unattributed: s.unattributed,
