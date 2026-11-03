@@ -16,12 +16,35 @@ let
   wgg = import ./wireguard-gym.nix { inherit pkgs; inherit (pkgs) lib; };
   ssh = import "${pkgs.path}/nixos/tests/ssh-keys.nix" pkgs;
   alarmText = "stopped unexpectedly. Network traffic is blocked until it is back.";
+  # The restart loop's killer: waits for a new instance of wireguard-gym
+  # (an InvocationID other than $1) to steer (128.0.0.0/1 over wg0, the last
+  # route its start adds), sleeps $2 seconds, and SIGKILLs the unit. Writes
+  # "<invocation> <ms from steering seen to kill>" to /run/nw-loop.done, or
+  # "timeout" if no new instance steered within about a minute.
+  killAfterSteer = pkgs.writeShellScript "kill-after-steer" ''
+    PATH=${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.iproute2 pkgs.gnugrep pkgs.systemd ]}
+    rm -f /run/nw-loop.done
+    for _ in $(seq 3000); do
+      cur=$(systemctl show -p InvocationID --value wireguard-gym.service)
+      if [ -n "$cur" ] && [ "$cur" != "$1" ] && ip -o route show 128.0.0.0/1 | grep -q 'dev wg0'; then
+        t0=$(date +%s%N)
+        sleep "$2"
+        systemctl kill --signal=SIGKILL wireguard-gym.service
+        t1=$(date +%s%N)
+        echo "$cur $(( (t1 - t0) / 1000000 ))" > /run/nw-loop.done
+        exit 0
+      fi
+      sleep 0.01
+    done
+    echo timeout > /run/nw-loop.done
+  '';
 in
 pkgs.testers.runNixOSTest {
   name = "planarian-netsec";
-  # A hang fails in half an hour, not the default hour. Not lower: "repair
-  # fails every attempt" alone waits out the backoff (10 + 60 + 300 s, §13).
-  globalTimeout = 1800;
+  # A hang fails in 40 minutes, not the default hour. Not lower: "repair
+  # fails every attempt" alone waits out the backoff (10 + 60 + 300 s, §13),
+  # and the restart loop runs four stop, start, kill and lift rounds.
+  globalTimeout = 2400;
 
   nodes.peer = { pkgs, ... }: {
     imports = [ wgg.peer ];
@@ -321,5 +344,56 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds(lan_ok(), timeout=60)
         not_held("gym-tpl@a")
         machine.succeed("rm -f /run/gym-tpl-a-slow")
+
+    # Gate 41562892467: a VPN killed about 1 s after its restart was not
+    # held, because its footprint was still the previous instance's
+    # `protecting no`. §12d: "a footprint missing or stale when a network
+    # tool fails ... count[s] as protecting". Each round starts a new
+    # instance from an unheld state and kills it within 200 ms of its
+    # steering, before netwatch can have written that instance's footprint
+    # or just after. Held every time.
+    with subtest("restart loop: a VPN dying within 200 ms of steering is held, every time"):
+        machine.wait_until_succeeds(tunnel_ok(), timeout=60)
+        not_held()
+        def mono(unit, prop):
+            return int(machine.succeed(f"systemctl show -p {prop} --value {unit}").strip() or 0)
+        for delay in ["0", "0.05", "0.1", "0.2"]:
+            # A new instance by the attested path (§12d: an attested stop
+            # holds nothing), so this round's hold can only be the kill's.
+            out = as_bob("planarian stop wireguard-gym")
+            assert "approve" in out, out
+            approve_as_root(out)
+            machine.wait_until_fails("systemctl is-active wireguard-gym.service", timeout=60)
+            not_held()
+            prev = machine.succeed("systemctl show -p InvocationID --value wireguard-gym.service").strip()
+            before = alarms()
+            machine.succeed(f"${killAfterSteer} '{prev}' {delay} </dev/null >/dev/null 2>&1 &")
+            out = as_bob("planarian release wireguard-gym")
+            if "approve" in out:
+                approve_as_root(out)
+            machine.succeed("systemctl start --no-block wireguard-gym.service")
+            machine.wait_until_succeeds("test -s /run/nw-loop.done", timeout=90)
+            done = machine.succeed("cat /run/nw-loop.done").strip()
+            # Preconditions: a new instance steered, and the kill landed
+            # within 200 ms of it (the killer's own poll adds <= 50 ms).
+            assert done != "timeout", f"delay {delay}: no new instance steered"
+            ms = int(done.split()[1])
+            assert ms <= float(delay) * 1000 + 50, f"delay {delay}: the kill came {ms} ms after steering"
+            # Held, by this kill's OnFailure=: the hold unit became active
+            # after the unit died, not left over from an earlier hold.
+            machine.wait_until_fails(lan_ok(), timeout=20)
+            held()
+            died = mono("wireguard-gym.service", "InactiveEnterTimestampMonotonic")
+            hold_at = mono("planarian-hold@wireguard-gym.service", "ActiveEnterTimestampMonotonic")
+            assert hold_at >= died > 0, f"delay {delay}: hold active at {hold_at}, unit died at {died}"
+            machine.fail(up_ok())
+            peer.fail(new_ssh("alice"))
+            assert alarms() > before, f"delay {delay}: no alarm"
+            # Back: the hold lifts once the unit is Running and Ready, by the
+            # repair or, if this target has escalated (§13), by hand.
+            machine.succeed("systemctl reset-failed wireguard-gym.service; systemctl start wireguard-gym.service")
+            machine.wait_until_succeeds(lan_ok(), timeout=120)
+            machine.wait_until_succeeds(tunnel_ok(), timeout=60)
+            not_held()
   '';
 }
