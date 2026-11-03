@@ -2216,3 +2216,32 @@ fn backoff_is_kept_between_attempts_even_after_a_slow_observation() {
         assert!(w[1] - w[0] >= min, "attempts {} and {} {} ms apart (min {min} ms): {at:?}", k + 1, k + 2, w[1] - w[0]);
     }
 }
+
+/// §13: a cooldown runs from the decision that set it, like an attempt's
+/// backoff, not from the start of the observation before it. The
+/// diagnoser has nothing for a device whose driver was never known, so the
+/// incident cools down for 1 h, counted from after the slow probes.
+#[test]
+fn an_exhausted_cooldown_runs_from_the_decision() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let dev = UnitId::device("snd-hda0");
+    r.fake.w().probe_batch_ms = 7_000;
+    r.fake.w().devices.insert(dev.clone(), None);
+    r.core.asm.known_drivers.clear();
+    for _ in 0..200 {
+        r.fake.advance(planarian_state::TICK);
+        let observed = r.fake.now();
+        r.core.tick();
+        r.core.asm.known_drivers.clear();
+        if let Some(IncidentState::Cooldown { until }) = r.core.incidents.active_for(&dev).map(|i| i.state.clone()) {
+            assert!(
+                until.0 >= observed.0 + 7_000 + planarian_incident::COOLDOWN_FIRST.0,
+                "cooldown until {} from an observation at {observed:?}",
+                until.0
+            );
+            return;
+        }
+    }
+    panic!("no cooldown: {:#?}", r.core.notices);
+}
