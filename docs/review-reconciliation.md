@@ -444,3 +444,11 @@ Read #35 and §12d on #34's branch (`ccr-c64ddb68-a5g3k5`), `nix/module.nix`, `n
 | Re-review of #38 (2 Nov), optionals | `ownUnits` was an option, so one owner definition could replace the set and exclude a VPN; footprint and heartbeat timestamps were wall-clock, so a clock stepped back made a stale one read fresh | the set is a value (`nix/own-units.nix`) both modules import, and module-eval asserts no such option exists; `.watch` and `at` are CLOCK_BOOTTIME seconds (`/proc/uptime`), fresh only from 5 s ahead to 30 s old (contract change sent to lane-daemon) |
 | Release expiry (coordinator, 2 Nov) | a release's `--until` was wall-clock only, so a clock stepped back lengthened an unprotected window past the administrator's choice | the marker is `boot`, or `<unix> <boottime>`; it expires at whichever passes first; anything else holds (module-eval runs the built script's condition on every case; format sent to lane-daemon) |
 | netwatch's object (lane-change-path, 2 Nov) | the derivation installed the first file in cargo's release directory, cargo's empty `.cargo-lock`: a 0-byte netwatch.bpf.o | it installs the crate's `[[bin]]` (`netwatch`), and the build fails unless the object is non-empty ELF with e_machine 247 (eBPF) |
+
+## lane-nix: the staging test that ran nowhere (3 Nov)
+
+Reconciled at `main` `1fc3589` against prop-auditor's audit (the "Tests that may not run" section on #59) and the coordinator's scope (3 Nov): `nix/package.nix`, and this one test's skip guard in `crates/backends/linux`.
+
+| Item | At `1fc3589` | Work |
+| --- | --- | --- |
+| `nixos::tests::git_owner_edit_after_staging_is_stale` | Skips unless nix-hash and git are both on PATH. The rust job has no nix-hash, and `checks.package` has `nativeCheckInputs = [ nix ]` and no git, so it runs nowhere. libtest hides a passing test's stderr, so its log line reads `ok` either way | `nativeCheckInputs = [ nix git ]`. The package's `preCheck` sets `PLANARIAN_REQUIRE_NIX_GIT_TESTS=1`, and while it is set the guard panics instead of skipping (netwatch's pattern). Shown in a one-off `--show-output` build of the package: it runs and is ok, with no SKIPPED line. With git removed, it fails with the guard's message |

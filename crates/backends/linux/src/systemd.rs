@@ -7,7 +7,9 @@
 
 use crate::admitted;
 use crate::cmd::run;
-use planarian_schema::{Ending, Observed, OpId, Outcome, Reason, Scope, Timestamp, UnitBackend, UnitId, UnitKind};
+use planarian_schema::{
+    Ending, Millis, Observed, OpId, Outcome, Reason, Scope, Timestamp, UnitBackend, UnitId, UnitKind,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -262,27 +264,31 @@ impl UnitBackend for Systemd {
         self.job("stop", id, op)
     }
     // §12d: the hold, a failure posture response (crate::hold).
-    fn hold(&self, unit: &UnitId) -> Outcome {
-        crate::hold::apply(unit)
+    fn hold(&self, unit: &UnitId, wait: Millis) -> Outcome {
+        crate::hold::apply(unit, ms(wait))
     }
-    fn lift_hold(&self, unit: &UnitId) -> Outcome {
-        crate::hold::lift(unit)
+    fn lift_hold(&self, unit: &UnitId, wait: Millis) -> Outcome {
+        crate::hold::lift(unit, ms(wait))
     }
     fn held(&self) -> Result<std::collections::BTreeSet<UnitId>, Outcome> {
         crate::hold::held_in(Path::new(crate::hold::HOLD_DIR))
     }
-    fn release_hold(&self, unit: &UnitId, until: Option<Timestamp>) -> Outcome {
-        crate::hold::release_in(Path::new(crate::hold::RELEASED_DIR), unit, until)
+    fn release_hold(&self, unit: &UnitId, until: Option<Timestamp>, wait: Millis) -> Outcome {
+        crate::hold::release_in(Path::new(crate::hold::RELEASED_DIR), unit, until, ms(wait))
     }
     fn end_release(&self, unit: &UnitId) -> Outcome {
         crate::hold::end_release_in(Path::new(crate::hold::RELEASED_DIR), unit)
     }
-    fn hold_table_present(&self) -> Result<bool, Outcome> {
-        crate::hold::table_present()
+    fn hold_table_present(&self, wait: Millis) -> Result<bool, Outcome> {
+        crate::hold::table_present(ms(wait))
     }
-    fn reapply_hold(&self, unit: &UnitId) -> Outcome {
-        crate::hold::reapply(unit)
+    fn reapply_hold(&self, unit: &UnitId, wait: Millis) -> Outcome {
+        crate::hold::reapply(unit, ms(wait))
     }
+}
+
+fn ms(m: Millis) -> std::time::Duration {
+    std::time::Duration::from_millis(m.0)
 }
 
 /// Where the posture marks a raised failure class (`failed-<class>`).
