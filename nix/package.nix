@@ -1,6 +1,6 @@
 # `gymHooks`: the gym's VM harness build (fault injection and the gym binary;
 # nix/tests/gym-vm.nix). Never the shipped package.
-{ lib, rustPlatform, nix, gymHooks ? false }:
+{ lib, rustPlatform, nix, git, gymHooks ? false }:
 
 rustPlatform.buildRustPackage {
   pname = if gymHooks then "planarian-gym-hooks" else "planarian";
@@ -29,8 +29,12 @@ rustPlatform.buildRustPackage {
   cargoTestFlags = [ "--workspace" ];
   doCheck = !gymHooks;
 
-  # The staging test hashes a directory with nix-hash, as the real backend does.
-  nativeCheckInputs = [ nix ];
+  # The staging tests hash a directory with nix-hash, as the real backend
+  # does, and one stages from a git checkout; here they must run, not skip.
+  nativeCheckInputs = [ nix git ];
+  preCheck = ''
+    export PLANARIAN_REQUIRE_NIX_GIT_TESTS=1
+  '';
 
   postInstall = ''
     install -Dm644 share/canonical.json $out/share/planarian/canonical.json
