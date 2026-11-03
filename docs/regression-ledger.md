@@ -54,6 +54,7 @@ carries a property test for the invariant it changes.
 | J14 | R11/C5: the override swap was check-then-rename, not compare-and-swap; txn dirs not exclusive | `867ffc1` (#6) | backends-linux::nixos::swap_override; txn::Store::create_fence/forget_fences | Kani `override_swap_never_overwrites_a_third_party`; `the_override_swap_waits_for_the_directory_lock`; `txn_fences_are_exclusive_and_swept_after_checkpoint`; `en-i23-third-party-override-kept` | Kani + unit + gym | recorded (reconciliation: "every case was checked to fail with its fix removed") | covered |
 | J15 | Startup revert stalled 15 min: the activation recovery ran before `planarian-ready.target` | #14 (`a018b08`), VM guard #15 (`6b03181`) | txn::Kernel::reconcile_deferring/finish_deferred; daemon::Core::finish_recovery | `deferred_recovery_runs_no_activation_before_ready`, `undeferred_reconcile_recovers_at_once` (kernel.rs); `restart_reverts_an_interrupted_activation_after_ready` (core/tests.rs); VM judge `stalls` on `crash-slow-worker-overlap` | unit + gym-VM | recorded: "shown failing on `main` without the fix, VM run 41355934489" | covered (systemd job ordering; VM-shaped) |
 | J16 | After `compact()`, `Journal::open` was quadratic in the store: `later_record` CRC'd the length the bytes claimed at every offset of the leftovers past the tail (minutes at 64 MiB). Found by prop-auditor writing D14 | lane-daemon/journal-open-linear | txn::Journal::later_record (`could_follow`) | `open_is_linear_in_the_store`, `open_after_a_compaction_does_not_search_the_leftovers_quadratically`, `after_a_compaction_a_damaged_middle_record_is_still_integrity`, `any_damage_before_the_last_record_is_integrity` (the reviewer's), `every_appended_frame_could_follow` (txn/src/journal/tests.rs) | proptest + unit | verified: without the header check, 116,456,038 bytes CRC'd for a 256 KiB store; the property's minimal case 155,257 for 131,072 | covered |
+| J17 | After `compact()`, every append and every catch-up by another handle read the rest of the store: `scan` read `HEADER + len` at the tail, `len` being whatever the leftovers there claimed (1.68 GB in one run), until the log overwrote them. Found by lane-daemon measuring the renewer | lane-daemon/scan-next-record | txn::Journal::scan (a body is read only for a header that could be the next record) | `appends_and_catch_ups_read_what_was_appended` (cost), `scan_outcomes_are_unchanged` (old vs new: same ledger, error and bytes left, 400 cases) (txn/src/journal/tests.rs) | proptest | verified: without the check "an append of 92 bytes read 130762"; dropping the skipping clause, the outcome property fails at `before = 1, compact, unreset` | covered |
 
 ## Daemon timing, holds and posture (`crates/daemon`, `crates/incident`, `nix/posture.nix`)
 
@@ -162,7 +163,7 @@ the coordinator's list:
 
 ## Counts
 
-63 rows for bugs fixed on `main`: 16 journal and kernel (J), 14 daemon (D),
+64 rows for bugs fixed on `main`: 17 journal and kernel (J), 14 daemon (D),
 16 change path (C), 17 backends, identity and gym (B). Another 9 netwatch
 rows are pending #42. 16 rows still owe a property test (status **gap**).
 J4 and J7 wait on lane-daemon's extraction of pure functions. The rest, in
