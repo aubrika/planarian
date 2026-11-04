@@ -321,6 +321,13 @@ pkgs.runCommand "planarian-module-eval.json" {
   diff paths-export paths-read || { echo "export: key paths differ between the export (<) and planariad's round trip (>): < is dropped, > is defaulted" >&2; exit 1; }
   [ -s paths-export ] || { echo "export: no key paths (the diff would be vacuous)" >&2; exit 1; }
   echo "ok: every key path in the export survives planariad's Export, and none is filled by default ($(wc -l < paths-export) paths)"
+  # And every value (prop-auditor's rule-23 note): a field parsed into a
+  # different value, not only a dropped or defaulted key, is a defect.
+  vf='del(.networkTools, .networkToolsInitrd, .networkToolsUnordered) | (.units[], .userUnits[]) |= (.probes |= map(del(.flagged)))'
+  jq -S "$vf" $exportPath > values-export
+  jq -S . parsed.json > values-read
+  diff values-export values-read || { echo "export: a value differs between the export (<) and planariad's round trip (>)" >&2; exit 1; }
+  echo "ok: every value in the export reads back unchanged through planariad's Export"
 
   root=$PWD/run
   # A stub systemctl, first on the script's PATH: the unit's InvocationID

@@ -257,4 +257,6 @@ pub use model::{
 };
 
 #[cfg(test)]
+mod props;
+#[cfg(test)]
 mod tests;

@@ -52,8 +52,12 @@ fn outcome(verb: &str, unit: &UnitId, o: Output) -> Outcome {
     }
 }
 
-pub fn apply(unit: &UnitId) -> Outcome {
-    outcome("start", unit, run(&["systemctl", "start", &hold_unit(unit)], TIMEOUT))
+/// Start the unit's hold, waiting at most `wait` (and never past TIMEOUT).
+/// Past it the `systemctl` client is killed and the result is `Unknown`;
+/// systemd's start job is the manager's, not the client's, and goes on, so
+/// the hold may still land.
+pub fn apply(unit: &UnitId, wait: Duration) -> Outcome {
+    outcome("start", unit, run(&["systemctl", "start", &hold_unit(unit)], wait.min(TIMEOUT)))
 }
 
 /// Rebuild the hold's table in place (`ExecReload` runs the script's
@@ -62,8 +66,8 @@ pub fn apply(unit: &UnitId) -> Outcome {
 ///
 /// `systemctl reload` fails on an inactive unit, so one not active (the hold
 /// was stopped, or never started on this boot) is started instead.
-pub fn reapply(unit: &UnitId) -> Outcome {
-    reapply_with(unit, |argv| run(argv, TIMEOUT))
+pub fn reapply(unit: &UnitId, wait: Duration) -> Outcome {
+    reapply_with(unit, |argv| run(argv, wait.min(TIMEOUT)))
 }
 
 fn reapply_with(unit: &UnitId, run: impl Fn(&[&str]) -> Output) -> Outcome {
@@ -77,8 +81,8 @@ fn reapply_with(unit: &UnitId, run: impl Fn(&[&str]) -> Output) -> Outcome {
 }
 
 /// The hold script's table (`table inet planarian-hold`).
-pub fn table_present() -> Result<bool, Outcome> {
-    let o = run(&["nft", "list", "table", "inet", "planarian-hold"], TIMEOUT);
+pub fn table_present(wait: Duration) -> Result<bool, Outcome> {
+    let o = run(&["nft", "list", "table", "inet", "planarian-hold"], wait.min(TIMEOUT));
     if o.ok() {
         Ok(true)
     } else if !o.timed_out && o.stderr.contains("No such file or directory") {
@@ -88,8 +92,8 @@ pub fn table_present() -> Result<bool, Outcome> {
     }
 }
 
-pub fn lift(unit: &UnitId) -> Outcome {
-    outcome("stop", unit, run(&["systemctl", "stop", &hold_unit(unit)], TIMEOUT))
+pub fn lift(unit: &UnitId, wait: Duration) -> Outcome {
+    outcome("stop", unit, run(&["systemctl", "stop", &hold_unit(unit)], wait.min(TIMEOUT)))
 }
 
 /// The units held now, from the hold script's state directory. A directory
@@ -136,13 +140,13 @@ fn marker_path(dir: &Path, unit: &UnitId) -> PathBuf {
 
 /// Write the release marker, then lift the hold. The marker comes first so
 /// that a failure racing the lift does not re-apply the hold.
-pub fn release_in(dir: &Path, unit: &UnitId, until: Option<Timestamp>) -> Outcome {
+pub fn release_in(dir: &Path, unit: &UnitId, until: Option<Timestamp>, wait: Duration) -> Outcome {
     if let Err(e) = std::fs::create_dir_all(dir)
         .and_then(|_| std::fs::write(marker_path(dir, unit), marker(until, wall_now(), boottime_s())))
     {
         return Outcome::Failed(format!("{}: {e}", dir.display()));
     }
-    lift(unit)
+    lift(unit, wait)
 }
 
 pub fn end_release_in(dir: &Path, unit: &UnitId) -> Outcome {
@@ -223,7 +227,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("planarian-hold-released-{}", std::process::id()));
         let u = UnitId::service("wireguard-gym");
         // `lift` runs systemctl, absent here: the marker is written first all the same.
-        let _ = release_in(&d, &u, None);
+        let _ = release_in(&d, &u, None, Duration::from_secs(1));
         assert_eq!(std::fs::read_to_string(d.join("wireguard-gym")).unwrap(), "boot\n");
         assert_eq!(end_release_in(&d, &u), Outcome::Succeeded);
         assert!(!d.join("wireguard-gym").exists());

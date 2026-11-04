@@ -234,7 +234,8 @@ proptest! {
 /// the exported fields #10's C19 line names), or the entry added or removed.
 fn edit_entry(d: &mut UnitDef, field: u8, k: u8) {
     // Every field, named (no `..`): a field added to `UnitDef` fails to
-    // compile here until it has an arm below and `FIELDS` counts it.
+    // compile here until it has an arm below and `MANIFEST_FIELDS` or
+    // `DERIVED_FIELDS` lists it.
     let UnitDef {
         id: _,
         desired: _,
@@ -316,7 +317,10 @@ fn edit_entry(d: &mut UnitDef, field: u8, k: u8) {
     }
 }
 
-const FIELDS: u8 = 14;
+/// `edit_entry`'s arms for the fields the manifest declares.
+const MANIFEST_FIELDS: [u8; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13];
+/// Its arms for the fields the module derives (`host::declared`): `holds`.
+const DERIVED_FIELDS: [u8; 1] = [11];
 
 fn manifest() -> Manifest {
     Manifest { units: planarian_fake::fixtures::gym_units(), user_units: planarian_fake::fixtures::gym_user_units() }
@@ -331,20 +335,32 @@ proptest! {
     /// entry did not ask (§11 ApplyChange row). Stated whole: any edit to any
     /// field of any entry, system or user scope, and any added or removed
     /// entry, touches the manifest.
+    ///
+    /// With a derived field changed too, anywhere (`holds`, which a manifest
+    /// edit must not hide behind); and a system-scope edit puts its unit in
+    /// `changed_units`.
     #[test]
     fn every_edit_to_an_entry_touches_the_manifest(
         user in any::<bool>(),
         which in any::<prop::sample::Index>(),
-        how in 0..FIELDS + 2,
+        how in 0..MANIFEST_FIELDS.len() as u8 + 2,
         k in any::<u8>(),
+        derived in proptest::option::of((any::<prop::sample::Index>(), any::<prop::sample::Index>())),
     ) {
         let base = manifest();
         let mut cand = base.clone();
+        if let Some((at, f)) = derived {
+            let ids: Vec<UnitId> = cand.units.keys().cloned().collect();
+            let d = cand.units.get_mut(&ids[at.index(ids.len())]).unwrap();
+            edit_entry(d, DERIVED_FIELDS[f.index(DERIVED_FIELDS.len())], k);
+        }
+        let n = MANIFEST_FIELDS.len() as u8;
+        let mut edited: Option<UnitId> = None;
         if user {
             let i = which.index(cand.user_units.len());
             match how {
-                f if f < FIELDS => edit_entry(&mut cand.user_units[i], f, k),
-                f if f == FIELDS => {
+                f if f < n => edit_entry(&mut cand.user_units[i], MANIFEST_FIELDS[f as usize], k),
+                f if f == n => {
                     cand.user_units.remove(i);
                 }
                 _ => {
@@ -357,13 +373,18 @@ proptest! {
             let ids: Vec<UnitId> = cand.units.keys().cloned().collect();
             let id = ids[which.index(ids.len())].clone();
             match how {
-                f if f < FIELDS => edit_entry(cand.units.get_mut(&id).unwrap(), f, k),
-                f if f == FIELDS => {
+                f if f < n => {
+                    edit_entry(cand.units.get_mut(&id).unwrap(), MANIFEST_FIELDS[f as usize], k);
+                    edited = Some(id);
+                }
+                f if f == n => {
                     cand.units.remove(&id);
+                    edited = Some(id);
                 }
                 _ => {
                     let mut extra = cand.units[&id].clone();
                     extra.id.name = format!("{}-extra-{k}", extra.id.name);
+                    edited = Some(extra.id.clone());
                     cand.units.insert(extra.id.clone(), extra);
                 }
             }
@@ -376,6 +397,43 @@ proptest! {
             if user { "user scope" } else { "system scope" },
             which
         );
+        if let Some(id) = edited {
+            prop_assert!(
+                crate::host::changed_units(&base, &cand).contains(&id),
+                "edit {} of {:?} did not change the unit",
+                how,
+                id
+            );
+        }
+    }
+
+    /// The fields the module derives (`holds`, from the unit's own systemd
+    /// config) are not the manifest (coordinator, Nov 3; gate 41596671872:
+    /// the base's network tools carried `holds: true` and the gym's
+    /// candidate facts did not, so every tool read as a manifest edit and the
+    /// change asked). Any derived edits, to any entries of either scope,
+    /// alone: `touches_manifest` is false and `changed_units` is empty.
+    #[test]
+    fn derived_fields_alone_are_not_the_manifest(
+        edits in proptest::collection::vec(
+            (any::<bool>(), any::<prop::sample::Index>(), any::<prop::sample::Index>(), any::<u8>()),
+            1..8,
+        ),
+    ) {
+        let base = manifest();
+        let mut cand = base.clone();
+        let ids: Vec<UnitId> = cand.units.keys().cloned().collect();
+        for (user, which, f, k) in edits {
+            let f = DERIVED_FIELDS[f.index(DERIVED_FIELDS.len())];
+            if user {
+                let i = which.index(cand.user_units.len());
+                edit_entry(&mut cand.user_units[i], f, k);
+            } else {
+                edit_entry(cand.units.get_mut(&ids[which.index(ids.len())]).unwrap(), f, k);
+            }
+        }
+        prop_assert!(!touches_manifest(&base, &cand, &ConfigDiff::default()), "a derived edit touched the manifest");
+        prop_assert_eq!(crate::host::changed_units(&base, &cand), BTreeSet::new());
     }
 
     /// The other side: a canonical probe's definition is `touches_canonical`'s
