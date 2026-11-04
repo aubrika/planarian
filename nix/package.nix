@@ -18,6 +18,10 @@ let
     "fentry/nf_setsockopt"
     "fentry/genl_rcv_msg"
     "fexit/register_netdevice"
+    "fentry/__dev_change_net_namespace"
+    "fexit/__dev_change_net_namespace"
+    "fentry/netif_change_name"
+    "fexit/netif_change_name"
   ];
   netwatchEbpf =
     if builtins.pathExists (netwatchCrate + "/Cargo.toml")

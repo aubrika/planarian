@@ -241,6 +241,53 @@ impl Claims {
 }
 
 impl Tracker {
+    /// An interface keeps its identity when the kernel renames it. Preserve
+    /// every owner's objects and route references, including attach-time
+    /// state and both invocation latches; the renamer gains no ownership.
+    pub fn rename_interface(&mut self, was: &str, now: &str) {
+        if was == now {
+            return;
+        }
+        let rename = |name: &mut String| {
+            if name.as_str() == was {
+                *name = now.to_string();
+            }
+        };
+        let iface = |i: &mut Option<String>| {
+            if let Some(i) = i {
+                rename(i);
+            }
+        };
+        for s in self.units.values_mut() {
+            if let Some(value) = s.objects.remove(&(ChangeKind::Interface, was.to_string())) {
+                s.objects.insert((ChangeKind::Interface, now.to_string()), value);
+            }
+            for (i, _) in s.objects.values_mut() {
+                iface(i);
+            }
+        }
+        for objects in [&mut self.unattributed, &mut self.pre_attach] {
+            if let Some(value) = objects.remove(&(ChangeKind::Interface, was.to_string())) {
+                objects.insert((ChangeKind::Interface, now.to_string()), value);
+            }
+            for i in objects.values_mut() {
+                iface(i);
+            }
+        }
+        for i in self.route_through.values_mut() {
+            rename(i);
+        }
+        if self.virtual_ifaces.remove(was) {
+            self.virtual_ifaces.insert(now.to_string());
+        }
+        for latch in self.latched.values_mut().chain(self.next_latch.values_mut()) {
+            if latch.ifaces.remove(was) {
+                latch.ifaces.insert(now.to_string());
+            }
+        }
+        self.relatch();
+    }
+
     pub fn apply(&mut self, c: &Change) {
         self.apply_change(c);
         self.relatch();
@@ -596,3 +643,7 @@ impl Tracker {
         FootprintView { watch, unattributed: why, units }
     }
 }
+
+#[cfg(test)]
+#[path = "rename_props.rs"]
+mod rename_props;

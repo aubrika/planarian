@@ -4,7 +4,10 @@
 //! is reported as [`Parsed::Unreadable`], which marks the sender's
 //! footprint `unattributed` (fail closed).
 
-use crate::ebpf::{Event, HOOK_GENL, HOOK_NETDEV, HOOK_NFBATCH, HOOK_NFNETLINK, HOOK_RTNETLINK, HOOK_SOCKOPT};
+use crate::ebpf::{
+    Event, HOOK_GENL, HOOK_NETDEV, HOOK_NETMOVE, HOOK_NETRENAME, HOOK_NFBATCH, HOOK_NFNETLINK, HOOK_RTNETLINK,
+    HOOK_SOCKOPT,
+};
 use crate::model::{Change, ChangeKind, Owner};
 
 const NLM_F_CREATE: u16 = 0x400;
@@ -45,6 +48,11 @@ pub enum Parsed {
     /// Nothing that can change how traffic leaves (a read, an address).
     Nothing,
     Changes(Vec<Change>),
+    /// The same interface, with every maker and route preserved.
+    Renamed {
+        was: String,
+        now: String,
+    },
     /// May change how traffic leaves, but could not be read in full.
     Unreadable(String),
 }
@@ -78,11 +86,33 @@ fn cstr(b: &[u8]) -> String {
     String::from_utf8_lossy(b.split(|c| *c == 0).next().unwrap_or(&[])).into_owned()
 }
 
-const RTM_SETLINK: u16 = 19;
-const IFINFOMSG_LEN: usize = 16;
-const IFLA_NET_NS_PID: u16 = 19;
-const IFLA_NET_NS_FD: u16 = 28;
-const IFLA_TARGET_NETNSID: u16 = 46;
+/// Deliberate bugs in the move rules, for the tests that show the move
+/// property catches them (rule 23).
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MoveMutant {
+    None,
+    /// A move into the host makes no claim.
+    DropArrival,
+    /// A move out of the host removes nothing.
+    DropDeparture,
+    /// A move out removes the name it has now, not the one it had.
+    DepartureByNewName,
+    /// Only the target's namespace is looked at: a move out is never seen.
+    TargetOnly,
+    /// Any move to another namespace removes the claim, whichever it left.
+    AnyDeparture,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MOVE_MUTANT: std::cell::Cell<MoveMutant> = const { std::cell::Cell::new(MoveMutant::None) };
+}
+
+#[cfg(test)]
+fn mutant(m: MoveMutant) -> bool {
+    MOVE_MUTANT.with(std::cell::Cell::get) == m
+}
 
 /// Which network namespace a request acts on, against netwatch's own
 /// (crate docs, "Namespaces").
@@ -96,30 +126,97 @@ pub enum Scope {
     /// The probe could not read the netns: a loss nothing can place
     /// (`.unattributed`, fail closed).
     Unknown,
-    /// A request elsewhere that may reach into this one (a link moved by
-    /// netns pid or fd, or aimed at a netns id; the kernel makes no request
-    /// here for the device arriving): charged to the mover as unattributed,
-    /// or to nobody if its unit is not known (fail closed either way).
-    Reaches,
 }
 
 pub fn scope(ev: &Event, own: u32) -> Scope {
+    if ev.hook == HOOK_NETMOVE {
+        // A move concerns the host if it arrives there or leaves from there.
+        return match (ev.netns, move_source(ev)) {
+            (0, _) | (_, None) => Scope::Unknown,
+            (target, _) if target == own => Scope::Host,
+            #[cfg(test)]
+            _ if mutant(MoveMutant::TargetOnly) => Scope::Elsewhere,
+            (_, Some((source, _))) if source == own => Scope::Host,
+            #[cfg(test)]
+            _ if mutant(MoveMutant::AnyDeparture) => Scope::Host,
+            _ => Scope::Elsewhere,
+        };
+    }
     if ev.netns == 0 {
         return Scope::Unknown;
     }
     if ev.netns == own {
         return Scope::Host;
     }
-    if ev.hook == HOOK_RTNETLINK && matches!(ev.nlmsg_type(), Some(RTM_NEWLINK | RTM_SETLINK)) {
-        let reaches = |a: &[(u16, &[u8])]| {
-            a.iter().any(|(t, _)| matches!(*t, IFLA_NET_NS_PID | IFLA_NET_NS_FD | IFLA_TARGET_NETNSID))
-        };
-        match attrs(&ev.data, NLMSG_HDRLEN + IFINFOMSG_LEN) {
-            Some(a) if !reaches(&a) && !ev.truncated() => {}
-            _ => return Scope::Reaches,
-        }
-    }
+    // A link moved into the host by a request made elsewhere (`IFLA_NET_NS_*`,
+    // `IFLA_TARGET_NETNSID`) is seen as the move itself (HOOK_NETMOVE), in the
+    // mover's context, and one created there as its registration (HOOK_NETDEV).
     Scope::Elsewhere
+}
+
+/// Where a moved interface came from: the source netns inode and the name it
+/// had there (`None`: the probe did not see the call begin, or could not
+/// read them).
+fn move_source(ev: &Event) -> Option<(u32, String)> {
+    let inum = u32::from_ne_bytes(ev.data.get(16..20)?.try_into().ok()?);
+    let name = cstr(ev.data.get(20..36)?);
+    (inum != 0).then_some((inum, name))
+}
+
+/// The loader's event path, including observed interface-index names. Route
+/// changes resolve against live names, never a stale cached index. Retain
+/// observed names for queued index-only deletions after the device is gone;
+/// a rename rewrites them and a departure/deletion removes them afterward.
+pub fn take_cached(
+    t: &mut crate::Tracker,
+    ev: &Event,
+    own_netns: u32,
+    unit: impl FnOnce() -> Option<planarian_schema::UnitId>,
+    names: &mut std::collections::BTreeMap<u32, String>,
+    read_names: &mut dyn FnMut() -> std::collections::BTreeMap<u32, String>,
+) {
+    let host = scope(ev, own_netns) == Scope::Host;
+    let route = host && ev.hook == HOOK_RTNETLINK && matches!(ev.nlmsg_type(), Some(RTM_NEWROUTE | RTM_DELROUTE));
+    let live = if route { Some(read_names()) } else { None };
+    if let Some(live) = &live {
+        names.extend(live.clone());
+    }
+    take(t, ev, own_netns, unit, &mut |i| {
+        if let Some(live) = &live {
+            return live.get(&i).cloned();
+        }
+        if !names.contains_key(&i) {
+            names.extend(read_names());
+        }
+        names.get(&i).cloned()
+    });
+    if !host {
+        return;
+    }
+    let identity = if ev.hook == HOOK_NETMOVE {
+        parse_move(ev, own_netns, &Owner::Unattributed)
+    } else if matches!(ev.hook, HOOK_NETDEV | HOOK_NETRENAME)
+        || (ev.hook == HOOK_RTNETLINK && matches!(ev.nlmsg_type(), Some(16 | 17 | 19)))
+    {
+        parse(ev, &Owner::Unattributed, &mut |i| names.get(&i).cloned())
+    } else {
+        return;
+    };
+    match identity {
+        Parsed::Renamed { was, now } => {
+            for name in names.values_mut() {
+                if name.as_str() == was {
+                    *name = now.clone();
+                }
+            }
+        }
+        Parsed::Changes(cs) => {
+            for c in cs.iter().filter(|c| c.kind == ChangeKind::Interface && c.removed) {
+                names.retain(|_, name| name.as_str() != c.object.as_str());
+            }
+        }
+        _ => {}
+    }
 }
 
 /// One event as the loop takes it: ignored if it acts in another netns, a
@@ -135,25 +232,106 @@ pub fn take(
     match scope(ev, own_netns) {
         Scope::Elsewhere => return,
         Scope::Unknown => return t.lost(None),
-        Scope::Reaches => return t.lost(unit().as_ref()),
         Scope::Host => {}
     }
     // The tracker's keys (interface names, `oif` resolved through the
     // host's /sys/class/net) are implicitly the host's: nothing from
     // another netns may reach it.
-    debug_assert_eq!(ev.netns, own_netns, "a non-host event reached the tracker");
+    debug_assert!(ev.hook == HOOK_NETMOVE || ev.netns == own_netns, "a non-host event reached the tracker");
     let unit = unit();
     let owner = unit.clone().map(Owner::Unit).unwrap_or(Owner::Unattributed);
-    match parse(ev, &owner, ifname) {
+    let parsed = if ev.hook == HOOK_NETMOVE { parse_move(ev, own_netns, &owner) } else { parse(ev, &owner, ifname) };
+    match parsed {
         Parsed::Nothing => {}
         Parsed::Changes(cs) => cs.iter().for_each(|c| t.apply(c)),
-        Parsed::Unreadable(_) => t.lost(unit.as_ref()),
+        Parsed::Renamed { was, now } => t.rename_interface(&was, &now),
+        Parsed::Unreadable(reason) => {
+            // Bounded diagnostics: at most eight per process, even under a
+            // stream of malformed requests. Every event still fails closed.
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static LOGGED: AtomicUsize = AtomicUsize::new(0);
+            if LOGGED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < 8).then_some(n + 1)).is_ok() {
+                eprintln!(
+                    "netwatch: unreadable event (hook {}, type {:?}, netns {}, unit {:?}): {reason}",
+                    ev.hook,
+                    ev.nlmsg_type(),
+                    ev.netns,
+                    unit,
+                );
+            }
+            t.lost(unit.as_ref());
+        }
     }
+}
+
+/// An interface moved between network namespaces (`HOOK_NETMOVE`), made by
+/// `owner`. Arriving in the host's (`own`): a claim on the name it has now,
+/// like any interface the mover brought. Leaving the host's: the interface
+/// is gone from it, under the name it had there (the kernel may have renamed
+/// it on the way). Between two others, or into the one it was in: nothing of
+/// the host's. A name it cannot read, where one matters, is unreadable.
+pub fn parse_move(ev: &Event, own: u32, owner: &Owner) -> Parsed {
+    let Some((source, was)) = move_source(ev) else {
+        return Parsed::Unreadable("a namespace move whose source was not seen".into());
+    };
+    let target = ev.netns;
+    if target == 0 {
+        return Parsed::Unreadable("a namespace move whose target was not read".into());
+    }
+    let now = cstr(ev.data.get(..16).unwrap_or(&[]));
+    let change = |name: String, removed| {
+        Parsed::Changes(vec![Change {
+            owner: owner.clone(),
+            kind: ChangeKind::Interface,
+            object: name.clone(),
+            iface: Some(name),
+            steers: false,
+            removed,
+        }])
+    };
+    #[cfg(test)]
+    let (arrives, leaves) = (
+        target == own && source != own && !mutant(MoveMutant::DropArrival),
+        (if mutant(MoveMutant::AnyDeparture) { target != own } else { source == own && target != own })
+            && !mutant(MoveMutant::DropDeparture),
+    );
+    #[cfg(not(test))]
+    let (arrives, leaves) = (target == own && source != own, source == own && target != own);
+    if arrives {
+        return if now.is_empty() {
+            Parsed::Unreadable("an interface moved in without a readable name".into())
+        } else {
+            change(now, false)
+        };
+    }
+    if leaves {
+        #[cfg(test)]
+        let was = if mutant(MoveMutant::DepartureByNewName) { now } else { was };
+        return if was.is_empty() {
+            Parsed::Unreadable("an interface moved out without a readable name".into())
+        } else {
+            change(was, true)
+        };
+    }
+    Parsed::Nothing
 }
 
 /// The changes in `ev`, made by `owner`. `ifname` names an interface index.
 pub fn parse(ev: &Event, owner: &Owner, ifname: &mut dyn FnMut(u32) -> Option<String>) -> Parsed {
     let b = &ev.data;
+    if ev.hook == HOOK_NETRENAME {
+        let names = b.get(..32).map(|b| (cstr(&b[..16]), cstr(&b[16..32])));
+        return match names {
+            Some((was, now)) if !was.is_empty() && !now.is_empty() => Parsed::Renamed { was, now },
+            _ => Parsed::Unreadable("an interface rename without both readable names".into()),
+        };
+    }
+    if ev.hook == HOOK_NETMOVE {
+        // Which way it went depends on the host's netns, which `parse` is
+        // not given: `take` calls `parse_move`. Anyone else must not read
+        // a move as nothing.
+        return Parsed::Unreadable("a namespace move is read by parse_move".into());
+    }
     if ev.hook == HOOK_NETDEV {
         // An interface registered in its creator's context: how a tun made
         // by ioctl is seen at all (no netlink message announces it).
@@ -234,6 +412,9 @@ pub fn parse(ev: &Event, owner: &Owner, ifname: &mut dyn FnMut(u32) -> Option<St
                 // §12d: a default or all-covering route (a /0, or the two /1
                 // halves OpenVPN's redirect-gateway uses), in any table.
                 let steers = dst_len <= 1;
+                if ty == RTM_NEWROUTE && steers && oif.is_some() && iface.is_none() {
+                    return Parsed::Unreadable("a steering route whose output interface was not read".into());
+                }
                 // Two default routes (the uplink's, a tunnel's) differ by their
                 // output interface and metric: the key carries both.
                 let object = format!("route {family} {table} {dst}/{dst_len} oif {} metric {metric}", oif.unwrap_or(0));
