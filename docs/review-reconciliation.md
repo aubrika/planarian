@@ -452,3 +452,22 @@ Reconciled at `main` `1fc3589` against prop-auditor's audit (the "Tests that may
 | Item | At `1fc3589` | Work |
 | --- | --- | --- |
 | `nixos::tests::git_owner_edit_after_staging_is_stale` | Skips unless nix-hash and git are both on PATH. The rust job has no nix-hash, and `checks.package` has `nativeCheckInputs = [ nix ]` and no git, so it runs nowhere. libtest hides a passing test's stderr, so its log line reads `ok` either way | `nativeCheckInputs = [ nix git ]`. The package's `preCheck` sets `PLANARIAN_REQUIRE_NIX_GIT_TESTS=1`, and while it is set the guard panics instead of skipping (netwatch's pattern). Shown in a one-off `--show-output` build of the package: it runs and is ok, with no SKIPPED line. With git removed, it fails with the guard's message |
+
+## lane-nix: Decision B, gainable capabilities (3 Nov)
+
+Reconciled at `main` `63fa26c` against the owner's Decision B (handoff from the previous lane-nix) and §12d "Which units".
+
+| Item | At `63fa26c` | Work |
+| --- | --- | --- |
+| Capabilities acquired through setuid or file capabilities | A unit counted only if it held CAP_NET_ADMIN or CAP_NET_RAW ambient, was root with a bounding set granting them, or had tun/ppp access. An unprivileged unit whose bounding set allows them could gain them after start, and was not a network tool (parked in the #38 re-review) | `isNetworkToolUnchecked` also counts a unit whose bounding set allows either capability (none set, or one granting them, `~` inverted) while `NoNewPrivileges=` is unset (`true`, `yes`, `1`, `on` read as set; anything else fails closed). One rule: the hold, the export's `holds` and the boot ordering all read `networkTools`, so it applies uniformly. module-eval fixtures `nt-gainable*` (tools) and `not-nnp*` (not); with the rule removed, module-eval fails on the new check. On the demo VM (`planarian-vm-text`) holdUnits goes from 71 to 72 (adds `gym-web`) |
+
+## lane-nix: concurrent hold changes (4 Nov)
+
+Reconciled at `main` `895eaa1` while readying #68. Independent systemd `OnFailure=` instances can apply a hold while the daemon lifts another; serial daemon calls alone do not serialize them.
+
+| Item | At `895eaa1` | Work |
+| --- | --- | --- |
+| Last lift racing another apply (D16) | `build` could read an empty marker directory, then delete the table installed by a concurrent apply. The other unit remained marked held while traffic passed | The apply, lift and reapply paths take one shared `flock` on `/run/planarian/hold.lock` before marker changes, the administrator snapshot and the full nft rebuild/delete. The lock lives outside the marker directory and is never unlinked. `condition` is read-only and takes no lock while waiting for netwatch. `util-linux` is explicit on the script's PATH |
+| Regression | A deterministic nft stub pauses the last lift at table deletion, then starts another unit's apply | `nix/tests/hold-concurrency.py` runs the real built script in module-eval. With the shared-lock block removed it fails `a concurrent lift deleted B's hold table`; with the lock it passes, and the competing apply does not change its marker while waiting |
+
+Rule 18: opens no path; this serializes existing restrictions and narrows which units may fail without a hold. Rule 23: these are Nix wiring and systemd helper changes, with module-eval fixtures and a deterministic concurrent-script regression; no pure Rust fold changes. No daemon API changes. The table's Core hash changes with the script, as intended.

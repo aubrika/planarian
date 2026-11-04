@@ -83,7 +83,9 @@ let
   # §12d "Which units": a *network tool* is a unit able to change how
   # traffic leaves the machine, computed at build time from its systemd
   # configuration, never from its name, and failing closed. It holds
-  # CAP_NET_ADMIN or CAP_NET_RAW (ambient, or root's bounding set); it is
+  # CAP_NET_ADMIN or CAP_NET_RAW (ambient, or root's bounding set); it
+  # could gain either (its bounding set allows one and NoNewPrivileges= is
+  # unset, so a setuid binary or file capability can grant it); it is
   # given /dev/net/tun or /dev/ppp explicitly (DeviceAllow= or Bind*Paths=;
   # TUNSETIFF needs CAP_NET_ADMIN, so bare device access creates nothing); it
   # declares network interfaces (the units the networkd netdev, WireGuard
@@ -124,11 +126,18 @@ let
       user = sc.User or "root";
       root = (user == "root" || user == "0") && !(sc.DynamicUser or false);
       bounding = sc.CapabilityBoundingSet or null;
+      # NoNewPrivileges= as systemd reads it; anything unrecognised counts
+      # as unset (failing closed).
+      noNewPrivs = builtins.elem (toString (sc.NoNewPrivileges or false)) [ "1" "true" "yes" "on" ];
       devices = words ((sc.DeviceAllow or [ ]) ++ (sc.BindPaths or [ ]) ++ (sc.BindReadOnlyPaths or [ ]));
     in
     builtins.elem name netdevUnits
     || grants (sc.AmbientCapabilities or [ ]) netCaps
     || (root && (bounding == null || grants bounding netCaps))
+    # Decision B: gainable. A unit whose bounding set allows them, and that
+    # may gain privileges (setuid binaries, file capabilities), could acquire
+    # CAP_NET_ADMIN or CAP_NET_RAW after it starts.
+    || ((bounding == null || grants bounding netCaps) && !noNewPrivs)
     || lib.any (d: lib.hasInfix "/dev/net/tun" d || lib.hasInfix "/dev/ppp" d) devices;
   # Classified from its own definition; a failed evaluation is a tool.
   isNetworkToolDefined = name:
@@ -829,3 +838,4 @@ in
     };
   };
 }
+

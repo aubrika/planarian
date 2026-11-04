@@ -188,13 +188,25 @@ let
   # have no conntrack entry to mark (no rule needed tracking before).
   hold = pkgs.writeShellScript "planarian-hold" ''
     set -u
-    PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep pkgs.gawk pkgs.nftables pkgs.iproute2 pkgs.findutils pkgs.getent config.systemd.package ]}
+    PATH=${lib.makeBinPath [ pkgs.coreutils pkgs.gnugrep pkgs.gawk pkgs.nftables pkgs.iproute2 pkgs.findutils pkgs.getent pkgs.util-linux config.systemd.package ]}
     dir=/run/planarian/hold
     released=/run/planarian/hold-released
     footprint=/run/planarian/footprint
     mkdir -p "$dir" "$released"
     cmd="$1"; unit="''${2:-}"
     log() { echo "planarian-hold: $*"; }
+
+    # Different OnFailure= instances and the daemon's lifts can run together.
+    # Serialize the markers, administrator snapshot and entire nft update:
+    # otherwise the last old lift can delete a new hold's table after seeing
+    # an empty directory. Keep the lock outside that directory and never
+    # unlink it, so every invocation locks the same inode. The read-only
+    # condition waits for netwatch without holding up a traffic restriction.
+    case "$cmd" in
+      apply|lift|reapply)
+        exec 9>/run/planarian/hold.lock || exit 1
+        flock --exclusive 9 || exit 1 ;;
+    esac
 
     is_admin() {
       [ "$1" = 0 ] && return 0
@@ -828,3 +840,4 @@ in
   }
   ]);
 }
+

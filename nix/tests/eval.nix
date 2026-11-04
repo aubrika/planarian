@@ -56,6 +56,14 @@ let
         services.planarian.units."not-tpl@a" = { };
         # A foreign unit named like Planarian's: classified like any other.
         systemd.services.planarian-test-vpn = { script = "true"; serviceConfig = { DynamicUser = true; AmbientCapabilities = [ "CAP_NET_ADMIN" ]; }; };
+        # Decision B: gainable capabilities. Bounding set allows them and
+        # NoNewPrivileges is unset: could gain them through setuid or file caps.
+        systemd.services.nt-gainable = { script = "true"; serviceConfig = { DynamicUser = true; }; };
+        systemd.services.nt-gainable-bounded = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = [ "CAP_CHOWN" "CAP_NET_RAW" ]; }; };
+        systemd.services.nt-gainable-nnp-off = { script = "true"; serviceConfig = { DynamicUser = true; NoNewPrivileges = false; }; };
+        systemd.services.not-nnp = { script = "true"; serviceConfig = { DynamicUser = true; NoNewPrivileges = true; }; };
+        systemd.services.not-nnp-yes = { script = "true"; serviceConfig = { User = "nobody"; NoNewPrivileges = "yes"; }; };
+        systemd.services.not-nnp-bounded-other = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = [ "CAP_CHOWN" ]; }; };
         systemd.services.not-bounded-empty = { script = "true"; serviceConfig.CapabilityBoundingSet = ""; };
         systemd.services.not-unprivileged = { script = "true"; serviceConfig = { DynamicUser = true; CapabilityBoundingSet = ""; }; };
         systemd.services.not-bounded-other = { script = "true"; serviceConfig.CapabilityBoundingSet = [ "CAP_CHOWN" "CAP_SETUID" ]; };
@@ -217,6 +225,8 @@ let
     (check (builtins.all (n: builtins.elem n hold.holdUnits) [ "gym-vpn" "nt-ambient" "nt-tun" "nt-inverted" "nt-root-bounded" "wg-quick-wg7" "firewall" ]) "each branch of the network-tool rule classifies (§12d): root with no bounding set, ambient CAP_NET_ADMIN, DeviceAllow /dev/net/tun, an inverted bounding set, a bounding set with CAP_NET_RAW, a netdev from the wg-quick tree, the firewall")
     (check (builtins.elem "planarian-test-vpn" hold.holdUnits) "a foreign unit named planarian-* is classified: Planarian's own units are excluded by the set the module declares, not by name (§12d)")
     (check (builtins.all (n: cfg.systemd.services ? ${n} || (n == "planarian-netwatch" && !(cfg.services.planarian.package.netwatch or false))) ownSet && builtins.all (n: !(builtins.elem n hold.holdUnits)) ownSet && !(sys.options.services.planarian ? ownUnits)) "every unit in the module's own set exists and none is classified; the set is no option, so no configuration can widen it")
+    (check (builtins.all (n: builtins.elem n hold.holdUnits) [ "nt-gainable" "nt-gainable-bounded" "nt-gainable-nnp-off" ]) "a unit whose bounding set allows CAP_NET_ADMIN or CAP_NET_RAW and that may gain privileges is a network tool (decision B): no bounding set, a set naming CAP_NET_RAW, NoNewPrivileges=false")
+    (check (builtins.all (n: !(builtins.elem n hold.holdUnits)) [ "not-nnp" "not-nnp-yes" "not-nnp-bounded-other" ]) "NoNewPrivileges (true or yes), or a bounding set without the network capabilities, keeps an unprivileged unit from counting (decision B)")
     (check (builtins.all (n: !(builtins.elem n hold.holdUnits)) [ "not-bounded-empty" "not-unprivileged" "not-bounded-other" "planariad" "planarian-recovery" ]) "a root unit with no network capabilities in its bounding set, an unprivileged one, and Planarian's own units are not network tools (§12d)")
     (check (builtins.elem "nt-vpn@" hold.holdUnits && hold.holdDropins."nt-vpn@.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "a templated network tool is classified, and each instance's failure holds as planarian-hold@<instance> (§12d)")
     (check (hold.holdDropins."firewall.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "the firewall is a network tool from its configuration, not its name (§12d)")
@@ -290,7 +300,7 @@ assert builtins.all (x: x) checks;
 pkgs.runCommand "planarian-module-eval.json" {
   export = builtins.toJSON export;
   passAsFile = [ "export" ];
-  nativeBuildInputs = [ pkgs.gnused pkgs.gawk pkgs.diffutils pkgs.jq ];
+  nativeBuildInputs = [ pkgs.gnused pkgs.gawk pkgs.diffutils pkgs.jq pkgs.python3 ];
 } ''
   # The export as planariad reads it (§12d; review of #38): parsed with its
   # own `nixos::Export` (`planariad --check-export`), the units it reads as
@@ -415,6 +425,9 @@ pkgs.runCommand "planarian-module-eval.json" {
   grep -q 'iif lo accept' $stub/load.2 && grep -q 'policy drop' $stub/load.2 && ! grep -q 'set allow4' $stub/load.2 \
     || { echo "reapply did not fall back to the lock" >&2; exit 1; }
   echo "ok: reapply with a failing table load holds everything but loopback"
+  # The real script, with nft stubbed: a last lift racing another unit's
+  # OnFailure= apply must leave the new hold's table in place (D16).
+  python ${./hold-concurrency.py} ${builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart)} ${pkgs.util-linux}/bin/flock
   # §12d (owner decision, Nov 2): the boot transaction systemd builds from
   # the unit files, upstream ones included, has netwatch in it and no
   # ordering cycle; and the check finds one when netwatch is ordered after
@@ -466,3 +479,4 @@ pkgs.runCommand "planarian-module-eval.json" {
   echo "ok: the network tools the systemd initrd runs ($(wc -l < want-initrd)) are exactly networkToolsInitrd"
   cp $exportPath $out
 ''
+
