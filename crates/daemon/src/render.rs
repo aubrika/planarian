@@ -95,6 +95,7 @@ pub fn record(r: &Record) -> String {
         Record::ExecProbeFlagged { unit, probe, argv0 } => {
             format!("{unit}: probe {probe} is an Exec probe: it runs a command ({argv0}) rather than a typed check")
         }
+        Record::NotPreparedAgain { txn, reason } => format!("txn {}: not prepared again: {reason}", txn.0),
     }
 }
 

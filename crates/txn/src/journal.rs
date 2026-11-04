@@ -104,6 +104,7 @@ pub const KINDS: &[&str] = &[
     "Reconciliation",
     "HoldApplied",
     "HoldLifted",
+    "NotPreparedAgain",
     "ExecProbeFlagged",
     "Skipped",
 ];
@@ -132,6 +133,7 @@ pub const DECISIVE_KINDS: &[&str] = &[
     "Reconciliation",
     "HoldApplied",
     "HoldLifted",
+    "NotPreparedAgain",
 ];
 
 /// A record's serialized kind, and the class it is written with. Exhaustive,
@@ -159,6 +161,7 @@ fn kind_and_class(r: &Record) -> (&'static str, Class) {
         Record::Reconciliation(_) => ("Reconciliation", D),
         Record::HoldApplied { .. } => ("HoldApplied", D),
         Record::HoldLifted { .. } => ("HoldLifted", D),
+        Record::NotPreparedAgain { .. } => ("NotPreparedAgain", D),
         Record::ExecProbeFlagged { .. } => ("ExecProbeFlagged", I),
         Record::Skipped { .. } => ("Skipped", I),
     }

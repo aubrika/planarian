@@ -1370,3 +1370,29 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    /// A retained refusal needs its decisive kind and checkpoint field,
+    /// both before compaction and after reopening the compacted journal.
+    #[test]
+    fn a_declined_transaction_remains_a_decisive_requirement(txn in any::<u64>()) {
+        let store = MemStore::new(64 << 10);
+        let mut j = Journal::open(store.clone()).unwrap();
+        let mut previous = supported();
+        previous.kinds.retain(|kind| kind != "NotPreparedAgain");
+        previous.fields.get_mut("checkpoint").unwrap().retain(|field| field != "not_prepared_again");
+        prop_assert!(j.required_decisive().unwrap().unsupported_by(&previous).is_empty());
+        j.append(Timestamp(5), Record::NotPreparedAgain { txn: TxnId(txn), reason: "refused".into() }).unwrap();
+        let required = j.required_decisive().unwrap();
+        let missing = required.unsupported_by(&previous);
+        prop_assert!(missing.contains(&"record kind NotPreparedAgain".to_owned()));
+        prop_assert!(missing.contains(&"decisive field checkpoint.not_prepared_again".to_owned()));
+        let mut missing_field = supported();
+        missing_field.fields.get_mut("checkpoint").unwrap().retain(|field| field != "not_prepared_again");
+        prop_assert_eq!(required.unsupported_by(&missing_field), vec!["decisive field checkpoint.not_prepared_again"]);
+        j.compact().unwrap();
+        let mut again = Journal::open(store).unwrap();
+        prop_assert_eq!(again.required_decisive().unwrap(), required);
+        prop_assert_eq!(again.ledger().not_prepared_again(), [TxnId(txn)].into_iter().collect());
+    }
+}
