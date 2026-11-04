@@ -371,41 +371,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             Err(e) => notices.push_back(format!("journal reconciliation failed: {e:?}")),
         }
         let ledger = ex.kernel.journal.ledger().clone();
-        // A generation waiting in Built for an activation window (§12f), or
-        // a change parked for approval (§12 step 4: tokens do not survive a
-        // restart), is Rejected(Interrupted) by the crash table and prepared
-        // again: the parked one asks for approval again.
-        let reprepare: Vec<(TxnId, Transition)> = ledger
-            .terminal
-            .iter()
-            .filter(|(id, t)| {
-                !terminal_before.contains(id)
-                    && t.state == TxnState::Rejected(RejectReason::Interrupted)
-                    && t.path.iter().rev().nth(1).is_some_and(|p| p == "Built" || p == "Prepared")
-            })
-            .map(|(id, t)| (*id, t.transition.clone()))
-            .collect();
-        // §12f: what a rollback withdrew and nothing has prepared again yet
-        // (no transaction names it in `prepared_again_from`), from the
-        // journal, so a restart between the two loses nothing and prepares
-        // nothing twice. Prepared again once the rollback is terminal.
-        let named: BTreeSet<TxnId> = ledger
-            .live
-            .values()
-            .filter_map(|t| t.txn.prepared_again_from)
-            .chain(ledger.terminal.values().filter_map(|t| t.prepared_again_from))
-            .collect();
-        let withdrawn: Vec<(TxnId, Transition, Option<Timestamp>)> = ledger
-            .terminal
-            .iter()
-            .filter(|(id, t)| {
-                t.withdrawn_for.is_some()
-                    && t.state == TxnState::Rejected(RejectReason::Interrupted)
-                    && !named.contains(id)
-                    && !reprepare.iter().any(|(r, _)| r == *id)
-            })
-            .map(|(id, t)| (*id, t.transition.clone(), None))
-            .collect();
+        // What the restart prepares again (§12f): see `restart::prepare_again`.
+        let again = crate::restart::prepare_again(&ledger, &terminal_before);
         let mut incidents = Manager::restore(ledger.incidents.values().cloned());
         incidents.startup_grace = cfg.startup_grace;
         let current = b.generations().current().unwrap_or_default();
@@ -513,8 +480,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 core.notice(format!("reconciliation: {a}"));
             }
         }
-        core.reprepare = reprepare;
-        core.withdrawn = withdrawn;
+        core.reprepare = again.reprepare;
+        core.withdrawn = again.withdrawn.into_iter().map(|(id, t)| (id, t, None)).collect();
         core.note_declarations(None, current, false);
         core
     }

@@ -9,6 +9,7 @@ pub mod hold;
 pub mod hooks;
 pub mod render;
 pub mod renew;
+pub mod restart;
 pub mod snapshot;
 
 pub use core::{Core, CoreConfig, LogRecord, Peer};
