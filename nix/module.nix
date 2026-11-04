@@ -112,13 +112,9 @@ let
   netCaps = [ "CAP_NET_ADMIN" "CAP_NET_RAW" ];
   words = v:
     if builtins.isList v then lib.concatMap words v
-    else if builtins.isString v then lib.filter (w: w != "") (lib.splitString " " v)
+    else if builtins.isString v then lib.filter (w: builtins.isString w && w != "") (builtins.split "[[:space:]]+" v)
     else [ (toString v) ];
-  # A capability set as systemd reads it: "~" inverts it (all but these).
-  grants = set: caps:
-    let ws = words set; inverted = ws != [ ] && lib.hasPrefix "~" (builtins.head ws);
-    in if inverted then lib.any (c: !(builtins.elem c (map (lib.removePrefix "~") ws))) caps
-       else lib.any (c: builtins.elem c ws) caps;
+  grants = import ./capabilities.nix { inherit lib; };
   isNetworkToolUnchecked = name:
     let
       svc = config.systemd.services.${name};
