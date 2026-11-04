@@ -126,12 +126,7 @@ fn invalid_scopes_cannot_become_a_physical_interface() {
 #[test]
 fn proxy_scope_boundaries_keep_bare_25_and_fail_closed_on_invalid_indices() {
     assert!(dns::proxy_hosts("https_proxy=http://[fe80::53%]:3128\n").is_empty());
-    for (scope, zone) in [
-        ("%0", "0"),
-        ("%250", "0"),
-        ("%4294967296", "4294967296"),
-        ("%254294967296", "4294967296"),
-    ] {
+    for (scope, zone) in [("%0", "0"), ("%250", "0"), ("%4294967296", "4294967296"), ("%254294967296", "4294967296")] {
         let targets = dns::proxy_hosts(&format!("https_proxy=http://[fe80::53{scope}]:3128\n"));
         assert_eq!(targets, vec![Target::Addr { addr: "fe80::53".parse().unwrap(), zone: Some(zone.into()) }]);
         assert_eq!(scoped_charge(&targets, 25, "tun25", 3, true), Charge { owners: BTreeSet::new(), unknown: true });
