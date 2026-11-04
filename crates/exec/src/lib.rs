@@ -17,6 +17,7 @@
 
 pub mod derive;
 pub mod host;
+mod journal_compat;
 
 use derive::{DeriveInput, derive, manifest_of};
 use host::ExecHost;
@@ -290,7 +291,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
     }
 
     fn plan(
-        &self,
+        &mut self,
         p: &Proposal,
         authz: &Authorization,
         state: &SystemState,
@@ -409,6 +410,13 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
 
         plan.cand_overrides = cand_overrides;
         plan.facts = self.facts_of(&plan, state, defs);
+        plan.facts.journal_incompatibility = match self.journal_compatibility(&plan) {
+            Ok(missing) => missing,
+            Err(refused) => {
+                self.release(&plan);
+                return Err(refused);
+            }
+        };
 
         // §12 step 3: `expected` must refine the spec's prediction.
         let predicted = predict(&transition, state, defs);
@@ -450,6 +458,23 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
         facts
     }
 
+    /// §12c: the journal's decisive requirements, including checkpoints,
+    /// against the target build. Re-read at planning, approval, and when a
+    /// waiting change leaves Built. Failed reads never mean compatible.
+    fn journal_compatibility(&mut self, plan: &Plan) -> Result<Vec<String>, Submitted> {
+        let Some((_, path)) = &plan.candidate else { return Ok(Vec::new()) };
+        let target = self
+            .b
+            .generations()
+            .journal_kinds(path)
+            .map_err(|o| reject(RejectReason::Other("journalKinds".into()), outcome_msg(o)))?;
+        let required = self.kernel.journal.required_decisive().map_err(|e| {
+            reject(RejectReason::Other("journalKinds".into()), format!("cannot read journal requirements: {e:?}"))
+        })?;
+        journal_compat::unsupported(&required, target.as_deref())
+            .map_err(|e| reject(RejectReason::Other("journalKinds".into()), e))
+    }
+
     fn decision_of(&self, plan: &Plan, state: &SystemState) -> Decision {
         let locked: Vec<String> =
             plan.cand_eval.as_ref().map(|e| e.locked.iter().cloned().collect()).unwrap_or_default();
@@ -478,8 +503,20 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
             .is_some_and(|b| self.b.generations().read_overrides().map(|(_, h)| h != b).unwrap_or(true));
         let mut again = plan.clone();
         again.facts = self.facts_of(&again, state, defs);
+        again.facts.journal_incompatibility = match self.journal_compatibility(&again) {
+            Ok(missing) => missing,
+            Err(refused) => {
+                self.release(plan);
+                let _ = self.kernel.reject(id, RejectReason::Stale);
+                return Some(refused);
+            }
+        };
         let redecided = self.decision_of(&again, state);
-        if !self.stale(plan) && !overrides_moved && redecided == plan.decision {
+        if !self.stale(plan)
+            && !overrides_moved
+            && redecided == plan.decision
+            && again.facts.journal_incompatibility == plan.facts.journal_incompatibility
+        {
             return None;
         }
         self.release(plan);

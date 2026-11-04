@@ -662,11 +662,11 @@ pub open spec fn uncapped_spec(i: Input) -> Decision {
             Decision::Allow { tier, approver } => Decision::Allow {
                 tier: ask_if(
                     floor_spec(f, *i.authz) || cumulative_spec(i) || f.touches_canonical_probe
-                        || f.below_security_floor,
+                        || f.below_security_floor || f.journal_incompatibility@.len() > 0,
                     tier,
                 ),
                 // I16: going below the security floor needs an administrator.
-                approver: admin_if(f.below_security_floor, approver),
+                approver: admin_if(f.below_security_floor || f.journal_incompatibility@.len() > 0, approver),
             },
             other => other,
         }
@@ -896,10 +896,11 @@ pub fn decide(i: &Input) -> (r: Decision)
         None => false,
     };
     let tier = ask_if_exec(
-        floors(f, i.authz) || cumulative || f.touches_canonical_probe || f.below_security_floor,
+        floors(f, i.authz) || cumulative || f.touches_canonical_probe || f.below_security_floor
+            || !f.journal_incompatibility.is_empty(),
         base,
     );
-    let approver = admin_if_exec(f.below_security_floor, class);
+    let approver = admin_if_exec(f.below_security_floor || !f.journal_incompatibility.is_empty(), class);
     if tier.rank_of() > i.settings.max_tier.rank_of() {
         Decision::Allow { tier: Tier::AskFirst, approver }
     } else {

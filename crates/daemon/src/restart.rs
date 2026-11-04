@@ -98,6 +98,7 @@ mod tests {
                 touches_canonical_probe: false,
                 changes_desired: false,
                 below_security_floor: false,
+                journal_incompatibility: Vec::new(),
                 restores_unattributed_stop: false,
                 restarts_failed_unit: false,
                 removes_sensitivity: Default::default(),

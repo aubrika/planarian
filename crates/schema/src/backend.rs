@@ -243,6 +243,13 @@ pub trait GenerationBackend {
     /// Evaluate an already-built generation from its store path (its exported
     /// manifest), for SwitchGeneration / Revert / Rollback.
     fn evaluate_built(&self, path: &StorePath) -> Result<EvaluatedGeneration, Outcome>;
+    /// The target build's static journalKinds descriptor (§12c), read from
+    /// its installed share/planarian/journal-kinds.json. None means the
+    /// descriptor is absent (a pre-export build), never an unreadable or
+    /// truncated descriptor. Do not execute an older daemon to query it.
+    fn journal_kinds(&self, _path: &StorePath) -> Result<Option<String>, Outcome> {
+        Err(Outcome::Unknown("this backend cannot read target journal kinds".into()))
+    }
     /// The live override set and its content hash.
     fn read_overrides(&self) -> Result<(OverrideSet, Hash), Outcome>;
     /// Keep override content addressable by hash, so `swap_override` can write it.

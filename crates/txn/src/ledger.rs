@@ -130,6 +130,13 @@ pub enum Record {
         unit: UnitId,
         reason: String,
     },
+    /// What a reader makes of an informational record whose kind it does not know
+    /// (journal frame format 3): the sequence advances and the chain extends,
+    /// the ledger does not change. Never written.
+    Skipped {
+        kind: String,
+    },
+
 }
 
 /// Who applied a hold: systemd's `OnFailure=` (seen by the daemon) or the
@@ -978,6 +985,7 @@ impl Ledger {
             Record::AgentStarted { name, instance, by } => self.agents.push((name, instance, by)),
             Record::HoldApplied { unit, .. } => self.hold_events.push((unit, true)),
             Record::HoldLifted { unit, .. } => self.hold_events.push((unit, false)),
+            Record::Skipped { .. } => {},
         }
     }
 

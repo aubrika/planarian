@@ -63,6 +63,7 @@ fn txn(check: CheckContext, expected: BTreeMap<UnitId, UnitStatus>) -> Transacti
             changes_desired: false,
             touches_core: false,
             below_security_floor: false,
+            journal_incompatibility: Vec::new(),
             other_sessions_affected: false,
             affected_sessions: vec![],
             restores_unattributed_stop: false,

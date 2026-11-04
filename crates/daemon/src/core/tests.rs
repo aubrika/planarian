@@ -9,6 +9,30 @@ use planarian_policy::{Settings, Tables};
 const ADMIN: Peer = Peer::new(0, true);
 const ALICE: Peer = Peer::new(1000, false);
 
+#[test]
+fn a_journal_incompatible_target_is_named_in_the_approval_text_and_json() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let args = [("scale".to_string(), Value::Str("1.25".into()))].into();
+    let result = r.core.handle(ADMIN, Request::Apply { change: ChangeId("font-scale".into()), args });
+    assert!(matches!(result, Response::Done { state: TxnState::Committed, .. }), "{result:?}");
+    let target = r.fake.w().gens[&GenerationId(1)].path.0.clone();
+    r.fake.w().journal_kinds.insert(target, None);
+    let result = r.core.handle(ADMIN, Request::Undo);
+    let Response::NeedsApproval { approve, why, .. } = result else { panic!("{result:?}") };
+    assert!(why.contains("journal") && why.contains("Administrator"), "{why}");
+    let Response::Status(status) = r.core.handle(ADMIN, Request::Status) else { panic!("status") };
+    let pending = status.pending.iter().find(|p| p.approve == approve).unwrap();
+    assert!(!pending.facts.journal_incompatibility.is_empty());
+    let lines = pending.diff.lines().join("\n");
+    let json = serde_json::to_string(pending).unwrap();
+    for requirement in &pending.facts.journal_incompatibility {
+        assert!(why.contains(requirement), "{why}");
+        assert!(lines.contains(requirement), "{lines}");
+        assert!(json.contains(requirement), "{json}");
+    }
+}
+
 fn config() -> CoreConfig {
     CoreConfig {
         exec: Config {

@@ -1,11 +1,12 @@
 //! The write-ahead journal (§12, §12c).
 //!
-//! Frame (format 2): `len: u32 | crc32c: u32 | seq: u64 | prev: [u8; 32] |
-//! payload`, little-endian, where `len` counts `prev` and the payload. The
-//! CRC covers a format tag, `seq`, `prev` and the payload.
+//! Frame (format 3): `len: u32 | crc32c: u32 | seq: u64 | prev: [u8; 32] |
+//! class: u8 | payload`, little-endian. The CRC and hash-chain commitment
+//! both cover the class. Format 2 (without the class) remains readable.
 //!
 //! **Hash chain (I18).** `prev` is the chain head before this record, and the
-//! head after it is SHA-256(`prev` ‖ `seq` ‖ payload); the first record after
+//! format-3 head after it is SHA-256(format tag ‖ `prev` ‖ `seq` ‖ class ‖
+//! payload); format 2 keeps SHA-256(`prev` ‖ `seq` ‖ payload). The first record after
 //! an empty journal chains from zero, and the checkpoint carries the head at
 //! its seq in its own `prev`. A scan accepts frames only while each is
 //! intact, its seq is exactly one more than the last, and its `prev` is the
@@ -33,10 +34,138 @@ use crate::store::Store;
 use planarian_schema::{GenerationId, Hash, Timestamp, Transition, TxnId};
 use std::io;
 
+mod compat;
+pub use compat::{JournalRequirements, original, supported};
+
 const HEADER: usize = 16;
 const PREV: usize = 32;
 /// Prefixed to the CRC input, so a frame of another format never passes.
-const FORMAT: &[u8] = b"planarian-journal-2";
+/// Format 2: `len | crc | seq | prev | payload`. Every record in it is
+/// decisive: a reader that cannot parse one has found damage.
+const FORMAT_2: &[u8] = b"planarian-journal-2";
+/// Format 3 adds a class byte after `prev` (inside the CRC): `len | crc | seq
+/// | prev | class | payload`. See [`Class`].
+const FORMAT_3: &[u8] = b"planarian-journal-3";
+
+/// Whether a reader that does not know a record's kind may go on without it.
+/// Written by the writer from the record (`Record::class`); read from the
+/// frame, so an older reader and a newer one agree on what the record was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// Changes what the ledger decides. A reader that cannot parse it has not
+    /// understood the journal: `Integrity`.
+    Decisive,
+    /// Informational. A reader that does not know its kind skips it
+    /// (`Record::Skipped`): the seq advances and the chain extends, the ledger
+    /// does not change.
+    Informational,
+    /// A CRC-valid frame with an unsupported semantic class. Readers retain
+    /// this distinction from a torn frame and report Integrity.
+    Invalid(u8),
+}
+
+impl Class {
+    fn byte(self) -> u8 {
+        match self {
+            Class::Decisive => 0,
+            Class::Informational => 1,
+            Class::Invalid(value) => value,
+        }
+    }
+
+    fn of_byte(b: u8) -> Class {
+        match b {
+            0 => Class::Decisive,
+            1 => Class::Informational,
+            value => Class::Invalid(value),
+        }
+    }
+}
+
+/// Every record kind this build knows (the serialized variant names).
+pub const KINDS: &[&str] = &[
+    "Prepared",
+    "Advance",
+    "Takeover",
+    "Renew",
+    "OpBegin",
+    "OpAck",
+    "OverrideSet",
+    "OverrideLifted",
+    "Incident",
+    "KnownGood",
+    "LiveTested",
+    "AcceptedBaseline",
+    "SecurityFloor",
+    "ExternalAccepted",
+    "TokenUsed",
+    "AgentStarted",
+    "Resolved",
+    "Reconciliation",
+    "HoldApplied",
+    "HoldLifted",
+    "Skipped",
+];
+
+/// The known kinds a reader must understand (class `Decisive`): the ones the
+/// writer never marks informational. A kind outside this list that arrives in a
+/// decisive frame is `Integrity`. The daemon's `journalKinds` export reads this.
+pub const DECISIVE_KINDS: &[&str] = &[
+    "Prepared",
+    "Advance",
+    "Takeover",
+    "Renew",
+    "OpBegin",
+    "OpAck",
+    "OverrideSet",
+    "OverrideLifted",
+    "Incident",
+    "KnownGood",
+    "LiveTested",
+    "AcceptedBaseline",
+    "SecurityFloor",
+    "ExternalAccepted",
+    "TokenUsed",
+    "AgentStarted",
+    "Resolved",
+    "Reconciliation",
+    "HoldApplied",
+    "HoldLifted",
+];
+
+/// A record's serialized kind, and the class it is written with. Exhaustive,
+/// so a new `Record` variant is a compile error here until it is classed.
+fn kind_and_class(r: &Record) -> (&'static str, Class) {
+    use Class::{Decisive as D, Informational as I};
+    match r {
+        Record::Prepared(_) => ("Prepared", D),
+        Record::Advance { .. } => ("Advance", D),
+        Record::Takeover { .. } => ("Takeover", D),
+        Record::Renew { .. } => ("Renew", D),
+        Record::OpBegin { .. } => ("OpBegin", D),
+        Record::OpAck { .. } => ("OpAck", D),
+        Record::OverrideSet(_) => ("OverrideSet", D),
+        Record::OverrideLifted(_) => ("OverrideLifted", D),
+        Record::Incident(_) => ("Incident", D),
+        Record::KnownGood(_) => ("KnownGood", D),
+        Record::LiveTested(_) => ("LiveTested", D),
+        Record::AcceptedBaseline(_) => ("AcceptedBaseline", D),
+        Record::SecurityFloor(_) => ("SecurityFloor", D),
+        Record::ExternalAccepted { .. } => ("ExternalAccepted", D),
+        Record::TokenUsed { .. } => ("TokenUsed", D),
+        Record::AgentStarted { .. } => ("AgentStarted", D),
+        Record::Resolved { .. } => ("Resolved", D),
+        Record::Reconciliation(_) => ("Reconciliation", D),
+        Record::HoldApplied { .. } => ("HoldApplied", D),
+        Record::HoldLifted { .. } => ("HoldLifted", D),
+        Record::Skipped { .. } => ("Skipped", I),
+    }
+}
+
+/// The class a record is written with.
+pub fn class_of(r: &Record) -> Class {
+    kind_and_class(r).1
+}
 
 #[derive(Debug)]
 pub enum JournalError {
@@ -96,7 +225,7 @@ pub struct Journal<S: Store> {
     pending_sentinel: Option<(TxnId, Vec<u8>)>,
 }
 
-/// The chain head after a record (I18).
+/// The format-2 chain head after a record (I18), retained for existing journals.
 pub fn chain(prev: &Hash, seq: u64, payload: &[u8]) -> Hash {
     let mut b = Vec::with_capacity(PREV + 8 + payload.len());
     b.extend_from_slice(&prev.0);
@@ -105,28 +234,80 @@ pub fn chain(prev: &Hash, seq: u64, payload: &[u8]) -> Hash {
     Hash::of(&b)
 }
 
-fn crc(body: &[u8]) -> u32 {
+/// The format-3 commitment includes the class that controls whether an
+/// unknown kind may be skipped. A class-only edit must change the chain,
+/// even when an editor recalculates this frame's CRC (I18).
+fn chain_v3(prev: &Hash, seq: u64, class: Class, payload: &[u8]) -> Hash {
     #[cfg(test)]
-    tests::CRC_BYTES.with(|c| c.set(c.get() + body.len() as u64));
-    crc32c::crc32c_append(crc32c::crc32c(FORMAT), body)
+    if tests::MUTANT.with(std::cell::Cell::get) == tests::Mutant::ClassOutsideChain {
+        return chain(prev, seq, payload);
+    }
+    let mut b = Vec::with_capacity(FORMAT_3.len() + PREV + 8 + 1 + payload.len());
+    b.extend_from_slice(FORMAT_3);
+    b.extend_from_slice(&prev.0);
+    b.extend_from_slice(&seq.to_le_bytes());
+    b.push(class.byte());
+    b.extend_from_slice(payload);
+    Hash::of(&b)
 }
 
-fn frame(seq: u64, prev: &Hash, payload: &[u8]) -> Vec<u8> {
+/// Both versions may occur in one retained segment during an upgrade.
+fn frame_head(f: &Frame<'_>) -> Hash {
+    match f.format {
+        3 => chain_v3(&f.prev, f.seq, f.class, f.payload),
+        _ => chain(&f.prev, f.seq, f.payload),
+    }
+}
+
+fn crc(format: &[u8], body: &[u8]) -> u32 {
+    #[cfg(test)]
+    tests::CRC_BYTES.with(|c| c.set(c.get() + body.len() as u64));
+    crc32c::crc32c_append(crc32c::crc32c(format), body)
+}
+
+/// A format 3 frame.
+fn frame(seq: u64, prev: &Hash, class: Class, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(8 + PREV + 1 + payload.len());
+    body.extend_from_slice(&seq.to_le_bytes());
+    body.extend_from_slice(&prev.0);
+    body.push(class.byte());
+    body.extend_from_slice(payload);
+    seal(FORMAT_3, &body)
+}
+
+/// A format 2 frame (read, never appended; fault injection re-frames one as it was).
+fn frame_v2(seq: u64, prev: &Hash, payload: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(8 + PREV + payload.len());
     body.extend_from_slice(&seq.to_le_bytes());
     body.extend_from_slice(&prev.0);
     body.extend_from_slice(payload);
-    let mut out = Vec::with_capacity(HEADER + PREV + payload.len());
-    out.extend_from_slice(&((PREV + payload.len()) as u32).to_le_bytes());
-    out.extend_from_slice(&crc(&body).to_le_bytes());
-    out.extend_from_slice(&body);
+    seal(FORMAT_2, &body)
+}
+
+fn seal(format: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(&((body.len() - 8) as u32).to_le_bytes());
+    out.extend_from_slice(&crc(format, body).to_le_bytes());
+    out.extend_from_slice(body);
     out
 }
 
-/// An intact frame: its seq, the chain head before it, its payload, and its size.
+/// `f`'s record re-framed with a new seq, `prev` and payload, in the format
+/// and class it had.
+fn reframe(f: &Frame<'_>, seq: u64, prev: &Hash, payload: &[u8]) -> Vec<u8> {
+    match f.format {
+        3 => frame(seq, prev, f.class, payload),
+        _ => frame_v2(seq, prev, payload),
+    }
+}
+
+/// An intact frame: its seq, the chain head before it, its class, its
+/// payload, and its size. `format` is 2 or 3; a format 2 frame is `Decisive`.
 struct Frame<'a> {
     seq: u64,
     prev: Hash,
+    class: Class,
+    format: u8,
     payload: &'a [u8],
     size: usize,
 }
@@ -142,12 +323,27 @@ fn unframe(bytes: &[u8]) -> Option<Frame<'_>> {
         return None;
     }
     let body = &bytes[8..HEADER + len];
-    if crc(body) != sum {
-        return None;
-    }
     let seq = u64::from_le_bytes(body[0..8].try_into().ok()?);
     let prev = Hash(body[8..8 + PREV].try_into().ok()?);
-    Some(Frame { seq, prev, payload: &body[8 + PREV..], size: HEADER + len })
+    // The format is the CRC seed that holds. Format 3 first: it is what is written.
+    if body.len() > 8 + PREV && crc(FORMAT_3, body) == sum {
+        let class = Class::of_byte(body[8 + PREV]);
+        #[cfg(test)]
+        if matches!(class, Class::Invalid(_))
+            && tests::MUTANT.with(std::cell::Cell::get) == tests::Mutant::InvalidClassIsTorn
+        {
+            return None;
+        }
+        return Some(Frame { seq, prev, class, format: 3, payload: &body[8 + PREV + 1..], size: HEADER + len });
+    }
+    #[cfg(test)]
+    if tests::MUTANT.with(std::cell::Cell::get) == tests::Mutant::NoFormat2 {
+        return None;
+    }
+    if crc(FORMAT_2, body) != sum {
+        return None;
+    }
+    Some(Frame { seq, prev, class: Class::Decisive, format: 2, payload: &body[8 + PREV..], size: HEADER + len })
 }
 
 /// Whether `bytes` could start a frame written after `last_seq`, judged on
@@ -172,7 +368,69 @@ fn could_follow(bytes: &[u8], last_seq: u64, capacity: u64) -> bool {
         return false;
     }
     let prefix = format!("{{\"seq\":{seq},");
-    bytes[HEADER + PREV..HEADER + len].starts_with(prefix.as_bytes())
+    let payload = &bytes[HEADER + PREV..HEADER + len];
+    // Format 2: the payload starts here. Format 3: a class byte, then it.
+    #[cfg(test)]
+    let v3 = tests::MUTANT.with(std::cell::Cell::get) != tests::Mutant::CouldFollowFormat2Only;
+    #[cfg(not(test))]
+    let v3 = true;
+    payload.starts_with(prefix.as_bytes()) || (v3 && !payload.is_empty() && payload[1..].starts_with(prefix.as_bytes()))
+}
+
+/// A valid CRC distinguishes a semantic class error from a torn frame.
+fn valid_class(f: &Frame<'_>) -> Result<(), JournalError> {
+    if let Class::Invalid(value) = f.class {
+        return Err(JournalError::Integrity(format!("record {} has unsupported journal class {value}", f.seq)));
+    }
+    Ok(())
+}
+
+/// The entry an intact frame holds. A frame whose record does not parse is an
+/// error, except an `Informational` one whose kind this build does not know: that
+/// reads as [`Record::Skipped`] (its seq advances and its chain extends; the
+/// ledger does not change). A known kind that does not parse is damage, in
+/// either class, and so is an unrecognizable record.
+fn decode(f: &Frame<'_>) -> Result<Entry, String> {
+    valid_class(f).map_err(|e| format!("{e:?}"))?;
+    let parse_err = match serde_json::from_slice::<Entry>(f.payload) {
+        Ok(e) => return Ok(e),
+        Err(e) => e,
+    };
+    #[cfg(test)]
+    let class = if tests::MUTANT.with(std::cell::Cell::get) == tests::Mutant::AnyClassSkips {
+        Class::Informational
+    } else {
+        f.class
+    };
+    #[cfg(not(test))]
+    let class = f.class;
+    if class != Class::Informational {
+        return Err(parse_err.to_string());
+    }
+    let v: serde_json::Value = serde_json::from_slice(f.payload).map_err(|e| e.to_string())?;
+    let obj = v.as_object().ok_or_else(|| parse_err.to_string())?;
+    let kind = match obj.get("record") {
+        Some(serde_json::Value::Object(o)) if o.len() == 1 => o.keys().next().cloned(),
+        Some(serde_json::Value::String(k)) => Some(k.clone()),
+        _ => None,
+    }
+    .ok_or_else(|| parse_err.to_string())?;
+    let known = KINDS.contains(&kind.as_str());
+    #[cfg(test)]
+    let known = known && tests::MUTANT.with(std::cell::Cell::get) != tests::Mutant::KnownKindSkips;
+    if known {
+        return Err(parse_err.to_string());
+    }
+    #[cfg(test)]
+    if tests::MUTANT.with(std::cell::Cell::get) == tests::Mutant::NoSkip {
+        return Err(parse_err.to_string());
+    }
+    let seq = obj.get("seq").and_then(serde_json::Value::as_u64).ok_or_else(|| parse_err.to_string())?;
+    let at = obj
+        .get("at")
+        .and_then(|a| serde_json::from_value::<Timestamp>(a.clone()).ok())
+        .ok_or_else(|| parse_err.to_string())?;
+    Ok(Entry { seq, at, record: Record::Skipped { kind } })
 }
 
 /// Fault injection (tests and the gym): rewrite the payload of the `nth`
@@ -196,7 +454,7 @@ pub fn tamper<S: Store>(store: &S, nth: usize, edit: impl FnOnce(&mut Vec<u8>)) 
             if payload.len() != f.payload.len() {
                 return Ok(false);
             }
-            store.write_at(off, &frame(f.seq, &f.prev, &payload))?;
+            store.write_at(off, &reframe(&f, f.seq, &f.prev, &payload))?;
             store.sync()?;
             return Ok(true);
         }
@@ -213,7 +471,7 @@ pub fn tamper<S: Store>(store: &S, nth: usize, edit: impl FnOnce(&mut Vec<u8>)) 
 pub fn delete<S: Store>(store: &S, nth: usize) -> io::Result<bool> {
     let mut off = 0u64;
     let mut at = None;
-    let mut rest: Vec<(u64, Hash, Vec<u8>)> = vec![];
+    let mut rest: Vec<(u64, Hash, Class, u8, Vec<u8>)> = vec![];
     for i in 0.. {
         let header = store.read_at(off, HEADER)?;
         if header.len() < HEADER {
@@ -225,14 +483,17 @@ pub fn delete<S: Store>(store: &S, nth: usize) -> io::Result<bool> {
         if i == nth {
             at = Some(off);
         } else if at.is_some() {
-            rest.push((f.seq - 1, f.prev, f.payload.to_vec()));
+            rest.push((f.seq - 1, f.prev, f.class, f.format, f.payload.to_vec()));
         }
         off += f.size as u64;
     }
     let Some(start) = at else { return Ok(false) };
     let mut out = vec![];
-    for (seq, prev, payload) in &rest {
-        out.extend_from_slice(&frame(*seq, prev, payload));
+    for (seq, prev, class, format, payload) in &rest {
+        out.extend_from_slice(&match format {
+            3 => frame(*seq, prev, *class, payload),
+            _ => frame_v2(*seq, prev, payload),
+        });
     }
     let end = start + out.len() as u64;
     out.resize((off - start) as usize, 0);
@@ -290,7 +551,15 @@ impl<S: Store> Journal<S> {
                 JournalError::Integrity("the checkpoint fails its CRC".into())
             });
         };
+        valid_class(&f)?;
         let (seq, payload) = (f.seq, f.payload);
+        let value: serde_json::Value = serde_json::from_slice(payload)
+            .map_err(|e| JournalError::Integrity(format!("the checkpoint does not parse: {e}")))?;
+        let required = compat::checkpoint_requirements(&value)?;
+        let missing = required.unsupported_by(&supported());
+        if !missing.is_empty() {
+            return Err(JournalError::Integrity(format!("the checkpoint needs {}", missing.join(", "))));
+        }
         let ledger: Ledger = serde_json::from_slice(payload)
             .map_err(|e| JournalError::Integrity(format!("the checkpoint does not parse: {e}")))?;
         if ledger.last_seq != seq {
@@ -306,7 +575,13 @@ impl<S: Store> Journal<S> {
 
     fn checkpoint_seq_on_disk(&self) -> Result<u64, JournalError> {
         Ok(match self.store.read_checkpoint()? {
-            Some(b) => unframe(&b).map(|f| f.seq).unwrap_or(0),
+            Some(b) => match unframe(&b) {
+                Some(f) => {
+                    valid_class(&f)?;
+                    f.seq
+                }
+                None => 0,
+            },
             None => 0,
         })
     }
@@ -408,7 +683,7 @@ impl<S: Store> Journal<S> {
                 }
                 return Ok(());
             };
-            let (seq, payload, size) = (f.seq, f.payload, f.size);
+            let (seq, size) = (f.seq, f.size);
             let consecutive = prev.is_none_or(|p| seq == p + 1);
             if !consecutive {
                 return self.stop_at_tail(truncate);
@@ -419,6 +694,7 @@ impl<S: Store> Journal<S> {
                 continue;
             }
             skipping = false;
+            valid_class(&f)?;
             match chain::follows(self.ledger.last_seq, &self.head, seq, &f.prev) {
                 Follows::Yes => {}
                 Follows::OutOfSequence => return self.stop_at_tail(truncate),
@@ -433,7 +709,7 @@ impl<S: Store> Journal<S> {
             // follows the chain) yet does not parse: a retained record that
             // does not parse is Integrity, here or anywhere, and nothing is
             // truncated or zeroed.
-            let entry: Entry = match serde_json::from_slice(payload) {
+            let entry: Entry = match decode(&f) {
                 Ok(e) => e,
                 Err(e) => {
                     return Err(JournalError::Integrity(format!("record {seq} is intact but does not parse: {e}")));
@@ -453,7 +729,7 @@ impl<S: Store> Journal<S> {
             self.ledger
                 .apply(entry)
                 .map_err(|e| JournalError::Integrity(format!("record {seq} is refused on replay: {e:?}")))?;
-            self.head = chain(&f.prev, seq, payload);
+            self.head = frame_head(&f);
             prev = Some(seq);
             self.offset += size as u64;
         }
@@ -523,7 +799,8 @@ impl<S: Store> Journal<S> {
                 off += f.size as u64;
                 continue;
             }
-            links.push(Link { seq: f.seq, prev: f.prev, next: chain(&f.prev, f.seq, f.payload) });
+            valid_class(&f)?;
+            links.push(Link { seq: f.seq, prev: f.prev, next: frame_head(&f) });
             off += f.size as u64;
         }
         // Verified: accepts exactly a chained segment, else names its first break.
@@ -591,17 +868,20 @@ impl<S: Store> Journal<S> {
         // The next seq and the current head (verified: what is appended
         // always follows the chain, `chain::appending_keeps_the_chain`).
         let (seq, prev) = chain::next_link(self.ledger.last_seq, &self.head);
+        if matches!(record, Record::Skipped { .. }) {
+            return Err(JournalError::Corrupt("Skipped is what a reader makes of a record, not one to write".into()));
+        }
         let entry = Entry { seq, at, record };
         self.ledger.validate(&entry)?;
         let payload = serde_json::to_vec(&entry).map_err(|e| JournalError::Corrupt(e.to_string()))?;
-        let bytes = frame(seq, &prev, &payload);
+        let bytes = frame(seq, &prev, class_of(&entry.record), &payload);
         if self.offset + bytes.len() as u64 > self.store.capacity() {
             return Err(JournalError::Full);
         }
         self.store.write_at(self.offset, &bytes)?;
         self.store.sync()?;
         self.ledger.apply(entry.clone())?;
-        self.head = chain(&prev, seq, &payload);
+        self.head = chain_v3(&prev, seq, class_of(&entry.record), &payload);
         self.offset += bytes.len() as u64;
         Ok(entry)
     }
@@ -615,26 +895,93 @@ impl<S: Store> Journal<S> {
 
     /// `segment`, with the store lock already held by the caller.
     fn segment_locked(&mut self) -> Result<Vec<Entry>, JournalError> {
+        self.refresh()?;
+        let (mut last, mut head) = match self.load_checkpoint()? {
+            Some((seq, _, head)) => (seq, head),
+            None => (0, Hash::ZERO),
+        };
         let mut out = vec![];
         let mut off = 0u64;
-        loop {
+        let mut skipping = true;
+        let mut previous = None;
+        // A checkpoint may be durable while the old log prefix survives a
+        // reset crash. Match reload: skip only that leading run, then keep
+        // every later retained record. Stopping at the prefix loses both
+        // gym replay history and decisive compatibility requirements.
+        while off < self.offset {
             let header = self.store.read_at(off, HEADER)?;
-            if header.len() < HEADER {
-                break;
+            if header.len() != HEADER {
+                return Err(JournalError::Integrity(format!("the retained frame at byte {off} has no header")));
             }
             let len = u32::from_le_bytes(header[0..4].try_into().expect("4 bytes")) as usize;
+            if len < PREV || (HEADER + len) as u64 > self.offset - off {
+                return Err(JournalError::Integrity(format!("the retained frame at byte {off} has an invalid length")));
+            }
             let bytes = self.store.read_at(off, HEADER + len)?;
-            let Some(f) = unframe(&bytes) else { break };
-            if f.seq <= self.checkpoint_seq || out.last().is_some_and(|e: &Entry| e.seq + 1 != f.seq) {
-                break;
+            let f = unframe(&bytes)
+                .ok_or_else(|| JournalError::Integrity(format!("the retained frame at byte {off} is damaged")))?;
+            if previous.is_some_and(|seq: u64| seq.checked_add(1) != Some(f.seq)) {
+                return Err(JournalError::Integrity(format!("the retained frame at byte {off} is out of sequence")));
             }
-            match serde_json::from_slice::<Entry>(f.payload) {
-                Ok(e) => out.push(e),
-                Err(_) => break,
-            }
+            previous = Some(f.seq);
             off += f.size as u64;
+            if skipping && f.seq <= self.checkpoint_seq {
+                continue;
+            }
+            skipping = false;
+            valid_class(&f)?;
+            if chain::follows(last, &head, f.seq, &f.prev) != Follows::Yes {
+                return Err(JournalError::Integrity(format!("retained record {} breaks the hash chain", f.seq)));
+            }
+            let entry = decode(&f)
+                .map_err(|e| JournalError::Integrity(format!("retained record {} does not parse: {e}", f.seq)))?;
+            if entry.seq != f.seq {
+                return Err(JournalError::Integrity(format!("retained record {} disagrees with its frame", f.seq)));
+            }
+            last = f.seq;
+            head = frame_head(&f);
+            out.push(entry);
+        }
+        if last != self.ledger.last_seq || head != self.head {
+            return Err(JournalError::Integrity("the retained segment no longer matches the journal".into()));
         }
         Ok(out)
+    }
+
+    /// Decisive requirements a generation's reader must understand (§12c).
+    /// The checkpoint carries the requirements of the history it replaced;
+    /// retained decisive records add theirs. Informational kinds add none.
+    pub fn required_decisive(&mut self) -> Result<JournalRequirements, JournalError> {
+        let _g = self.store.lock()?;
+        self.refresh()?;
+        self.required_decisive_locked()
+    }
+
+    fn required_decisive_locked(&mut self) -> Result<JournalRequirements, JournalError> {
+        let mut required = JournalRequirements::empty();
+        if let Some(bytes) = self.store.read_checkpoint()? {
+            let f = unframe(&bytes).ok_or_else(|| JournalError::Integrity("the checkpoint fails its CRC".into()))?;
+            let value = serde_json::from_slice(f.payload)
+                .map_err(|e| JournalError::Integrity(format!("the checkpoint does not parse: {e}")))?;
+            required.merge(&compat::checkpoint_requirements(&value)?);
+        }
+        for entry in self.segment_locked()? {
+            required.merge(&compat::record_requirements(&entry.record)?);
+        }
+        // The equivalent checkpoint paths are themselves decisive state,
+        // including a newly prepared live transaction not yet compacted.
+        let state = serde_json::to_value(&self.ledger).map_err(|e| JournalError::Corrupt(e.to_string()))?;
+        let mut checkpoint = serde_json::Map::new();
+        checkpoint.insert(
+            compat::CHECKPOINT_REQUIREMENTS.into(),
+            serde_json::to_value(&required).map_err(|e| JournalError::Corrupt(e.to_string()))?,
+        );
+        let mut state = state;
+        if let Some(object) = state.as_object_mut() {
+            object.extend(checkpoint);
+        }
+        required.merge(&compat::checkpoint_requirements(&state)?);
+        Ok(required)
     }
 
     /// Byte offset where the next record will be written.
@@ -672,8 +1019,14 @@ impl<S: Store> Journal<S> {
     /// `compact`, with the store lock already held by the caller.
     fn compact_locked(&mut self) -> Result<(), JournalError> {
         self.refresh()?;
-        let payload = serde_json::to_vec(&self.ledger).map_err(|e| JournalError::Corrupt(e.to_string()))?;
-        self.store.write_checkpoint(&frame(self.ledger.last_seq, &self.head, &payload))?;
+        let required = self.required_decisive_locked()?;
+        let mut value = serde_json::to_value(&self.ledger).map_err(|e| JournalError::Corrupt(e.to_string()))?;
+        value.as_object_mut().ok_or_else(|| JournalError::Corrupt("ledger is not an object".into()))?.insert(
+            compat::CHECKPOINT_REQUIREMENTS.into(),
+            serde_json::to_value(&required).map_err(|e| JournalError::Corrupt(e.to_string()))?,
+        );
+        let payload = serde_json::to_vec(&value).map_err(|e| JournalError::Corrupt(e.to_string()))?;
+        self.store.write_checkpoint(&frame(self.ledger.last_seq, &self.head, Class::Decisive, &payload))?;
         self.checkpoint_seq = self.ledger.last_seq;
         self.store.write_at(0, &[0; HEADER])?;
         self.store.sync()?;

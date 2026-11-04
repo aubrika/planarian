@@ -6,6 +6,99 @@ use planarian_policy::{authorization_of, user_authorization};
 use planarian_state::{Assembler, Context, Manifest};
 use planarian_txn::kernel::CrashPoint;
 
+/// A pre-export target is not assumed to understand this writer's journal.
+#[test]
+fn a_legacy_generation_requires_an_administrator_for_its_journal() {
+    let mut r = Rig::new();
+    let good = change("font-scale", &[("scale", Value::Str("1.25".into()))]);
+    assert_eq!(finished(&r.propose(good, admin())), TxnState::Committed);
+    let current = r.fake.w().current;
+    let target = r.fake.w().gens[&GenerationId(1)].path.0.clone();
+    r.fake.w().journal_kinds.insert(target, None);
+    let result = r.propose(Transition::Rollback, admin());
+    let Submitted::Parked { txn, facts, .. } = result else { panic!("{result:?}") };
+    assert!(!facts.journal_incompatibility.is_empty());
+    assert_eq!(r.ex.parked[&txn].class, ApproverClass::Administrator);
+    assert_eq!(r.fake.w().current, current, "the target has not run");
+}
+
+#[test]
+fn unreadable_or_malformed_target_journal_kinds_never_activate() {
+    for broken in [None, Some("{"), Some("{}"), Some("")] {
+        let mut r = Rig::new();
+        let good = change("font-scale", &[("scale", Value::Str("1.25".into()))]);
+        assert_eq!(finished(&r.propose(good, admin())), TxnState::Committed);
+        let current = r.fake.w().current;
+        let target = r.fake.w().gens[&GenerationId(1)].path.0.clone();
+        match broken {
+            None => r.fake.w().journal_kinds_fails = Some("unreadable".into()),
+            Some(json) => {
+                r.fake.w().journal_kinds.insert(target, Some(json.into()));
+            }
+        }
+        let result = r.propose(Transition::Rollback, admin());
+        assert!(matches!(result, Submitted::Rejected { .. }), "{result:?}");
+        assert_eq!(r.fake.w().current, current);
+    }
+}
+
+/// An approval is bound to the actual decisive requirements, even when a
+/// changed list would still ask the same Administrator approver class.
+#[test]
+fn new_decisive_journal_requirements_invalidate_an_existing_approval() {
+    let mut r = Rig::new();
+    let good = change("font-scale", &[("scale", Value::Str("1.25".into()))]);
+    assert_eq!(finished(&r.propose(good, admin())), TxnState::Committed);
+    let current = r.fake.w().current;
+    let target = r.fake.w().gens[&GenerationId(1)].path.0.clone();
+    let mut capabilities = planarian_txn::journal::supported();
+    capabilities.format = 2;
+    capabilities.fields.get_mut("Prepared").unwrap().retain(|field| field != "facts.journal_incompatibility");
+    capabilities
+        .fields
+        .get_mut("checkpoint")
+        .unwrap()
+        .retain(|field| field != "live.*.txn.facts.journal_incompatibility");
+    r.fake.w().journal_kinds.insert(target, Some(serde_json::to_string(&capabilities).unwrap()));
+    let result = r.propose(Transition::Rollback, admin());
+    let Submitted::Parked { approve: first, .. } = result else { panic!("{result:?}") };
+    // Preparing that request itself journals a nonempty compatibility fact.
+    // The newly decisive field must invalidate the old approval exactly once.
+    let result = r.approve(first);
+    let Submitted::Parked { approve: next, facts, .. } = result else { panic!("{result:?}") };
+    assert_ne!(next, first);
+    assert!(facts.journal_incompatibility.iter().any(|k| k.contains("facts.journal_incompatibility")), "{facts:?}");
+    assert_eq!(r.fake.w().current, current);
+    assert_eq!(finished(&r.approve(next)), TxnState::Committed, "the same requirements must not ask forever");
+    assert_eq!(r.fake.w().current, GenerationId(1));
+}
+
+proptest::proptest! {
+    /// §12c's compatibility floor applies at every autonomy setting and to
+    /// both a human's transition and an autonomous repair rollback.
+    #[test]
+    fn a_journal_incompatible_target_always_needs_an_administrator(
+        missing in proptest::collection::vec("[A-Za-z.]{1,24}", 1..6),
+        max in 0u8..3,
+        human in proptest::bool::ANY,
+    ) {
+        let mut r = Rig::new();
+        let (s, defs) = r.observe();
+        let authz = if human { admin() } else { authorization_of(Actor::Daemon) };
+        let t = Transition::Rollback;
+        let p = Proposal {
+            observed: s.digest(), expected: predict(&t, &s, &defs),
+            transition: t, reason: "journal compatibility".into(), source: Source::User,
+        };
+        let mut plan = r.ex.plan(&p, &authz, &s, &defs, None).unwrap();
+        plan.facts.journal_incompatibility = missing;
+        r.ex.cfg.settings.max_tier = [Tier::Observe, Tier::Runtime, Tier::Tested][max as usize];
+        proptest::prop_assert_eq!(r.ex.decision_of(&plan, &s), Decision::Allow {
+            tier: Tier::AskFirst, approver: ApproverClass::Administrator,
+        });
+    }
+}
+
 const ALICE: u32 = 1000;
 
 struct Rig {
