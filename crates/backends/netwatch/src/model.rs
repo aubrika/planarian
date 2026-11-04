@@ -511,6 +511,71 @@ impl Tracker {
         changed
     }
 
+    /// Who owns interface `name` (B-22 a, `dns::charges`): its creators (a
+    /// claim on the interface) and the units that added a steering route
+    /// over it.
+    pub fn interface_owners(&self, name: &str) -> crate::dns::Owners {
+        let mut o = crate::dns::Owners::default();
+        for (u, s) in &self.units {
+            for ((k, _), (i, steers)) in &s.objects {
+                match k {
+                    ChangeKind::Interface if i.as_deref() == Some(name) => {
+                        o.creators.insert(u.clone());
+                    }
+                    ChangeKind::Route if *steers && i.as_deref() == Some(name) => {
+                        o.routers.insert(u.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        o
+    }
+
+    /// The DNS and proxy charges standing now (compared with a fresh
+    /// computation, so a pass that changes nothing writes nothing).
+    pub fn dns_charges(&self) -> BTreeMap<(ChangeKind, String), crate::dns::Charge> {
+        let mut out: BTreeMap<(ChangeKind, String), crate::dns::Charge> = BTreeMap::new();
+        for (u, s) in &self.units {
+            for key in s.objects.keys().filter(|(k, _)| matches!(k, ChangeKind::Dns | ChangeKind::Proxy)) {
+                out.entry(key.clone()).or_default().owners.insert(u.clone());
+            }
+        }
+        for key in self.unattributed.keys().filter(|(k, _)| matches!(k, ChangeKind::Dns | ChangeKind::Proxy)) {
+            out.entry(key.clone()).or_default().unknown = true;
+        }
+        out
+    }
+
+    /// The links something created (virtual), as the tracker knows them.
+    pub fn virtual_links(&self) -> &BTreeSet<String> {
+        &self.virtual_ifaces
+    }
+
+    /// B-22 (a): replace every DNS and proxy object with `charges`. Nothing
+    /// is remembered between passes (the rule is recomputed from the
+    /// settings and the footprints each time), so an object absent from
+    /// `charges` is gone for everyone: a charge cannot stick. An `unknown`
+    /// charge is an object-bound unattributed mark; an owned one is the
+    /// owners' claim.
+    pub fn set_dns(&mut self, charges: &BTreeMap<(ChangeKind, String), crate::dns::Charge>) {
+        let own = |k: &(ChangeKind, String)| matches!(k.0, ChangeKind::Dns | ChangeKind::Proxy);
+        for s in self.units.values_mut() {
+            s.objects.retain(|k, _| !own(k));
+        }
+        self.unattributed.retain(|k, _| !own(k));
+        self.pre_attach.retain(|k, _| !own(k));
+        for (key, c) in charges {
+            for u in &c.owners {
+                self.units.entry(u.clone()).or_default().objects.insert(key.clone(), (None, true));
+            }
+            if c.unknown {
+                self.unattributed.insert(key.clone(), None);
+            }
+        }
+        self.relatch();
+    }
+
     /// The unit's latest invocation as its cgroup shows it; whether it
     /// changed. A new invocation (a new id, or a new cgroup whose id is
     /// not read yet) resets the latch; an id read late, or `ended`, does not.

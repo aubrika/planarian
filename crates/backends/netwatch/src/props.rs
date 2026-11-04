@@ -1007,3 +1007,339 @@ mod wgcases {
         assert!(wg::devices(&[m]).is_err());
     }
 }
+
+// ---- B-22 (a): DNS and proxy steer for the owners of the interface that carries them
+
+mod dnscharge {
+    use super::*;
+    use crate::dns::{self, Charge, Key, Lookup, Owners, Target, World};
+    use std::net::IpAddr;
+
+    const TOOLS: usize = 4;
+
+    fn tool(i: usize) -> UnitId {
+        u(&format!("tool{i}"))
+    }
+
+    /// The interfaces of this world: two virtual with owners to be drawn,
+    /// one virtual nobody owns, one physical (the uplink) that a DHCP
+    /// client's unit may have added a route over.
+    const IFACES: [&str; 4] = ["tun0", "tun1", "orphan0", "wan0"];
+
+    fn is_virtual(i: &str) -> bool {
+        i != "wan0"
+    }
+
+    /// The addresses the settings may name, each with its kernel answer to
+    /// be drawn (the route table is an input, not something the code looks up).
+    fn addrs() -> [IpAddr; 5] {
+        ["10.0.0.1", "10.1.0.1", "192.0.2.1", "2001:db8::1", "203.0.113.1"].map(|a| a.parse().unwrap())
+    }
+
+    #[derive(Clone, Debug)]
+    struct Scene {
+        creators: Vec<BTreeSet<usize>>,
+        routers: Vec<BTreeSet<usize>>,
+        /// Per address: 0..4 an interface, 4 no route, 5 failed, 6 one of
+        /// the machine's own addresses (`local … dev lo`).
+        kernel: Vec<u8>,
+    }
+
+    fn scene() -> impl Strategy<Value = Scene> {
+        let owners = || proptest::collection::vec(proptest::collection::btree_set(0..TOOLS, 0..=2), IFACES.len());
+        (owners(), owners(), proptest::collection::vec(0u8..7, 5)).prop_map(|(creators, routers, kernel)| Scene {
+            creators,
+            routers,
+            kernel,
+        })
+    }
+
+    fn target() -> impl Strategy<Value = Target> {
+        prop_oneof![
+            4 => (0usize..5, proptest::option::weighted(0.25, 0usize..IFACES.len()))
+                .prop_map(|(a, z)| Target::Addr { addr: addrs()[a], zone: z.map(|i| IFACES[i].to_string()) }),
+            1 => Just(Target::Unreadable),
+        ]
+    }
+
+    fn charge_of(sc: &Scene, targets: &[Target], link: Option<&str>) -> Charge {
+        let virt: BTreeSet<String> = IFACES.iter().filter(|i| is_virtual(i)).map(|i| i.to_string()).collect();
+        let owners = |n: &str| match IFACES.iter().position(|i| *i == n) {
+            Some(k) => Owners {
+                creators: sc.creators[k].iter().map(|i| tool(*i)).collect(),
+                routers: sc.routers[k].iter().map(|i| tool(*i)).collect(),
+            },
+            None => Owners::default(),
+        };
+        let lookup = |a: &IpAddr| match addrs().iter().position(|x| x == a).map(|k| sc.kernel[k]) {
+            Some(i @ 0..4) => Lookup::Via(IFACES[i as usize].to_string()),
+            Some(4) => Lookup::NoRoute,
+            Some(6) => Lookup::Local,
+            _ => Lookup::Failed,
+        };
+        dns::charges(
+            targets,
+            link,
+            &World { virtual_ifaces: &virt, owners: &owners, lookup: &lookup, ifname: &|_| None },
+        )
+    }
+
+    /// The rule, written from §12d and the coordinator's decision, not from
+    /// `carried`: the interface a setting rides is named by the resolved
+    /// link it belongs to, else by its zone, else by what the kernel says;
+    /// a physical one charges nobody; a virtual one charges its creators and
+    /// the units that routed over it; a virtual one with none, a failed
+    /// lookup and an unreadable address are unknown; no route charges nobody.
+    fn oracle(sc: &Scene, targets: &[Target], link: Option<&str>) -> (BTreeSet<UnitId>, bool) {
+        let ride = |iface: &str| -> (BTreeSet<UnitId>, bool) {
+            let k = IFACES.iter().position(|i| *i == iface).expect("one of ours");
+            if !is_virtual(iface) {
+                return (BTreeSet::new(), false);
+            }
+            let both: BTreeSet<usize> = sc.creators[k].union(&sc.routers[k]).copied().collect();
+            let none = both.is_empty();
+            (both.into_iter().map(tool).collect(), none)
+        };
+        let (mut who, mut unknown) = (BTreeSet::new(), false);
+        let mut take = |(w, u): (BTreeSet<UnitId>, bool)| {
+            who.extend(w);
+            unknown |= u;
+        };
+        for t in targets {
+            match t {
+                Target::Unreadable => take((BTreeSet::new(), true)),
+                Target::Addr { addr, zone } => {
+                    if let Some(l) = link {
+                        take(ride(l));
+                    } else if let Some(z) = zone {
+                        take(ride(z));
+                    } else {
+                        match sc.kernel[addrs().iter().position(|x| x == addr).unwrap()] {
+                            i @ 0..4 => take(ride(IFACES[i as usize])),
+                            4 | 6 => {}
+                            _ => take((BTreeSet::new(), true)),
+                        }
+                    }
+                }
+            }
+        }
+        (who, unknown)
+    }
+
+    proptest! {
+        #![proptest_config(cfg(2048))]
+
+        /// A setting charges exactly the owners of the interface that
+        /// carries it (and is unknown exactly when something cannot be
+        /// placed): the uplink charges nobody however many units added
+        /// routes over it, a lookup that picks a virtual link with an owner
+        /// charges its creators and its routers and no other tool, and a
+        /// lookup that fails, an address that cannot be read or a virtual
+        /// link nobody owns is unknown.
+        #[test]
+        fn a_setting_charges_the_owners_of_the_interface_that_carries_it(
+            sc in scene(),
+            targets in proptest::collection::vec(target(), 0..5),
+            link in proptest::option::weighted(0.25, 0usize..IFACES.len()),
+        ) {
+            let link = link.map(|i| IFACES[i]);
+            let c = charge_of(&sc, &targets, link);
+            let (who, unknown) = oracle(&sc, &targets, link);
+            prop_assert_eq!((&c.owners, c.unknown), (&who, unknown), "{:?} link {:?}", targets, link);
+        }
+
+        /// A charge moves with the route: the same settings under another
+        /// kernel answer charge the owners of the new interface (recomputed,
+        /// nothing remembered), and the same input twice gives the same answer.
+        #[test]
+        fn a_route_change_moves_the_charge(sc in scene(), other in proptest::collection::vec(0u8..7, 5), targets in proptest::collection::vec(target(), 1..4)) {
+            let first = charge_of(&sc, &targets, None);
+            prop_assert_eq!(&first, &charge_of(&sc, &targets, None), "same input, same charge");
+            let moved = Scene { kernel: other, ..sc.clone() };
+            let (who, unknown) = oracle(&moved, &targets, None);
+            let c = charge_of(&moved, &targets, None);
+            prop_assert_eq!((c.owners, c.unknown), (who, unknown));
+        }
+
+        /// `set_dns` replaces every DNS and proxy object and touches nothing
+        /// else: after it the charges standing are exactly those given (an
+        /// object left out is gone for everyone, a charge cannot stick), an
+        /// unknown one is an object-bound mark with no unit behind it, the
+        /// interface and route claims are as they were, and a tool is
+        /// protecting while it owns a charged object or something else does.
+        #[test]
+        fn set_dns_replaces_every_dns_object_and_nothing_else(
+            first in charges_map(),
+            second in charges_map(),
+        ) {
+            let mut t = Tracker::default();
+            // Claims that are not DNS: a tool's interface and route.
+            let ch = |kind, object: &str, steers| Change { owner: Owner::Unit(tool(0)), kind, object: object.into(), iface: Some("tun0".into()), steers, removed: false };
+            t.apply(&ch(ChangeKind::Interface, "tun0", false));
+            t.apply(&ch(ChangeKind::Route, "route-tun0-0", true));
+            let others = |t: &Tracker| t.claims().objects.into_iter().filter(|o| !matches!(o.1, ChangeKind::Dns | ChangeKind::Proxy)).collect::<Vec<_>>();
+            let before = others(&t);
+            t.set_dns(&first);
+            prop_assert_eq!(t.dns_charges(), nonempty(&first));
+            t.set_dns(&second);
+            prop_assert_eq!(t.dns_charges(), nonempty(&second), "nothing of the first survives");
+            prop_assert_eq!(others(&t), before, "other claims untouched");
+            let mut fresh = Tracker::default();
+            fresh.apply(&ch(ChangeKind::Interface, "tun0", false));
+            fresh.apply(&ch(ChangeKind::Route, "route-tun0-0", true));
+            fresh.set_dns(&second);
+            for i in 0..TOOLS {
+                prop_assert_eq!(t.footprint(&tool(i), NOW).protecting, fresh.footprint(&tool(i), NOW).protecting, "tool{} as if fresh", i);
+            }
+            let owned: BTreeSet<UnitId> = second.values().flat_map(|c| c.owners.iter().cloned()).collect();
+            for i in 1..TOOLS {
+                prop_assert_eq!(t.footprint(&tool(i), NOW).protecting, owned.contains(&tool(i)), "tool{}", i);
+            }
+            let v = t.view(WatchState::Attached { at: NOW }, &[tool(1)], NOW);
+            let any_unknown = second.values().any(|c| c.unknown);
+            prop_assert_eq!(v.unattributed.iter().any(|w| w.contains("Dns") || w.contains("Proxy")), any_unknown);
+        }
+    }
+
+    fn keys() -> [Key; 3] {
+        [
+            (ChangeKind::Dns, "resolv.conf".into()),
+            (ChangeKind::Dns, "link tun0".into()),
+            (ChangeKind::Proxy, "/etc/environment".into()),
+        ]
+    }
+
+    fn charges_map() -> impl Strategy<Value = BTreeMap<Key, Charge>> {
+        proptest::collection::vec((proptest::collection::btree_set(1usize..TOOLS, 0..=2), any::<bool>()), 3).prop_map(
+            |v| {
+                keys()
+                    .into_iter()
+                    .zip(v)
+                    .map(|(k, (o, unknown))| (k, Charge { owners: o.into_iter().map(tool).collect(), unknown }))
+                    .collect()
+            },
+        )
+    }
+
+    fn nonempty(m: &BTreeMap<Key, Charge>) -> BTreeMap<Key, Charge> {
+        m.iter().filter(|(_, c)| !c.owners.is_empty() || c.unknown).map(|(k, c)| (k.clone(), c.clone())).collect()
+    }
+
+    proptest! {
+        #![proptest_config(cfg(512))]
+
+        /// `interface_owners` is the creators (units with an interface claim
+        /// on the name) and the routers (units with a *steering* route over
+        /// it), whatever else is claimed: a non-steering route, another
+        /// interface, or a removed object adds no owner.
+        #[test]
+        fn interface_owners_are_creators_and_steering_routers(ops in ops()) {
+            let t = tracker_of(&ops);
+            for name in ["v0", "v1", "p0"] {
+                let owners = t.interface_owners(name);
+                let (mut creators, mut routers) = (BTreeSet::new(), BTreeSet::new());
+                for unit in ["a", "b"] {
+                    let c = t.claims();
+                    for (cu, k, _, i, steers) in &c.objects {
+                        if cu.name != unit || i.as_deref() != Some(name) { continue; }
+                        match k {
+                            ChangeKind::Interface => { creators.insert(u(unit)); }
+                            ChangeKind::Route if *steers => { routers.insert(u(unit)); }
+                            _ => {}
+                        }
+                    }
+                }
+                prop_assert_eq!((owners.creators, owners.routers), (creators, routers), "{}", name);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "loader")]
+mod routeclassify {
+    use super::*;
+    use crate::dns::Lookup;
+
+    fn reply(kind: &Reply) -> Vec<u8> {
+        let mut m = vec![0u8; 16];
+        match kind {
+            Reply::Oif(i, ty) => {
+                // rtmsg: family, dst_len, src_len, tos, table, protocol, scope, type
+                m.extend(vec![2u8, 32, 0, 0, 0, 0, 0, *ty, 0, 0, 0, 0]);
+                m.extend(nl_attr(1, &[10, 0, 0, 1])); // RTA_DST
+                m.extend(nl_attr(4, &i.to_ne_bytes())); // RTA_OIF
+                m[4..6].copy_from_slice(&24u16.to_ne_bytes());
+            }
+            Reply::NoOif => {
+                m.extend(vec![2u8, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                m.extend(nl_attr(1, &[10, 0, 0, 1]));
+                m[4..6].copy_from_slice(&24u16.to_ne_bytes());
+            }
+            Reply::Err(code) => {
+                m[4..6].copy_from_slice(&2u16.to_ne_bytes());
+                m.extend(code.to_ne_bytes());
+            }
+            Reply::Short => {
+                m.truncate(10);
+            }
+        }
+        let len = m.len() as u32;
+        if !matches!(kind, Reply::Short) {
+            m[0..4].copy_from_slice(&len.to_ne_bytes());
+        }
+        m
+    }
+
+    #[derive(Clone, Debug)]
+    enum Reply {
+        Oif(u32, u8),
+        NoOif,
+        Err(i32),
+        Short,
+    }
+
+    proptest! {
+        #![proptest_config(cfg(1024))]
+
+        /// What the kernel's reply to a route lookup comes to: an output
+        /// interface that has a name is `Via` it; one that has no name (an
+        /// index the host cannot resolve), a reply that names none, a short
+        /// or malformed one and any other error is `Failed` (fail closed);
+        /// only the kernel's two "unreachable" errors are `NoRoute`.
+        #[test]
+        fn a_route_reply_is_via_no_route_or_failed(
+            r in prop_oneof![
+                3 => ((1u32..8), prop_oneof![Just(1u8), Just(2), Just(3), Just(7)]).prop_map(|(i, t)| Reply::Oif(i, t)),
+                1 => Just(Reply::NoOif),
+                3 => prop_oneof![Just(-101i32), Just(-113), Just(-2), Just(-1), Just(0), Just(-22)].prop_map(Reply::Err),
+                1 => Just(Reply::Short),
+            ],
+        ) {
+            let mut names = |i: u32| (i % 2 == 1).then(|| format!("if{i}"));
+            let got = crate::route::classify(&reply(&r), &mut names);
+            let want = match &r {
+                // The machine's own address (`RTN_LOCAL`) is not a path out, whether or
+                // not its interface (`lo`) has a name.
+                Reply::Oif(_, 2) => Lookup::Local,
+                Reply::Oif(i, _) if i % 2 == 1 => Lookup::Via(format!("if{i}")),
+                Reply::Err(-101) | Reply::Err(-113) => Lookup::NoRoute,
+                _ => Lookup::Failed,
+            };
+            prop_assert_eq!(got, want, "{:?}", r);
+        }
+
+        /// Whatever bytes come back, a lookup never panics and never
+        /// invents an interface for bytes that name none.
+        #[test]
+        fn a_route_reply_of_any_bytes_is_never_invented(bytes in proptest::collection::vec(any::<u8>(), 0..96)) {
+            let mut names = |i: u32| Some(format!("if{i}"));
+            let got = crate::route::classify(&bytes, &mut names);
+            if let Lookup::Via(n) = got {
+                // The name must come from an RTA_OIF attribute actually present.
+                let idx: u32 = n.trim_start_matches("if").parse().unwrap();
+                let needle = idx.to_ne_bytes();
+                prop_assert!(bytes.windows(4).any(|w| w == needle), "{n} from nowhere");
+            }
+        }
+    }
+}
