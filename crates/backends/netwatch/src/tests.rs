@@ -3021,24 +3021,28 @@ mod dnsproxy {
     fn netif(seed: u64) -> (String, Vec<Target>) {
         let mut s = seed | 1;
         let loop_ = ["127.0.0.53", "[::1]:53", "::1#local", "::1%lo"];
-        let remote: [(&str, &str); 3] = [
-            ("1.1.1.1#cloudflare-dns.com", "1.1.1.1"),
-            ("[2001:db8::53]:853", "2001:db8::53"),
-            ("10.8.0.1", "10.8.0.1"),
+        let remote: [(&str, &str, Option<&str>); 6] = [
+            ("1.1.1.1#cloudflare-dns.com", "1.1.1.1", None),
+            ("[2001:db8::53]:853", "2001:db8::53", None),
+            ("10.8.0.1", "10.8.0.1", None),
+            ("[fe80::1]:853%7#dns.example", "fe80::1", Some("7")),
+            ("fe80::2%7#dns.example", "fe80::2", Some("7")),
+            ("10.8.0.9:853#dns.example", "10.8.0.9", None),
         ];
         let (mut toks, mut want) = (vec![], vec![]);
         for _ in 0..(1 + next(&mut s) % 4) {
             if next(&mut s).is_multiple_of(2) {
                 toks.push(pick(&mut s, &loop_).to_string());
             } else {
-                let (t, a) = pick(&mut s, &remote);
+                let (t, a, z) = pick(&mut s, &remote);
                 toks.push(t.to_string());
-                want.push(addr(a, None));
+                want.push(addr(a, *z));
             }
         }
         want.sort();
         want.dedup();
-        (format!("# private\nIS_MANAGED=yes\nDNS={}\nDOMAINS=~.\n", toks.join(" ")), want)
+        let key = pick(&mut s, &["SERVERS", "SERVERS", "DNS", "DNS_EX"]);
+        (format!("# private\nIS_MANAGED=yes\n{key}={}\nDOMAINS=~.\n", toks.join(" ")), want)
     }
 
     fn proxy(seed: u64) -> (String, Vec<Target>) {
@@ -3099,6 +3103,8 @@ mod dnsproxy {
             (Mutant::NoZoneStrip, resolv, dns::resolv_servers, 20),
             (Mutant::LoopbackSteers, netif, dns::netif_servers, 60),
             (Mutant::FirstServerOnly, netif, dns::netif_servers, 40),
+            (Mutant::ResolvedIgnoresServers, netif, dns::netif_servers, 30),
+            (Mutant::ResolvedDropsPortScope, netif, dns::netif_servers, 30),
             (Mutant::ProxyLowerOnly, proxy, dns::proxy_hosts, 60),
         ] {
             MUTANT.with(|c| c.set(m));
@@ -3441,8 +3447,11 @@ mod route {
 #[cfg(feature = "loader")]
 mod files {
     use crate::ChangeKind;
-    use crate::dns::Target;
+    use crate::dns::{self, Charge, Lookup, Owners, Target, World};
     use crate::files::Files;
+    use planarian_schema::UnitId;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
     use std::path::Path;
 
     fn put(root: &Path, rel: &str, text: &str) {
@@ -3469,8 +3478,8 @@ mod files {
             "export https_proxy=\"http://192.0.2.5:3128\"\nhttp_proxy=http://proxy.example.org:3128\n",
         );
         put(d.path(), "etc/profile.d/a.sh", "export PATH=/x\n");
-        put(d.path(), "run/systemd/resolve/netif/7", "DNS=10.8.0.1\n");
-        put(d.path(), "run/systemd/resolve/netif/9", "DNS=1.1.1.1\n"); // no such interface: not read
+        put(d.path(), "run/systemd/resolve/netif/7", "SERVERS=10.8.0.1\n");
+        put(d.path(), "run/systemd/resolve/netif/9", "SERVERS=1.1.1.1\n"); // no such interface: not read
         let f = Files::new(d.path());
         let o = f.observe(&mut names);
         let get = |k: ChangeKind, n: &str| o.get(&(k, n.to_string())).cloned();
@@ -3486,6 +3495,42 @@ mod files {
         // A file that goes is no longer a setting.
         std::fs::remove_file(d.path().join("etc/environment")).unwrap();
         assert!(!f.observe(&mut names).contains_key(&(ChangeKind::Proxy, "/etc/environment".to_string())));
+    }
+
+    proptest! {
+        // Construct the pinned producer's record, interface identity and
+        // expected owner independently of Files or the address parser.
+        // systemd v260.5, resolved-link.c:1272-1323 (link_save_user).
+        #[test]
+        fn resolved_saved_servers_keep_their_link_identity(index in 1u32..4096, suffix in 1u16..u16::MAX) {
+            let d = tempfile::tempdir().unwrap();
+            let name = format!("tun{index}");
+            let ipv6 = format!("fe80::{suffix:x}");
+            let record = format!(
+                "# This is private data. Do not parse.\nLLMNR=resolve\nMDNS=no\nDNSSEC=no\n\
+                 DNSOVERTLS=opportunistic\nDEFAULT_ROUTE=yes\n\
+                 SERVERS=10.8.0.53 10.8.0.54:853#dns.example [{ipv6}]:853%{index}#dns.example\nDOMAINS=~.\n"
+            );
+            put(d.path(), &format!("run/systemd/resolve/netif/{index}"), &record);
+            let settings = Files::new(d.path()).observe(&mut |i| (i == index).then(|| name.clone()));
+            let key = (ChangeKind::Dns, format!("link {name}"));
+            let mut targets = vec![a("10.8.0.53", None), a("10.8.0.54", None), a(&ipv6, Some(&index.to_string()))];
+            targets.sort();
+            prop_assert_eq!(settings.len(), 1);
+            prop_assert_eq!(settings.get(&key), Some(&(targets, Some(name.clone()))));
+
+            let owner = UnitId::service("vpn");
+            let virtual_ifaces = BTreeSet::from([name.clone()]);
+            let owners = |iface: &str| Owners {
+                creators: if iface == name { BTreeSet::from([owner.clone()]) } else { BTreeSet::new() },
+                routers: BTreeSet::new(),
+            };
+            let lookup = |_: &std::net::IpAddr| -> Lookup { panic!("per-link DNS must keep its link context") };
+            let world = World { virtual_ifaces: &virtual_ifaces, owners: &owners, lookup: &lookup, ifname: &|_| None };
+            let charges = dns::all(&settings, &world);
+            prop_assert_eq!(charges.len(), 1);
+            prop_assert_eq!(charges.get(&key), Some(&Charge { owners: BTreeSet::from([owner]), unknown: false }));
+        }
     }
 
     /// The signature changes with a replace-by-rename (a new inode) and an

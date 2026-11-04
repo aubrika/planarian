@@ -543,3 +543,28 @@ rename fold and independent properties, and the common own-read filter
 precedes all scan triggers. DNS uses fresh live names for route and scope
 resolution. The combined VM keeps namespace (r), WireGuard (s), and DNS
 (t) cases; the final stacked-head Rust/Nix and VM checks remain pending.
+
+### #74 live resolved state format (N23)
+
+Rust CI passed at `b53bad25`, but the first live DNS case failed on the
+descendant `ded07a98` (run 41910326878, job 126856505840): the VPN owned a
+`resolved` DNS object while the expected `link nwdns0` object was absent.
+The per-link assertion is correct. The pinned systemd 260.5 producer saves
+addresses under `SERVERS=` in `/run/systemd/resolve/netif/<ifindex>`
+([link_save_user](https://github.com/systemd/systemd/blob/v260.5/src/resolve/resolved-link.c#L1293));
+the parser accepted only `DNS=` and `DNS_EX=`. The flattened global file
+could attribute this simple server by route, masking the missing link
+context in synthetic tests.
+
+The parser now accepts `SERVERS=`. Its saved-server adapter also preserves
+the pinned producer's scope after a port (`[fe80::1]:853%7#name`), keeping
+that grammar separate from proxy URI rules
+([serializer](https://github.com/systemd/systemd/blob/v260.5/src/basic/in-addr-util.c#L561)).
+An independent producer-format property constructs the saved record and interface map, checks the exact per-link
+key and IPv4/scoped-IPv6 targets, and requires the link owner's charge
+without an unscoped lookup. The seeded setting property retains legacy
+spellings and mutants that ignore `SERVERS=` or drop that scope. VM
+(t1)–(t9) retain their ownership and object-identity assertions; (t1), (t2) and (t7) exercise the
+native per-link path. DNS diagnostics tolerate an absent footprint file
+so route/resolved output still prints. Opens no path (rule 18); fresh
+Rust and live VM execution remain pending.

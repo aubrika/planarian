@@ -70,6 +70,10 @@ pub(crate) enum Mutant {
     BareScopeIsDelimiter,
     /// Keep trailing shell syntax in the proxy assignment's value.
     AssignmentKeepsSyntax,
+    /// Ignore the SERVERS= key that resolved writes for a link.
+    ResolvedIgnoresServers,
+    /// Read a port-bearing resolved server like a URI, losing its outer scope.
+    ResolvedDropsPortScope,
 }
 
 #[cfg(test)]
@@ -162,14 +166,40 @@ pub fn resolv_servers(content: &str) -> Vec<Target> {
     targets(servers.iter().map(String::as_str))
 }
 
-/// A resolved link's (or the global) state file: its `DNS=` and `DNS_EX=` lines.
+/// A resolved link's saved state (`SERVERS=`, systemd 260.5), or the older
+/// `DNS=` / `DNS_EX=` address-list spellings.
 pub fn netif_servers(content: &str) -> Vec<Target> {
-    let toks: Vec<&str> = content
+    let toks: Vec<String> = content
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("DNS=").or_else(|| l.trim().strip_prefix("DNS_EX=")))
+        .filter_map(|l| {
+            let l = l.trim();
+            let servers = l.strip_prefix("SERVERS=");
+            #[cfg(test)]
+            let servers = if mutant(Mutant::ResolvedIgnoresServers) { None } else { servers };
+            servers.or_else(|| l.strip_prefix("DNS=")).or_else(|| l.strip_prefix("DNS_EX="))
+        })
         .flat_map(str::split_whitespace)
+        .map(saved_server)
         .collect();
-    targets(toks.into_iter())
+    targets(toks.iter().map(String::as_str))
+}
+
+/// systemd's saved address is not URI syntax: a link-local scope follows
+/// the port (`[fe80::1]:853%7#name`). Normalize only this producer's form;
+/// proxy URI parsing retains its own bracket and percent rules.
+fn saved_server(tok: &str) -> String {
+    let tok = tok.split('#').next().unwrap_or("");
+    #[cfg(test)]
+    if mutant(Mutant::ResolvedDropsPortScope) {
+        return tok.to_string();
+    }
+    if let Some((host, rest)) = tok.strip_prefix('[').and_then(|t| t.split_once(']'))
+        && let Some((port, zone)) = rest.strip_prefix(':').and_then(|t| t.split_once('%'))
+        && port.parse::<u16>().is_ok()
+    {
+        return format!("{host}%{zone}");
+    }
+    tok.to_string()
 }
 
 /// A file that sets environment variables (`/etc/environment`, a profile

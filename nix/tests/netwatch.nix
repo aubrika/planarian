@@ -917,7 +917,7 @@ pkgs.testers.runNixOSTest {
                 f"jq -c --arg o '{obj}' '[.objects[] | select(.[2] == $o) | .[0] | tostring]' {FP}/.state")
             return json.loads(out)
         def show():
-            print(machine.execute(f"cat {FP}/.state; echo; for f in {FP}/nw-dnsvpn {FP}/nw-dnsrun {FP}/backdoor {FP}/.unattributed; do echo \"== $f\"; cat \"$f\" 2>&1; done; ls -l /etc/resolv.conf; cat /etc/resolv.conf; ip route; resolvectl status --no-pager")[1])
+            print(machine.execute(f"cat {FP}/.state; echo; for f in {FP}/nw-dnsvpn {FP}/nw-dnsrun {FP}/backdoor {FP}/.unattributed /run/systemd/resolve/netif/*; do echo \"== $f\"; cat \"$f\" 2>&1 || true; done; ls -l /etc/resolv.conf; cat /etc/resolv.conf; ip route; resolvectl status --no-pager")[1])
         def until(what, pred, timeout=30):
             for _ in range(timeout):
                 if pred():
