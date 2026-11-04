@@ -276,6 +276,9 @@ impl UnitBackend for Systemd {
     fn release_hold(&self, unit: &UnitId, until: Option<Timestamp>, wait: Millis) -> Outcome {
         crate::hold::release_in(Path::new(crate::hold::RELEASED_DIR), unit, until, ms(wait))
     }
+    fn timed_release_active(&self, unit: &UnitId, until: Timestamp) -> Result<bool, Outcome> {
+        crate::hold::timed_release_active_in(Path::new(crate::hold::RELEASED_DIR), unit, until)
+    }
     fn end_release(&self, unit: &UnitId) -> Outcome {
         crate::hold::end_release_in(Path::new(crate::hold::RELEASED_DIR), unit)
     }

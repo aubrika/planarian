@@ -544,6 +544,70 @@ precedes all scan triggers. DNS uses fresh live names for route and scope
 resolution. The combined VM keeps namespace (r), WireGuard (s), and DNS
 (t) cases; the final stacked-head Rust/Nix and VM checks remain pending.
 
+## lane-daemon: #78 netwatch gate and authorized hold release (4 Nov)
+
+Reconciled against SPEC §12d and the coordinator’s final review of the landed
+hold-release paths at `main` `895eaa1`. The kernel table remains Core; the
+explicit release operation must be able to ask an administrator for every
+tool, including Routine tools. No new authorization path is opened (rule 18):
+all spellings still pass through the executor, including parked approvals.
+
+| Finding | Decision and regression |
+| --- | --- |
+| The daemon counted every network tool as protecting traffic | Read `UnitBackend::protecting`, fail closed on Err, and retain standing journal/host holds until recovery. D17 records the gate property and catalog cases. |
+| Approving a non-administrator’s release, or submitting the equivalent generic SetOverride, skipped the release marker | Run the same marker/lift follow-up for every successfully committed attested Stopped hold override; failed or re-parked work cannot release. D18 records direct/generic/approval equivalence. |
+| Synthetic holds inherited Routine and refused non-administrators as Unauthorized | Give the explicit hold-release operation a Security administrator floor, independent of the tool’s tags; Core protects the table, not this explicit authorized release. D19 records tag generation and Routine end-to-end coverage. |
+| Backend failures were ignored and an arbitrary override suppressed a hold | Record completion only after marker/lift succeeds; retry failures/Unknown and expired marker cleanup, including after steering ends. Match only real system-service holds with attested Stopped overrides. Keep deadlines synchronized and bound an Explicit release to next boot. D20 records the effect/lifetime/failure cases. |
+
+Current validation is pending on the new branch head: this environment has no
+Rust/Nix toolchain. The original gate mutant evidence is retained in D17;
+new release/floor rows remain pending until CI and the independent review run.
+
+
+
+### #78 final review: preserve the first timed-release bound
+
+The independent local reviewer found that reissuing `release_hold` after a
+backward wall-clock step recomputed a later boot deadline and could reopen
+traffic after the original bound expired. The Linux backend now reads and
+preserves the existing same-until marker, refuses an expired marker before
+lifting, and latches observed wall expiry onto the boot bound. A nonblocking
+marker-directory lock serializes update/removal without waiting behind a
+stuck writer. The Nix condition and lift retain release markers; neither
+erases the only original bound.
+
+The daemon verifies every active timed marker on both clocks before any
+reconciliation lift, including when no new OnFailure hold has appeared. A
+missing/corrupt/unreadable bound fails closed: after an initial timed marker
+write fails or a marker disappears, reconciliation cannot reconstruct its
+original monotonic lifetime from wall time, including after daemon restart.
+A fresh administrator action is needed to create a timed release in that
+case; untimed releases still retry automatically. D20 carries the generated
+clock/retry/restart property and the file-backed marker regressions. These
+new checks and their negative runs remain pending execution on the new head.
+
+
+### #78 final stack integration
+
+The final candidate is a single-parent restack onto #79 `6796007f`, carrying
+the dependency chain #68 → #70 → #71 → #74 → #69 → #75 → #79. The original
+#78 source at `c9da6119` is merged against `895eaa1`; all three source snapshots
+were checked against their exact Git blob identities. Parent trait/fact and
+journal changes, Exec-probe flag/retry coverage, and NotPreparedAgain/Stale
+handling are retained alongside the protecting gate and authorized release
+changes. D17–D20 and the parent’s D21–D23 coexist; ledger counts come from
+the 103 actual rows.
+
+Package execution on `c9da6119` exposed two invalid lifecycle fixtures: a
+20-second deadline was calculated before two 15-second settling transactions,
+and a 10-second release expired before its own commit. The tests now give
+each active release a post-settle window and assert its marker exists before
+exercising expiry/cleanup. A separate regression checks expiry during settle
+with and without a prior release: no expired marker is created, and stale
+prior markers are removed on reconciliation. Five exact formatter corrections
+from that head and the parent’s formatter corrections are retained. Final
+stacked-head execution and independent review remain pending.
+
 ### #74 live resolved state format (N23)
 
 Rust CI passed at `b53bad25`, but the first live DNS case failed on the

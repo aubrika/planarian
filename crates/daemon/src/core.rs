@@ -316,7 +316,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// §12d: held units whose hold an attested release lifted, until the
     /// release ends; and held units whose failed repair administrators have
     /// been told about (once per hold).
-    hold_released: BTreeSet<UnitId>,
+    hold_released: BTreeMap<UnitId, Option<Timestamp>>,
+    /// A release marker/lift or marker cleanup that has not succeeded yet.
+    /// Retried quietly, and included even after the tool stops protecting.
+    release_unconfirmed: BTreeMap<UnitId, Timestamp>,
     hold_notified: BTreeSet<UnitId>,
 }
 
@@ -417,7 +420,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             core_hash: Hash::ZERO,
             core_hash_record: None,
             parked_agents: BTreeMap::new(),
-            hold_released: BTreeSet::new(),
+            hold_released: BTreeMap::new(),
+            release_unconfirmed: BTreeMap::new(),
             hold_notified: BTreeSet::new(),
             after_ready: deferred,
             ex,
@@ -650,9 +654,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             s.holds.extend(h);
         }
         let mut defs = self.asm.defs();
+        // §12d: the network tools that protect traffic now. Fail closed: an
+        // unreadable watch counts every tool as protecting.
+        let tools: Vec<UnitId> = crate::hold::network_tools(&defs).map(|d| d.id.clone()).collect();
+        s.protecting = if tools.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.b.units().protecting(&tools).unwrap_or_else(|_| tools.iter().cloned().collect())
+        };
         // §12d: each network-security unit's hold unit, known (so releasing
-        // it derives the held unit's sensitivity) but never expected.
-        let holds: Vec<UnitDef> = crate::hold::network_security(&defs).map(crate::hold::hold_def).collect();
+        // it derives the hold's administrator floor) but never expected.
+        let holds: Vec<UnitDef> = crate::hold::network_tools(&defs).map(crate::hold::hold_def).collect();
         for d in holds {
             defs.entry(d.id.clone()).or_insert(d);
         }
@@ -695,6 +707,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             None => self.ex.submit(p.clone(), authz.clone(), s, defs),
         };
         self.note_withdrawn(built);
+        self.committed_hold_release(&p.transition, &result, defs);
         if let Some((facts, _)) = self.ex.last.clone() {
             self.touched.extend(facts.affected_units.iter().cloned());
             // §11: the affected sessions are notified either way.
@@ -834,6 +847,43 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         self.hold_left = Millis(self.hold_left.0.saturating_sub(took));
     }
 
+    /// Every spelling of the same committed effect, including an approval,
+    /// must create the backend marker before lifting the host's hold.
+    fn committed_hold_release(&mut self, t: &Transition, r: &Submitted, defs: &UnitDefs) {
+        if matches!(r, Submitted::Finished { state: TxnState::Committed, .. })
+            && let Transition::SetOverride(o) = t
+            && o.holds_at(self.b.clock().now())
+            && let Some(u) = crate::hold::released(o)
+            && defs.get(&u).is_some_and(|d| d.holds)
+        {
+            self.release_host(&u, crate::hold::release_until(&o.until), HOLD_WAIT);
+        }
+    }
+
+    fn release_host(&mut self, u: &UnitId, until: Option<Timestamp>, wait: Millis) {
+        match self.b.units().release_hold(u, until, wait) {
+            Outcome::Succeeded => {
+                self.hold_released.insert(u.clone(), until);
+                self.release_unconfirmed.remove(u);
+                self.lift_unconfirmed.remove(u);
+                if self.ledger().holds().contains(u) {
+                    self.journal(Record::HoldLifted {
+                        unit: u.clone(),
+                        reason: "released by an attested override".into(),
+                    });
+                }
+            }
+            o => self.release_unconfirmed(u, format!("its hold could not be released: {o:?}")),
+        }
+    }
+
+    fn release_unconfirmed(&mut self, u: &UnitId, why: String) {
+        let later = self.b.clock().boot_now().plus(HOLD_UNCONFIRMED_RETRY);
+        if self.release_unconfirmed.insert(u.clone(), later).is_none() {
+            self.notice(format!("ALARM: {u}: {why}; Planarian will retry"));
+        }
+    }
+
     /// Compact the journal and return the entries it discarded (the segment
     /// it checkpointed), read in the same core call: no tick of this daemon
     /// can journal between the two, so they are exactly what the checkpoint
@@ -910,13 +960,27 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {
         use crate::hold;
         use planarian_txn::ledger::HoldBy;
-        let units: Vec<UnitId> = hold::network_security(defs).map(|d| d.id.clone()).collect();
-        if units.is_empty() {
-            return false;
-        }
         let mut applied = false;
         let journaled = self.ledger().holds();
         let host = self.b.units().held();
+        // The units this tick looks after: network-security units (tools
+        // protecting traffic), and any tool whose hold stands (journaled or
+        // on the host) whether or not it still protects, so that hold is
+        // lifted once the unit is back. A tool that is not protecting is
+        // never held.
+        let units: Vec<UnitId> = hold::network_tools(defs)
+            .filter(|d| {
+                s.protecting.contains(&d.id)
+                    || journaled.contains(&d.id)
+                    || host.as_ref().is_ok_and(|h| h.contains(&d.id))
+                    || self.hold_released.contains_key(&d.id)
+                    || self.release_unconfirmed.contains_key(&d.id)
+            })
+            .map(|d| d.id.clone())
+            .collect();
+        if units.is_empty() {
+            return false;
+        }
         // Anything else flushing the ruleset removes the hold's table while
         // the units stay held: put it back (journal, alarm, re-apply).
         let mut holding = journaled.clone();
@@ -931,7 +995,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let mut lifted = BTreeSet::new();
         for u in &units {
             if journaled.contains(u)
-                && !self.hold_released.contains(u)
+                && !self.hold_released.contains_key(u)
                 && s.override_of(&hold::hold_unit(u)).is_none()
                 && !hold::failed(s, defs, u)
                 && hold::back(s, defs, u)
@@ -972,6 +1036,62 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             if lifted.contains(&u) {
                 continue;
             }
+            // An attested Stopped override is the release effect. Both the
+            // backend marker and the lift must succeed before it is recorded
+            // as complete; a failed/unknown call is retried within the tick's
+            // shared hold budget, even if the tool no longer protects traffic.
+            let now = self.b.clock().boot_now();
+            let due = self.release_unconfirmed.get(&u).is_none_or(|next| now >= *next);
+            let release = s.override_of(&hold::hold_unit(&u)).filter(|o| hold::released(o).is_some());
+            if let Some(o) = release {
+                let until = hold::release_until(&o.until);
+                // A wall-clock rollback must not revive a timed release
+                // whose original boot bound has passed. Verify the persisted
+                // marker even if the host has not applied a new hold yet.
+                // Missing/unreadable bounds fail closed, including restart
+                // after an initial marker write failed: never invent a new
+                // deadline from the old wall-clock override.
+                let active = match until.map(|until| self.b.units().timed_release_active(&u, until)) {
+                    None | Some(Ok(true)) => true,
+                    Some(Ok(false)) => {
+                        self.release_unconfirmed(
+                            &u,
+                            "its timed release has expired or its original bound is missing".into(),
+                        );
+                        false
+                    }
+                    Some(Err(o)) => {
+                        self.release_unconfirmed(&u, format!("its timed release could not be verified: {o:?}"));
+                        false
+                    }
+                };
+                if active
+                    && (self.hold_released.get(&u) != Some(&until) || on_host != Some(false))
+                    && due
+                    && let Some(wait) = self.hold_wait()
+                {
+                    let t0 = self.b.clock().boot_now();
+                    self.release_host(&u, until, wait);
+                    self.hold_spent(t0);
+                }
+                if active {
+                    continue;
+                }
+            }
+            if release.is_none()
+                && (self.hold_released.contains_key(&u) || self.release_unconfirmed.contains_key(&u))
+                && due
+            {
+                // The release ended. A failed cleanup keeps its retry state;
+                // failure to remove a marker must never be silently accepted.
+                match self.b.units().end_release(&u) {
+                    Outcome::Succeeded => {
+                        self.hold_released.remove(&u);
+                        self.release_unconfirmed.remove(&u);
+                    }
+                    o => self.release_unconfirmed(&u, format!("its release marker could not be removed: {o:?}")),
+                }
+            }
             // (`!in_journal` is defensive: a unit journaled as held has its entry
             // dropped by the failed-again arm first.)
             if self.lift_unconfirmed.contains_key(&u) && !in_journal {
@@ -1002,22 +1122,11 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     }
                 }
             }
-            // An attested release (an override on the hold unit) lifts it
-            // until the release ends.
-            if s.override_of(&hold::hold_unit(&u)).is_some() {
-                if in_journal {
-                    self.journal(Record::HoldLifted {
-                        unit: u.clone(),
-                        reason: "released by an attested override".into(),
-                    });
-                }
-                self.hold_released.insert(u);
+            // A cache/pending marker kept this tool in the loop solely for
+            // cleanup. Once it no longer protects and has no standing hold,
+            // cleanup must not start a new hold on its traffic.
+            if !s.protecting.contains(&u) && !in_journal && on_host == Some(false) {
                 continue;
-            }
-            if self.hold_released.remove(&u) {
-                // The release ended: the hold script's marker goes; a unit
-                // still failed is held again below.
-                let _ = self.b.units().end_release(&u);
             }
             if hold::failed(s, defs, &u) {
                 if !in_journal {
@@ -1523,7 +1632,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 stops_are_faults: def.stops_are_faults,
                 systemd_restarts: def.systemd_restart.as_ref().is_some_and(|p| p.restart),
                 lenient,
-                network_tool: def.holds,
+                network_tool: def.holds && s.protecting.contains(u),
                 held: s.holds.contains(u) || host_held.as_ref().is_ok_and(|h| h.contains(u)),
                 hold_tried: false,
             };
@@ -2469,7 +2578,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         resp
     }
 
-    fn user_submit(&mut self, t: Transition, peer: Peer, source: Source, reason: String) -> Response {
+    fn user_submit(&mut self, mut t: Transition, peer: Peer, source: Source, reason: String) -> Response {
+        // §12d: even an explicitly unbounded hold release ends at boot. Use
+        // the same lifetime for the override and its backend marker.
+        if let Transition::SetOverride(o) = &mut t
+            && crate::hold::released(o).is_some()
+            && o.until == Until::Explicit
+        {
+            o.until = Until::NextBoot;
+        }
         // Admission before work (R09): a caller refused anyway queues no
         // staging or build; `submit` then refuses it, logged.
         let who = self.authz(&peer);
@@ -2746,8 +2863,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
             Request::HoldRelease { unit, until } => {
                 // §12d: an attested override on the hold unit, through the
-                // executor like any override, so the hold unit's sensitivity
-                // (the held unit's) decides: administrator authority, or
+                // executor like any override, with the hold's administrator
+                // floor regardless of the held tool's tags: authority, or
                 // AskFirst with an Administrator approver (§11).
                 let hold = crate::hold::hold_unit(&unit);
                 let (_, defs) = self.observe();
@@ -2764,20 +2881,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     reason.clone(),
                     Actor::user(peer.uid),
                 );
-                let r = self.user_submit(Transition::SetOverride(o), peer.clone(), Source::User, reason);
-                if matches!(&r, Response::Done { state: TxnState::Committed, .. }) {
-                    // The executor stopped the hold unit; the marker keeps a
-                    // new failure from holding again until the release ends.
-                    if self.ledger().holds().contains(&unit) {
-                        self.journal(Record::HoldLifted {
-                            unit: unit.clone(),
-                            reason: format!("released by uid {}", peer.uid),
-                        });
-                    }
-                    let _ = self.b.units().release_hold(&unit, crate::hold::release_until(&until), HOLD_WAIT);
-                    self.hold_released.insert(unit);
-                }
-                r
+                self.user_submit(Transition::SetOverride(o), peer, Source::User, reason)
             }
             Request::LiftOverride { unit } => {
                 let r = self.user_submit(
@@ -2957,6 +3061,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 let built = self.waiting_built();
                 let r = self.ex.approve(&hash, &approver, &s, &defs);
                 self.note_withdrawn(built);
+                if let Some(pk) = &parked {
+                    self.committed_hold_release(&pk.proposal.transition, &r, &defs);
+                }
                 // Re-bound and asked again under a new id (§12 step 4): the
                 // proposer's agent goes with it.
                 if let (Some(pk), Submitted::Parked { txn: again, .. }) = (&parked, &r)
