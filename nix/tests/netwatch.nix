@@ -925,7 +925,7 @@ pkgs.testers.runNixOSTest {
                 machine.sleep(1)
             show()
             raise AssertionError(what)
-        def settled(what, pred):
+        def dns_settled(what, pred):
             # Nothing should come: give netwatch a few passes, then check.
             machine.sleep(12)
             if not pred():
@@ -999,16 +999,16 @@ pkgs.testers.runNixOSTest {
         # (t2) DNS on the uplink, as DHCP sets it: routed through eth1, which
         # no unit made. No tool's.
         machine.succeed(f"resolvectl dns eth1 {UPLINK}")
-        settled("an uplink's DNS was charged", lambda: claimants("link eth1") == [])
+        dns_settled("an uplink's DNS was charged", lambda: claimants("link eth1") == [])
         machine.succeed("resolvectl revert eth1")
 
         # (t3) resolv.conf replaced by rename from nw-dnsrun. Loopback (the
         # machine's stub) steers nothing. A server on the uplink is nobody's.
         # A server on the VPN's subnet is the VPN's, not the writer's.
         replace("/etc/resolv.conf", "nameserver 127.0.0.53\\nnameserver ::1\\n")
-        settled("loopback was charged", lambda: claimants("resolv.conf") == [])
+        dns_settled("loopback was charged", lambda: claimants("resolv.conf") == [])
         replace("/etc/resolv.conf", f"nameserver {UPLINK}\\n")
-        settled("a server on the uplink was charged", lambda: claimants("resolv.conf") == [])
+        dns_settled("a server on the uplink was charged", lambda: claimants("resolv.conf") == [])
         replace("/etc/resolv.conf", "nameserver 10.81.0.54\\n")
         until("a server over the VPN not charged to the VPN alone", lambda: only("resolv.conf", "nw-dnsvpn"))
         route_lookups_settle()
@@ -1040,7 +1040,7 @@ pkgs.testers.runNixOSTest {
         replace("/etc/environment", f"https_proxy=http://{UPLINK}:3128\\n")
         until("a proxy on the uplink still charged", lambda: claimants("/etc/environment") == [])
         replace("/etc/environment", "LANG=C.UTF-8\\n")
-        settled("an unset proxy was charged", lambda: claimants("/etc/environment") == [])
+        dns_settled("an unset proxy was charged", lambda: claimants("/etc/environment") == [])
 
         # (t7) A server over a virtual interface whose maker is unknown (made
         # while netwatch was stopped, so no unit is known to have made it):
@@ -1069,7 +1069,7 @@ pkgs.testers.runNixOSTest {
         replace("/etc/resolv.conf", f"nameserver {own}\\n")
         def local_is_nobody():
             return claimants("resolv.conf") == [] and machine.execute(f"grep -q 'resolv.conf' {FP}/.unattributed")[0] != 0
-        settled("a server on the machine's own address was charged or marked", local_is_nobody)
+        dns_settled("a server on the machine's own address was charged or marked", local_is_nobody)
         replace("/etc/resolv.conf", "nameserver 127.0.0.53\\n")
         watch_fresh()
 
