@@ -534,3 +534,173 @@ proptest! {
         prop_assert!(new.1 == old.1, "the bytes left on disk differ");
     }
 }
+
+/// `compact_returning_segment` (reviewer, #65): the entries it returns are
+/// exactly those its checkpoint replaced, even while another handle (the
+/// renewer's `Renew`, the watchdog) appends. `segment()` then `compact()`
+/// each take the store lock alone, so an append between them is
+/// checkpointed but missing from what was saved.
+#[test]
+fn a_returned_segment_is_exactly_what_the_checkpoint_replaced() {
+    let store = MemStore::new(1 << 20);
+    let mut a = Journal::open(store.clone()).unwrap();
+    append(&mut a, 0).unwrap();
+    let mut b = Journal::open(store.clone()).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let writer = std::thread::spawn(move || {
+        let mut i = 1;
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = append(&mut b, i);
+            i += 1;
+        }
+    });
+    let mut previous = a.checkpoint_seq;
+    let mut failure = None;
+    for _ in 0..300 {
+        let segment = a.compact_returning_segment().unwrap();
+        let replaced = segment.last().map_or(previous, |e| e.seq);
+        let contiguous = segment.windows(2).all(|w| w[0].seq + 1 == w[1].seq)
+            && segment.first().is_none_or(|e| e.seq == previous + 1);
+        if a.checkpoint_seq != replaced || !contiguous {
+            failure = Some((a.checkpoint_seq, replaced, segment.len(), previous));
+            break;
+        }
+        previous = a.checkpoint_seq;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(failure.is_none(), "(checkpoint, last returned, returned, previous) = {failure:?}");
+}
+
+/// A MemStore that counts the lock acquisitions, and the store accesses
+/// (log, checkpoint) made while no guard is held.
+#[derive(Clone)]
+struct LockWatch {
+    store: MemStore,
+    held: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    locks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    bare: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[allow(dead_code)] // field 0 is held for its Drop (the store lock), never read
+struct WatchGuard(<MemStore as Store>::Guard, std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        self.1.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl LockWatch {
+    fn new(capacity: u64) -> LockWatch {
+        LockWatch {
+            store: MemStore::new(capacity),
+            held: Default::default(),
+            locks: Default::default(),
+            bare: Default::default(),
+        }
+    }
+
+    fn access(&self) {
+        if self.held.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.bare.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// (lock acquisitions, accesses without the lock) since the last call.
+    fn take(&self) -> (usize, usize) {
+        let o = std::sync::atomic::Ordering::SeqCst;
+        (self.locks.swap(0, o), self.bare.swap(0, o))
+    }
+}
+
+impl Store for LockWatch {
+    type Guard = WatchGuard;
+    fn lock(&self) -> io::Result<Self::Guard> {
+        let g = self.store.lock()?;
+        self.held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.locks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(WatchGuard(g, self.held.clone()))
+    }
+    fn capacity(&self) -> u64 {
+        self.store.capacity()
+    }
+    fn read_at(&self, off: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.access();
+        self.store.read_at(off, len)
+    }
+    fn write_at(&self, off: u64, bytes: &[u8]) -> io::Result<()> {
+        self.access();
+        self.store.write_at(off, bytes)
+    }
+    fn sync(&self) -> io::Result<()> {
+        self.store.sync()
+    }
+    fn read_checkpoint(&self) -> io::Result<Option<Vec<u8>>> {
+        self.access();
+        self.store.read_checkpoint()
+    }
+    fn write_checkpoint(&self, bytes: &[u8]) -> io::Result<()> {
+        self.access();
+        self.store.write_checkpoint(bytes)
+    }
+    fn read_sentinel(&self) -> io::Result<Option<Vec<u8>>> {
+        self.store.read_sentinel()
+    }
+    fn write_sentinel(&self, bytes: &[u8]) -> io::Result<()> {
+        self.store.write_sentinel(bytes)
+    }
+    fn fence(&self, txn: TxnId) -> io::Result<Option<u64>> {
+        self.store.fence(txn)
+    }
+    fn set_fence(&self, txn: TxnId, epoch: u64) -> io::Result<()> {
+        self.store.set_fence(txn, epoch)
+    }
+    fn create_fence(&self, txn: TxnId, epoch: u64) -> io::Result<()> {
+        self.store.create_fence(txn, epoch)
+    }
+    fn forget_fences<F: Fn(TxnId) -> bool>(&self, keep: F) -> io::Result<Vec<TxnId>> {
+        self.store.forget_fences(keep)
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
+
+    /// The stress above can only fail by luck. This is the invariant it
+    /// stands for, with no thread: `compact_returning_segment` reads the log
+    /// and writes the checkpoint under one acquisition of the store lock,
+    /// held throughout (every log and checkpoint access happens while a
+    /// guard is live), whatever the journal holds, with or without a second
+    /// handle's appends not yet seen; and what it returns is exactly the
+    /// entries since the last checkpoint, the second handle's included.
+    #[test]
+    fn compact_returning_segment_reads_and_checkpoints_under_one_lock(
+        rounds in proptest::collection::vec((0u8..6, 0u8..6), 1..8)
+    ) {
+        let watch = LockWatch::new(1 << 20);
+        let mut a = Journal::open(watch.clone()).unwrap();
+        let mut b = Journal::open(watch.clone()).unwrap();
+        let mut seq = 0u64;
+        let mut since: Vec<u64> = vec![];
+        for (mine, theirs) in rounds {
+            let app = |j: &mut Journal<LockWatch>, i: u64| j.append(Timestamp(i), Record::KnownGood(GenerationId(i + 1))).map(|e| e.seq);
+            for _ in 0..mine {
+                seq += 1;
+                since.push(app(&mut a, seq).unwrap());
+            }
+            for _ in 0..theirs {
+                seq += 1;
+                since.push(app(&mut b, seq).unwrap());
+            }
+            watch.take();
+            let segment = a.compact_returning_segment().unwrap();
+            let (locks, bare) = watch.take();
+            prop_assert_eq!(locks, 1, "one acquisition for the read and the checkpoint");
+            prop_assert_eq!(bare, 0, "store accessed without the lock held");
+            prop_assert_eq!(segment.iter().map(|e| e.seq).collect::<Vec<_>>(), since.clone(), "exactly what the checkpoint replaced");
+            since.clear();
+        }
+    }
+}
