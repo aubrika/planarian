@@ -360,10 +360,13 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         Err(why)
     };
     let mut lost_seen = 0u64;
+    // WireGuard's generic netlink family id, once known (read each tick).
+    let mut wg_family: Option<u16> = crate::snapshot::wireguard_family().unwrap_or(None);
     let mut next_tick = Instant::now();
     // Between ticks, the running units are refreshed at most this often.
     let mut running = std::collections::BTreeSet::new();
     let mut running_at: Option<Instant> = None;
+    let reader_tgid = std::process::id();
     while !stop.load(Ordering::Relaxed) {
         let mut changed = false;
         // Cgroups made and removed since the last pass first, so a unit's
@@ -374,12 +377,58 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
             changed |= tracker.set_invocation(u, inv);
         }
         let mut drained = 0;
+        // A generic netlink request may have configured a WireGuard peer.
+        let mut genl = false;
+        let mut family_checked = false;
         while let Some(item) = ring.next() {
-            drained += 1;
             let Some(ev) = crate::ebpf::Event::parse(&item) else {
+                drained += 1;
                 tracker.lost(None);
                 continue;
             };
+            // The reader's own dumps and route lookups are observed too.
+            // They must neither trigger another read nor prevent idle wait.
+            // An unreadable event above still counts and fails closed.
+            if ev.is_own_request(reader_tgid) {
+                continue;
+            }
+            drained += 1;
+            if ev.hook == crate::ebpf::HOOK_GENL {
+                genl = true;
+                // WireGuard's family id is assigned when its module loads:
+                // an id this watch does not know is looked up again (once a
+                // drain) before the request is set aside as another family's.
+                if ev.nlmsg_type().is_some_and(|t| Some(t) != wg_family) && !family_checked {
+                    family_checked = true;
+                    match crate::snapshot::wireguard_family() {
+                        Ok(f) => wg_family = f,
+                        Err(why) => {
+                            eprintln!("netwatch: {why}");
+                            tracker.lost(None);
+                        }
+                    }
+                }
+                if let Some(family) = wg_family {
+                    let unit = ev.cgpath.as_deref().and_then(unit_of_cgroup).or_else(|| cgroups.unit(ev.cgroup));
+                    match (crate::wg::host_request(&ev, family, own_netns), unit) {
+                        // A request from no unit (an administrator's `wg set`)
+                        // binds nobody. The devices a unit configured follow
+                        // their live peers, whoever changes them.
+                        (crate::wg::Genl::Other, _) | (_, None) => {}
+                        (crate::wg::Genl::Set(dev), Some(u)) => tracker.bind_wireguard(&u, &dev),
+                        (crate::wg::Genl::SetIndex(i), Some(u)) => {
+                            match ifnames.get(&i).cloned().or_else(|| {
+                                ifnames = read_ifnames();
+                                ifnames.get(&i).cloned()
+                            }) {
+                                Some(dev) => tracker.bind_wireguard(&u, &dev),
+                                None => tracker.lost(Some(&u)),
+                            }
+                        }
+                        (crate::wg::Genl::SetUnnamed, Some(u)) => tracker.lost(Some(&u)),
+                    }
+                }
+            }
             // The path the kernel had at the request, else the id's record.
             let unit = || ev.cgpath.as_deref().and_then(unit_of_cgroup).or_else(|| cgroups.unit(ev.cgroup));
             take_cached(&mut tracker, &ev, own_netns, unit, &mut ifnames, &mut read_ifnames);
@@ -417,6 +466,24 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
             changed |= tracker.set_invocation(u, inv);
         }
         let tick = Instant::now() >= next_tick;
+        // B-22 (b): the peers' endpoints are read as the kernel has them,
+        // after any generic netlink request and at every tick (a peer set
+        // by anything else, or a tunnel that came up since). A read that
+        // fails is a loss nothing can place: nothing is derived from a
+        // failed tool.
+        if genl || tick {
+            match crate::snapshot::wireguard() {
+                Ok((family, devices)) => {
+                    wg_family = family;
+                    changed |= tracker.set_wireguard(&devices);
+                }
+                Err(why) => {
+                    eprintln!("netwatch: {why}");
+                    tracker.lost(None);
+                    changed = true;
+                }
+            }
+        }
         if tick || changed {
             // A change is written at once, not at the next tick: a tool that
             // steers and dies between ticks must not read as before.

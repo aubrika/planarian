@@ -48,7 +48,7 @@ pkgs.testers.runNixOSTest {
     # on /dev/net/tun's autoload.
     boot.kernelModules = [ "tun" ];
     virtualisation.memorySize = 2048;
-    environment.systemPackages = [ pkgs.iproute2 pkgs.iptables pkgs.nftables ];
+    environment.systemPackages = [ pkgs.iproute2 pkgs.iptables pkgs.nftables pkgs.wireguard-tools pkgs.jq ];
 
     systemd.services.nw-route = oneshot
       (pkgs.writeShellScript "nw-route-up" ''
@@ -189,6 +189,44 @@ pkgs.testers.runNixOSTest {
       privateKeyFile = "${pkgs.writeText "wgnw.key" "uJhR8JkZjr32TbqdjI+D0hftWxS1UzsOHfr1VRjvLWA="}";
       peers = [ ];
     };
+    # (s) A WireGuard tunnel that configures its own peers over generic
+    # netlink (`wg set`), as a VPN client does: one IPv4 and one IPv6 peer,
+    # TEST-NET and documentation addresses (nothing answers; only what the
+    # footprint and the hold carry is under test). Its default route has
+    # metric 4007, so it steers (protecting) without carrying the test's
+    # traffic. ExecReload moves the first peer, from inside its cgroup, as a
+    # roaming client or `wg syncconf` does. /run/nw-wg-slow: seconds its
+    # start takes, so the daemon's restart cannot outrun the hold's check.
+    systemd.services.nw-wg = {
+      wantedBy = [ "multi-user.target" ];
+      after = [ "planarian-netwatch.service" ];
+      path = [ pkgs.iproute2 pkgs.wireguard-tools pkgs.coreutils ];
+      serviceConfig = {
+        Type = "simple";
+        Restart = "no";
+        ExecStartPre = "${pkgs.bash}/bin/bash -c 'sleep $(cat /run/nw-wg-slow 2>/dev/null || echo 0)'";
+        ExecReload = pkgs.writeShellScript "nw-wg-reload" ''
+          set -e
+          PATH=${pkgs.lib.makeBinPath [ pkgs.wireguard-tools pkgs.coreutils ]}
+          wg set nwwg0 peer "$(cat /run/nw-wg/p1)" endpoint 192.0.2.8:51822
+        '';
+      };
+      script = ''
+        set -e
+        mkdir -p /run/nw-wg
+        ip link del nwwg0 2>/dev/null || true
+        ip link add nwwg0 type wireguard
+        wg genkey > /run/nw-wg/key
+        p1="$(wg genkey | wg pubkey)"; p2="$(wg genkey | wg pubkey)"
+        echo "$p1" > /run/nw-wg/p1
+        wg set nwwg0 private-key /run/nw-wg/key listen-port 51900 \
+          peer "$p1" endpoint 192.0.2.7:51820 allowed-ips 10.79.0.2/32 \
+          peer "$p2" endpoint '[2001:db8::7]:51821' allowed-ips 10.79.0.3/32
+        ip link set nwwg0 up
+        ip route add default dev nwwg0 metric 4007
+        exec sleep infinity
+      '';
+    };
     # (r) The mover: a network tool (root, no bounding set) that runs, in its
     # own cgroup, each script the driver drops at /run/nw-mover/go, and
     # stays up while a move is tested. Exit status in rc. After an object's
@@ -217,6 +255,8 @@ pkgs.testers.runNixOSTest {
     systemd.targets.multi-user.wants = [ "nw-tpl@a.service" ];
     # Declared with no tag so the daemon restarts nw-quiet after each kill.
     services.planarian.units.nw-quiet = { };
+    # Declared too, so the daemon restarts nw-wg after (s)'s kill.
+    services.planarian.units.nw-wg = { };
   };
 
   # A second node for netwatch's retry rule: no firewall, no nftables, and
@@ -285,7 +325,7 @@ pkgs.testers.runNixOSTest {
 
     machine.wait_for_unit("planarian-ready.target")
     machine.wait_for_unit("planarian-netwatch.service")
-    for u in ["nw-mover", "nw-route", "nw-quiet", "nw-sockopt", "nw-nft", "nw-hostwg", "nw-tun", "nw-tunsetup", "nw-tunroute", "nw-tunauto"]:
+    for u in ["nw-mover", "nw-wg", "nw-route", "nw-quiet", "nw-sockopt", "nw-nft", "nw-hostwg", "nw-tun", "nw-tunsetup", "nw-tunroute", "nw-tunauto"]:
         machine.wait_for_unit(f"{u}.service")
 
     with subtest("(a) the watch is attached, with a fresh CLOCK_BOOTTIME stamp"):
@@ -614,6 +654,143 @@ pkgs.testers.runNixOSTest {
         lines = protecting("nw-tunauto", "yes")
         assert f"iface {name}" in lines, (name, lines)
         machine.fail(f"grep -rq 'tun%d' {FP}")
+
+    with subtest("(s) a WireGuard tunnel's peers: endpoints in its footprint, a changed peer follows, the hold passes them once the device is gone"):
+        # §12d: "Its own interfaces and peer endpoints, read from its
+        # footprint, are what the hold passes"; the hold passes "traffic to
+        # the endpoints" so the tunnel can re-handshake and its restart can
+        # lift the hold. B-22 (b): peers are set over generic netlink.
+        def show():
+            print(machine.execute(f"for f in {FP}/nw-wg {FP}/.unattributed; do echo \"== $f\"; cat \"$f\" 2>&1; done; wg show nwwg0 endpoints; nft list table inet planarian-hold")[1])
+        def check(fn):
+            try:
+                fn()
+            except Exception:
+                show()
+                raise
+        def has(line, timeout=60):
+            check(lambda: machine.wait_until_succeeds(f"grep -qx '{line}' {FP}/nw-wg", timeout=timeout))
+        def standing(addr):
+            # netwatch's own record of what stands now (`.state`, its claims):
+            # whether any endpoint there names addr.
+            return machine.execute(
+                f"jq -e --arg a '{addr}' '[.endpoints[] | tostring | select(contains($a))] | length > 0' {FP}/.state")[0] == 0
+
+        # (1) Its footprint carries both peers, each as the hold reads it.
+        check(lambda: protecting("nw-wg", "yes"))
+        has("iface nwwg0")
+        has("endpoint udp 192.0.2.7 51820")
+        has("endpoint udp 2001:db8::7 51821")
+        machine.fail(f"test -e {FP}/.unattributed")
+
+        # Reading the peers must settle: the probes also see netwatch's own
+        # GETFAMILY/GET_DEVICE requests. Before the reader filter each dump
+        # scheduled another dump and rewrote the heartbeat about 100 times/s.
+        # Sample in one process, so the sampler creates no repeated cgroups.
+        import json, shlex
+        pid = int(machine.succeed("systemctl show -P MainPID planarian-netwatch.service").strip())
+        sampler = "\n".join([
+            "import json, os, pathlib, time",
+            f"pid = {pid}",
+            "def cpu():",
+            "    fields = pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()",
+            "    return int(fields[11]) + int(fields[12])",
+            "before = cpu()",
+            "stamps = set()",
+            "for _ in range(25):",
+            "    stamps.add(pathlib.Path('/run/planarian/footprint/.watch').stat().st_mtime_ns)",
+            "    time.sleep(0.1)",
+            "print(json.dumps({'writes': len(stamps), 'cpu': (cpu() - before) / os.sysconf('SC_CLK_TCK')}))",
+        ])
+        idle = json.loads(machine.succeed("${pkgs.python3}/bin/python3 -c " + shlex.quote(sampler)))
+        assert idle["writes"] <= 6, ("the reader triggered itself", idle)
+        assert idle["cpu"] < 0.5, ("the settled reader did not idle", idle)
+
+        # (1b) Other netns are not the host's ((n)): a device of the same
+        # name configured in another netns, by the driver (itself a network
+        # tool), binds the driver to nothing of the host's. It takes none of
+        # the host tunnel's peers, and nothing is unattributed.
+        machine.succeed("${ip} netns add nwg && ${ip} -n nwg link add nwwg0 type wireguard")
+        machine.succeed("k=$(wg genkey | wg pubkey) && ${ip} netns exec nwg wg set nwwg0 peer $k endpoint 192.0.2.99:51830 allowed-ips 10.80.0.2/32")
+        machine.sleep(12)
+        def foreign_binds_nothing():
+            lines = footprint("backdoor")
+            assert not any(l.startswith("endpoint ") or l == "unattributed" for l in lines), lines
+            machine.fail(f"test -e {FP}/.unattributed")
+        check(foreign_binds_nothing)
+        machine.succeed("${ip} netns del nwg")
+
+        # Enough peers for a real multipart dump. Linux repeats the device
+        # identity only in the first message; later messages contain peers
+        # alone. The old synthetic replies repeated the identity and missed
+        # this kernel shape. Keep the two original peers for the checks below.
+        machine.succeed("""set -e
+          : > /run/nw-wg/many-peers
+          for i in $(seq 1 128); do
+            key=$(wg genkey | wg pubkey)
+            printf '[Peer]\\nPublicKey = %s\\nEndpoint = 198.51.100.%s:52000\\nAllowedIPs = 10.91.0.%s/32\\n' "$key" "$i" "$i" >> /run/nw-wg/many-peers
+          done
+          wg addconf nwwg0 /run/nw-wg/many-peers
+        """)
+        assert len(machine.succeed("wg show nwwg0 peers").splitlines()) == 130
+        has("endpoint udp 198.51.100.128 52000")
+        machine.fail(f"test -e {FP}/.unattributed")
+
+        # (1c) Renaming keeps the configuring unit's saved binding and
+        # endpoints, not just its route-derived iface line. Change a peer
+        # under the new name so a latched old footprint cannot hide a lost
+        # binding. Restore the name for the service's reload/restart below.
+        def renamed_binding(name):
+            state = json.loads(machine.succeed(f"cat {FP}/.state"))
+            bound = [d for u, d in state["wireguard"] if u == "service:nw-wg"]
+            assert bound == [name], bound
+            peers = [e for u, e in state["endpoints"] if u == "service:nw-wg"]
+            assert any(e["addr"] == "192.0.2.7" and e["port"] == 51922 for e in peers), peers
+            assert any(e["addr"] == "2001:db8::7" and e["port"] == 51821 for e in peers), peers
+            machine.fail(f"test -e {FP}/.unattributed")
+        machine.succeed("${ip} link set nwwg0 down && ${ip} link set nwwg0 name nwwg1 && ${ip} link set nwwg1 up")
+        machine.succeed("wg set nwwg1 peer $(cat /run/nw-wg/p1) endpoint 192.0.2.7:51922")
+        check(lambda: settled(lambda: renamed_binding("nwwg1")))
+        has("iface nwwg1")
+        has("endpoint udp 192.0.2.7 51922")
+        machine.succeed("${ip} link set nwwg1 down && ${ip} link set nwwg1 name nwwg0 && ${ip} link set nwwg0 up")
+        check(lambda: settled(lambda: renamed_binding("nwwg0")))
+        has("iface nwwg0")
+
+        # (2) The tunnel moves its first peer (`wg set`, from its own
+        # cgroup): the footprint follows, and what stands is the new one.
+        machine.succeed("systemctl reload nw-wg.service")
+        machine.succeed("wg show nwwg0 endpoints | grep -q '192.0.2.8:51822'")
+        has("endpoint udp 192.0.2.8 51822")
+        has("endpoint udp 2001:db8::7 51821")
+        check(lambda: machine.wait_until_succeeds(
+            f"jq -e '[.endpoints[] | tostring | select(contains(\"192.0.2.8\"))] | length > 0' {FP}/.state", timeout=30))
+        assert not standing("192.0.2.7"), "the moved peer's old endpoint still stands"
+
+        # (3) The device goes (deleted outside it): nothing of it stands, so
+        # no endpoint stands; the invocation's latch keeps them, and when the
+        # tunnel then fails, the hold passes its peers (and its interface),
+        # so a restart can reach them.
+        machine.succeed("${ip} link del nwwg0")
+        check(lambda: machine.wait_until_succeeds(
+            f"! jq -e '[.endpoints[] | tostring | select(contains(\"192.0.2.8\") or contains(\"2001:db8::7\"))] | length > 0' {FP}/.state", timeout=30))
+        has("endpoint udp 192.0.2.8 51822")
+        has("endpoint udp 2001:db8::7 51821")
+        machine.succeed("echo 30 > /run/nw-wg-slow")
+        machine.succeed("systemctl kill --signal=SIGKILL nw-wg.service")
+        check(lambda: machine.wait_until_succeeds("systemctl is-active planarian-hold@nw-wg.service", timeout=30))
+        machine.succeed("test -e /run/planarian/hold/nw-wg")
+        table = machine.succeed("nft list table inet planarian-hold")
+        for want in ["udp . 192.0.2.8 . 51822", "udp . 2001:db8::7 . 51821", '"nwwg0"']:
+            assert want in table, (want, table)
+
+        # Back (the daemon restarts it): the hold lifts, and the new
+        # invocation's footprint is its own peers, not the last one's.
+        machine.succeed("rm -f /run/nw-wg-slow")
+        check(lambda: machine.wait_until_succeeds("systemctl is-active nw-wg.service", timeout=120))
+        check(lambda: machine.wait_until_fails("test -e /run/planarian/hold/nw-wg", timeout=120))
+        has("endpoint udp 192.0.2.7 51820")
+        check(lambda: machine.wait_until_succeeds(f"! grep -q '192.0.2.8' {FP}/nw-wg", timeout=30))
 
     with subtest("(f) a stopped watch goes stale, and a failing tool that was not protecting is held"):
         # Stopped, not killed: a killed watcher may be restarted at once, and

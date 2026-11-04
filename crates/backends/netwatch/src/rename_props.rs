@@ -38,6 +38,7 @@ fn fixture(identity: &str, shape: &Shape) -> Tracker {
             s.objects.insert((ChangeKind::Route, format!("route-{n}")), (Some(identity.into()), true));
         }
         s.endpoints.insert(endpoint);
+        s.wireguard.extend([identity.into(), "otherwg0".into()]);
         s.unattributed = n % 2 == 0;
         t.units.insert(u.clone(), s);
         t.invocations.insert(u.clone(), Invocation { id: Some(format!("{:032x}", n + 1)), ended });
@@ -95,6 +96,35 @@ proptest! {
     }
 
     #[test]
+    fn a_renamed_wireguard_binding_follows_live_peers_and_survives_reattach(
+        was in "nw[a-z]{1,6}", now in "nw[a-z]{1,6}",
+        port in 1u16..=u16::MAX,
+        shape in prop::collection::vec((any::<bool>(), any::<bool>(), any::<bool>(), any::<bool>()), 1..5),
+    ) {
+        prop_assume!(was != now);
+        let endpoint = Endpoint { proto: Proto::Udp, addr: "198.51.100.9".parse().unwrap(), port };
+        let devices = [crate::wg::Device { name: now.clone(), ifindex: 7, endpoints: vec![endpoint] }];
+        let mut t = fixture(&was, &shape);
+        apply(&mut t, &event(HOST, &was, &now));
+        t.set_wireguard(&devices);
+        let mut want = fixture(&now, &shape);
+        want.set_wireguard(&devices);
+        // The independently constructed final identity includes current
+        // peers, unrelated bindings and both invocation histories.
+        prop_assert_eq!(state(&t), state(&want));
+        for s in t.units.values() {
+            prop_assert_eq!(&s.endpoints, &BTreeSet::from([endpoint]));
+            prop_assert!(s.wireguard.contains(&now));
+            prop_assert!(!s.wireguard.contains(&was));
+        }
+        let claims = t.claims();
+        let mut restored = Tracker::attach(&claims, &[], &BTreeSet::new());
+        restored.set_wireguard(&devices);
+        prop_assert_eq!(restored.claims().wireguard, claims.wireguard);
+        prop_assert_eq!(restored.claims().endpoints, claims.endpoints);
+    }
+
+    #[test]
     fn a_rename_without_both_names_preserves_claims_and_fails_closed(
         name in "nw[a-z]{1,6}", missing_old in any::<bool>(), unknown_netns in any::<bool>(),
     ) {
@@ -125,6 +155,11 @@ fn the_unfixed_rename_and_partial_renames_are_caught() {
     let mut mutants = vec![];
     let mut m = t.clone();
     m.units = before.units.clone();
+    mutants.push(m);
+    let mut m = t.clone();
+    for (u, s) in &mut m.units {
+        s.wireguard = before.units[u].wireguard.clone();
+    }
     mutants.push(m);
     let mut m = t.clone();
     m.unattributed = before.unattributed.clone();
