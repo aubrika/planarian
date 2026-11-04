@@ -131,6 +131,8 @@ carries a property test for the invariant it changes.
 | B17 | en-i6's judge checked `Activating` only | `faf936d` (#13) | gym::check | `repair_prepared_in_each_exclusive_state` | unit | recorded: "against the old judge the test fails" | covered |
 | B18 | An unprivileged unit could gain CAP_NET_ADMIN or CAP_NET_RAW through a setuid or file-capability binary, but was not classified as a network tool and had no failure hold. The first classifier also omitted systemd's tab/newline-separated, case-insensitive and numeric spellings | #68 | `nix/module.nix::isNetworkToolUnchecked`, `nix/capabilities.nix` | module-eval's Decision B and capability-syntax fixtures; generated alias/inversion property (`nix/tests/capabilities.nix`) over ordinary and inverted sets, names/case/ids, strings/lists and four whitespace separators; unknown syntax fails closed | property (finite) + eval | recorded on #68: removing the gainable rule fails its module-eval fixture. Native systemd `capability_set_from_string` confirms `CAP_CHOWN` + tab + `CAP_NET_RAW`, `cap_net_raw` and `13` grant bit 13 while the old predicate omits it. The module-eval property asserts the fixed parser passes and the exact old predicate is rejected on every run | pending |
 
+| B19 | The package exported journal-kinds.json, but NixOS's system-path omitted /share/planarian, so every current target appeared to be a legacy format-2 reader and otherwise admissible generation changes parked for Administrator approval | #69 live VM follow-up | nix/module.nix::environment.pathsToLink; backends-linux::nixos::read_journal_kinds | `every prebuilt candidate exports its installed journal reader` in gym-vm.nix and vm-generations.nix; gym-smoke malicious-decl-catalog-enable and storage-boot-full-publish | VM + gym-VM | observed on 3dcd2615 job126875977720: payload enable asked for journal format3/targetreads2, never activated and produced no gym-web incident; independent pinned nixpkgs system-path inspection confirms the omitted data directory; fixed exact-head execution pending | pending: real candidate VM execution |
+
 Harness and fixture bugs (the VM harness, catalog typos, test waits) are in
 `docs/ga-status.md`; they are not Planarian's and are left out.
 
@@ -195,8 +197,8 @@ in a debug build).
 
 ## Counts
 
-97 rows, including the fixes in this stack: 22 journal and kernel (J), 16 daemon (D),
-18 change path (C), 18 backends, identity and gym (B), 23 netwatch (N).
+98 rows, including the fixes in this stack: 22 journal and kernel (J), 16 daemon (D),
+18 change path (C), 19 backends, identity and gym (B), 23 netwatch (N).
 Two rows still owe a property test (status **gap**):
 - J4: the daemon restart selector was extracted in #76; its ledger row is reconciled by the closing docs lane.
 - C16: the property is in #53, held for the owner's decision on whether
