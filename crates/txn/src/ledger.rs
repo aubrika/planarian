@@ -137,6 +137,15 @@ pub enum Record {
         kind: String,
     },
 
+    /// §9: an `Exec` probe is flagged in the journal, once when first seen
+    /// and again if its command changes. Informational (§12c): no decision
+    /// reads it, so applying it changes nothing in the ledger.
+    ExecProbeFlagged {
+        unit: UnitId,
+        probe: String,
+        /// The command's first word only.
+        argv0: String,
+    },
 }
 
 /// Who applied a hold: systemd's `OnFailure=` (seen by the daemon) or the
@@ -986,6 +995,7 @@ impl Ledger {
             Record::HoldApplied { unit, .. } => self.hold_events.push((unit, true)),
             Record::HoldLifted { unit, .. } => self.hold_events.push((unit, false)),
             Record::Skipped { .. } => {},
+            Record::ExecProbeFlagged { .. } => {},
         }
     }
 

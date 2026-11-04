@@ -104,6 +104,7 @@ pub const KINDS: &[&str] = &[
     "Reconciliation",
     "HoldApplied",
     "HoldLifted",
+    "ExecProbeFlagged",
     "Skipped",
 ];
 
@@ -158,6 +159,7 @@ fn kind_and_class(r: &Record) -> (&'static str, Class) {
         Record::Reconciliation(_) => ("Reconciliation", D),
         Record::HoldApplied { .. } => ("HoldApplied", D),
         Record::HoldLifted { .. } => ("HoldLifted", D),
+        Record::ExecProbeFlagged { .. } => ("ExecProbeFlagged", I),
         Record::Skipped { .. } => ("Skipped", I),
     }
 }

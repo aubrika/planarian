@@ -3143,3 +3143,174 @@ fn a_lift_that_alone_hangs_is_retried_quietly_once_a_minute() {
     assert!(!r.fake.w().held.contains(&web), "never lifted: {:?}", r.core.notices);
     assert_eq!(r.core.notices.iter().filter(|n| n.contains("flows again")).count(), 1, "{:?}", r.core.notices);
 }
+
+// ---- §9: "`Exec` probes, which run arbitrary commands, are permitted only
+// in manifest entries authored by a principal with administrator authority;
+// they are flagged in the console and the journal" (reviewer's case; P11's
+// scope row in docs/review-reconciliation.md: read from `ProbeKind::Exec`,
+// not from the export's `flagged` key). The gym's manifest has two Exec
+// probes, NetworkManager's `wifi-associated` and snd-hda0's
+// `snd-hda0-driven`, and typed ones (gym-web's `gym-web-http`, `-tcp`).
+
+const EXEC_PROBES: [(&str, &str); 2] =
+    [("service:NetworkManager", "wifi-associated"), ("device:snd-hda0", "snd-hda0-driven")];
+const TYPED_PROBE: (&str, &str) = ("service:gym-web", "gym-web-http");
+
+/// The part of a unit row's detail about `probe` (`<probe>: …`, `; `-separated).
+fn probe_part<'a>(detail: &'a str, probe: &str) -> Option<&'a str> {
+    detail.split("; ").find(|p| p.starts_with(&format!("{probe}:")) || p.starts_with(&format!("{probe} ")))
+}
+
+fn mentions_exec(s: &str) -> bool {
+    s.to_ascii_lowercase().contains("exec")
+}
+
+/// The journal (§12c's, Planarian's own; coordinator, Nov 3: not journald):
+/// a record names each Exec probe as one, and none names a typed probe as
+/// one. Read as each record renders, so any record kind will do; flagged,
+/// not re-journaled on every tick.
+#[test]
+fn an_exec_probe_is_flagged_in_the_journal() {
+    const TICKS: usize = 5;
+    let mut r = Rig::new();
+    r.ticks(TICKS);
+    let records: Vec<String> =
+        r.core.ex.kernel.journal.segment().unwrap().iter().map(|e| crate::render::record(&e.record)).collect();
+    for (_, probe) in EXEC_PROBES {
+        let n = records.iter().filter(|t| t.contains(probe) && mentions_exec(t)).count();
+        assert!(n >= 1, "no journal record flags the Exec probe {probe}: {records:#?}");
+        assert!(n < TICKS, "the Exec probe {probe} is journaled on every tick ({n} records)");
+    }
+    assert!(
+        !records.iter().any(|t| t.contains(TYPED_PROBE.1) && mentions_exec(t)),
+        "a typed probe is flagged as Exec in the journal: {records:#?}"
+    );
+}
+
+/// The console and the CLI: both render the status report's unit rows (the
+/// console embeds the same `StatusReport`); each Exec probe's part of its
+/// unit's row says it is one, and a typed probe's does not.
+#[test]
+fn an_exec_probe_is_flagged_in_the_console_and_status() {
+    let mut r = Rig::new();
+    r.ticks(3);
+    let Response::Console(c) = r.core.handle(ADMIN, Request::Console) else { panic!("console") };
+    let Response::Status(st) = r.core.handle(ADMIN, Request::Status) else { panic!("status") };
+    for (rows, what) in [(&c.status.units, "console"), (&st.units, "status")] {
+        let detail = |u: &str| {
+            rows.iter().find(|row| row.unit.to_string() == u).map(|row| row.detail.clone()).unwrap_or_default()
+        };
+        for (unit, probe) in EXEC_PROBES {
+            let d = detail(unit);
+            let part = probe_part(&d, probe);
+            assert!(
+                part.is_some_and(mentions_exec),
+                "{what}: {unit}'s row does not flag its Exec probe {probe}: {d:?}"
+            );
+        }
+        let d = detail(TYPED_PROBE.0);
+        assert!(
+            !probe_part(&d, TYPED_PROBE.1).is_some_and(mentions_exec),
+            "{what}: the typed probe {} is flagged as Exec: {d:?}",
+            TYPED_PROBE.1
+        );
+    }
+}
+
+/// Injects a full journal, an I/O failure before the write, or a failed sync
+/// after the frame is written. The last case has an uncertain append outcome.
+#[derive(Clone)]
+struct ExecFlagStore {
+    inner: MemStore,
+    failure: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl Store for ExecFlagStore {
+    type Guard = <MemStore as Store>::Guard;
+    fn lock(&self) -> std::io::Result<Self::Guard> {
+        self.inner.lock()
+    }
+    fn capacity(&self) -> u64 {
+        if self.failure.load(std::sync::atomic::Ordering::SeqCst) == 1 { 0 } else { self.inner.capacity() }
+    }
+    fn read_at(&self, off: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        self.inner.read_at(off, len)
+    }
+    fn write_at(&self, off: u64, bytes: &[u8]) -> std::io::Result<()> {
+        if self.failure.load(std::sync::atomic::Ordering::SeqCst) == 2 {
+            return Err(std::io::Error::other("scripted write failure"));
+        }
+        self.inner.write_at(off, bytes)
+    }
+    fn sync(&self) -> std::io::Result<()> {
+        if self.failure.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+            return Err(std::io::Error::other("scripted sync failure after write"));
+        }
+        self.inner.sync()
+    }
+    fn read_checkpoint(&self) -> std::io::Result<Option<Vec<u8>>> {
+        self.inner.read_checkpoint()
+    }
+    fn write_checkpoint(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.inner.write_checkpoint(bytes)
+    }
+    fn read_sentinel(&self) -> std::io::Result<Option<Vec<u8>>> {
+        self.inner.read_sentinel()
+    }
+    fn write_sentinel(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.inner.write_sentinel(bytes)
+    }
+    fn fence(&self, txn: TxnId) -> std::io::Result<Option<u64>> {
+        self.inner.fence(txn)
+    }
+    fn set_fence(&self, txn: TxnId, epoch: u64) -> std::io::Result<()> {
+        self.inner.set_fence(txn, epoch)
+    }
+    fn create_fence(&self, txn: TxnId, epoch: u64) -> std::io::Result<()> {
+        self.inner.create_fence(txn, epoch)
+    }
+    fn forget_fences<F: Fn(TxnId) -> bool>(&self, keep: F) -> std::io::Result<Vec<TxnId>> {
+        self.inner.forget_fences(keep)
+    }
+}
+
+#[test]
+fn an_exec_flag_is_retried_after_journal_failure_without_repeating_a_written_frame() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for failure in 1..=3 {
+        let inner = MemStore::new(64 << 10);
+        let store = ExecFlagStore { inner: inner.clone(), failure: Default::default() };
+        let fake = gym_world(inner);
+        fake.w().alive.insert(100);
+        let mut journal = Journal::open(store.clone()).unwrap();
+        journal.append(fake.w().now, Record::KnownGood(GenerationId(1))).unwrap();
+        let mut core = Core::start(journal, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config());
+        let (_, defs) = core.observe();
+        store.failure.store(failure, SeqCst);
+        core.flag_exec_probes(&defs);
+        assert!(core.exec_flagged.is_empty(), "failure {failure}: claimed the flags were journaled");
+        assert!(!core.notices.iter().any(|n| n.contains("is an Exec probe")));
+        assert!(core.notices.iter().any(|n| n.contains("journal write failed")));
+        store.failure.store(0, SeqCst);
+        for _ in 0..3 {
+            core.flag_exec_probes(&defs);
+        }
+        let mut reopened = Journal::open(store).unwrap();
+        let entries = reopened.segment().unwrap();
+        for (_, probe) in EXEC_PROBES {
+            let flags = entries
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.record, Record::ExecProbeFlagged { probe: seen, .. } if seen == probe
+                    )
+                })
+                .count();
+            assert_eq!(flags, 1, "failure {failure}: {probe} was lost or repeated");
+            let notices = core.notices.iter().filter(|n| n.contains(probe) && n.contains("is an Exec probe")).count();
+            assert_eq!(notices, 1, "failure {failure}: {probe}'s notice was lost or repeated");
+        }
+        assert_eq!(core.exec_flagged.len(), EXEC_PROBES.len());
+        assert!(core.exec_flag_pending.is_empty());
+    }
+}
