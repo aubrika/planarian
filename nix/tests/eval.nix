@@ -56,6 +56,34 @@ let
         services.planarian.units."not-tpl@a" = { };
         # A foreign unit named like Planarian's: classified like any other.
         systemd.services.planarian-test-vpn = { script = "true"; serviceConfig = { DynamicUser = true; AmbientCapabilities = [ "CAP_NET_ADMIN" ]; }; };
+        # Decision B: gainable capabilities. Bounding set allows them and
+        # NoNewPrivileges is unset: could gain them through setuid or file caps.
+        systemd.services.nt-gainable = { script = "true"; serviceConfig = { DynamicUser = true; }; };
+        systemd.services.nt-gainable-bounded = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = [ "CAP_CHOWN" "CAP_NET_RAW" ]; }; };
+        systemd.services.nt-gainable-nnp-off = { script = "true"; serviceConfig = { DynamicUser = true; NoNewPrivileges = false; }; };
+        systemd.services.not-nnp = { script = "true"; serviceConfig = { DynamicUser = true; NoNewPrivileges = true; }; };
+        systemd.services.not-nnp-yes = { script = "true"; serviceConfig = { User = "nobody"; NoNewPrivileges = "yes"; }; };
+        systemd.services.not-nnp-bounded-other = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = [ "CAP_CHOWN" ]; }; };
+        # Capability syntax is systemd's, not a space-separated enum: tabs,
+        # newlines, case-insensitive names and decimal ids have equal force.
+        # NNP is true on the ambient fixtures to isolate held capabilities.
+        systemd.services.nt-ambient-tab = { script = "true"; serviceConfig = { User = "nobody"; NoNewPrivileges = true; AmbientCapabilities = "CAP_CHOWN\tCAP_NET_RAW"; }; };
+        systemd.services.nt-ambient-case = { script = "true"; serviceConfig = { User = "nobody"; NoNewPrivileges = true; AmbientCapabilities = "cAp_NeT_rAw"; }; };
+        systemd.services.nt-ambient-number = { script = "true"; serviceConfig = { User = "nobody"; NoNewPrivileges = true; AmbientCapabilities = "13"; }; };
+        systemd.services.nt-gainable-newline = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = "CAP_CHOWN\nCAP_NET_RAW"; }; };
+        systemd.services.nt-gainable-case = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = "cap_net_admin"; }; };
+        systemd.services.nt-gainable-number = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = "13"; }; };
+        systemd.services.nt-root-number = { script = "true"; serviceConfig = { NoNewPrivileges = true; CapabilityBoundingSet = "12"; }; };
+        systemd.services.not-inverted-tab = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = "~CAP_NET_ADMIN\tCAP_NET_RAW"; }; };
+        systemd.services.not-inverted-case = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = "~cap_net_admin CaP_nEt_RaW"; }; };
+        systemd.services.not-inverted-number = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = "~12 13"; }; };
+        systemd.services.not-bounded-case = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = "cap_chown"; }; };
+        systemd.services.not-bounded-number = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = "0"; }; };
+        # Ambiguous/new spellings must not waive a hold. Inverted list
+        # assignments are not equivalent to one joined inverted assignment.
+        systemd.services.nt-capability-unknown = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = "CAP_FUTURE_UNKNOWN"; }; };
+        systemd.services.nt-inverted-unknown = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = "~CAP_NET_ADMIN CAP_NET_RAW CAP_FUTURE_UNKNOWN"; }; };
+        systemd.services.nt-inverted-list = { script = "true"; serviceConfig = { User = "nobody"; CapabilityBoundingSet = [ "~CAP_NET_ADMIN" "CAP_NET_RAW" ]; }; };
         systemd.services.not-bounded-empty = { script = "true"; serviceConfig.CapabilityBoundingSet = ""; };
         systemd.services.not-unprivileged = { script = "true"; serviceConfig = { DynamicUser = true; CapabilityBoundingSet = ""; }; };
         systemd.services.not-bounded-other = { script = "true"; serviceConfig.CapabilityBoundingSet = [ "CAP_CHOWN" "CAP_SETUID" ]; };
@@ -202,6 +230,7 @@ let
   expectedHolds = builtins.filter (id: toolOrInstance (pkgs.lib.removePrefix "service:" id)) (map (u: u.id) export.units);
   unitKeysRead = u: builtins.all (k: builtins.elem k unitDefFields) (builtins.attrNames u);
   checks = [
+    (check (import ./capabilities.nix { inherit (pkgs) lib; }) "capability aliases and inverted sets obey the generated property, which rejects the original parser")
     (check (builtins.any isExec probes) "the configuration exports an Exec probe (P11's check is not vacuous)")
     (check (builtins.all (p: !(isExec p) || (p.flagged or null) == true) probes) "every exported Exec probe carries flagged = true (§9, P11)")
     (check (builtins.all (p: isExec p || !(p ? flagged)) probes) "no other exported probe carries flagged (§9, P11)")
@@ -217,6 +246,11 @@ let
     (check (builtins.all (n: builtins.elem n hold.holdUnits) [ "gym-vpn" "nt-ambient" "nt-tun" "nt-inverted" "nt-root-bounded" "wg-quick-wg7" "firewall" ]) "each branch of the network-tool rule classifies (§12d): root with no bounding set, ambient CAP_NET_ADMIN, DeviceAllow /dev/net/tun, an inverted bounding set, a bounding set with CAP_NET_RAW, a netdev from the wg-quick tree, the firewall")
     (check (builtins.elem "planarian-test-vpn" hold.holdUnits) "a foreign unit named planarian-* is classified: Planarian's own units are excluded by the set the module declares, not by name (§12d)")
     (check (builtins.all (n: cfg.systemd.services ? ${n} || (n == "planarian-netwatch" && !(cfg.services.planarian.package.netwatch or false))) ownSet && builtins.all (n: !(builtins.elem n hold.holdUnits)) ownSet && !(sys.options.services.planarian ? ownUnits)) "every unit in the module's own set exists and none is classified; the set is no option, so no configuration can widen it")
+    (check (builtins.all (n: builtins.elem n hold.holdUnits) [ "nt-gainable" "nt-gainable-bounded" "nt-gainable-nnp-off" ]) "a unit whose bounding set allows CAP_NET_ADMIN or CAP_NET_RAW and that may gain privileges is a network tool (decision B): no bounding set, a set naming CAP_NET_RAW, NoNewPrivileges=false")
+    (check (builtins.all (n: !(builtins.elem n hold.holdUnits)) [ "not-nnp" "not-nnp-yes" "not-nnp-bounded-other" ]) "NoNewPrivileges (true or yes), or a bounding set without the network capabilities, keeps an unprivileged unit from counting (decision B)")
+    (check (builtins.all (n: builtins.elem n hold.holdUnits) [ "nt-ambient-tab" "nt-ambient-case" "nt-ambient-number" "nt-gainable-newline" "nt-gainable-case" "nt-gainable-number" "nt-root-number" ]) "systemd capability syntax cannot hide held or gainable network authority: whitespace, case and decimal ids")
+    (check (builtins.all (n: !(builtins.elem n hold.holdUnits)) [ "not-inverted-tab" "not-inverted-case" "not-inverted-number" "not-bounded-case" "not-bounded-number" ]) "known inverted capability sets exclude exactly their normalized ids; non-network names and ids stay non-network")
+    (check (builtins.all (n: builtins.elem n hold.holdUnits) [ "nt-capability-unknown" "nt-inverted-unknown" "nt-inverted-list" ]) "unknown capability syntax and ambiguous inverted assignments fail closed")
     (check (builtins.all (n: !(builtins.elem n hold.holdUnits)) [ "not-bounded-empty" "not-unprivileged" "not-bounded-other" "planariad" "planarian-recovery" ]) "a root unit with no network capabilities in its bounding set, an unprivileged one, and Planarian's own units are not network tools (§12d)")
     (check (builtins.elem "nt-vpn@" hold.holdUnits && hold.holdDropins."nt-vpn@.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "a templated network tool is classified, and each instance's failure holds as planarian-hold@<instance> (§12d)")
     (check (hold.holdDropins."firewall.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "the firewall is a network tool from its configuration, not its name (§12d)")
@@ -290,7 +324,7 @@ assert builtins.all (x: x) checks;
 pkgs.runCommand "planarian-module-eval.json" {
   export = builtins.toJSON export;
   passAsFile = [ "export" ];
-  nativeBuildInputs = [ pkgs.gnused pkgs.gawk pkgs.diffutils pkgs.jq ];
+  nativeBuildInputs = [ pkgs.gnused pkgs.gawk pkgs.diffutils pkgs.jq pkgs.python3 ];
 } ''
   # The export as planariad reads it (§12d; review of #38): parsed with its
   # own `nixos::Export` (`planariad --check-export`), the units it reads as
@@ -415,6 +449,9 @@ pkgs.runCommand "planarian-module-eval.json" {
   grep -q 'iif lo accept' $stub/load.2 && grep -q 'policy drop' $stub/load.2 && ! grep -q 'set allow4' $stub/load.2 \
     || { echo "reapply did not fall back to the lock" >&2; exit 1; }
   echo "ok: reapply with a failing table load holds everything but loopback"
+  # The real script, with nft stubbed: a last lift racing another unit's
+  # OnFailure= apply must leave the new hold's table in place (D16).
+  python ${./hold-concurrency.py} ${builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart)} ${pkgs.util-linux}/bin/flock
   # §12d (owner decision, Nov 2): the boot transaction systemd builds from
   # the unit files, upstream ones included, has netwatch in it and no
   # ordering cycle; and the check finds one when netwatch is ordered after
@@ -466,3 +503,4 @@ pkgs.runCommand "planarian-module-eval.json" {
   echo "ok: the network tools the systemd initrd runs ($(wc -l < want-initrd)) are exactly networkToolsInitrd"
   cp $exportPath $out
 ''
+

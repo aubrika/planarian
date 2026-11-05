@@ -3,10 +3,10 @@
 # have KVM once /dev/kvm is opened to the runner user.
 #
 # A push to main runs the VM checks, the GA demonstration and the gym smoke
-# entries; a pull request runs the gym smoke entries only. A newer push
+# entries; a pull request runs the VM checks and gym smoke entries. A newer push
 # cancels either. The whole catalog is one job per VM entry (94
-# at v4.6, several hundred runner minutes), so it runs only by hand (Actions →
-# VM tests → Run workflow → catalog).
+# at v4.6, several hundred runner minutes), so it runs by hand (Actions →
+# VM tests → Run workflow → catalog) or with the full-catalog PR label.
 name: VM tests
 
 on:
@@ -14,6 +14,7 @@ on:
     branches: [main]
     paths-ignore: ["docs/**", "**.md"]
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
     paths-ignore: ["docs/**"]
   workflow_dispatch:
     inputs:
@@ -67,8 +68,8 @@ jobs:
           path: /tmp/nix-ci-cache
           key: nix-ci-${{ github.run_id }}
 
+  # Module wiring and kernel attribution are merge gates on pull requests too.
   vm:
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -199,8 +200,10 @@ jobs:
       - run: nix build -L .#firecracker-target -o fc
       - run: fc/bin/run-firecracker-target
 
+  # A maintainer can request the same full catalog gate on a PR without
+  # publishing its branch: apply the `full-catalog` label. Dispatch stays available.
   catalog-ids:
-    if: inputs.catalog
+    if: inputs.catalog || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-catalog'))
     runs-on: ubuntu-24.04
     outputs:
       ids: ${{ steps.ids.outputs.ids }}

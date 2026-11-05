@@ -76,6 +76,7 @@ carries a property test for the invariant it changes.
 | D13 | P23: the first residue kill taught nothing | `8a0e523` (#2) | daemon::Core (residue) | `residue-first-kill-teaches-stop`; Kani residue harnesses | gym-fake + Kani | recorded: "fails with the lesson removed" | covered |
 | D14 | Network hold (#36/#40): a flushed hold table failed open; a restart lifted the hold; a failed re-apply was never retried; an uncheckable table re-applied every tick; mapped IPv4 flows were cut; the scope walk was unbounded | #36, #40 (`80edb77`, `6f68d55`, `d147ec6`, `bc38cc8`, `3f8cb25`, `504a43a`) | daemon::hold, backends-linux::hold, `planarian-hold@` | `a_flushed_hold_table_is_put_back`, `a_failed_reapply_is_retried_with_backoff`, `an_uncheckable_hold_table_alarms_once_and_is_checked_again`, `reapply_reloads_an_active_hold_and_starts_an_inactive_one`; vm-netsec; module-eval | proptest + unit + VM + eval | `holds_are_the_last_event_per_unit` (journal_props.rs) for the fold across compactions and reopens (1 MiB stores; 64 MiB in `at_the_default_journal_size`, ignored); the rest recorded per commit | covered |
 | D15 | A lift the host did not answer (a stuck `systemctl stop`) was journaled `HoldLifted`, then next tick looked like a hold set unseen by `OnFailure=`: a second `HoldApplied`, a second lift and a second notice, every tick; also a hold timeout stayed silenced across episodes, and a skipped table check stepped the re-apply backoff | lane-daemon/lift-unconfirmed (this PR; reviewer's optionals 47aed77, 4418da9) | daemon::Core::lift_back/lift_host (`lift_unconfirmed`), hold_table | `a_stuck_lift_is_journaled_and_noticed_once`, `a_later_episodes_hold_timeout_alarms_again`, `a_flush_while_a_lift_is_pending_does_not_hold_again` (reviewer's), `a_lift_that_alone_hangs_is_retried_quietly_once_a_minute` (fake `lift_hangs`) and prop-auditor's `hold_episode_props` property (core/tests.rs; fake `hold_hangs`, cleared part-way) | unit | verified: with core.rs from main, the stuck-lift test fails (repeated hold events) and the two-episode test sees one timeout alarm, not two; with the retry gate or the once-only notice removed, the lift-only-hangs case fails (30 attempts in 5 minutes; 5 notices); the skipped-check backoff has no test of its own | covered |
+| D16 | The last old hold's lift could see no markers, then delete the table a concurrent OnFailure= apply had installed for another failed unit, leaving that unit marked held with traffic unfiltered | #68 | `nix/posture.nix::planarian-hold` (`apply`, `lift`, `reapply`) | `nix/tests/hold-concurrency.py`, run against the built script by module-eval; deterministic table-delete barrier with a competing apply | eval + unit | verified: remove the shared-lock block and the same test fails with `a concurrent lift deleted B's hold table`; with it, the competing apply waits before changing its marker and its final table has policy drop | pending |
 
 ## Change path: derive, policy, exec (`crates/exec`, `crates/policy`)
 
@@ -120,6 +121,7 @@ carries a property test for the invariant it changes.
 | B15 | Approval at a terminal had no effect on the VM harness (`script` wrapper) | `b219d81` | gym::live::request_at | `approve-at-terminal-runs` (fake + VM) | gym-VM | recorded: four entries "left their AskFirst change Prepared" | covered |
 | B16 | The `TokenUsed` record was on the boot clock, so the judge missed the approver on the VM | `641a479` (#2) | exec (TokenUsed) | `the_approval_record_is_on_the_wall_clock` | unit | recorded: "fails with the boot clock" | covered |
 | B17 | en-i6's judge checked `Activating` only | `faf936d` (#13) | gym::check | `repair_prepared_in_each_exclusive_state` | unit | recorded: "against the old judge the test fails" | covered |
+| B18 | An unprivileged unit could gain CAP_NET_ADMIN or CAP_NET_RAW through a setuid or file-capability binary, but was not classified as a network tool and had no failure hold. The first classifier also omitted systemd's tab/newline-separated, case-insensitive and numeric spellings | #68 | `nix/module.nix::isNetworkToolUnchecked`, `nix/capabilities.nix` | module-eval's Decision B and capability-syntax fixtures; generated alias/inversion property (`nix/tests/capabilities.nix`) over ordinary and inverted sets, names/case/ids, strings/lists and four whitespace separators; unknown syntax fails closed | property (finite) + eval | recorded on #68: removing the gainable rule fails its module-eval fixture. Native systemd `capability_set_from_string` confirms `CAP_CHOWN` + tab + `CAP_NET_RAW`, `cap_net_raw` and `13` grant bit 13 while the old predicate omits it. The module-eval property asserts the fixed parser passes and the exact old predicate is rejected on every run | pending |
 
 Harness and fixture bugs (the VM harness, catalog typos, test waits) are in
 `docs/ga-status.md`; they are not Planarian's and are left out.
@@ -171,10 +173,13 @@ in a debug build).
 | N10 | An ioctl-made tun (classic OpenVPN, wireguard-go) was never seen: no netlink message announces it | #42 (`939819f`) | netwatch::parse (`HOOK_NETDEV`), netwatch-ebpf `register_netdevice` | `a_tun_made_by_ioctl_protects`, `a_physical_nic_is_never_created_by_a_tool` (tests.rs); `vm-netwatch` (o) | unit + VM | recorded: the commit; the N9 property covers what the claim then does | covered |
 | N11 | A tool's work could be read as over before its invocation had ended, or a restarted invocation inherited the old one's footprint; the hold must wait for the invocation's end | #42 (`1058551`, `bb4a81b`, `4fa57b6`) | netwatch::Tracker::set_invocation, cgroups::finish | `invocations_end_only_once_seen_gone`, `the_invocation_property_catches_each_mutant`, `the_property_catches_each_mutant` (tests.rs: hand-rolled properties with mutants in the code, run in the `rust` job with `NETWATCH_REQUIRE_XATTR_TESTS`) | property (hand-rolled) + unit | recorded in the tests (`FinishAll`, `EndAtRemoval`, `no_latch`, `no_carry` each caught) | covered |
 
+
 ## Counts
 
 78 rows for bugs fixed on `main`: 18 journal and kernel (J), 15 daemon (D),
 17 change path (C), 17 backends, identity and gym (B), 11 netwatch (N).
+Two additional rows are pending in #68: D16 (concurrent hold updates) and
+B18 (gainable network capabilities); neither is counted as fixed on `main`.
 Three rows still owe a property test (status **gap**):
 - J4 and J7: each waits on a lane's extraction of a pure function from the
   daemon or the kernel.
@@ -183,3 +188,4 @@ Three rows still owe a property test (status **gap**):
 
 The rest are covered by the strongest cheap test their shape allows; for
 bugs that depend on the kernel or systemd, that is a VM test.
+
