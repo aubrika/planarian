@@ -2110,6 +2110,8 @@ fn a_withdrawn_update_is_prepared_again_after_a_restart() {
         .chain(l.live.values().map(|t| (t.txn.id, t.txn.transition.clone(), t.txn.state.clone())))
         .any(|(id, t, _)| id > waiting && matches!(t, Transition::ApplyChange { .. }));
     assert!(again, "the withdrawn update was not prepared again after the restart; notices: {:?}", r.core.notices);
+    // Accepted, so not declined (NotPreparedAgain is for a refusal only).
+    assert!(r.core.ledger().not_prepared_again().is_empty());
 }
 
 /// §12f, the other half of the reviewer's case: once a withdrawn update has
@@ -3313,4 +3315,125 @@ fn an_exec_flag_is_retried_after_journal_failure_without_repeating_a_written_fra
         assert_eq!(core.exec_flagged.len(), EXEC_PROBES.len());
         assert!(core.exec_flag_pending.is_empty());
     }
+}
+
+/// §12f, Decision A: a restart that decided not to prepare a withdrawn update
+/// again (`NotPreparedAgain`) said so in the journal, and the next restart
+/// does not try it: the same scenario as
+/// `a_withdrawn_update_is_prepared_again_after_a_restart`, with the record.
+#[test]
+fn a_withdrawn_update_that_was_not_prepared_again_stays_so_after_a_restart() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    r.fake.w().activation_restarts.clear();
+    let resp = r.core.handle(ADMIN, Request::Undo);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let now = r.fake.now();
+    r.core
+        .ex
+        .kernel
+        .journal
+        .append(now, Record::NotPreparedAgain { txn: waiting, reason: "Refused: scripted".into() })
+        .unwrap();
+    let log = r.core.log.clone();
+    r.fake.w().alive.remove(&100);
+    r.fake.w().alive.insert(101);
+    let mut core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO },
+        config(),
+    );
+    core.remember(log);
+    r.core = core;
+    r.ticks(3);
+    let l = r.core.ledger();
+    let again = l
+        .terminal
+        .iter()
+        .map(|(id, t)| (*id, t.transition.clone()))
+        .chain(l.live.values().map(|t| (t.txn.id, t.txn.transition.clone())))
+        .any(|(id, t)| id > waiting && matches!(t, Transition::ApplyChange { .. }));
+    assert!(!again, "prepared again despite the record: {:?}", r.core.notices);
+    assert_eq!(l.not_prepared_again(), [waiting].into_iter().collect());
+}
+
+/// §12f, Decision A: a restart whose new proposal is refused (the dry
+/// activation of the withdrawn update fails, R10) journals
+/// `NotPreparedAgain`, and the next restart does not try it again.
+#[test]
+fn a_refused_re_prepare_is_journaled_and_not_retried_by_the_next_restart() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    r.fake.w().activation_restarts.clear();
+    let resp = r.core.handle(ADMIN, Request::Undo);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let restart = |r: &mut Rig, pid: u32| {
+        let log = r.core.log.clone();
+        r.fake.w().alive.remove(&(pid - 1));
+        r.fake.w().alive.insert(pid);
+        let mut core = Core::start(
+            Journal::open(r.fake.store.clone()).unwrap(),
+            r.fake.clone(),
+            OwnerId::Daemon { pid, boot_id: Hash::ZERO },
+            config(),
+        );
+        core.remember(log);
+        r.core = core;
+    };
+    // The next dry activation fails: the new proposal is refused.
+    r.fake.w().dry_activate_fails = Some("scripted".into());
+    restart(&mut r, 101);
+    r.ticks(3);
+    let declined = r.core.ledger().not_prepared_again();
+    assert!(declined.contains(&waiting), "no NotPreparedAgain: {:?}", r.core.notices);
+    // A later restart, with the dry activation healthy again, leaves it be.
+    r.fake.w().dry_activate_fails = None;
+    let before = r.core.ledger().next_txn;
+    restart(&mut r, 102);
+    r.ticks(3);
+    let l = r.core.ledger();
+    let again = l
+        .terminal
+        .iter()
+        .map(|(id, t)| (*id, t.transition.clone()))
+        .chain(l.live.values().map(|t| (t.txn.id, t.txn.transition.clone())))
+        .any(|(id, t)| id.0 >= before && matches!(t, Transition::ApplyChange { .. }));
+    assert!(!again, "tried again: {:?}", r.core.notices);
+}
+
+/// A concurrent owner edit is transient Stale, not a permanent refusal of
+/// the withdrawn transaction. A later restart may prepare it from the new
+/// source, as the ordinary stale-check contract requires.
+#[test]
+fn a_stale_re_prepare_remains_retryable_after_a_restart() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    r.fake.w().activation_restarts.clear();
+    let resp = r.core.handle(ADMIN, Request::Undo);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let restart = |r: &mut Rig, pid: u32| {
+        let log = r.core.log.clone();
+        r.fake.w().alive.remove(&(pid - 1));
+        r.fake.w().alive.insert(pid);
+        let mut core = Core::start(
+            Journal::open(r.fake.store.clone()).unwrap(),
+            r.fake.clone(),
+            OwnerId::Daemon { pid, boot_id: Hash::ZERO },
+            config(),
+        );
+        core.remember(log);
+        r.core = core;
+    };
+    r.fake.w().edit_on_stage = true;
+    restart(&mut r, 101);
+    r.ticks(3);
+    assert!(!r.core.ledger().not_prepared_again().contains(&waiting), "Stale is retryable");
+    assert!(r.core.notices.iter().any(|n| n.contains("prepared again") && n.contains("Stale")), "{:?}", r.core.notices);
+    restart(&mut r, 102);
+    r.ticks(3);
+    let ledger = r.core.ledger();
+    let retried = ledger.terminal.values().any(|t| t.prepared_again_from == Some(waiting))
+        || ledger.live.values().any(|t| t.txn.prepared_again_from == Some(waiting));
+    assert!(retried, "the stale transaction was never retried: {:?}", r.core.notices);
 }

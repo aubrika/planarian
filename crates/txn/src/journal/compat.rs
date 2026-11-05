@@ -119,6 +119,7 @@ pub fn supported() -> JournalRequirements {
     reads.kinds = DECISIVE_KINDS.iter().map(|s| (*s).to_owned()).collect();
     reads.fields.entry("Prepared".into()).or_default().push("facts.journal_incompatibility".into());
     reads.fields.entry("checkpoint".into()).or_default().push("live.*.txn.facts.journal_incompatibility".into());
+    reads.fields.entry("checkpoint".into()).or_default().push("not_prepared_again".into());
     reads
 }
 
@@ -154,6 +155,10 @@ pub(super) fn record_requirements(record: &Record) -> Result<JournalRequirements
         return Ok(required);
     }
     required.kinds.push(kind.to_owned());
+    // This record becomes the checkpoint's declined-ID set at compaction.
+    if matches!(record, Record::NotPreparedAgain { .. }) {
+        required.fields.entry("checkpoint".into()).or_default().push("not_prepared_again".into());
+    }
     let value = serde_json::to_value(record).map_err(|e| JournalError::Corrupt(e.to_string()))?;
     if let Some(payload) = value.get(kind) {
         fields_in(kind, payload, &mut required);
