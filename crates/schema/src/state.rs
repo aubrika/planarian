@@ -83,6 +83,15 @@ pub struct SystemState {
     /// digest: a hold changes what a transition does.
     #[serde(default)]
     pub holds: BTreeSet<UnitId>,
+    /// §12d: the network tools that count as protecting traffic now, from
+    /// the kernel-attributed footprints (`UnitBackend::protecting`; an
+    /// unreadable watch counts every network tool as protecting, fail
+    /// closed). With `UnitDef::holds` (the build-time half, "network tool")
+    /// it decides which units are network-security units. Filled by the
+    /// daemon. Excluded from the digest: it steers the daemon's holds, not
+    /// what a transition does.
+    #[serde(default)]
+    pub protecting: BTreeSet<UnitId>,
     /// The reference time for staleness. Excluded from the digest.
     pub observed_at: Timestamp,
 }
@@ -326,6 +335,7 @@ mod tests {
             resources: Resources::default(),
             core_hash: Hash::ZERO,
             holds: BTreeSet::new(),
+            protecting: BTreeSet::new(),
             observed_at: Timestamp(now),
         }
     }
@@ -423,6 +433,20 @@ mod tests {
         let mut c = a.clone();
         c.generation = GenerationId(3);
         assert_ne!(a.digest(), c.digest());
+    }
+
+    /// §12d: `protecting` steers the daemon's holds, not what a transition
+    /// does, and no approved decision reads it: it is not in the digest
+    /// (`holds`, which the no-ask restart reads, is).
+    #[test]
+    fn digest_ignores_protecting_but_not_holds() {
+        let (id, _) = web();
+        let a = state(100_000);
+        let mut b = a.clone();
+        b.protecting.insert(id.clone());
+        assert_eq!(a.digest(), b.digest());
+        b.holds.insert(id);
+        assert_ne!(a.digest(), b.digest());
     }
 
     /// §18.4, over random states: perturbing resources or any observation

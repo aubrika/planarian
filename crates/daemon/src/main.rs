@@ -334,6 +334,12 @@ fn check_export(text: &str) -> Result<String, String> {
 fn main() {
     // Before anything else (no config, no journal): a pure check.
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--journal-kinds") {
+        // A build-time/read-only export: do not open configuration, the
+        // socket, or the journal, including when a machine is unhealthy.
+        println!("{}", serde_json::to_string(&planarian_txn::journal::supported()).expect("journal kinds serialize"));
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--check-export") {
         let Some(path) = args.get(2) else {
             eprintln!("usage: planariad --check-export <path>");

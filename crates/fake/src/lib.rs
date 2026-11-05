@@ -230,6 +230,10 @@ pub struct World {
     pub agent_instances: BTreeMap<String, InstanceId>,
     /// The next build's dry activation fails this way (R10).
     pub dry_activate_fails: Option<String>,
+    /// Static per-generation journalKinds exports. An explicit None is a
+    /// pre-export build; other generations use this build's descriptor.
+    pub journal_kinds: BTreeMap<String, Option<String>>,
+    pub journal_kinds_fails: Option<String>,
     /// §12d: network-security units whose failure holds traffic, as systemd's
     /// `OnFailure=` on them starts `planarian-hold@<unit>` (nix/posture.nix).
     pub hold_on_failure: BTreeSet<UnitId>,
@@ -238,6 +242,9 @@ pub struct World {
     /// Network tools the host declines to hold: not protecting (the hold
     /// unit's condition skips, as for a tool with no footprint).
     pub hold_declines: BTreeSet<UnitId>,
+    /// The footprint files cannot be read (`UnitBackend::protecting` is an
+    /// `Err`): the daemon counts every network tool as protecting.
+    pub protecting_unreadable: bool,
     /// A hold's start takes this long (a slow or stuck `systemctl start`):
     /// every hold call gives up after its wait, the fake clock advanced by
     /// that much, and the hold lands later, as systemd's job would.
@@ -251,8 +258,14 @@ pub struct World {
     /// Released holds and until when (`None`: the next boot), as the
     /// `/run/planarian/hold-released` marker the hold script honours.
     pub hold_released: BTreeMap<UnitId, Option<Timestamp>>,
+    /// The original boot-clock bound for each timed release marker. It
+    /// survives a daemon restart, just like the marker in /run.
+    pub hold_release_deadlines: BTreeMap<UnitId, Timestamp>,
     /// Fault injection: the next hold or lift fails this way.
     pub hold_fails: Option<String>,
+    /// Fault injection: writing or removing the release marker fails once.
+    pub hold_release_fails: Option<String>,
+    pub hold_release_end_fails: Option<String>,
     /// Fault injection: something flushed the nftables ruleset, so the hold's
     /// table is gone while holds are still in place (`/run` says held).
     pub hold_table_flushed: bool,
@@ -303,6 +316,38 @@ pub struct World {
 }
 
 impl World {
+    /// §12d: the steering route attributed by `steers_traffic` is gone.
+    pub fn stops_steering(&mut self, unit: &UnitId) {
+        use planarian_backend_netwatch::{Change, ChangeKind, Owner};
+        self.netwatch.apply(&Change {
+            owner: Owner::Unit(unit.clone()),
+            kind: ChangeKind::Route,
+            object: "route steer0".into(),
+            iface: Some("steer0".into()),
+            steers: true,
+            removed: true,
+        });
+    }
+
+    /// §12d: the kernel has attributed a default route that steers traffic
+    /// to `unit` (the scripted footprint feed, as the gym's `footprint`
+    /// step does): it is now protecting traffic.
+    pub fn steers_traffic(&mut self, unit: &UnitId) {
+        use planarian_backend_netwatch::{Change, ChangeKind, Owner};
+        for (kind, steers, object) in
+            [(ChangeKind::Interface, false, "steer0"), (ChangeKind::Route, true, "route steer0")]
+        {
+            self.netwatch.apply(&Change {
+                owner: Owner::Unit(unit.clone()),
+                kind,
+                object: object.into(),
+                iface: Some("steer0".into()),
+                steers,
+                removed: false,
+            });
+        }
+    }
+
     /// The fake store's NAR hash of a path.
     pub fn nar_of(path: &StorePath) -> Hash {
         Hash::of(path.0.as_bytes())
@@ -499,15 +544,26 @@ impl World {
     /// §12d, `OnFailure=`: a failed network-security unit's traffic is held,
     /// unless an unexpired release marks it.
     pub fn on_failure_holds(&mut self) {
-        let now = self.now;
         let failed: Vec<UnitId> = self
             .hold_on_failure
             .iter()
             .filter(|u| self.units.get(*u).is_some_and(|s| matches!(s.observed, Observed::Failed(_))))
-            .filter(|u| !self.hold_released.get(*u).is_some_and(|t| t.is_none_or(|t| t > now)))
+            .filter(|u| !self.release_active(u))
             .cloned()
             .collect();
         self.held.extend(failed);
+    }
+
+    fn release_active(&self, unit: &UnitId) -> bool {
+        let wall = self.now.0.saturating_add_signed(self.wall_skew) / 1000;
+        match self.hold_released.get(unit) {
+            Some(None) => true,
+            Some(Some(until)) => {
+                until.0 / 1000 > wall
+                    && self.hold_release_deadlines.get(unit).is_some_and(|t| t.0 / 1000 > self.now.0 / 1000)
+            }
+            None => false,
+        }
     }
 
     /// Advance time-driven behaviour to `now`.
@@ -626,6 +682,10 @@ impl World {
     }
 
     pub fn reboot(&mut self) {
+        // /run is new after boot; daemon restarts keep these markers.
+        self.held.clear();
+        self.hold_released.clear();
+        self.hold_release_deadlines.clear();
         // A one-shot entry boots once; one that fails to boot falls back to
         // the default (the boot loader's own fallback).
         self.booted = match self.one_shot.take() {
@@ -770,6 +830,9 @@ impl UnitBackend for Fake {
     /// §12d: the scripted footprints (`footprint_view`), read as the Linux
     /// side reads the files.
     fn protecting(&self, tools: &[UnitId]) -> Result<BTreeSet<UnitId>, Outcome> {
+        if self.w().protecting_unreadable {
+            return Err(Outcome::Unknown("the footprint files cannot be read (scripted)".into()));
+        }
         let now = self.w().now.0 / 1000;
         Ok(self.footprint_view(tools).protecting(tools, now))
     }
@@ -832,7 +895,7 @@ impl UnitBackend for Fake {
         // A posture response carries no op (docs/bypasses.md): op 0.
         w.calls.push(Call { call: format!("hold({unit})"), op: NO_OP, at: now, fenced: false });
         // The script honours an unexpired release (nix/posture.nix).
-        if !w.hold_released.get(unit).is_some_and(|t| t.is_none_or(|t| t > now)) && !w.hold_declines.contains(unit) {
+        if !w.release_active(unit) && !w.hold_declines.contains(unit) {
             w.held.insert(unit.clone());
         }
         Outcome::Succeeded
@@ -857,12 +920,58 @@ impl UnitBackend for Fake {
     }
 
     fn release_hold(&self, unit: &UnitId, until: Option<Timestamp>, wait: Millis) -> Outcome {
-        self.w().hold_released.insert(unit.clone(), until);
+        {
+            let mut w = self.w();
+            if let Some(why) = w.hold_release_fails.take() {
+                return Outcome::Failed(why);
+            }
+            if let Some(until) = until {
+                let wall = w.now.0.saturating_add_signed(w.wall_skew) / 1000;
+                let boot = w.now.0 / 1000;
+                let same =
+                    w.hold_released.get(unit).is_some_and(|old| old.is_some_and(|old| old.0 / 1000 == until.0 / 1000));
+                let deadline = if same {
+                    let Some(deadline) = w.hold_release_deadlines.get(unit) else {
+                        return Outcome::Failed("the original timed release bound is missing".into());
+                    };
+                    deadline.0 / 1000
+                } else {
+                    boot.saturating_add((until.0 / 1000).saturating_sub(wall))
+                };
+                let active = until.0 / 1000 > wall && deadline > boot;
+                let deadline = if active { deadline } else { deadline.min(boot) };
+                w.hold_release_deadlines.insert(unit.clone(), Timestamp(deadline.saturating_mul(1000)));
+                w.hold_released.insert(unit.clone(), Some(until));
+                if !active {
+                    return Outcome::Failed("the timed hold release has expired".into());
+                }
+            } else {
+                w.hold_released.insert(unit.clone(), None);
+                w.hold_release_deadlines.remove(unit);
+            }
+        }
         self.lift_hold(unit, wait)
     }
 
+    fn timed_release_active(&self, unit: &UnitId, until: Timestamp) -> Result<bool, Outcome> {
+        let mut w = self.w();
+        if w.hold_released.get(unit) != Some(&Some(until)) || !w.hold_release_deadlines.contains_key(unit) {
+            return Ok(false);
+        }
+        let active = w.release_active(unit);
+        if !active {
+            let now = w.now;
+            w.hold_release_deadlines.entry(unit.clone()).and_modify(|deadline| *deadline = (*deadline).min(now));
+        }
+        Ok(active)
+    }
+
     fn end_release(&self, unit: &UnitId) -> Outcome {
+        if let Some(why) = self.w().hold_release_end_fails.take() {
+            return Outcome::Failed(why);
+        }
         self.w().hold_released.remove(unit);
+        self.w().hold_release_deadlines.remove(unit);
         Outcome::Succeeded
     }
 
@@ -908,6 +1017,16 @@ impl UnitBackend for Fake {
 }
 
 impl GenerationBackend for Fake {
+    fn journal_kinds(&self, path: &StorePath) -> Result<Option<String>, Outcome> {
+        let w = self.w();
+        if let Some(why) = &w.journal_kinds_fails {
+            return Err(Outcome::Unknown(why.clone()));
+        }
+        Ok(w.journal_kinds.get(&path.0).cloned().unwrap_or_else(|| {
+            Some(serde_json::to_string(&planarian_txn::journal::supported()).expect("journal kinds serialize"))
+        }))
+    }
+
     fn current(&self) -> Result<GenerationId, Outcome> {
         Ok(self.w().current)
     }

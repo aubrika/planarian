@@ -66,6 +66,9 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     install -Dm644 share/canonical.json $out/share/planarian/canonical.json
+    # §12c: query this build once, never execute a target generation's
+    # possibly older daemon while planning a transition.
+    $out/bin/planariad --journal-kinds > $out/share/planarian/journal-kinds.json
     ln -s planarian $out/bin/ask
   '' + lib.optionalString (netwatchEbpf != null) ''
     # Read at runtime next to the running binary, never from the

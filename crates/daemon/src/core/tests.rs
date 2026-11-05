@@ -9,6 +9,30 @@ use planarian_policy::{Settings, Tables};
 const ADMIN: Peer = Peer::new(0, true);
 const ALICE: Peer = Peer::new(1000, false);
 
+#[test]
+fn a_journal_incompatible_target_is_named_in_the_approval_text_and_json() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let args = [("scale".to_string(), Value::Str("1.25".into()))].into();
+    let result = r.core.handle(ADMIN, Request::Apply { change: ChangeId("font-scale".into()), args });
+    assert!(matches!(result, Response::Done { state: TxnState::Committed, .. }), "{result:?}");
+    let target = r.fake.w().gens[&GenerationId(1)].path.0.clone();
+    r.fake.w().journal_kinds.insert(target, None);
+    let result = r.core.handle(ADMIN, Request::Undo);
+    let Response::NeedsApproval { approve, why, .. } = result else { panic!("{result:?}") };
+    assert!(why.contains("journal") && why.contains("Administrator"), "{why}");
+    let Response::Status(status) = r.core.handle(ADMIN, Request::Status) else { panic!("status") };
+    let pending = status.pending.iter().find(|p| p.approve == approve).unwrap();
+    assert!(!pending.facts.journal_incompatibility.is_empty());
+    let lines = pending.diff.lines().join("\n");
+    let json = serde_json::to_string(pending).unwrap();
+    for requirement in &pending.facts.journal_incompatibility {
+        assert!(why.contains(requirement), "{why}");
+        assert!(lines.contains(requirement), "{lines}");
+        assert!(json.contains(requirement), "{json}");
+    }
+}
+
 fn config() -> CoreConfig {
     CoreConfig {
         exec: Config {
@@ -1435,6 +1459,7 @@ fn rig_with_held_sshd(holds: bool) -> Rig {
             d.holds = holds;
         }
         if holds {
+            w.steers_traffic(&sshd);
             w.hold_on_failure.insert(sshd);
         }
         w.alive.insert(100);
@@ -1574,6 +1599,297 @@ fn hold_release_needs_an_administrator() {
 
     let resp = r.core.handle(ADMIN, Request::HoldRelease { unit: UnitId::service("gym-web"), until: Until::NextBoot });
     assert!(matches!(resp, Response::Error { .. }), "no hold to release: {resp:?}");
+}
+
+fn failed_routine_tool() -> Rig {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().units.get_mut(&web).unwrap().fail_on_start = true;
+    r.fake.w().signal(&web, 11);
+    r.ticks(2);
+    assert!(r.fake.w().held.contains(&web));
+    r
+}
+
+fn release_web(generic: bool, until: Until) -> Request {
+    let unit = UnitId::service("gym-web");
+    if generic {
+        Request::SetOverride { unit: crate::hold::hold_unit(&unit), desired: OverrideDesired::Stopped, until }
+    } else {
+        Request::HoldRelease { unit, until }
+    }
+}
+
+/// D18/D19: authorization and the resulting marker are identical for both
+/// CLI spellings and both paths to commitment. Routine tools still ask an
+/// administrator; approving must perform the backend release, not just stop
+/// the synthetic unit. A later OnFailure= cannot reapply the released hold.
+mod release_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 16, failure_persistence: None, ..ProptestConfig::default() })]
+
+        #[test]
+        fn equivalent_releases_have_the_same_administrator_floor_and_backend_effect(
+            generic in any::<bool>(), approved in any::<bool>(), explicit in any::<bool>(), ticks in 1..8usize,
+        ) {
+            let web = UnitId::service("gym-web");
+            let mut r = failed_routine_tool();
+            let until = if explicit { Until::Explicit } else { Until::NextBoot };
+            let caller = if approved { ALICE } else { ADMIN };
+            let mut resp = r.core.handle(caller, release_web(generic, until));
+            if approved {
+                let Response::NeedsApproval { approve, why, .. } = resp else { panic!("must ask an administrator: {resp:?}") };
+                prop_assert!(why.contains("administrator"), "{why}");
+                prop_assert!(r.fake.w().held.contains(&web));
+                prop_assert!(!r.fake.w().hold_released.contains_key(&web));
+                resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+            }
+            prop_assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+            prop_assert_eq!(r.fake.w().hold_released.get(&web).cloned(), Some(None));
+            prop_assert!(!r.fake.w().held.contains(&web));
+            let hold = crate::hold::hold_unit(&web);
+            prop_assert!(r.core.ledger().overrides.iter().any(|o| o.unit == hold && o.until == Until::NextBoot));
+            r.fake.w().signal(&web, 11);
+            r.ticks(ticks);
+            prop_assert!(!r.fake.w().held.contains(&web), "{:?}", r.core.notices);
+        }
+    }
+}
+
+#[test]
+fn a_timed_release_ends_and_a_changed_deadline_reaches_the_backend() {
+    let web = UnitId::service("gym-web");
+    let mut r = failed_routine_tool();
+    let first = r.fake.now().plus(Millis::secs(300));
+    let resp = r.core.handle(ADMIN, release_web(true, Until::At(first)));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert_eq!(r.fake.w().hold_released.get(&web), Some(&Some(first)));
+    // Each SetOverride waits DEFAULT_SETTLE before committing. Give this
+    // replacement its own live window after that settle, rather than
+    // computing both deadlines before either transaction has run.
+    let second = r.fake.now().plus(Millis(planarian_schema::spec::DEFAULT_SETTLE.0 + 20_000));
+    let resp = r.core.handle(ADMIN, release_web(true, Until::At(second)));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert!(r.fake.now() < second, "the replacement must still be active at commit");
+    assert_eq!(r.fake.w().hold_released.get(&web), Some(&Some(second)));
+    r.ticks(8);
+    assert!(!r.fake.w().hold_released.contains_key(&web), "expired marker remains");
+    assert!(r.fake.w().held.contains(&web), "failed tool must be held again: {:?}", r.core.notices);
+}
+
+#[test]
+fn a_release_expiring_during_settle_never_creates_a_marker_and_reconciles_the_prior_release() {
+    let web = UnitId::service("gym-web");
+    for prior in [false, true] {
+        let mut r = failed_routine_tool();
+        if prior {
+            let resp = r.core.handle(ADMIN, release_web(true, Until::NextBoot));
+            assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+            assert_eq!(r.fake.w().hold_released.get(&web), Some(&None));
+        }
+        let until = r.fake.now().plus(Millis(planarian_schema::spec::DEFAULT_SETTLE.0 / 2));
+        let resp = r.core.handle(ADMIN, release_web(true, Until::At(until)));
+        assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+        assert!(r.fake.now() >= until, "the short release must expire during settle");
+        assert_ne!(r.fake.w().hold_released.get(&web), Some(&Some(until)), "expired release created a marker");
+        r.ticks(1);
+        assert!(!r.fake.w().hold_released.contains_key(&web), "stale prior marker survived reconciliation");
+        assert!(r.fake.w().held.contains(&web), "failed tool was not held: {:?}", r.core.notices);
+    }
+}
+
+#[test]
+fn release_marker_and_lift_failures_are_not_recorded_as_complete_and_are_retried() {
+    let web = UnitId::service("gym-web");
+    // A marker write failure, a lift failure after the marker was written,
+    // and an unanswered lift are three distinct backend outcomes.
+    for fault in 0..3 {
+        let mut r = failed_routine_tool();
+        match fault {
+            0 => r.fake.w().hold_release_fails = Some("marker is read-only".into()),
+            1 => r.fake.w().hold_fails = Some("lift job failed".into()),
+            _ => r.fake.w().lift_hangs = Some(Millis::secs(30)),
+        }
+        let resp = r.core.handle(ADMIN, release_web(false, Until::NextBoot));
+        assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+        assert!(!r.core.hold_released.contains_key(&web), "failure {fault} falsely completed");
+        assert!(r.core.release_unconfirmed.contains_key(&web));
+        assert!(r.fake.w().held.contains(&web));
+        assert!(r.core.ledger().holds().contains(&web), "failed lift journaled as lifted");
+        assert!(r.core.notices.iter().any(|n| n.contains("hold could not be released")));
+        // Include a tool that stopped protecting: pending release work must
+        // survive the gate changing, even when only the journal has its hold.
+        r.fake.w().stops_steering(&web);
+        r.fake.w().lift_hangs = None;
+        r.ticks(18);
+        assert_eq!(r.fake.w().hold_released.get(&web), Some(&None), "fault {fault}");
+        assert!(!r.fake.w().held.contains(&web), "fault {fault}: {:?}", r.core.notices);
+        assert!(!r.core.ledger().holds().contains(&web));
+        assert!(!r.core.release_unconfirmed.contains_key(&web));
+    }
+}
+
+#[test]
+fn an_ended_release_retries_a_failed_marker_cleanup_after_steering_stops() {
+    let web = UnitId::service("gym-web");
+    let mut r = failed_routine_tool();
+    let deadline = r.fake.now().plus(Millis(planarian_schema::spec::DEFAULT_SETTLE.0 + 10_000));
+    let resp = r.core.handle(ADMIN, release_web(true, Until::At(deadline)));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert!(r.fake.now() < deadline, "the release must still be active at commit");
+    assert!(r.core.hold_released.contains_key(&web), "the release never reached its backend");
+    assert_eq!(r.fake.w().hold_released.get(&web), Some(&Some(deadline)));
+    r.fake.w().stops_steering(&web);
+    r.fake.w().hold_release_end_fails = Some("unlink failed".into());
+    r.ticks(3);
+    assert!(r.core.hold_released.contains_key(&web), "failed cleanup forgotten");
+    assert!(r.fake.w().hold_released.contains_key(&web));
+    assert!(r.core.notices.iter().any(|n| n.contains("release marker could not be removed")));
+    r.ticks(18);
+    assert!(!r.core.hold_released.contains_key(&web));
+    assert!(!r.fake.w().hold_released.contains_key(&web), "cleanup was never retried");
+}
+
+#[test]
+fn leaving_a_hold_alone_is_not_a_release() {
+    let web = UnitId::service("gym-web");
+    let mut r = failed_routine_tool();
+    let resp = r.core.handle(
+        ADMIN,
+        Request::SetOverride {
+            unit: crate::hold::hold_unit(&web),
+            until: Until::NextBoot,
+            desired: OverrideDesired::LeaveAlone,
+        },
+    );
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    r.ticks(3);
+    assert!(r.fake.w().held.contains(&web));
+    assert!(!r.fake.w().hold_released.contains_key(&web));
+    assert!(r.core.ledger().holds().contains(&web));
+}
+
+fn restart_release_daemon(r: &mut Rig, pid: u32) {
+    r.fake.w().alive.remove(&100);
+    r.fake.w().alive.remove(&101);
+    r.fake.w().alive.insert(pid);
+    let mut cfg = config();
+    cfg.fresh_boot = false;
+    r.core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid, boot_id: Hash::ZERO },
+        cfg,
+    );
+}
+
+/// D20: the marker's original monotonic bound outlives the daemon, while
+/// wall rollback must never give reconciliation a fresh release lifetime.
+mod timed_release_props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseResult;
+
+    fn check(lifetime: u64, rollback: u64, fault: usize, restart: bool, on_failure: bool) -> TestCaseResult {
+        let web = UnitId::service("gym-web");
+        let mut r = failed_routine_tool();
+        let until = r.fake.now().plus(Millis::secs(lifetime));
+        match fault {
+            1 => r.fake.w().hold_fails = Some("lift failed after writing marker".into()),
+            2 => r.fake.w().lift_hangs = Some(Millis::secs(30)),
+            _ => {}
+        }
+        let resp = r.core.handle(ADMIN, release_web(true, Until::At(until)));
+        prop_assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+        let original = r.fake.w().hold_release_deadlines[&web];
+        r.fake.w().lift_hangs = None;
+        r.fake.w().wall_skew = -(rollback as i64 * 1000);
+        if !on_failure {
+            r.fake.w().hold_on_failure.remove(&web);
+        }
+        // A failed/unknown lift retries while its original bound still
+        // holds. A successful one needs no second lift, but is checked.
+        r.fake.advance(Millis::secs(65));
+        r.ticks(1);
+        prop_assert!(!r.fake.w().held.contains(&web), "retry never lifted: {:?}", r.core.notices);
+        prop_assert_eq!(r.fake.w().hold_release_deadlines[&web], original);
+        if restart {
+            restart_release_daemon(&mut r, 101);
+            r.ticks(1);
+            prop_assert_eq!(r.fake.w().hold_release_deadlines[&web], original);
+        }
+        let left = original.0.saturating_sub(r.fake.w().now.0);
+        r.fake.advance(Millis(left + 5_000));
+        r.ticks(2);
+        prop_assert!(r.fake.now() < until, "the wall override should still appear active");
+        prop_assert!(r.fake.w().held.contains(&web), "release revived after its boot bound: {:?}", r.core.notices);
+        prop_assert_eq!(r.fake.w().hold_release_deadlines[&web], original);
+        if restart {
+            restart_release_daemon(&mut r, 102);
+            r.ticks(2);
+            prop_assert!(r.fake.w().held.contains(&web), "restart revived an expired release");
+            prop_assert_eq!(r.fake.w().hold_release_deadlines[&web], original);
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 16, failure_persistence: None, ..ProptestConfig::default() })]
+
+        #[test]
+        fn rollback_retry_and_restart_never_extend_the_original_bound(
+            lifetime in 90..240u64, rollback in 300..7_200u64,
+            fault in 0..3usize, restart in any::<bool>(), on_failure in any::<bool>(),
+        ) {
+            check(lifetime, rollback, fault, restart, on_failure)?;
+        }
+    }
+
+    #[test]
+    fn every_lift_outcome_and_both_hold_paths_obey_the_original_bound() {
+        for fault in 0..3 {
+            for on_failure in [false, true] {
+                check(180, 3_600, fault, true, on_failure).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_timed_bounds_are_never_reconstructed_after_rollback_or_restart() {
+    let web = UnitId::service("gym-web");
+    for missing in 0..3 {
+        let mut r = failed_routine_tool();
+        let until = r.fake.now().plus(Millis::secs(180));
+        if missing == 0 {
+            r.fake.w().hold_release_fails = Some("marker write failed".into());
+        }
+        let resp = r.core.handle(ADMIN, release_web(true, Until::At(until)));
+        assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+        match missing {
+            1 => {
+                r.fake.w().hold_released.remove(&web);
+            }
+            2 => {
+                r.fake.w().hold_release_deadlines.remove(&web);
+            }
+            _ => {}
+        }
+        r.fake.w().wall_skew = -3_600_000;
+        r.fake.advance(Millis::secs(200));
+        restart_release_daemon(&mut r, 101);
+        r.ticks(3);
+        assert!(r.fake.w().held.contains(&web), "missing {missing} recreated an expired bound");
+        if missing < 2 {
+            assert!(!r.fake.w().hold_released.contains_key(&web));
+        } else {
+            assert!(!r.fake.w().hold_release_deadlines.contains_key(&web));
+        }
+        assert!(r.core.notices.iter().any(|n| n.contains("original bound is missing")));
+    }
 }
 
 /// §12d (#36 review): anything else flushing the ruleset removes the hold's
@@ -2086,6 +2402,8 @@ fn a_withdrawn_update_is_prepared_again_after_a_restart() {
         .chain(l.live.values().map(|t| (t.txn.id, t.txn.transition.clone(), t.txn.state.clone())))
         .any(|(id, t, _)| id > waiting && matches!(t, Transition::ApplyChange { .. }));
     assert!(again, "the withdrawn update was not prepared again after the restart; notices: {:?}", r.core.notices);
+    // Accepted, so not declined (NotPreparedAgain is for a refusal only).
+    assert!(r.core.ledger().not_prepared_again().is_empty());
 }
 
 /// §12f, the other half of the reviewer's case: once a withdrawn update has
@@ -2536,6 +2854,13 @@ mod limit_props {
 /// gym-web as a network tool (`holds`), held by OnFailure= when it fails
 /// (`hold_on_failure`) if `on_failure`.
 fn rig_with_network_tool(holds: bool, on_failure: bool) -> Rig {
+    rig_with_tool(holds, on_failure, holds)
+}
+
+/// As `rig_with_network_tool`, with the kernel's attribution scripted:
+/// `steers`, the tool has a default route over an interface it created
+/// (it is protecting traffic); otherwise it has steered nothing.
+fn rig_with_tool(holds: bool, on_failure: bool, steers: bool) -> Rig {
     let store = MemStore::new(8 << 20);
     let fake = gym_world(store.clone());
     let web = UnitId::service("gym-web");
@@ -2548,6 +2873,11 @@ fn rig_with_network_tool(holds: bool, on_failure: bool) -> Rig {
         }
         if let Some(d) = w.base_units.get_mut(&web) {
             d.holds = holds;
+        }
+        if steers {
+            // §12d: a network tool holds traffic only while it is protecting
+            // it: the kernel has attributed a steering route to it.
+            w.steers_traffic(&web);
         }
         if on_failure {
             w.hold_on_failure.insert(web);
@@ -2786,6 +3116,8 @@ fn a_wedged_hold_does_not_starve_another_units_lift() {
                 d.holds = true;
             }
         }
+        w.steers_traffic(&app);
+        w.steers_traffic(&web);
         w.hold_wedged.insert(app.clone());
         w.alive.insert(100);
     }
@@ -3118,4 +3450,412 @@ fn a_lift_that_alone_hangs_is_retried_quietly_once_a_minute() {
     r.ticks(15);
     assert!(!r.fake.w().held.contains(&web), "never lifted: {:?}", r.core.notices);
     assert_eq!(r.core.notices.iter().filter(|n| n.contains("flows again")).count(), 1, "{:?}", r.core.notices);
+}
+
+// ---- §9: "`Exec` probes, which run arbitrary commands, are permitted only
+// in manifest entries authored by a principal with administrator authority;
+// they are flagged in the console and the journal" (reviewer's case; P11's
+// scope row in docs/review-reconciliation.md: read from `ProbeKind::Exec`,
+// not from the export's `flagged` key). The gym's manifest has two Exec
+// probes, NetworkManager's `wifi-associated` and snd-hda0's
+// `snd-hda0-driven`, and typed ones (gym-web's `gym-web-http`, `-tcp`).
+
+const EXEC_PROBES: [(&str, &str); 2] =
+    [("service:NetworkManager", "wifi-associated"), ("device:snd-hda0", "snd-hda0-driven")];
+const TYPED_PROBE: (&str, &str) = ("service:gym-web", "gym-web-http");
+
+/// The part of a unit row's detail about `probe` (`<probe>: …`, `; `-separated).
+fn probe_part<'a>(detail: &'a str, probe: &str) -> Option<&'a str> {
+    detail.split("; ").find(|p| p.starts_with(&format!("{probe}:")) || p.starts_with(&format!("{probe} ")))
+}
+
+fn mentions_exec(s: &str) -> bool {
+    s.to_ascii_lowercase().contains("exec")
+}
+
+/// The journal (§12c's, Planarian's own; coordinator, Nov 3: not journald):
+/// a record names each Exec probe as one, and none names a typed probe as
+/// one. Read as each record renders, so any record kind will do; flagged,
+/// not re-journaled on every tick.
+#[test]
+fn an_exec_probe_is_flagged_in_the_journal() {
+    const TICKS: usize = 5;
+    let mut r = Rig::new();
+    r.ticks(TICKS);
+    let records: Vec<String> =
+        r.core.ex.kernel.journal.segment().unwrap().iter().map(|e| crate::render::record(&e.record)).collect();
+    for (_, probe) in EXEC_PROBES {
+        let n = records.iter().filter(|t| t.contains(probe) && mentions_exec(t)).count();
+        assert!(n >= 1, "no journal record flags the Exec probe {probe}: {records:#?}");
+        assert!(n < TICKS, "the Exec probe {probe} is journaled on every tick ({n} records)");
+    }
+    assert!(
+        !records.iter().any(|t| t.contains(TYPED_PROBE.1) && mentions_exec(t)),
+        "a typed probe is flagged as Exec in the journal: {records:#?}"
+    );
+}
+
+/// The console and the CLI: both render the status report's unit rows (the
+/// console embeds the same `StatusReport`); each Exec probe's part of its
+/// unit's row says it is one, and a typed probe's does not.
+#[test]
+fn an_exec_probe_is_flagged_in_the_console_and_status() {
+    let mut r = Rig::new();
+    r.ticks(3);
+    let Response::Console(c) = r.core.handle(ADMIN, Request::Console) else { panic!("console") };
+    let Response::Status(st) = r.core.handle(ADMIN, Request::Status) else { panic!("status") };
+    for (rows, what) in [(&c.status.units, "console"), (&st.units, "status")] {
+        let detail = |u: &str| {
+            rows.iter().find(|row| row.unit.to_string() == u).map(|row| row.detail.clone()).unwrap_or_default()
+        };
+        for (unit, probe) in EXEC_PROBES {
+            let d = detail(unit);
+            let part = probe_part(&d, probe);
+            assert!(
+                part.is_some_and(mentions_exec),
+                "{what}: {unit}'s row does not flag its Exec probe {probe}: {d:?}"
+            );
+        }
+        let d = detail(TYPED_PROBE.0);
+        assert!(
+            !probe_part(&d, TYPED_PROBE.1).is_some_and(mentions_exec),
+            "{what}: the typed probe {} is flagged as Exec: {d:?}",
+            TYPED_PROBE.1
+        );
+    }
+}
+
+/// Injects a full journal, an I/O failure before the write, or a failed sync
+/// after the frame is written. The last case has an uncertain append outcome.
+#[derive(Clone)]
+struct ExecFlagStore {
+    inner: MemStore,
+    failure: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl Store for ExecFlagStore {
+    type Guard = <MemStore as Store>::Guard;
+    fn lock(&self) -> std::io::Result<Self::Guard> {
+        self.inner.lock()
+    }
+    fn capacity(&self) -> u64 {
+        if self.failure.load(std::sync::atomic::Ordering::SeqCst) == 1 { 0 } else { self.inner.capacity() }
+    }
+    fn read_at(&self, off: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        self.inner.read_at(off, len)
+    }
+    fn write_at(&self, off: u64, bytes: &[u8]) -> std::io::Result<()> {
+        if self.failure.load(std::sync::atomic::Ordering::SeqCst) == 2 {
+            return Err(std::io::Error::other("scripted write failure"));
+        }
+        self.inner.write_at(off, bytes)
+    }
+    fn sync(&self) -> std::io::Result<()> {
+        if self.failure.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+            return Err(std::io::Error::other("scripted sync failure after write"));
+        }
+        self.inner.sync()
+    }
+    fn read_checkpoint(&self) -> std::io::Result<Option<Vec<u8>>> {
+        self.inner.read_checkpoint()
+    }
+    fn write_checkpoint(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.inner.write_checkpoint(bytes)
+    }
+    fn read_sentinel(&self) -> std::io::Result<Option<Vec<u8>>> {
+        self.inner.read_sentinel()
+    }
+    fn write_sentinel(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.inner.write_sentinel(bytes)
+    }
+    fn fence(&self, txn: TxnId) -> std::io::Result<Option<u64>> {
+        self.inner.fence(txn)
+    }
+    fn set_fence(&self, txn: TxnId, epoch: u64) -> std::io::Result<()> {
+        self.inner.set_fence(txn, epoch)
+    }
+    fn create_fence(&self, txn: TxnId, epoch: u64) -> std::io::Result<()> {
+        self.inner.create_fence(txn, epoch)
+    }
+    fn forget_fences<F: Fn(TxnId) -> bool>(&self, keep: F) -> std::io::Result<Vec<TxnId>> {
+        self.inner.forget_fences(keep)
+    }
+}
+
+#[test]
+fn an_exec_flag_is_retried_after_journal_failure_without_repeating_a_written_frame() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for failure in 1..=3 {
+        let inner = MemStore::new(64 << 10);
+        let store = ExecFlagStore { inner: inner.clone(), failure: Default::default() };
+        let fake = gym_world(inner);
+        fake.w().alive.insert(100);
+        let mut journal = Journal::open(store.clone()).unwrap();
+        journal.append(fake.w().now, Record::KnownGood(GenerationId(1))).unwrap();
+        let mut core = Core::start(journal, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config());
+        let (_, defs) = core.observe();
+        store.failure.store(failure, SeqCst);
+        core.flag_exec_probes(&defs);
+        assert!(core.exec_flagged.is_empty(), "failure {failure}: claimed the flags were journaled");
+        assert!(!core.notices.iter().any(|n| n.contains("is an Exec probe")));
+        assert!(core.notices.iter().any(|n| n.contains("journal write failed")));
+        store.failure.store(0, SeqCst);
+        for _ in 0..3 {
+            core.flag_exec_probes(&defs);
+        }
+        let mut reopened = Journal::open(store).unwrap();
+        let entries = reopened.segment().unwrap();
+        for (_, probe) in EXEC_PROBES {
+            let flags = entries
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.record, Record::ExecProbeFlagged { probe: seen, .. } if seen == probe
+                    )
+                })
+                .count();
+            assert_eq!(flags, 1, "failure {failure}: {probe} was lost or repeated");
+            let notices = core.notices.iter().filter(|n| n.contains(probe) && n.contains("is an Exec probe")).count();
+            assert_eq!(notices, 1, "failure {failure}: {probe}'s notice was lost or repeated");
+        }
+        assert_eq!(core.exec_flagged.len(), EXEC_PROBES.len());
+        assert!(core.exec_flag_pending.is_empty());
+    }
+}
+
+/// §12f, Decision A: a restart that decided not to prepare a withdrawn update
+/// again (`NotPreparedAgain`) said so in the journal, and the next restart
+/// does not try it: the same scenario as
+/// `a_withdrawn_update_is_prepared_again_after_a_restart`, with the record.
+#[test]
+fn a_withdrawn_update_that_was_not_prepared_again_stays_so_after_a_restart() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    r.fake.w().activation_restarts.clear();
+    let resp = r.core.handle(ADMIN, Request::Undo);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let now = r.fake.now();
+    r.core
+        .ex
+        .kernel
+        .journal
+        .append(now, Record::NotPreparedAgain { txn: waiting, reason: "Refused: scripted".into() })
+        .unwrap();
+    let log = r.core.log.clone();
+    r.fake.w().alive.remove(&100);
+    r.fake.w().alive.insert(101);
+    let mut core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid: 101, boot_id: Hash::ZERO },
+        config(),
+    );
+    core.remember(log);
+    r.core = core;
+    r.ticks(3);
+    let l = r.core.ledger();
+    let again = l
+        .terminal
+        .iter()
+        .map(|(id, t)| (*id, t.transition.clone()))
+        .chain(l.live.values().map(|t| (t.txn.id, t.txn.transition.clone())))
+        .any(|(id, t)| id > waiting && matches!(t, Transition::ApplyChange { .. }));
+    assert!(!again, "prepared again despite the record: {:?}", r.core.notices);
+    assert_eq!(l.not_prepared_again(), [waiting].into_iter().collect());
+}
+
+/// §12f, Decision A: a restart whose new proposal is refused (the dry
+/// activation of the withdrawn update fails, R10) journals
+/// `NotPreparedAgain`, and the next restart does not try it again.
+#[test]
+fn a_refused_re_prepare_is_journaled_and_not_retried_by_the_next_restart() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    r.fake.w().activation_restarts.clear();
+    let resp = r.core.handle(ADMIN, Request::Undo);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let restart = |r: &mut Rig, pid: u32| {
+        let log = r.core.log.clone();
+        r.fake.w().alive.remove(&(pid - 1));
+        r.fake.w().alive.insert(pid);
+        let mut core = Core::start(
+            Journal::open(r.fake.store.clone()).unwrap(),
+            r.fake.clone(),
+            OwnerId::Daemon { pid, boot_id: Hash::ZERO },
+            config(),
+        );
+        core.remember(log);
+        r.core = core;
+    };
+    // The next dry activation fails: the new proposal is refused.
+    r.fake.w().dry_activate_fails = Some("scripted".into());
+    restart(&mut r, 101);
+    r.ticks(3);
+    let declined = r.core.ledger().not_prepared_again();
+    assert!(declined.contains(&waiting), "no NotPreparedAgain: {:?}", r.core.notices);
+    // A later restart, with the dry activation healthy again, leaves it be.
+    r.fake.w().dry_activate_fails = None;
+    let before = r.core.ledger().next_txn;
+    restart(&mut r, 102);
+    r.ticks(3);
+    let l = r.core.ledger();
+    let again = l
+        .terminal
+        .iter()
+        .map(|(id, t)| (*id, t.transition.clone()))
+        .chain(l.live.values().map(|t| (t.txn.id, t.txn.transition.clone())))
+        .any(|(id, t)| id.0 >= before && matches!(t, Transition::ApplyChange { .. }));
+    assert!(!again, "tried again: {:?}", r.core.notices);
+}
+
+/// A concurrent owner edit is transient Stale, not a permanent refusal of
+/// the withdrawn transaction. A later restart may prepare it from the new
+/// source, as the ordinary stale-check contract requires.
+#[test]
+fn a_stale_re_prepare_remains_retryable_after_a_restart() {
+    let mut r = Rig::new();
+    let waiting = an_update_waiting_in_built(&mut r);
+    r.fake.w().activation_restarts.clear();
+    let resp = r.core.handle(ADMIN, Request::Undo);
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    let restart = |r: &mut Rig, pid: u32| {
+        let log = r.core.log.clone();
+        r.fake.w().alive.remove(&(pid - 1));
+        r.fake.w().alive.insert(pid);
+        let mut core = Core::start(
+            Journal::open(r.fake.store.clone()).unwrap(),
+            r.fake.clone(),
+            OwnerId::Daemon { pid, boot_id: Hash::ZERO },
+            config(),
+        );
+        core.remember(log);
+        r.core = core;
+    };
+    r.fake.w().edit_on_stage = true;
+    restart(&mut r, 101);
+    r.ticks(3);
+    assert!(!r.core.ledger().not_prepared_again().contains(&waiting), "Stale is retryable");
+    assert!(r.core.notices.iter().any(|n| n.contains("prepared again") && n.contains("Stale")), "{:?}", r.core.notices);
+    restart(&mut r, 102);
+    r.ticks(3);
+    let ledger = r.core.ledger();
+    let retried = ledger.terminal.values().any(|t| t.prepared_again_from == Some(waiting))
+        || ledger.live.values().any(|t| t.txn.prepared_again_from == Some(waiting));
+    assert!(retried, "the stale transaction was never retried: {:?}", r.core.notices);
+}
+
+/// §12d *Which units* (coordinator, Nov 3): the hold gate is `UnitDef::holds`
+/// (a network tool, from the build) and `SystemState::protecting` (from the
+/// kernel-attributed footprints). A tool that is not protecting traffic is
+/// never held by the daemon when it stops outside Planarian; one that is,
+/// is; and an unreadable footprint feed (`Err`) counts every tool as
+/// protecting.
+mod gate_props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as PConfig, FailurePersistence};
+
+    fn pconfig() -> PConfig {
+        let cases = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(16);
+        PConfig { cases, failure_persistence: None::<Box<dyn FailurePersistence>>, ..PConfig::default() }
+    }
+
+    proptest! {
+        #![proptest_config(pconfig())]
+
+        #[test]
+        fn a_tool_is_held_exactly_when_it_protects_or_the_feed_is_unreadable(
+            steers in any::<bool>(),
+            unreadable in any::<bool>(),
+            ticks in 3..12usize,
+        ) {
+            let web = UnitId::service("gym-web");
+            let mut r = rig_with_tool(true, false, steers);
+            r.fake.w().protecting_unreadable = unreadable;
+            r.fake.w().stop_out_of_band(&web);
+            r.ticks(ticks);
+            let asked = r.fake.w().calls.iter().any(|c| c.call.starts_with("hold(service:gym-web)"));
+            let journaled = r.core.ledger().hold_events.iter().any(|e| e.0 == web && e.1);
+            let protecting = steers || unreadable;
+            prop_assert_eq!(asked, protecting, "{:#?}", r.core.notices);
+            prop_assert_eq!(journaled, protecting, "{:#?}", r.core.notices);
+            if !protecting {
+                // Repaired as any unit is (or left stopped as intended), never held.
+                prop_assert!(!r.fake.w().held.contains(&web));
+            }
+        }
+    }
+}
+
+/// §12d: a hold that stands for a tool that has stopped protecting is still
+/// lifted once the unit is back (the gate does not strand it).
+#[test]
+fn a_hold_stands_until_the_unit_is_back_even_if_it_stopped_protecting() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(1);
+    assert!(r.fake.w().held.contains(&web), "held first: {:?}", r.core.notices);
+    // The route goes: the tool no longer protects anything.
+    r.fake.w().stops_steering(&web);
+    r.ticks(30);
+    assert!(!r.fake.w().held.contains(&web), "still held: {:?}", r.core.notices);
+    assert!(r.core.ledger().holds().is_empty(), "{:?}", r.core.ledger().hold_events);
+}
+
+/// The gate over every state of the feed, not a sample of them: a tool that
+/// stops outside Planarian is held exactly when the kernel attributes
+/// steering to it or the feed cannot be read (4 combinations, 2 lengths).
+#[test]
+fn the_gate_is_exact_over_every_state_of_the_feed() {
+    let web = UnitId::service("gym-web");
+    for steers in [false, true] {
+        for unreadable in [false, true] {
+            for ticks in [3, 9] {
+                let mut r = rig_with_tool(true, false, steers);
+                r.fake.w().protecting_unreadable = unreadable;
+                r.fake.w().stop_out_of_band(&web);
+                r.ticks(ticks);
+                let asked = r.fake.w().calls.iter().any(|c| c.call.starts_with("hold(service:gym-web)"));
+                let journaled = r.core.ledger().hold_events.iter().any(|e| e.0 == web && e.1);
+                let want = steers || unreadable;
+                assert_eq!((asked, journaled), (want, want), "steers {steers} unreadable {unreadable} {ticks} ticks");
+            }
+        }
+    }
+}
+
+/// A hold that landed on the host (OnFailure=) before the tool stopped
+/// protecting, and that the daemon has not journaled yet, is still looked
+/// after: journaled, then lifted once the tool is back.
+#[test]
+fn a_hold_only_the_host_has_is_still_lifted_when_the_tool_stops_protecting() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_tool(true, true, true);
+    r.fake.w().kill(&web);
+    r.fake.w().stops_steering(&web);
+    r.ticks(40);
+    assert!(!r.fake.w().held.contains(&web), "stranded on the host: {:?}", r.core.notices);
+    assert!(r.core.ledger().holds().is_empty(), "{:?}", r.core.ledger().hold_events);
+}
+
+/// A hold the journal has but the host no longer shows (flushed) for a tool
+/// that has stopped protecting is still looked after, and the journal's hold
+/// is lifted once the tool is back.
+#[test]
+fn a_hold_only_the_journal_has_is_still_lifted_when_the_tool_stops_protecting() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_tool(true, false, true);
+    r.fake.w().stop_out_of_band(&web);
+    for _ in 0..10 {
+        if r.core.ledger().hold_events.iter().any(|e| e.0 == web && e.1) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.core.ledger().holds().contains(&web), "never journaled: {:?}", r.core.notices);
+    r.fake.w().held.remove(&web);
+    r.fake.w().stops_steering(&web);
+    r.ticks(40);
+    assert!(r.core.ledger().holds().is_empty(), "left in the journal: {:?}", r.core.ledger().hold_events);
 }

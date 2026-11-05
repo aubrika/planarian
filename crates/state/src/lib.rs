@@ -468,6 +468,8 @@ impl Assembler {
             core_hash: ctx.core_hash,
             // §12d: filled by the daemon from its journal and the host.
             holds: Default::default(),
+            // §12d: filled by the daemon from the netwatch footprints.
+            protecting: Default::default(),
             observed_at: now,
         }
     }

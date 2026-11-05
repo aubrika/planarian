@@ -514,10 +514,14 @@ pub struct UnitDef {
     /// person's intent. Backup, sync and the desktop's own units.
     #[serde(default)]
     pub stops_are_faults: bool,
-    /// §12d *Network security fails closed*: its failure holds the machine's
-    /// traffic. Computed by the module (nix/module.nix `isNetworkSecurity`),
-    /// exported, never a manifest option. Interim (B-21): the netwatch
-    /// footprint replaces it.
+    /// §12d *Which units*: a *network tool*, the build-time half of a
+    /// network-security unit: able to change how traffic leaves the machine
+    /// (computed by the module from the unit's systemd configuration, never
+    /// from its name; nix/module.nix `isNetworkSecurity`; exported, never a
+    /// manifest option). Whether the tool is protecting traffic now is the
+    /// runtime half (`SystemState::protecting`, from netwatch's footprints):
+    /// only a network tool that is protecting has its failure hold the
+    /// machine's traffic.
     #[serde(default)]
     pub holds: bool,
     /// What the hold still lets it reach (the manifest's `holdAllow`).

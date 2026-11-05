@@ -22,13 +22,18 @@ pub struct PrepareAgain {
 }
 
 /// `terminal_before`: the transactions already terminal before this
-/// restart's reconciliation (those it interrupted are the others).
+/// restart's reconciliation (those it interrupted are the others). Those
+/// the journal says were `NotPreparedAgain` are in neither list.
 pub fn prepare_again(ledger: &Ledger, terminal_before: &BTreeSet<TxnId>) -> PrepareAgain {
+    // A restart that decided not to prepare a transaction again said so
+    // (`NotPreparedAgain`); no later restart tries it.
+    let declined = ledger.not_prepared_again();
     let reprepare: Vec<(TxnId, Transition)> = ledger
         .terminal
         .iter()
         .filter(|(id, t)| {
             !terminal_before.contains(id)
+                && !declined.contains(id)
                 && t.state == TxnState::Rejected(RejectReason::Interrupted)
                 && t.path.iter().rev().nth(1).is_some_and(|p| p == "Built" || p == "Prepared")
         })
@@ -47,6 +52,7 @@ pub fn prepare_again(ledger: &Ledger, terminal_before: &BTreeSet<TxnId>) -> Prep
             t.withdrawn_for.is_some()
                 && t.state == TxnState::Rejected(RejectReason::Interrupted)
                 && !named.contains(id)
+                && !declined.contains(id)
                 && !reprepare.iter().any(|(r, _)| r == *id)
         })
         .map(|(id, t)| (*id, t.transition.clone()))
@@ -98,6 +104,7 @@ mod tests {
                 touches_canonical_probe: false,
                 changes_desired: false,
                 below_security_floor: false,
+                journal_incompatibility: Vec::new(),
                 restores_unattributed_stop: false,
                 restarts_failed_unit: false,
                 removes_sensitivity: Default::default(),
@@ -150,6 +157,9 @@ mod tests {
         /// transaction that does not exist).
         Prepare(Option<u8>),
         Move(prop::sample::Index, To),
+        /// A restart declined to prepare this transaction again
+        /// (`NotPreparedAgain`): an id of the script, or one it never made.
+        Declined(u8),
     }
 
     fn ops() -> impl Strategy<Value = Vec<Op>> {
@@ -164,6 +174,7 @@ mod tests {
             prop_oneof![
                 3 => proptest::option::weighted(0.4, 1u8..8).prop_map(Op::Prepare),
                 7 => (any::<prop::sample::Index>(), to).prop_map(|(i, t)| Op::Move(i, t)),
+                2 => (1u8..10).prop_map(Op::Declined),
             ],
             1..30,
         )
@@ -176,6 +187,7 @@ mod tests {
         history: BTreeMap<TxnId, Vec<TxnState>>,
         withdrawn_for: BTreeMap<TxnId, TxnId>,
         again: BTreeMap<TxnId, TxnId>,
+        declined: BTreeSet<TxnId>,
     }
 
     use std::collections::BTreeMap;
@@ -207,6 +219,12 @@ mod tests {
                         if let Some(a) = again {
                             m.again.insert(id, a);
                         }
+                    }
+                }
+                Op::Declined(n) => {
+                    let id = TxnId(*n as u64);
+                    if apply(&mut l, Record::NotPreparedAgain { txn: id, reason: "refused".into() }) {
+                        m.declined.insert(id);
                     }
                 }
                 Op::Move(i, to) => {
@@ -291,13 +309,28 @@ mod tests {
                 let h = &m.history[id];
                 h.len() >= 2 && matches!(h[h.len() - 2], TxnState::Built | TxnState::Prepared)
             };
-            let want_re: BTreeSet<TxnId> = m.history.keys().filter(|i| interrupted(i) && !before.contains(i) && was_waiting(i)).copied().collect();
+            let want_re: BTreeSet<TxnId> = m.history.keys().filter(|i| interrupted(i) && !before.contains(i) && !m.declined.contains(i) && was_waiting(i)).copied().collect();
             let want_wd: BTreeSet<TxnId> = m
                 .history
                 .keys()
-                .filter(|i| interrupted(i) && m.withdrawn_for.contains_key(i) && !named.contains(i) && !want_re.contains(i))
+                .filter(|i| {
+                    interrupted(i)
+                        && m.withdrawn_for.contains_key(i)
+                        && !named.contains(i)
+                        && !m.declined.contains(i)
+                        && !want_re.contains(i)
+                })
                 .copied()
                 .collect();
+            // A declined transaction is in neither list, and the ledger's fold
+            // holds exactly the ids the journal declined, across compaction too.
+            prop_assert!(re_set.is_disjoint(&m.declined) && wd_set.is_disjoint(&m.declined), "declined but prepared again");
+            prop_assert_eq!(ledger.not_prepared_again(), m.declined.clone(), "the fold");
+            prop_assert_eq!(serde_json::from_slice::<Ledger>(&serde_json::to_vec(&ledger).unwrap()).unwrap().not_prepared_again(), m.declined.clone(), "the fold, after compaction");
+            // A checkpoint from before the record existed has none.
+            let mut old = serde_json::to_value(&ledger).unwrap();
+            old.as_object_mut().unwrap().remove("not_prepared_again");
+            prop_assert!(serde_json::from_value::<Ledger>(old).unwrap().not_prepared_again().is_empty(), "an old checkpoint");
             prop_assert_eq!(&re_set, &want_re, "reprepare");
             prop_assert_eq!(&wd_set, &want_wd, "withdrawn");
 
@@ -305,6 +338,121 @@ mod tests {
             let compacted: Ledger = serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
             prop_assert_eq!(&prepare_again(&compacted, &before), &got, "after compaction");
             prop_assert_eq!(&prepare_again(&replayed(&entries), &before), &got, "after replay");
+        }
+    }
+
+    use planarian_txn::ledger::TerminalTxn;
+
+    /// The function as it was in `Core::start`, before `NotPreparedAgain`:
+    /// the frame the new one is held to when nothing was declined.
+    fn earlier(ledger: &Ledger, terminal_before: &BTreeSet<TxnId>) -> PrepareAgain {
+        let reprepare: Vec<(TxnId, Transition)> = ledger
+            .terminal
+            .iter()
+            .filter(|(id, t)| {
+                !terminal_before.contains(id)
+                    && t.state == TxnState::Rejected(RejectReason::Interrupted)
+                    && t.path.iter().rev().nth(1).is_some_and(|p| p == "Built" || p == "Prepared")
+            })
+            .map(|(id, t)| (*id, t.transition.clone()))
+            .collect();
+        let named: BTreeSet<TxnId> = ledger
+            .live
+            .values()
+            .filter_map(|t| t.txn.prepared_again_from)
+            .chain(ledger.terminal.values().filter_map(|t| t.prepared_again_from))
+            .collect();
+        let withdrawn: Vec<(TxnId, Transition)> = ledger
+            .terminal
+            .iter()
+            .filter(|(id, t)| {
+                t.withdrawn_for.is_some()
+                    && t.state == TxnState::Rejected(RejectReason::Interrupted)
+                    && !named.contains(id)
+                    && !reprepare.iter().any(|(r, _)| r == *id)
+            })
+            .map(|(id, t)| (*id, t.transition.clone()))
+            .collect();
+        PrepareAgain { reprepare, withdrawn }
+    }
+
+    #[derive(Clone, Debug)]
+    struct Shape {
+        interrupted: bool,
+        penultimate: u8,
+        withdrawn_for: bool,
+        prepared_again_from: Option<u64>,
+        before: bool,
+        declined: bool,
+    }
+
+    fn shape() -> impl Strategy<Value = Shape> {
+        (
+            prop_oneof![4 => Just(true), 1 => Just(false)],
+            0..3u8,
+            any::<bool>(),
+            prop_oneof![3 => Just(None), 1 => (1..8u64).prop_map(Some)],
+            prop_oneof![1 => Just(true), 3 => Just(false)],
+            prop_oneof![1 => Just(true), 2 => Just(false)],
+        )
+            .prop_map(|(interrupted, penultimate, withdrawn_for, prepared_again_from, before, declined)| {
+                Shape { interrupted, penultimate, withdrawn_for, prepared_again_from, before, declined }
+            })
+    }
+
+    fn terminal_of(e: &Shape) -> TerminalTxn {
+        let step = ["Built", "Prepared", "Checking"][e.penultimate as usize % 3];
+        TerminalTxn {
+            state: if e.interrupted { TxnState::Rejected(RejectReason::Interrupted) } else { TxnState::Committed },
+            epoch: 1,
+            owner: OwnerId::Daemon { pid: 1, boot_id: Hash::ZERO },
+            path: vec![step.into(), "Rejected".into()],
+            transition: Transition::Rollback,
+            why: String::new(),
+            withdrawn_for: e.withdrawn_for.then_some(TxnId(99)),
+            prepared_again_from: e.prepared_again_from.map(TxnId),
+        }
+    }
+
+    proptest! {
+        /// What a restart prepares again is a function of the journal: a
+        /// transaction a restart declined (`NotPreparedAgain`) is in neither
+        /// list, whatever else is true of it; nothing is added; and with
+        /// nothing declined the answer is exactly the earlier function's.
+        #[test]
+        fn a_declined_transaction_is_never_prepared_again(entries in proptest::collection::vec(shape(), 1..10)) {
+            let mut ledger = Ledger::default();
+            let mut terminal_before = BTreeSet::new();
+            let mut declined = vec![];
+            for (i, e) in entries.iter().enumerate() {
+                let id = TxnId(i as u64 + 1);
+                ledger.terminal.insert(id, terminal_of(e));
+                if e.before {
+                    terminal_before.insert(id);
+                }
+                if e.declined {
+                    declined.push(id);
+                }
+            }
+            let reference = earlier(&ledger, &terminal_before);
+            ledger.not_prepared_again = declined.clone();
+            let got = prepare_again(&ledger, &terminal_before);
+            let ids = |l: &[(TxnId, Transition)]| l.iter().map(|(i, _)| *i).collect::<Vec<_>>();
+            for id in ids(&got.reprepare).into_iter().chain(ids(&got.withdrawn)) {
+                prop_assert!(!declined.contains(&id), "{id:?} was declined");
+                prop_assert!(
+                    ids(&reference.reprepare).contains(&id) || ids(&reference.withdrawn).contains(&id),
+                    "{id:?} is new"
+                );
+            }
+            // Exactly the earlier answer without the declined ones.
+            let drop = |l: &[(TxnId, Transition)]| l.iter().filter(|(i, _)| !declined.contains(i)).cloned().collect::<Vec<_>>();
+            prop_assert_eq!(&got.reprepare, &drop(&reference.reprepare));
+            // A withdrawn transaction is declined out of `withdrawn` only, so one that was not
+            // reprepared stays prepared-again-able by nobody else.
+            prop_assert!(got.reprepare.iter().all(|(i, _)| !got.withdrawn.iter().any(|(w, _)| w == i)));
+            ledger.not_prepared_again.clear();
+            prop_assert_eq!(prepare_again(&ledger, &terminal_before), reference);
         }
     }
 }

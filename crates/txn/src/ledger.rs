@@ -130,6 +130,29 @@ pub enum Record {
         unit: UnitId,
         reason: String,
     },
+    /// What a reader makes of an informational record whose kind it does not know
+    /// (journal frame format 3): the sequence advances and the chain extends,
+    /// the ledger does not change. Never written.
+    Skipped {
+        kind: String,
+    },
+
+    /// §9: an `Exec` probe is flagged in the journal, once when first seen
+    /// and again if its command changes. Informational (§12c): no decision
+    /// reads it, so applying it changes nothing in the ledger.
+    ExecProbeFlagged {
+        unit: UnitId,
+        probe: String,
+        /// The command's first word only.
+        argv0: String,
+    },
+    /// §12f: a restart decided not to prepare `txn` again (its new proposal
+    /// was refused), so no later restart tries it again. Decisive: the
+    /// restart's fold (`prepare_again`) excludes the ids it names.
+    NotPreparedAgain {
+        txn: TxnId,
+        reason: String,
+    },
 }
 
 /// Who applied a hold: systemd's `OnFailure=` (seen by the daemon) or the
@@ -248,6 +271,13 @@ pub struct Ledger {
     /// holds replays to none.
     #[serde(default)]
     pub hold_events: Vec<(UnitId, bool)>,
+    /// §12f: the transactions a restart decided not to prepare again
+    /// (`NotPreparedAgain`), in order. Append-only like `hold_events`: vstd
+    /// has no ordering spec for `TxnId`, so the fold uses no set; read as a
+    /// set through `not_prepared_again()`. A journal from before it replays
+    /// to none.
+    #[serde(default)]
+    pub not_prepared_again: Vec<TxnId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -978,6 +1008,9 @@ impl Ledger {
             Record::AgentStarted { name, instance, by } => self.agents.push((name, instance, by)),
             Record::HoldApplied { unit, .. } => self.hold_events.push((unit, true)),
             Record::HoldLifted { unit, .. } => self.hold_events.push((unit, false)),
+            Record::Skipped { .. } => {},
+            Record::ExecProbeFlagged { .. } => {},
+            Record::NotPreparedAgain { txn, .. } => self.not_prepared_again.push(txn),
         }
     }
 
@@ -1417,6 +1450,11 @@ impl Ledger {
     /// Who started the last instance under `name`, for a refusal's message.
     pub fn agent_owner(&self, name: &str) -> Option<u32> {
         self.agents.iter().rev().find(|(n, _, _)| n == name).map(|(_, _, by)| *by)
+    }
+
+    /// §12f: the transactions a restart decided not to prepare again.
+    pub fn not_prepared_again(&self) -> std::collections::BTreeSet<TxnId> {
+        self.not_prepared_again.iter().copied().collect()
     }
 
     /// §12d: the units whose traffic the journal says is held now: the

@@ -13,6 +13,28 @@ thread_local! {
     /// The scan as it was before it read a body only for a header that
     /// could be the next record (the reference for `scan_outcomes_are_unchanged`).
     pub(super) static OLD_SCAN: Cell<bool> = const { Cell::new(false) };
+    /// A deliberate bug in the frame reader, for the tests that show the
+    /// class tests catch it (`mutants_are_caught`).
+    pub(super) static MUTANT: Cell<Mutant> = const { Cell::new(Mutant::None) };
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Mutant {
+    None,
+    /// An intact frame's unsupported class is mistaken for a torn tail.
+    InvalidClassIsTorn,
+    /// The format-3 class is not part of the hash-chain commitment.
+    ClassOutsideChain,
+    /// A decisive frame is read as informational: an unknown decisive kind is skipped.
+    AnyClassSkips,
+    /// An informational frame of a kind this build knows is skipped when it does not parse.
+    KnownKindSkips,
+    /// An informational frame of an unknown kind is damage, not a skip.
+    NoSkip,
+    /// Format 2 frames are not read.
+    NoFormat2,
+    /// `could_follow` knows only the format 2 payload offset.
+    CouldFollowFormat2Only,
 }
 
 fn crc_bytes<R>(f: impl FnOnce() -> R) -> (R, u64) {
@@ -152,7 +174,7 @@ fn after_a_compaction_a_damaged_middle_record_is_still_integrity() {
     }
     j.compact().unwrap();
     let first = append(&mut j, i).unwrap();
-    let size = (HEADER + PREV + serde_json::to_vec(&first).unwrap().len()) as u64;
+    let size = (HEADER + PREV + 1 + serde_json::to_vec(&first).unwrap().len()) as u64;
     for k in 1..5 {
         append(&mut j, i + k).unwrap();
     }
@@ -203,7 +225,7 @@ proptest! {
         for _ in 0..n {
             let e = append(&mut j, i).unwrap();
             i += 1;
-            let size = (HEADER + PREV + serde_json::to_vec(&e).unwrap().len()) as u64;
+            let size = (HEADER + PREV + 1 + serde_json::to_vec(&e).unwrap().len()) as u64;
             records.push((off, size));
             off += size;
         }
@@ -443,7 +465,7 @@ proptest! {
                 // A crash after the checkpoint, before the log restarts at 0:
                 // the old segment is still there, at or below its seq.
                 let payload = serde_json::to_vec(j.ledger()).unwrap();
-                store.write_checkpoint(&frame(j.ledger().last_seq, &j.head(), &payload)).unwrap();
+                store.write_checkpoint(&frame(j.ledger().last_seq, &j.head(), Class::Decisive, &payload)).unwrap();
             } else {
                 j.compact().unwrap();
             }
@@ -702,5 +724,675 @@ proptest! {
             prop_assert_eq!(segment.iter().map(|e| e.seq).collect::<Vec<_>>(), since.clone(), "exactly what the checkpoint replaced");
             since.clear();
         }
+    }
+}
+
+// ---- Record classes (frame format 3) and format 2 frames.
+
+/// One log entry, as the test writes it.
+#[derive(Clone, Debug)]
+enum Item {
+    /// A known record, in a format 3 frame.
+    Known3(u64),
+    /// A known record, in a format 2 frame.
+    Known2(u64),
+    /// An informational record of a kind this build does not know, format 3.
+    Unknown(u8),
+}
+
+/// What follows the items, and must be refused.
+#[derive(Clone, Debug, PartialEq)]
+enum Last {
+    Nothing,
+    /// An unknown kind in a decisive format 3 frame.
+    UnknownDecisive,
+    /// An unknown kind in a format 2 frame.
+    UnknownFormat2,
+    /// A known kind whose payload does not parse, in an informational frame.
+    BrokenKnownInformational,
+}
+
+fn items() -> impl Strategy<Value = (Vec<Item>, Last)> {
+    let item = prop_oneof![
+        3 => (0u64..50).prop_map(Item::Known3),
+        2 => (0u64..50).prop_map(Item::Known2),
+        3 => (0u8..5).prop_map(Item::Unknown),
+    ];
+    let last = prop_oneof![
+        2 => Just(Last::Nothing),
+        1 => Just(Last::UnknownDecisive),
+        1 => Just(Last::UnknownFormat2),
+        1 => Just(Last::BrokenKnownInformational),
+    ];
+    (proptest::collection::vec(item, 1..24), last)
+}
+
+/// An entry's JSON with its record's kind renamed: a record from a newer build.
+fn newer(seq: u64, n: u64, kind: &str) -> Vec<u8> {
+    let e = Entry { seq, at: Timestamp(n), record: Record::KnownGood(GenerationId(n + 1)) };
+    String::from_utf8(serde_json::to_vec(&e).unwrap()).unwrap().replace("KnownGood", kind).into_bytes()
+}
+
+/// Write `items` into a fresh store as a hand-built, chained log.
+fn build(items: &[Item], last: &Last, capacity: u64) -> (MemStore, Hash, Option<GenerationId>) {
+    let store = MemStore::new(capacity);
+    let (mut off, mut head, mut known) = (0u64, Hash::ZERO, None);
+    let put = |bytes: Vec<u8>, off: &mut u64| {
+        store.write_at(*off, &bytes).unwrap();
+        *off += bytes.len() as u64;
+    };
+    for (i, it) in items.iter().enumerate() {
+        let seq = i as u64 + 1;
+        let (bytes, _payload) = match it {
+            Item::Known3(n) | Item::Known2(n) => {
+                let e = Entry { seq, at: Timestamp(*n), record: Record::KnownGood(GenerationId(n + 1)) };
+                known = Some(GenerationId(n + 1));
+                let payload = serde_json::to_vec(&e).unwrap();
+                let v3 = matches!(it, Item::Known3(_));
+                (
+                    if v3 { frame(seq, &head, Class::Decisive, &payload) } else { frame_v2(seq, &head, &payload) },
+                    payload,
+                )
+            }
+            Item::Unknown(k) => {
+                let payload = newer(seq, 0, &format!("Frob{k}"));
+                (frame(seq, &head, Class::Informational, &payload), payload)
+            }
+        };
+        let f = unframe(&bytes).expect("test writes an intact frame");
+        head = frame_head(&f);
+        put(bytes, &mut off);
+    }
+    let seq = items.len() as u64 + 1;
+    match last {
+        Last::Nothing => {}
+        Last::UnknownDecisive => put(frame(seq, &head, Class::Decisive, &newer(seq, 0, "Frob9")), &mut off),
+        Last::UnknownFormat2 => put(frame_v2(seq, &head, &newer(seq, 0, "Frob9")), &mut off),
+        Last::BrokenKnownInformational => {
+            let p = newer(seq, 0, "KnownGood");
+            let p = String::from_utf8(p).unwrap().replace("{\"KnownGood\":1}", "{\"KnownGood\":\"x\"}").into_bytes();
+            put(frame(seq, &head, Class::Informational, &p), &mut off);
+        }
+    }
+    (store, head, known)
+}
+
+/// The class property, as one check so the mutants can run it too: a log of
+/// known records (either format) and informational records of unknown kinds opens
+/// to the ledger of the known ones, with every seq counted and the chain
+/// carried through the skipped ones, then takes an append that a reopen
+/// reads; and what `last` adds is Integrity, with nothing truncated.
+fn classes_hold(items: &[Item], last: &Last) -> Result<(), String> {
+    let (store, head, known) = build(items, last, 64 << 10);
+    read_classes(store, head, known, items.len() as u64, last)
+}
+
+/// Only the consumer runs under a mutant. In particular, the fixture's
+/// format-2 frames must be decoded with the clean reader while constructing
+/// their expected chain heads, before the NoFormat2 mutant is enabled.
+fn read_classes(store: MemStore, head: Hash, known: Option<GenerationId>, n: u64, last: &Last) -> Result<(), String> {
+    let before = store.read_at(0, 64 << 10).unwrap();
+    let opened = Journal::open(store.clone());
+    if *last != Last::Nothing {
+        return match opened {
+            Err(JournalError::Integrity(_)) if store.read_at(0, 64 << 10).unwrap() == before => Ok(()),
+            Err(JournalError::Integrity(_)) => Err(format!("{last:?} was Integrity but the log was changed")),
+            Ok(_) => Err(format!("{last:?} opened")),
+            Err(e) => Err(format!("{last:?} gave {e:?}, not Integrity")),
+        };
+    }
+    let mut j = opened.map_err(|e| format!("{e:?}"))?;
+    if j.ledger().last_seq != n {
+        return Err(format!("last_seq {} for {n} records", j.ledger().last_seq));
+    }
+    if j.head() != head {
+        return Err("the chain did not carry through the records".into());
+    }
+    if j.ledger().known_good != known {
+        return Err(format!("known_good {:?}, expected {known:?}", j.ledger().known_good));
+    }
+    j.append(Timestamp(99), Record::KnownGood(GenerationId(1000))).map_err(|e| format!("append: {e:?}"))?;
+    let again = Journal::open(store.clone()).map_err(|e| format!("reopen: {e:?}"))?;
+    if again.ledger().last_seq != n + 1 || again.ledger().known_good != Some(GenerationId(1000)) {
+        return Err("the appended record was not read back".into());
+    }
+    // A second handle catching up reads the same (the refresh path).
+    let mut other = Journal::open(store).map_err(|e| format!("{e:?}"))?;
+    if other.sync_ledger().map_err(|e| format!("{e:?}"))?.last_seq != n + 1 {
+        return Err("a catch-up missed the record".into());
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+
+    #[test]
+    fn classes_hold_for_any_mix((items, last) in items()) {
+        MUTANT.with(|m| m.set(Mutant::None));
+        if let Err(e) = classes_hold(&items, &last) {
+            prop_assert!(false, "{}", e);
+        }
+    }
+}
+
+/// Every mutant is caught by the class property on a log that has what it
+/// breaks (rule 23). The generator weights those shapes (checked below).
+#[test]
+fn mutants_are_caught() {
+    let mix = [Item::Known2(1), Item::Known3(2), Item::Unknown(1), Item::Known3(3)];
+    let cases: [(Mutant, Vec<Item>, Last); 5] = [
+        (Mutant::AnyClassSkips, mix.to_vec(), Last::UnknownDecisive),
+        (Mutant::AnyClassSkips, mix.to_vec(), Last::UnknownFormat2),
+        (Mutant::KnownKindSkips, mix.to_vec(), Last::BrokenKnownInformational),
+        (Mutant::NoSkip, mix.to_vec(), Last::Nothing),
+        (Mutant::NoFormat2, mix.to_vec(), Last::Nothing),
+    ];
+    for (m, items, last) in cases {
+        MUTANT.with(|c| c.set(Mutant::None));
+        classes_hold(&items, &last).unwrap_or_else(|e| panic!("clean run failed: {e}"));
+        let (store, head, known) = build(&items, &last, 64 << 10);
+        MUTANT.with(|c| c.set(m));
+        let r = read_classes(store, head, known, items.len() as u64, &last);
+        MUTANT.with(|c| c.set(Mutant::None));
+        assert!(r.is_err(), "mutant {m:?} was not caught on {items:?} + {last:?}");
+    }
+}
+
+/// `could_follow` accepts the frames of both formats; a version that knows
+/// only format 2's payload offset does not (so the search for a later record
+/// would miss format 3 frames, and a damaged record before one would be
+/// truncated as a torn tail rather than Integrity).
+#[test]
+fn could_follow_reads_both_formats() {
+    let e = Entry { seq: 5, at: Timestamp(1), record: Record::KnownGood(GenerationId(2)) };
+    let payload = serde_json::to_vec(&e).unwrap();
+    let cap = 64 << 10;
+    for (name, bytes) in [
+        ("format 3 decisive", frame(5, &Hash::ZERO, Class::Decisive, &payload)),
+        ("format 3 informational", frame(5, &Hash::ZERO, Class::Informational, &payload)),
+        ("format 2", frame_v2(5, &Hash::ZERO, &payload)),
+    ] {
+        MUTANT.with(|m| m.set(Mutant::None));
+        assert!(could_follow(&bytes, 4, cap), "{name} does not pass could_follow");
+        MUTANT.with(|m| m.set(Mutant::CouldFollowFormat2Only));
+        let blind = could_follow(&bytes, 4, cap);
+        MUTANT.with(|m| m.set(Mutant::None));
+        assert_eq!(blind, name == "format 2", "{name}: the format-2-only mutant");
+        // Not the next record: the same frame, past `last_seq`'s window.
+        assert!(!could_follow(&bytes, 5, cap), "{name} follows its own seq");
+    }
+}
+
+/// After a compaction, a log of format 3 frames with skipped records opens in
+/// time linear in the store (the leftovers past the tail are not searched at
+/// every offset), as before the class byte.
+#[test]
+fn open_after_compaction_with_skipped_frames_is_linear() {
+    let capacity: u64 = 128 << 10;
+    let (store, _, _) = build(
+        &(0..400).map(|i| if i % 3 == 0 { Item::Unknown((i % 5) as u8) } else { Item::Known3(i) }).collect::<Vec<_>>(),
+        &Last::Nothing,
+        capacity,
+    );
+    let mut j = Journal::open(store.clone()).unwrap();
+    j.compact().unwrap();
+    for i in 0..40 {
+        append(&mut j, i).unwrap();
+    }
+    let checkpoint = store.read_checkpoint().unwrap().map_or(0, |c| c.len() as u64);
+    let (opened, crcd) = crc_bytes(|| Journal::open(store.clone()));
+    let opened = opened.unwrap();
+    assert_eq!(opened.ledger().last_seq, j.ledger().last_seq);
+    assert!(crcd <= capacity + 2 * checkpoint + 4096, "open CRC'd {crcd} bytes for a {capacity} byte store");
+}
+
+/// `KINDS` is the set of kinds the match in `kind_and_class` names, each
+/// kind is the serialized variant name, and the decisive ones are exactly the
+/// kinds that match classes `Decisive` (`Skipped` is the reader's, never
+/// written).
+#[test]
+fn kinds_are_the_variants() {
+    let src = include_str!("../journal.rs");
+    let arms = src.split("fn kind_and_class").nth(1).unwrap().split("pub fn class_of").next().unwrap();
+    for k in KINDS {
+        let one = arms.matches(&format!("(\"{k}\", D)")).count() + arms.matches(&format!("(\"{k}\", I)")).count();
+        assert_eq!(one, 1, "{k} is not one arm of kind_and_class");
+    }
+    assert_eq!(arms.matches(", D)").count() + arms.matches(", I)").count(), KINDS.len(), "an arm is not in KINDS");
+    for k in DECISIVE_KINDS {
+        assert!(KINDS.contains(k));
+        assert_eq!(arms.matches(&format!("(\"{k}\", D)")).count(), 1, "{k} is listed decisive but its arm is not D");
+    }
+    let informational: Vec<&&str> = KINDS.iter().filter(|k| !DECISIVE_KINDS.contains(k)).collect();
+    assert_eq!(informational, [&"ExecProbeFlagged", &"Skipped"], "everything else is decisive");
+    // The name is what serde writes.
+    for kind in 0..6 {
+        let r = record(kind, 3, 2);
+        let e = Entry { seq: 1, at: Timestamp(0), record: r.clone() };
+        let v: serde_json::Value = serde_json::to_value(&e).unwrap();
+        let key = v["record"].as_object().unwrap().keys().next().unwrap().clone();
+        assert_eq!(kind_and_class(&r).0, key);
+    }
+}
+
+/// Skipped is a reader's record: appending one is refused.
+#[test]
+fn skipped_is_not_written() {
+    let mut j = Journal::open(MemStore::new(16 << 10)).unwrap();
+    assert!(matches!(j.append(Timestamp(0), Record::Skipped { kind: "X".into() }), Err(JournalError::Corrupt(_))));
+}
+
+/// A damaged record with format 3 frames after it is Integrity, not a torn
+/// tail to truncate: the search for a later record has to see format 3. With
+/// `could_follow` knowing only format 2 the later records are missed, the log
+/// is cut at the damage, and the records after it are lost without a word.
+#[test]
+fn a_damaged_record_before_format_3_frames_is_integrity() {
+    let items: Vec<Item> = (0..6).map(Item::Known3).collect();
+    let run = || {
+        let (store, _, _) = build(&items, &Last::Nothing, 64 << 10);
+        // Flip a byte in the second frame's payload (its CRC then fails).
+        let first = store.read_at(0, HEADER).unwrap();
+        let first_len = HEADER + u32::from_le_bytes(first[0..4].try_into().unwrap()) as usize;
+        let at = (first_len + HEADER + PREV + 1 + 12) as u64;
+        let b = store.read_at(at, 1).unwrap()[0];
+        store.write_at(at, &[b ^ 0x55]).unwrap();
+        Journal::open(store).map(|j| j.ledger().last_seq)
+    };
+    MUTANT.with(|m| m.set(Mutant::None));
+    assert!(matches!(run(), Err(JournalError::Integrity(_))), "{:?}", run());
+    MUTANT.with(|m| m.set(Mutant::CouldFollowFormat2Only));
+    let blind = run();
+    MUTANT.with(|m| m.set(Mutant::None));
+    assert!(matches!(blind, Ok(1)), "the format-2-only mutant should have truncated at the damage: {blind:?}");
+}
+
+/// An editor reseals only the class byte's frame, retaining the next frame
+/// and its predecessor hash. An older reader must still find Integrity,
+/// rather than silently skip a decisive kind it does not understand (I18).
+fn class_edit_is_integrity(prefix: usize, suffix: u64) -> Result<(), String> {
+    let store = MemStore::new(64 << 10);
+    let (mut off, mut head) = (0u64, Hash::ZERO);
+    for i in 0..prefix {
+        let payload = newer(i as u64 + 1, i as u64, "KnownGood");
+        let bytes = frame_v2(i as u64 + 1, &head, &payload);
+        head = chain(&head, i as u64 + 1, &payload);
+        store.write_at(off, &bytes).unwrap();
+        off += bytes.len() as u64;
+    }
+    let seq = prefix as u64 + 1;
+    let payload = newer(seq, suffix, "FutureDecision");
+    let original = frame(seq, &head, Class::Decisive, &payload);
+    let next_head = chain_v3(&head, seq, Class::Decisive, &payload);
+    let next_payload = newer(seq + 1, 7, "KnownGood");
+    let next = frame(seq + 1, &next_head, Class::Decisive, &next_payload);
+    store.write_at(off, &original).unwrap();
+    store.write_at(off + original.len() as u64, &next).unwrap();
+    // Exactly the partial edit from the review: class 0 -> 1, resealed
+    // CRC; neither payload, next frame, nor its chain head is rewritten.
+    store.write_at(off, &frame(seq, &head, Class::Informational, &payload)).unwrap();
+    let before = store.read_at(0, 64 << 10).unwrap();
+    match Journal::open(store.clone()) {
+        Err(JournalError::Integrity(_)) if store.read_at(0, 64 << 10).unwrap() == before => Ok(()),
+        other => Err(format!("class-only edit opened or changed the log: {:?}", other.map(|j| j.ledger.last_seq))),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    #[test]
+    fn class_only_edits_are_integrity(prefix in 0usize..12, suffix in 0u64..u64::MAX) {
+        MUTANT.with(|m| m.set(Mutant::None));
+        prop_assert!(class_edit_is_integrity(prefix, suffix).is_ok());
+    }
+
+    #[test]
+    fn a_read_handles_chain_detects_a_class_edit(n in 2usize..12, which in any::<prop::sample::Index>()) {
+        let store = MemStore::new(64 << 10);
+        let mut j = Journal::open(store.clone()).unwrap();
+        let mut frames = vec![];
+        for i in 0..n {
+            let start = j.offset();
+            append(&mut j, i as u64).unwrap();
+            frames.push((start, j.offset() - start));
+        }
+        let (start, length) = frames[which.index(n)];
+        let bytes = store.read_at(start, length as usize).unwrap();
+        let f = unframe(&bytes).unwrap();
+        let edited = frame(f.seq, &f.prev, Class::Informational, f.payload);
+        store.write_at(start, &edited).unwrap();
+        prop_assert!(matches!(j.verify_chain(), Err(JournalError::Integrity(_))));
+    }
+}
+
+#[test]
+fn the_class_outside_the_chain_mutant_is_caught() {
+    MUTANT.with(|m| m.set(Mutant::None));
+    class_edit_is_integrity(1, 3).unwrap();
+    MUTANT.with(|m| m.set(Mutant::ClassOutsideChain));
+    let result = class_edit_is_integrity(1, 3);
+    MUTANT.with(|m| m.set(Mutant::None));
+    assert!(result.is_err(), "the old class-only partial edit must open under the mutant");
+}
+
+#[test]
+fn an_empty_journal_requires_the_format_its_transition_will_write() {
+    let store = MemStore::new(64 << 10);
+    let mut j = Journal::open(store).unwrap();
+    let needs = j.required_decisive().unwrap();
+    assert_eq!(needs.format, 3);
+    assert!(needs.kinds.iter().any(|kind| kind == "Prepared"));
+    assert!(needs.kinds.iter().any(|kind| kind == "Advance"));
+    assert!(!needs.unsupported_by(&original()).is_empty());
+    assert!(needs.unsupported_by(&supported()).is_empty());
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+    /// The descriptor is retained across every compaction/reopen, including
+    /// requirements whose decisive record is no longer in the physical log.
+    #[test]
+    fn decisive_requirements_survive_compaction(
+        history in proptest::collection::vec((0u8..6, any::<bool>()), 1..32),
+    ) {
+        let store = MemStore::new(64 << 10);
+        let mut j = Journal::open(store.clone()).unwrap();
+        for (i, (kind, compact)) in history.into_iter().enumerate() {
+            j.append(Timestamp(i as u64), record(kind, i as u64, 1)).unwrap();
+            let before = j.required_decisive().unwrap();
+            if compact {
+                j.compact().unwrap();
+                j = Journal::open(store.clone()).unwrap();
+            }
+            let after = j.required_decisive().unwrap();
+            prop_assert_eq!(&before, &after);
+            prop_assert!(after.unsupported_by(&supported()).is_empty());
+        }
+    }
+
+    /// Omitting any single advertised decisive kind or field is observable;
+    /// a target advertising the complete requirements is always compatible.
+    #[test]
+    fn compatibility_checks_every_decisive_requirement(
+        kind in 0usize..DECISIVE_KINDS.len(),
+        field in any::<bool>(),
+    ) {
+        let needs = supported();
+        prop_assert!(needs.unsupported_by(&needs).is_empty());
+        let mut target = needs.clone();
+        if field {
+            target.fields.get_mut("Prepared").unwrap().clear();
+        } else {
+            target.kinds.remove(kind);
+        }
+        prop_assert!(!needs.unsupported_by(&target).is_empty());
+    }
+}
+
+#[test]
+fn a_checkpoint_cannot_hide_an_unknown_decisive_requirement() {
+    let store = MemStore::new(64 << 10);
+    let mut j = Journal::open(store.clone()).unwrap();
+    append(&mut j, 0).unwrap();
+    j.compact().unwrap();
+    let bytes = store.read_checkpoint().unwrap().unwrap();
+    let f = unframe(&bytes).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(f.payload).unwrap();
+    value[compat::CHECKPOINT_REQUIREMENTS]["kinds"].as_array_mut().unwrap().push("FutureDecision".into());
+    let payload = serde_json::to_vec(&value).unwrap();
+    store.write_checkpoint(&frame(f.seq, &f.prev, f.class, &payload)).unwrap();
+    assert!(matches!(Journal::open(store), Err(JournalError::Integrity(_))));
+}
+
+#[test]
+fn a_compacted_decisive_field_stays_required_without_its_record() {
+    let store = MemStore::new(64 << 10);
+    let mut state = serde_json::to_value(Ledger::default()).unwrap();
+    let mut needs = JournalRequirements::empty();
+    needs.fields.insert("Prepared".into(), vec!["facts.journal_incompatibility".into()]);
+    state[compat::CHECKPOINT_REQUIREMENTS] = serde_json::to_value(&needs).unwrap();
+    store.write_checkpoint(&frame(0, &Hash::ZERO, Class::Decisive, &serde_json::to_vec(&state).unwrap())).unwrap();
+    let mut j = Journal::open(store.clone()).unwrap();
+    assert_eq!(j.required_decisive().unwrap(), needs);
+    j.compact().unwrap();
+    let mut again = Journal::open(store).unwrap();
+    assert_eq!(again.required_decisive().unwrap(), needs);
+}
+
+fn invalid_class_log(prefix: &[bool], class: u8, later: bool) -> (MemStore, Journal<MemStore>) {
+    let items: Vec<_> = prefix
+        .iter()
+        .enumerate()
+        .map(|(i, old)| if *old { Item::Known2(i as u64) } else { Item::Known3(i as u64) })
+        .collect();
+    let (store, _, _) = build(&items, &Last::Nothing, 64 << 10);
+    let mut j = Journal::open(store.clone()).unwrap();
+    let start = j.offset();
+    append(&mut j, 41).unwrap();
+    let length = j.offset() - start;
+    if later {
+        append(&mut j, 42).unwrap();
+    }
+    let bytes = store.read_at(start, length as usize).unwrap();
+    let f = unframe(&bytes).unwrap();
+    store.write_at(start, &frame(f.seq, &f.prev, Class::Invalid(class), f.payload)).unwrap();
+    (store, j)
+}
+
+fn invalid_class_is_integrity(prefix: &[bool], class: u8, later: bool) -> Result<(), String> {
+    let (store, _) = invalid_class_log(prefix, class, later);
+    let before = store.read_at(0, 64 << 10).unwrap();
+    match Journal::open(store.clone()) {
+        Err(JournalError::Integrity(_)) if store.read_at(0, 64 << 10).unwrap() == before => Ok(()),
+        other => {
+            Err(format!("unsupported class {class} opened or changed the log: {:?}", other.map(|j| j.ledger.last_seq)))
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    /// A valid CRC does not make an unknown semantic class a torn record.
+    /// Preserve it as evidence, at the tail or before a later record and
+    /// after any mixture of the two supported frame formats.
+    #[test]
+    fn an_intact_unknown_class_is_integrity_and_kept(
+        prefix in proptest::collection::vec(any::<bool>(), 0..12),
+        class in 2u8..=255,
+        later in any::<bool>(),
+    ) {
+        MUTANT.with(|m| m.set(Mutant::None));
+        prop_assert!(invalid_class_is_integrity(&prefix, class, later).is_ok());
+    }
+
+    #[test]
+    fn every_read_helper_refuses_an_intact_unknown_class(
+        prefix in proptest::collection::vec(any::<bool>(), 0..8),
+        class in 2u8..=255,
+    ) {
+        let (store, mut j) = invalid_class_log(&prefix, class, false);
+        let before = store.read_at(0, 64 << 10).unwrap();
+        prop_assert!(matches!(j.verify_chain(), Err(JournalError::Integrity(_))));
+        prop_assert!(matches!(j.segment(), Err(JournalError::Integrity(_))));
+        prop_assert!(matches!(j.required_decisive(), Err(JournalError::Integrity(_))));
+        prop_assert_eq!(store.read_at(0, 64 << 10).unwrap(), before);
+    }
+
+    #[test]
+    fn a_checkpoint_with_an_unknown_class_is_integrity(class in 2u8..=255) {
+        let store = MemStore::new(64 << 10);
+        let mut j = Journal::open(store.clone()).unwrap();
+        append(&mut j, 0).unwrap();
+        j.compact().unwrap();
+        let bytes = store.read_checkpoint().unwrap().unwrap();
+        let f = unframe(&bytes).unwrap();
+        let edited = frame(f.seq, &f.prev, Class::Invalid(class), f.payload);
+        store.write_checkpoint(&edited).unwrap();
+        prop_assert!(matches!(j.required_decisive(), Err(JournalError::Integrity(_))));
+        prop_assert!(matches!(j.verify_chain(), Err(JournalError::Integrity(_))));
+        prop_assert!(matches!(Journal::open(store.clone()), Err(JournalError::Integrity(_))));
+        prop_assert_eq!(store.read_checkpoint().unwrap().unwrap(), edited);
+    }
+}
+
+#[test]
+fn the_invalid_class_is_torn_mutant_is_caught() {
+    MUTANT.with(|m| m.set(Mutant::None));
+    invalid_class_is_integrity(&[true, false], 2, false).unwrap();
+    MUTANT.with(|m| m.set(Mutant::InvalidClassIsTorn));
+    let result = invalid_class_is_integrity(&[true, false], 2, false);
+    MUTANT.with(|m| m.set(Mutant::None));
+    assert!(result.is_err(), "the old decoder must truncate this intact tail under the mutant");
+}
+
+#[test]
+fn an_unknown_class_after_damage_is_still_an_intact_later_record() {
+    let (store, _) = invalid_class_log(&[false], 255, false);
+    let at = (HEADER + PREV + 1 + 12) as u64;
+    let byte = store.read_at(at, 1).unwrap()[0];
+    store.write_at(at, &[byte ^ 1]).unwrap();
+    let before = store.read_at(0, 64 << 10).unwrap();
+    assert!(matches!(Journal::open(store.clone()), Err(JournalError::Integrity(_))));
+    assert_eq!(store.read_at(0, 64 << 10).unwrap(), before);
+}
+
+/// An Exec flag is informational, leaves decisions unchanged and, if unknown, is skipped.
+#[test]
+fn an_informational_kind_is_written_informational_and_applies_to_nothing() {
+    let store = MemStore::new(64 << 10);
+    let mut j = Journal::open(store.clone()).unwrap();
+    append(&mut j, 0).unwrap();
+    let before = serde_json::to_value(j.ledger()).unwrap();
+    let flagged = Record::ExecProbeFlagged {
+        unit: planarian_schema::UnitId::service("u"),
+        probe: "p".into(),
+        argv0: "sh".into(),
+    };
+    let at = j.offset();
+    let e = j.append(Timestamp(5), flagged.clone()).unwrap();
+    // On disk: format 3, class byte 1.
+    let header = store.read_at(at, HEADER).unwrap();
+    let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    let bytes = store.read_at(at, HEADER + len).unwrap();
+    let f = unframe(&bytes).expect("intact");
+    assert_eq!((f.format, f.class), (3, Class::Informational));
+    // Known to this reader: it reads as itself and changes only last_seq.
+    let again = Journal::open(store.clone()).unwrap();
+    assert_eq!(again.ledger().last_seq, e.seq);
+    let mut after = serde_json::to_value(again.ledger()).unwrap();
+    let mut was = before;
+    after["last_seq"] = 0.into();
+    was["last_seq"] = 0.into();
+    assert_eq!(after, was, "an informational record changes nothing in the ledger");
+    // Unknown to a reader (renamed, as a newer build's kind would be to an older one): skipped.
+    let json = String::from_utf8(f.payload.to_vec()).unwrap().replace("ExecProbeFlagged", "FromTheFuture");
+    let entry = decode(&Frame {
+        seq: e.seq,
+        prev: f.prev,
+        class: Class::Informational,
+        format: 3,
+        payload: json.as_bytes(),
+        size: 0,
+    });
+    assert_eq!(entry.unwrap().record, Record::Skipped { kind: "FromTheFuture".into() });
+}
+
+/// Informational flags never raise the generation compatibility floor.
+#[test]
+fn an_exec_flag_adds_no_decisive_journal_requirement() {
+    let mut j = Journal::open(MemStore::new(64 << 10)).unwrap();
+    let before = j.required_decisive().unwrap();
+    let flagged = Record::ExecProbeFlagged {
+        unit: planarian_schema::UnitId::service("u"),
+        probe: "p".into(),
+        argv0: "sh".into(),
+    };
+    j.append(Timestamp(5), flagged).unwrap();
+    assert_eq!(j.required_decisive().unwrap(), before);
+    j.compact().unwrap();
+    assert_eq!(j.required_decisive().unwrap(), before);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    /// Filter known Exec flags out of generated histories: every decision
+    /// and decisive requirement stays identical, through reopen/compaction.
+    #[test]
+    fn known_exec_flags_never_change_decisions_or_requirements(
+        steps in proptest::collection::vec((0u8..4, any::<u16>(), 1usize..4, any::<bool>(), any::<bool>()), 1..20),
+    ) {
+        let flagged_store = MemStore::new(64 << 10);
+        let plain_store = MemStore::new(64 << 10);
+        let mut flagged = Journal::open(flagged_store.clone()).unwrap();
+        let mut plain = Journal::open(plain_store.clone()).unwrap();
+        for (kind, value, flags, compact, reopen) in steps {
+            let generation = GenerationId(value as u64);
+            let decision = match kind {
+                0 => Record::KnownGood(generation),
+                1 => Record::LiveTested(Some(generation)),
+                2 => Record::AcceptedBaseline(Some(generation)),
+                _ => Record::SecurityFloor(Some(generation)),
+            };
+            flagged.append(Timestamp(1), decision.clone()).unwrap();
+            plain.append(Timestamp(1), decision).unwrap();
+            for probe in 0..flags {
+                let record = Record::ExecProbeFlagged {
+                    unit: planarian_schema::UnitId::service(&format!("u{value}")),
+                    probe: format!("p{probe}"),
+                    argv0: format!("command{value}"),
+                };
+                prop_assert_eq!(class_of(&record), Class::Informational);
+                flagged.append(Timestamp(2), record).unwrap();
+            }
+            for phase in 0..3 {
+                if phase == 1 && reopen {
+                    flagged = Journal::open(flagged_store.clone()).unwrap();
+                    plain = Journal::open(plain_store.clone()).unwrap();
+                }
+                if phase == 2 && compact {
+                    flagged.compact().unwrap();
+                    plain.compact().unwrap();
+                    flagged = Journal::open(flagged_store.clone()).unwrap();
+                    plain = Journal::open(plain_store.clone()).unwrap();
+                }
+                let mut actual = serde_json::to_value(flagged.ledger()).unwrap();
+                let mut expected = serde_json::to_value(plain.ledger()).unwrap();
+                actual.as_object_mut().unwrap().remove("last_seq");
+                expected.as_object_mut().unwrap().remove("last_seq");
+                prop_assert_eq!(actual, expected, "phase {}", phase);
+                prop_assert_eq!(flagged.required_decisive().unwrap(), plain.required_decisive().unwrap(), "phase {}", phase);
+            }
+        }
+    }
+}
+
+proptest! {
+    /// A retained refusal needs its decisive kind and checkpoint field,
+    /// both before compaction and after reopening the compacted journal.
+    #[test]
+    fn a_declined_transaction_remains_a_decisive_requirement(txn in any::<u64>()) {
+        let store = MemStore::new(64 << 10);
+        let mut j = Journal::open(store.clone()).unwrap();
+        let mut previous = supported();
+        previous.kinds.retain(|kind| kind != "NotPreparedAgain");
+        previous.fields.get_mut("checkpoint").unwrap().retain(|field| field != "not_prepared_again");
+        prop_assert!(j.required_decisive().unwrap().unsupported_by(&previous).is_empty());
+        j.append(Timestamp(5), Record::NotPreparedAgain { txn: TxnId(txn), reason: "refused".into() }).unwrap();
+        let required = j.required_decisive().unwrap();
+        let missing = required.unsupported_by(&previous);
+        prop_assert!(missing.contains(&"record kind NotPreparedAgain".to_owned()));
+        prop_assert!(missing.contains(&"decisive field checkpoint.not_prepared_again".to_owned()));
+        let mut missing_field = supported();
+        missing_field.fields.get_mut("checkpoint").unwrap().retain(|field| field != "not_prepared_again");
+        prop_assert_eq!(required.unsupported_by(&missing_field), vec!["decisive field checkpoint.not_prepared_again"]);
+        j.compact().unwrap();
+        let mut again = Journal::open(store).unwrap();
+        prop_assert_eq!(again.required_decisive().unwrap(), required);
+        prop_assert_eq!(again.ledger().not_prepared_again(), [TxnId(txn)].into_iter().collect());
     }
 }
