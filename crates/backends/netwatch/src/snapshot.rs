@@ -23,46 +23,185 @@ const NFT_GETTABLE: u16 = (10 << 8) | 1;
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
 
-/// Send one dump request and collect every reply message's bytes.
-/// `protocol`: `None` is `NETLINK_ROUTE`.
-fn dump(protocol: Option<rustix::net::Protocol>, ty: u16, body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+/// How long a netlink read waits for the kernel's reply.
+pub(crate) const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why a netlink request failed: the kernel's errno, or the socket/reply.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NlError {
+    Errno(i32),
+    Other(String),
+}
+
+impl std::fmt::Display for NlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NlError::Errno(e) => write!(f, "error {e}"),
+            NlError::Other(s) => f.write_str(s),
+        }
+    }
+}
+
+/// Send one request (`flags` besides `NLM_F_REQUEST`) and collect every
+/// reply message's bytes. `protocol`: `None` is `NETLINK_ROUTE`.
+fn request(protocol: Option<rustix::net::Protocol>, ty: u16, flags: u16, body: &[u8]) -> Result<Vec<Vec<u8>>, NlError> {
+    let other = |what: &str, e: rustix::io::Errno| NlError::Other(format!("{what}: {e}"));
     let fd = rustix::net::socket(AddressFamily::NETLINK, SocketType::RAW, protocol)
-        .map_err(|e| format!("netlink socket: {e}"))?;
-    rustix::net::bind(&fd, &SocketAddrNetlink::new(0, 0)).map_err(|e| format!("netlink bind: {e}"))?;
+        .map_err(|e| other("netlink socket", e))?;
+    rustix::net::bind(&fd, &SocketAddrNetlink::new(0, 0)).map_err(|e| other("netlink bind", e))?;
+    // Every read is bounded: whatever the kernel does, a lookup returns, so
+    // netwatch signals ready and stops on SIGTERM. A reply that does not come
+    // is an error (the caller fails closed), never a wait.
+    rustix::net::sockopt::set_socket_timeout(&fd, rustix::net::sockopt::Timeout::Recv, Some(RECV_TIMEOUT))
+        .map_err(|e| other("netlink receive timeout", e))?;
     let mut req = ((16 + body.len()) as u32).to_ne_bytes().to_vec();
     req.extend(ty.to_ne_bytes());
-    req.extend((NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+    req.extend((NLM_F_REQUEST | flags).to_ne_bytes());
     req.extend(1u32.to_ne_bytes());
     req.extend(0u32.to_ne_bytes());
     req.extend(body);
     rustix::net::sendto(&fd, &req, SendFlags::empty(), &SocketAddrNetlink::new(0, 0))
-        .map_err(|e| format!("netlink send: {e}"))?;
+        .map_err(|e| other("netlink send", e))?;
     let mut out = vec![];
     let mut buf = vec![0u8; 1 << 16];
     loop {
-        let (n, _) =
-            rustix::net::recv(&fd, &mut buf[..], RecvFlags::empty()).map_err(|e| format!("netlink recv: {e}"))?;
-        let mut o = 0;
-        while o + 16 <= n {
-            let len = u32::from_ne_bytes(buf[o..o + 4].try_into().unwrap()) as usize;
-            let t = u16::from_ne_bytes(buf[o + 4..o + 6].try_into().unwrap());
-            if len < 16 || o + len > n {
-                return Err("a malformed netlink reply".into());
+        let (n, received) = rustix::net::recv(&fd, &mut buf[..], RecvFlags::TRUNC).map_err(|e| {
+            if e == rustix::io::Errno::AGAIN {
+                NlError::Other(format!("netlink reply not received within {} s", RECV_TIMEOUT.as_secs()))
+            } else {
+                other("netlink recv", e)
             }
-            match t {
-                NLMSG_DONE => return Ok(out),
-                NLMSG_ERROR => {
-                    let code = buf.get(o + 16..o + 20).map(|b| i32::from_ne_bytes(b.try_into().unwrap())).unwrap_or(0);
-                    return if code == 0 { Ok(out) } else { Err(format!("netlink dump {ty}: error {code}")) };
-                }
-                _ => out.push(buf[o..o + len].to_vec()),
-            }
-            o += (len + 3) & !3;
+        })?;
+        if received > n {
+            return Err(NlError::Other("a truncated netlink datagram".into()));
         }
-        if n == 0 {
+        if collect_reply(&buf[..n], &mut out)? {
             return Ok(out);
         }
     }
+}
+
+/// Collect a complete datagram, returning true only at a successful
+/// terminator. An interrupted or failed dump is never a smaller snapshot.
+pub(crate) fn collect_reply(bytes: &[u8], out: &mut Vec<Vec<u8>>) -> Result<bool, NlError> {
+    const NLM_F_DUMP_INTR: u16 = 0x10;
+    if bytes.is_empty() {
+        return Err(NlError::Other("an empty netlink datagram".into()));
+    }
+    let mut offset = 0;
+    while offset + 16 <= bytes.len() {
+        let len = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let ty = u16::from_ne_bytes(bytes[offset + 4..offset + 6].try_into().unwrap());
+        let flags = u16::from_ne_bytes(bytes[offset + 6..offset + 8].try_into().unwrap());
+        if len < 16 || offset + len > bytes.len() {
+            return Err(NlError::Other("a malformed netlink reply".into()));
+        }
+        if flags & NLM_F_DUMP_INTR != 0 {
+            return Err(NlError::Other("an interrupted netlink dump".into()));
+        }
+        if ty == NLMSG_DONE || ty == NLMSG_ERROR {
+            let code = match len {
+                16 if ty == NLMSG_DONE => 0,
+                20.. => i32::from_ne_bytes(bytes[offset + 16..offset + 20].try_into().unwrap()),
+                _ => return Err(NlError::Other("a short netlink terminator".into())),
+            };
+            return if code == 0 { Ok(true) } else { Err(NlError::Errno(code)) };
+        }
+        out.push(bytes[offset..offset + len].to_vec());
+        offset += (len + 3) & !3;
+    }
+    if offset < bytes.len() && (bytes.len() - offset > 3 || bytes[offset..].iter().any(|b| *b != 0)) {
+        return Err(NlError::Other("a cut netlink header".into()));
+    }
+    Ok(false)
+}
+
+/// Send one dump request and collect every reply message's bytes.
+fn dump(protocol: Option<rustix::net::Protocol>, ty: u16, body: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    request(protocol, ty, NLM_F_DUMP, body).map_err(|e| format!("netlink dump {ty}: {e}"))
+}
+
+const GENL_ID_CTRL: u16 = 0x10;
+const CTRL_CMD_GETFAMILY: u8 = 3;
+const CTRL_ATTR_FAMILY_ID: u16 = 1;
+const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+#[cfg(test)]
+const ENOENT: i32 = -2;
+
+/// A generic netlink family's id, by name, if it is registered (the id is
+/// assigned at registration, for a module when it loads). Not registered is
+/// `None`; any other failure is an error, and the caller fails closed.
+///
+/// This asks by *name*, as `CTRL_CMD_GETFAMILY` with `CTRL_ATTR_FAMILY_NAME`
+/// as a plain request, which the kernel answers with one message and no
+/// terminator; `request` reads until a terminator and so would wait for a
+/// reply that never comes (this hung netwatch's start on a machine with the
+/// family, #71's gate). The kernel also *loads the module* of a family it
+/// does not have, when asked by name: asking must not change the machine.
+pub fn family_id(name: &str) -> Result<Option<u16>, String> {
+    family_id_in_dump(name)
+}
+
+/// The families the controller lists, and the id of the one named `name`: a
+/// dump, which ends with a terminator and loads no module.
+fn family_id_in_dump(name: &str) -> Result<Option<u16>, String> {
+    let body = [CTRL_CMD_GETFAMILY, 1, 0, 0];
+    let reply = request(Some(netlink::GENERIC), GENL_ID_CTRL, NLM_F_DUMP, &body)
+        .map_err(|e| format!("generic netlink family list: {e}"))?;
+    Ok(family_in(&reply, name))
+}
+
+/// The id of family `name` among the controller's `NEWFAMILY` messages.
+pub fn family_in(msgs: &[Vec<u8>], name: &str) -> Option<u16> {
+    msgs.iter().find_map(|m| {
+        let attrs = crate::parse::attrs(m, 16 + 4)?;
+        let named = attrs.iter().find(|(t, _)| *t == CTRL_ATTR_FAMILY_NAME)?;
+        if crate::parse::cstr(named.1) != name {
+            return None;
+        }
+        let (_, id) = attrs.iter().find(|(t, _)| *t == CTRL_ATTR_FAMILY_ID)?;
+        id.get(0..2).map(|b| u16::from_ne_bytes([b[0], b[1]]))
+    })
+}
+
+/// The old way (by name, a plain request), kept only so the regression test
+/// can show it hangs; never called outside tests.
+#[cfg(test)]
+pub(crate) fn family_id_by_name(name: &str) -> Result<Option<u16>, String> {
+    let mut body = vec![CTRL_CMD_GETFAMILY, 1, 0, 0];
+    body.extend((4u16 + name.len() as u16 + 1).to_ne_bytes());
+    body.extend(CTRL_ATTR_FAMILY_NAME.to_ne_bytes());
+    body.extend(name.as_bytes());
+    body.push(0);
+    while !body.len().is_multiple_of(4) {
+        body.push(0);
+    }
+    match request(Some(netlink::GENERIC), GENL_ID_CTRL, 0, &body) {
+        Ok(r) => Ok(family_in(&r, name)),
+        Err(NlError::Errno(ENOENT)) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// WireGuard's generic netlink family id, if the module is loaded.
+pub fn wireguard_family() -> Result<Option<u16>, String> {
+    family_id("wireguard")
+}
+
+/// The WireGuard devices as the kernel has them, with their peers'
+/// endpoints (B-22 b), and the family id read on the way (`None`: no
+/// devices). The reply carries keys; [`crate::wg::devices`] reads none.
+pub fn wireguard() -> Result<(Option<u16>, Vec<crate::wg::Device>), String> {
+    let Some(family) = wireguard_family()? else { return Ok((None, vec![])) };
+    let links = dump(None, RTM_GETLINK, &[0u8; 16])?;
+    let mut devices = vec![];
+    for index in crate::wg::link_indices(&links)? {
+        let body = crate::wg::get_device_request(index);
+        let msgs = request(Some(netlink::GENERIC), family, NLM_F_DUMP, &body)
+            .map_err(|e| format!("wireguard device {index} dump: {e}"))?;
+        devices.extend(crate::wg::devices(&msgs)?);
+    }
+    Ok((Some(family), devices))
 }
 
 fn changes(hook: u32, msgs: Vec<Vec<u8>>, ifname: &mut dyn FnMut(u32) -> Option<String>) -> Vec<Change> {

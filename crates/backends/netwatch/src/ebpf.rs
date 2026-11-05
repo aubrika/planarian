@@ -50,6 +50,14 @@ pub struct Event {
 }
 
 impl Event {
+    /// Netwatch only reads kernel state. Its own reads pass the same probes
+    /// as changes made by other processes; feeding them back into the reader
+    /// would schedule another read forever. The kernel reports the tgid in
+    /// the initial PID namespace, where the system service runs.
+    pub fn is_own_request(&self, reader_tgid: u32) -> bool {
+        self.tgid == reader_tgid
+    }
+
     pub fn parse(b: &[u8]) -> Option<Event> {
         if b.len() < EVENT_SIZE {
             return None;
