@@ -283,8 +283,54 @@
 //! nothing can place: nothing is derived from a failed tool. The reply
 //! carries the device's keys; nothing here copies or keeps them.
 //!
-//! **Not yet observed** (docs/bypasses.md, temporary): DNS servers set
-//! through resolved (D-Bus) or `/etc/resolv.conf`, and the system proxy.
+//! **DNS and the system proxy** (B-22 a; `dns`, `files`, `route`). SPEC §12d
+//! counts "DNS servers on *its* interface" and the system proxy: a unit that
+//! points the machine's resolver at a server reached through its tunnel
+//! steers traffic as a default route does. So the charge goes to the units
+//! whose interface *carries* the address, not to whoever wrote the setting
+//! (coordinator, Nov 3; the first design charged writers, and charged DHCP
+//! clients for the uplink's DNS). Each pass, with nothing remembered
+//! between passes:
+//! 1. read the settings (`files`): `/etc/resolv.conf`; resolved's per-link
+//!    servers (`/run/systemd/resolve/netif/<ifindex>`) and its
+//!    `/run/systemd/resolve/resolv.conf`; the proxy hosts that are IP
+//!    literals in `/etc/environment`, NixOS's `/etc/set-environment` and
+//!    `/etc/profile.d/*`. A loopback address (127/8, `::1`, v4-mapped) steers
+//!    nothing: a dead local stub fails DNS closed rather than leaking;
+//! 2. ask the kernel which interface reaches each address (`route`:
+//!    `RTM_GETROUTE` for that destination, the `ip route get` equivalent, so
+//!    policy rules and fwmark tables such as wg-quick's are honoured). An
+//!    address with a zone (`fe80::1%tun0`) and a resolved link's own servers
+//!    name their interface themselves;
+//! 3. charge the owners of that interface (`dns::charges`): for a *virtual*
+//!    interface, the units with a claim on it (its creator) and the units that
+//!    added a steering route over it. A *physical* interface (the uplink,
+//!    DHCP-learned DNS) steers for nobody and is charged to nobody, as a
+//!    default route over wlan0 is. "No route" (the kernel's network
+//!    unreachable) is no interface: nobody. So is one of the machine's own
+//!    addresses (`local ... dev lo`, route type `RTN_LOCAL`: dnsmasq, a
+//!    Pi-hole on the host's LAN address, libvirt's virbr0): a server on this
+//!    machine is not a path out, as loopback is not (reviewer, #74), and
+//!    `lo` is a virtual link nobody owns, which would otherwise hold every
+//!    tool;
+//! 4. *unknown* fails closed, and is bound to its setting, never the global
+//!    marker: a lookup that failed, an address that cannot be read, or a
+//!    virtual interface nobody is known to own. It clears when the lookup
+//!    succeeds or the setting changes.
+//!
+//! The pass runs when a file changed (their device, inode, size and mtime are
+//! compared; no watcher, so there is no writer to attribute), when the ring
+//! delivered an external request (a route or an interface may have moved
+//! the charge), and every tick. The watch's own read requests are ignored
+//! before they can schedule another pass. `Tracker::set_dns` replaces every
+//! DNS and proxy object at once, so a charge cannot stick, and the
+//! invocation's latch keeps what it was charged for the invocation.
+//!
+//! *Not covered* (docs/bypasses.md, B-22): a proxy named by host *name*
+//! (resolving it would be a DNS query netwatch must not make); the proxy
+//! anywhere but those files (per-user dconf, a unit's own `Environment=`,
+//! an application's configuration); a local DNS proxy's own upstream
+//! configuration.
 //!
 //! **The hold's order.** When a network tool fails, it is held unless all of
 //! these pass: (1) no unexpired release; (a) the unit's file says
@@ -304,12 +350,17 @@ pub mod btf;
 #[cfg(feature = "loader")]
 pub mod cgroups;
 mod contract;
+pub mod dns;
 pub mod ebpf;
+#[cfg(feature = "loader")]
+pub mod files;
 pub mod host;
 #[cfg(feature = "loader")]
 pub mod loader;
 mod model;
 pub mod parse;
+#[cfg(feature = "loader")]
+pub mod route;
 #[cfg(feature = "loader")]
 pub mod snapshot;
 pub mod wg;
@@ -321,6 +372,8 @@ pub use model::{
     Change, ChangeKind, Claims, Endpoint, Footprint, FootprintView, Invocation, Owner, Proto, Tracker, WatchState,
 };
 
+#[cfg(test)]
+mod dns_scope_props;
 #[cfg(test)]
 mod props;
 #[cfg(test)]

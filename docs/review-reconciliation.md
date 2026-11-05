@@ -487,3 +487,84 @@ Reconciled at `f7d90e7` against the failed `vm-netwatch` job in run 41741215668,
 Reconciled the formatted WireGuard head `d589c341` with namespace tracking at `3bdba7c5` on #68 (the repaired #70 restack). An interface rename must also rename each configuring unit's persisted WireGuard binding; its current endpoint set and both invocation histories keep their identity. The full-state final-name oracle now includes those bindings, a generated snapshot/reattach property checks changed peers under the new name, and a binding-only partial-rename mutant is rejected. VM (s) renames the real WireGuard device, changes a peer under its new name, verifies the saved binding and current endpoints directly, then renames it back. N22 records this integration regression; interrupted dumps use N21, leaving #70's N17 cache row intact.
 
 B-27 remains open: bindings accumulate and survive netwatch restart through `.state`. Neither another configuring request nor restarting the watcher clears an old same-name binding. The documented mitigation now requires reboot or an actual reset of the saved binding. This corrects the accepted limitation without changing its semantics. Opens no path (rule 18); the documentation and VM wiring need no separate property beyond the identity fold properties (rule 23). Final stacked-head Rust/Nix and VM execution remain pending CI.
+
+
+## lane-change-path: DNS/proxy loop integration (#74 readiness), 4 Nov
+
+At `10b003d`, each settings pass asks the kernel for routes, the probes
+report those reads, and the next drain treats them as external work. That
+starts another settings pass and keeps rewriting the heartbeat. #71's
+`Event::is_own_request` filter closes the shared cause: own reads are
+discarded before the effective drain count, scan triggers and idle wait.
+Malformed events still count as loss and fail closed.
+
+#74 is stacked on #71 (`e3dec50`): the loop retains the WireGuard scan and
+DNS/proxy scan, with their original external-event and tick triggers. The
+DNS charge stays with the virtual interface's creators and steering
+routers, never the settings writer or a physical uplink's DHCP client.
+`vm-netwatch` (t3) now samples heartbeat rewrites and process CPU after a
+real non-loopback DNS lookup; the property and common regression are N13
+in `docs/regression-ledger.md`.
+
+B-22 combines #71's closed WireGuard half with #74's narrowed DNS/proxy
+half. Hostname proxies, proxy settings outside the listed system files,
+and a local DNS proxy's own upstream configuration remain uncovered and
+explicitly fail open; this PR does not call B-22 or the Phase A gate closed.
+This loop correction opens no path (rule 18).
+
+### #74 independent review: scoped literals and shell assignment words
+
+At published `6db4fa98` the reviewer found three holes inside the existing
+IP-literal settings scope: numeric IPv6 scopes were treated as interface
+names, scoped IPv6 proxy hosts were rejected before parsing, and trailing
+shell comments or semicolons hid otherwise valid literal proxy values.
+
+The follow-up resolves a numeric scope through the live interface map;
+missing and overflowing indexes are Unknown. Plain and RFC-encoded URI
+zones use the shared scoped-address parser; percent decoding is URI-only,
+so a DNS scope %25 remains index 25. A literal assignment-word tokenizer
+handles quotes, escapes, comments and semicolon boundaries without executing
+shell or expanding variables. IPv4 scopes remain invalid, and hostname
+proxies remain explicitly unsupported by B-22. Independent construction
+properties and VM case (t9) cover these corrections (ledger N18–N20).
+The correction opens no path (rule 18).
+
+Re-review at `b8398360` caught the ambiguous bare proxy zone `%25`: native
+curl accepts it as numeric interface index 25, while `%2525` encodes that
+same index. URI delimiter decoding now requires a nonempty zone suffix
+before the closing bracket. Independent owner constructions include both
+index-25 spellings, plus empty and overflowing scope boundaries; a seeded
+mutant restores the unconditional decoder (N19).
+
+The final #74 candidate stacks on #71 `14f822c5` (including #70 and #68),
+using initial #71 `e3dec50` as the three-way base. The loader retains
+`take_cached` event identity, persisted WireGuard bindings retain their
+rename fold and independent properties, and the common own-read filter
+precedes all scan triggers. DNS uses fresh live names for route and scope
+resolution. The combined VM keeps namespace (r), WireGuard (s), and DNS
+(t) cases; the final stacked-head Rust/Nix and VM checks remain pending.
+
+### #74 live resolved state format (N23)
+
+Rust CI passed at `b53bad25`, but the first live DNS case failed on the
+descendant `ded07a98` (run 41910326878, job 126856505840): the VPN owned a
+`resolved` DNS object while the expected `link nwdns0` object was absent.
+The per-link assertion is correct. The pinned systemd 260.5 producer saves
+addresses under `SERVERS=` in `/run/systemd/resolve/netif/<ifindex>`
+([link_save_user](https://github.com/systemd/systemd/blob/v260.5/src/resolve/resolved-link.c#L1293));
+the parser accepted only `DNS=` and `DNS_EX=`. The flattened global file
+could attribute this simple server by route, masking the missing link
+context in synthetic tests.
+
+The parser now accepts `SERVERS=`. Its saved-server adapter also preserves
+the pinned producer's scope after a port (`[fe80::1]:853%7#name`), keeping
+that grammar separate from proxy URI rules
+([serializer](https://github.com/systemd/systemd/blob/v260.5/src/basic/in-addr-util.c#L561)).
+An independent producer-format property constructs the saved record and interface map, checks the exact per-link
+key and IPv4/scoped-IPv6 targets, and requires the link owner's charge
+without an unscoped lookup. The seeded setting property retains legacy
+spellings and mutants that ignore `SERVERS=` or drop that scope. VM
+(t1)–(t9) retain their ownership and object-identity assertions; (t1), (t2) and (t7) exercise the
+native per-link path. DNS diagnostics tolerate an absent footprint file
+so route/resolved output still prints. Opens no path (rule 18); fresh
+Rust and live VM execution remain pending.

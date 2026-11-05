@@ -362,6 +362,12 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
     let mut lost_seen = 0u64;
     // WireGuard's generic netlink family id, once known (read each tick).
     let mut wg_family: Option<u16> = crate::snapshot::wireguard_family().unwrap_or(None);
+    // B-22 (a): the settings that carry DNS and proxy steering, recomputed
+    // each pass they may have changed (a file changed, or external work the
+    // ring delivered: a route or an interface may have moved the charge) and at
+    // every tick. Nothing is remembered between passes.
+    let files = crate::files::Files::new(Path::new("/"));
+    let mut files_seen = Vec::new();
     let mut next_tick = Instant::now();
     // Between ticks, the running units are refreshed at most this often.
     let mut running = std::collections::BTreeSet::new();
@@ -482,6 +488,25 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                     tracker.lost(None);
                     changed = true;
                 }
+            }
+        }
+        let signature = files.signature();
+        if signature != files_seen || drained > 0 || tick {
+            files_seen = signature;
+            let names = read_ifnames();
+            let settings = files.observe(&mut |i| names.get(&i).cloned());
+            let virtual_links = tracker.virtual_links().clone();
+            let lookup = |a: &std::net::IpAddr| {
+                crate::route::get(a, &mut |i| names.get(&i).cloned().or_else(|| read_ifnames().get(&i).cloned()))
+            };
+            let owners = |n: &str| tracker.interface_owners(n);
+            let ifname = |i: u32| names.get(&i).cloned().or_else(|| read_ifnames().get(&i).cloned());
+            let world =
+                crate::dns::World { virtual_ifaces: &virtual_links, owners: &owners, lookup: &lookup, ifname: &ifname };
+            let charges = crate::dns::all(&settings, &world);
+            if charges != tracker.dns_charges() {
+                tracker.set_dns(&charges);
+                changed = true;
             }
         }
         if tick || changed {
