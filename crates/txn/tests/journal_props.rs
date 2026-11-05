@@ -26,6 +26,38 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, FailurePersistence};
 use std::collections::BTreeMap;
 
+proptest! {
+    #![proptest_config(config(64))]
+
+    /// J7: whichever owner acknowledges first, takeover supersedes only an
+    /// operation still unacknowledged at its locked decision. Every begun
+    /// operation ends with exactly one acknowledgement.
+    #[test]
+    fn a_takeover_never_acknowledges_an_operation_twice(
+        old_owner_first in proptest::collection::vec(any::<bool>(), 1..24),
+    ) {
+        let rig = Rig::new();
+        let mut kernel = rig.daemon();
+        let id = kernel.prepare(txn(Transition::RestartUnit(web()), Actor::Daemon)).unwrap();
+        let now = rig.w().now;
+        for (i, old_first) in old_owner_first.into_iter().enumerate() {
+            let op = OpId { txn: id, epoch: 1, seq: i as u64 + 1 };
+            kernel.journal.append(now, Record::OpBegin { op, call: "restart".into() }).unwrap();
+            if old_first {
+                kernel.journal.append(now, Record::OpAck { op, outcome: Outcome::Succeeded }).unwrap();
+            }
+            prop_assert_eq!(planarian_txn::supersedes(kernel.journal.ledger(), op), !old_first);
+            kernel.supersede_unacked(&[op]).unwrap();
+            // A second takeover or a stale captured list still cannot ack twice.
+            kernel.supersede_unacked(&[op]).unwrap();
+            let entries = kernel.journal.segment().unwrap();
+            let acks = entries.iter().filter(|e| matches!(&e.record, Record::OpAck { op: seen, .. } if *seen == op)).count();
+            prop_assert_eq!(acks, 1);
+            prop_assert!(!planarian_txn::supersedes(kernel.journal.ledger(), op));
+        }
+    }
+}
+
 thread_local! {
     /// Overrides for `at_the_default_journal_size`: the store's size, and
     /// the cases per property.
@@ -379,19 +411,21 @@ fn damage() -> impl Strategy<Value = Damage> {
     ]
 }
 
-/// The frame format (journal.rs's header): `len | crc32c | seq | prev |
-/// payload`, the CRC over the format tag, `seq`, `prev` and the payload.
+/// The frame format (journal.rs's header): `len | crc32c | seq | prev | class |
+/// payload`, the CRC over the format tag, `seq`, `prev`, the class byte and
+/// the payload (format 3).
 fn reframe(bytes: &[u8], edit: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
-    let (seq, prev) = (&bytes[8..16], &bytes[16..48]);
-    let mut payload = bytes[48..].to_vec();
+    let (seq, prev, class) = (&bytes[8..16], &bytes[16..48], bytes[48]);
+    let mut payload = bytes[49..].to_vec();
     edit(&mut payload);
     let mut body = Vec::new();
     body.extend_from_slice(seq);
     body.extend_from_slice(prev);
+    body.push(class);
     body.extend_from_slice(&payload);
     let mut out = Vec::new();
-    out.extend_from_slice(&((32 + payload.len()) as u32).to_le_bytes());
-    out.extend_from_slice(&crc32c::crc32c_append(crc32c::crc32c(b"planarian-journal-2"), &body).to_le_bytes());
+    out.extend_from_slice(&((33 + payload.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&crc32c::crc32c_append(crc32c::crc32c(b"planarian-journal-3"), &body).to_le_bytes());
     out.extend_from_slice(&body);
     out
 }
@@ -429,7 +463,7 @@ proptest! {
                     p[k] = if p[k] == byte { byte ^ 1 } else { byte };
                 });
                 let seq = u64::from_le_bytes(b[8..16].try_into().unwrap());
-                may_open = serde_json::from_slice::<Ledger>(&b[48..])
+                may_open = serde_json::from_slice::<Ledger>(&b[49..])
                     .is_ok_and(|l| l.last_seq == seq && l.well_formed());
                 b
             }
@@ -560,4 +594,99 @@ fn at_the_default_journal_size() {
     holds_are_the_last_event_per_unit();
     a_damaged_checkpoint_is_integrity();
     an_accepted_append_survives_any_crash();
+}
+
+/// Simulate power loss after checkpoint replacement but before log reset.
+/// The old prefix survives, reload skips it, and later records are appended
+/// after it rather than at byte zero.
+fn checkpoint_with_optional_reset_crash(kernel: &mut K, rig: &Rig, crash: bool) {
+    let prefix = rig.store.read_at(0, kernel.journal.offset() as usize).unwrap();
+    kernel.journal.compact().unwrap();
+    if crash {
+        rig.store.write_at(0, &prefix).unwrap();
+        rig.store.sync().unwrap();
+    }
+    *kernel = rig.daemon();
+}
+
+fn assert_compatibility_field_requirements(kernel: &mut K, expected: bool) {
+    let needs = kernel.journal.required_decisive().unwrap();
+    let prepared = needs
+        .fields
+        .get("Prepared")
+        .is_some_and(|fields| fields.iter().any(|field| field == "facts.journal_incompatibility"));
+    let checkpoint = needs
+        .fields
+        .get("checkpoint")
+        .is_some_and(|fields| fields.iter().any(|field| field == "live.*.txn.facts.journal_incompatibility"));
+    assert_eq!((prepared, checkpoint), (expected, expected), "{needs:?}");
+    let mut target = planarian_txn::journal::supported();
+    target.fields.get_mut("Prepared").unwrap().retain(|field| field != "facts.journal_incompatibility");
+    target.fields.get_mut("checkpoint").unwrap().retain(|field| field != "live.*.txn.facts.journal_incompatibility");
+    assert_eq!(!needs.unsupported_by(&target).is_empty(), expected, "{needs:?}");
+}
+
+fn append_terminal_compatibility_transaction(kernel: &mut K, extension: bool) -> TxnId {
+    let mut transaction = txn(Transition::RestartUnit(web()), Actor::user(ADMIN));
+    if extension {
+        transaction.facts.journal_incompatibility = vec!["target lacks a decisive field".into()];
+    }
+    let id = kernel.prepare(transaction).unwrap();
+    kernel.reject(id, RejectReason::Other("fixture declined".into())).unwrap();
+    assert!(kernel.journal.ledger().terminal.contains_key(&id));
+    assert!(!kernel.journal.ledger().live.contains_key(&id));
+    id
+}
+
+#[test]
+fn a_reset_crash_prefix_cannot_hide_a_later_terminal_decisive_field() {
+    let rig = Rig::new();
+    let mut kernel = rig.daemon();
+    kernel.journal.append(Timestamp(1), Record::KnownGood(G1)).unwrap();
+    checkpoint_with_optional_reset_crash(&mut kernel, &rig, true);
+    let id = append_terminal_compatibility_transaction(&mut kernel, true);
+    let retained = kernel.journal.segment().unwrap();
+    assert!(retained.iter().any(|entry| matches!(&entry.record, Record::Prepared(t) if t.id == id)));
+    assert!(retained.iter().any(|entry| matches!(&entry.record, Record::Advance { txn, .. } if *txn == id)));
+    assert_compatibility_field_requirements(&mut kernel, true);
+    let saved = kernel.journal.compact_returning_segment().unwrap();
+    assert_eq!(saved, retained, "the gym must save exactly the retained suffix it checkpoints");
+    let mut again = rig.daemon();
+    assert_compatibility_field_requirements(&mut again, true);
+}
+
+proptest! {
+    #![proptest_config(config(64))]
+
+    /// Actual extension fields, rather than only baseline kinds, can change
+    /// the descriptor. Their requirements outlive a transaction, every
+    /// checkpoint/reset crash, compaction, and subsequent empty extension.
+    #[test]
+    fn decisive_extensions_survive_reset_crashes_and_terminal_history(
+        rounds in proptest::collection::vec((1u8..5, any::<bool>(), any::<bool>()), 1..8),
+    ) {
+        let rig = Rig::new();
+        let mut kernel = rig.daemon();
+        let mut required = false;
+        for (prefix, crash, extension) in rounds {
+            for i in 0..prefix {
+                kernel.journal.append(Timestamp(i as u64), Record::KnownGood(G1)).unwrap();
+            }
+            checkpoint_with_optional_reset_crash(&mut kernel, &rig, crash);
+            let id = append_terminal_compatibility_transaction(&mut kernel, extension);
+            required |= extension;
+            assert_compatibility_field_requirements(&mut kernel, required);
+            let saved = kernel.journal.compact_returning_segment().unwrap();
+            prop_assert!(
+                saved.iter().any(|entry| matches!(&entry.record, Record::Prepared(t) if t.id == id)),
+                "saved Prepared"
+            );
+            prop_assert!(
+                saved.iter().any(|entry| matches!(&entry.record, Record::Advance { txn, .. } if *txn == id)),
+                "saved Advance"
+            );
+            kernel = rig.daemon();
+            assert_compatibility_field_requirements(&mut kernel, required);
+        }
+    }
 }

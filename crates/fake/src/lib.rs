@@ -230,6 +230,10 @@ pub struct World {
     pub agent_instances: BTreeMap<String, InstanceId>,
     /// The next build's dry activation fails this way (R10).
     pub dry_activate_fails: Option<String>,
+    /// Static per-generation journalKinds exports. An explicit None is a
+    /// pre-export build; other generations use this build's descriptor.
+    pub journal_kinds: BTreeMap<String, Option<String>>,
+    pub journal_kinds_fails: Option<String>,
     /// §12d: network-security units whose failure holds traffic, as systemd's
     /// `OnFailure=` on them starts `planarian-hold@<unit>` (nix/posture.nix).
     pub hold_on_failure: BTreeSet<UnitId>,
@@ -908,6 +912,16 @@ impl UnitBackend for Fake {
 }
 
 impl GenerationBackend for Fake {
+    fn journal_kinds(&self, path: &StorePath) -> Result<Option<String>, Outcome> {
+        let w = self.w();
+        if let Some(why) = &w.journal_kinds_fails {
+            return Err(Outcome::Unknown(why.clone()));
+        }
+        Ok(w.journal_kinds.get(&path.0).cloned().unwrap_or_else(|| {
+            Some(serde_json::to_string(&planarian_txn::journal::supported()).expect("journal kinds serialize"))
+        }))
+    }
+
     fn current(&self) -> Result<GenerationId, Outcome> {
         Ok(self.w().current)
     }

@@ -236,6 +236,7 @@ pub fn derive(i: &DeriveInput<'_>) -> DerivedFacts {
         changes_desired: false,
         touches_core: false,
         below_security_floor: false,
+        journal_incompatibility: Vec::new(),
         restores_unattributed_stop: false,
         restarts_failed_unit: false,
         removes_sensitivity: Default::default(),

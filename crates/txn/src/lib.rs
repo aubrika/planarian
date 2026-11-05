@@ -23,5 +23,7 @@ pub mod ledger;
 pub mod machine;
 pub mod store;
 
+pub use kernel::supersedes;
+
 #[cfg(kani)]
 mod kani;

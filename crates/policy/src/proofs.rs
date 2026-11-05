@@ -299,6 +299,7 @@ pub proof fn i14_facts_caller_is_not_authority(a: Input, b: Input)
         a.facts.changes_desired == b.facts.changes_desired,
         a.facts.touches_core == b.facts.touches_core,
         a.facts.below_security_floor == b.facts.below_security_floor,
+        a.facts.journal_incompatibility == b.facts.journal_incompatibility,
         a.facts.other_sessions_affected == b.facts.other_sessions_affected,
         a.facts.affected_sessions == b.facts.affected_sessions,
         a.facts.restores_unattributed_stop == b.facts.restores_unattributed_stop,

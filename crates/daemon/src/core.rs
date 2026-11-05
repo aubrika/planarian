@@ -1261,7 +1261,19 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         // The units it would remove or stop: derive's `removes`, the same set
         // as `removes_sensitivity` (§11 Rollback row), each with its own.
         let (removed, each_known) = crate::approval::removed(f);
-        crate::approval::diff(t, options, evaluated.is_some(), &removed, each_known, &self.ex.cfg.tables)
+        let mut diff =
+            crate::approval::diff(t, options, evaluated.is_some(), &removed, each_known, &self.ex.cfg.tables);
+        if !f.journal_incompatibility.is_empty() {
+            let warning = format!(
+                "The target Planarian cannot read decisive journal data: {}. Administrator approval is required; the target may stop with Integrity or lose these decisions.",
+                f.journal_incompatibility.join(", ")
+            );
+            diff.note = Some(match diff.note {
+                Some(note) => format!("{note}; {warning}"),
+                None => warning,
+            });
+        }
+        diff
     }
 
     /// Every option whose value differs between a live generation

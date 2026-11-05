@@ -52,6 +52,7 @@ fn facts(
         changes_desired: flags & 4 != 0,
         touches_core: flags & 8 != 0,
         below_security_floor: flags & 16 != 0,
+        journal_incompatibility: Vec::new(),
         restores_unattributed_stop: flags & 128 != 0,
         restarts_failed_unit: false,
         removes_sensitivity: Default::default(),
