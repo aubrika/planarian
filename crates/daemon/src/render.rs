@@ -92,10 +92,15 @@ pub fn record(r: &Record) -> String {
         Record::HoldApplied { unit, by } => format!("traffic held for {unit} ({by:?})"),
         Record::HoldLifted { unit, reason } => format!("traffic hold on {unit} lifted: {reason}"),
         Record::Skipped { kind } => format!("a {kind} record from a newer Planarian, skipped"),
+        Record::ExecProbeFlagged { unit, probe, argv0 } => {
+            format!("{unit}: probe {probe} is an Exec probe: it runs a command ({argv0}) rather than a typed check")
+        }
     }
 }
 
-pub fn evidence(s: &SystemState, u: &UnitId) -> String {
+/// A unit's observed state and probe results, one part each. An `Exec` probe
+/// is named as one (§9: flagged in the console and the journal).
+pub fn evidence(s: &SystemState, defs: &UnitDefs, u: &UnitId) -> String {
     let Some((o, ev)) = s.units.get(u) else { return String::new() };
     let mut parts = vec![format!("{o:?}")];
     for e in ev {
@@ -107,7 +112,11 @@ pub fn evidence(s: &SystemState, u: &UnitId) -> String {
             ProbeResult::Error(m) => format!("error ({m})"),
         };
         let stale = if e.fresh_at(s.observed_at) { "" } else { ", stale" };
-        parts.push(format!("{}: {r}{stale}", e.probe.0));
+        let exec = defs.get(u).is_some_and(|d| {
+            d.probes.iter().any(|p| p.id == e.probe && matches!(p.kind, planarian_schema::ProbeKind::Exec { .. }))
+        });
+        let kind = if exec { " (Exec)" } else { "" };
+        parts.push(format!("{}{kind}: {r}{stale}", e.probe.0));
     }
     parts.join("; ")
 }

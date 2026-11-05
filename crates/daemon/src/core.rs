@@ -271,6 +271,12 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// retried quietly at `HOLD_UNCONFIRMED_RETRY`'s cadence, so a hung lift
     /// neither churns the journal nor spends every tick's budget.
     lift_unconfirmed: BTreeMap<UnitId, Timestamp>,
+    /// §9: Exec probes already flagged in the journal this run (a record and
+    /// a notice, once per probe and command, the first time each is seen).
+    exec_flagged: BTreeSet<(UnitId, String, String)>,
+    /// An append error may have followed the write. Its preceding sequence
+    /// bounds where a retry looks for an already-written flag.
+    exec_flag_pending: BTreeMap<(UnitId, String, String), u64>,
     /// §12d: the end of this tick's hold budget (`hold_wait`).
     hold_left: Millis,
     /// Generation transactions withdrawn from `Built` for a rollback about to
@@ -458,6 +464,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             daemon_held: BTreeSet::new(),
             hold_unconfirmed: BTreeMap::new(),
             lift_unconfirmed: BTreeMap::new(),
+            exec_flagged: BTreeSet::new(),
+            exec_flag_pending: BTreeMap::new(),
             hold_left: HOLD_WAIT,
             withdrawn: vec![],
             earlier: BTreeMap::new(),
@@ -836,6 +844,67 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         &mut self,
     ) -> Result<Vec<planarian_txn::ledger::Entry>, planarian_txn::journal::JournalError> {
         self.ex.kernel.journal.compact_returning_segment()
+    }
+
+    /// §9: "`Exec` probes ... are flagged in the console and the journal":
+    /// one notice (which the binary writes to the system journal) the first
+    /// time each is seen. The console and `planarian status` flag them in
+    /// the unit rows (`render::evidence`).
+    fn flag_exec_probes(&mut self, defs: &UnitDefs) {
+        for (u, d) in defs {
+            for p in &d.probes {
+                if let ProbeKind::Exec { argv, .. } = &p.kind {
+                    let argv0 = argv.first().cloned().unwrap_or_default();
+                    let key = (u.clone(), p.id.0.clone(), argv0.clone());
+                    if self.exec_flagged.contains(&key) {
+                        continue;
+                    }
+                    let written = (|| -> Result<(), JournalError> {
+                        if let Some(after) = self.exec_flag_pending.get(&key).copied() {
+                            // An I/O error does not say whether the frame was
+                            // written. Reconcile it before retrying; a frame
+                            // read back is confirmed only after sync succeeds.
+                            self.ex.kernel.journal.sync_ledger()?;
+                            let found = self.ex.kernel.journal.segment()?.iter().any(|e| {
+                                e.seq > after
+                                    && matches!(
+                                        &e.record,
+                                        Record::ExecProbeFlagged { unit, probe, argv0: seen }
+                                            if unit == u && probe == &p.id.0 && seen == &argv0
+                                    )
+                            });
+                            if found {
+                                self.ex.kernel.journal.store().sync()?;
+                                return Ok(());
+                            }
+                            // Compaction may have discarded an unconfirmed
+                            // informational frame. Then emit a fresh flag.
+                        }
+                        let after = self.ex.kernel.journal.ledger().last_seq;
+                        let record =
+                            Record::ExecProbeFlagged { unit: u.clone(), probe: p.id.0.clone(), argv0: argv0.clone() };
+                        match self.ex.kernel.journal.append(self.b.clock().now(), record) {
+                            Ok(_) => Ok(()),
+                            Err(e) => {
+                                self.exec_flag_pending.entry(key.clone()).or_insert(after);
+                                Err(e)
+                            }
+                        }
+                    })();
+                    match written {
+                        Ok(()) => {
+                            self.exec_flag_pending.remove(&key);
+                            self.exec_flagged.insert(key);
+                            self.notice(format!(
+                                "{u}: probe {} is an Exec probe: it runs a command ({argv0}) rather than a typed check",
+                                p.id.0
+                            ));
+                        }
+                        Err(e) => self.notice(format!("journal write failed: {e:?}")),
+                    }
+                }
+            }
+        }
     }
 
     fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {
@@ -1816,6 +1885,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         // daemon just applied is in the state the repair is derived from.
         let (s, defs) = if self.network_holds(&s, &defs) { self.observe() } else { (s, defs) };
 
+        self.flag_exec_probes(&defs);
+
         // §13: a hold opened here runs from the decision, after the probes.
         let decided = self.b.clock().now();
         for inc in self.incidents.tick_at(now, decided, &s, &defs) {
@@ -2440,7 +2511,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             .keys()
             .map(|u| {
                 let status = s.status(u, &defs);
-                UnitRow { unit: u.clone(), detail: render::evidence(&s, u), expected: s.expected(u, &defs), status }
+                UnitRow {
+                    unit: u.clone(),
+                    detail: render::evidence(&s, &defs, u),
+                    expected: s.expected(u, &defs),
+                    status,
+                }
             })
             .collect();
         let pending = self

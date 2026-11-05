@@ -965,7 +965,7 @@ fn kinds_are_the_variants() {
         assert_eq!(arms.matches(&format!("(\"{k}\", D)")).count(), 1, "{k} is listed decisive but its arm is not D");
     }
     let informational: Vec<&&str> = KINDS.iter().filter(|k| !DECISIVE_KINDS.contains(k)).collect();
-    assert_eq!(informational, [&"Skipped"], "everything else is decisive");
+    assert_eq!(informational, [&"ExecProbeFlagged", &"Skipped"], "everything else is decisive");
     // The name is what serde writes.
     for kind in 0..6 {
         let r = record(kind, 3, 2);
@@ -1258,4 +1258,115 @@ fn an_unknown_class_after_damage_is_still_an_intact_later_record() {
     let before = store.read_at(0, 64 << 10).unwrap();
     assert!(matches!(Journal::open(store.clone()), Err(JournalError::Integrity(_))));
     assert_eq!(store.read_at(0, 64 << 10).unwrap(), before);
+}
+
+/// An Exec flag is informational, leaves decisions unchanged and, if unknown, is skipped.
+#[test]
+fn an_informational_kind_is_written_informational_and_applies_to_nothing() {
+    let store = MemStore::new(64 << 10);
+    let mut j = Journal::open(store.clone()).unwrap();
+    append(&mut j, 0).unwrap();
+    let before = serde_json::to_value(j.ledger()).unwrap();
+    let flagged = Record::ExecProbeFlagged {
+        unit: planarian_schema::UnitId::service("u"),
+        probe: "p".into(),
+        argv0: "sh".into(),
+    };
+    let at = j.offset();
+    let e = j.append(Timestamp(5), flagged.clone()).unwrap();
+    // On disk: format 3, class byte 1.
+    let header = store.read_at(at, HEADER).unwrap();
+    let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    let bytes = store.read_at(at, HEADER + len).unwrap();
+    let f = unframe(&bytes).expect("intact");
+    assert_eq!((f.format, f.class), (3, Class::Informational));
+    // Known to this reader: it reads as itself and changes only last_seq.
+    let again = Journal::open(store.clone()).unwrap();
+    assert_eq!(again.ledger().last_seq, e.seq);
+    let mut after = serde_json::to_value(again.ledger()).unwrap();
+    let mut was = before;
+    after["last_seq"] = 0.into();
+    was["last_seq"] = 0.into();
+    assert_eq!(after, was, "an informational record changes nothing in the ledger");
+    // Unknown to a reader (renamed, as a newer build's kind would be to an older one): skipped.
+    let json = String::from_utf8(f.payload.to_vec()).unwrap().replace("ExecProbeFlagged", "FromTheFuture");
+    let entry = decode(&Frame {
+        seq: e.seq,
+        prev: f.prev,
+        class: Class::Informational,
+        format: 3,
+        payload: json.as_bytes(),
+        size: 0,
+    });
+    assert_eq!(entry.unwrap().record, Record::Skipped { kind: "FromTheFuture".into() });
+}
+
+/// Informational flags never raise the generation compatibility floor.
+#[test]
+fn an_exec_flag_adds_no_decisive_journal_requirement() {
+    let mut j = Journal::open(MemStore::new(64 << 10)).unwrap();
+    let before = j.required_decisive().unwrap();
+    let flagged = Record::ExecProbeFlagged {
+        unit: planarian_schema::UnitId::service("u"),
+        probe: "p".into(),
+        argv0: "sh".into(),
+    };
+    j.append(Timestamp(5), flagged).unwrap();
+    assert_eq!(j.required_decisive().unwrap(), before);
+    j.compact().unwrap();
+    assert_eq!(j.required_decisive().unwrap(), before);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+    /// Filter known Exec flags out of generated histories: every decision
+    /// and decisive requirement stays identical, through reopen/compaction.
+    #[test]
+    fn known_exec_flags_never_change_decisions_or_requirements(
+        steps in proptest::collection::vec((0u8..4, any::<u16>(), 1usize..4, any::<bool>(), any::<bool>()), 1..20),
+    ) {
+        let flagged_store = MemStore::new(64 << 10);
+        let plain_store = MemStore::new(64 << 10);
+        let mut flagged = Journal::open(flagged_store.clone()).unwrap();
+        let mut plain = Journal::open(plain_store.clone()).unwrap();
+        for (kind, value, flags, compact, reopen) in steps {
+            let generation = GenerationId(value as u64);
+            let decision = match kind {
+                0 => Record::KnownGood(generation),
+                1 => Record::LiveTested(Some(generation)),
+                2 => Record::AcceptedBaseline(Some(generation)),
+                _ => Record::SecurityFloor(Some(generation)),
+            };
+            flagged.append(Timestamp(1), decision.clone()).unwrap();
+            plain.append(Timestamp(1), decision).unwrap();
+            for probe in 0..flags {
+                let record = Record::ExecProbeFlagged {
+                    unit: planarian_schema::UnitId::service(&format!("u{value}")),
+                    probe: format!("p{probe}"),
+                    argv0: format!("command{value}"),
+                };
+                prop_assert_eq!(class_of(&record), Class::Informational);
+                flagged.append(Timestamp(2), record).unwrap();
+            }
+            for phase in 0..3 {
+                if phase == 1 && reopen {
+                    flagged = Journal::open(flagged_store.clone()).unwrap();
+                    plain = Journal::open(plain_store.clone()).unwrap();
+                }
+                if phase == 2 && compact {
+                    flagged.compact().unwrap();
+                    plain.compact().unwrap();
+                    flagged = Journal::open(flagged_store.clone()).unwrap();
+                    plain = Journal::open(plain_store.clone()).unwrap();
+                }
+                let mut actual = serde_json::to_value(flagged.ledger()).unwrap();
+                let mut expected = serde_json::to_value(plain.ledger()).unwrap();
+                actual.as_object_mut().unwrap().remove("last_seq");
+                expected.as_object_mut().unwrap().remove("last_seq");
+                prop_assert_eq!(actual, expected, "phase {}", phase);
+                prop_assert_eq!(flagged.required_decisive().unwrap(), plain.required_decisive().unwrap(), "phase {}", phase);
+            }
+        }
+    }
 }
