@@ -5,7 +5,7 @@
 //! fix must change nothing else. The ledger says which mutant each one
 //! catches. `PROPTEST_CASES` overrides the case counts.
 
-use crate::ebpf::{Event, HOOK_NETDEV, HOOK_NFBATCH, HOOK_NFNETLINK, HOOK_RTNETLINK, HOOK_SOCKOPT};
+use crate::ebpf::{Event, HOOK_NETDEV, HOOK_NETMOVE, HOOK_NFBATCH, HOOK_NFNETLINK, HOOK_RTNETLINK, HOOK_SOCKOPT};
 use crate::host::unit_of_cgroup;
 use crate::model::{Change, ChangeKind, Claims, Owner, Tracker, WatchState};
 use crate::parse::{Parsed, parse, take};
@@ -145,7 +145,9 @@ fn any_event(netns: u32) -> impl Strategy<Value = Event> {
         Just(HOOK_NFBATCH),
         Just(HOOK_SOCKOPT),
         Just(HOOK_NETDEV),
-        0u32..9
+        // Not a move: which way one went depends on the host's netns, and
+        // `tests::moves` has its own exhaustive property for them.
+        (0u32..9).prop_filter("a move is read by parse_move", |h| *h != HOOK_NETMOVE)
     ];
     // A header with a type that matters (link/route/rule messages, with and
     // without NLM_F_CREATE) followed by arbitrary bytes.
@@ -157,23 +159,20 @@ fn any_event(netns: u32) -> impl Strategy<Value = Event> {
 proptest! {
     #![proptest_config(cfg(512))]
 
-    /// An event acting in another network namespace changes nothing here,
-    /// unless it is a link request that may reach into this one (then the
-    /// mover's footprint is unattributed). The frame: a request elsewhere
-    /// that cannot reach us leaves every footprint and claim as it was.
+    /// An event acting in another network namespace changes nothing here:
+    /// every footprint and claim is as it was, whatever the event is, a link
+    /// request that names a namespace in this machine's reach included (a
+    /// move into the host is seen as the move, `tests::moves`).
     #[test]
     fn events_in_other_namespaces_change_nothing_here(
         other in (1u32..).prop_filter("not ours", |n| *n != OWN_NETNS),
         ev in any_event(0),
     ) {
         let ev = Event { netns: other, ..ev };
-        let reaches = ev.hook == HOOK_RTNETLINK && matches!(ev.nlmsg_type(), Some(16 | 19));
         let mut t = baseline();
         let before = rendered(&t);
         take(&mut t, &ev, OWN_NETNS, || Some(UnitId::service("other")), &mut no_names);
-        if !reaches {
-            prop_assert_eq!(rendered(&t), before, "{:?}", ev);
-        }
+        prop_assert_eq!(rendered(&t), before, "{:?}", ev);
     }
 
     /// A netns the probe could not read is a loss nothing can place: the
@@ -194,6 +193,7 @@ proptest! {
         match parse(&ev, &owner, &mut no_names) {
             Parsed::Nothing => {}
             Parsed::Changes(cs) => cs.iter().for_each(|c| direct.apply(c)),
+            Parsed::Renamed { was, now } => direct.rename_interface(&was, &now),
             Parsed::Unreadable(_) => direct.lost(Some(&UnitId::service("other"))),
         }
         let mut via_take = baseline();
@@ -215,15 +215,19 @@ fn nl_attr(ty: u16, v: &[u8]) -> Vec<u8> {
 proptest! {
     #![proptest_config(cfg(512))]
 
-    /// A link request acting elsewhere that names a namespace in this
+    /// A link request acting elsewhere changes nothing of the host's by
+    /// itself, whatever it asks for: even one that names a namespace in this
     /// machine's reach (IFLA_NET_NS_PID 19, IFLA_NET_NS_FD 28,
-    /// IFLA_TARGET_NETNSID 46) may move a device into the host's: the mover
-    /// is charged as unattributed (protecting: fail closed), or nobody's
-    /// unit is known and the global marker stands. A request with only
-    /// other attributes changes nothing (the frame). Over RTM_NEWLINK and
-    /// RTM_SETLINK, with other attributes before and after.
+    /// IFLA_TARGET_NETNSID 46) and may move a device into the host's. A
+    /// move that happens is seen as the move (`__dev_change_net_namespace`,
+    /// `tests::moves`: arrival, departure, unreadable ends all decided there),
+    /// and a link created in the host as its registration; a request that
+    /// moves nothing leaves nothing behind. (Before B-24 was closed this
+    /// charged the mover as unattributed, for good, with no object to clear
+    /// it by.) Over RTM_NEWLINK and RTM_SETLINK, with other attributes
+    /// before and after.
     #[test]
-    fn a_link_request_elsewhere_that_reaches_here_is_never_dropped(
+    fn a_link_request_elsewhere_changes_nothing_by_itself(
         ty in prop_oneof![Just(16u16), Just(19)],
         before in proptest::collection::vec(prop_oneof![Just(3u16), Just(4), Just(10), Just(13)], 0..3),
         reach in proptest::option::of(prop_oneof![Just(19u16), Just(28), Just(46)]),
@@ -240,17 +244,7 @@ proptest! {
         let before_state = rendered(&t);
         let mover = UnitId::service("other");
         take(&mut t, &ev, OWN_NETNS, || known.then(|| mover.clone()), &mut no_names);
-        let tools = [UnitId::service("wg"), mover.clone()];
-        let v = t.view(WatchState::Attached { at: NOW }, &tools, NOW);
-        if reach.is_some() {
-            if known {
-                prop_assert!(v.units["other"].unattributed && v.units["other"].protecting, "{:?}", v.units["other"]);
-            } else {
-                prop_assert!(!v.unattributed.is_empty(), "nobody's unit known: the global marker");
-            }
-        } else {
-            prop_assert_eq!(rendered(&t), before_state);
-        }
+        prop_assert_eq!(rendered(&t), before_state, "{} the host's state", if reach.is_some() { "a reaching request changed" } else { "a request changed" });
     }
 }
 

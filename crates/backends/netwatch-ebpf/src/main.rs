@@ -36,6 +36,8 @@ pub const HOOK_GENL: u32 = 3;
 pub const HOOK_NFBATCH: u32 = 4;
 pub const HOOK_SOCKOPT: u32 = 5;
 pub const HOOK_NETDEV: u32 = 6;
+pub const HOOK_NETMOVE: u32 = 7;
+pub const HOOK_NETRENAME: u32 = 8;
 
 #[repr(C)]
 pub struct Event {
@@ -326,6 +328,222 @@ pub fn netdev(ctx: FExitContext) -> u32 {
             && bpf_probe_read_kernel_buf(dev.wrapping_add(name_off as usize), &mut data[..16]).is_ok();
         (*ev).len = 16;
         (*ev).captured = if ok { 16 } else { 0 };
+    }
+    entry.submit(0);
+    0
+}
+
+/// The netns of a `struct net *`, or 0.
+#[inline(always)]
+fn netns_of_net(net: *const u8) -> u32 {
+    if net.is_null() {
+        return 0;
+    }
+    let inum = unsafe { core::ptr::read_volatile(&NETNS_NET_INUM) };
+    let mut b = [0u8; 4];
+    match unsafe { bpf_probe_read_kernel_buf(net.wrapping_add(inum as usize), &mut b) } {
+        Ok(()) => u32::from_ne_bytes(b),
+        Err(_) => 0,
+    }
+}
+
+/// The netns a device is in now (`net_device.nd_net`), or 0.
+#[inline(always)]
+fn netns_of_dev(dev: *const u8) -> u32 {
+    let (set, net_off) = unsafe { (core::ptr::read_volatile(&NETDEV_SET), core::ptr::read_volatile(&NETDEV_NET)) };
+    if set == 0 || dev.is_null() {
+        return 0;
+    }
+    netns_of_net(read_ptr(dev, net_off))
+}
+
+/// Where `__dev_change_net_namespace` found the device: the netns inode (4
+/// bytes, native-endian) then the name (`IFNAMSIZ`), written at entry and
+/// read at exit. The function runs under the RTNL lock (it asserts it), so
+/// there is never more than one call in flight and one slot is enough. All
+/// zeros means "not seen at entry": userspace fails closed.
+#[map]
+static MOVE_SRC: aya_ebpf::maps::Array<[u8; 20]> = aya_ebpf::maps::Array::with_max_entries(1, 0);
+
+/// A device is about to change network namespace: remember where it is and
+/// what it is called (the exit sees only where it went, and a name the
+/// kernel may have re-resolved).
+#[fentry(function = "__dev_change_net_namespace")]
+pub fn netmove_enter(ctx: FEntryContext) -> u32 {
+    let dev: *const u8 = ctx.arg(0);
+    let Some(slot) = MOVE_SRC.get_ptr_mut(0) else { return 0 };
+    let slot = unsafe { &mut *slot };
+    *slot = [0u8; 20];
+    let inum = netns_of_dev(dev).to_ne_bytes();
+    let name_off = unsafe { core::ptr::read_volatile(&NETDEV_NAME) };
+    let set = unsafe { core::ptr::read_volatile(&NETDEV_SET) };
+    if set == 0 || dev.is_null() {
+        return 0;
+    }
+    let mut name = [0u8; 16];
+    if unsafe { bpf_probe_read_kernel_buf(dev.wrapping_add(name_off as usize), &mut name) }.is_err() {
+        return 0;
+    }
+    for i in 0..4 {
+        slot[i] = inum[i];
+    }
+    for i in 0..16 {
+        slot[4 + i] = name[i];
+    }
+    0
+}
+
+/// A device changed network namespace (the function returned and the device
+/// is in the target): a link moved by `ip link set … netns`, `IFLA_NET_NS_*`
+/// or `IFLA_NEW_NETNSID`, in the mover's context. Reported with `netns` the
+/// target's inode and in `data`: the device's name now (16 bytes), the source
+/// netns inode (4) and the source name (16), from `MOVE_SRC`. A call that
+/// failed leaves the device where it was (its netns is not the target's) and
+/// reports nothing; one whose netns the probe could not read reports `netns`
+/// 0 (userspace fails closed).
+///
+/// The slot's cases: a call that fails is cleared here and reports nothing
+/// (inert: nothing moved). An exit with no entry (attached mid-call) finds
+/// the slot all zeros: source 0, which userspace reads as unreadable and
+/// fails closed. An exit that cannot reserve a ring entry counts in `LOST`
+/// (userspace: a loss nothing can place) and leaves the slot for the next
+/// entry to overwrite. An entry cannot be left without its exit while both
+/// are attached: the exit runs on every return.
+///
+/// Note the cost of a source of 0 (an exit with no entry): userspace reads
+/// it as `Scope::Unknown`, which marks the *global* unattributed marker, and
+/// that stands until the watch restarts. It happens only for a move already
+/// under way when the probes attached (the attach is before the snapshot),
+/// so it is rare and fails closed.
+#[fexit(function = "__dev_change_net_namespace")]
+pub fn netmove(ctx: FExitContext) -> u32 {
+    let dev: *const u8 = ctx.arg(0);
+    let target: *const u8 = ctx.arg(1);
+    let target_inum = netns_of_net(target);
+    let now = netns_of_dev(dev);
+    let slot = MOVE_SRC.get_ptr_mut(0);
+    let moved = target_inum == 0 || now == 0 || now == target_inum;
+    if !moved {
+        if let Some(slot) = slot {
+            unsafe { *slot = [0u8; 20] };
+        }
+        return 0;
+    }
+    let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
+        if let Some(n) = LOST.get_ptr_mut(0) {
+            unsafe { *n += 1 };
+        }
+        return 0;
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).cgroup = bpf_get_current_cgroup_id();
+        (*ev).tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).hook = HOOK_NETMOVE;
+        (*ev).netns = if now == target_inum { target_inum } else { 0 };
+        cgroup_path(ev);
+        let name_off = core::ptr::read_volatile(&NETDEV_NAME);
+        let set = core::ptr::read_volatile(&NETDEV_SET);
+        let data = &mut (*ev).data;
+        for b in data[..36].iter_mut() {
+            *b = 0;
+        }
+        let ok = set != 0
+            && !dev.is_null()
+            && bpf_probe_read_kernel_buf(dev.wrapping_add(name_off as usize), &mut data[..16]).is_ok();
+        if let Some(slot) = slot {
+            for i in 0..20 {
+                data[16 + i] = (*slot)[i];
+            }
+            *slot = [0u8; 20];
+        }
+        (*ev).len = 36;
+        (*ev).captured = if ok { 36 } else { 0 };
+    }
+    entry.submit(0);
+    0
+}
+
+/// `netif_change_name` runs under RTNL too. It may run after the namespace
+/// move returns (rtnetlink's combined move+name request), so the move event
+/// alone cannot supply the final host name. Keep a separate slot: no task
+/// can interleave a second rename while RTNL is held.
+#[map]
+static RENAME_SRC: aya_ebpf::maps::Array<[u8; 16]> = aya_ebpf::maps::Array::with_max_entries(1, 0);
+
+#[fentry(function = "netif_change_name")]
+pub fn netrename_enter(ctx: FEntryContext) -> u32 {
+    let dev: *const u8 = ctx.arg(0);
+    let Some(slot) = RENAME_SRC.get_ptr_mut(0) else { return 0 };
+    unsafe { *slot = [0u8; 16] };
+    let (set, name_off) = unsafe { (core::ptr::read_volatile(&NETDEV_SET), core::ptr::read_volatile(&NETDEV_NAME)) };
+    if set != 0 && !dev.is_null() {
+        let mut name = [0u8; 16];
+        if unsafe { bpf_probe_read_kernel_buf(dev.wrapping_add(name_off as usize), &mut name) }.is_ok() {
+            unsafe { *slot = name };
+        }
+    }
+    0
+}
+
+/// Observe the resulting name, even when a failed rollback returns an error
+/// after changing it. A failed call is inert only when both readable names
+/// prove it unchanged. An absent entry or unreadable name fails closed;
+/// ring loss uses the usual LOST gate.
+#[fexit(function = "netif_change_name")]
+pub fn netrename(ctx: FExitContext) -> u32 {
+    let dev: *const u8 = ctx.arg(0);
+    let ret: i32 = ctx.arg(2);
+    let slot = RENAME_SRC.get_ptr_mut(0);
+    if ret != 0 {
+        let (set, name_off) = unsafe { (core::ptr::read_volatile(&NETDEV_SET), core::ptr::read_volatile(&NETDEV_NAME)) };
+        let mut now = [0u8; 16];
+        let mut unchanged = set != 0
+            && !dev.is_null()
+            && unsafe { bpf_probe_read_kernel_buf(dev.wrapping_add(name_off as usize), &mut now) }.is_ok();
+        if let Some(slot) = slot {
+            // Linux's NETDEV_CHANGENAME notifier can fail its rollback too:
+            // the function then returns an error with the new name standing.
+            unchanged &= unsafe { (*slot)[0] != 0 };
+            for i in 0..16 {
+                unchanged &= unsafe { (*slot)[i] == now[i] };
+            }
+            if unchanged {
+                unsafe { *slot = [0u8; 16] };
+                return 0;
+            }
+        }
+    }
+    let Some(mut entry) = EVENTS.reserve::<Event>(0) else {
+        if let Some(n) = LOST.get_ptr_mut(0) {
+            unsafe { *n += 1 };
+        }
+        return 0;
+    };
+    let ev = entry.as_mut_ptr();
+    unsafe {
+        (*ev).cgroup = bpf_get_current_cgroup_id();
+        (*ev).tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+        (*ev).hook = HOOK_NETRENAME;
+        (*ev).netns = netns_of_dev(dev);
+        cgroup_path(ev);
+        let data = &mut (*ev).data;
+        for b in data[..32].iter_mut() {
+            *b = 0;
+        }
+        if let Some(slot) = slot {
+            for i in 0..16 {
+                data[i] = (*slot)[i];
+            }
+            *slot = [0u8; 16];
+        }
+        let set = core::ptr::read_volatile(&NETDEV_SET);
+        let name_off = core::ptr::read_volatile(&NETDEV_NAME);
+        let ok = set != 0
+            && !dev.is_null()
+            && bpf_probe_read_kernel_buf(dev.wrapping_add(name_off as usize), &mut data[16..32]).is_ok();
+        (*ev).len = 32;
+        (*ev).captured = if ok { 32 } else { 0 };
     }
     entry.submit(0);
     0

@@ -78,6 +78,16 @@ fn changes(hook: u32, msgs: Vec<Vec<u8>>, ifname: &mut dyn FnMut(u32) -> Option<
         match parse(&ev, &Owner::Unattributed, ifname) {
             Parsed::Changes(c) => out.extend(c),
             Parsed::Nothing => {}
+            // Only state-dump hooks reach here, never a rename event. If
+            // that contract changes, do not silently drop an identity move.
+            Parsed::Renamed { .. } => out.push(Change {
+                owner: Owner::Unattributed,
+                kind: ChangeKind::Route,
+                object: "unreadable: a rename in a state snapshot".into(),
+                iface: None,
+                steers: true,
+                removed: false,
+            }),
             // Something standing it cannot read: fail closed.
             Parsed::Unreadable(why) => out.push(Change {
                 owner: Owner::Unattributed,

@@ -190,9 +190,46 @@
 //! container's or a `PrivateNetwork=` service's own interfaces, routes and
 //! firewall are ignored, so a container's `wg0` going away leaves the host
 //! VPN's `wg0` claim standing. Fail closed: a netns the probe could not
-//! read, or a link message elsewhere that may reach into the host (moved
-//! by `IFLA_NET_NS_PID`/`_FD`, or aimed by `IFLA_TARGET_NETNSID`), is a loss
-//! nothing can place (`.unattributed`, until the next attach).
+//! read is a loss nothing can place (`.unattributed`, until the next
+//! attach).
+//!
+//! **Moves between namespaces** (B-24). A link moved into the host by a
+//! request made elsewhere (`ip link set <dev> netns 1` run in a container or
+//! by `ip netns`; `IFLA_NET_NS_PID`/`_FD`, `IFLA_TARGET_NETNSID`) arrives
+//! with no request in the host's netns, and the request itself names the
+//! device by its index there. So the probe is on the move:
+//! `__dev_change_net_namespace`, which runs in the mover's context for every
+//! such move and under the RTNL lock (one call at a time, so one slot
+//! carries the source from entry to exit). Its entry remembers the device's
+//! netns and name; its exit reports, only when the device is now in the
+//! target, the target's netns, the name it has now, and what it was in the
+//! source (`HOOK_NETMOVE`, `parse::parse_move`). A move *into* the host is
+//! an interface claim for the mover under the name it has there, like any
+//! interface it brought (a default route over it, when virtual, then
+//! protects the mover); it goes when the interface is deleted or moved out,
+//! so the mover no longer stays protecting until reboot. The invocation's
+//! deliberate steering latch still lasts through its end; a later quiet
+//! invocation has no residual move charge. A move *out* of the
+//! host is the interface gone, under the name it had there (the kernel may
+//! rename it in the target). A move between two other namespaces, or into
+//! the one it was in, is no business of the host's. A move whose ends the
+//! probe could not read (a netns it could not read, or a call that began
+//! before it attached) applies nothing and fails closed, as an unreadable
+//! netns does.
+//!
+//! **Renames** preserve an interface's identity and makers. A combined
+//! move-and-name request normally calls `netif_change_name` *after* the move
+//! returns; the move probe therefore sees an intermediate name. Its own
+//! entry/exit pair reports the resulting name, including a failed rollback
+//! that left it changed (`HOOK_NETRENAME`). The fold changes every interface
+//! key and reference, including routes and
+//! invocation latches, without giving ownership to the renamer or clearing
+//! a protecting latch. Foreign renames remain foreign; an unreadable host
+//! rename fails closed.
+//! Route changes resolve their interface indices against live names; queued
+//! deletions retain the observed name, rewritten by any preceding rename,
+//! even when sysfs no longer has the device. An unreadable steering output
+//! interface fails closed rather than using a historical name.
 //!
 //! **Starting** (coordinator, Nov 2). Whatever happens, `.watch` is
 //! written before systemd hears `READY=1`, and systemd hears it once, so
@@ -207,9 +244,10 @@
 //!   `loader::RETRY_SECS` (30 s), rewriting the reason each time. The
 //!   first attach that succeeds reconciles (above) and writes `attached`.
 //!
-//! Probes: `rtnetlink_rcv_msg`, `nf_setsockopt`, `genl_rcv_msg` and
-//! `register_netdevice` are built in, so fentry, or fexit for
-//! `register_netdevice` (they need vmlinux's BTF); `nfnetlink_rcv_msg` and
+//! Probes: `rtnetlink_rcv_msg`, `nf_setsockopt`, `genl_rcv_msg`,
+//! `register_netdevice`, `__dev_change_net_namespace` and `netif_change_name` are built in, so
+//! fentry, or fexit for `register_netdevice` and (with an fentry before it)
+//! `__dev_change_net_namespace` and `netif_change_name` (they need vmlinux's BTF); `nfnetlink_rcv_msg` and
 //! `nfnetlink_rcv_batch` are in the `nfnetlink` module (`=m` on NixOS
 //! kernels), so kprobes by symbol, which need the module loaded: the
 //! initrd loads it (`boot.kernelModules`), since netwatch starts early in

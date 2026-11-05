@@ -22,14 +22,21 @@ pub enum Kind {
 /// and its kin use `setsockopt`, all through `nf_setsockopt`.
 /// `register_netdevice` sees every interface registered, in its creator's
 /// context, including a tun made by ioctl, which no netlink message
-/// announces (coordinator, Nov 2).
-pub const PROBES: [(&str, &str, Kind); 6] = [
+/// announces (coordinator, Nov 2). `__dev_change_net_namespace` sees every
+/// interface moved between network namespaces, in the mover's context: the
+/// entry remembers where the device was and what it was called, the exit
+/// (only a call that moved it reports) says where it went (B-24).
+pub const PROBES: [(&str, &str, Kind); 10] = [
     ("rtnetlink", "rtnetlink_rcv_msg", Kind::FEntry),
     ("nfnetlink", "nfnetlink_rcv_msg", Kind::KProbe),
     ("nfbatch", "nfnetlink_rcv_batch", Kind::KProbe),
     ("sockopt", "nf_setsockopt", Kind::FEntry),
     ("genl", "genl_rcv_msg", Kind::FEntry),
     ("netdev", "register_netdevice", Kind::FExit),
+    ("netmove_enter", "__dev_change_net_namespace", Kind::FEntry),
+    ("netmove", "__dev_change_net_namespace", Kind::FExit),
+    ("netrename_enter", "netif_change_name", Kind::FEntry),
+    ("netrename", "netif_change_name", Kind::FExit),
 ];
 
 /// Why the watch could not start (crate docs, "Starting"): an unusable
@@ -259,7 +266,7 @@ pub fn notify_ready(socket: Option<&Path>) {
 
 pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> Result<(), String> {
     use crate::host::{boottime_secs, expand_tools, network_tools, read_ifnames, read_virtual_ifaces, unit_of_cgroup};
-    use crate::parse::take;
+    use crate::parse::take_cached;
     use crate::{Tracker, WatchState};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -373,15 +380,9 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                 tracker.lost(None);
                 continue;
             };
-            let mut name = |i: u32| {
-                if !ifnames.contains_key(&i) {
-                    ifnames = read_ifnames();
-                }
-                ifnames.get(&i).cloned()
-            };
             // The path the kernel had at the request, else the id's record.
             let unit = || ev.cgpath.as_deref().and_then(unit_of_cgroup).or_else(|| cgroups.unit(ev.cgroup));
-            take(&mut tracker, &ev, own_netns, unit, &mut name);
+            take_cached(&mut tracker, &ev, own_netns, unit, &mut ifnames, &mut read_ifnames);
         }
         changed |= drained > 0;
         // Events the ring buffer had no room for: a loss nothing can place.

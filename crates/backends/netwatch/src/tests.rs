@@ -530,9 +530,11 @@ mod loader_checks {
         use crate::loader::{Kind, PROBES};
         for (prog, func, kind) in PROBES {
             // register_netdevice at exit: the name is final only then.
-            let want = match func {
-                f if f.starts_with("nfnetlink_") => Kind::KProbe,
-                "register_netdevice" => Kind::FExit,
+            // __dev_change_net_namespace: an fentry that remembers where the
+            // device was, and an fexit that reports where it went.
+            let want = match (prog, func) {
+                (_, f) if f.starts_with("nfnetlink_") => Kind::KProbe,
+                (_, "register_netdevice") | ("netmove" | "netrename", _) => Kind::FExit,
                 _ => Kind::FEntry,
             };
             assert_eq!(kind, want, "{prog} ({func})");
@@ -1527,29 +1529,285 @@ mod namespaces {
         assert_eq!(v.units["wg-quick-wg0"].ifaces, ["wg0".to_string()].into());
     }
 
-    /// A link message elsewhere that may reach into the host (moved by
-    /// netns pid or fd, or aimed at a netns id) is never dropped: charged
-    /// to the mover's unit as unattributed, or to nobody if it is unknown.
+    /// A link message elsewhere that asks for a move into the host is not
+    /// itself a change in the host (B-24): the move is seen as it happens
+    /// (`HOOK_NETMOVE`, in `moves`), and a link created there as its
+    /// registration. The request alone is the container's.
     #[test]
-    fn a_link_moved_from_elsewhere_is_unattributed() {
+    fn a_move_request_elsewhere_is_elsewhere() {
         for ty in [19u16, 28, 46] {
             let mut body = new_link("wg1");
             body.extend(attr(ty, &1u32.to_ne_bytes()));
-            assert_eq!(scope(&msg(CONTAINER, 16, 0x1, &body), HOST), Scope::Reaches, "attr {ty}");
-            assert_eq!(scope(&msg(CONTAINER, 19, 0x1, &body), HOST), Scope::Reaches, "RTM_SETLINK, attr {ty}");
+            assert_eq!(scope(&msg(CONTAINER, 16, 0x1, &body), HOST), Scope::Elsewhere, "attr {ty}");
+            assert_eq!(scope(&msg(CONTAINER, 19, 0x1, &body), HOST), Scope::Elsewhere, "RTM_SETLINK, attr {ty}");
         }
         let mut body = new_link("wg1");
         body.extend(attr(28, &3u32.to_ne_bytes()));
         let mover = UnitId::service("nspawn-mover");
         let mut t = Tracker::default();
         take(&mut t, &msg(CONTAINER, 19, 0x1, &body), HOST, || Some(mover.clone()), &mut names);
-        let v = t.view(WatchState::Attached { at: NOW }, std::slice::from_ref(&mover), NOW);
-        assert!(v.units["nspawn-mover"].unattributed && v.protecting_now("nspawn-mover", NOW), "the mover holds");
-        let mut t = Tracker::default();
-        take(&mut t, &msg(CONTAINER, 19, 0x1, &body), HOST, || None, &mut names);
-        assert!(!clean(&t), "no mover known: unattributed for all");
-        assert_eq!(scope(&msg(CONTAINER, 16, 0x1, &new_link("wg1")), HOST), Scope::Elsewhere);
+        assert!(clean(&t), "no unattributed mark from the request alone");
         assert_eq!(scope(&msg(HOST, 16, 0x1, &new_link("wg1")), HOST), Scope::Host);
+    }
+}
+
+/// Interfaces moved between network namespaces (B-24): `ip link set <dev>
+/// netns 1`, run in a container or by `ip netns`. The probe on
+/// `__dev_change_net_namespace` reports where the device went, where it
+/// was and what it was called, in the mover's context.
+mod moves {
+    use crate::ebpf::{Event, HOOK_NETMOVE};
+    use crate::parse::{Parsed, Scope, parse, scope, take};
+    use crate::{ChangeKind, Owner, Tracker, WatchState};
+    use planarian_schema::UnitId;
+    use std::collections::BTreeSet;
+
+    const HOST: u32 = 0xF000_0000;
+    const BOX: u32 = 0xF000_1234;
+    const OTHER: u32 = 0xF000_5678;
+    const NOW: u64 = 100;
+
+    /// A device moved from `from` to `to`; named `was` before, `now` after.
+    fn moved(from: u32, to: u32, was: &str, now: &str) -> Event {
+        let mut d = vec![0u8; 36];
+        d[..now.len()].copy_from_slice(now.as_bytes());
+        d[16..20].copy_from_slice(&from.to_ne_bytes());
+        d[20..20 + was.len()].copy_from_slice(was.as_bytes());
+        Event { cgroup: 1, tgid: 2, hook: HOOK_NETMOVE, len: 36, netns: to, cgpath: None, data: d }
+    }
+
+    /// `register_netdevice`'s report: a device made in the host.
+    fn registered(name: &str, netns: u32) -> Event {
+        let mut data = name.as_bytes().to_vec();
+        data.resize(16, 0);
+        Event { cgroup: 1, tgid: 2, hook: crate::ebpf::HOOK_NETDEV, len: 16, netns, cgpath: None, data }
+    }
+
+    fn names(_: u32) -> Option<String> {
+        None
+    }
+
+    fn mover() -> UnitId {
+        UnitId::service("nspawn-mover")
+    }
+
+    fn view(t: &Tracker) -> crate::FootprintView {
+        t.view(WatchState::Attached { at: NOW }, &[mover()], NOW)
+    }
+
+    /// The interfaces any unit holds a claim on (a claim steers nothing by
+    /// itself, so the files list it only once something routes over it).
+    fn claimed(t: &Tracker) -> BTreeSet<String> {
+        t.claims().objects.iter().filter(|o| o.1 == ChangeKind::Interface).map(|o| o.2.clone()).collect()
+    }
+
+    fn set(n: &[&str]) -> BTreeSet<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// B-24: a device moved into the host is an interface claim for the
+    /// mover, under the name it has there: not an unattributed mark nothing
+    /// can clear.
+    #[test]
+    fn a_device_moved_in_is_a_claim_for_the_mover_and_goes_with_the_device() {
+        let mut t = Tracker::default();
+        take(&mut t, &moved(BOX, HOST, "eth1", "wg9"), HOST, || Some(mover()), &mut names);
+        let v = view(&t);
+        assert!(v.unattributed.is_empty(), "{v:?}");
+        assert_eq!(claimed(&t), set(&["wg9"]));
+        assert!(t.claims().objects.iter().any(|o| o.0 == mover() && o.2 == "wg9"), "the mover's claim");
+        assert!(!v.units["nspawn-mover"].unattributed && !v.units["nspawn-mover"].protecting);
+        // Deleted in the host (any unit, or the admin): the claim goes.
+        t.apply(&crate::Change {
+            owner: Owner::Unattributed,
+            kind: ChangeKind::Interface,
+            object: "wg9".into(),
+            iface: Some("wg9".into()),
+            steers: false,
+            removed: true,
+        });
+        assert!(claimed(&t).is_empty());
+    }
+
+    /// And routed over, it protects (a virtual link the mover brought in).
+    #[test]
+    fn a_default_route_over_a_moved_in_link_protects_its_mover() {
+        let mut t = Tracker::default();
+        take(&mut t, &moved(BOX, HOST, "wg0", "wg0"), HOST, || Some(mover()), &mut names);
+        t.apply(&crate::Change {
+            owner: Owner::Unit(mover()),
+            kind: ChangeKind::Route,
+            object: "route 2 254 0/0 oif 7 metric 0".into(),
+            iface: Some("wg0".into()),
+            steers: true,
+            removed: false,
+        });
+        t.set_virtual(set(&["wg0"]));
+        let v = view(&t);
+        assert!(v.units["nspawn-mover"].protecting, "{v:?}");
+        assert_eq!(v.units["nspawn-mover"].ifaces, set(&["wg0"]));
+    }
+
+    /// A move out of the host is the interface gone, by the name it had in
+    /// the host (the kernel may have re-resolved it in the target).
+    #[test]
+    fn a_device_moved_out_is_gone_by_its_old_name() {
+        let vpn = UnitId::service("openvpn-work");
+        let mut t = Tracker::default();
+        take(&mut t, &registered("tun0", HOST), HOST, || Some(vpn.clone()), &mut names);
+        assert_eq!(claimed(&t), set(&["tun0"]));
+        take(&mut t, &moved(HOST, BOX, "tun0", "eth7"), HOST, || None, &mut names);
+        assert!(claimed(&t).is_empty(), "{:?}", t.claims());
+    }
+
+    /// Between two other namespaces, or into the one it was in, the host's
+    /// footprints are untouched; and a move whose ends were not read fails
+    /// closed and applies nothing.
+    #[test]
+    fn moves_that_are_not_the_hosts_leave_it_alone() {
+        let vpn = UnitId::service("openvpn-work");
+        let mut t = Tracker::default();
+        take(&mut t, &registered("tun0", HOST), HOST, || Some(vpn.clone()), &mut names);
+        for ev in [moved(BOX, OTHER, "tun0", "tun0"), moved(HOST, HOST, "tun0", "tun0")] {
+            take(&mut t, &ev, HOST, || None, &mut names);
+        }
+        let v = t.view(WatchState::Attached { at: NOW }, std::slice::from_ref(&vpn), NOW);
+        assert_eq!(claimed(&t), set(&["tun0"]));
+        assert!(v.unattributed.is_empty());
+        assert_eq!(scope(&moved(BOX, OTHER, "a", "a"), HOST), Scope::Elsewhere);
+        // Not read: the target, or the source (the call began before the watch).
+        for ev in [moved(BOX, 0, "tun0", "tun0"), moved(0, HOST, "tun0", "tun0")] {
+            assert_eq!(scope(&ev, HOST), Scope::Unknown);
+            let mut t2 = t.clone();
+            take(&mut t2, &ev, HOST, || None, &mut names);
+            let v = t2.view(WatchState::Attached { at: NOW }, std::slice::from_ref(&vpn), NOW);
+            assert!(!v.unattributed.is_empty(), "fails closed");
+            assert_eq!(claimed(&t2), set(&["tun0"]), "and applies nothing");
+        }
+        // A move read by parse, which is not given the host's netns, is
+        // never read as nothing.
+        assert!(matches!(parse(&moved(BOX, HOST, "a", "a"), &Owner::Unattributed, &mut names), Parsed::Unreadable(_)));
+    }
+
+    /// An arrival or departure with no name to key it on is unreadable.
+    #[test]
+    fn a_nameless_move_is_unreadable() {
+        let mut t = Tracker::default();
+        take(&mut t, &moved(BOX, HOST, "eth1", ""), HOST, || Some(mover()), &mut names);
+        assert!(
+            !view(&t).unattributed.is_empty() || view(&t).units.get("nspawn-mover").is_some_and(|f| f.unattributed)
+        );
+        let mut t = Tracker::default();
+        take(&mut t, &moved(HOST, BOX, "", "eth1"), HOST, || Some(mover()), &mut names);
+        assert!(view(&t).units.get("nspawn-mover").is_some_and(|f| f.unattributed));
+    }
+
+    // ---- Rule 23: what a move means is what its namespaces say.
+
+    const ENDS: [u32; 4] = [HOST, BOX, OTHER, 0];
+    const NAMES: [&str; 5] = ["", "p", "q", "x", "y"];
+
+    /// One move against a host holding claims on `p` and `q` (some moves
+    /// name them, some name others: a name already claimed makes an arrival
+    /// a no-op, so the alphabet must reach both). The oracle is
+    /// written from the namespaces, not from `parse_move`: an interface
+    /// arriving in the host is claimed under the name it has there; one
+    /// leaving it is gone under the name it had there; a move between two
+    /// others, or into the namespace it was in, changes nothing of the
+    /// host's; and a move whose ends were not read, or that needs a name it
+    /// has not got, applies nothing and fails closed.
+    fn check(from: u32, to: u32, was: &str, now: &str) -> Result<(), String> {
+        let mut t = Tracker::default();
+        for n in ["p", "q"] {
+            take(&mut t, &registered(n, HOST), HOST, || Some(UnitId::service("a")), &mut names);
+        }
+        // A steering route over `p`: it goes with the interface when `p` leaves
+        // (the kernel drops an interface's routes with it, with no message).
+        t.apply(&crate::Change {
+            owner: Owner::Unit(UnitId::service("a")),
+            kind: ChangeKind::Route,
+            object: "route-p".into(),
+            iface: Some("p".into()),
+            steers: true,
+            removed: false,
+        });
+        take(&mut t, &moved(from, to, was, now), HOST, || Some(mover()), &mut names);
+        let (mut want, mut lost) = (set(&["p", "q"]), false);
+        let mut route = true;
+        if from == 0 || to == 0 {
+            lost = true;
+        } else if to == HOST && from != HOST {
+            if now.is_empty() {
+                lost = true;
+            } else {
+                want.insert(now.to_string());
+            }
+        } else if from == HOST && to != HOST {
+            if was.is_empty() {
+                lost = true;
+            } else {
+                want.remove(was);
+                route &= was != "p";
+            }
+        }
+        let v = view(&t);
+        let unattributed = !v.unattributed.is_empty() || v.units.get("nspawn-mover").is_some_and(|f| f.unattributed);
+        if claimed(&t) != want {
+            return Err(format!("claims {:?}, expected {want:?}", claimed(&t)));
+        }
+        let has_route = t.claims().objects.iter().any(|o| o.1 == ChangeKind::Route && o.2 == "route-p");
+        if has_route != route {
+            return Err(format!("route over p claimed: {has_route}, expected {route}"));
+        }
+        if unattributed != lost {
+            return Err(format!("unattributed {unattributed}, expected {lost}"));
+        }
+        Ok(())
+    }
+
+    fn failing() -> Vec<(u32, u32, &'static str, &'static str)> {
+        let mut out = vec![];
+        for from in ENDS {
+            for to in ENDS {
+                for was in NAMES {
+                    for now in NAMES {
+                        if check(from, to, was, now).is_err() {
+                            out.push((from, to, was, now));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every combination of source, target and names (400) means what its
+    /// namespaces say.
+    #[test]
+    fn a_move_means_what_its_namespaces_say() {
+        crate::parse::MOVE_MUTANT.with(|m| m.set(crate::parse::MoveMutant::None));
+        let bad = failing();
+        assert!(bad.is_empty(), "{} of 400 moves misread, first {:?}", bad.len(), bad.first());
+    }
+
+    /// Each deliberate bug is caught, by more than a stray case (a thin
+    /// catch would mean the space does not exercise it).
+    #[test]
+    fn the_move_mutants_are_caught() {
+        use crate::parse::{MOVE_MUTANT, MoveMutant as M};
+        for (m, at_least) in [
+            (M::DropArrival, 24),
+            (M::DropDeparture, 24),
+            (M::DepartureByNewName, 24),
+            (M::TargetOnly, 24),
+            (M::AnyDeparture, 24),
+        ] {
+            MOVE_MUTANT.with(|c| c.set(m));
+            let bad = failing();
+            MOVE_MUTANT.with(|c| c.set(M::None));
+            eprintln!("mutant {m:?} fails {} of 400 moves", bad.len());
+            assert!(bad.len() >= at_least, "mutant {m:?} caught by only {} of 400 moves", bad.len());
+        }
     }
 }
 

@@ -22,6 +22,15 @@ pub const HOOK_SOCKOPT: u32 = 5;
 /// `register_netdevice`: an interface registered, of any kind; `data` is
 /// its name, `netns` its own.
 pub const HOOK_NETDEV: u32 = 6;
+/// `__dev_change_net_namespace`: an interface moved to another network
+/// namespace, in the mover's context. `netns` is the target's; `data` is the
+/// name it has now (16 bytes), the source netns inode (4, native-endian) and
+/// the name it had there (16). `netns` 0, or a source inode of 0, means the
+/// probe could not read them.
+pub const HOOK_NETMOVE: u32 = 7;
+/// `netif_change_name`: an observed rename. `data` is the old then new
+/// IFNAMSIZ name (16 bytes each); ownership stays with the original maker.
+pub const HOOK_NETRENAME: u32 = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
