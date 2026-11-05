@@ -157,6 +157,12 @@ pub trait UnitBackend {
     fn release_hold(&self, _unit: &UnitId, _until: Option<Timestamp>, _wait: Millis) -> Outcome {
         Outcome::Failed("this backend cannot hold traffic".into())
     }
+    /// Whether this exact timed release still has its original persisted
+    /// bound and is active on both wall and boot clocks. Reconciliation must
+    /// not recreate a missing bound from wall time after a clock rollback.
+    fn timed_release_active(&self, _unit: &UnitId, _until: Timestamp) -> Result<bool, Outcome> {
+        Err(Outcome::Failed("this backend cannot verify a timed hold release".into()))
+    }
     /// The release ended (expired, or the override lifted): remove the mark.
     fn end_release(&self, _unit: &UnitId) -> Outcome {
         Outcome::Succeeded

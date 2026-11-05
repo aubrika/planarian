@@ -1,0 +1,128 @@
+# Family: network-security (§12d "Network security fails closed", "Which
+# units"; owner decisions, Nov 2). The reviewer's cases for the classifier,
+# written from the spec before the change, on the fake harness's scripted
+# footprint feed (`footprint`, `footprint_stale`, `netwatch`; 00-format.toml).
+#
+# §12d: "A *network tool* is a unit able to change how traffic leaves the
+# machine … computed at build time from the unit's systemd configuration,
+# never from its name; fail closed. A network tool is *protecting traffic*
+# while the kernel has attributed to it a change that currently steers
+# traffic … A *network-security unit* is a network tool that is protecting
+# traffic. … Fail closed: a change the kernel could not attribute, a
+# footprint missing or stale when a network tool fails, or a watch that
+# failed to attach, all count as protecting." And: when one has failed, "its
+# traffic is held"; its restart "runs at once"; the hold "is lifted when the
+# unit is `Running` and its Readiness probes pass".
+
+[[fault]]
+id = "netsec-unnamed-tool-protecting-holds"
+family = "network-security"
+summary = "gym-netd, a network tool whose name matches nothing, created an interface that carries the default route. It crashes: its traffic is held, it is restarted at once without asking, and the hold lifts once it is back."
+spec = ["§12d Which units", "§12d Network security fails closed", "§11 RestartUnit row"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "footprint", unit = "service:gym-netd", change = "interface", interface = "gnet0", steers = false },
+  { raw = "footprint", unit = "service:gym-netd", change = "route", interface = "gnet0", steers = true },
+  { raw = "wait", for = "30s" },
+]
+inject = { raw = "kill_unit", unit = "service:gym-netd", signal = "SIGSEGV" }
+window = "3m"
+
+[fault.required_post]
+units = { "service:gym-netd" = "Running" }
+holds_seen = ["service:gym-netd"]
+holds_at_end = []
+
+[[fault.required_post.txn]]
+transition = "RestartUnit"
+target = "service:gym-netd"
+decision = "Allow(Runtime)"
+terminal = "Committed"
+
+[[fault]]
+id = "netsec-tool-without-steering-holds-nothing"
+family = "network-security"
+summary = "gym-syncd is a network tool by its configuration but has never steered traffic: its footprint holds only an address on its own non-default interface. It crashes: nothing is held, and it is repaired as any unit is."
+spec = ["§12d Which units"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "footprint", unit = "service:gym-syncd", change = "interface", interface = "gsync0", steers = false },
+  { raw = "wait", for = "30s" },
+]
+inject = { raw = "kill_unit", unit = "service:gym-syncd", signal = "SIGSEGV" }
+window = "3m"
+
+[fault.required_post]
+units = { "service:gym-syncd" = "Running" }
+holds_seen = []
+
+[[fault]]
+id = "netsec-stale-footprint-holds"
+family = "network-security"
+summary = "gym-syncd's footprint shows nothing that steers traffic, but it has gone stale when gym-syncd crashes. Fail closed: a stale footprint counts as protecting, so its traffic is held until it is back."
+spec = ["§12d Which units: fail closed"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "footprint", unit = "service:gym-syncd", change = "interface", interface = "gsync0", steers = false },
+  { raw = "footprint_stale", unit = "service:gym-syncd" },
+  { raw = "wait", for = "30s" },
+]
+inject = { raw = "kill_unit", unit = "service:gym-syncd", signal = "SIGSEGV" }
+window = "3m"
+
+[fault.required_post]
+units = { "service:gym-syncd" = "Running" }
+holds_seen = ["service:gym-syncd"]
+holds_at_end = []
+
+[[fault]]
+id = "netsec-watch-not-attached-holds"
+family = "network-security"
+summary = "The kernel watch failed to attach, so nothing is attributed to anyone. gym-syncd, a network tool with no footprint, crashes. Fail closed: with no watch, any network tool's failure holds its traffic."
+spec = ["§12d Which units: fail closed"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "netwatch", state = "attach-failed" },
+  { raw = "wait", for = "30s" },
+]
+inject = { raw = "kill_unit", unit = "service:gym-syncd", signal = "SIGSEGV" }
+window = "3m"
+
+[fault.required_post]
+units = { "service:gym-syncd" = "Running" }
+holds_seen = ["service:gym-syncd"]
+holds_at_end = []
+
+[[fault]]
+id = "netsec-unattributed-change-holds"
+family = "network-security"
+summary = "A default route appeared that the kernel could not attribute to any unit. gym-syncd, a network tool whose own footprint steers nothing, crashes. Fail closed: an unattributed change counts as protecting, so its traffic is held."
+spec = ["§12d Which units: fail closed"]
+tags = ["acceptance"]
+scoring = "must-pass"
+harness = ["fake"]
+intent = { kind = "none" }
+setup = [
+  { raw = "footprint", unit = "service:gym-syncd", change = "interface", interface = "gsync0", steers = false },
+  { raw = "footprint", unit = "unattributed", change = "route", steers = true },
+  { raw = "wait", for = "30s" },
+]
+inject = { raw = "kill_unit", unit = "service:gym-syncd", signal = "SIGSEGV" }
+window = "3m"
+
+[fault.required_post]
+units = { "service:gym-syncd" = "Running" }
+holds_seen = ["service:gym-syncd"]
+holds_at_end = []

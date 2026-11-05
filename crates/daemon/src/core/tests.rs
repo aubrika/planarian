@@ -1459,6 +1459,7 @@ fn rig_with_held_sshd(holds: bool) -> Rig {
             d.holds = holds;
         }
         if holds {
+            w.steers_traffic(&sshd);
             w.hold_on_failure.insert(sshd);
         }
         w.alive.insert(100);
@@ -1598,6 +1599,297 @@ fn hold_release_needs_an_administrator() {
 
     let resp = r.core.handle(ADMIN, Request::HoldRelease { unit: UnitId::service("gym-web"), until: Until::NextBoot });
     assert!(matches!(resp, Response::Error { .. }), "no hold to release: {resp:?}");
+}
+
+fn failed_routine_tool() -> Rig {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().units.get_mut(&web).unwrap().fail_on_start = true;
+    r.fake.w().signal(&web, 11);
+    r.ticks(2);
+    assert!(r.fake.w().held.contains(&web));
+    r
+}
+
+fn release_web(generic: bool, until: Until) -> Request {
+    let unit = UnitId::service("gym-web");
+    if generic {
+        Request::SetOverride { unit: crate::hold::hold_unit(&unit), desired: OverrideDesired::Stopped, until }
+    } else {
+        Request::HoldRelease { unit, until }
+    }
+}
+
+/// D18/D19: authorization and the resulting marker are identical for both
+/// CLI spellings and both paths to commitment. Routine tools still ask an
+/// administrator; approving must perform the backend release, not just stop
+/// the synthetic unit. A later OnFailure= cannot reapply the released hold.
+mod release_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 16, failure_persistence: None, ..ProptestConfig::default() })]
+
+        #[test]
+        fn equivalent_releases_have_the_same_administrator_floor_and_backend_effect(
+            generic in any::<bool>(), approved in any::<bool>(), explicit in any::<bool>(), ticks in 1..8usize,
+        ) {
+            let web = UnitId::service("gym-web");
+            let mut r = failed_routine_tool();
+            let until = if explicit { Until::Explicit } else { Until::NextBoot };
+            let caller = if approved { ALICE } else { ADMIN };
+            let mut resp = r.core.handle(caller, release_web(generic, until));
+            if approved {
+                let Response::NeedsApproval { approve, why, .. } = resp else { panic!("must ask an administrator: {resp:?}") };
+                prop_assert!(why.contains("administrator"), "{why}");
+                prop_assert!(r.fake.w().held.contains(&web));
+                prop_assert!(!r.fake.w().hold_released.contains_key(&web));
+                resp = r.core.handle(ADMIN.at_terminal(), Request::Approve { hash: approve });
+            }
+            prop_assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+            prop_assert_eq!(r.fake.w().hold_released.get(&web).cloned(), Some(None));
+            prop_assert!(!r.fake.w().held.contains(&web));
+            let hold = crate::hold::hold_unit(&web);
+            prop_assert!(r.core.ledger().overrides.iter().any(|o| o.unit == hold && o.until == Until::NextBoot));
+            r.fake.w().signal(&web, 11);
+            r.ticks(ticks);
+            prop_assert!(!r.fake.w().held.contains(&web), "{:?}", r.core.notices);
+        }
+    }
+}
+
+#[test]
+fn a_timed_release_ends_and_a_changed_deadline_reaches_the_backend() {
+    let web = UnitId::service("gym-web");
+    let mut r = failed_routine_tool();
+    let first = r.fake.now().plus(Millis::secs(300));
+    let resp = r.core.handle(ADMIN, release_web(true, Until::At(first)));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert_eq!(r.fake.w().hold_released.get(&web), Some(&Some(first)));
+    // Each SetOverride waits DEFAULT_SETTLE before committing. Give this
+    // replacement its own live window after that settle, rather than
+    // computing both deadlines before either transaction has run.
+    let second = r.fake.now().plus(Millis(planarian_schema::spec::DEFAULT_SETTLE.0 + 20_000));
+    let resp = r.core.handle(ADMIN, release_web(true, Until::At(second)));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert!(r.fake.now() < second, "the replacement must still be active at commit");
+    assert_eq!(r.fake.w().hold_released.get(&web), Some(&Some(second)));
+    r.ticks(8);
+    assert!(!r.fake.w().hold_released.contains_key(&web), "expired marker remains");
+    assert!(r.fake.w().held.contains(&web), "failed tool must be held again: {:?}", r.core.notices);
+}
+
+#[test]
+fn a_release_expiring_during_settle_never_creates_a_marker_and_reconciles_the_prior_release() {
+    let web = UnitId::service("gym-web");
+    for prior in [false, true] {
+        let mut r = failed_routine_tool();
+        if prior {
+            let resp = r.core.handle(ADMIN, release_web(true, Until::NextBoot));
+            assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+            assert_eq!(r.fake.w().hold_released.get(&web), Some(&None));
+        }
+        let until = r.fake.now().plus(Millis(planarian_schema::spec::DEFAULT_SETTLE.0 / 2));
+        let resp = r.core.handle(ADMIN, release_web(true, Until::At(until)));
+        assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+        assert!(r.fake.now() >= until, "the short release must expire during settle");
+        assert_ne!(r.fake.w().hold_released.get(&web), Some(&Some(until)), "expired release created a marker");
+        r.ticks(1);
+        assert!(!r.fake.w().hold_released.contains_key(&web), "stale prior marker survived reconciliation");
+        assert!(r.fake.w().held.contains(&web), "failed tool was not held: {:?}", r.core.notices);
+    }
+}
+
+#[test]
+fn release_marker_and_lift_failures_are_not_recorded_as_complete_and_are_retried() {
+    let web = UnitId::service("gym-web");
+    // A marker write failure, a lift failure after the marker was written,
+    // and an unanswered lift are three distinct backend outcomes.
+    for fault in 0..3 {
+        let mut r = failed_routine_tool();
+        match fault {
+            0 => r.fake.w().hold_release_fails = Some("marker is read-only".into()),
+            1 => r.fake.w().hold_fails = Some("lift job failed".into()),
+            _ => r.fake.w().lift_hangs = Some(Millis::secs(30)),
+        }
+        let resp = r.core.handle(ADMIN, release_web(false, Until::NextBoot));
+        assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+        assert!(!r.core.hold_released.contains_key(&web), "failure {fault} falsely completed");
+        assert!(r.core.release_unconfirmed.contains_key(&web));
+        assert!(r.fake.w().held.contains(&web));
+        assert!(r.core.ledger().holds().contains(&web), "failed lift journaled as lifted");
+        assert!(r.core.notices.iter().any(|n| n.contains("hold could not be released")));
+        // Include a tool that stopped protecting: pending release work must
+        // survive the gate changing, even when only the journal has its hold.
+        r.fake.w().stops_steering(&web);
+        r.fake.w().lift_hangs = None;
+        r.ticks(18);
+        assert_eq!(r.fake.w().hold_released.get(&web), Some(&None), "fault {fault}");
+        assert!(!r.fake.w().held.contains(&web), "fault {fault}: {:?}", r.core.notices);
+        assert!(!r.core.ledger().holds().contains(&web));
+        assert!(!r.core.release_unconfirmed.contains_key(&web));
+    }
+}
+
+#[test]
+fn an_ended_release_retries_a_failed_marker_cleanup_after_steering_stops() {
+    let web = UnitId::service("gym-web");
+    let mut r = failed_routine_tool();
+    let deadline = r.fake.now().plus(Millis(planarian_schema::spec::DEFAULT_SETTLE.0 + 10_000));
+    let resp = r.core.handle(ADMIN, release_web(true, Until::At(deadline)));
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    assert!(r.fake.now() < deadline, "the release must still be active at commit");
+    assert!(r.core.hold_released.contains_key(&web), "the release never reached its backend");
+    assert_eq!(r.fake.w().hold_released.get(&web), Some(&Some(deadline)));
+    r.fake.w().stops_steering(&web);
+    r.fake.w().hold_release_end_fails = Some("unlink failed".into());
+    r.ticks(3);
+    assert!(r.core.hold_released.contains_key(&web), "failed cleanup forgotten");
+    assert!(r.fake.w().hold_released.contains_key(&web));
+    assert!(r.core.notices.iter().any(|n| n.contains("release marker could not be removed")));
+    r.ticks(18);
+    assert!(!r.core.hold_released.contains_key(&web));
+    assert!(!r.fake.w().hold_released.contains_key(&web), "cleanup was never retried");
+}
+
+#[test]
+fn leaving_a_hold_alone_is_not_a_release() {
+    let web = UnitId::service("gym-web");
+    let mut r = failed_routine_tool();
+    let resp = r.core.handle(
+        ADMIN,
+        Request::SetOverride {
+            unit: crate::hold::hold_unit(&web),
+            until: Until::NextBoot,
+            desired: OverrideDesired::LeaveAlone,
+        },
+    );
+    assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+    r.ticks(3);
+    assert!(r.fake.w().held.contains(&web));
+    assert!(!r.fake.w().hold_released.contains_key(&web));
+    assert!(r.core.ledger().holds().contains(&web));
+}
+
+fn restart_release_daemon(r: &mut Rig, pid: u32) {
+    r.fake.w().alive.remove(&100);
+    r.fake.w().alive.remove(&101);
+    r.fake.w().alive.insert(pid);
+    let mut cfg = config();
+    cfg.fresh_boot = false;
+    r.core = Core::start(
+        Journal::open(r.fake.store.clone()).unwrap(),
+        r.fake.clone(),
+        OwnerId::Daemon { pid, boot_id: Hash::ZERO },
+        cfg,
+    );
+}
+
+/// D20: the marker's original monotonic bound outlives the daemon, while
+/// wall rollback must never give reconciliation a fresh release lifetime.
+mod timed_release_props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseResult;
+
+    fn check(lifetime: u64, rollback: u64, fault: usize, restart: bool, on_failure: bool) -> TestCaseResult {
+        let web = UnitId::service("gym-web");
+        let mut r = failed_routine_tool();
+        let until = r.fake.now().plus(Millis::secs(lifetime));
+        match fault {
+            1 => r.fake.w().hold_fails = Some("lift failed after writing marker".into()),
+            2 => r.fake.w().lift_hangs = Some(Millis::secs(30)),
+            _ => {}
+        }
+        let resp = r.core.handle(ADMIN, release_web(true, Until::At(until)));
+        prop_assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+        let original = r.fake.w().hold_release_deadlines[&web];
+        r.fake.w().lift_hangs = None;
+        r.fake.w().wall_skew = -(rollback as i64 * 1000);
+        if !on_failure {
+            r.fake.w().hold_on_failure.remove(&web);
+        }
+        // A failed/unknown lift retries while its original bound still
+        // holds. A successful one needs no second lift, but is checked.
+        r.fake.advance(Millis::secs(65));
+        r.ticks(1);
+        prop_assert!(!r.fake.w().held.contains(&web), "retry never lifted: {:?}", r.core.notices);
+        prop_assert_eq!(r.fake.w().hold_release_deadlines[&web], original);
+        if restart {
+            restart_release_daemon(&mut r, 101);
+            r.ticks(1);
+            prop_assert_eq!(r.fake.w().hold_release_deadlines[&web], original);
+        }
+        let left = original.0.saturating_sub(r.fake.w().now.0);
+        r.fake.advance(Millis(left + 5_000));
+        r.ticks(2);
+        prop_assert!(r.fake.now() < until, "the wall override should still appear active");
+        prop_assert!(r.fake.w().held.contains(&web), "release revived after its boot bound: {:?}", r.core.notices);
+        prop_assert_eq!(r.fake.w().hold_release_deadlines[&web], original);
+        if restart {
+            restart_release_daemon(&mut r, 102);
+            r.ticks(2);
+            prop_assert!(r.fake.w().held.contains(&web), "restart revived an expired release");
+            prop_assert_eq!(r.fake.w().hold_release_deadlines[&web], original);
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 16, failure_persistence: None, ..ProptestConfig::default() })]
+
+        #[test]
+        fn rollback_retry_and_restart_never_extend_the_original_bound(
+            lifetime in 90..240u64, rollback in 300..7_200u64,
+            fault in 0..3usize, restart in any::<bool>(), on_failure in any::<bool>(),
+        ) {
+            check(lifetime, rollback, fault, restart, on_failure)?;
+        }
+    }
+
+    #[test]
+    fn every_lift_outcome_and_both_hold_paths_obey_the_original_bound() {
+        for fault in 0..3 {
+            for on_failure in [false, true] {
+                check(180, 3_600, fault, true, on_failure).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_timed_bounds_are_never_reconstructed_after_rollback_or_restart() {
+    let web = UnitId::service("gym-web");
+    for missing in 0..3 {
+        let mut r = failed_routine_tool();
+        let until = r.fake.now().plus(Millis::secs(180));
+        if missing == 0 {
+            r.fake.w().hold_release_fails = Some("marker write failed".into());
+        }
+        let resp = r.core.handle(ADMIN, release_web(true, Until::At(until)));
+        assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+        match missing {
+            1 => {
+                r.fake.w().hold_released.remove(&web);
+            }
+            2 => {
+                r.fake.w().hold_release_deadlines.remove(&web);
+            }
+            _ => {}
+        }
+        r.fake.w().wall_skew = -3_600_000;
+        r.fake.advance(Millis::secs(200));
+        restart_release_daemon(&mut r, 101);
+        r.ticks(3);
+        assert!(r.fake.w().held.contains(&web), "missing {missing} recreated an expired bound");
+        if missing < 2 {
+            assert!(!r.fake.w().hold_released.contains_key(&web));
+        } else {
+            assert!(!r.fake.w().hold_release_deadlines.contains_key(&web));
+        }
+        assert!(r.core.notices.iter().any(|n| n.contains("original bound is missing")));
+    }
 }
 
 /// §12d (#36 review): anything else flushing the ruleset removes the hold's
@@ -2562,6 +2854,13 @@ mod limit_props {
 /// gym-web as a network tool (`holds`), held by OnFailure= when it fails
 /// (`hold_on_failure`) if `on_failure`.
 fn rig_with_network_tool(holds: bool, on_failure: bool) -> Rig {
+    rig_with_tool(holds, on_failure, holds)
+}
+
+/// As `rig_with_network_tool`, with the kernel's attribution scripted:
+/// `steers`, the tool has a default route over an interface it created
+/// (it is protecting traffic); otherwise it has steered nothing.
+fn rig_with_tool(holds: bool, on_failure: bool, steers: bool) -> Rig {
     let store = MemStore::new(8 << 20);
     let fake = gym_world(store.clone());
     let web = UnitId::service("gym-web");
@@ -2574,6 +2873,11 @@ fn rig_with_network_tool(holds: bool, on_failure: bool) -> Rig {
         }
         if let Some(d) = w.base_units.get_mut(&web) {
             d.holds = holds;
+        }
+        if steers {
+            // §12d: a network tool holds traffic only while it is protecting
+            // it: the kernel has attributed a steering route to it.
+            w.steers_traffic(&web);
         }
         if on_failure {
             w.hold_on_failure.insert(web);
@@ -2812,6 +3116,8 @@ fn a_wedged_hold_does_not_starve_another_units_lift() {
                 d.holds = true;
             }
         }
+        w.steers_traffic(&app);
+        w.steers_traffic(&web);
         w.hold_wedged.insert(app.clone());
         w.alive.insert(100);
     }
@@ -3436,4 +3742,120 @@ fn a_stale_re_prepare_remains_retryable_after_a_restart() {
     let retried = ledger.terminal.values().any(|t| t.prepared_again_from == Some(waiting))
         || ledger.live.values().any(|t| t.txn.prepared_again_from == Some(waiting));
     assert!(retried, "the stale transaction was never retried: {:?}", r.core.notices);
+}
+
+/// §12d *Which units* (coordinator, Nov 3): the hold gate is `UnitDef::holds`
+/// (a network tool, from the build) and `SystemState::protecting` (from the
+/// kernel-attributed footprints). A tool that is not protecting traffic is
+/// never held by the daemon when it stops outside Planarian; one that is,
+/// is; and an unreadable footprint feed (`Err`) counts every tool as
+/// protecting.
+mod gate_props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as PConfig, FailurePersistence};
+
+    fn pconfig() -> PConfig {
+        let cases = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(16);
+        PConfig { cases, failure_persistence: None::<Box<dyn FailurePersistence>>, ..PConfig::default() }
+    }
+
+    proptest! {
+        #![proptest_config(pconfig())]
+
+        #[test]
+        fn a_tool_is_held_exactly_when_it_protects_or_the_feed_is_unreadable(
+            steers in any::<bool>(),
+            unreadable in any::<bool>(),
+            ticks in 3..12usize,
+        ) {
+            let web = UnitId::service("gym-web");
+            let mut r = rig_with_tool(true, false, steers);
+            r.fake.w().protecting_unreadable = unreadable;
+            r.fake.w().stop_out_of_band(&web);
+            r.ticks(ticks);
+            let asked = r.fake.w().calls.iter().any(|c| c.call.starts_with("hold(service:gym-web)"));
+            let journaled = r.core.ledger().hold_events.iter().any(|e| e.0 == web && e.1);
+            let protecting = steers || unreadable;
+            prop_assert_eq!(asked, protecting, "{:#?}", r.core.notices);
+            prop_assert_eq!(journaled, protecting, "{:#?}", r.core.notices);
+            if !protecting {
+                // Repaired as any unit is (or left stopped as intended), never held.
+                prop_assert!(!r.fake.w().held.contains(&web));
+            }
+        }
+    }
+}
+
+/// §12d: a hold that stands for a tool that has stopped protecting is still
+/// lifted once the unit is back (the gate does not strand it).
+#[test]
+fn a_hold_stands_until_the_unit_is_back_even_if_it_stopped_protecting() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_network_tool(true, true);
+    r.fake.w().stop_out_of_band(&web);
+    r.ticks(1);
+    assert!(r.fake.w().held.contains(&web), "held first: {:?}", r.core.notices);
+    // The route goes: the tool no longer protects anything.
+    r.fake.w().stops_steering(&web);
+    r.ticks(30);
+    assert!(!r.fake.w().held.contains(&web), "still held: {:?}", r.core.notices);
+    assert!(r.core.ledger().holds().is_empty(), "{:?}", r.core.ledger().hold_events);
+}
+
+/// The gate over every state of the feed, not a sample of them: a tool that
+/// stops outside Planarian is held exactly when the kernel attributes
+/// steering to it or the feed cannot be read (4 combinations, 2 lengths).
+#[test]
+fn the_gate_is_exact_over_every_state_of_the_feed() {
+    let web = UnitId::service("gym-web");
+    for steers in [false, true] {
+        for unreadable in [false, true] {
+            for ticks in [3, 9] {
+                let mut r = rig_with_tool(true, false, steers);
+                r.fake.w().protecting_unreadable = unreadable;
+                r.fake.w().stop_out_of_band(&web);
+                r.ticks(ticks);
+                let asked = r.fake.w().calls.iter().any(|c| c.call.starts_with("hold(service:gym-web)"));
+                let journaled = r.core.ledger().hold_events.iter().any(|e| e.0 == web && e.1);
+                let want = steers || unreadable;
+                assert_eq!((asked, journaled), (want, want), "steers {steers} unreadable {unreadable} {ticks} ticks");
+            }
+        }
+    }
+}
+
+/// A hold that landed on the host (OnFailure=) before the tool stopped
+/// protecting, and that the daemon has not journaled yet, is still looked
+/// after: journaled, then lifted once the tool is back.
+#[test]
+fn a_hold_only_the_host_has_is_still_lifted_when_the_tool_stops_protecting() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_tool(true, true, true);
+    r.fake.w().kill(&web);
+    r.fake.w().stops_steering(&web);
+    r.ticks(40);
+    assert!(!r.fake.w().held.contains(&web), "stranded on the host: {:?}", r.core.notices);
+    assert!(r.core.ledger().holds().is_empty(), "{:?}", r.core.ledger().hold_events);
+}
+
+/// A hold the journal has but the host no longer shows (flushed) for a tool
+/// that has stopped protecting is still looked after, and the journal's hold
+/// is lifted once the tool is back.
+#[test]
+fn a_hold_only_the_journal_has_is_still_lifted_when_the_tool_stops_protecting() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_tool(true, false, true);
+    r.fake.w().stop_out_of_band(&web);
+    for _ in 0..10 {
+        if r.core.ledger().hold_events.iter().any(|e| e.0 == web && e.1) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.core.ledger().holds().contains(&web), "never journaled: {:?}", r.core.notices);
+    r.fake.w().held.remove(&web);
+    r.fake.w().stops_steering(&web);
+    r.ticks(40);
+    assert!(r.core.ledger().holds().is_empty(), "left in the journal: {:?}", r.core.ledger().hold_events);
 }
