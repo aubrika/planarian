@@ -298,6 +298,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// when they stop, never restarted, never an incident. Set each observe.
     unmanaged: BTreeSet<UnitId>,
     unmanaged_unreadable_noted: bool,
+    /// Unmanaged tools seen running (what makes a later signal-ended stop a
+    /// failure) and where the rotation through the rest has reached.
+    unmanaged_up: BTreeSet<UnitId>,
+    unmanaged_cursor: usize,
     /// A switch outside Planarian seen at `.0`: its stops and starts follow
     /// the profile change by more than a tick, so they stay explained until
     /// `.1` (see `SWITCH_SETTLE`).
@@ -500,6 +504,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             network_tools,
             unmanaged: BTreeSet::new(),
             unmanaged_unreadable_noted: false,
+            unmanaged_up: BTreeSet::new(),
+            unmanaged_cursor: 0,
             switch_window: None,
             next_gc_check: Timestamp(0),
             space_noted: Timestamp(0),
@@ -676,6 +682,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let Some(tools) = self.network_tools.clone() else { return };
         let listed = if tools.iter().any(|t| t.ends_with('@')) { self.b.units().list().ok() } else { None };
         self.unmanaged = crate::hold::unmanaged_set(&tools, listed.as_deref(), &self.unmanaged, defs);
+        self.unmanaged_up.retain(|u| self.unmanaged.contains(u));
     }
 
     /// Observe without acting (also used to answer requests).
@@ -1024,19 +1031,44 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
     }
 
-    /// `s` and `defs` with each unmanaged network tool added as a unit
-    /// observed through the backend (an unreadable one is Unknown: neither
-    /// held nor lifted this tick).
-    fn with_unmanaged(&self, s: &SystemState, defs: &UnitDefs) -> (SystemState, UnitDefs) {
+    /// `s` and `defs` with the unmanaged network tools this tick looks at
+    /// added as units, observed through the backend (see
+    /// `hold::unmanaged_observed` for what is down; an unreadable one is
+    /// Unknown: neither held nor lifted). Those looked at are the tools whose
+    /// hold stands or is pending, always, and of the rest that protect
+    /// traffic (a tool that protects nothing is never held), at most
+    /// `UNMANAGED_OBSERVE_PER_TICK`, rotating, so a tick does not cost more
+    /// with many instances.
+    fn with_unmanaged(&mut self, s: &SystemState, defs: &UnitDefs) -> (SystemState, UnitDefs) {
         let (mut s, mut defs) = (s.clone(), defs.clone());
-        for u in &self.unmanaged {
-            let observed = self
-                .b
-                .units()
-                .observe(u)
-                .unwrap_or_else(|o| Observed::Unknown { since: s.observed_at, reason: format!("{o:?}") });
+        let standing = |me: &Self, u: &UnitId| {
+            s.holds.contains(u)
+                || me.hold_released.contains_key(u)
+                || me.release_unconfirmed.contains_key(u)
+                || me.lift_unconfirmed.contains_key(u)
+        };
+        let all: Vec<UnitId> = self.unmanaged.iter().cloned().collect();
+        let (must, rest): (Vec<UnitId>, Vec<UnitId>) = all.into_iter().partition(|u| standing(self, u));
+        let rest: Vec<UnitId> = rest.into_iter().filter(|u| s.protecting.contains(u)).collect();
+        let take = rest.len().min(crate::hold::UNMANAGED_OBSERVE_PER_TICK);
+        let start = if rest.is_empty() { 0 } else { self.unmanaged_cursor % rest.len() };
+        self.unmanaged_cursor = start + take;
+        let chosen: Vec<UnitId> =
+            must.into_iter().chain((0..take).map(|i| rest[(start + i) % rest.len()].clone())).collect();
+        for u in chosen {
+            let held = s.holds.contains(&u);
+            let observed = match self.b.units().observe(&u) {
+                Ok(raw) => {
+                    if raw == Observed::Active {
+                        self.unmanaged_up.insert(u.clone());
+                    }
+                    let was_up = self.unmanaged_up.contains(&u);
+                    crate::hold::unmanaged_observed(raw, was_up, self.b.units().ended_by(&u), held)
+                }
+                Err(o) => Observed::Unknown { since: s.observed_at, reason: format!("{o:?}") },
+            };
             s.units.insert(u.clone(), (observed, vec![]));
-            defs.insert(u.clone(), crate::hold::unmanaged_def(u));
+            defs.insert(u.clone(), crate::hold::unmanaged_def(&u));
         }
         (s, defs)
     }

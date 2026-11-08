@@ -4207,6 +4207,76 @@ mod unmanaged_tools {
         assert!(!r.fake.w().held.contains(&vpn), "lifts once it can be seen running");
     }
 
+    /// A unit that ended on its own is not down: a oneshot that finished
+    /// (`modprobe@x`: inactive, exit status 0) is never held or alarmed,
+    /// though it is in the export's templates and counts as protecting (no
+    /// footprint). Nor is one that was never seen running.
+    #[test]
+    fn a_finished_oneshot_instance_is_not_down() {
+        let inst = UnitId::service("modprobe@dm_mod");
+        let mut r = rig("modprobe@", "modprobe@dm_mod", true);
+        {
+            let mut w = r.fake.w();
+            let sim = w.units.get_mut(&inst).unwrap();
+            sim.observed = Observed::Bound;
+            sim.ended = Some(Ending::Exited(0));
+        }
+        r.ticks(20);
+        assert!(!r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
+        assert_eq!(says(&r, &alarm_text("modprobe@dm_mod")), 0);
+        assert!(r.core.ledger().holds().is_empty());
+        // Never seen up, and now inactive: not down either.
+        let mut r = rig("modprobe@", "modprobe@x", false);
+        r.fake.w().units.insert(
+            UnitId::service("modprobe@never"),
+            UnitSim { observed: Observed::Absent, ..UnitSim::active(Timestamp(0)) },
+        );
+        r.fake.w().steers_traffic(&UnitId::service("modprobe@never"));
+        r.ticks(20);
+        assert!(!r.fake.w().held.contains(&UnitId::service("modprobe@never")));
+    }
+
+    /// The cost of looking does not grow with the instances: each tick
+    /// observes at most UNMANAGED_OBSERVE_PER_TICK of the unmanaged tools that
+    /// are not held, and a failure among many is held within
+    /// ceil(n / that) ticks of its happening.
+    #[test]
+    fn many_instances_cost_a_bounded_number_of_observations_a_tick() {
+        const N: usize = 100;
+        let cap = crate::hold::UNMANAGED_OBSERVE_PER_TICK;
+        let names: Vec<UnitId> = (0..N).map(|i| UnitId::service(&format!("t@{i}"))).collect();
+        let mut r = rig("t@", "t@0", true);
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &names {
+                w.units.insert(u.clone(), UnitSim::active(now));
+                w.steers_traffic(u);
+            }
+        }
+        let observed = |r: &Rig| -> u64 {
+            r.fake.w().observe_counts.iter().filter(|(u, _)| u.name.starts_with("t@")).map(|(_, n)| *n).sum()
+        };
+        for _ in 0..4 {
+            let before = observed(&r);
+            r.ticks(1);
+            let calls = observed(&r) - before;
+            assert!(calls <= cap as u64, "a tick observed {calls} unmanaged units (cap {cap})");
+        }
+        // One is killed (it was seen running); it is held within a full round.
+        let victim = &names[N - 1];
+        r.fake.w().kill(victim);
+        let mut ticks = 0;
+        while !r.fake.w().held.contains(victim) && ticks < 40 {
+            r.ticks(1);
+            ticks += 1;
+        }
+        assert!(r.fake.w().held.contains(victim), "never held: {:?}", r.core.notices);
+        assert!(ticks <= N.div_ceil(cap) + 1, "held after {ticks} ticks");
+        // Every instance was seen at least once in a round, so being up was known.
+        assert!(names.iter().all(|u| r.fake.w().observe_counts.get(u).copied().unwrap_or(0) >= 1));
+    }
+
     mod props {
         use super::*;
         use proptest::prelude::*;

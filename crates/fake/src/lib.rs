@@ -241,6 +241,8 @@ pub struct World {
     pub list_fails: Option<String>,
     /// Units whose `observe` fails.
     pub observe_fails: BTreeSet<UnitId>,
+    /// How many times each unit was observed (`observe`).
+    pub observe_counts: BTreeMap<UnitId, u64>,
     /// `evaluate_built` fails (the export cannot be read).
     pub evaluate_built_fails: Option<String>,
     pub queued_jobs_fails: Option<String>,
@@ -857,7 +859,8 @@ impl UnitBackend for Fake {
         Ok(self.footprint_view(tools).protecting(tools, now))
     }
     fn observe(&self, id: &UnitId) -> Result<Observed, Outcome> {
-        let w = self.w();
+        let mut w = self.w();
+        *w.observe_counts.entry(id.clone()).or_default() += 1;
         if w.observe_fails.contains(id) {
             return Err(Outcome::Unknown("cannot observe it (scripted)".into()));
         }

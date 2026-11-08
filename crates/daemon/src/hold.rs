@@ -98,6 +98,28 @@ pub fn unmanaged_set(
     want
 }
 
+/// What the hold code is to read of an unmanaged tool, from what the backend
+/// saw. It has no manifest unit, so there is no Running to compare against:
+/// only a failure counts as down. Systemd's `Failed` is one; a unit seen up
+/// that a signal or the OOM killer then ended is one (a `systemctl stop` or a
+/// kill: §12d counts it); one that never ran, or that ended on its own (a
+/// oneshot that finished, `modprobe@x`), is not down and reads as up. A unit
+/// whose hold stands keeps what was seen: it lifts only when seen running.
+pub fn unmanaged_observed(raw: Observed, was_up: bool, ended: Option<Ending>, held: bool) -> Observed {
+    match raw {
+        Observed::Absent | Observed::Bound | Observed::Detected if !held => {
+            let killed = matches!(ended, Some(Ending::Signal(_) | Ending::OomKill));
+            if was_up && killed { raw } else { Observed::Active }
+        }
+        other => other,
+    }
+}
+
+/// How many unmanaged tools a tick observes besides the ones held (one
+/// `systemctl show` each): a failure among many instances is noticed within
+/// ceil(n / this) ticks, and a tick's cost does not grow with n.
+pub const UNMANAGED_OBSERVE_PER_TICK: usize = 8;
+
 /// An unmanaged network tool (no manifest unit; the export's `networkTools`)
 /// as the hold code reads a unit: desired Running, a network tool. Never
 /// given to the assembler or the incident manager: it is never repaired.
@@ -286,6 +308,30 @@ mod tests {
                 .filter(|u| !defs.contains_key(u))
                 .collect();
             prop_assert_eq!(got, want);
+        }
+
+        /// What an unmanaged tool reads as, against a model: down only when
+        /// systemd says failed, or it was seen up and a signal or the OOM
+        /// killer ended it, or its hold stands and it is not seen running.
+        #[test]
+        fn an_unmanaged_tool_is_down_only_when_it_failed_or_was_killed_or_stays_held(
+            raw in prop::sample::select(vec![
+                Observed::Absent, Observed::Bound, Observed::Detected, Observed::Active,
+                Observed::Failed(Reason::ExitCode(1)),
+            ]),
+            was_up in any::<bool>(), held in any::<bool>(),
+            ended in prop::sample::select(vec![
+                None, Some(Ending::Exited(0)), Some(Ending::Exited(1)), Some(Ending::Signal(15)), Some(Ending::OomKill),
+            ]),
+        ) {
+            let got = unmanaged_observed(raw.clone(), was_up, ended, held);
+            let inactive = matches!(raw, Observed::Absent | Observed::Bound | Observed::Detected);
+            let killed = matches!(ended, Some(Ending::Signal(_) | Ending::OomKill));
+            let down = matches!(raw, Observed::Failed(_)) || (inactive && (held || (was_up && killed)));
+            prop_assert_eq!(matches!(got, Observed::Failed(_) | Observed::Absent | Observed::Bound | Observed::Detected), down);
+            if !inactive {
+                prop_assert_eq!(got, raw);
+            }
         }
     }
 }
