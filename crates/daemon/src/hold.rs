@@ -124,10 +124,14 @@ pub fn unmanaged_observed(raw: Observed, was_up: bool, ended: Option<Ending>, he
 /// footprint while it is not running counts as protecting.
 pub const UNMANAGED_DOWN_GRACE: Millis = Millis::secs(10);
 
-/// How many unmanaged tools a tick observes besides the ones held (one
-/// `systemctl show` each): a failure among many instances is noticed within
-/// ceil(n / this) ticks, and a tick's cost does not grow with n.
+/// How many protecting unmanaged tools never seen running a tick looks at
+/// (one `systemctl show` each), rotating. The ones seen running, and the ones
+/// held, are looked at every tick.
 pub const UNMANAGED_OBSERVE_PER_TICK: usize = 8;
+
+/// More unmanaged tools than this observed every tick is said once: each is
+/// a `systemctl show` in the tick.
+pub const UNMANAGED_MANY: usize = 32;
 
 /// An unmanaged network tool (no manifest unit; the export's `networkTools`)
 /// as the hold code reads a unit: desired Running, a network tool. Never

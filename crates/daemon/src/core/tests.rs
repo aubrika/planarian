@@ -4236,15 +4236,9 @@ mod unmanaged_tools {
         assert!(!r.fake.w().held.contains(&UnitId::service("modprobe@never")));
     }
 
-    /// The cost of looking does not grow with the instances: each tick
-    /// observes at most UNMANAGED_OBSERVE_PER_TICK of the unmanaged tools that
-    /// are not held, and a failure among many is held within
-    /// ceil(n / that) ticks of its happening.
-    #[test]
-    fn many_instances_cost_a_bounded_number_of_observations_a_tick() {
-        const N: usize = 100;
-        let cap = crate::hold::UNMANAGED_OBSERVE_PER_TICK;
-        let names: Vec<UnitId> = (0..N).map(|i| UnitId::service(&format!("t@{i}"))).collect();
+    /// `n` unmanaged instances of `t@`, all protecting and running.
+    fn many(n: usize) -> (Rig, Vec<UnitId>) {
+        let names: Vec<UnitId> = (0..n).map(|i| UnitId::service(&format!("t@{i}"))).collect();
         let mut r = rig("t@", "t@0", true);
         {
             let mut w = r.fake.w();
@@ -4254,27 +4248,77 @@ mod unmanaged_tools {
                 w.steers_traffic(u);
             }
         }
-        let observed = |r: &Rig| -> u64 {
+        r.ticks(1);
+        (r, names)
+    }
+
+    fn observed_by_tick(r: &mut Rig) -> u64 {
+        let total = |r: &Rig| -> u64 {
             r.fake.w().observe_counts.iter().filter(|(u, _)| u.name.starts_with("t@")).map(|(_, n)| *n).sum()
         };
-        for _ in 0..4 {
-            let before = observed(&r);
-            r.ticks(1);
-            let calls = observed(&r) - before;
-            assert!(calls <= cap as u64, "a tick observed {calls} unmanaged units (cap {cap})");
+        let before = total(r);
+        r.ticks(1);
+        total(r) - before
+    }
+
+    /// Protecting tools never seen running are looked at a few a tick
+    /// (rotating); each tick's cost for them is bounded, and once seen they
+    /// are looked at every tick.
+    #[test]
+    fn unseen_tools_are_rotated_and_seen_ones_are_observed_every_tick() {
+        const N: usize = 100;
+        let cap = crate::hold::UNMANAGED_OBSERVE_PER_TICK as u64;
+        let (mut r, names) = many(N);
+        // The first tick after they appear has seen at most `cap` of them (and t@0).
+        assert!(r.core.unmanaged_up.len() as u64 <= 1 + cap, "{} seen at once", r.core.unmanaged_up.len());
+        // Warming up: a tick looks at the seen ones plus at most `cap` new.
+        let mut seen_before = 0;
+        for _ in 0..N.div_ceil(cap as usize) + 2 {
+            let seen_now = r.core.unmanaged_up.len() as u64;
+            let calls = observed_by_tick(&mut r);
+            assert!(calls <= seen_now + cap, "a tick observed {calls} with {seen_now} seen (cap {cap})");
+            seen_before = seen_now;
         }
-        // One is killed (it was seen running); it is held within a full round.
-        let victim = &names[N - 1];
-        r.fake.w().kill(victim);
-        let mut ticks = 0;
-        while !r.fake.w().held.contains(victim) && ticks < 40 {
-            r.ticks(1);
-            ticks += 1;
-        }
-        assert!(r.fake.w().held.contains(victim), "never held: {:?}", r.core.notices);
-        assert!(ticks <= N.div_ceil(cap) + 1, "held after {ticks} ticks");
-        // Every instance was seen at least once in a round, so being up was known.
+        assert!(seen_before > 0);
+        // Warm: every instance is observed every tick.
+        assert_eq!(r.core.unmanaged_up.len(), N);
+        assert!(observed_by_tick(&mut r) >= N as u64, "a seen tool was skipped");
+        assert!(observed_by_tick(&mut r) >= N as u64);
         assert!(names.iter().all(|u| r.fake.w().observe_counts.get(u).copied().unwrap_or(0) >= 1));
+    }
+
+    /// Whatever their number, a seen tool that goes down is held within the
+    /// grace and a tick or two: a kill (systemd failed) on the next tick, a
+    /// clean stop (no OnFailure=) after UNMANAGED_DOWN_GRACE. Detection does
+    /// not depend on N.
+    #[test]
+    fn a_seen_tool_that_goes_down_is_held_within_a_tick_or_the_grace_whatever_the_number() {
+        let tick = planarian_state::TICK.0;
+        for n in [1usize, 8, 40, 100] {
+            let (mut r, names) = many(n);
+            r.ticks(n.div_ceil(crate::hold::UNMANAGED_OBSERVE_PER_TICK) + 3);
+            let (killed, stopped) = (&names[n - 1], &names[n / 2]);
+            r.fake.w().kill(killed);
+            r.ticks(1);
+            assert!(r.fake.w().held.contains(killed), "n={n}: a kill not held on the next tick: {:?}", r.core.notices);
+            r.fake.w().stop_out_of_band(stopped);
+            let ticks = (crate::hold::UNMANAGED_DOWN_GRACE.0 / tick) as usize + 2;
+            r.ticks(ticks);
+            assert!(r.fake.w().held.contains(stopped), "n={n}: a clean stop not held after {ticks} ticks");
+        }
+    }
+
+    /// More than UNMANAGED_MANY observed every tick is said once.
+    #[test]
+    fn many_unmanaged_tools_observed_every_tick_are_said_once() {
+        let (mut r, _) = many(crate::hold::UNMANAGED_MANY + 8);
+        r.ticks(12);
+        let said =
+            r.core.notices.iter().filter(|n| n.contains("unmanaged network tools are observed every tick")).count();
+        assert_eq!(said, 1, "{:?}", r.core.notices);
+        let (mut r, _) = many(4);
+        r.ticks(12);
+        assert!(!r.core.notices.iter().any(|n| n.contains("observed every tick")));
     }
 
     /// A restart is a stop and a start seconds apart: a tool seen up and

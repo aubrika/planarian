@@ -302,6 +302,7 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// failure) and where the rotation through the rest has reached.
     unmanaged_up: BTreeSet<UnitId>,
     unmanaged_cursor: usize,
+    unmanaged_many_noted: bool,
     /// Since when each unmanaged tool has been seen down by a signal, and
     /// whether this tick is inside a switch window (a rebuild's stops and
     /// restarts are not a tool going down).
@@ -511,6 +512,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             unmanaged_unreadable_noted: false,
             unmanaged_up: BTreeSet::new(),
             unmanaged_cursor: 0,
+            unmanaged_many_noted: false,
             unmanaged_down_since: BTreeMap::new(),
             switching: false,
             switch_window: None,
@@ -1050,11 +1052,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// `s` and `defs` with the unmanaged network tools this tick looks at
     /// added as units, observed through the backend (see
     /// `hold::unmanaged_observed` for what is down; an unreadable one is
-    /// Unknown: neither held nor lifted). Those looked at are the tools whose
-    /// hold stands or is pending, always, and of the rest that protect
-    /// traffic (a tool that protects nothing is never held), at most
-    /// `UNMANAGED_OBSERVE_PER_TICK`, rotating, so a tick does not cost more
-    /// with many instances.
+    /// Unknown: neither held nor lifted). Always looked at: the tools whose
+    /// hold stands or is pending, and every protecting tool seen running (a
+    /// down one is held the next tick, whatever their number: more than
+    /// `UNMANAGED_MANY` is said once). Of the protecting tools never seen
+    /// running, at most `UNMANAGED_OBSERVE_PER_TICK`, rotating: one never
+    /// seen up cannot read as down, so how soon it is first seen matters only
+    /// to when it becomes watched. A tool that protects nothing is never held
+    /// and is not observed.
     fn with_unmanaged(&mut self, s: &SystemState, defs: &UnitDefs) -> (SystemState, UnitDefs) {
         let (mut s, mut defs) = (s.clone(), defs.clone());
         let standing = |me: &Self, u: &UnitId| {
@@ -1065,12 +1070,23 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         };
         let all: Vec<UnitId> = self.unmanaged.iter().cloned().collect();
         let (must, rest): (Vec<UnitId>, Vec<UnitId>) = all.into_iter().partition(|u| standing(self, u));
-        let rest: Vec<UnitId> = rest.into_iter().filter(|u| s.protecting.contains(u)).collect();
-        let take = rest.len().min(crate::hold::UNMANAGED_OBSERVE_PER_TICK);
-        let start = if rest.is_empty() { 0 } else { self.unmanaged_cursor % rest.len() };
+        let (seen, unseen): (Vec<UnitId>, Vec<UnitId>) =
+            rest.into_iter().filter(|u| s.protecting.contains(u)).partition(|u| self.unmanaged_up.contains(u));
+        let take = unseen.len().min(crate::hold::UNMANAGED_OBSERVE_PER_TICK);
+        let start = if unseen.is_empty() { 0 } else { self.unmanaged_cursor % unseen.len() };
         self.unmanaged_cursor = start + take;
-        let chosen: Vec<UnitId> =
-            must.into_iter().chain((0..take).map(|i| rest[(start + i) % rest.len()].clone())).collect();
+        let mut chosen: Vec<UnitId> = must.into_iter().chain(seen).collect();
+        if chosen.len() > crate::hold::UNMANAGED_MANY {
+            if !std::mem::replace(&mut self.unmanaged_many_noted, true) {
+                self.notice(format!(
+                    "warning: {} unmanaged network tools are observed every tick; a tick takes longer for them",
+                    chosen.len()
+                ));
+            }
+        } else {
+            self.unmanaged_many_noted = false;
+        }
+        chosen.extend((0..take).map(|i| unseen[(start + i) % unseen.len()].clone()));
         for u in chosen {
             let held = s.holds.contains(&u);
             let observed = match self.b.units().observe(&u) {
