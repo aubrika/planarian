@@ -3912,3 +3912,54 @@ mod switch_window_props {
         }
     }
 }
+
+mod switch_window_busy {
+    use super::*;
+
+    const T: u64 = 5; // seconds per tick
+
+    /// An outside switch seen, then `after` seconds of ticks, then a stop of
+    /// gym-db; whether that stop was inferred as a person's.
+    fn inferred_after(after: u64, setup: impl Fn(&mut Rig), keep: impl Fn(&mut Rig)) -> bool {
+        let mut r = Rig::new();
+        r.ticks(2);
+        setup(&mut r);
+        let g = r.fake.w().add_generation(&Default::default());
+        r.fake.w().current = g;
+        for _ in 0..=(after / T) {
+            r.ticks(1);
+            keep(&mut r);
+        }
+        r.fake.w().stop_out_of_band(&UnitId::service("gym-db"));
+        r.ticks(3);
+        !r.core.ledger().overrides.is_empty()
+    }
+
+    fn busy(r: &mut Rig) {
+        r.fake.w().extra_pending_jobs = 2;
+    }
+
+    #[test]
+    fn jobs_still_queued_past_the_quiet_period_keep_the_window_open() {
+        // 150 s > SWITCH_SETTLE, jobs queued the whole time.
+        assert!(!inferred_after(150, |_| {}, busy));
+        // Control: with the queue empty the same stop is a person's.
+        assert!(inferred_after(150, |_| {}, |_| {}));
+    }
+
+    #[test]
+    fn a_failing_job_query_keeps_the_window_open() {
+        let failing = |r: &mut Rig| r.fake.w().pending_jobs_fails = Some("no bus".into());
+        assert!(!inferred_after(150, |_| {}, failing));
+    }
+
+    #[test]
+    fn the_cap_closes_the_window_even_while_busy_and_a_stop_after_it_is_a_persons() {
+        // 570 s: inside the 600 s cap, still busy: explained.
+        assert!(!inferred_after(570, |_| {}, busy));
+        // 640 s: past the cap, still busy: inferred.
+        assert!(inferred_after(640, |_| {}, busy));
+        let failing = |r: &mut Rig| r.fake.w().pending_jobs_fails = Some("no bus".into());
+        assert!(inferred_after(640, |_| {}, failing));
+    }
+}
