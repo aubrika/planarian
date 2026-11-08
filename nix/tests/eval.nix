@@ -207,6 +207,11 @@ let
   nftOn = (sys.extendModules { modules = [ { networking.nftables.enable = true; } ]; }).config.services.planarian;
   nftOnDropin = nftOn.holdDropins."nftables.service.d/50-planarian-reapply.conf";
   nftOnHold = nftOn.holdDropins."nftables.service.d/50-planarian-hold.conf";
+  # The same with netwatch: the hold file also orders nftables after it
+  # (unless nftables is one of the cycle exceptions).
+  nftNw = ((withNetwatch sys).extendModules { modules = [ { networking.nftables.enable = true; } ]; }).config.services.planarian;
+  nftNwHold = nftNw.holdDropins."nftables.service.d/50-planarian-hold.conf";
+  nftNwReapply = nftNw.holdDropins."nftables.service.d/50-planarian-reapply.conf";
   # §12d (netwatch): the reference kernel carries BTF and what aya's
   # programs on the netlink paths need. Read from its configuration (built,
   # like the respond script above). netwatch reports a failed attach at
@@ -270,6 +275,7 @@ let
     (check (hold.holdDropins."gym-vpn.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "a network-security unit's failure applies the hold through OnFailure= (§12d)")
     (check (!(cfg.systemd.services.gym-vpn ? onFailure) || !(builtins.elem "planarian-hold@gym-vpn.service" cfg.systemd.services.gym-vpn.onFailure)) "the OnFailure= is a drop-in, not a unit definition (no stub for an undefined unit)")
     (check (builtins.elem "nftables" nftOn.holdUnits && pkgs.lib.hasInfix "\nOnFailure=planarian-hold@%N.service\n" nftOnHold && !(pkgs.lib.hasInfix "ExecStartPost=" nftOnHold) && pkgs.lib.hasInfix "ExecStartPost=" nftOnDropin && pkgs.lib.hasInfix "ExecReload=" nftOnDropin && !(pkgs.lib.hasInfix "OnFailure=" nftOnDropin)) "nftables, a network tool, has its OnFailure= hold and its re-application in two files of different names (one name replaced the other: verify-hold found it in vm-netwatch, #96)")
+    (check (builtins.elem "nftables" nftNw.holdUnits && (builtins.elem "nftables" (import ../netwatch-unordered.nix).cycle || pkgs.lib.hasInfix "\nAfter=planarian-netwatch.service\n" nftNwHold) && pkgs.lib.hasInfix "\nOnFailure=planarian-hold@%N.service\n" nftNwHold && !(pkgs.lib.hasInfix "After=" nftNwReapply) && pkgs.lib.hasInfix "ExecStartPost=" nftNwReapply && nftNwHold != nftNwReapply) "with netwatch, nftables' hold file keeps its OnFailure= and its After=planarian-netwatch.service, and the re-application is a separate file with its own lines (#96)")
     (check (builtins.all (n: builtins.length (builtins.filter (m: m == n) (builtins.attrNames nftOn.holdDropins)) == 1) (builtins.attrNames nftOn.holdDropins) && builtins.all (n: !(pkgs.lib.hasInfix "ExecStartPost=" nftOn.holdDropins.${n}) || !(pkgs.lib.hasInfix "OnFailure=" nftOn.holdDropins.${n})) (builtins.attrNames nftOn.holdDropins)) "no drop-in file carries both a hold and a re-application: they would be one name to systemd")
     (check (pkgs.lib.hasInfix "ExecStartPost=" nftDropin && pkgs.lib.hasInfix "ExecReload=" nftDropin && pkgs.lib.hasInfix " reapply" nftDropin) "a hold is re-applied after nftables.service starts or reloads, which may flush every table (§12d)")
     (check (cfg.environment.etc."planarian/hold/gym-vpn.allow".text == "udp 192.0.2.7 51820\niface wg9\n") "the hold passes the unit's holdAllow endpoints and its own interfaces, as a kill switch does (§12d; owner decision, Nov 2)")
