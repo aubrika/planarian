@@ -485,7 +485,8 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                 }
                 Err(why) => {
                     eprintln!("netwatch: {why}");
-                    tracker.lost(None);
+                    // Object-bound: cleared by the next read that succeeds.
+                    tracker.wireguard_unread();
                     changed = true;
                 }
             }

@@ -81,6 +81,28 @@ fn request(protocol: Option<rustix::net::Protocol>, ty: u16, flags: u16, body: &
     }
 }
 
+/// A dump the kernel flagged as interrupted: the list changed under it.
+pub(crate) const INTERRUPTED: &str = "an interrupted netlink dump";
+
+/// Run `read` again, up to `attempts` times in all, while it fails as
+/// interrupted (a peer list that changes under a dump is the normal answer to
+/// a `wg addconf` racing it; the next dump is consistent). Any other failure,
+/// or the last interruption, is returned: a failed dump is never a smaller
+/// snapshot.
+pub(crate) fn retry_interrupted<T>(
+    attempts: usize,
+    mut read: impl FnMut() -> Result<T, NlError>,
+) -> Result<T, NlError> {
+    let mut left = attempts.max(1);
+    loop {
+        left -= 1;
+        match read() {
+            Err(NlError::Other(s)) if s == INTERRUPTED && left > 0 => continue,
+            r => return r,
+        }
+    }
+}
+
 /// Collect a complete datagram, returning true only at a successful
 /// terminator. An interrupted or failed dump is never a smaller snapshot.
 pub(crate) fn collect_reply(bytes: &[u8], out: &mut Vec<Vec<u8>>) -> Result<bool, NlError> {
@@ -97,7 +119,7 @@ pub(crate) fn collect_reply(bytes: &[u8], out: &mut Vec<Vec<u8>>) -> Result<bool
             return Err(NlError::Other("a malformed netlink reply".into()));
         }
         if flags & NLM_F_DUMP_INTR != 0 {
-            return Err(NlError::Other("an interrupted netlink dump".into()));
+            return Err(NlError::Other(INTERRUPTED.into()));
         }
         if ty == NLMSG_DONE || ty == NLMSG_ERROR {
             let code = match len {
@@ -183,6 +205,10 @@ pub(crate) fn family_id_by_name(name: &str) -> Result<Option<u16>, String> {
     }
 }
 
+/// How many times a WireGuard device dump is tried while the kernel keeps
+/// flagging it interrupted (each try is bounded by the receive timeout).
+const WG_DUMP_ATTEMPTS: usize = 3;
+
 /// WireGuard's generic netlink family id, if the module is loaded.
 pub fn wireguard_family() -> Result<Option<u16>, String> {
     family_id("wireguard")
@@ -197,7 +223,7 @@ pub fn wireguard() -> Result<(Option<u16>, Vec<crate::wg::Device>), String> {
     let mut devices = vec![];
     for index in crate::wg::link_indices(&links)? {
         let body = crate::wg::get_device_request(index);
-        let msgs = request(Some(netlink::GENERIC), family, NLM_F_DUMP, &body)
+        let msgs = retry_interrupted(WG_DUMP_ATTEMPTS, || request(Some(netlink::GENERIC), family, NLM_F_DUMP, &body))
             .map_err(|e| format!("wireguard device {index} dump: {e}"))?;
         devices.extend(crate::wg::devices(&msgs)?);
     }

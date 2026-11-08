@@ -3012,6 +3012,44 @@ mod genl_bounded {
         assert_eq!(got, Ok(None));
     }
 
+    /// A dump the kernel flags interrupted (a peer list changing under it) is
+    /// read again, up to the attempts given; any other failure is returned at
+    /// once, and the last interruption is returned, never a smaller result.
+    /// Exhaustive over every outcome sequence of length 4.
+    #[test]
+    fn an_interrupted_dump_is_retried_a_bounded_number_of_times() {
+        use crate::snapshot::{INTERRUPTED, NlError, retry_interrupted};
+        // 0 = interrupted, 1 = ok, 2 = another failure
+        for code in 0..3usize.pow(4) {
+            let outcomes: Vec<usize> = (0..4).map(|i| code / 3usize.pow(i) % 3).collect();
+            for attempts in 1..=4usize {
+                let mut calls = 0;
+                let got = retry_interrupted(attempts, || {
+                    let o = outcomes[calls];
+                    calls += 1;
+                    match o {
+                        0 => Err(NlError::Other(INTERRUPTED.into())),
+                        1 => Ok(calls),
+                        _ => Err(NlError::Errno(-1)),
+                    }
+                });
+                // The first outcome that is not an interruption ends it, or
+                // the attempts do.
+                let end = outcomes.iter().take(attempts).position(|o| *o != 0);
+                match end {
+                    Some(i) => {
+                        assert_eq!(calls, i + 1, "{outcomes:?} x{attempts}");
+                        assert_eq!(got.is_ok(), outcomes[i] == 1);
+                    }
+                    None => {
+                        assert_eq!(calls, attempts, "{outcomes:?} x{attempts}");
+                        assert!(matches!(got, Err(NlError::Other(ref s)) if s == INTERRUPTED));
+                    }
+                }
+            }
+        }
+    }
+
     /// The WireGuard lookups return too (none here, or the devices).
     #[test]
     fn the_wireguard_lookups_return() {

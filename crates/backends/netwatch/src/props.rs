@@ -867,6 +867,8 @@ mod wgfold {
         /// The device was deleted (RTM_DELLINK): and may be made again before
         /// the next read, with the same name and index.
         Del(usize),
+        /// A WireGuard read failed (an interrupted dump).
+        Unread,
     }
 
     fn steps() -> impl Strategy<Value = Vec<Step>> {
@@ -876,6 +878,7 @@ mod wgfold {
                 3 => read().prop_map(Step::Set),
                 1 => (0..UNITS, 1u8..5).prop_map(|(a, n)| Step::Restore(a, n)),
                 1 => (0..DEVS).prop_map(Step::Del),
+                1 => Just(Step::Unread),
             ],
             0..16,
         )
@@ -903,8 +906,13 @@ mod wgfold {
             // device -> the interface index its first read showed
             let mut bound: Vec<BTreeMap<usize, Option<u32>>> = vec![BTreeMap::new(); UNITS];
             let mut want: Vec<BTreeSet<Endpoint>> = vec![BTreeSet::new(); UNITS];
+            let mut unread = false;
             for s in &steps {
                 match s {
+                    Step::Unread => {
+                        t.wireguard_unread();
+                        unread = true;
+                    }
                     Step::Bind(a, d) => {
                         t.bind_wireguard(&unit(*a), &dev_name(*d));
                         bound[*a].insert(*d, None);
@@ -938,9 +946,18 @@ mod wgfold {
                             want[i] = r.iter().filter(|(d, _, _)| bound[i].contains_key(d)).flat_map(|(_, _, e)| e.iter().map(|n| ep(*n))).collect();
                         }
                         let changed = t.set_wireguard(&devices(r));
-                        prop_assert_eq!(changed, before != want, "the return value, on {:?}", r);
+                        prop_assert_eq!(changed, before != want || unread, "the return value, on {:?}", r);
+                        unread = false;
                     }
                 }
+                // A failed read marks the footprints unattributed, and the
+                // next read that succeeds clears it: not at a restart.
+                let marked = t
+                    .view(WatchState::Attached { at: NOW }, &[], NOW)
+                    .unattributed
+                    .iter()
+                    .any(|w| w.contains("WireGuard peers"));
+                prop_assert_eq!(marked, unread, "the failed-read mark, after {:?}", s);
                 for (i, w) in want.iter().enumerate() {
                     prop_assert_eq!(&endpoints(&t, i), w, "unit {} after {:?}", i, s);
                 }
@@ -959,6 +976,9 @@ mod wgfold {
                     Step::Set(r) => { t.set_wireguard(&devices(r)); }
                     Step::Restore(a, n) => t.add_endpoint(&unit(*a), ep(*n)),
                     Step::Del(d) => t.apply(&Change { owner: Owner::Unattributed, kind: ChangeKind::Interface, object: dev_name(*d), iface: Some(dev_name(*d)), steers: false, removed: true }),
+                    // A failed read is not kept by a restart: the new watch
+                    // reads again.
+                    Step::Unread => {}
                 }
             }
             // What the restart keeps includes the index each binding was

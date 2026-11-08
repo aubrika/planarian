@@ -182,6 +182,12 @@ pub struct Tracker {
     /// A lost event could not be placed: everything counts as unattributed
     /// until the watch restarts (which re-reads the kernel's state).
     lost_unplaced: bool,
+    /// The last WireGuard read failed: the peers (and so the endpoints the
+    /// hold passes) are unknown. Object-bound: it clears with the next read
+    /// that succeeds, not at a restart (a failed dump is the kernel's
+    /// answer to a peer list changing under it, not an event nobody can
+    /// place).
+    wg_unread: bool,
     /// Steering objects found standing on attach that no footprint claimed:
     /// made while nobody watched (§12d, fail closed). Each clears when its
     /// object is removed.
@@ -506,7 +512,9 @@ impl Tracker {
     /// none (the latch keeps what an invocation found protecting with, for
     /// the hold to pass its peer). Returns whether anything changed.
     pub fn set_wireguard(&mut self, devices: &[crate::wg::Device]) -> bool {
-        let mut changed = false;
+        // A read that succeeded: whatever the last failed one left unknown
+        // is known again.
+        let mut changed = std::mem::take(&mut self.wg_unread);
         for s in self.units.values_mut() {
             if s.wireguard.is_empty() {
                 continue;
@@ -677,6 +685,12 @@ impl Tracker {
         }
     }
 
+    /// A WireGuard read failed (an interrupted or failed dump): fail closed
+    /// until one succeeds.
+    pub fn wireguard_unread(&mut self) {
+        self.wg_unread = true;
+    }
+
     /// An event was lost. With the unit known, its footprint is marked
     /// unattributed; without, the global marker stands.
     pub fn lost(&mut self, unit: Option<&UnitId>) {
@@ -793,6 +807,9 @@ impl Tracker {
         why.extend(self.pre_attach.keys().map(|(k, o)| format!("pre-attach {k:?} {o}")));
         if self.lost_unplaced {
             why.push("an event was lost and could not be placed".into());
+        }
+        if self.wg_unread {
+            why.push("the WireGuard peers could not be read".into());
         }
         FootprintView { watch, unattributed: why, units }
     }
