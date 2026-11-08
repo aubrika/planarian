@@ -154,6 +154,31 @@ pkgs.testers.runNixOSTest {
       };
     };
     services.planarian.units.gym-linger = { };
+    # The real `systemctl show` format for the daemon's batch observation
+    # (#93, `planariad --observe-units`): a oneshot that exits 0 (no
+    # RemainAfterExit, so it ends inactive) and a simple unit to stop with
+    # SIGTERM. Neither is a network tool (own network namespace, no
+    # capabilities), so stopping one holds nothing.
+    systemd.services.gym-oneshot = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${pkgs.coreutils}/bin/true";
+        DynamicUser = true;
+        PrivateNetwork = true;
+        CapabilityBoundingSet = [ "" ];
+      };
+    };
+    systemd.services.gym-term = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+        DynamicUser = true;
+        PrivateNetwork = true;
+        CapabilityBoundingSet = [ "" ];
+      };
+    };
     # Case E (§12d "A network tool Planarian does not manage", owner decision,
     # Nov 3): a network tool by its systemd configuration (root, no
     # capability bounding set) that steers (a dropping rule for 203.0.113.81,
@@ -612,5 +637,34 @@ pkgs.testers.runNixOSTest {
         machine.fail(f"systemctl is-active {UNMANAGED}.service")
         assert invocation() == killed, f"a new run of {UNMANAGED}: {killed} -> {invocation()}"
         assert e_alarms() == 2, e_alarms()
+
+    # The daemon reads unmanaged tools with one multi-unit `systemctl show`
+    # (#93, `observe_many`). Its parser's sample is hand-written; this checks
+    # it against the real systemd's output, through the installed binary.
+    with subtest("observe_many reads the real systemctl show: running, not found, exited 0, stopped by SIGTERM"):
+        daemon = machine.succeed("readlink -f /proc/$(systemctl show -p MainPID --value planariad.service)/exe").strip()
+        def observe(*units):
+            out = machine.succeed(f"{daemon} --observe-units {' '.join(units)}")
+            got = {}
+            for line in out.splitlines():
+                parts = line.split("\t")
+                assert len(parts) == 3, out
+                got[parts[0]] = (parts[1], parts[2])
+            assert set(got) == set(units), out
+            return got, out
+        machine.wait_until_succeeds("systemctl show -p ActiveState --value gym-oneshot.service | grep -qx inactive", timeout=60)
+        machine.wait_for_unit("gym-term.service")
+        got, out = observe("sshd.service", "planarian-nosuch.service", "gym-oneshot.service", "gym-term.service")
+        assert got["sshd.service"][0] == "Ok(Active)", out
+        assert got["gym-term.service"][0] == "Ok(Active)", out
+        # Not found is Absent, never an Err (systemd answers for it).
+        assert got["planarian-nosuch.service"][0] == "Ok(Absent)", out
+        # A oneshot that ran and exited 0 is not running and ended on its own.
+        assert got["gym-oneshot.service"][0] == "Ok(Bound)", out
+        assert "Exited(0)" in got["gym-oneshot.service"][1], out
+        machine.succeed("systemctl stop gym-term.service")
+        got, out = observe("gym-term.service")
+        assert got["gym-term.service"][0] == "Ok(Bound)", out
+        assert "Signal(15)" in got["gym-term.service"][1], out
   '';
 }
