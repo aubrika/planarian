@@ -250,6 +250,11 @@ pub struct World {
     pub observe_fails: BTreeSet<UnitId>,
     /// How many times each unit was observed (`observe`).
     pub observe_counts: BTreeMap<UnitId, u64>,
+    /// Units that receive the signal just after their next `observe` or
+    /// `observe_many` has answered: the read shows what it was, and the
+    /// world changes before the daemon acts on it, as when a tick's probes
+    /// take seconds after its status read.
+    pub signal_after_observe: BTreeMap<UnitId, i32>,
     /// `evaluate_built` fails (the export cannot be read).
     pub evaluate_built_fails: Option<String>,
     pub queued_jobs_fails: Option<String>,
@@ -882,7 +887,11 @@ impl UnitBackend for Fake {
         if w.observe_fails.contains(id) {
             return Err(Outcome::Unknown("cannot observe it (scripted)".into()));
         }
-        Ok(w.units.get(&World::key(id)).map(|s| s.observed.clone()).unwrap_or(Observed::Absent))
+        let seen = w.units.get(&World::key(id)).map(|s| s.observed.clone()).unwrap_or(Observed::Absent);
+        if let Some(sig) = w.signal_after_observe.remove(id) {
+            w.signal(id, sig);
+        }
+        Ok(seen)
     }
 
     fn observe_many(&self, ids: &[UnitId]) -> Vec<(Result<Observed, Outcome>, Option<Ending>)> {
@@ -901,6 +910,9 @@ impl UnitBackend for Fake {
                 let ended = matches!(observed, Observed::Absent | Observed::Bound | Observed::Detected)
                     .then(|| sim.and_then(|s| s.ended))
                     .flatten();
+                if let Some(sig) = w.signal_after_observe.remove(id) {
+                    w.signal(id, sig);
+                }
                 (Ok(observed), ended)
             })
             .collect()

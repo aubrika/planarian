@@ -2929,6 +2929,112 @@ fn a_held_network_tool_killed_outside_planarian_is_restarted_at_once() {
     assert!(!r.fake.w().held.contains(&web), "the hold lifts once it is back");
 }
 
+/// gym-web as a network tool with no Readiness probe, as the catalog's
+/// `gym-linger` is: back is then only "Running".
+fn rig_with_probeless_tool() -> Rig {
+    let mut r = rig_with_network_tool(true, true);
+    let mut m = r.core.asm.manifest().clone();
+    m.units.get_mut(&UnitId::service("gym-web")).unwrap().probes.retain(|p| p.role != ProbeRole::Readiness);
+    r.core.asm.set_manifest(m);
+    r.ticks(2);
+    r
+}
+
+/// §12d, catalog run 42504673480 (`vm-netsec`, "a lingering cgroup"): a
+/// tick reads a tool's status, then spends seconds on probes; the tool is
+/// SIGKILLed in that gap, OnFailure= holds it, and the tick's hold step then
+/// saw a hold on the host and, from its old reading, a tool that was
+/// Running: it alarmed and lifted in one observation, and traffic flowed
+/// while the tool was down. A hold lifts only on a status read at the moment
+/// of the lift, and never on the observation that alarmed it.
+#[test]
+fn a_kill_after_the_status_read_does_not_lift_the_hold_it_caused() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_probeless_tool();
+    r.fake.w().signal_after_observe.insert(web.clone(), 9);
+    r.ticks(1);
+    let held = r.fake.w().held.contains(&web);
+    assert!(held, "OnFailure= held it and nothing lifted it: {:?}", r.core.notices);
+    assert_eq!(r.calls("lift_hold(service:gym-web)"), 0, "lifted on a reading older than the kill");
+    assert!(!r.core.notices.iter().any(|n| n.contains("is back; network traffic flows again")), "{:?}", r.core.notices);
+    // It stays held until it is genuinely Running again, then lifts.
+    let mut seen_down_held = false;
+    for _ in 0..12 {
+        r.ticks(1);
+        let (running, held) = (r.status("service:gym-web") == UnitStatus::Running, r.fake.w().held.contains(&web));
+        assert!(running || held, "traffic flowed while the tool was down: {:?}", r.core.notices);
+        seen_down_held |= !running && held;
+    }
+    assert!(seen_down_held || r.calls("restart(service:gym-web)") >= 1);
+    assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
+    assert!(!r.fake.w().held.contains(&web), "the hold lifts once it is back");
+}
+
+/// The same race for a hold the daemon has already journaled: the tool is
+/// Running when the tick reads it and killed before the hold step runs. The
+/// lift asks systemd again and finds it down.
+#[test]
+fn a_journaled_hold_does_not_lift_on_a_reading_older_than_a_second_kill() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_probeless_tool();
+    r.fake.w().kill(&web);
+    r.ticks(1);
+    assert!(r.core.ledger().holds().contains(&web), "journaled: {:?}", r.core.notices);
+    {
+        let mut w = r.fake.w();
+        w.units.get_mut(&web).unwrap().observed = Observed::Active;
+        w.signal_after_observe.insert(web.clone(), 9);
+    }
+    let before = r.calls("lift_hold(service:gym-web)");
+    r.ticks(1);
+    let after = r.calls("lift_hold(service:gym-web)");
+    let held = r.fake.w().held.contains(&web);
+    assert!(held, "lifted on a reading older than the kill: {:?}", r.core.notices);
+    assert_eq!(before, after, "asked the host to lift");
+}
+
+/// The alarm for a hold the daemon finds already standing and the lift of
+/// that hold are never the same observation, even for a tool that is
+/// Running again by then (systemd restarted it before the daemon looked).
+#[test]
+fn the_alarm_for_a_hold_and_its_lift_are_never_one_observation() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_probeless_tool();
+    r.fake.w().kill(&web);
+    r.fake.w().units.get_mut(&web).unwrap().observed = Observed::Active; // systemd's Restart= beat the daemon
+    assert!(r.fake.w().held.contains(&web));
+    r.ticks(1);
+    assert!(r.core.notices.iter().any(|n| *n == crate::hold::alarm(&web)), "alarmed: {:?}", r.core.notices);
+    assert_eq!(r.calls("lift_hold(service:gym-web)"), 0, "alarm and lift in one observation");
+    assert!(r.fake.w().held.contains(&web));
+    r.ticks(2);
+    assert!(!r.fake.w().held.contains(&web), "lifted on a later observation");
+}
+
+/// A killed tool whose child lingers in its cgroup is Failed (or, while
+/// systemd tears it down, Transitioning), never Running: its hold stands
+/// whatever the read says about processes.
+#[test]
+fn a_tool_that_is_failing_or_deactivating_stays_held() {
+    for linger in [
+        Observed::Failed(Reason::ExitCode(137)),
+        Observed::Transitioning { from: Box::new(Observed::Active), since: Timestamp(0) },
+    ] {
+        let web = UnitId::service("gym-web");
+        let mut r = rig_with_probeless_tool();
+        r.fake.w().kill(&web);
+        r.ticks(1);
+        assert!(r.fake.w().held.contains(&web));
+        // Held on the host and journaled; the unit's state is pinned.
+        for _ in 0..8 {
+            r.fake.w().units.get_mut(&web).unwrap().observed = linger.clone();
+            r.ticks(1);
+            assert!(r.fake.w().held.contains(&web), "lifted while {linger:?}: {:?}", r.core.notices);
+        }
+        assert_eq!(r.calls("lift_hold(service:gym-web)"), 0, "{linger:?}");
+    }
+}
+
 /// Stopped cleanly outside Planarian (`systemctl stop`: no OnFailure=):
 /// §12d's other half, "by `planariad` for a stop outside Planarian that is
 /// not attributed (always a fault, §11 residue)". Held by the daemon,
@@ -3458,6 +3564,50 @@ fn a_lift_that_alone_hangs_is_retried_quietly_once_a_minute() {
     r.ticks(15);
     assert!(!r.fake.w().held.contains(&web), "never lifted: {:?}", r.core.notices);
     assert_eq!(r.core.notices.iter().filter(|n| n.contains("flows again")).count(), 1, "{:?}", r.core.notices);
+}
+
+/// The retry of a lift the host had not confirmed is a lift too: it asks
+/// systemd again, so a tool killed since the tick's status read keeps its hold.
+#[test]
+fn the_retry_of_an_unconfirmed_lift_does_not_open_traffic_for_a_tool_that_is_down() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_probeless_tool();
+    r.fake.w().stop_out_of_band(&web);
+    for _ in 0..10 {
+        if r.fake.w().held.contains(&web) {
+            break;
+        }
+        r.ticks(1);
+    }
+    r.fake.w().lift_hangs = Some(Millis::secs(30));
+    for _ in 0..40 {
+        if r.core.lift_unconfirmed.contains_key(&web) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.core.lift_unconfirmed.contains_key(&web), "no unconfirmed lift: {:?}", r.core.notices);
+    r.fake.w().lift_hangs = None;
+    let asked = r.calls("lift_hold(service:gym-web)");
+    let mut killed = false;
+    for _ in 0..40 {
+        let due = {
+            let next = r.core.lift_unconfirmed.get(&web).copied();
+            next.is_some_and(|n| r.core.b.clock().boot_now().plus(planarian_state::TICK) >= n)
+        };
+        if due && !killed {
+            r.fake.w().signal_after_observe.insert(web.clone(), 9);
+            killed = true;
+        }
+        r.ticks(1);
+        if killed {
+            break;
+        }
+    }
+    assert!(killed, "the retry never came due");
+    let held = r.fake.w().held.contains(&web);
+    assert!(held, "the retry lifted on a reading older than the kill: {:?}", r.core.notices);
+    assert_eq!(r.calls("lift_hold(service:gym-web)"), asked, "asked the host to lift again");
 }
 
 // ---- §9: "`Exec` probes, which run arbitrary commands, are permitted only

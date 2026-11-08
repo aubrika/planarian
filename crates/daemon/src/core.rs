@@ -1317,7 +1317,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     // pending: not a new hold. Retried when due.
                     Some(true) if !hold::failed(s, defs, &u) && hold::back(s, defs, &u) => {
                         let now = self.b.clock().boot_now();
-                        if self.lift_unconfirmed.get(&u).is_some_and(|next| now >= *next) && self.hold_wait().is_some()
+                        if self.lift_unconfirmed.get(&u).is_some_and(|next| now >= *next)
+                            && self.hold_wait().is_some()
+                            && self.running_now(&u)
                         {
                             self.lift_host(&u);
                         }
@@ -1399,7 +1401,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::OnFailure });
                     self.notice(if self.unmanaged.contains(&u) { hold::unmanaged_alarm(&u) } else { hold::alarm(&u) });
                 }
-                if hold::back(s, defs, &u) {
+                // Only a hold that stood before this observation lifts on
+                // it: the alarm above and the lift are never one observation
+                // (catalog run 42504673480).
+                if in_journal && hold::back(s, defs, &u) {
                     self.lift_back(&u);
                 }
             }
@@ -1411,12 +1416,22 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// when the tick has no budget left: nothing is done, and it is lifted
     /// on a later tick.
     fn lift_back(&mut self, u: &UnitId) -> bool {
-        if self.hold_wait().is_none() {
+        if self.hold_wait().is_none() || !self.running_now(u) {
             return false;
         }
         self.journal(Record::HoldLifted { unit: u.clone(), reason: "Running, and its Readiness probes pass".into() });
         self.lift_host(u);
         true
+    }
+
+    /// Whether systemd says the unit is Running at this moment. The tick's
+    /// state was read before its probes, which can take seconds, so a lift
+    /// asks again: a tool killed since (OnFailure= has held it) must not have
+    /// its traffic opened on the old reading. `deactivating`, `failed`, a
+    /// cgroup that merely still has processes, and a read that fails all
+    /// keep the hold (fail closed).
+    fn running_now(&self, u: &UnitId) -> bool {
+        matches!(self.b.units().observe(u), Ok(Observed::Active))
     }
 
     /// Asks the host to lift a hold already journaled as lifted. A lift the
