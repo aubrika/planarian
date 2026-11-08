@@ -1532,9 +1532,11 @@ fn what_was_added_during_format_2_is_required_of_a_target_that_predates_the_expo
     assert_eq!(needs(&renew(5)), vec!["decisive field Renew.boot_at"]);
     assert!(needs(&renew(0)).is_empty(), "a boot time at its default needs nothing");
     let token = |approver, txn| Record::TokenUsed { nonce: [1; 16], expires: Timestamp(9), approver, txn };
-    assert_eq!(needs(&token(7, 0)), vec!["decisive field TokenUsed.approver"]);
-    assert_eq!(needs(&token(7, 3)), vec!["decisive field TokenUsed.approver", "decisive field TokenUsed.txn"]);
-    assert!(needs(&token(0, 0)).is_empty());
+    // Root (uid 0) and the first transaction (id 0) are real values.
+    let both = vec!["decisive field TokenUsed.approver", "decisive field TokenUsed.txn"];
+    assert_eq!(needs(&token(7, 0)), both);
+    assert_eq!(needs(&token(7, 3)), both);
+    assert_eq!(needs(&token(0, 0)), both);
     let agent = |instance| Record::AgentStarted { name: "a".into(), instance, by: 1000 };
     assert_eq!(
         needs(&agent([1; 16])),
@@ -1583,12 +1585,14 @@ fn a_prepared_transactions_added_fields_are_required_once_set() {
     assert!(required("checkpoint", json!({"live": {"1": {"boot_only": false}}})).is_empty());
 }
 
-/// An id that is zero for real is set: the first transaction's id is 0, so a
-/// `withdrawn_for` or `prepared_again_from` of `TxnId(0)` must be required,
-/// where an approver of 0 (the default of a record from before the field) is
-/// not. (A zero counted as unset everywhere dropped the former.)
+/// A value that is zero for real is set: the first transaction's id is 0, so
+/// a `withdrawn_for`, `prepared_again_from` or `TokenUsed.txn` of `TxnId(0)`
+/// must be required, and an approver of 0 is root, who approves most things.
+/// Only a field that can never be zero for real (a boot time, an agent's
+/// InvocationID, an unset flag) reads zero as unset. (A zero counted as unset
+/// everywhere dropped the first; the list then kept two.)
 #[test]
-fn an_id_of_zero_is_a_set_field_but_an_approver_of_zero_is_not() {
+fn a_value_of_zero_is_a_set_field_unless_zero_can_never_be_real() {
     use serde_json::json;
     let required = |kind: &str, v: serde_json::Value| {
         let mut r = compat::JournalRequirements { format: 3, kinds: vec![], fields: Default::default() };
@@ -1599,7 +1603,11 @@ fn an_id_of_zero_is_a_set_field_but_an_approver_of_zero_is_not() {
     assert_eq!(required("Prepared", json!({"prepared_again_from": 0})), ["prepared_again_from"]);
     assert_eq!(required("checkpoint", json!({"terminal": {"3": {"withdrawn_for": 0}}})), ["terminal.*.withdrawn_for"]);
     assert_eq!(required("checkpoint", json!({"not_prepared_again": [0]})), ["not_prepared_again"]);
-    assert!(required("TokenUsed", json!({"approver": 0, "txn": 0})).is_empty());
+    assert_eq!(required("TokenUsed", json!({"approver": 0, "txn": 0})), ["approver", "txn"]);
+    assert!(required("Renew", json!({"boot_at": 0})).is_empty());
+    assert!(required("AgentStarted", json!({"instance": [0, 0, 0, 0]})).is_empty());
+    assert_eq!(required("AgentStarted", json!({"instance": [0, 0, 0, 1]})), ["instance"]);
+    assert!(required("checkpoint", json!({"live": {"1": {"boot_only": false}}})).is_empty());
 }
 
 mod active_props {
@@ -1670,12 +1678,8 @@ mod reads_what_it_writes {
                 worker_pid: None,
                 boot_at: Timestamp(boot_at),
             }),
-            (any::<u64>(), any::<u64>()).prop_map(|(approver, txn)| Record::TokenUsed {
-                nonce: [3; 16],
-                expires: Timestamp(1),
-                approver,
-                txn,
-            }),
+            (prop_oneof![Just(0u64), any::<u64>()], prop_oneof![Just(0u64), any::<u64>()])
+                .prop_map(|(approver, txn)| Record::TokenUsed { nonce: [3; 16], expires: Timestamp(1), approver, txn }),
             any::<[u8; 16]>().prop_map(|instance| Record::AgentStarted { name: "a".into(), instance, by: 1000 }),
             any::<u64>().prop_map(|n| Record::Advance {
                 txn: planarian_schema::TxnId(n),
@@ -1696,6 +1700,16 @@ mod reads_what_it_writes {
 
         /// A build reads everything it writes: what a record it writes needs
         /// of a reader, this build's own descriptor supplies.
+        /// Root and the first transaction are real values: whatever the
+        /// approver and the transaction, both are named as reasons.
+        #[test]
+        fn a_token_names_its_approver_and_transaction_whatever_their_values(approver in prop_oneof![Just(0u64), any::<u64>()], txn in prop_oneof![Just(0u64), any::<u64>()]) {
+            let r = Record::TokenUsed { nonce: [3; 16], expires: Timestamp(1), approver, txn };
+            let mut m = compat::record_requirements(&r).unwrap().unsupported_by(&original());
+            m.retain(|x| !x.starts_with("journal format"));
+            prop_assert_eq!(m, vec!["decisive field TokenUsed.approver", "decisive field TokenUsed.txn"]);
+        }
+
         #[test]
         fn a_build_reads_everything_it_writes(r in written()) {
             let needs = compat::record_requirements(&r).unwrap();
