@@ -117,6 +117,9 @@ pkgs.testers.runNixOSTest (
 
     testScript = ''
       machine.wait_for_unit("planariad.service")
+      with subtest("every prebuilt candidate exports its installed journal reader"):
+          for candidate in ["${base}", "${good}", "${bad}"]:
+              machine.succeed(f"cmp ${m.services.planarian.package}/share/planarian/journal-kinds.json {candidate}/sw/share/planarian/journal-kinds.json")
       machine.wait_until_succeeds("planarian status | grep -E 'ok +service:gym-web'", timeout=900)
 
       machine.succeed(

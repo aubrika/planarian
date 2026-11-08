@@ -759,6 +759,9 @@ in
 
     # With the console: its launcher entry and icons too.
     environment.systemPackages = [ cfg.package ] ++ lib.optional (cfg.console.enable || cfg.tray.enable) cfg.console.package;
+    # §12c: generation preflight reads the target's static journal descriptor.
+    # NixOS's default system-path links omit this package data directory.
+    environment.pathsToLink = [ "/share/planarian" ];
     users.groups.planarian-admin = { };
 
     # The healer is not the patient (Principle 1): no activation restarts or

@@ -684,7 +684,35 @@ fn Timestamp_now() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
 }
 
+/// Read only installed metadata, with a bound. An absent export is legacy;
+/// malformed/unreadable exports are errors, never a smaller capability set.
+fn read_journal_kinds(generation: &Path) -> Result<Option<String>, Outcome> {
+    use std::io::Read;
+    const LIMIT: u64 = 64 * 1024;
+    let path = generation.join("sw/share/planarian/journal-kinds.json");
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && matches!(std::fs::symlink_metadata(&path), Err(missing) if missing.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(Outcome::Failed(format!("{}: {e}", path.display()))),
+    };
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes).map_err(|e| Outcome::Failed(format!("{}: {e}", path.display())))?;
+    if bytes.len() as u64 > LIMIT {
+        return Err(Outcome::Failed(format!("{}: journalKinds exceeds {LIMIT} bytes", path.display())));
+    }
+    String::from_utf8(bytes).map(Some).map_err(|e| Outcome::Failed(format!("{}: {e}", path.display())))
+}
+
 impl GenerationBackend for Nixos {
+    fn journal_kinds(&self, path: &StorePath) -> Result<Option<String>, Outcome> {
+        read_journal_kinds(Path::new(&path.0))
+    }
+
     fn current(&self) -> Result<GenerationId, Outcome> {
         self.id_of_link(Path::new("/run/current-system"))
     }
@@ -1226,6 +1254,23 @@ impl GenerationBackend for Nixos {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn journal_kinds_reads_only_a_bounded_static_export() {
+        let root = std::env::temp_dir().join(format!("planarian-journal-kinds-{}", std::process::id()));
+        let dir = root.join("sw/share/planarian");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("journal-kinds.json");
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(super::read_journal_kinds(&root).unwrap(), None);
+        std::fs::write(&file, "{\"format\":3}").unwrap();
+        assert_eq!(super::read_journal_kinds(&root).unwrap().as_deref(), Some("{\"format\":3}"));
+        std::fs::write(&file, vec![b'x'; 64 * 1024 + 1]).unwrap();
+        assert!(super::read_journal_kinds(&root).is_err());
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink("missing-journal-kinds", &file).unwrap();
+        assert!(super::read_journal_kinds(&root).is_err(), "a broken export is not legacy");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
     use super::*;
 
     /// §12b: a committed candidate's build root and a no-longer-protected

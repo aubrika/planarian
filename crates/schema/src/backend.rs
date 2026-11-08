@@ -95,6 +95,13 @@ pub trait UnitBackend {
     fn auto_restarts(&self, _id: &UnitId) -> Option<u32> {
         None
     }
+    /// Every job systemd has queued or is running (stop, start, restart,
+    /// reload), not only Planarian's own. Used to tell when a switch outside
+    /// Planarian has finished. A backend that cannot say, or whose query fails,
+    /// returns `Err`, never an empty list.
+    fn queued_jobs(&self) -> Result<Vec<JobId>, Outcome> {
+        Err(Outcome::Unknown("this backend cannot list queued jobs".into()))
+    }
     /// The boot report's unit check (§10): active units whose definition does
     /// not come from the running generation (a file outside the store that is
     /// not a generator's).
@@ -156,6 +163,12 @@ pub trait UnitBackend {
     /// failure does not hold.
     fn release_hold(&self, _unit: &UnitId, _until: Option<Timestamp>, _wait: Millis) -> Outcome {
         Outcome::Failed("this backend cannot hold traffic".into())
+    }
+    /// Whether this exact timed release still has its original persisted
+    /// bound and is active on both wall and boot clocks. Reconciliation must
+    /// not recreate a missing bound from wall time after a clock rollback.
+    fn timed_release_active(&self, _unit: &UnitId, _until: Timestamp) -> Result<bool, Outcome> {
+        Err(Outcome::Failed("this backend cannot verify a timed hold release".into()))
     }
     /// The release ended (expired, or the override lifted): remove the mark.
     fn end_release(&self, _unit: &UnitId) -> Outcome {
@@ -243,6 +256,13 @@ pub trait GenerationBackend {
     /// Evaluate an already-built generation from its store path (its exported
     /// manifest), for SwitchGeneration / Revert / Rollback.
     fn evaluate_built(&self, path: &StorePath) -> Result<EvaluatedGeneration, Outcome>;
+    /// The target build's static journalKinds descriptor (§12c), read from
+    /// its installed share/planarian/journal-kinds.json. None means the
+    /// descriptor is absent (a pre-export build), never an unreadable or
+    /// truncated descriptor. Do not execute an older daemon to query it.
+    fn journal_kinds(&self, _path: &StorePath) -> Result<Option<String>, Outcome> {
+        Err(Outcome::Unknown("this backend cannot read target journal kinds".into()))
+    }
     /// The live override set and its content hash.
     fn read_overrides(&self) -> Result<(OverrideSet, Hash), Outcome>;
     /// Keep override content addressable by hash, so `swap_override` can write it.
