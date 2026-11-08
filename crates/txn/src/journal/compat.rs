@@ -150,15 +150,17 @@ pub fn supported() -> JournalRequirements {
 }
 
 /// Fields whose zero, false, empty or all-zero value is the default a record
-/// from before the field carried, and can never be a real value, so such a
-/// value requires nothing. Each entry says why zero is never real; a field
+/// from before the field carried, so such a value requires nothing. Each
+/// entry says why that default needs no reader to understand it; a field
 /// whose zero can be real (an id, a uid: `approver` 0 is root, `TokenUsed.txn`
 /// 0 and `withdrawn_for` 0 are the first transaction) is not listed.
 /// - `boot_at`: the renewal's time on the boot clock; a daemon renews seconds
 ///   after boot, never at 0 ms.
 /// - `instance`: an agent unit's InvocationID, 128 random bits systemd never
 ///   makes all zero.
-/// - `live.*.boot_only`: a flag whose `false` is what a build without it means.
+/// - `live.*.boot_only`: a flag; `false` is what a build without the field
+///   means, so an unset flag requires nothing (unlike the two above, `false` is
+///   a real value, just not one a reader has to understand).
 pub(super) const ZERO_IS_DEFAULT: &[&str] = &["boot_at", "instance", "live.*.boot_only"];
 
 /// Whether the value at `path` in `value` is one a reader must understand:
