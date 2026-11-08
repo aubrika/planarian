@@ -195,7 +195,7 @@ fn verify(args: &[String]) -> ExitCode {
         if let Some(p) = tree::hold_problem(&units, tool, o.netwatch && !o.cycle.contains(tool)) {
             eprintln!("planarian-unitclass: the hold is not in force: {p}");
             eprintln!(
-                "planarian-unitclass: remove the empty OnFailure=/After= (or the drop-in that resets it) from that unit's configuration; a network tool's failure must hold traffic (SPEC §12d)"
+                "planarian-unitclass: restore the hold's drop-in for that unit (or remove the file that shadows it): a network tool's failure must hold traffic (SPEC §12d)"
             );
             bad += 1;
         }

@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 pub const HOLD_ONFAILURE: &str = "planarian-hold@%N.service";
 pub const NETWATCH_UNIT: &str = "planarian-netwatch.service";
+/// The file name of the hold's own drop-in (nix/posture.nix `holdDropins`).
+pub const HOLD_DROPIN_NAME: &str = "50-planarian-hold.conf";
 
 /// A package's unit directories that exist.
 pub fn package_roots(pkg: &Path) -> Vec<PathBuf> {
@@ -177,17 +179,26 @@ pub fn hold_problem(root: &Path, tool: &str, want_after_netwatch: bool) -> Optio
         Ok(s) => s,
         Err(e) => return Some(format!("{tool}: {e}")),
     };
-    if !s.on_failure.iter().any(|u| u == HOLD_ONFAILURE) {
-        return Some(format!(
-            "{tool}: OnFailure= does not name {HOLD_ONFAILURE} in the merged unit (effective: {:?}); an empty OnFailure= in a later drop-in or overrides.conf resets it",
-            s.on_failure
-        ));
+    let missing_onfailure = !s.on_failure.iter().any(|u| u == HOLD_ONFAILURE);
+    let missing_after = want_after_netwatch && !s.after.iter().any(|u| u == NETWATCH_UNIT);
+    if !missing_onfailure && !missing_after {
+        return None;
     }
-    if want_after_netwatch && !s.after.iter().any(|u| u == NETWATCH_UNIT) {
-        return Some(format!(
-            "{tool}: After= does not name {NETWATCH_UNIT} in the merged unit (effective: {:?}); an empty After= in a later drop-in or overrides.conf resets it",
-            s.after
-        ));
-    }
-    None
+    let what = match (missing_onfailure, missing_after) {
+        (true, true) => format!("OnFailure={HOLD_ONFAILURE} and After={NETWATCH_UNIT}"),
+        (true, false) => format!("OnFailure={HOLD_ONFAILURE}"),
+        _ => format!("After={NETWATCH_UNIT}"),
+    };
+    // Which hold drop-in applies to this unit? systemd reads one file of that name, from the most specific directory.
+    let winner =
+        dropins(&[root.to_path_buf()], &unit).ok().and_then(|d| d.into_iter().find(|(n, _)| n == HOLD_DROPIN_NAME));
+    Some(match winner {
+        None => format!(
+            "the hold for {tool} is missing: no {HOLD_DROPIN_NAME} applies to {unit}, so the merged unit lacks {what}"
+        ),
+        Some((_, path)) => format!(
+            "the hold for {tool} is missing, or shadowed by {}: that is the {HOLD_DROPIN_NAME} systemd reads for {unit}, and the merged unit lacks {what}",
+            path.display()
+        ),
+    })
 }

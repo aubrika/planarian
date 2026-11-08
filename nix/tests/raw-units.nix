@@ -177,6 +177,8 @@ pkgs.runCommand "planarian-raw-units-check" {
       echo "raw-units: verify-hold passed with the hold removed from $t" >&2; exit 1
     fi
     grep -q "$t" err
+    grep -q "the hold for $t is missing" err
+    ! grep -q "empty" err
     tamper "$t" '[Unit]
 Description=no hold here
 '
@@ -184,6 +186,8 @@ Description=no hold here
       echo "raw-units: verify-hold passed with the hold replaced in $t" >&2; exit 1
     fi
     grep -q "$t" err
+    grep -q "shadowed by" err
+    ! grep -q "empty" err
   done
   # systemd 260.5 does not reset a dependency list on an empty assignment (the
   # real-systemd oracle shows it), so a later empty OnFailure=/After= strips nothing.

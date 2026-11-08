@@ -691,7 +691,12 @@ fn the_hold_is_verified_in_the_merged_tree() {
     fs::remove_file(root.join("t.service.d/overrides.conf")).unwrap();
     // A hold file with the lines missing (replaced by one of the same name) is a problem.
     write(&root.join("t.service.d/50-planarian-hold.conf"), "[Unit]\nDescription=x\n");
-    assert!(tree::hold_problem(&root, "t", true).unwrap().contains("OnFailure="));
+    let msg = tree::hold_problem(&root, "t", true).unwrap();
+    assert!(
+        msg.contains("OnFailure=")
+            && msg.contains(&root.join("t.service.d/50-planarian-hold.conf").display().to_string()),
+        "{msg}"
+    );
     // With only the OnFailure line, After= is a problem where ordering after netwatch is wanted.
     write(&root.join("t.service.d/50-planarian-hold.conf"), &tree::hold_dropin(false, false));
     assert!(tree::hold_problem(&root, "t", true).unwrap().contains("After="));
@@ -702,7 +707,8 @@ fn the_hold_is_verified_in_the_merged_tree() {
     );
     // No hold file at all is a problem.
     fs::remove_file(root.join("t.service.d/50-planarian-hold.conf")).unwrap();
-    assert!(tree::hold_problem(&root, "t", false).is_some());
+    let msg = tree::hold_problem(&root, "t", false).unwrap();
+    assert!(msg.contains("the hold for t is missing: no 50-planarian-hold.conf applies"), "{msg}");
     // A tool with no unit file in the tree (a disabled service) or a masked one
     // cannot fail, so it is not a problem.
     assert_eq!(tree::hold_problem(&root, "missing", true), None);
@@ -783,7 +789,13 @@ fn the_same_drop_in_name_in_a_template_and_its_instance_is_read_from_the_instanc
     assert_eq!(tree::hold_problem(&root, "gym-tpl@", true), None);
     // An instance's own file of the hold's name, without the lines, shadows the template's.
     write(&root.join("gym-tpl@a.service.d/50-planarian-hold.conf"), "[Unit]\nDescription=x\n");
-    assert!(tree::hold_problem(&root, "gym-tpl@a", true).is_some());
+    let msg = tree::hold_problem(&root, "gym-tpl@a", true).unwrap();
+    let shadow = root.join("gym-tpl@a.service.d/50-planarian-hold.conf");
+    assert!(
+        msg.contains("shadowed by") && msg.contains(&shadow.display().to_string()),
+        "the message names the shadowing file: {msg}"
+    );
+    assert!(msg.contains("gym-tpl@a") && !msg.contains("empty"), "{msg}");
     assert_eq!(tree::hold_problem(&root, "gym-tpl@", true), None);
 }
 
