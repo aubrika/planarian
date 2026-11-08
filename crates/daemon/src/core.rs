@@ -290,6 +290,24 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// whether a generation changed: their stops are not someone else's.
     touched: BTreeSet<UnitId>,
     generation_touched: bool,
+    /// §12d: the running generation's exported network tools (a template ends
+    /// in `@`), `None` while they could not be read: never an empty set made
+    /// of a failed read (rule 21).
+    network_tools: Option<BTreeSet<String>>,
+    /// The tools among them that no manifest unit declares: held and alarmed
+    /// when they stop, never restarted, never an incident. Set each observe.
+    unmanaged: BTreeSet<UnitId>,
+    unmanaged_unreadable_noted: bool,
+    /// Per unmanaged tool, whether netwatch said it protected traffic the last
+    /// time it was observed running (its latch): a footprint exists only while
+    /// an instance runs, so when it is down this says what it was doing. Its
+    /// key is "seen running". And where the rotation through the rest has
+    /// reached.
+    unmanaged_latch: BTreeMap<UnitId, bool>,
+    unmanaged_cursor: usize,
+    /// The last `list` of systemd's units for template instances, and when.
+    unmanaged_listed: Option<(Timestamp, Option<Vec<UnitId>>)>,
+    unmanaged_many_noted: bool,
     /// A switch outside Planarian seen at `.0`: its stops and starts follow
     /// the profile change by more than a tick, so they stay explained until
     /// `.1` (see `SWITCH_SETTLE`).
@@ -395,8 +413,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let mut incidents = Manager::restore(ledger.incidents.values().cloned());
         incidents.startup_grace = cfg.startup_grace;
         let current = b.generations().current().unwrap_or_default();
+        let mut network_tools = None;
         let manifest = match b.generations().path_of(current).and_then(|p| b.generations().evaluate_built(&p)) {
-            Ok(e) => manifest_of(&e),
+            Ok(e) => {
+                network_tools = Some(e.network_tools.clone());
+                manifest_of(&e)
+            }
             Err(o) => {
                 notices.push_back(format!(
                     "the running generation has no Planarian manifest ({o:?}); nothing is watched until a generation built with services.planarian.enable is running"
@@ -485,6 +507,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
             generation_touched: false,
+            network_tools,
+            unmanaged: BTreeSet::new(),
+            unmanaged_unreadable_noted: false,
+            unmanaged_latch: BTreeMap::new(),
+            unmanaged_cursor: 0,
+            unmanaged_listed: None,
+            unmanaged_many_noted: false,
             switch_window: None,
             next_gc_check: Timestamp(0),
             space_noted: Timestamp(0),
@@ -630,12 +659,62 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
     }
 
+    /// §12d: the exported network tools no manifest unit declares, as units:
+    /// a template (`name@`) as each instance systemd lists. An unreadable
+    /// export is never an empty set: the last set read stands, and with none
+    /// the daemon says so (once) and tries again. A failed list leaves the
+    /// instances of the previous tick.
+    fn refresh_unmanaged(&mut self, defs: &UnitDefs, keep: &BTreeSet<UnitId>) {
+        if self.network_tools.is_none() {
+            let read = self
+                .b
+                .generations()
+                .current()
+                .and_then(|g| self.b.generations().path_of(g))
+                .and_then(|p| self.b.generations().evaluate_built(&p));
+            match read {
+                Ok(e) => {
+                    self.network_tools = Some(e.network_tools);
+                    self.unmanaged_unreadable_noted = false;
+                }
+                Err(o) => {
+                    if !std::mem::replace(&mut self.unmanaged_unreadable_noted, true) {
+                        self.notice(format!(
+                            "ALARM: this generation's network tools could not be read ({o:?}); a network tool Planarian does not manage is not watched until they can"
+                        ));
+                    }
+                    return;
+                }
+            }
+        }
+        let Some(tools) = self.network_tools.clone() else { return };
+        // `observe` runs several times a tick, and listing systemd's units is
+        // a command: once a tick is enough (a failed list stays failed that
+        // long, and keeps the previous instances).
+        let now = self.b.clock().now();
+        let listed = if tools.iter().any(|t| t.ends_with('@')) {
+            match &self.unmanaged_listed {
+                Some((at, l)) if now.0 < at.0 + planarian_state::TICK.0 => l.clone(),
+                _ => {
+                    let l = self.b.units().list().ok();
+                    self.unmanaged_listed = Some((now, l.clone()));
+                    l
+                }
+            }
+        } else {
+            None
+        };
+        self.unmanaged = crate::hold::unmanaged_set(&tools, listed.as_deref(), &self.unmanaged, keep, defs);
+        self.unmanaged_latch.retain(|u, _| self.unmanaged.contains(u));
+    }
+
     /// Observe without acting (also used to answer requests).
     pub fn observe(&mut self) -> (SystemState, UnitDefs) {
         let l = self.ledger();
         let current = self.b.generations().current().unwrap_or(self.manifest_gen);
         if current != self.manifest_gen {
             if let Ok(e) = self.b.generations().path_of(current).and_then(|p| self.b.generations().evaluate_built(&p)) {
+                self.network_tools = Some(e.network_tools.clone());
                 self.gen_manifest = manifest_of(&e);
                 self.asm.set_manifest(self.effective_manifest().0);
             }
@@ -669,7 +748,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let mut defs = self.asm.defs();
         // §12d: the network tools that protect traffic now. Fail closed: an
         // unreadable watch counts every tool as protecting.
-        let tools: Vec<UnitId> = crate::hold::network_tools(&defs).map(|d| d.id.clone()).collect();
+        let standing: BTreeSet<UnitId> = s
+            .holds
+            .iter()
+            .chain(self.hold_released.keys())
+            .chain(self.release_unconfirmed.keys())
+            .chain(self.lift_unconfirmed.keys())
+            .cloned()
+            .collect();
+        self.refresh_unmanaged(&defs, &standing);
+        let tools: Vec<UnitId> =
+            crate::hold::network_tools(&defs).map(|d| d.id.clone()).chain(self.unmanaged.iter().cloned()).collect();
         s.protecting = if tools.is_empty() {
             BTreeSet::new()
         } else {
@@ -677,7 +766,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         };
         // §12d: each network-security unit's hold unit, known (so releasing
         // it derives the hold's administrator floor) but never expected.
-        let holds: Vec<UnitDef> = crate::hold::network_tools(&defs).map(crate::hold::hold_def).collect();
+        let holds: Vec<UnitDef> = crate::hold::network_tools(&defs)
+            .map(crate::hold::hold_def)
+            .chain(self.unmanaged.iter().map(|u| crate::hold::hold_def(&crate::hold::unmanaged_def(u))))
+            .collect();
         for d in holds {
             defs.entry(d.id.clone()).or_insert(d);
         }
@@ -970,6 +1062,108 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
     }
 
+    /// `s` and `defs` with the unmanaged network tools this tick looks at
+    /// added as units, observed through the backend (see
+    /// `hold::unmanaged_observed` for what is down; an unreadable one is
+    /// Unknown: neither held nor lifted).
+    ///
+    /// Always looked at: the tools whose hold stands or is pending, and every
+    /// tool seen running whose latch says it protected traffic (a down one is
+    /// held on the next tick, whatever their number: more than
+    /// `UNMANAGED_MANY` is said once). The rest, never seen running or seen
+    /// not protecting, at most `UNMANAGED_OBSERVE_PER_TICK`, rotating.
+    ///
+    /// A footprint exists only while an instance runs, and a tool with none
+    /// counts as protecting (fail closed, #78), so what a tool was doing is
+    /// latched while it is observed running (netwatch's `protecting`). When it
+    /// is down: held if the latch says it protected, or nothing was ever
+    /// recorded (still fail closed); a restart of one that protected nothing
+    /// holds nothing. A new run overwrites the latch.
+    fn with_unmanaged(&mut self, s: &SystemState, defs: &UnitDefs) -> (SystemState, UnitDefs) {
+        let (mut s, mut defs) = (s.clone(), defs.clone());
+        let standing = |me: &Self, u: &UnitId| {
+            s.holds.contains(u)
+                || me.hold_released.contains_key(u)
+                || me.release_unconfirmed.contains_key(u)
+                || me.lift_unconfirmed.contains_key(u)
+        };
+        let all: Vec<UnitId> = self.unmanaged.iter().cloned().collect();
+        let (must, rest): (Vec<UnitId>, Vec<UnitId>) = all.into_iter().partition(|u| standing(self, u));
+        // A plain tool's footprint is netwatch's own word whether it runs or
+        // not, so one reported protecting is looked at every tick; an
+        // instance's is gone when it stops, so its latch says.
+        let (every, rotate): (Vec<UnitId>, Vec<UnitId>) = rest.into_iter().partition(|u| {
+            self.unmanaged_latch.get(u) == Some(&true)
+                || (planarian_backend_netwatch::host::footprint_outlives_the_unit(u) && s.protecting.contains(u))
+        });
+        let take = rotate.len().min(crate::hold::UNMANAGED_OBSERVE_PER_TICK);
+        let start = if rotate.is_empty() { 0 } else { self.unmanaged_cursor % rotate.len() };
+        self.unmanaged_cursor = start + take;
+        let chosen: Vec<UnitId> = must.into_iter().chain(every).collect();
+        if chosen.len() > crate::hold::UNMANAGED_MANY {
+            if !std::mem::replace(&mut self.unmanaged_many_noted, true) {
+                self.notice(format!(
+                    "warning: {} unmanaged network tools are observed every tick; a tick takes longer for them",
+                    chosen.len()
+                ));
+            }
+        } else {
+            self.unmanaged_many_noted = false;
+        }
+        // The tools always looked at, in a few commands (a chunk is one
+        // `systemctl show`), then the rotation's, unless the first took the
+        // tick's whole budget for this work: managed observation and the
+        // holds that follow are not made to wait behind it.
+        let t0 = self.b.clock().now();
+        for chunk in chosen.chunks(crate::hold::UNMANAGED_BATCH) {
+            self.observe_unmanaged(&mut s, &mut defs, chunk);
+        }
+        let spent = self.b.clock().now().0.saturating_sub(t0.0);
+        if spent < crate::hold::UNMANAGED_BUDGET.0 {
+            let pick: Vec<UnitId> = (0..take).map(|i| rotate[(start + i) % rotate.len()].clone()).collect();
+            self.observe_unmanaged(&mut s, &mut defs, &pick);
+            self.unmanaged_cursor = start + take;
+        } else {
+            self.unmanaged_cursor = start;
+        }
+        (s, defs)
+    }
+
+    /// Observe `units` in one backend call and put each in `s` and `defs`,
+    /// updating latches (`with_unmanaged`).
+    fn observe_unmanaged(&mut self, s: &mut SystemState, defs: &mut UnitDefs, units: &[UnitId]) {
+        if units.is_empty() {
+            return;
+        }
+        let results = self.b.units().observe_many(units);
+        for (u, (observed, ended)) in units.iter().zip(results) {
+            let held = s.holds.contains(u);
+            let observed = match observed {
+                Ok(raw) => {
+                    let seen = crate::hold::unmanaged_observed(raw.clone(), ended, held);
+                    let down =
+                        matches!(seen, Observed::Failed(_) | Observed::Absent | Observed::Bound | Observed::Detected);
+                    if raw == Observed::Active {
+                        // Running: what netwatch says it protects now is its latch.
+                        self.unmanaged_latch.insert(u.clone(), s.protecting.contains(u));
+                    } else if down
+                        && !planarian_backend_netwatch::host::footprint_outlives_the_unit(u)
+                        && self.unmanaged_latch.get(u) == Some(&false)
+                    {
+                        // A stopped instance has no footprint, so netwatch's
+                        // "protecting" for it is only the fail-closed
+                        // default; it protected nothing when it ran.
+                        s.protecting.remove(u);
+                    }
+                    seen
+                }
+                Err(o) => Observed::Unknown { since: s.observed_at, reason: format!("{o:?}") },
+            };
+            s.units.insert(u.clone(), (observed, vec![]));
+            defs.insert(u.clone(), crate::hold::unmanaged_def(u));
+        }
+    }
+
     fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {
         use crate::hold;
         use planarian_txn::ledger::HoldBy;
@@ -1123,7 +1317,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     // pending: not a new hold. Retried when due.
                     Some(true) if !hold::failed(s, defs, &u) && hold::back(s, defs, &u) => {
                         let now = self.b.clock().boot_now();
-                        if self.lift_unconfirmed.get(&u).is_some_and(|next| now >= *next) && self.hold_wait().is_some()
+                        if self.lift_unconfirmed.get(&u).is_some_and(|next| now >= *next)
+                            && self.hold_wait().is_some()
+                            && self.running_now(&u)
                         {
                             self.lift_host(&u);
                         }
@@ -1151,7 +1347,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     // fine: the hold is the same either way.
                     let by = if asked || on_host != Some(true) { HoldBy::Daemon } else { HoldBy::OnFailure };
                     self.journal(Record::HoldApplied { unit: u.clone(), by });
-                    self.notice(hold::alarm(&u));
+                    self.notice(if self.unmanaged.contains(&u) { hold::unmanaged_alarm(&u) } else { hold::alarm(&u) });
                 }
                 if on_host != Some(true) {
                     let now = self.b.clock().boot_now();
@@ -1198,10 +1394,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
             } else if in_journal || on_host == Some(true) {
                 if !in_journal {
-                    // OnFailure= held it while the daemon was not looking.
+                    // OnFailure= held it while the daemon was not looking: its
+                    // traffic is blocked all the same, so the person is told
+                    // (once: the hold is journaled now, so the failed branch
+                    // above does not say it again).
                     self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::OnFailure });
+                    self.notice(if self.unmanaged.contains(&u) { hold::unmanaged_alarm(&u) } else { hold::alarm(&u) });
                 }
-                if hold::back(s, defs, &u) {
+                // Only a hold that stood before this observation lifts on
+                // it: the alarm above and the lift are never one observation
+                // (catalog run 42504673480).
+                if in_journal && hold::back(s, defs, &u) {
                     self.lift_back(&u);
                 }
             }
@@ -1213,12 +1416,28 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// when the tick has no budget left: nothing is done, and it is lifted
     /// on a later tick.
     fn lift_back(&mut self, u: &UnitId) -> bool {
-        if self.hold_wait().is_none() {
+        if self.hold_wait().is_none() || !self.running_now(u) {
             return false;
         }
         self.journal(Record::HoldLifted { unit: u.clone(), reason: "Running, and its Readiness probes pass".into() });
         self.lift_host(u);
         true
+    }
+
+    /// Whether systemd says the unit is Running at this moment. The tick's
+    /// state was read before its probes, which can take seconds, so a lift
+    /// asks again: a tool killed since (OnFailure= has held it) must not have
+    /// its traffic opened on the old reading. `deactivating`, `failed`, a
+    /// cgroup that merely still has processes, and a read that fails all
+    /// keep the hold (fail closed).
+    /// The read is one systemd call, charged to the tick's hold budget like
+    /// the hold and lift calls, and the lift waits for the next tick if it
+    /// used the rest of it.
+    fn running_now(&mut self, u: &UnitId) -> bool {
+        let t0 = self.b.clock().boot_now();
+        let running = matches!(self.b.units().observe(u), Ok(Observed::Active));
+        self.hold_spent(t0);
+        running && self.hold_wait().is_some()
     }
 
     /// Asks the host to lift a hold already journaled as lifted. A lift the
@@ -2041,7 +2260,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
         // §12d: the hold is in place before the incident opens; a hold the
         // daemon just applied is in the state the repair is derived from.
-        let (s, defs) = if self.network_holds(&s, &defs) { self.observe() } else { (s, defs) };
+        let held = if self.unmanaged.is_empty() {
+            self.network_holds(&s, &defs)
+        } else {
+            // The unmanaged tools are hold subjects only: seen and defined
+            // for this call, never in the state or defs the incident manager
+            // and the residue read, so none is repaired or opens an incident.
+            let (hs, hd) = self.with_unmanaged(&s, &defs);
+            self.network_holds(&hs, &hd)
+        };
+        let (s, defs) = if held { self.observe() } else { (s, defs) };
 
         self.flag_exec_probes(&defs);
 

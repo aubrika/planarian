@@ -86,6 +86,21 @@ impl Ending {
 
 pub trait UnitBackend {
     fn observe(&self, id: &UnitId) -> Result<Observed, Outcome>;
+    /// `observe` for many units, with how a unit that is not running last
+    /// ended (`ended_by`), in `ids`' order: one command where the backend can
+    /// (the default asks one unit at a time). A unit whose answer could not
+    /// be read is an `Err`, never `Absent`.
+    fn observe_many(&self, ids: &[UnitId]) -> Vec<(Result<Observed, Outcome>, Option<Ending>)> {
+        ids.iter()
+            .map(|u| {
+                let o = self.observe(u);
+                let ended = matches!(o, Ok(Observed::Absent | Observed::Bound | Observed::Detected))
+                    .then(|| self.ended_by(u))
+                    .flatten();
+                (o, ended)
+            })
+            .collect()
+    }
     /// How the unit's main process last ended; None if the backend cannot say.
     fn ended_by(&self, _id: &UnitId) -> Option<Ending> {
         None

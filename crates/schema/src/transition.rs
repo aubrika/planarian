@@ -523,6 +523,11 @@ pub struct EvaluatedGeneration {
     /// completeness): a unit in neither has no entry, and fails closed.
     #[serde(default)]
     pub services: BTreeMap<String, Sensitivities>,
+    /// §12d: every system service that is a network tool, declared or not
+    /// (the export's `networkTools`; a template ends in `@`). Empty for a
+    /// generation whose export has no such key (built before it existed).
+    #[serde(default)]
+    pub network_tools: BTreeSet<String>,
 }
 
 impl EvaluatedGeneration {

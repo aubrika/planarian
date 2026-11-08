@@ -323,6 +323,7 @@ impl<B: Backends + Clone, S: Store> Executor<B, S> {
                 declarations: BTreeMap::new(),
                 inputs: BTreeMap::new(),
                 services: BTreeMap::new(),
+                network_tools: Default::default(),
             },
             Err(e) => {
                 return Err(reject(

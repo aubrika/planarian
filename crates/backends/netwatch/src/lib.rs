@@ -273,6 +273,11 @@
 //! failed read leaves the map unknown, never "no such family": the
 //! WireGuard read and every request fail closed (a loss) until the next tick
 //! reads again (rule 21).
+//! Limit (prop-auditor, #87): the map is read once per tick, so a family id
+//! that is given up and reused (nl80211's id taken by WireGuard after a
+//! reload, say) is read as the old family for up to one tick; the WireGuard
+//! dump on that id then fails closed (an error) rather than being
+//! misattributed, and the next tick's read makes the map exact.
 //! GET_DEVICE dump names one interface: links are enumerated through
 //! rtnetlink, then each WireGuard interface is queried by index. In a large
 //! reply only the first chunk names the device; peer-only continuations
