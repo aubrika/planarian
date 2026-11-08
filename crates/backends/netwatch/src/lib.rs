@@ -274,9 +274,8 @@
 //! A binding lasts as long as the device it named (B-27): the first read of
 //! the device pins it by interface index (kept in `.state`), and a read
 //! without the device, with the name on a device of another index, or an
-//! `RTM_DELLINK` for it ends it (so does the end of a unit's invocation once
-//! another unit is bound to the same device); a unit that configures the
-//! device again binds afresh.
+//! `RTM_DELLINK` for it ends it; a unit that configures the device again
+//! binds afresh. A binding does not end with its unit's invocation (B-28).
 //! A unit takes exactly its devices' peers, so a peer changed by `wg set`
 //! follows and a device that is gone has none; the latch keeps them for the
 //! invocation, so the hold can still pass the peer. A request naming no

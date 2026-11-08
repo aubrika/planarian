@@ -2844,31 +2844,6 @@ mod wireguard {
         assert_eq!(t.footprint(&b, NOW).endpoints, [e2].into());
     }
 
-    /// B-27 (coordinator, #83): a unit whose invocation has ended, with the
-    /// device still standing and another unit configuring it, gives the
-    /// device up: its failure must not hold the other's working tunnel. The
-    /// peers its invocation had stay latched for its own hold.
-    #[test]
-    fn an_ended_invocation_gives_up_a_device_another_unit_configured() {
-        let (a, b) = (UnitId::service("wg-quick-a"), UnitId::service("wg-quick-b"));
-        let (e1, e2) = (udp("192.0.2.7", 51820), udp("198.51.100.9", 1));
-        let dev = |eps: &[Endpoint]| Device { name: "wg0".into(), ifindex: 10, endpoints: eps.to_vec() };
-        let mut t = created_wg(&a, "wg0");
-        t.set_invocation(&a, crate::Invocation { id: Some("a".repeat(32)), ended: false });
-        t.bind_wireguard(&a, "wg0");
-        t.set_wireguard(&[dev(&[e1])]);
-        t.set_invocation(&a, crate::Invocation { id: Some("a".repeat(32)), ended: true });
-        // While a is live, b configuring the same device shares it.
-        t.set_invocation(&b, crate::Invocation { id: Some("b".repeat(32)), ended: false });
-        t.bind_wireguard(&b, "wg0");
-        t.set_wireguard(&[dev(&[e2])]);
-        assert!(t.footprint(&a, NOW).endpoints.contains(&e1), "latched for a's own hold");
-        let now = |t: &Tracker, u: &UnitId| t.footprint(u, NOW).endpoints;
-        assert_eq!(now(&t, &b), [e2].into());
-        assert!(!t.claims().wireguard.contains(&(a.clone(), "wg0".to_string())), "a's binding ended");
-        assert!(t.claims().wireguard.contains(&(b.clone(), "wg0".to_string())));
-    }
-
     /// The latch keeps what an invocation found protecting with: a tunnel
     /// whose device leaves with its last process still names its peer.
     #[test]

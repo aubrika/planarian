@@ -867,12 +867,6 @@ mod wgfold {
         /// The device was deleted (RTM_DELLINK): and may be made again before
         /// the next read, with the same name and index.
         Del(usize),
-        /// A unit's invocation ended.
-        End(usize),
-    }
-
-    fn invocation(i: usize, ended: bool) -> Invocation {
-        Invocation { id: Some(format!("{i:032x}")), ended }
     }
 
     fn steps() -> impl Strategy<Value = Vec<Step>> {
@@ -882,7 +876,6 @@ mod wgfold {
                 3 => read().prop_map(Step::Set),
                 1 => (0..UNITS, 1u8..5).prop_map(|(a, n)| Step::Restore(a, n)),
                 1 => (0..DEVS).prop_map(Step::Del),
-                1 => (0..UNITS).prop_map(Step::End),
             ],
             0..16,
         )
@@ -910,18 +903,11 @@ mod wgfold {
             // device -> the interface index its first read showed
             let mut bound: Vec<BTreeMap<usize, Option<u32>>> = vec![BTreeMap::new(); UNITS];
             let mut want: Vec<BTreeSet<Endpoint>> = vec![BTreeSet::new(); UNITS];
-            let mut ended = [false; UNITS];
             for s in &steps {
                 match s {
                     Step::Bind(a, d) => {
-                        t.set_invocation(&unit(*a), invocation(*a, false));
-                        ended[*a] = false;
                         t.bind_wireguard(&unit(*a), &dev_name(*d));
                         bound[*a].insert(*d, None);
-                    }
-                    Step::End(a) => {
-                        t.set_invocation(&unit(*a), invocation(*a, true));
-                        ended[*a] = true;
                     }
                     Step::Del(d) => {
                         t.apply(&Change { owner: Owner::Unattributed, kind: ChangeKind::Interface, object: dev_name(*d), iface: Some(dev_name(*d)), steers: false, removed: true });
@@ -937,15 +923,9 @@ mod wgfold {
                     }
                     Step::Set(r) => {
                         let before = want.clone();
-                        let holders = bound.clone();
                         for i in 0..UNITS {
                             if bound[i].is_empty() {
                                 continue;
-                            }
-                            if ended[i] {
-                                // An ended invocation gives up a device another
-                                // unit is bound to.
-                                bound[i].retain(|d, _| (0..UNITS).all(|j| j == i || !holders[j].contains_key(d)));
                             }
                             let seen = bound[i].clone();
                             for (d, index) in seen {
@@ -978,9 +958,6 @@ mod wgfold {
                     Step::Bind(a, d) => t.bind_wireguard(&unit(*a), &dev_name(*d)),
                     Step::Set(r) => { t.set_wireguard(&devices(r)); }
                     Step::Restore(a, n) => t.add_endpoint(&unit(*a), ep(*n)),
-                    // An invocation is not kept across a restart, so its end
-                    // is not part of what is compared.
-                    Step::End(_) => {}
                     Step::Del(d) => t.apply(&Change { owner: Owner::Unattributed, kind: ChangeKind::Interface, object: dev_name(*d), iface: Some(dev_name(*d)), steers: false, removed: true }),
                 }
             }
