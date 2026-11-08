@@ -1430,8 +1430,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// its traffic opened on the old reading. `deactivating`, `failed`, a
     /// cgroup that merely still has processes, and a read that fails all
     /// keep the hold (fail closed).
-    fn running_now(&self, u: &UnitId) -> bool {
-        matches!(self.b.units().observe(u), Ok(Observed::Active))
+    /// The read is one systemd call, charged to the tick's hold budget like
+    /// the hold and lift calls, and the lift waits for the next tick if it
+    /// used the rest of it.
+    fn running_now(&mut self, u: &UnitId) -> bool {
+        let t0 = self.b.clock().boot_now();
+        let running = matches!(self.b.units().observe(u), Ok(Observed::Active));
+        self.hold_spent(t0);
+        running && self.hold_wait().is_some()
     }
 
     /// Asks the host to lift a hold already journaled as lifted. A lift the

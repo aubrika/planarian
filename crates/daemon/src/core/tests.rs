@@ -2993,6 +2993,30 @@ fn a_journaled_hold_does_not_lift_on_a_reading_older_than_a_second_kill() {
     assert_eq!(before, after, "asked the host to lift");
 }
 
+/// The fresh read before a lift is one systemd call, charged to the tick's
+/// hold budget: a read that takes the whole budget defers the lift to the
+/// next tick, and one that is cheap lifts at once.
+#[test]
+fn the_read_before_a_lift_is_charged_to_the_hold_budget() {
+    let web = UnitId::service("gym-web");
+    for (cost, lifts) in [(Millis(0), true), (Millis(100), true), (HOLD_WAIT, false), (Millis::secs(30), false)] {
+        let mut r = rig_with_probeless_tool();
+        r.fake.w().kill(&web);
+        r.ticks(1);
+        assert!(r.core.ledger().holds().contains(&web), "journaled: {:?}", r.core.notices);
+        {
+            let mut w = r.fake.w();
+            w.units.get_mut(&web).unwrap().observed = Observed::Active;
+            w.command_cost = cost;
+        }
+        r.core.hold_left = HOLD_WAIT;
+        let lifted = r.core.lift_back(&web);
+        r.fake.w().command_cost = Millis(0);
+        assert_eq!(lifted, lifts, "cost {cost:?}");
+        assert_eq!(r.calls("lift_hold(service:gym-web)") > 0, lifts, "cost {cost:?}");
+    }
+}
+
 /// The alarm for a hold the daemon finds already standing and the lift of
 /// that hold are never the same observation, even for a tool that is
 /// Running again by then (systemd restarted it before the daemon looked).
