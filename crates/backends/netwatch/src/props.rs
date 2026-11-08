@@ -835,42 +835,51 @@ mod wgfold {
         Endpoint { proto: Proto::Udp, addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, n)), port: 51_000 + n as u16 }
     }
 
-    /// One read of the kernel: the devices that exist, each with its peers'
+    /// One read of the kernel: the devices that exist, each with its
+    /// interface index (a device made again has another) and its peers'
     /// endpoints (numbers standing for addresses).
-    type Read = Vec<(usize, BTreeSet<u8>)>;
+    type Read = Vec<(usize, u32, BTreeSet<u8>)>;
 
     fn devices(r: &Read) -> Vec<Device> {
         r.iter()
-            .map(|(d, eps)| Device {
+            .map(|(d, index, eps)| Device {
                 name: dev_name(*d),
-                ifindex: 10 + *d as u32,
+                ifindex: *index,
                 endpoints: eps.iter().map(|n| ep(*n)).collect(),
             })
             .collect()
     }
 
     fn read() -> impl Strategy<Value = Read> {
-        proptest::collection::btree_map(0..DEVS, proptest::collection::btree_set(1u8..5, 0..4), 0..=DEVS)
-            .prop_map(|m| m.into_iter().collect())
+        proptest::collection::btree_map(0..DEVS, (10u32..13, proptest::collection::btree_set(1u8..5, 0..4)), 0..=DEVS)
+            .prop_map(|m| m.into_iter().map(|(d, (i, e))| (d, i, e)).collect())
     }
 
     #[derive(Clone, Debug)]
     enum Step {
-        /// A unit sent a request configuring a device.
-        Bind(usize, usize),
+        /// A unit sent a request configuring a device, pinned at once to the
+        /// index it had then (`None`: the name did not resolve).
+        Bind(usize, usize, Option<u32>),
         /// The loop read the devices.
         Set(Read),
         /// An endpoint restored from the footprint files after a restart that
         /// lost `.state` (no binding with it).
         Restore(usize, u8),
+        /// The device was deleted (RTM_DELLINK): and may be made again before
+        /// the next read, with the same name and index.
+        Del(usize),
+        /// A WireGuard read failed (an interrupted dump).
+        Unread,
     }
 
     fn steps() -> impl Strategy<Value = Vec<Step>> {
         proptest::collection::vec(
             prop_oneof![
-                2 => (0..UNITS, 0..DEVS).prop_map(|(a, b)| Step::Bind(a, b)),
+                2 => (0..UNITS, 0..DEVS, proptest::option::of(10u32..13)).prop_map(|(a, b, i)| Step::Bind(a, b, i)),
                 3 => read().prop_map(Step::Set),
                 1 => (0..UNITS, 1u8..5).prop_map(|(a, n)| Step::Restore(a, n)),
+                1 => (0..DEVS).prop_map(Step::Del),
+                1 => Just(Step::Unread),
             ],
             0..16,
         )
@@ -885,20 +894,37 @@ mod wgfold {
 
         /// A unit's endpoints are exactly those of the devices it
         /// configured, as the last read has them: a peer that moved
-        /// follows, a device that is gone takes its endpoints with it, and a
-        /// unit that configured nothing (even one that made the tunnel)
-        /// carries none. `set_wireguard` says it changed something exactly
-        /// when some unit's endpoints did.
+        /// follows, and a unit that configured nothing (even one that made
+        /// the tunnel) carries none. A binding lasts as long as the device
+        /// it named (B-27): a read without the device, or with the name on a
+        /// device of another interface index, ends it, so a later device of
+        /// that name made by someone else is not this unit's, until this
+        /// unit configures it again. `set_wireguard` says it changed
+        /// something exactly when some unit's endpoints did.
         #[test]
         fn a_unit_carries_exactly_the_endpoints_of_the_devices_it_configured(steps in steps()) {
             let mut t = Tracker::default();
-            let mut bound: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); UNITS];
+            // device -> the interface index its first read showed
+            let mut bound: Vec<BTreeMap<usize, Option<u32>>> = vec![BTreeMap::new(); UNITS];
             let mut want: Vec<BTreeSet<Endpoint>> = vec![BTreeSet::new(); UNITS];
+            let mut unread = false;
             for s in &steps {
                 match s {
-                    Step::Bind(a, d) => {
-                        t.bind_wireguard(&unit(*a), &dev_name(*d));
-                        bound[*a].insert(*d);
+                    Step::Unread => {
+                        t.wireguard_unread();
+                        unread = true;
+                    }
+                    Step::Bind(a, d, pin) => {
+                        t.bind_wireguard_at(&unit(*a), &dev_name(*d), *pin);
+                        bound[*a].insert(*d, *pin);
+                    }
+                    Step::Del(d) => {
+                        t.apply(&Change { owner: Owner::Unattributed, kind: ChangeKind::Interface, object: dev_name(*d), iface: Some(dev_name(*d)), steers: false, removed: true });
+                        for i in 0..UNITS {
+                            if bound[i].remove(d).is_some() {
+                                want[i].clear();
+                            }
+                        }
                     }
                     Step::Restore(a, n) => {
                         t.add_endpoint(&unit(*a), ep(*n));
@@ -907,14 +933,41 @@ mod wgfold {
                     Step::Set(r) => {
                         let before = want.clone();
                         for i in 0..UNITS {
-                            if !bound[i].is_empty() {
-                                want[i] = r.iter().filter(|(d, _)| bound[i].contains(d)).flat_map(|(_, e)| e.iter().map(|n| ep(*n))).collect();
+                            if bound[i].is_empty() {
+                                continue;
                             }
+                            // Mirror of the rule (model.rs): by name, else by the
+                            // pinned index under another name, else by nothing.
+                            let seen = std::mem::take(&mut bound[i]);
+                            for (d, index) in seen {
+                                match r.iter().find(|(x, _, _)| *x == d) {
+                                    Some((_, now, _)) if index.is_none_or(|was| was == *now) => { bound[i].insert(d, Some(*now)); }
+                                    Some(_) => {}
+                                    None => match index {
+                                        None => {}
+                                        Some(was) => {
+                                            if let Some((x, _, _)) = r.iter().find(|(_, now, _)| *now == was) {
+                                                bound[i].insert(*x, Some(was));
+                                            }
+                                        }
+                                    },
+                                }
+                            }
+                            want[i] = r.iter().filter(|(d, _, _)| bound[i].contains_key(d)).flat_map(|(_, _, e)| e.iter().map(|n| ep(*n))).collect();
                         }
                         let changed = t.set_wireguard(&devices(r));
-                        prop_assert_eq!(changed, before != want, "the return value, on {:?}", r);
+                        prop_assert_eq!(changed, before != want || unread, "the return value, on {:?}", r);
+                        unread = false;
                     }
                 }
+                // A failed read marks the footprints unattributed, and the
+                // next read that succeeds clears it: not at a restart.
+                let marked = t
+                    .view(WatchState::Attached { at: NOW }, &[], NOW)
+                    .unattributed
+                    .iter()
+                    .any(|w| w.contains("WireGuard peers"));
+                prop_assert_eq!(marked, unread, "the failed-read mark, after {:?}", s);
                 for (i, w) in want.iter().enumerate() {
                     prop_assert_eq!(&endpoints(&t, i), w, "unit {} after {:?}", i, s);
                 }
@@ -929,11 +982,18 @@ mod wgfold {
             let mut t = Tracker::default();
             for s in &steps {
                 match s {
-                    Step::Bind(a, d) => t.bind_wireguard(&unit(*a), &dev_name(*d)),
+                    Step::Bind(a, d, pin) => t.bind_wireguard_at(&unit(*a), &dev_name(*d), *pin),
                     Step::Set(r) => { t.set_wireguard(&devices(r)); }
                     Step::Restore(a, n) => t.add_endpoint(&unit(*a), ep(*n)),
+                    Step::Del(d) => t.apply(&Change { owner: Owner::Unattributed, kind: ChangeKind::Interface, object: dev_name(*d), iface: Some(dev_name(*d)), steers: false, removed: true }),
+                    // A failed read is not kept by a restart: the new watch
+                    // reads again.
+                    Step::Unread => {}
                 }
             }
+            // What the restart keeps includes the index each binding was
+            // pinned to, so a device made again while the watch was down
+            // is not inherited either.
             let mut after = Tracker::attach(&t.claims(), &[], &BTreeSet::new());
             t.set_wireguard(&devices(&last));
             after.set_wireguard(&devices(&last));
@@ -959,7 +1019,13 @@ mod wgfold {
             let mut seen: BTreeSet<Endpoint> = BTreeSet::new();
             for r in &reads {
                 t.set_wireguard(&devices(r));
-                seen.extend(r.iter().filter(|(d, _)| *d == 0).flat_map(|(_, e)| e.iter().map(|n| ep(*n))));
+                // The binding may have ended with the device; the unit's
+                // invocation still had what it carried while bound.
+                if let Some((_, _, e)) = r.iter().find(|(d, _, _)| *d == 0)
+                    && t.claims().wireguard.contains(&(a.clone(), "wg0".to_string()))
+                {
+                    seen.extend(e.iter().map(|n| ep(*n)));
+                }
                 let f = t.footprint(&a, NOW);
                 prop_assert!(f.protecting);
                 prop_assert!(seen.is_subset(&f.endpoints), "lost {:?} of {:?}", seen.difference(&f.endpoints).collect::<Vec<_>>(), f.endpoints);

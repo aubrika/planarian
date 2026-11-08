@@ -410,7 +410,10 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                     && let Err(why) = genl_ids.ensure(t, &mut crate::snapshot::families)
                 {
                     eprintln!("netwatch: {why}");
-                    tracker.lost(None);
+                    // The family list is unknown, so the WireGuard peers are:
+                    // an object-bound mark a good read clears (as at N25), not
+                    // the global lost-event mark only a restart clears.
+                    tracker.wireguard_unread();
                 }
                 if let Ok(Some(family)) = genl_ids.family("wireguard") {
                     let unit = ev.cgpath.as_deref().and_then(unit_of_cgroup).or_else(|| cgroups.unit(ev.cgroup));
@@ -419,13 +422,23 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                         // binds nobody. The devices a unit configured follow
                         // their live peers, whoever changes them.
                         (crate::wg::Genl::Other, _) | (_, None) => {}
-                        (crate::wg::Genl::Set(dev), Some(u)) => tracker.bind_wireguard(&u, &dev),
+                        (crate::wg::Genl::Set(dev), Some(u)) => {
+                            // Pinned at the request, from the kernel's list as
+                            // it is now (not the cache: the name may be a
+                            // device made since).
+                            let scan = crate::host::try_read_ifnames()
+                                .map(|m| m.into_iter().find(|(_, n)| *n == dev).map(|(i, _)| i));
+                            if let Err(why) = &scan {
+                                eprintln!("netwatch: {why}");
+                            }
+                            tracker.bind_wireguard_scanned(&u, &dev, scan)
+                        }
                         (crate::wg::Genl::SetIndex(i), Some(u)) => {
                             match ifnames.get(&i).cloned().or_else(|| {
                                 ifnames = read_ifnames();
                                 ifnames.get(&i).cloned()
                             }) {
-                                Some(dev) => tracker.bind_wireguard(&u, &dev),
+                                Some(dev) => tracker.bind_wireguard_at(&u, &dev, Some(i)),
                                 None => tracker.lost(Some(&u)),
                             }
                         }
@@ -483,7 +496,8 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                 }
                 Err(why) => {
                     eprintln!("netwatch: {why}");
-                    tracker.lost(None);
+                    // Object-bound: cleared by the next read that succeeds.
+                    tracker.wireguard_unread();
                     changed = true;
                 }
             }
