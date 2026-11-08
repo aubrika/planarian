@@ -52,7 +52,7 @@ The directory is the root of a bpffs mounted with `-o mode=0700` (without the op
 - Stage 2 does not mount a new one: the instance moved with `/run`. The stage-2 unit has the same mount unit ordered before it, and the mount is idempotent (already mounted at that path: nothing to do; the loader checks it is a bpffs with `statfs` and refuses a path that is not, §5 "refuse"). With no initrd watch (a scripted initrd) the stage-2 mount unit makes the instance fresh, and the same code runs.
 - A pin directory that is not a bpffs root, or whose mount is not `0700 root`, is refused.
 - Never use the system's `/sys/fs/bpf` for any of this: stage 2 probably over-mounts the initrd's instance rather than freeing it, so pins made there stay attached but hidden (reviewer, #94).
-- When a generation turns netwatch off, a named unit (`planarian-netwatch-bpf-clear.service`, `ExecStart` unpins the links and unmounts `/run/planarian/netwatch-bpf`, run from the stage-2 stop of the watch only when the export says it is off) removes the instance, so a stopped watch does not leave probes attached for a unit nobody runs. A plain stop or restart of the watch leaves it (§5).
+- When a generation turns netwatch off, a named unit (`planarian-netwatch-bpf-clear.service`, `ExecStart` unpins the links and unmounts `/run/planarian/netwatch-bpf`, run from the stage-2 stop of the watch only when the export says it is off; the unit exists **only in generations with netwatch off** (reviewer, #94), so a generation with the watch on carries no unit that could remove the instance) removes the instance, so a stopped watch does not leave probes attached for a unit nobody runs. A plain stop or restart of the watch leaves it (§5).
 
 ## 4. The build-hash and layout check
 
