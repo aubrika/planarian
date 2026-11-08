@@ -703,6 +703,21 @@ fn the_hold_is_verified_in_the_merged_tree() {
 }
 
 #[test]
+fn the_hold_check_reads_the_hold_leniently() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("units");
+    // A unit file the classifier rejects (a bad header, a line without '=') still has its hold checked.
+    write(
+        &root.join("t.service"),
+        "[Unit]\nDescription=x\n[Service\nUser=nobody\n[Service]\nnonsense\nExecStart=/bin/true\n",
+    );
+    write(&root.join("t.service.d/50-planarian-hold.conf"), &tree::hold_dropin(true, true));
+    assert_eq!(tree::hold_problem(&root, "t", true), None);
+    write(&root.join("t.service.d/90-strip.conf"), "[Unit]\nOnFailure=\n");
+    assert!(tree::hold_problem(&root, "t", true).is_some());
+}
+
+#[test]
 fn the_generated_drop_in_matches_the_nix_holddropins_text() {
     assert_eq!(
         tree::hold_dropin(true, true),

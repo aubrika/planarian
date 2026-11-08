@@ -71,6 +71,16 @@ pub fn effective(roots: &[PathBuf], unit: &str, main: &Path) -> Result<Settings,
     Ok(s)
 }
 
+/// The effective `OnFailure=` and `After=` of `unit`, read leniently.
+pub fn effective_hold(roots: &[PathBuf], unit: &str, main: &Path) -> Result<Settings, Error> {
+    let mut s = Settings::default();
+    s.apply_hold(&syntax::parse_lenient(&main.display().to_string(), &read(main)?));
+    for (_, p) in dropins(roots, unit)? {
+        s.apply_hold(&syntax::parse_lenient(&p.display().to_string(), &read(&p)?));
+    }
+    Ok(s)
+}
+
 /// The name Planarian lists a unit under: `foo.service` is `foo`, a template
 /// `foo@.service` is `foo@`.
 pub fn tool_name(unit_file: &str) -> Option<String> {
@@ -156,7 +166,9 @@ pub fn hold_problem(root: &Path, tool: &str, want_after_netwatch: bool) -> Optio
     if fs::symlink_metadata(main).is_err() || masked(main) {
         return None;
     }
-    let s = match effective(&[root.to_path_buf()], &unit, main) {
+    // Only OnFailure= and After= are read, leniently: a unit file the classifier
+    // cannot parse must not fail a build here; its hold is still checked.
+    let s = match effective_hold(&[root.to_path_buf()], &unit, main) {
         Ok(s) => s,
         Err(e) => return Some(format!("{tool}: {e}")),
     };

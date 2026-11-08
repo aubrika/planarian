@@ -106,8 +106,20 @@ pub struct Assignment {
     pub file: String,
 }
 
-/// Parse a unit file or drop-in into its assignments.
+/// Parse a unit file or drop-in into its assignments, exactly: a line it
+/// cannot read is an [`Error`] (the classifier's mode).
 pub fn parse(file: &str, text: &str) -> Result<Vec<Assignment>, Error> {
+    parse_with(file, text, true)
+}
+
+/// As [`parse`], but a line that cannot be read is skipped, as systemd skips
+/// it. The hold check's mode: it reads two `[Unit]` settings and must not
+/// fail a system build over a unit file's other syntax.
+pub fn parse_lenient(file: &str, text: &str) -> Vec<Assignment> {
+    parse_with(file, text, false).unwrap_or_default()
+}
+
+fn parse_with(file: &str, text: &str, strict: bool) -> Result<Vec<Assignment>, Error> {
     let mut out = Vec::new();
     let mut section = String::new();
     let mut pending: Option<String> = None;
@@ -151,7 +163,11 @@ pub fn parse(file: &str, text: &str) -> Result<Vec<Assignment>, Error> {
                     section = name.trim().to_string();
                     continue;
                 }
-                _ => return Err(Error::BadSection { file: file.into(), line: line.into() }),
+                _ if strict => return Err(Error::BadSection { file: file.into(), line: line.into() }),
+                _ => {
+                    section = String::new(); // the keys under a bad header are not read
+                    continue;
+                }
             }
         }
         match line.split_once('=') {
@@ -161,7 +177,9 @@ pub fn parse(file: &str, text: &str) -> Result<Vec<Assignment>, Error> {
                 value: v.trim().to_string(),
                 file: file.into(),
             }),
-            None if section == "Service" => return Err(Error::NoAssignment { file: file.into(), line: line.into() }),
+            None if strict && section == "Service" => {
+                return Err(Error::NoAssignment { file: file.into(), line: line.into() });
+            }
             None => {}
         }
     }
@@ -319,6 +337,18 @@ fn list(into: &mut Vec<String>, value: &str) {
 }
 
 impl Settings {
+    /// Apply only the `[Unit]` lists the hold check reads (`OnFailure=`,
+    /// `After=`), whatever else the unit says.
+    pub fn apply_hold<'a>(&mut self, assignments: impl IntoIterator<Item = &'a Assignment>) {
+        for a in assignments.into_iter().filter(|a| a.section == "Unit") {
+            match a.key.as_str() {
+                "OnFailure" => list(&mut self.on_failure, &a.value),
+                "After" => list(&mut self.after, &a.value),
+                _ => {}
+            }
+        }
+    }
+
     /// Apply assignments in order (main file, then drop-ins by file name).
     pub fn apply<'a>(&mut self, assignments: impl IntoIterator<Item = &'a Assignment>) -> Result<(), Error> {
         for a in assignments {

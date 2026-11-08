@@ -83,6 +83,7 @@ jobs:
           nix build -L
           .#checks.x86_64-linux.package
           .#checks.x86_64-linux.module-eval
+          .#checks.x86_64-linux.raw-units
           .#checks.x86_64-linux.boundaries
           .#checks.x86_64-linux.verus
           .#checks.x86_64-linux.demo-vm

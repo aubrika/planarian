@@ -125,7 +125,8 @@ let
       # NoNewPrivileges= as systemd reads it; anything unrecognised counts
       # as unset (failing closed).
       noNewPrivs = builtins.elem (toString (sc.NoNewPrivileges or false)) [ "1" "true" "yes" "on" ];
-      devices = words ((sc.DeviceAllow or [ ]) ++ (sc.BindPaths or [ ]) ++ (sc.BindReadOnlyPaths or [ ]));
+      # NixOS accepts these as a string or a list; a string must not break the `++`.
+      devices = words (lib.concatMap lib.toList [ (sc.DeviceAllow or [ ]) (sc.BindPaths or [ ]) (sc.BindReadOnlyPaths or [ ]) ]);
     in
     builtins.elem name netdevUnits
     || grants (sc.AmbientCapabilities or [ ]) netCaps
@@ -717,7 +718,16 @@ in
         (lib.filterAttrs (n: _: !(cfg.units ? ${n})) config.systemd.services);
     };
 
-    environment.etc."planarian/export.json".text = builtins.toJSON cfg.export;
+    # The evaluated export with the build-time list of raw-unit network tools
+    # (B-23) unioned into `networkTools`: the raw names are only known after
+    # the build, and the consumers (planariad, netwatch) read this file.
+    environment.etc."planarian/export.json".source =
+      let evaluated = pkgs.writeText "planarian-export-evaluated.json" (builtins.toJSON cfg.export); in
+      if cfg.rawUnits == null then evaluated
+      else pkgs.runCommand "planarian-export.json" { nativeBuildInputs = [ pkgs.jq ]; } ''
+        jq -c --slurpfile raw ${cfg.rawUnits}/share/planarian/raw-network-tools.json \
+          '.networkTools = ((.networkTools + $raw[0]) | unique)' ${evaluated} > "$out"
+      '';
 
     environment.etc."planarian/config.json".text = builtins.toJSON {
       inherit (cfg) owner flakeAttr maxTier optionSensitivity;
