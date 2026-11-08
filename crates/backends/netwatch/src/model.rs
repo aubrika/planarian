@@ -155,8 +155,10 @@ struct Standing {
     objects: BTreeMap<(ChangeKind, String), (Option<String>, bool)>,
     endpoints: BTreeSet<Endpoint>,
     /// WireGuard devices this unit configured (its generic netlink requests
-    /// named them): where its `endpoints` come from (B-22 b).
-    wireguard: BTreeSet<String>,
+    /// named them): where its `endpoints` come from (B-22 b). Each is bound
+    /// to the device it named: the name, and the interface index the first
+    /// read of it showed. A binding ends with that device (B-27).
+    wireguard: BTreeMap<String, Option<u32>>,
     unattributed: bool,
 }
 
@@ -180,6 +182,12 @@ pub struct Tracker {
     /// A lost event could not be placed: everything counts as unattributed
     /// until the watch restarts (which re-reads the kernel's state).
     lost_unplaced: bool,
+    /// The last WireGuard read failed: the peers (and so the endpoints the
+    /// hold passes) are unknown. Object-bound: it clears with the next read
+    /// that succeeds, not at a restart (a failed dump is the kernel's
+    /// answer to a peer list changing under it, not an event nobody can
+    /// place).
+    wg_unread: bool,
     /// Steering objects found standing on attach that no footprint claimed:
     /// made while nobody watched (§12d, fail closed). Each clears when its
     /// object is removed.
@@ -234,6 +242,10 @@ pub struct Claims {
     /// (unit, WireGuard device it configured).
     #[serde(default)]
     pub wireguard: Vec<(UnitId, String)>,
+    /// (unit, device name, interface index): the device a binding was
+    /// first read to name (B-27); absent for one not read yet.
+    #[serde(default)]
+    pub wireguard_index: Vec<(UnitId, String, u32)>,
 }
 
 impl Claims {
@@ -267,8 +279,8 @@ impl Tracker {
             }
         };
         for s in self.units.values_mut() {
-            if s.wireguard.remove(was) {
-                s.wireguard.insert(now.to_string());
+            if let Some(index) = s.wireguard.remove(was) {
+                s.wireguard.insert(now.to_string(), index);
             }
             if let Some(value) = s.objects.remove(&(ChangeKind::Interface, was.to_string())) {
                 s.objects.insert((ChangeKind::Interface, now.to_string()), value);
@@ -316,6 +328,15 @@ impl Tracker {
             self.pre_attach.remove(&key);
             if c.kind == ChangeKind::Interface {
                 self.virtual_ifaces.remove(&c.object);
+                // A deleted device ends every WireGuard binding to it, even
+                // when a device of the same name and index is made again
+                // before the next read (B-27).
+                for s in self.units.values_mut() {
+                    if s.wireguard.remove(&c.object).is_some() {
+                        // Its peers went with it; what is left is read again.
+                        s.endpoints.clear();
+                    }
+                }
             }
             if c.kind == ChangeKind::Route {
                 self.route_through.remove(&c.object);
@@ -364,7 +385,8 @@ impl Tracker {
                 c.objects.push((u.clone(), *k, o.clone(), i.clone(), *steers));
             }
             c.endpoints.extend(s.endpoints.iter().map(|e| (u.clone(), *e)));
-            c.wireguard.extend(s.wireguard.iter().map(|d| (u.clone(), d.clone())));
+            c.wireguard.extend(s.wireguard.keys().map(|d| (u.clone(), d.clone())));
+            c.wireguard_index.extend(s.wireguard.iter().filter_map(|(d, i)| i.map(|i| (u.clone(), d.clone(), i))));
             if s.unattributed {
                 c.unattributed_units.push(u.clone());
             }
@@ -407,6 +429,11 @@ impl Tracker {
         }
         for (u, d) in &previous.wireguard {
             t.bind_wireguard(u, d);
+        }
+        for (u, d, i) in &previous.wireguard_index {
+            if let Some(b) = t.units.get_mut(u).and_then(|s| s.wireguard.get_mut(d)) {
+                *b = Some(*i);
+            }
         }
         for u in &previous.unattributed_units {
             t.lost(Some(u));
@@ -473,8 +500,36 @@ impl Tracker {
     /// peers, whoever owns the device now (coordinator, Nov 3): the claim
     /// goes to the unit the request's cgroup names. Bindings accumulate and
     /// are saved in `.state`; another request does not clear an older one.
+    /// A binding lasts as long as the device it first named (B-27): a request
+    /// is a fresh claim, whose device the next read pins by interface index.
     pub fn bind_wireguard(&mut self, unit: &UnitId, dev: &str) {
-        self.units.entry(unit.clone()).or_default().wireguard.insert(dev.to_string());
+        self.bind_wireguard_at(unit, dev, None);
+    }
+
+    /// A request configured `dev`; `scan` is what the scan of the kernel's
+    /// interface list said about its index: `Ok(Some(i))` pins at once,
+    /// `Ok(None)` is a name with no device, and `Err` is a scan that failed,
+    /// which fails closed (the peers are unknown) until a read succeeds,
+    /// never "no such device" (rule 21).
+    pub fn bind_wireguard_scanned(&mut self, unit: &UnitId, dev: &str, scan: Result<Option<u32>, String>) {
+        match scan {
+            Ok(index) => self.bind_wireguard_at(unit, dev, index),
+            Err(_) => {
+                self.wireguard_unread();
+                self.bind_wireguard_at(unit, dev, None);
+            }
+        }
+    }
+
+    /// As [`Tracker::bind_wireguard`], pinned at once to the interface index
+    /// the name has now (read at the request, from the kernel's own list),
+    /// where it resolves: a binding pinned at its birth cannot be taken over
+    /// by a device made later under the same name, and a rename before the
+    /// first read still finds it by index. `None` (the name did not
+    /// resolve: no such device yet) leaves it for the next read to pin, and
+    /// a read without the name ends it.
+    pub fn bind_wireguard_at(&mut self, unit: &UnitId, dev: &str, index: Option<u32>) {
+        self.units.entry(unit.clone()).or_default().wireguard.insert(dev.to_string(), index);
     }
 
     /// B-22 (b): each unit that configured WireGuard devices takes exactly
@@ -483,27 +538,54 @@ impl Tracker {
     /// none (the latch keeps what an invocation found protecting with, for
     /// the hold to pass its peer). Returns whether anything changed.
     pub fn set_wireguard(&mut self, devices: &[crate::wg::Device]) -> bool {
-        let mut changed = false;
+        // A read that succeeded: whatever the last failed one left unknown
+        // is known again.
+        let mut changed = std::mem::take(&mut self.wg_unread);
         for s in self.units.values_mut() {
             if s.wireguard.is_empty() {
                 continue;
             }
+            // A binding is to a device, not to its name (B-27). Once a read
+            // has pinned it by interface index:
+            // - the name on a device with another index (made again between
+            //   reads, by anyone) ends it;
+            // - the name gone, with the index standing under another name,
+            //   is a rename the read saw before its event did: the binding
+            //   follows the device (the event, when it comes, finds nothing
+            //   left to move);
+            // - the name gone, and the index too, is a deleted device: it
+            //   ends.
+            // A binding that did not resolve to a device at its request (no
+            // such device yet) and that no read has pinned ends with a read
+            // without its name (a device made later under it is not this
+            // unit's). A unit that configures the device again sends a
+            // request, which binds it afresh.
+            let old = std::mem::take(&mut s.wireguard);
+            for (name, index) in old {
+                match devices.iter().find(|d| d.name == name) {
+                    Some(d) if index.is_none_or(|i| i == d.ifindex) => {
+                        s.wireguard.insert(name, Some(d.ifindex));
+                    }
+                    Some(_) => {}
+                    None => match index {
+                        None => {}
+                        Some(i) => {
+                            if let Some(d) = devices.iter().find(|d| d.ifindex == i) {
+                                s.wireguard.insert(d.name.clone(), Some(i));
+                            }
+                        }
+                    },
+                }
+            }
             let now: BTreeSet<Endpoint> = devices
                 .iter()
-                .filter(|d| s.wireguard.contains(&d.name))
+                .filter(|d| s.wireguard.contains_key(&d.name))
                 .flat_map(|d| d.endpoints.iter().copied())
                 .collect();
             if s.endpoints != now {
                 s.endpoints = now;
                 changed = true;
             }
-            // A binding is to the device's name and outlives the device (a
-            // tunnel that bounces is the same unit's, and a restart keeps it
-            // in `.state`). Known limit: a later device of the same name,
-            // made by another unit, also hands this unit its peers. Neither
-            // another configuring request nor a watch restart clears the
-            // saved binding; it lasts until reboot or an explicit reset
-            // that actually removes it (B-27).
         }
         if changed {
             self.relatch();
@@ -646,6 +728,12 @@ impl Tracker {
         }
     }
 
+    /// A WireGuard read failed (an interrupted or failed dump): fail closed
+    /// until one succeeds.
+    pub fn wireguard_unread(&mut self) {
+        self.wg_unread = true;
+    }
+
     /// An event was lost. With the unit known, its footprint is marked
     /// unattributed; without, the global marker stands.
     pub fn lost(&mut self, unit: Option<&UnitId>) {
@@ -762,6 +850,9 @@ impl Tracker {
         why.extend(self.pre_attach.keys().map(|(k, o)| format!("pre-attach {k:?} {o}")));
         if self.lost_unplaced {
             why.push("an event was lost and could not be placed".into());
+        }
+        if self.wg_unread {
+            why.push("the WireGuard peers could not be read".into());
         }
         FootprintView { watch, unattributed: why, units }
     }
