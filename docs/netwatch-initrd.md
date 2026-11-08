@@ -51,6 +51,8 @@ The directory is the root of a bpffs mounted with `-o mode=0700` (without the op
 - `/run/planarian/netwatch-bpf` is a bpffs mount (`mount -t bpf -o mode=0700 bpf …`), made in the initrd before the initrd watch loads, by a mount unit (lane-nix's side) so that it is in the host mount namespace and not a service's private one.
 - Stage 2 does not mount a new one: the instance moved with `/run`. The stage-2 unit has the same mount unit ordered before it, and the mount is idempotent (already mounted at that path: nothing to do; the loader checks it is a bpffs with `statfs` and refuses a path that is not, §5 "refuse"). With no initrd watch (a scripted initrd) the stage-2 mount unit makes the instance fresh, and the same code runs.
 - A pin directory that is not a bpffs root, or whose mount is not `0700 root`, is refused.
+- Never use the system's `/sys/fs/bpf` for any of this: stage 2 probably over-mounts the initrd's instance rather than freeing it, so pins made there stay attached but hidden (reviewer, #94).
+- When a generation turns netwatch off, a named unit (`planarian-netwatch-bpf-clear.service`, `ExecStart` unpins the links and unmounts `/run/planarian/netwatch-bpf`, run from the stage-2 stop of the watch only when the export says it is off) removes the instance, so a stopped watch does not leave probes attached for a unit nobody runs. A plain stop or restart of the watch leaves it (§5).
 
 ## 4. The build-hash and layout check
 
@@ -98,7 +100,7 @@ Measure first, then set the size:
 2. lane-nix runs VM boots with a deliberately large ring (16 MiB) for the initrd configurations that matter: no initrd networking; `boot.initrd.network` with static addresses; with networkd in the initrd; a WireGuard or VLAN link set up in the initrd. It records `drained` for each.
 3. `ring_bytes = round_up_pow2(max_over_configs(drained) × 928 × 4)`, with a floor of 512 KiB, and the number and the configurations recorded in this file.
 
-The 4× margin covers slower hardware and a longer initrd (disk unlock waiting on a person, which is the real unknown: nothing in the initrd generates netlink requests while it waits, so the count should not grow with time, and the measurement must include that case). The function (`ring_bytes_for(measured)`) is pure and has a property test: the result is a power of two, at least the floor, at least `measured × 928`, and monotone in `measured`.
+The measurement boots include a long initrd (a wait on a disk-unlock prompt before switch-root, the reviewer's request), not only the quick ones. The 4× margin covers slower hardware and a longer initrd (disk unlock waiting on a person, which is the real unknown: nothing in the initrd generates netlink requests while it waits, so the count should not grow with time, and the measurement must include that case). The function (`ring_bytes_for(measured)`) is pure and has a property test: the result is a power of two, at least the floor, at least `measured × 928`, and monotone in `measured`.
 
 An overflow is never silent: `LOST` counts it and takeover reports it as a lost event, which fails closed (global `unattributed`).
 
