@@ -1812,8 +1812,15 @@ mod timed_release_props {
         }
         // A failed/unknown lift retries while its original bound still
         // holds. A successful one needs no second lift, but is checked.
-        r.fake.advance(Millis::secs(65));
+        // The release handling itself may have taken fake time (a hung
+        // lift), so derive the wait from what is left of the bound: the
+        // retry tick (5 s) must land strictly before `original`.
+        let now = r.fake.w().now.0;
+        let remaining = original.0.saturating_sub(now);
+        let wait = remaining.saturating_sub(10_000).min(65_000);
+        r.fake.advance(Millis(wait));
         r.ticks(1);
+        prop_assert!(r.fake.w().now.0 < original.0, "retry tick landed past the original bound");
         prop_assert!(!r.fake.w().held.contains(&web), "retry never lifted: {:?}", r.core.notices);
         prop_assert_eq!(r.fake.w().hold_release_deadlines[&web], original);
         if restart {
@@ -1850,6 +1857,7 @@ mod timed_release_props {
 
     #[test]
     fn every_lift_outcome_and_both_hold_paths_obey_the_original_bound() {
+        check(90, 300, 2, false, false).unwrap();
         for fault in 0..3 {
             for on_failure in [false, true] {
                 check(180, 3_600, fault, true, on_failure).unwrap();
