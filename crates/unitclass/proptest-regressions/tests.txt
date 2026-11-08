@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b02b03e8008afeec7797be194a227b212317524802407fc86cd413166e3b60e8 # shrinks to c = Cfg { user: None, dynamic: None, bounding: Unset, ambient: Unset, nnp: None, device: [], bind: [], bind_ro: [] }, st = Style { reset_prefix: false, split: false, continuation: false, comments: false, tabs: false, blank_lines: false, lower_caps: false, numeric_caps: false, bool_spelling: 0, decoys: false, reversed: false }, which = 5
+cc 075849fc4bf5523b2f881c75273698d6ad8bf74995d3cdffc9b5d376b0c875a6 # shrinks to c = Cfg { user: None, dynamic: None, bounding: Unset, ambient: Unset, nnp: None, device: [], bind: [], bind_ro: ["/var/lib/x:/var/lib/y"] }, st = Style { reset_prefix: true, split: true, continuation: true, comments: false, tabs: false, blank_lines: false, lower_caps: false, numeric_caps: false, bool_spelling: 0, decoys: false, reversed: true }

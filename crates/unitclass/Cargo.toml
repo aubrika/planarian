@@ -1,0 +1,18 @@
+[package]
+name = "planarian-unitclass"
+description = "Planarian: classify systemd unit files as network tools at build time (SPEC §12d, B-23), and verify the hold is in force in the merged unit tree."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "planarian-unitclass"
+path = "src/main.rs"
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
