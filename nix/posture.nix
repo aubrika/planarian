@@ -473,13 +473,11 @@ let
     value = "[Unit]\nOnFailure=planarian-hold@%N.service\n"
       + lib.optionalString (netwatchOn && !(builtins.elem u unordered.cycle)) "After=planarian-netwatch.service\n";
   }) cfg.holdUnits);
+  # The re-application is its own file: two drop-ins of one name in one
+  # directory are one file to systemd (and to lndir, which keeps one), so
+  # nftables' own hold and the re-application must not share a name.
   holdDropins = toolDropins // {
-    # The same file as nftables' own hold when nftables is a network tool:
-    # both go in it (a second file of that name would replace the first, and
-    # nftables would lose its OnFailure= hold and its ordering after netwatch).
-    "nftables.service.d/50-planarian-hold.conf" =
-      (toolDropins."nftables.service.d/50-planarian-hold.conf" or "")
-      + "[Service]\nExecStartPost=${hold} reapply\nExecReload=${hold} reapply\n";
+    "nftables.service.d/50-planarian-reapply.conf" = "[Service]\nExecStartPost=${hold} reapply\nExecReload=${hold} reapply\n";
   };
   netwatchOn = cfg.package.netwatch or false;
   unordered = import ./netwatch-unordered.nix;
