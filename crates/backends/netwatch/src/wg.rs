@@ -347,3 +347,70 @@ impl GenlIds {
         Ok(self.by_id.iter().find(|(_, n)| n.as_str() == name).map(|(i, _)| *i))
     }
 }
+
+/// One generic netlink request the probe saw, given the family list kept
+/// (`ids`), applied to the tracker: the WireGuard bindings it makes, and what
+/// fails closed. Returns what to log.
+///
+/// - The request's family id is looked up if the map does not hold it
+///   (`GenlIds::ensure`). If the list cannot be read, the request cannot be
+///   told from a WireGuard one: the peers are unknown (`wireguard_unread`,
+///   cleared by a good read), **and** the unit that sent it, if it is a unit
+///   in the host's namespace, is marked lost (`lost(Some(unit))`), because
+///   the binding it may have made cannot be recovered from a later good read
+///   (a failed read must not make its unit stop protecting).
+/// - A WireGuard `SET` binds the unit to the device it names, pinned at the
+///   request from a fresh scan of the interface list (a failed scan marks
+///   the peers unknown and binds unpinned).
+#[allow(clippy::too_many_arguments)]
+pub fn take_genl(
+    t: &mut crate::model::Tracker,
+    ids: &mut GenlIds,
+    ev: &crate::ebpf::Event,
+    own_netns: u32,
+    unit: impl FnOnce() -> Option<planarian_schema::UnitId>,
+    fetch: &mut dyn FnMut() -> Result<Vec<(String, u16)>, String>,
+    scan: &mut dyn FnMut() -> Result<std::collections::BTreeMap<u32, String>, String>,
+    ifnames: &mut std::collections::BTreeMap<u32, String>,
+    read_ifnames: &mut dyn FnMut() -> std::collections::BTreeMap<u32, String>,
+) -> Vec<String> {
+    let mut log = vec![];
+    if let Some(ty) = ev.nlmsg_type()
+        && let Err(why) = ids.ensure(ty, fetch)
+    {
+        log.push(why);
+        t.wireguard_unread();
+        if ev.netns == own_netns
+            && let Some(u) = unit()
+        {
+            t.lost(Some(&u));
+        }
+        return log;
+    }
+    let Ok(Some(family)) = ids.family("wireguard") else { return log };
+    match (host_request(ev, family, own_netns), unit()) {
+        // A request from no unit (an administrator's `wg set`) binds nobody.
+        // The devices a unit configured follow their live peers, whoever
+        // changes them.
+        (Genl::Other, _) | (_, None) => {}
+        (Genl::Set(dev), Some(u)) => {
+            let found = scan().map(|m| m.into_iter().find(|(_, n)| *n == dev).map(|(i, _)| i));
+            if let Err(why) = &found {
+                log.push(why.clone());
+            }
+            t.bind_wireguard_scanned(&u, &dev, found);
+        }
+        (Genl::SetIndex(i), Some(u)) => {
+            let name = ifnames.get(&i).cloned().or_else(|| {
+                *ifnames = read_ifnames();
+                ifnames.get(&i).cloned()
+            });
+            match name {
+                Some(dev) => t.bind_wireguard_at(&u, &dev, Some(i)),
+                None => t.lost(Some(&u)),
+            }
+        }
+        (Genl::SetUnnamed, Some(u)) => t.lost(Some(&u)),
+    }
+    log
+}

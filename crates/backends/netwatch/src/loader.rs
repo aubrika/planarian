@@ -402,48 +402,23 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
             drained += 1;
             if ev.hook == crate::ebpf::HOOK_GENL {
                 genl = true;
-                // WireGuard's family id is assigned when its module loads:
-                // an id the map does not hold is looked up again (once per id
+                // WireGuard's family id is assigned when its module loads: an
+                // id the map does not hold is looked up again (once per id
                 // until the next tick) before the request is set aside as
                 // another family's. A known one costs no dump.
-                if let Some(t) = ev.nlmsg_type()
-                    && let Err(why) = genl_ids.ensure(t, &mut crate::snapshot::families)
-                {
-                    eprintln!("netwatch: {why}");
-                    // The family list is unknown, so the WireGuard peers are:
-                    // an object-bound mark a good read clears (as at N25), not
-                    // the global lost-event mark only a restart clears.
-                    tracker.wireguard_unread();
-                }
-                if let Ok(Some(family)) = genl_ids.family("wireguard") {
-                    let unit = ev.cgpath.as_deref().and_then(unit_of_cgroup).or_else(|| cgroups.unit(ev.cgroup));
-                    match (crate::wg::host_request(&ev, family, own_netns), unit) {
-                        // A request from no unit (an administrator's `wg set`)
-                        // binds nobody. The devices a unit configured follow
-                        // their live peers, whoever changes them.
-                        (crate::wg::Genl::Other, _) | (_, None) => {}
-                        (crate::wg::Genl::Set(dev), Some(u)) => {
-                            // Pinned at the request, from the kernel's list as
-                            // it is now (not the cache: the name may be a
-                            // device made since).
-                            let scan = crate::host::try_read_ifnames()
-                                .map(|m| m.into_iter().find(|(_, n)| *n == dev).map(|(i, _)| i));
-                            if let Err(why) = &scan {
-                                eprintln!("netwatch: {why}");
-                            }
-                            tracker.bind_wireguard_scanned(&u, &dev, scan)
-                        }
-                        (crate::wg::Genl::SetIndex(i), Some(u)) => {
-                            match ifnames.get(&i).cloned().or_else(|| {
-                                ifnames = read_ifnames();
-                                ifnames.get(&i).cloned()
-                            }) {
-                                Some(dev) => tracker.bind_wireguard_at(&u, &dev, Some(i)),
-                                None => tracker.lost(Some(&u)),
-                            }
-                        }
-                        (crate::wg::Genl::SetUnnamed, Some(u)) => tracker.lost(Some(&u)),
-                    }
+                let unit = || ev.cgpath.as_deref().and_then(unit_of_cgroup).or_else(|| cgroups.unit(ev.cgroup));
+                for line in crate::wg::take_genl(
+                    &mut tracker,
+                    &mut genl_ids,
+                    &ev,
+                    own_netns,
+                    unit,
+                    &mut crate::snapshot::families,
+                    &mut crate::host::try_read_ifnames,
+                    &mut ifnames,
+                    &mut read_ifnames,
+                ) {
+                    eprintln!("netwatch: {line}");
                 }
             }
             // The path the kernel had at the request, else the id's record.

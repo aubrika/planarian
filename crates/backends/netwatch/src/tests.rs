@@ -2496,7 +2496,7 @@ mod wireguard {
     use crate::wg::{self, Device, MUTANT, Mutant};
     use crate::{ChangeKind, Endpoint, Owner, Proto, Tracker, WatchState};
     use planarian_schema::UnitId;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::net::IpAddr;
 
     const NOW: u64 = 100;
@@ -3009,6 +3009,82 @@ mod wireguard {
     // ---- The request: which device did the unit configure?
 
     const FAMILY: u16 = 0x21;
+
+    /// Drive `wg::take_genl` with the pieces a test controls: the controller
+    /// list (`list`: `None` is a failed read) and the interface scan.
+    fn take(
+        t: &mut Tracker,
+        ids: &mut wg::GenlIds,
+        ev: &crate::ebpf::Event,
+        unit: &UnitId,
+        list: Option<Vec<(String, u16)>>,
+        scan: Result<BTreeMap<u32, String>, String>,
+    ) -> Vec<String> {
+        wg::take_genl(
+            t,
+            ids,
+            ev,
+            0xF000_0000,
+            || Some(unit.clone()),
+            &mut || list.clone().ok_or_else(|| "the controller did not answer".to_string()),
+            &mut || scan.clone(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new,
+        )
+    }
+
+    fn wg_set(name: &[u8]) -> crate::ebpf::Event {
+        request(FAMILY, 1, &[attr(2, false, name)], usize::MAX)
+    }
+
+    /// Reviewer, #87: while the family list cannot be read, a request cannot
+    /// be told from a WireGuard one. The peers are unknown (a mark a good read
+    /// clears), **and** the sending unit is marked lost, because a binding it
+    /// may have made cannot be recovered afterwards: when the mark clears, the
+    /// unit must not have stopped protecting. A request from another network
+    /// namespace is not the host's and marks no unit.
+    #[test]
+    fn a_request_while_the_family_list_is_unknown_marks_its_unit_lost() {
+        let (u, other) = (UnitId::service("wg-setter"), UnitId::service("elsewhere"));
+        let mut t = Tracker::default();
+        let mut ids = wg::GenlIds::default();
+        let log = take(&mut t, &mut ids, &wg_set(b"wgtest\0"), &u, None, Ok(BTreeMap::new()));
+        assert!(!log.is_empty(), "the failed read is reported");
+        assert!(t.footprint(&u, NOW).unattributed, "the unit that may have bound is lost");
+        let marked = |t: &Tracker| {
+            t.view(WatchState::Attached { at: NOW }, &[], NOW)
+                .unattributed
+                .iter()
+                .any(|w| w.contains("WireGuard peers"))
+        };
+        assert!(marked(&t));
+        // The next good read clears the peers mark, not the unit's.
+        assert!(ids.refresh(&mut || Ok(vec![("wireguard".to_string(), FAMILY)])).is_ok());
+        t.set_wireguard(&[]);
+        assert!(!marked(&t));
+        assert!(t.footprint(&u, NOW).unattributed, "still lost: the binding cannot be recovered");
+        // Another namespace's request marks nobody.
+        let mut t2 = Tracker::default();
+        let mut ids2 = wg::GenlIds::default();
+        let mut foreign = wg_set(b"wgtest\0");
+        foreign.netns = 0xF000_1234;
+        take(&mut t2, &mut ids2, &foreign, &other, None, Ok(BTreeMap::new()));
+        assert!(!t2.footprint(&other, NOW).unattributed);
+    }
+
+    /// With the list known, the same request binds its unit at the index the
+    /// scan gives, and marks nothing lost.
+    #[test]
+    fn a_request_with_the_family_list_known_binds_and_marks_nothing() {
+        let u = UnitId::service("wg-setter");
+        let mut t = Tracker::default();
+        let mut ids = wg::GenlIds::default();
+        assert!(ids.refresh(&mut || Ok(vec![("wireguard".to_string(), FAMILY)])).is_ok());
+        let log = take(&mut t, &mut ids, &wg_set(b"wgtest\0"), &u, None, Ok([(7, "wgtest".to_string())].into()));
+        assert!(log.is_empty());
+        assert!(!t.footprint(&u, NOW).unattributed);
+        assert!(t.claims().wireguard_index.contains(&(u.clone(), "wgtest".to_string(), 7)));
+    }
 
     /// A captured generic netlink request: family, command, attributes,
     /// cut to `cut` bytes (the probe's capture window).
