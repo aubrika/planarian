@@ -421,13 +421,19 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                         // binds nobody. The devices a unit configured follow
                         // their live peers, whoever changes them.
                         (crate::wg::Genl::Other, _) | (_, None) => {}
-                        (crate::wg::Genl::Set(dev), Some(u)) => tracker.bind_wireguard(&u, &dev),
+                        (crate::wg::Genl::Set(dev), Some(u)) => {
+                            // Pinned at the request, from the kernel's list as
+                            // it is now (not the cache: the name may be a
+                            // device made since).
+                            let index = read_ifnames().into_iter().find(|(_, n)| *n == dev).map(|(i, _)| i);
+                            tracker.bind_wireguard_at(&u, &dev, index)
+                        }
                         (crate::wg::Genl::SetIndex(i), Some(u)) => {
                             match ifnames.get(&i).cloned().or_else(|| {
                                 ifnames = read_ifnames();
                                 ifnames.get(&i).cloned()
                             }) {
-                                Some(dev) => tracker.bind_wireguard(&u, &dev),
+                                Some(dev) => tracker.bind_wireguard_at(&u, &dev, Some(i)),
                                 None => tracker.lost(Some(&u)),
                             }
                         }

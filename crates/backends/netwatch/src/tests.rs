@@ -2822,12 +2822,19 @@ mod wireguard {
         t.set_wireguard(&[named("nwwg1", &[e2])]);
         assert_eq!(t.footprint(&a, NOW).endpoints, [e2].into());
         assert_eq!(t.claims().wireguard, vec![(a.clone(), "nwwg1".to_string())]);
-        // A binding no read has pinned yet survives a read without its name
-        // (it cannot be told from a rename); its DELLINK ends it.
+        // A binding that resolved to no device at its request ends with a read
+        // without its name, so a device made later under it is not this
+        // unit's (the reviewer's sequence on #83: a binds wg0 before it
+        // exists, b makes and configures it).
+        let b = UnitId::service("wg-quick-b");
         let mut u = Tracker::default();
-        u.bind_wireguard(&a, "nwwg0");
+        u.bind_wireguard_at(&a, "nwwg0", None);
         u.set_wireguard(&[]);
-        assert!(u.claims().wireguard.contains(&(a.clone(), "nwwg0".to_string())));
+        assert!(!u.claims().wireguard.contains(&(a.clone(), "nwwg0".to_string())));
+        u.bind_wireguard_at(&b, "nwwg0", Some(10));
+        u.set_wireguard(&[named("nwwg0", &[e2])]);
+        assert!(u.footprint(&a, NOW).endpoints.is_empty(), "a carries nothing of b's device");
+        assert_eq!(u.footprint(&b, NOW).endpoints, [e2].into());
     }
 
     /// RTM_DELLINK for `name` at `index`, from the host's netns.

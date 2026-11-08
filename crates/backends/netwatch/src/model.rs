@@ -503,7 +503,18 @@ impl Tracker {
     /// A binding lasts as long as the device it first named (B-27): a request
     /// is a fresh claim, whose device the next read pins by interface index.
     pub fn bind_wireguard(&mut self, unit: &UnitId, dev: &str) {
-        self.units.entry(unit.clone()).or_default().wireguard.insert(dev.to_string(), None);
+        self.bind_wireguard_at(unit, dev, None);
+    }
+
+    /// As [`Tracker::bind_wireguard`], pinned at once to the interface index
+    /// the name has now (read at the request, from the kernel's own list),
+    /// where it resolves: a binding pinned at its birth cannot be taken over
+    /// by a device made later under the same name, and a rename before the
+    /// first read still finds it by index. `None` (the name did not
+    /// resolve: no such device yet) leaves it for the next read to pin, and
+    /// a read without the name ends it.
+    pub fn bind_wireguard_at(&mut self, unit: &UnitId, dev: &str, index: Option<u32>) {
+        self.units.entry(unit.clone()).or_default().wireguard.insert(dev.to_string(), index);
     }
 
     /// B-22 (b): each unit that configured WireGuard devices takes exactly
@@ -529,10 +540,11 @@ impl Tracker {
             //   left to move);
             // - the name gone, and the index too, is a deleted device: it
             //   ends.
-            // A binding no read has pinned yet ends only by the device's
-            // `RTM_DELLINK` (a read without its name cannot tell a rename
-            // from a deletion). A unit that configures the device again sends
-            // a request, which binds it afresh.
+            // A binding that did not resolve to a device at its request (no
+            // such device yet) and that no read has pinned ends with a read
+            // without its name (a device made later under it is not this
+            // unit's). A unit that configures the device again sends a
+            // request, which binds it afresh.
             let old = std::mem::take(&mut s.wireguard);
             for (name, index) in old {
                 match devices.iter().find(|d| d.name == name) {
@@ -541,9 +553,7 @@ impl Tracker {
                     }
                     Some(_) => {}
                     None => match index {
-                        None => {
-                            s.wireguard.insert(name, None);
-                        }
+                        None => {}
                         Some(i) => {
                             if let Some(d) = devices.iter().find(|d| d.ifindex == i) {
                                 s.wireguard.insert(d.name.clone(), Some(i));

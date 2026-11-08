@@ -857,8 +857,9 @@ mod wgfold {
 
     #[derive(Clone, Debug)]
     enum Step {
-        /// A unit sent a request configuring a device.
-        Bind(usize, usize),
+        /// A unit sent a request configuring a device, pinned at once to the
+        /// index it had then (`None`: the name did not resolve).
+        Bind(usize, usize, Option<u32>),
         /// The loop read the devices.
         Set(Read),
         /// An endpoint restored from the footprint files after a restart that
@@ -874,7 +875,7 @@ mod wgfold {
     fn steps() -> impl Strategy<Value = Vec<Step>> {
         proptest::collection::vec(
             prop_oneof![
-                2 => (0..UNITS, 0..DEVS).prop_map(|(a, b)| Step::Bind(a, b)),
+                2 => (0..UNITS, 0..DEVS, proptest::option::of(10u32..13)).prop_map(|(a, b, i)| Step::Bind(a, b, i)),
                 3 => read().prop_map(Step::Set),
                 1 => (0..UNITS, 1u8..5).prop_map(|(a, n)| Step::Restore(a, n)),
                 1 => (0..DEVS).prop_map(Step::Del),
@@ -913,9 +914,9 @@ mod wgfold {
                         t.wireguard_unread();
                         unread = true;
                     }
-                    Step::Bind(a, d) => {
-                        t.bind_wireguard(&unit(*a), &dev_name(*d));
-                        bound[*a].insert(*d, None);
+                    Step::Bind(a, d, pin) => {
+                        t.bind_wireguard_at(&unit(*a), &dev_name(*d), *pin);
+                        bound[*a].insert(*d, *pin);
                     }
                     Step::Del(d) => {
                         t.apply(&Change { owner: Owner::Unattributed, kind: ChangeKind::Interface, object: dev_name(*d), iface: Some(dev_name(*d)), steers: false, removed: true });
@@ -943,7 +944,7 @@ mod wgfold {
                                     Some((_, now, _)) if index.is_none_or(|was| was == *now) => { bound[i].insert(d, Some(*now)); }
                                     Some(_) => {}
                                     None => match index {
-                                        None => { bound[i].insert(d, None); }
+                                        None => {}
                                         Some(was) => {
                                             if let Some((x, _, _)) = r.iter().find(|(_, now, _)| *now == was) {
                                                 bound[i].insert(*x, Some(was));
@@ -981,7 +982,7 @@ mod wgfold {
             let mut t = Tracker::default();
             for s in &steps {
                 match s {
-                    Step::Bind(a, d) => t.bind_wireguard(&unit(*a), &dev_name(*d)),
+                    Step::Bind(a, d, pin) => t.bind_wireguard_at(&unit(*a), &dev_name(*d), *pin),
                     Step::Set(r) => { t.set_wireguard(&devices(r)); }
                     Step::Restore(a, n) => t.add_endpoint(&unit(*a), ep(*n)),
                     Step::Del(d) => t.apply(&Change { owner: Owner::Unattributed, kind: ChangeKind::Interface, object: dev_name(*d), iface: Some(dev_name(*d)), steers: false, removed: true }),
