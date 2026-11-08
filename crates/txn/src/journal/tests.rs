@@ -1396,3 +1396,91 @@ proptest! {
         prop_assert_eq!(again.ledger().not_prepared_again(), [TxnId(txn)].into_iter().collect());
     }
 }
+
+/// §12c ("Each build exports the kinds and decisive fields it reads"): the
+/// descriptor `planariad --journal-kinds` prints is `supported()`. It
+/// round-trips as the requirements a target is compared with, reads at least
+/// the original set a build without an export is taken to read (format 2, 20
+/// kinds), and names exactly the decisive kinds.
+#[test]
+fn the_exported_descriptor_is_this_builds_reader() {
+    let json = serde_json::to_string(&supported()).unwrap();
+    let back: compat::JournalRequirements = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, supported());
+    assert_eq!(back.format, 3);
+    let mut decisive: Vec<String> = DECISIVE_KINDS.iter().map(|k| (*k).to_owned()).collect();
+    decisive.sort();
+    let mut kinds = back.kinds.clone();
+    kinds.sort();
+    assert_eq!(kinds, decisive, "the descriptor's kinds are the decisive kinds");
+    let o = original();
+    assert_eq!((o.format, o.kinds.len()), (2, 20), "docs/deviations.md names the original set as format 2, 20 kinds");
+    assert!(o.unsupported_by(&back).is_empty(), "a build reads at least the original set");
+}
+
+/// Registry guard: a `#[serde(default)]` field is how a field is added
+/// without breaking older journals, and a reader that ignores one can act on a
+/// wrong value. So each defaulted field in the journal's records, the ledger
+/// they fold into and the transaction they carry must be classified here, as
+/// a decisive field the descriptor names (`supported()`), or as one that
+/// predates the export (and is therefore in the original set a build without
+/// an export is taken to read). A new one fails until a person classifies it.
+#[test]
+fn every_defaulted_field_of_a_decisive_kind_is_classified() {
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Decisive,
+        PredatesExport,
+    }
+    use Kind::{Decisive, PredatesExport};
+    let table: &[(&str, Kind)] = &[
+        ("withdrawn_for", Decisive),
+        ("prepared_again_from", Decisive),
+        ("not_prepared_again", Decisive),
+        ("boot_at", PredatesExport),
+        ("approver", PredatesExport),
+        ("txn", PredatesExport),
+        ("instance", PredatesExport),
+        ("why", PredatesExport),
+        ("boot_only", PredatesExport),
+        ("security_floor", PredatesExport),
+        ("external", PredatesExport),
+        ("agents", PredatesExport),
+        ("hold_events", PredatesExport),
+        ("candidate_nar", PredatesExport),
+        ("pre_passing", PredatesExport),
+    ];
+    let sources = [include_str!("../ledger.rs"), include_str!("../../../schema/src/txn.rs")];
+    let mut found: Vec<String> = vec![];
+    for src in sources {
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, l) in lines.iter().enumerate() {
+            if !l.trim_start().starts_with("#[serde(default") {
+                continue;
+            }
+            let field = lines[i + 1..]
+                .iter()
+                .map(|l| l.trim())
+                .find(|l| !l.starts_with("///") && !l.starts_with("#["))
+                .and_then(|l| l.trim_start_matches("pub ").split(':').next())
+                .expect("a field follows the attribute")
+                .to_owned();
+            found.push(field);
+        }
+    }
+    found.sort();
+    found.dedup();
+    for f in &found {
+        assert!(
+            table.iter().any(|(n, _)| n == f),
+            "`#[serde(default)]` field `{f}` is unclassified: add it to the descriptor's fields (a decisive field) or to this table (predates the export)"
+        );
+    }
+    for (name, kind) in table {
+        assert!(found.iter().any(|f| f == name), "`{name}` is classified but is no longer a defaulted field");
+        if matches!(kind, Decisive) {
+            let described = supported().fields.values().flatten().any(|p| p.rsplit('.').next() == Some(*name));
+            assert!(described, "`{name}` is classified decisive but the descriptor names no path for it");
+        }
+    }
+}
