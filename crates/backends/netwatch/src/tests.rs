@@ -2837,6 +2837,26 @@ mod wireguard {
         assert_eq!(u.footprint(&b, NOW).endpoints, [e2].into());
     }
 
+    /// A DELLINK the watch never saw (it was not running): the saved binding
+    /// is pinned by index, so a device made again under the name with another
+    /// index is not the old unit's after the restart. (The same explicitly
+    /// chosen index is B-29.)
+    #[test]
+    fn a_device_made_again_while_the_watch_was_down_is_not_inherited() {
+        let (a, b) = (UnitId::service("wg-quick-a"), UnitId::service("wg-quick-b"));
+        let (e1, e2) = (udp("192.0.2.7", 51820), udp("198.51.100.9", 1));
+        let dev_at = |index, eps: &[Endpoint]| Device { name: "wg0".into(), ifindex: index, endpoints: eps.to_vec() };
+        let mut t = Tracker::default();
+        t.bind_wireguard_at(&a, "wg0", Some(10));
+        t.set_wireguard(&[dev_at(10, &[e1])]);
+        // The watch restarts from `.state`; b made wg0 again meanwhile.
+        let mut after = Tracker::attach(&t.claims(), &[], &BTreeSet::new());
+        after.bind_wireguard_at(&b, "wg0", Some(11));
+        after.set_wireguard(&[dev_at(11, &[e2])]);
+        assert!(after.footprint(&a, NOW).endpoints.is_empty(), "a is not bound to b's device");
+        assert_eq!(after.footprint(&b, NOW).endpoints, [e2].into());
+    }
+
     /// RTM_DELLINK for `name` at `index`, from the host's netns.
     fn dellink(name: &str, index: u32) -> crate::ebpf::Event {
         let mut body = vec![0u8; 16]; // ifinfomsg
