@@ -234,10 +234,10 @@ pub struct World {
     /// pre-export build; other generations use this build's descriptor.
     pub journal_kinds: BTreeMap<String, Option<String>>,
     pub journal_kinds_fails: Option<String>,
-    /// Queued jobs `pending_jobs` reports besides the real ones (a switch's
-    /// stop and start jobs), and a failure of the query itself.
-    pub extra_pending_jobs: usize,
-    pub pending_jobs_fails: Option<String>,
+    /// Jobs `queued_jobs` reports (systemd's whole queue: a switch's stop and
+    /// start jobs), and a failure of the query itself.
+    pub queued_jobs: usize,
+    pub queued_jobs_fails: Option<String>,
     /// §12d: network-security units whose failure holds traffic, as systemd's
     /// `OnFailure=` on them starts `planarian-hold@<unit>` (nix/posture.nix).
     pub hold_on_failure: BTreeSet<UnitId>,
@@ -831,6 +831,14 @@ impl Fake {
 }
 
 impl UnitBackend for Fake {
+    fn queued_jobs(&self) -> Result<Vec<JobId>, Outcome> {
+        let w = self.w();
+        if let Some(why) = &w.queued_jobs_fails {
+            return Err(Outcome::Unknown(why.clone()));
+        }
+        Ok((0..w.queued_jobs).map(|i| JobId(format!("{i} queued.service"))).collect())
+    }
+
     /// §12d: the scripted footprints (`footprint_view`), read as the Linux
     /// side reads the files.
     fn protecting(&self, tools: &[UnitId]) -> Result<BTreeSet<UnitId>, Outcome> {
@@ -1157,12 +1165,7 @@ impl GenerationBackend for Fake {
     }
 
     fn pending_jobs(&self) -> Result<Vec<JobId>, Outcome> {
-        let w = self.w();
-        if let Some(why) = &w.pending_jobs_fails {
-            return Err(Outcome::Unknown(why.clone()));
-        }
-        let extra = (0..w.extra_pending_jobs).map(|i| JobId(format!("extra-{i}.job")));
-        Ok(w.jobs.keys().cloned().chain(extra).collect())
+        Ok(self.w().jobs.keys().cloned().collect())
     }
 
     fn jobs_tagged(&self, op: &OpId) -> Result<Option<Vec<JobId>>, Outcome> {

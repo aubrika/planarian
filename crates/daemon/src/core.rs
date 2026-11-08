@@ -1582,15 +1582,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// the tick that saw the generation change until `SWITCH_SETTLE` after
     /// the last tick that still saw work queued, and never beyond
     /// `SWITCH_SETTLE_MAX` after the change. A person's stop after the window
-    /// is a person's. Known limits (D24): the queue is `pending_jobs()`, which
-    /// on Linux lists only Planarian's own `planarian-op-*` units, so there
-    /// the window is the fixed `SWITCH_SETTLE`; the window is not restored
+    /// is a person's. Known limits (D24): the queue is systemd's whole job
+    /// queue (`queued_jobs()`; an `Err` counts as busy, so the window then
+    /// runs to the cap); the window is not restored
     /// after a daemon restart; a person's stop of a non-Security unit inside
     /// the window is read as a fault and repaired.
     fn in_switch_window(&mut self, now: Timestamp) -> bool {
         let Some((since, until)) = self.switch_window else { return false };
         let cap = since.plus(SWITCH_SETTLE_MAX);
-        let busy = now.0 < until.0 && self.b.generations().pending_jobs().map_or(true, |j| !j.is_empty());
+        let busy = now.0 < until.0 && self.b.units().queued_jobs().map_or(true, |j| !j.is_empty());
         let until = if busy { Timestamp(until.0.max(now.plus(SWITCH_SETTLE).0)) } else { until };
         let until = Timestamp(until.0.min(cap.0));
         if now.0 >= until.0 {

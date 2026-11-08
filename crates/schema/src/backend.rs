@@ -95,6 +95,13 @@ pub trait UnitBackend {
     fn auto_restarts(&self, _id: &UnitId) -> Option<u32> {
         None
     }
+    /// Every job systemd has queued or is running (stop, start, restart,
+    /// reload), not only Planarian's own. Used to tell when a switch outside
+    /// Planarian has finished. A backend that cannot say, or whose query fails,
+    /// returns `Err`, never an empty list.
+    fn queued_jobs(&self) -> Result<Vec<JobId>, Outcome> {
+        Err(Outcome::Unknown("this backend cannot list queued jobs".into()))
+    }
     /// The boot report's unit check (§10): active units whose definition does
     /// not come from the running generation (a file outside the store that is
     /// not a generator's).

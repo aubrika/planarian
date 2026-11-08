@@ -3964,7 +3964,7 @@ mod switch_window_busy {
     }
 
     fn busy(r: &mut Rig) {
-        r.fake.w().extra_pending_jobs = 2;
+        r.fake.w().queued_jobs = 2;
     }
 
     #[test]
@@ -3977,7 +3977,7 @@ mod switch_window_busy {
 
     #[test]
     fn a_failing_job_query_keeps_the_window_open() {
-        let failing = |r: &mut Rig| r.fake.w().pending_jobs_fails = Some("no bus".into());
+        let failing = |r: &mut Rig| r.fake.w().queued_jobs_fails = Some("no bus".into());
         assert!(!inferred_after(150, |_| {}, failing));
     }
 
@@ -3987,7 +3987,7 @@ mod switch_window_busy {
         assert!(!inferred_after(570, |_| {}, busy));
         // 640 s: past the cap, still busy: inferred.
         assert!(inferred_after(640, |_| {}, busy));
-        let failing = |r: &mut Rig| r.fake.w().pending_jobs_fails = Some("no bus".into());
+        let failing = |r: &mut Rig| r.fake.w().queued_jobs_fails = Some("no bus".into());
         assert!(inferred_after(640, |_| {}, failing));
     }
 }
