@@ -143,6 +143,7 @@ carries a property test for the invariant it changes.
 | B18 | An unprivileged unit could gain CAP_NET_ADMIN or CAP_NET_RAW through a setuid or file-capability binary, but was not classified as a network tool and had no failure hold. The first classifier also omitted systemd's tab/newline-separated, case-insensitive and numeric spellings | #68 | `nix/module.nix::isNetworkToolUnchecked`, `nix/capabilities.nix` | module-eval's Decision B and capability-syntax fixtures; generated alias/inversion property (`nix/tests/capabilities.nix`) over ordinary and inverted sets, names/case/ids, strings/lists and four whitespace separators; unknown syntax fails closed | property (finite) + eval | the nix job of CI run 42477250585 on main `8cbf49a` (module-eval) is green; recorded on #68: removing the gainable rule fails its module-eval fixture. Native systemd `capability_set_from_string` confirms `CAP_CHOWN` + tab + `CAP_NET_RAW`, `cap_net_raw` and `13` grant bit 13 while the old predicate omits it. The module-eval property asserts the fixed parser passes and the exact old predicate is rejected on every run | covered |
 
 | B19 | The package exported journal-kinds.json, but NixOS's system-path omitted /share/planarian, so every current target appeared to be a legacy format-2 reader and otherwise admissible generation changes parked for Administrator approval | #69 live VM follow-up | nix/module.nix::environment.pathsToLink; backends-linux::nixos::read_journal_kinds | `every prebuilt candidate exports its installed journal reader` in gym-vm.nix and vm-generations.nix; gym-smoke malicious-decl-catalog-enable and storage-boot-full-publish | VM + gym-VM | observed on 3dcd2615 job126875977720: payload enable asked for journal format3/targetreads2, never activated and produced no gym-web incident; independent pinned nixpkgs system-path inspection confirms the omitted data directory; fixed exact-head execution pending | pending: real candidate VM execution |
+| B20 | `systemctl show` for `observe_many` took the unit names as plain arguments, so a name beginning with `-` (`planariad --observe-units` reads names from its command line) would be read as an option (reviewer's optional on #93) | lane-daemon/compat-comment | backends-linux::systemd::observe_many_args (the names follow `--`) | `a_unit_name_that_starts_with_a_dash_is_passed_as_a_name` (systemd.rs, with a property over names) | unit + proptest | verified: without the `--` the test fails (`args[2]` is the first name). Only the one systemctl call of `observe_many` changes; the manifest's own unit names never begin with `-` | covered |
 
 Harness and fixture bugs (the VM harness, catalog typos, test waits) are in
 `docs/ga-status.md`; they are not Planarian's and are left out.
@@ -211,8 +212,8 @@ in a debug build).
 
 ## Counts
 
-112 rows, including the fixes in this stack: 23 journal and kernel (J), 26 daemon (D),
-18 change path (C), 19 backends, identity and gym (B), 26 netwatch (N).
+113 rows, including the fixes in this stack: 23 journal and kernel (J), 26 daemon (D),
+18 change path (C), 20 backends, identity and gym (B), 26 netwatch (N).
 No row owes a property test (status **gap**). J4 closed in the post-#82
 reconciliation: its selection is extracted (`daemon::restart::prepare_again`)
 and held by a property. C16 is covered again: a run someone asks for bypasses
