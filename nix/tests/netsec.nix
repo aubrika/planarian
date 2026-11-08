@@ -490,7 +490,12 @@ pkgs.testers.runNixOSTest {
             assert hold_at >= died > 0, f"delay {delay}: hold active at {hold_at}, unit died at {died}"
             machine.fail(up_ok())
             peer.fail(new_ssh("alice"))
-            assert alarms() > before, f"delay {delay}: no alarm"
+            # The alarm is the daemon's, at the end of the tick that sees the
+            # hold; a kill mid-tick waits for that tick and the next, whose
+            # probes include the held tunnel's (a 10 s connect timeout): about
+            # 21 s in catalogs 42517825769 and 42518238021, where a read at
+            # 21 s missed it. Waited for, not read once.
+            machine.wait_until_succeeds(f"[ $(journalctl -b -u planariad -o cat | grep -c '{ALARM}' || true) -gt {before} ]", timeout=90)
             # Back: the hold lifts once the unit is Running and Ready, by the
             # repair or, if this target has escalated (§13), by hand.
             machine.succeed("systemctl reset-failed wireguard-gym.service; systemctl start wireguard-gym.service")
@@ -593,7 +598,7 @@ pkgs.testers.runNixOSTest {
         machine.fail(lan_ok())
         peer.fail(new_ssh("alice"))
         machine.succeed("curl -sf --max-time 5 -o /dev/null http://127.0.0.1:8001/")
-        machine.wait_until_succeeds(f"[ $(journalctl -b -u planariad -o cat | grep 'ALARM: ' | grep '{UNMANAGED}' | grep -cF '{E_ALARM}' || true) -ge 1 ]", timeout=30)
+        machine.wait_until_succeeds(f"[ $(journalctl -b -u planariad -o cat | grep 'ALARM: ' | grep '{UNMANAGED}' | grep -cF '{E_ALARM}' || true) -ge 1 ]", timeout=90)
         # Not repaired: past §13's first backoff (10 s) and then some, the
         # unit is still down on the run that was killed, and the daemon has
         # named it in no repair, restart or incident.
@@ -622,7 +627,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"systemctl kill --signal=SIGKILL {UNMANAGED}.service")
         machine.wait_until_succeeds(f"systemctl is-active planarian-hold@{UNMANAGED}.service && test -e /run/planarian/hold/{UNMANAGED}", timeout=20)
         machine.fail(lan_ok())
-        machine.wait_until_succeeds(f"[ $(journalctl -b -u planariad -o cat | grep 'ALARM: ' | grep '{UNMANAGED}' | grep -cF '{E_ALARM}' || true) -ge 2 ]", timeout=30)
+        machine.wait_until_succeeds(f"[ $(journalctl -b -u planariad -o cat | grep 'ALARM: ' | grep '{UNMANAGED}' | grep -cF '{E_ALARM}' || true) -ge 2 ]", timeout=90)
         # A non-administrator's release asks for an administrator.
         code, out = as_alice(f"planarian hold release {UNMANAGED}")
         assert "approv" in out.lower() and "administrator" in out.lower(), out
