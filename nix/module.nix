@@ -47,11 +47,11 @@ let
             (builtins.attrNames os))
         (lib.filter isEnabled (builtins.attrNames options.services));
       unitPaths = lib.concatMap (u: drvs (u.path or [ ])) (builtins.attrValues config.systemd.services);
-      # The hold's drop-ins (§12d) are Planarian's own text files, no
+      # The hold's drop-ins (§12d) and the raw-unit classification (B-23) are Planarian's own generated files, no
       # package; they are computed from every service's configuration, which
       # may read this set (a cycle), so they are left out by their marker.
       roots = lib.concatMap drvs (config.environment.systemPackages
-          ++ builtins.filter (p: !(p.planarianHoldDropins or false)) config.systemd.packages)
+          ++ builtins.filter (p: !(p.planarianHoldDropins or false) && !(p.planarianRawUnits or false)) config.systemd.packages)
         ++ fromServices ++ unitPaths
         ++ drvs config.boot.kernelPackages.kernel ++ drvs config.hardware.firmware;
       item = p: let k = ok p.outPath; in if k == null then [ ] else [ { key = k; pkg = p; } ];

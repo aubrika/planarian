@@ -96,6 +96,19 @@
         module-eval = import ./nix/tests/eval.nix { inherit pkgs self nixpkgs; };
         # B-23: network tools that are only unit files, classified at build time.
         raw-units = import ./nix/tests/raw-units.nix { inherit pkgs self nixpkgs; };
+        # The gym's VM configurations evaluate: gym-owner's script carries the
+        # module's export, so anything the export reads of the system (the
+        # inspected packages, the unit set) can close a cycle that the
+        # test machines of module-eval do not have (#96: every gym job hit
+        # "infinite recursion encountered"). Forcing the drvPath evaluates
+        # the whole machine; the string's context is dropped so nothing builds.
+        gym-vm-eval =
+          let
+            vms = self.legacyPackages.${pkgs.stdenv.hostPlatform.system}.gym-vm;
+            ids = [ "crash-daemon-restart-reconciles" ];
+            paths = map (id: builtins.unsafeDiscardStringContext vms.${id}.driver.drvPath) ids;
+          in
+          pkgs.runCommand "gym-vm-eval" { } "printf '%s\\n' ${nixpkgs.lib.escapeShellArgs paths} > $out";
         # B-23: real systemd as the second oracle for the unit-file classifier (a VM).
         vm-unitclass-systemd = import ./nix/tests/unitclass-systemd.nix { inherit pkgs self; };
         vm-runtime = import ./nix/tests/vm.nix { inherit pkgs self; };
