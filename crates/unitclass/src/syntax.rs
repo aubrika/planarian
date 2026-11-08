@@ -380,3 +380,60 @@ impl Settings {
         Ok(())
     }
 }
+
+fn json_str(s: &str) -> String {
+    let mut o = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+fn json_list(v: &[String]) -> String {
+    format!("[{}]", v.iter().map(|s| json_str(s)).collect::<Vec<_>>().join(","))
+}
+
+impl Caps {
+    fn to_json(&self) -> String {
+        let (state, set) = match self {
+            Caps::Unset => ("unset", CapSet::default()),
+            Caps::Reset => ("reset", CapSet::default()),
+            Caps::Set(c) => ("set", c.clone()),
+        };
+        let caps: Vec<String> = set.caps.iter().map(|c| c.to_string()).collect();
+        format!(
+            r#"{{"state":"{state}","inverted":{},"ambiguous":{},"caps":{}}}"#,
+            set.inverted,
+            set.ambiguous,
+            json_list(&caps)
+        )
+    }
+}
+
+impl Settings {
+    /// The effective settings as JSON, for comparing with `systemctl show`
+    /// (nix/tests/unitclass-systemd.nix).
+    pub fn to_json(&self, tool: bool) -> String {
+        let opt = |o: &Option<String>| o.as_ref().map_or("null".to_string(), |s| json_str(s));
+        let ob = |o: Option<bool>| o.map_or("null".to_string(), |b| b.to_string());
+        format!(
+            r#"{{"tool":{tool},"user":{},"dynamic_user":{},"no_new_privileges":{},"bounding":{},"ambient":{},"device_allow":{},"bind_paths":{},"bind_read_only_paths":{},"on_failure":{},"after":{}}}"#,
+            opt(&self.user),
+            ob(self.dynamic_user),
+            ob(self.no_new_privileges),
+            self.bounding.to_json(),
+            self.ambient.to_json(),
+            json_list(&self.device_allow),
+            json_list(&self.bind_paths),
+            json_list(&self.bind_read_only_paths),
+            json_list(&self.on_failure),
+            json_list(&self.after),
+        )
+    }
+}

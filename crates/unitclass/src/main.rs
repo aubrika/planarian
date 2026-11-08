@@ -5,6 +5,7 @@
 //!            [--have-hold NAME]... PKG...
 //!   verify-hold --units DIR --tools FILE [--netwatch] [--cycle NAME]...
 //!   check FILE
+//!   show --units DIR UNIT.service   (the effective settings as JSON)
 //!
 //! Exit status: 0 success; 1 a hold is not in force (verify-hold) or FILE is
 //! not a sorted list of unique names (check); 2 usage; 3 an I/O error. A unit
@@ -22,6 +23,7 @@ fn usage() -> ExitCode {
     );
     eprintln!("       planarian-unitclass verify-hold --units DIR --tools FILE [--netwatch] [--cycle NAME]...");
     eprintln!("       planarian-unitclass check FILE");
+    eprintln!("       planarian-unitclass show --units DIR UNIT.service");
     ExitCode::from(2)
 }
 
@@ -88,6 +90,7 @@ fn main() -> ExitCode {
         Some("classify") => classify(&args[1..]),
         Some("verify-hold") => verify(&args[1..]),
         Some("check") => check(&args[1..]),
+        Some("show") => show(&args[1..]),
         _ => usage(),
     }
 }
@@ -210,6 +213,31 @@ fn check(args: &[String]) -> ExitCode {
         Some(n) if n.windows(2).all(|w| w[0] < w[1]) => ExitCode::SUCCESS,
         _ => {
             eprintln!("planarian-unitclass: {file} is not a sorted JSON array of unique names");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `show --units DIR UNIT.service`: the effective settings of one unit in a
+/// merged tree, as JSON (an instance reads its template's file).
+fn show(args: &[String]) -> ExitCode {
+    let Some(o) = opts(args) else { return usage() };
+    let (Some(units), [unit]) = (o.units, o.rest.as_slice()) else { return usage() };
+    let mut main = units.join(unit);
+    if std::fs::symlink_metadata(&main).is_err() {
+        let Some((t, _)) = unit.strip_suffix(".service").and_then(|s| s.split_once('@')) else {
+            eprintln!("planarian-unitclass: no {unit} in {}", units.display());
+            return ExitCode::from(3);
+        };
+        main = units.join(format!("{t}@.service"));
+    }
+    match tree::effective(std::slice::from_ref(&units), unit, &main) {
+        Ok(s) => {
+            println!("{}", s.to_json(planarian_unitclass::rule::is_network_tool(&s)));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("planarian-unitclass: {e}");
             ExitCode::from(1)
         }
     }

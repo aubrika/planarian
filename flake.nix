@@ -96,6 +96,8 @@
         module-eval = import ./nix/tests/eval.nix { inherit pkgs self nixpkgs; };
         # B-23: network tools that are only unit files, classified at build time.
         raw-units = import ./nix/tests/raw-units.nix { inherit pkgs self nixpkgs; };
+        # B-23: real systemd as the second oracle for the unit-file classifier (a VM).
+        vm-unitclass-systemd = import ./nix/tests/unitclass-systemd.nix { inherit pkgs self; };
         vm-runtime = import ./nix/tests/vm.nix { inherit pkgs self; };
         vm-posture = import ./nix/tests/posture.nix { inherit pkgs self; };
         # §12d network security fails closed (#35; reviewer's case).
