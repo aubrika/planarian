@@ -298,16 +298,14 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// when they stop, never restarted, never an incident. Set each observe.
     unmanaged: BTreeSet<UnitId>,
     unmanaged_unreadable_noted: bool,
-    /// Unmanaged tools seen running (what makes a later signal-ended stop a
-    /// failure) and where the rotation through the rest has reached.
-    unmanaged_up: BTreeSet<UnitId>,
+    /// Per unmanaged tool, whether netwatch said it protected traffic the last
+    /// time it was observed running (its latch): a footprint exists only while
+    /// an instance runs, so when it is down this says what it was doing. Its
+    /// key is "seen running". And where the rotation through the rest has
+    /// reached.
+    unmanaged_latch: BTreeMap<UnitId, bool>,
     unmanaged_cursor: usize,
     unmanaged_many_noted: bool,
-    /// Since when each unmanaged tool has been seen down by a signal, and
-    /// whether this tick is inside a switch window (a rebuild's stops and
-    /// restarts are not a tool going down).
-    unmanaged_down_since: BTreeMap<UnitId, Timestamp>,
-    switching: bool,
     /// A switch outside Planarian seen at `.0`: its stops and starts follow
     /// the profile change by more than a tick, so they stay explained until
     /// `.1` (see `SWITCH_SETTLE`).
@@ -510,11 +508,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             network_tools,
             unmanaged: BTreeSet::new(),
             unmanaged_unreadable_noted: false,
-            unmanaged_up: BTreeSet::new(),
+            unmanaged_latch: BTreeMap::new(),
             unmanaged_cursor: 0,
             unmanaged_many_noted: false,
-            unmanaged_down_since: BTreeMap::new(),
-            switching: false,
             switch_window: None,
             next_gc_check: Timestamp(0),
             space_noted: Timestamp(0),
@@ -691,8 +687,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let Some(tools) = self.network_tools.clone() else { return };
         let listed = if tools.iter().any(|t| t.ends_with('@')) { self.b.units().list().ok() } else { None };
         self.unmanaged = crate::hold::unmanaged_set(&tools, listed.as_deref(), &self.unmanaged, keep, defs);
-        self.unmanaged_up.retain(|u| self.unmanaged.contains(u));
-        self.unmanaged_down_since.retain(|u, _| self.unmanaged.contains(u));
+        self.unmanaged_latch.retain(|u, _| self.unmanaged.contains(u));
     }
 
     /// Observe without acting (also used to answer requests).
@@ -1052,14 +1047,20 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// `s` and `defs` with the unmanaged network tools this tick looks at
     /// added as units, observed through the backend (see
     /// `hold::unmanaged_observed` for what is down; an unreadable one is
-    /// Unknown: neither held nor lifted). Always looked at: the tools whose
-    /// hold stands or is pending, and every protecting tool seen running (a
-    /// down one is held the next tick, whatever their number: more than
-    /// `UNMANAGED_MANY` is said once). Of the protecting tools never seen
-    /// running, at most `UNMANAGED_OBSERVE_PER_TICK`, rotating: one never
-    /// seen up cannot read as down, so how soon it is first seen matters only
-    /// to when it becomes watched. A tool that protects nothing is never held
-    /// and is not observed.
+    /// Unknown: neither held nor lifted).
+    ///
+    /// Always looked at: the tools whose hold stands or is pending, and every
+    /// tool seen running whose latch says it protected traffic (a down one is
+    /// held on the next tick, whatever their number: more than
+    /// `UNMANAGED_MANY` is said once). The rest, never seen running or seen
+    /// not protecting, at most `UNMANAGED_OBSERVE_PER_TICK`, rotating.
+    ///
+    /// A footprint exists only while an instance runs, and a tool with none
+    /// counts as protecting (fail closed, #78), so what a tool was doing is
+    /// latched while it is observed running (netwatch's `protecting`). When it
+    /// is down: held if the latch says it protected, or nothing was ever
+    /// recorded (still fail closed); a restart of one that protected nothing
+    /// holds nothing. A new run overwrites the latch.
     fn with_unmanaged(&mut self, s: &SystemState, defs: &UnitDefs) -> (SystemState, UnitDefs) {
         let (mut s, mut defs) = (s.clone(), defs.clone());
         let standing = |me: &Self, u: &UnitId| {
@@ -1070,12 +1071,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         };
         let all: Vec<UnitId> = self.unmanaged.iter().cloned().collect();
         let (must, rest): (Vec<UnitId>, Vec<UnitId>) = all.into_iter().partition(|u| standing(self, u));
-        let (seen, unseen): (Vec<UnitId>, Vec<UnitId>) =
-            rest.into_iter().filter(|u| s.protecting.contains(u)).partition(|u| self.unmanaged_up.contains(u));
-        let take = unseen.len().min(crate::hold::UNMANAGED_OBSERVE_PER_TICK);
-        let start = if unseen.is_empty() { 0 } else { self.unmanaged_cursor % unseen.len() };
+        let (every, rotate): (Vec<UnitId>, Vec<UnitId>) =
+            rest.into_iter().partition(|u| self.unmanaged_latch.get(u) == Some(&true));
+        let take = rotate.len().min(crate::hold::UNMANAGED_OBSERVE_PER_TICK);
+        let start = if rotate.is_empty() { 0 } else { self.unmanaged_cursor % rotate.len() };
         self.unmanaged_cursor = start + take;
-        let mut chosen: Vec<UnitId> = must.into_iter().chain(seen).collect();
+        let mut chosen: Vec<UnitId> = must.into_iter().chain(every).collect();
         if chosen.len() > crate::hold::UNMANAGED_MANY {
             if !std::mem::replace(&mut self.unmanaged_many_noted, true) {
                 self.notice(format!(
@@ -1086,26 +1087,30 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         } else {
             self.unmanaged_many_noted = false;
         }
-        chosen.extend((0..take).map(|i| unseen[(start + i) % unseen.len()].clone()));
+        chosen.extend((0..take).map(|i| rotate[(start + i) % rotate.len()].clone()));
         for u in chosen {
             let held = s.holds.contains(&u);
             let observed = match self.b.units().observe(&u) {
                 Ok(raw) => {
+                    let seen = crate::hold::unmanaged_observed(raw.clone(), self.b.units().ended_by(&u), held);
                     if raw == Observed::Active {
-                        self.unmanaged_up.insert(u.clone());
+                        // Running: what netwatch says it protects now is its latch.
+                        self.unmanaged_latch.insert(u.clone(), s.protecting.contains(&u));
+                    } else if matches!(
+                        seen,
+                        Observed::Failed(_) | Observed::Absent | Observed::Bound | Observed::Detected
+                    ) && self.unmanaged_latch.get(&u) == Some(&false)
+                    {
+                        // Down, and it protected nothing when it ran.
+                        s.protecting.remove(&u);
+                    } else if matches!(
+                        seen,
+                        Observed::Failed(_) | Observed::Absent | Observed::Bound | Observed::Detected
+                    ) {
+                        // Down, protected or never recorded: fail closed.
+                        s.protecting.insert(u.clone());
                     }
-                    let was_up = self.unmanaged_up.contains(&u);
-                    let seen = crate::hold::unmanaged_observed(raw, was_up, self.b.units().ended_by(&u), held);
-                    if matches!(seen, Observed::Absent | Observed::Bound | Observed::Detected) && !held {
-                        // Ended by a signal: down once it has stayed so, and
-                        // not while a switch is stopping and starting units.
-                        let since = *self.unmanaged_down_since.entry(u.clone()).or_insert(s.observed_at);
-                        let settled = s.observed_at.0.saturating_sub(since.0) >= crate::hold::UNMANAGED_DOWN_GRACE.0;
-                        if settled && !self.switching { seen } else { Observed::Active }
-                    } else {
-                        self.unmanaged_down_since.remove(&u);
-                        seen
-                    }
+                    seen
                 }
                 Err(o) => Observed::Unknown { since: s.observed_at, reason: format!("{o:?}") },
             };
@@ -1775,7 +1780,6 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let host_held = self.b.units().held();
         let mut tried_hold = false;
         let in_switch = self.in_switch_window(now);
-        self.switching = in_switch;
         for (u, def) in defs {
             let st = s.status(u, defs);
             // A Security unit killed by a termination signal that systemd

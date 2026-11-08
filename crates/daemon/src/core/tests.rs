@@ -4261,50 +4261,46 @@ mod unmanaged_tools {
         total(r) - before
     }
 
-    /// Protecting tools never seen running are looked at a few a tick
-    /// (rotating); each tick's cost for them is bounded, and once seen they
-    /// are looked at every tick.
+    fn latched(r: &Rig) -> usize {
+        r.core.unmanaged_latch.values().filter(|p| **p).count()
+    }
+
+    /// Tools not yet seen running are rotated a few a tick; once seen
+    /// protecting, each is observed every tick.
     #[test]
-    fn unseen_tools_are_rotated_and_seen_ones_are_observed_every_tick() {
+    fn unseen_tools_are_rotated_and_seen_protecting_ones_are_observed_every_tick() {
         const N: usize = 100;
         let cap = crate::hold::UNMANAGED_OBSERVE_PER_TICK as u64;
         let (mut r, names) = many(N);
         // The first tick after they appear has seen at most `cap` of them (and t@0).
-        assert!(r.core.unmanaged_up.len() as u64 <= 1 + cap, "{} seen at once", r.core.unmanaged_up.len());
-        // Warming up: a tick looks at the seen ones plus at most `cap` new.
-        let mut seen_before = 0;
+        assert!(latched(&r) as u64 <= 1 + cap, "{} latched at once", latched(&r));
+        // Warming up: a tick looks at the latched ones plus at most `cap` new.
         for _ in 0..N.div_ceil(cap as usize) + 2 {
-            let seen_now = r.core.unmanaged_up.len() as u64;
+            let seen_now = latched(&r) as u64;
             let calls = observed_by_tick(&mut r);
-            assert!(calls <= seen_now + cap, "a tick observed {calls} with {seen_now} seen (cap {cap})");
-            seen_before = seen_now;
+            assert!(calls <= seen_now + cap, "a tick observed {calls} with {seen_now} latched (cap {cap})");
         }
-        assert!(seen_before > 0);
         // Warm: every instance is observed every tick.
-        assert_eq!(r.core.unmanaged_up.len(), N);
-        assert!(observed_by_tick(&mut r) >= N as u64, "a seen tool was skipped");
+        assert_eq!(latched(&r), N);
+        assert!(observed_by_tick(&mut r) >= N as u64, "a latched tool was skipped");
         assert!(observed_by_tick(&mut r) >= N as u64);
         assert!(names.iter().all(|u| r.fake.w().observe_counts.get(u).copied().unwrap_or(0) >= 1));
     }
 
-    /// Whatever their number, a seen tool that goes down is held within the
-    /// grace and a tick or two: a kill (systemd failed) on the next tick, a
-    /// clean stop (no OnFailure=) after UNMANAGED_DOWN_GRACE. Detection does
-    /// not depend on N.
+    /// Whatever their number, a latched-protecting tool that goes down is held
+    /// on the next tick: a kill (systemd failed) and a clean stop alike (no
+    /// grace, no switch exemption).
     #[test]
-    fn a_seen_tool_that_goes_down_is_held_within_a_tick_or_the_grace_whatever_the_number() {
-        let tick = planarian_state::TICK.0;
+    fn a_latched_tool_that_goes_down_is_held_on_the_next_tick_whatever_the_number() {
         for n in [1usize, 8, 40, 100] {
             let (mut r, names) = many(n);
             r.ticks(n.div_ceil(crate::hold::UNMANAGED_OBSERVE_PER_TICK) + 3);
             let (killed, stopped) = (&names[n - 1], &names[n / 2]);
             r.fake.w().kill(killed);
+            r.fake.w().stop_out_of_band(stopped);
             r.ticks(1);
             assert!(r.fake.w().held.contains(killed), "n={n}: a kill not held on the next tick: {:?}", r.core.notices);
-            r.fake.w().stop_out_of_band(stopped);
-            let ticks = (crate::hold::UNMANAGED_DOWN_GRACE.0 / tick) as usize + 2;
-            r.ticks(ticks);
-            assert!(r.fake.w().held.contains(stopped), "n={n}: a clean stop not held after {ticks} ticks");
+            assert!(r.fake.w().held.contains(stopped), "n={n}: a clean stop not held on the next tick");
         }
     }
 
@@ -4321,47 +4317,65 @@ mod unmanaged_tools {
         assert!(!r.core.notices.iter().any(|n| n.contains("observed every tick")));
     }
 
-    /// A restart is a stop and a start seconds apart: a tool seen up and
-    /// ended by a signal reads as down only after it has stayed down
-    /// UNMANAGED_DOWN_GRACE, so a restart holds and alarms nothing, while one
-    /// that stays down does.
+    /// The latch (a footprint exists only while an instance runs, so a stopped
+    /// one counts as protecting): an instance that protected nothing while it
+    /// ran and is restarted is held for nothing; one that protected traffic is
+    /// held at once and lifts when it runs again; one never observed running
+    /// and stopped by a signal is held (fail closed).
     #[test]
-    fn a_restart_holds_nothing_but_staying_down_does() {
+    fn what_a_tool_was_doing_while_it_ran_decides_whether_stopping_it_holds() {
+        let restart = |r: &mut Rig, inst: &UnitId| {
+            r.fake.w().stop_out_of_band(inst);
+            r.ticks(1);
+            let now = r.fake.w().now;
+            *r.fake.w().units.get_mut(inst).unwrap() = UnitSim::active(now);
+            r.ticks(3);
+        };
+        // Protected nothing while running (observed by rotation): a restart holds and alarms nothing.
+        let inst = UnitId::service("openvpn@quiet");
+        let mut r = rig("openvpn@", "openvpn@quiet", false);
+        r.ticks(2);
+        assert_eq!(r.core.unmanaged_latch.get(&inst), Some(&false), "{:?}", r.core.unmanaged_latch);
+        restart(&mut r, &inst);
+        assert!(!r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
+        assert_eq!(says(&r, &alarm_text("openvpn@quiet")), 0);
+        // Protected traffic: held at once, lifted when running again.
         let inst = UnitId::service("openvpn@work");
         let mut r = rig("openvpn@", "openvpn@work", true);
+        r.ticks(2);
+        assert_eq!(r.core.unmanaged_latch.get(&inst), Some(&true));
         r.fake.w().stop_out_of_band(&inst);
         r.ticks(1);
+        assert!(r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
         let now = r.fake.w().now;
         *r.fake.w().units.get_mut(&inst).unwrap() = UnitSim::active(now);
-        r.ticks(10);
-        assert!(!r.fake.w().held.contains(&inst), "a restart was held: {:?}", r.core.notices);
-        assert_eq!(says(&r, &alarm_text("openvpn@work")), 0);
-        // Staying down is held (the other tests); here, just after the grace.
-        r.fake.w().stop_out_of_band(&inst);
-        r.ticks(1);
-        assert!(!r.fake.w().held.contains(&inst), "held before the grace");
-        r.ticks(3);
+        r.ticks(4);
+        assert!(!r.fake.w().held.contains(&inst), "never lifted: {:?}", r.core.notices);
+        // Never observed running, then stopped by a signal: held (fail closed).
+        let inst = UnitId::service("openvpn@late");
+        let mut r = rig("openvpn@", "openvpn@work", true);
+        r.fake.w().units.insert(
+            inst.clone(),
+            UnitSim { observed: Observed::Bound, ended: Some(Ending::Signal(15)), ..UnitSim::active(Timestamp(0)) },
+        );
+        r.ticks(12);
         assert!(r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
     }
 
-    /// A rebuild stops and restarts units: while a switch is settling, a
-    /// signal-ended stop of an unmanaged tool is not a tool going down; once
-    /// it has settled, a tool still down is held.
+    /// A new run overwrites the latch: an instance that protected nothing,
+    /// then (restarted) protects traffic, is held when it stops.
     #[test]
-    fn a_switch_stopping_an_unmanaged_tool_holds_nothing_until_it_settles() {
-        let vpn = UnitId::service("some-vpn");
-        let mut r = rig("some-vpn", "some-vpn", true);
-        let g = r.fake.w().add_generation(&Default::default());
-        r.fake.w().gens.get_mut(&g).unwrap().eval.network_tools.insert("some-vpn".into());
-        r.fake.w().current = g;
+    fn a_new_run_does_not_inherit_the_old_latch() {
+        let inst = UnitId::service("openvpn@work");
+        let mut r = rig("openvpn@", "openvpn@work", false);
+        r.ticks(2);
+        assert_eq!(r.core.unmanaged_latch.get(&inst), Some(&false));
+        r.fake.w().steers_traffic(&inst);
+        r.ticks(14);
+        assert_eq!(r.core.unmanaged_latch.get(&inst), Some(&true), "the latch was not updated");
+        r.fake.w().stop_out_of_band(&inst);
         r.ticks(1);
-        r.fake.w().stop_out_of_band(&vpn);
-        r.ticks(8);
-        assert!(!r.fake.w().held.contains(&vpn), "held mid-switch: {:?}", r.core.notices);
-        // Settled (60 s after the last queued job) and still down.
-        r.ticks(20);
-        assert!(r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
-        assert_eq!(says(&r, &alarm_text("some-vpn")), 1);
+        assert!(r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
     }
 
     /// A hold that stands on a tool the generation no longer exports is still

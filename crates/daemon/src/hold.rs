@@ -103,30 +103,25 @@ pub fn unmanaged_set(
 
 /// What the hold code is to read of an unmanaged tool, from what the backend
 /// saw. It has no manifest unit, so there is no Running to compare against:
-/// only a failure counts as down. Systemd's `Failed` is one; a unit seen up
-/// that a signal or the OOM killer then ended is one (a `systemctl stop` or a
-/// kill: §12d counts it); one that never ran, or that ended on its own (a
-/// oneshot that finished, `modprobe@x`), is not down and reads as up. A unit
-/// whose hold stands keeps what was seen: it lifts only when seen running.
-pub fn unmanaged_observed(raw: Observed, was_up: bool, ended: Option<Ending>, held: bool) -> Observed {
+/// only a failure counts as down. Systemd's `Failed` is one; an inactive unit
+/// that a signal or the OOM killer ended is one (a `systemctl stop` or a kill:
+/// §12d counts it), whether or not it was seen running; one that never ran, or
+/// that ended on its own (a oneshot that finished, `modprobe@x`), is not down
+/// and reads as up. A unit whose hold stands keeps what was seen: it lifts
+/// only when seen running.
+pub fn unmanaged_observed(raw: Observed, ended: Option<Ending>, held: bool) -> Observed {
     match raw {
         Observed::Absent | Observed::Bound | Observed::Detected if !held => {
-            let killed = matches!(ended, Some(Ending::Signal(_) | Ending::OomKill));
-            if was_up && killed { raw } else { Observed::Active }
+            if matches!(ended, Some(Ending::Signal(_) | Ending::OomKill)) { raw } else { Observed::Active }
         }
         other => other,
     }
 }
 
-/// A unit seen up and ended by a signal reads as down only after it has stayed
-/// down this long: a restart (a rebuild's, a person's `systemctl restart`)
-/// is a stop and a start a second or two apart, and a tool that has no
-/// footprint while it is not running counts as protecting.
-pub const UNMANAGED_DOWN_GRACE: Millis = Millis::secs(10);
-
-/// How many protecting unmanaged tools never seen running a tick looks at
-/// (one `systemctl show` each), rotating. The ones seen running, and the ones
-/// held, are looked at every tick.
+/// How many unmanaged tools a tick looks at besides those always looked at
+/// (one `systemctl show` each), rotating: the ones never seen running and the
+/// ones seen protecting nothing. A tool seen running that protected traffic,
+/// and the ones held, are looked at every tick.
 pub const UNMANAGED_OBSERVE_PER_TICK: usize = 8;
 
 /// More unmanaged tools than this observed every tick is said once: each is
@@ -328,7 +323,7 @@ mod tests {
         }
 
         /// What an unmanaged tool reads as, against a model: down only when
-        /// systemd says failed, or it was seen up and a signal or the OOM
+        /// systemd says failed, or it is inactive and a signal or the OOM
         /// killer ended it, or its hold stands and it is not seen running.
         #[test]
         fn an_unmanaged_tool_is_down_only_when_it_failed_or_was_killed_or_stays_held(
@@ -336,15 +331,15 @@ mod tests {
                 Observed::Absent, Observed::Bound, Observed::Detected, Observed::Active,
                 Observed::Failed(Reason::ExitCode(1)),
             ]),
-            was_up in any::<bool>(), held in any::<bool>(),
+            held in any::<bool>(),
             ended in prop::sample::select(vec![
                 None, Some(Ending::Exited(0)), Some(Ending::Exited(1)), Some(Ending::Signal(15)), Some(Ending::OomKill),
             ]),
         ) {
-            let got = unmanaged_observed(raw.clone(), was_up, ended, held);
+            let got = unmanaged_observed(raw.clone(), ended, held);
             let inactive = matches!(raw, Observed::Absent | Observed::Bound | Observed::Detected);
             let killed = matches!(ended, Some(Ending::Signal(_) | Ending::OomKill));
-            let down = matches!(raw, Observed::Failed(_)) || (inactive && (held || (was_up && killed)));
+            let down = matches!(raw, Observed::Failed(_)) || (inactive && (held || killed));
             prop_assert_eq!(matches!(got, Observed::Failed(_) | Observed::Absent | Observed::Bound | Observed::Detected), down);
             if !inactive {
                 prop_assert_eq!(got, raw);

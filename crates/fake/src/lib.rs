@@ -764,7 +764,16 @@ impl Fake {
             None => WatchState::Attached { at: now },
             Some(reason) => WatchState::Failed { reason: reason.clone() },
         };
-        let mut view = w.netwatch.view(watch, tools, now);
+        // As netwatch writes them: a template instance has a footprint only
+        // while it runs (a plain tool always has one).
+        let running: Vec<UnitId> = tools
+            .iter()
+            .filter(|u| {
+                !u.name.contains('@') || w.units.get(&World::key(u)).is_some_and(|s| s.observed == Observed::Active)
+            })
+            .cloned()
+            .collect();
+        let mut view = w.netwatch.view(watch, &running, now);
         for u in &w.netwatch_stale {
             if let Some(f) = view.units.get_mut(&file_name(u)) {
                 f.at = now.saturating_sub(FRESH_SECS + 1);
