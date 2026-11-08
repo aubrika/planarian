@@ -9,3 +9,4 @@ cc 53854bb47d0799793a00d7201871ba9f8c3e99d0d85b43df9c707d46a2c68907 # shrinks to
 cc ea93dbe895e6aa196d3e0ad37c9c4ecb77239034cd3c4c4f25804e9c6b0427f3 # shrinks to tools = {"a"}, listed = None, previous = {}, managed = {"a"}
 cc 1783fcb32299a8c5acc2b0ba903e6dabc13a740648802da0864fd537a3bb2204 # shrinks to raw = Absent, was_up = false, held = false, ended = None
 cc c780246531dee909e6a6e8b79f1459f694bd9fc1af111aa7506e100bfdfc909a # shrinks to raw = Absent, was_up = false, held = false, ended = Some(Signal(15))
+cc 7984096546bd4083c3d8824fde164f933a7d450840d58438ced5ca1dfb0b5bc2 # shrinks to tools = {}, listed = None, previous = {"a"}, managed = {}, keep = {"a"}

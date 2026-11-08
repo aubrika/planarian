@@ -71,13 +71,16 @@ pub fn network_tools(defs: &UnitDefs) -> impl Iterator<Item = &UnitDef> {
 /// themselves. A template is each unit of `listed` whose name extends it (an
 /// instance is longer than the template's own name); where the list could not
 /// be read (`None`), the instances of the previous tick stand, never dropped.
+/// A previous one whose hold stands (`keep`) stays whatever the export says
+/// now: a generation that stops exporting it must not strand its hold.
 pub fn unmanaged_set(
     tools: &BTreeSet<String>,
     listed: Option<&[UnitId]>,
     previous: &BTreeSet<UnitId>,
+    keep: &BTreeSet<UnitId>,
     defs: &UnitDefs,
 ) -> BTreeSet<UnitId> {
-    let mut want = BTreeSet::new();
+    let mut want: BTreeSet<UnitId> = previous.intersection(keep).cloned().collect();
     let templates: Vec<&String> = tools.iter().filter(|t| t.ends_with('@')).collect();
     for t in tools.iter().filter(|t| !t.ends_with('@')) {
         want.insert(UnitId::service(t.trim_end_matches(".service")));
@@ -114,6 +117,12 @@ pub fn unmanaged_observed(raw: Observed, was_up: bool, ended: Option<Ending>, he
         other => other,
     }
 }
+
+/// A unit seen up and ended by a signal reads as down only after it has stayed
+/// down this long: a restart (a rebuild's, a person's `systemctl restart`)
+/// is a stop and a start a second or two apart, and a tool that has no
+/// footprint while it is not running counts as protecting.
+pub const UNMANAGED_DOWN_GRACE: Millis = Millis::secs(10);
 
 /// How many unmanaged tools a tick observes besides the ones held (one
 /// `systemctl show` each): a failure among many instances is noticed within
@@ -275,12 +284,14 @@ mod tests {
             ]), 0..8)),
             previous in prop::collection::btree_set(prop::sample::select(vec!["t@1", "u@x", "a", "t@old"]), 0..4),
             managed in prop::collection::btree_set(prop::sample::select(vec!["a", "t@2", "c", "u@x"]), 0..4),
+            keep in prop::collection::btree_set(prop::sample::select(vec!["t@1", "t@old", "a", "planarian-hold@a", "zz"]), 0..4),
         ) {
             let tools: BTreeSet<String> = tools.into_iter().map(String::from).collect();
             let listed: Option<Vec<UnitId>> = listed.map(|l| l.into_iter().map(UnitId::service).collect());
             let previous: BTreeSet<UnitId> = previous.into_iter().map(UnitId::service).collect();
             let defs: UnitDefs = managed.into_iter().map(|n| (UnitId::service(n), unmanaged_def(&UnitId::service(n)))).collect();
-            let got = unmanaged_set(&tools, listed.as_deref(), &previous, &defs);
+            let keep: BTreeSet<UnitId> = keep.into_iter().map(UnitId::service).collect();
+            let got = unmanaged_set(&tools, listed.as_deref(), &previous, &keep, &defs);
 
             // The model: names, then filter.
             let mut want: BTreeSet<String> = BTreeSet::new();
@@ -301,6 +312,8 @@ mod tests {
                     }
                 }
             }
+            // A previous unit whose hold stands stays, whatever the export says.
+            want.extend(previous.iter().filter(|u| keep.contains(*u)).map(|u| u.name.clone()));
             let want: BTreeSet<UnitId> = want
                 .into_iter()
                 .filter(|n| !(n.starts_with("planarian-hold@") && n.len() > "planarian-hold@".len()))

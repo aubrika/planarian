@@ -302,6 +302,11 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// failure) and where the rotation through the rest has reached.
     unmanaged_up: BTreeSet<UnitId>,
     unmanaged_cursor: usize,
+    /// Since when each unmanaged tool has been seen down by a signal, and
+    /// whether this tick is inside a switch window (a rebuild's stops and
+    /// restarts are not a tool going down).
+    unmanaged_down_since: BTreeMap<UnitId, Timestamp>,
+    switching: bool,
     /// A switch outside Planarian seen at `.0`: its stops and starts follow
     /// the profile change by more than a tick, so they stay explained until
     /// `.1` (see `SWITCH_SETTLE`).
@@ -506,6 +511,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             unmanaged_unreadable_noted: false,
             unmanaged_up: BTreeSet::new(),
             unmanaged_cursor: 0,
+            unmanaged_down_since: BTreeMap::new(),
+            switching: false,
             switch_window: None,
             next_gc_check: Timestamp(0),
             space_noted: Timestamp(0),
@@ -656,7 +663,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
     /// export is never an empty set: the last set read stands, and with none
     /// the daemon says so (once) and tries again. A failed list leaves the
     /// instances of the previous tick.
-    fn refresh_unmanaged(&mut self, defs: &UnitDefs) {
+    fn refresh_unmanaged(&mut self, defs: &UnitDefs, keep: &BTreeSet<UnitId>) {
         if self.network_tools.is_none() {
             let read = self
                 .b
@@ -681,8 +688,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
         let Some(tools) = self.network_tools.clone() else { return };
         let listed = if tools.iter().any(|t| t.ends_with('@')) { self.b.units().list().ok() } else { None };
-        self.unmanaged = crate::hold::unmanaged_set(&tools, listed.as_deref(), &self.unmanaged, defs);
+        self.unmanaged = crate::hold::unmanaged_set(&tools, listed.as_deref(), &self.unmanaged, keep, defs);
         self.unmanaged_up.retain(|u| self.unmanaged.contains(u));
+        self.unmanaged_down_since.retain(|u, _| self.unmanaged.contains(u));
     }
 
     /// Observe without acting (also used to answer requests).
@@ -725,7 +733,15 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let mut defs = self.asm.defs();
         // §12d: the network tools that protect traffic now. Fail closed: an
         // unreadable watch counts every tool as protecting.
-        self.refresh_unmanaged(&defs);
+        let standing: BTreeSet<UnitId> = s
+            .holds
+            .iter()
+            .chain(self.hold_released.keys())
+            .chain(self.release_unconfirmed.keys())
+            .chain(self.lift_unconfirmed.keys())
+            .cloned()
+            .collect();
+        self.refresh_unmanaged(&defs, &standing);
         let tools: Vec<UnitId> =
             crate::hold::network_tools(&defs).map(|d| d.id.clone()).chain(self.unmanaged.iter().cloned()).collect();
         s.protecting = if tools.is_empty() {
@@ -1063,7 +1079,17 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                         self.unmanaged_up.insert(u.clone());
                     }
                     let was_up = self.unmanaged_up.contains(&u);
-                    crate::hold::unmanaged_observed(raw, was_up, self.b.units().ended_by(&u), held)
+                    let seen = crate::hold::unmanaged_observed(raw, was_up, self.b.units().ended_by(&u), held);
+                    if matches!(seen, Observed::Absent | Observed::Bound | Observed::Detected) && !held {
+                        // Ended by a signal: down once it has stayed so, and
+                        // not while a switch is stopping and starting units.
+                        let since = *self.unmanaged_down_since.entry(u.clone()).or_insert(s.observed_at);
+                        let settled = s.observed_at.0.saturating_sub(since.0) >= crate::hold::UNMANAGED_DOWN_GRACE.0;
+                        if settled && !self.switching { seen } else { Observed::Active }
+                    } else {
+                        self.unmanaged_down_since.remove(&u);
+                        seen
+                    }
                 }
                 Err(o) => Observed::Unknown { since: s.observed_at, reason: format!("{o:?}") },
             };
@@ -1733,6 +1759,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let host_held = self.b.units().held();
         let mut tried_hold = false;
         let in_switch = self.in_switch_window(now);
+        self.switching = in_switch;
         for (u, def) in defs {
             let st = s.status(u, defs);
             // A Security unit killed by a termination signal that systemd

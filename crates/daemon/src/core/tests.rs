@@ -4277,6 +4277,70 @@ mod unmanaged_tools {
         assert!(names.iter().all(|u| r.fake.w().observe_counts.get(u).copied().unwrap_or(0) >= 1));
     }
 
+    /// A restart is a stop and a start seconds apart: a tool seen up and
+    /// ended by a signal reads as down only after it has stayed down
+    /// UNMANAGED_DOWN_GRACE, so a restart holds and alarms nothing, while one
+    /// that stays down does.
+    #[test]
+    fn a_restart_holds_nothing_but_staying_down_does() {
+        let inst = UnitId::service("openvpn@work");
+        let mut r = rig("openvpn@", "openvpn@work", true);
+        r.fake.w().stop_out_of_band(&inst);
+        r.ticks(1);
+        let now = r.fake.w().now;
+        *r.fake.w().units.get_mut(&inst).unwrap() = UnitSim::active(now);
+        r.ticks(10);
+        assert!(!r.fake.w().held.contains(&inst), "a restart was held: {:?}", r.core.notices);
+        assert_eq!(says(&r, &alarm_text("openvpn@work")), 0);
+        // Staying down is held (the other tests); here, just after the grace.
+        r.fake.w().stop_out_of_band(&inst);
+        r.ticks(1);
+        assert!(!r.fake.w().held.contains(&inst), "held before the grace");
+        r.ticks(3);
+        assert!(r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
+    }
+
+    /// A rebuild stops and restarts units: while a switch is settling, a
+    /// signal-ended stop of an unmanaged tool is not a tool going down; once
+    /// it has settled, a tool still down is held.
+    #[test]
+    fn a_switch_stopping_an_unmanaged_tool_holds_nothing_until_it_settles() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        let g = r.fake.w().add_generation(&Default::default());
+        r.fake.w().gens.get_mut(&g).unwrap().eval.network_tools.insert("some-vpn".into());
+        r.fake.w().current = g;
+        r.ticks(1);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(8);
+        assert!(!r.fake.w().held.contains(&vpn), "held mid-switch: {:?}", r.core.notices);
+        // Settled (60 s after the last queued job) and still down.
+        r.ticks(20);
+        assert!(r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
+        assert_eq!(says(&r, &alarm_text("some-vpn")), 1);
+    }
+
+    /// A hold that stands on a tool the generation no longer exports is still
+    /// watched and lifted once the tool is back.
+    #[test]
+    fn a_hold_stays_watched_after_the_export_stops_naming_the_tool() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(6);
+        assert!(r.fake.w().held.contains(&vpn));
+        // The export no longer lists it (a new generation, read at once).
+        r.core.network_tools = Some(Default::default());
+        r.ticks(2);
+        assert!(r.core.unmanaged.contains(&vpn), "dropped while held");
+        let now = r.fake.w().now;
+        *r.fake.w().units.get_mut(&vpn).unwrap() = UnitSim::active(now);
+        r.ticks(5);
+        assert!(!r.fake.w().held.contains(&vpn), "never lifted: {:?}", r.core.notices);
+        r.ticks(3);
+        assert!(!r.core.unmanaged.contains(&vpn), "watched once lifted and unexported");
+    }
+
     mod props {
         use super::*;
         use proptest::prelude::*;
