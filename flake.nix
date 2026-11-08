@@ -101,6 +101,8 @@
         # §12d netwatch: footprints and the watch heartbeat (reviewer's case).
         vm-netwatch = import ./nix/tests/netwatch.nix { inherit pkgs self; };
         vm-generations = import ./nix/tests/vm-generations.nix { inherit pkgs self; };
+        # B-26 (docs/netwatch-initrd.md §9): A1–A4 as kernel probes, no product code.
+        vm-initrd-probe = import ./nix/tests/initrd-probe.nix { inherit pkgs self; };
         installer = import ./nix/tests/installer.nix { inherit pkgs self nixpkgs; };
         # The demo VM (`nix run .#vm-text`) builds.
         demo-vm = self.nixosConfigurations."planarian-vm-text-${pkgs.stdenv.hostPlatform.system}".config.system.build.vm;
