@@ -4515,6 +4515,35 @@ mod unmanaged_tools {
         assert_eq!(says(&r, &alarm_text("some-vpn")), 0);
     }
 
+    /// A plain tool that netwatch reports protecting is observed every tick,
+    /// not by the rotation: among more than the per-tick cap of plain tools
+    /// that protect nothing (all rotating), one that begins to steer and is
+    /// killed is held on the very next tick, whichever place it has in the
+    /// rotation.
+    #[test]
+    fn a_plain_tool_reported_protecting_is_not_left_to_the_rotation() {
+        const N: usize = 20;
+        let names: Vec<UnitId> = (0..N).map(|i| UnitId::service(&format!("p{i:02}"))).collect();
+        let mut r = rig("p00", "p00", false);
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &names {
+                w.units.insert(u.clone(), UnitSim::active(now));
+            }
+        }
+        r.core.network_tools = Some(names.iter().map(|u| u.name.clone()).collect());
+        r.ticks(N.div_ceil(crate::hold::UNMANAGED_OBSERVE_PER_TICK) + 2);
+        assert!(names.iter().all(|u| r.core.unmanaged_latch.get(u) == Some(&false)), "{:?}", r.core.unmanaged_latch);
+        // Each place in the rotation: the first, a middle one, the last.
+        for victim in [&names[0], &names[N / 2], &names[N - 1]] {
+            r.fake.w().steers_traffic(victim);
+            r.fake.w().kill(victim);
+            r.ticks(1);
+            assert!(r.fake.w().held.contains(victim), "{victim} not held on the next tick: {:?}", r.core.notices);
+        }
+    }
+
     mod props {
         use super::*;
         use proptest::prelude::*;
