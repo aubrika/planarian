@@ -412,7 +412,7 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
                     eprintln!("netwatch: {why}");
                     tracker.lost(None);
                 }
-                if let Some(family) = genl_ids.id("wireguard") {
+                if let Ok(Some(family)) = genl_ids.family("wireguard") {
                     let unit = ev.cgpath.as_deref().and_then(unit_of_cgroup).or_else(|| cgroups.unit(ev.cgroup));
                     match (crate::wg::host_request(&ev, family, own_netns), unit) {
                         // A request from no unit (an administrator's `wg set`)
@@ -477,7 +477,7 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         // failed tool.
         if genl || tick {
             let listed = if tick { genl_ids.refresh(&mut crate::snapshot::families) } else { Ok(()) };
-            match listed.and_then(|()| crate::snapshot::wireguard(genl_ids.id("wireguard"))) {
+            match listed.and_then(|()| genl_ids.family("wireguard")).and_then(crate::snapshot::wireguard) {
                 Ok(devices) => {
                     changed |= tracker.set_wireguard(&devices);
                 }

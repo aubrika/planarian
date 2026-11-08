@@ -278,46 +278,72 @@ pub fn classify(ev: &crate::ebpf::Event, family: u16) -> Genl {
 /// is already in the map costs none. The map is read again when a request
 /// carries an id it does not hold (a module loaded since; once per id until
 /// the next tick, so a number nothing registered cannot make a dump per
-/// request) and at every tick (an id given up and reused). A failed read
-/// leaves the map as it was and is reported to the caller, which fails
-/// closed; the id is not asked about again before the tick either.
+/// request) and at every tick (an id given up and reused).
+///
+/// The map is *known* only after a successful read. Until then, and after a
+/// failed read, it is unknown: [`GenlIds::family`] says so with an error,
+/// which the caller fails closed on, and an unknown map is read again at the
+/// next tick, not before. A failed read never reads as "no such family"
+/// (rule 21: nothing is derived from a failed tool).
 #[derive(Debug, Default)]
 pub struct GenlIds {
     by_id: std::collections::BTreeMap<u16, String>,
-    /// Ids a read did not list (or failed on), until the next tick.
+    /// Ids a read did not list, until the next tick.
     unlisted: std::collections::BTreeSet<u16>,
+    /// The last read succeeded.
+    known: bool,
 }
 
 impl GenlIds {
     /// Read the controller's list again, replacing the map (a tick, or the
-    /// first read).
+    /// first read). A failed read leaves the map unknown.
     pub fn refresh(&mut self, fetch: &mut dyn FnMut() -> Result<Vec<(String, u16)>, String>) -> Result<(), String> {
         self.unlisted.clear();
-        self.by_id = fetch()?.into_iter().map(|(n, i)| (i, n)).collect();
-        Ok(())
+        self.replace(fetch())
     }
 
-    /// A request carried family id `id`: read the list only if the map does
-    /// not hold it and it has not been looked for since the last tick.
+    fn replace(&mut self, read: Result<Vec<(String, u16)>, String>) -> Result<(), String> {
+        match read {
+            Ok(list) => {
+                self.by_id = list.into_iter().map(|(n, i)| (i, n)).collect();
+                self.known = true;
+                Ok(())
+            }
+            Err(why) => {
+                self.known = false;
+                Err(why)
+            }
+        }
+    }
+
+    /// A request carried family id `id`: read the list only if the map is
+    /// known, does not hold the id, and has not been asked for it since the
+    /// last tick. An unknown map is an error (the tick reads it again).
     pub fn ensure(
         &mut self,
         id: u16,
         fetch: &mut dyn FnMut() -> Result<Vec<(String, u16)>, String>,
     ) -> Result<(), String> {
+        if !self.known {
+            return Err("the generic netlink family list is not known".into());
+        }
         if self.by_id.contains_key(&id) || self.unlisted.contains(&id) {
             return Ok(());
         }
-        let read = fetch();
         self.unlisted.insert(id);
-        self.by_id = read?.into_iter().map(|(n, i)| (i, n)).collect();
+        self.replace(fetch())?;
         if self.by_id.contains_key(&id) {
             self.unlisted.remove(&id);
         }
         Ok(())
     }
 
-    /// The id of family `name`, as last read.
-    pub fn id(&self, name: &str) -> Option<u16> {
-        self.by_id.iter().find(|(_, n)| n.as_str() == name).map(|(i, _)| *i)
+    /// The id of family `name` (`None`: it is not registered), or an error
+    /// while the map is unknown.
+    pub fn family(&self, name: &str) -> Result<Option<u16>, String> {
+        if !self.known {
+            return Err("the generic netlink family list is not known".into());
+        }
+        Ok(self.by_id.iter().find(|(_, n)| n.as_str() == name).map(|(i, _)| *i))
     }
 }

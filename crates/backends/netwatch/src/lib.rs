@@ -270,7 +270,9 @@
 //! `wg::GenlIds`: read at start and every tick, and again only for a request
 //! whose family id the map does not hold (once per id until the next tick),
 //! so another family's traffic (nl80211's scans) costs no dump per drain. A
-//! failed read is a loss, and the next tick reads again.
+//! failed read leaves the map unknown, never "no such family": the
+//! WireGuard read and every request fail closed (a loss) until the next tick
+//! reads again (rule 21).
 //! GET_DEVICE dump names one interface: links are enumerated through
 //! rtnetlink, then each WireGuard interface is queried by index. In a large
 //! reply only the first chunk names the device; peer-only continuations

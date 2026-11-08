@@ -2933,6 +2933,42 @@ mod genl_bounded {
         assert_eq!(got, Ok(None));
     }
 
+    /// A family message, by construction: the genl header after the netlink
+    /// one, then the attributes given.
+    fn family_msg(attrs: &[Vec<u8>]) -> Vec<u8> {
+        let mut m = vec![0u8; 16 + 4];
+        m.extend(attrs.concat());
+        m
+    }
+
+    fn fattr(ty: u16, v: &[u8]) -> Vec<u8> {
+        let mut a = (4 + v.len() as u16).to_ne_bytes().to_vec();
+        a.extend(ty.to_ne_bytes());
+        a.extend(v);
+        while !a.len().is_multiple_of(4) {
+            a.push(0);
+        }
+        a
+    }
+
+    /// Rule 21: a message of the controller's list that cannot be read makes
+    /// the whole list an error, never a smaller one (the missing family could
+    /// be WireGuard's).
+    #[test]
+    fn an_unreadable_family_message_is_an_error_not_a_smaller_list() {
+        let good = family_msg(&[fattr(2, b"nl80211\0"), fattr(1, &0x1cu16.to_ne_bytes())]);
+        assert_eq!(snapshot::families_in(std::slice::from_ref(&good)), Ok(vec![("nl80211".to_string(), 0x1c)]));
+        let no_id = family_msg(&[fattr(2, b"wireguard\0")]);
+        let no_name = family_msg(&[fattr(1, &0x1du16.to_ne_bytes())]);
+        let cut_id = family_msg(&[fattr(2, b"wireguard\0"), fattr(1, &[7])]);
+        let mut cut_attr = good.clone();
+        cut_attr.truncate(cut_attr.len() - 6);
+        cut_attr[20..22].copy_from_slice(&200u16.to_ne_bytes()); // claims more than there is
+        for bad in [no_id, no_name, cut_id, cut_attr] {
+            assert!(snapshot::families_in(&[good.clone(), bad.clone()]).is_err(), "{bad:?}");
+        }
+    }
+
     /// The WireGuard lookups return too (none here, or the devices).
     #[test]
     fn the_wireguard_lookups_return() {

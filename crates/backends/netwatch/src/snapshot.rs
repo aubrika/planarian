@@ -189,18 +189,31 @@ pub fn families() -> Result<Vec<(String, u16)>, String> {
     let body = [CTRL_CMD_GETFAMILY, 1, 0, 0];
     let reply = request(Some(netlink::GENERIC), GENL_ID_CTRL, NLM_F_DUMP, &body)
         .map_err(|e| format!("generic netlink family list: {e}"))?;
-    Ok(families_in(&reply))
+    families_in(&reply)
 }
 
-/// The (name, id) of each family among the controller's `NEWFAMILY` messages.
-pub fn families_in(msgs: &[Vec<u8>]) -> Vec<(String, u16)> {
+/// The (name, id) of each family among the controller's `NEWFAMILY`
+/// messages. A message that cannot be read (cut attributes, no name, no id)
+/// is an error, never a smaller list (rule 21): a family missing from the
+/// map could be WireGuard's.
+pub fn families_in(msgs: &[Vec<u8>]) -> Result<Vec<(String, u16)>, String> {
     msgs.iter()
-        .filter_map(|m| {
-            let attrs = crate::parse::attrs(m, 16 + 4)?;
-            let name = attrs.iter().find(|(t, _)| *t == CTRL_ATTR_FAMILY_NAME)?;
-            let (_, id) = attrs.iter().find(|(t, _)| *t == CTRL_ATTR_FAMILY_ID)?;
-            let id = id.get(0..2).map(|b| u16::from_ne_bytes([b[0], b[1]]))?;
-            Some((crate::parse::cstr(name.1), id))
+        .map(|m| {
+            let attrs =
+                crate::parse::attrs(m, 16 + 4).ok_or("a generic netlink family message with a malformed attribute")?;
+            let name = attrs
+                .iter()
+                .find(|(t, _)| *t == CTRL_ATTR_FAMILY_NAME)
+                .ok_or("a generic netlink family message naming no family")?;
+            let (_, id) = attrs
+                .iter()
+                .find(|(t, _)| *t == CTRL_ATTR_FAMILY_ID)
+                .ok_or("a generic netlink family message with no id")?;
+            let id = id
+                .get(0..2)
+                .map(|b| u16::from_ne_bytes([b[0], b[1]]))
+                .ok_or("a generic netlink family message with a cut id")?;
+            Ok((crate::parse::cstr(name.1), id))
         })
         .collect()
 }
