@@ -149,29 +149,37 @@ pub fn supported() -> JournalRequirements {
     reads
 }
 
-fn active(value: &serde_json::Value, path: &[&str]) -> bool {
+/// Fields whose zero, false, empty or all-zero value is the default a record
+/// from before the field carried (a boot time of 0, an approver of 0, an
+/// instance of zero bytes, an unset flag): such a value requires nothing. Not
+/// an id or other value that is zero for real: a `withdrawn_for` of `TxnId(0)`
+/// is set (the first transaction's id is 0), so it is not listed.
+pub(super) const ZERO_IS_DEFAULT: &[&str] = &["boot_at", "approver", "txn", "instance", "live.*.boot_only"];
+
+/// Whether the value at `path` in `value` is one a reader must understand:
+/// present, and (for a `zero_default` path) not at its default.
+pub(super) fn active(value: &serde_json::Value, path: &[&str], zero_default: bool) -> bool {
     let Some((first, rest)) = path.split_first() else {
         return match value {
             serde_json::Value::Null => false,
-            // A field at its default (0, false, "", all-zero bytes) is not one
-            // a reader has to understand.
-            serde_json::Value::Array(a) => a.iter().any(|v| active(v, &[])),
+            serde_json::Value::Array(a) if zero_default => a.iter().any(|v| active(v, &[], true)),
+            serde_json::Value::Array(a) => !a.is_empty(),
             serde_json::Value::Object(o) => !o.is_empty(),
-            serde_json::Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
-            serde_json::Value::Bool(b) => *b,
-            serde_json::Value::String(s) => !s.is_empty(),
+            serde_json::Value::Number(n) => !zero_default || n.as_f64().is_some_and(|f| f != 0.0),
+            serde_json::Value::Bool(b) => !zero_default || *b,
+            serde_json::Value::String(s) => !zero_default || !s.is_empty(),
         };
     };
     if *first == "*" {
-        return value.as_object().is_some_and(|o| o.values().any(|v| active(v, rest)));
+        return value.as_object().is_some_and(|o| o.values().any(|v| active(v, rest, zero_default)));
     }
-    value.get(*first).is_some_and(|v| active(v, rest))
+    value.get(*first).is_some_and(|v| active(v, rest, zero_default))
 }
 
 pub(super) fn fields_in(kind: &str, value: &serde_json::Value, out: &mut JournalRequirements) {
     if let Some(paths) = supported().fields.get(kind) {
         for path in paths {
-            if active(value, &path.split('.').collect::<Vec<_>>()) {
+            if active(value, &path.split('.').collect::<Vec<_>>(), ZERO_IS_DEFAULT.contains(&path.as_str())) {
                 out.fields.entry(kind.to_owned()).or_default().push(path.clone());
             }
         }

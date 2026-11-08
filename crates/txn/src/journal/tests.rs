@@ -1582,3 +1582,124 @@ fn a_prepared_transactions_added_fields_are_required_once_set() {
     );
     assert!(required("checkpoint", json!({"live": {"1": {"boot_only": false}}})).is_empty());
 }
+
+/// An id that is zero for real is set: the first transaction's id is 0, so a
+/// `withdrawn_for` or `prepared_again_from` of `TxnId(0)` must be required,
+/// where an approver of 0 (the default of a record from before the field) is
+/// not. (A zero counted as unset everywhere dropped the former.)
+#[test]
+fn an_id_of_zero_is_a_set_field_but_an_approver_of_zero_is_not() {
+    use serde_json::json;
+    let required = |kind: &str, v: serde_json::Value| {
+        let mut r = compat::JournalRequirements { format: 3, kinds: vec![], fields: Default::default() };
+        compat::fields_in(kind, &v, &mut r);
+        r.fields.into_values().flatten().collect::<Vec<_>>()
+    };
+    assert_eq!(required("Advance", json!({"withdrawn_for": 0})), ["withdrawn_for"]);
+    assert_eq!(required("Prepared", json!({"prepared_again_from": 0})), ["prepared_again_from"]);
+    assert_eq!(required("checkpoint", json!({"terminal": {"3": {"withdrawn_for": 0}}})), ["terminal.*.withdrawn_for"]);
+    assert_eq!(required("checkpoint", json!({"not_prepared_again": [0]})), ["not_prepared_again"]);
+    assert!(required("TokenUsed", json!({"approver": 0, "txn": 0})).is_empty());
+}
+
+mod active_props {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn json_value() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            prop_oneof![Just(0i64), Just(1), Just(-1), any::<i64>()].prop_map(|n| json!(n)),
+            prop_oneof![Just(String::new()), "[a-z]{1,4}"].prop_map(Value::String),
+        ];
+        leaf.prop_recursive(3, 24, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                prop::collection::btree_map("[a-c]", inner, 0..4).prop_map(|m| Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    /// The independent model: a field a reader must understand is one that is
+    /// present, and, where zero is the default, has a non-default leaf. (Where
+    /// zero is real, anything but null, an empty list or an empty map is set.)
+    fn model(v: &Value, zero_default: bool) -> bool {
+        match v {
+            Value::Null => false,
+            Value::Bool(b) => !zero_default || *b,
+            Value::Number(n) => !zero_default || n.as_i64() != Some(0),
+            Value::String(s) => !zero_default || !s.is_empty(),
+            Value::Array(a) if zero_default => a.iter().any(|x| model(x, true)),
+            Value::Array(a) => !a.is_empty(),
+            Value::Object(o) => !o.is_empty(),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, failure_persistence: None, ..ProptestConfig::default() })]
+
+        #[test]
+        fn active_is_true_exactly_when_the_model_says_so(v in json_value(), zero_default in any::<bool>()) {
+            prop_assert_eq!(compat::active(&v, &[], zero_default), model(&v, zero_default), "{:?}", v);
+        }
+
+        /// A path into a value reaches the same decision as the value at its end.
+        #[test]
+        fn a_path_is_followed_to_the_value(v in json_value(), zero_default in any::<bool>()) {
+            let wrapped = json!({"live": {"7": {"txn": {"f": v.clone()}}}});
+            prop_assert_eq!(
+                compat::active(&wrapped, &["live", "*", "txn", "f"], zero_default),
+                model(&v, zero_default)
+            );
+            prop_assert!(!compat::active(&wrapped, &["live", "*", "txn", "absent"], zero_default));
+        }
+    }
+}
+
+mod reads_what_it_writes {
+    use super::*;
+    use crate::ledger::HoldBy;
+
+    fn written() -> impl Strategy<Value = Record> {
+        let unit = planarian_schema::UnitId::service("gym-web");
+        prop_oneof![
+            (any::<u64>(), any::<u64>()).prop_map(|(n, boot_at)| Record::Renew {
+                txn: planarian_schema::TxnId(n),
+                epoch: n,
+                worker_pid: None,
+                boot_at: Timestamp(boot_at),
+            }),
+            (any::<u64>(), any::<u64>()).prop_map(|(approver, txn)| Record::TokenUsed {
+                nonce: [3; 16],
+                expires: Timestamp(1),
+                approver,
+                txn,
+            }),
+            any::<[u8; 16]>().prop_map(|instance| Record::AgentStarted { name: "a".into(), instance, by: 1000 }),
+            any::<u64>().prop_map(|n| Record::Advance {
+                txn: planarian_schema::TxnId(n),
+                epoch: 1,
+                to: planarian_schema::TxnState::Prepared,
+                note: String::new(),
+                withdrawn_for: (n % 2 == 0).then_some(planarian_schema::TxnId(n / 2)),
+            }),
+            Just(Record::HoldApplied { unit: unit.clone(), by: HoldBy::Daemon }),
+            Just(Record::HoldLifted { unit, reason: "r".into() }),
+            any::<u64>().prop_map(|seq| Record::ExternalAccepted { seq, digest: planarian_schema::Hash([1; 32]) }),
+            any::<u64>().prop_map(|n| Record::NotPreparedAgain { txn: planarian_schema::TxnId(n), reason: "r".into() }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, failure_persistence: None, ..ProptestConfig::default() })]
+
+        /// A build reads everything it writes: what a record it writes needs
+        /// of a reader, this build's own descriptor supplies.
+        #[test]
+        fn a_build_reads_everything_it_writes(r in written()) {
+            let needs = compat::record_requirements(&r).unwrap();
+            prop_assert!(needs.unsupported_by(&supported()).is_empty(), "{:?}", needs.unsupported_by(&supported()));
+        }
+    }
+}
