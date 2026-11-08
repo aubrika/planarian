@@ -13,6 +13,7 @@
 //! The hold is a failure posture response, not a transaction (docs/bypasses.md).
 
 use planarian_schema::*;
+use std::collections::BTreeSet;
 
 /// The alarm when a held unit goes down (§12d, §11), word for word.
 pub fn alarm(unit: &UnitId) -> String {
@@ -63,6 +64,38 @@ pub fn hold_def(held: &UnitDef) -> UnitDef {
 /// `Core::network_holds` and the residue facts apply.
 pub fn network_tools(defs: &UnitDefs) -> impl Iterator<Item = &UnitDef> {
     defs.values().filter(|d| d.holds)
+}
+
+/// The unmanaged network tools: the export's `tools` (a template ends in
+/// `@`) as units, minus the manifest's units (`defs`) and the hold units
+/// themselves. A template is each unit of `listed` whose name extends it (an
+/// instance is longer than the template's own name); where the list could not
+/// be read (`None`), the instances of the previous tick stand, never dropped.
+pub fn unmanaged_set(
+    tools: &BTreeSet<String>,
+    listed: Option<&[UnitId]>,
+    previous: &BTreeSet<UnitId>,
+    defs: &UnitDefs,
+) -> BTreeSet<UnitId> {
+    let mut want = BTreeSet::new();
+    let templates: Vec<&String> = tools.iter().filter(|t| t.ends_with('@')).collect();
+    for t in tools.iter().filter(|t| !t.ends_with('@')) {
+        want.insert(UnitId::service(t.trim_end_matches(".service")));
+    }
+    if !templates.is_empty() {
+        match listed {
+            Some(all) => {
+                want.extend(
+                    all.iter()
+                        .filter(|u| templates.iter().any(|t| u.name.starts_with(t.as_str()) && u.name.len() > t.len()))
+                        .cloned(),
+                );
+            }
+            None => want.extend(previous.iter().filter(|u| u.name.contains('@')).cloned()),
+        }
+    }
+    want.retain(|u| !defs.contains_key(u) && held_by(u).is_none());
+    want
 }
 
 /// An unmanaged network tool (no manifest unit; the export's `networkTools`)
@@ -203,6 +236,56 @@ mod tests {
             let mut o = Override::attested(unit, desired, Until::NextBoot, "release".into(), Actor::user(0));
             if !attested { o.attribution = Attribution::Inferred; }
             prop_assert_eq!(released(&o).is_some(), system && service && attested && desired == OverrideDesired::Stopped);
+        }
+
+        /// `unmanaged_set` against an independent model, over generated tools
+        /// (plain, `.service`-suffixed, templates), lists (readable or not),
+        /// previous instances and manifest units, drawn from names that
+        /// collide on purpose (a hold unit, the bare template, a template's
+        /// prefix of another).
+        #[test]
+        fn the_unmanaged_set_is_the_exports_tools_less_the_managed_and_the_hold_units(
+            tools in prop::collection::btree_set(prop::sample::select(vec![
+                "a", "b", "c.service", "t@", "u@", "planarian-hold@",
+            ]), 0..5),
+            listed in prop::option::of(prop::collection::vec(prop::sample::select(vec![
+                "a", "b", "t@", "t@1", "t@2", "u@x", "u@", "ut@z", "planarian-hold@a", "planarian-hold@", "other",
+            ]), 0..8)),
+            previous in prop::collection::btree_set(prop::sample::select(vec!["t@1", "u@x", "a", "t@old"]), 0..4),
+            managed in prop::collection::btree_set(prop::sample::select(vec!["a", "t@2", "c", "u@x"]), 0..4),
+        ) {
+            let tools: BTreeSet<String> = tools.into_iter().map(String::from).collect();
+            let listed: Option<Vec<UnitId>> = listed.map(|l| l.into_iter().map(UnitId::service).collect());
+            let previous: BTreeSet<UnitId> = previous.into_iter().map(UnitId::service).collect();
+            let defs: UnitDefs = managed.into_iter().map(|n| (UnitId::service(n), unmanaged_def(&UnitId::service(n)))).collect();
+            let got = unmanaged_set(&tools, listed.as_deref(), &previous, &defs);
+
+            // The model: names, then filter.
+            let mut want: BTreeSet<String> = BTreeSet::new();
+            for t in &tools {
+                if !t.ends_with('@') {
+                    want.insert(t.strip_suffix(".service").unwrap_or(t).to_string());
+                }
+            }
+            let templates: Vec<&String> = tools.iter().filter(|t| t.ends_with('@')).collect();
+            if !templates.is_empty() {
+                let pool: Vec<String> = match &listed {
+                    Some(l) => l.iter().map(|u| u.name.clone()).collect(),
+                    None => previous.iter().filter(|u| u.name.contains('@')).map(|u| u.name.clone()).collect(),
+                };
+                for n in pool {
+                    if templates.iter().any(|t| n.len() > t.len() && n.starts_with(t.as_str())) || listed.is_none() {
+                        want.insert(n);
+                    }
+                }
+            }
+            let want: BTreeSet<UnitId> = want
+                .into_iter()
+                .filter(|n| !(n.starts_with("planarian-hold@") && n.len() > "planarian-hold@".len()))
+                .map(|n| UnitId::service(&n))
+                .filter(|u| !defs.contains_key(u))
+                .collect();
+            prop_assert_eq!(got, want);
         }
     }
 }

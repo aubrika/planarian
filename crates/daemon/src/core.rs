@@ -674,31 +674,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
         let Some(tools) = self.network_tools.clone() else { return };
-        let mut want: BTreeSet<UnitId> = BTreeSet::new();
-        let mut templates = vec![];
-        for t in &tools {
-            match t.strip_suffix('@') {
-                Some(_) => templates.push(t.clone()),
-                None => {
-                    want.insert(UnitId::service(t.trim_end_matches(".service")));
-                }
-            }
-        }
-        if !templates.is_empty() {
-            match self.b.units().list() {
-                Ok(all) => {
-                    for u in all {
-                        if templates.iter().any(|t| u.name.starts_with(t.as_str()) && u.name.len() > t.len()) {
-                            want.insert(u);
-                        }
-                    }
-                }
-                // Keep the instances already known.
-                Err(_) => want.extend(self.unmanaged.iter().filter(|u| u.name.contains('@')).cloned()),
-            }
-        }
-        want.retain(|u| !defs.contains_key(u) && crate::hold::held_by(u).is_none());
-        self.unmanaged = want;
+        let listed = if tools.iter().any(|t| t.ends_with('@')) { self.b.units().list().ok() } else { None };
+        self.unmanaged = crate::hold::unmanaged_set(&tools, listed.as_deref(), &self.unmanaged, defs);
     }
 
     /// Observe without acting (also used to answer requests).

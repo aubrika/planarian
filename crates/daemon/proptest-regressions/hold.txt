@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b65015e7243ce627f8d6088964db55719df1a279777108d29e68470ec337946e # shrinks to tools = {"t@"}, listed = None, previous = {"t@1"}, managed = {}
+cc 53854bb47d0799793a00d7201871ba9f8c3e99d0d85b43df9c707d46a2c68907 # shrinks to tools = {"planarian-hold@"}, listed = Some(["planarian-hold@a"]), previous = {}, managed = {}
+cc ea93dbe895e6aa196d3e0ad37c9c4ecb77239034cd3c4c4f25804e9c6b0427f3 # shrinks to tools = {"a"}, listed = None, previous = {}, managed = {"a"}

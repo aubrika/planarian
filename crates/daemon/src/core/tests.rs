@@ -3995,6 +3995,7 @@ mod switch_window_busy {
 mod unmanaged_tools {
     use super::*;
     use planarian_fake::UnitSim;
+    use proptest::test_runner::TestCaseError;
 
     /// A machine whose generation exports `export` among its `networkTools`
     /// with no manifest unit for it, and whose unit `running` runs (steering
@@ -4150,43 +4151,122 @@ mod unmanaged_tools {
         assert!(r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
     }
 
+    /// A failed list of systemd's units leaves a template's instances as they
+    /// were: a transient failure must not drop a held tool from the watch.
+    #[test]
+    fn a_failed_unit_list_keeps_a_templates_instances_watched() {
+        let inst = UnitId::service("openvpn@work");
+        let mut r = rig("openvpn@", "openvpn@work", true);
+        r.fake.w().list_fails = Some("systemctl list-units: timed out".into());
+        r.ticks(2);
+        r.fake.w().stop_out_of_band(&inst);
+        r.ticks(10);
+        assert!(r.fake.w().held.contains(&inst), "dropped from the watch: {:?}", r.core.notices);
+        r.fake.w().list_fails = None;
+        r.ticks(2);
+        assert!(r.fake.w().held.contains(&inst));
+    }
+
+    /// A hold unit is never an unmanaged tool, whatever a template in the
+    /// export would match, and a unit named exactly like the template is not
+    /// one of its instances.
+    #[test]
+    fn hold_units_and_the_bare_template_are_not_unmanaged_tools() {
+        let mut r = rig("planarian-hold@", "planarian-hold@some-vpn", true);
+        r.fake.w().units.insert(UnitId::service("planarian-hold@"), UnitSim::active(Timestamp(0)));
+        r.ticks(2);
+        assert!(r.core.unmanaged.is_empty(), "{:?}", r.core.unmanaged);
+        let mut r = rig("openvpn@", "openvpn@work", true);
+        r.fake.w().units.insert(UnitId::service("openvpn@"), UnitSim::active(Timestamp(0)));
+        r.ticks(2);
+        assert_eq!(r.core.unmanaged, BTreeSet::from([UnitId::service("openvpn@work")]));
+    }
+
+    /// A tool that cannot be observed is Unknown: neither held (it may be
+    /// running) nor lifted (it may be down).
+    #[test]
+    fn an_unobservable_unmanaged_tool_is_neither_held_nor_lifted() {
+        let vpn = UnitId::service("some-vpn");
+        // Not held while it cannot be seen, though it is protecting.
+        let mut r = rig("some-vpn", "some-vpn", true);
+        r.fake.w().observe_fails.insert(vpn.clone());
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(10);
+        assert!(!r.fake.w().held.contains(&vpn), "held what it could not see: {:?}", r.core.notices);
+        // Held, then not lifted while it cannot be seen even if it is back.
+        r.fake.w().observe_fails.clear();
+        r.ticks(3);
+        assert!(r.fake.w().held.contains(&vpn));
+        r.fake.w().observe_fails.insert(vpn.clone());
+        let now = r.fake.w().now;
+        *r.fake.w().units.get_mut(&vpn).unwrap() = UnitSim::active(now);
+        r.ticks(10);
+        assert!(r.fake.w().held.contains(&vpn), "lifted what it could not see");
+        r.fake.w().observe_fails.clear();
+        r.ticks(5);
+        assert!(!r.fake.w().held.contains(&vpn), "lifts once it can be seen running");
+    }
+
     mod props {
         use super::*;
         use proptest::prelude::*;
 
-        proptest! {
-            #![proptest_config(ProptestConfig { cases: 48, failure_persistence: None, ..ProptestConfig::default() })]
+        /// One case of the space below.
+        fn check(template: bool, steers: bool, down: u8, on_failure: bool, after: usize) -> Result<(), TestCaseError> {
+            let (export, running) = if template { ("tun@", "tun@a") } else { ("tun", "tun") };
+            let id = UnitId::service(running);
+            let mut r = rig(export, running, steers);
+            // (The fake's OnFailure= hold is unconditional; the real hold
+            // unit's condition skips a tool that protects nothing.)
+            if on_failure && steers {
+                r.fake.w().hold_on_failure.insert(id.clone());
+            }
+            match down {
+                1 => r.fake.w().stop_out_of_band(&id),
+                2 => r.fake.w().kill(&id),
+                _ => {}
+            }
+            r.ticks(after);
+            let held = steers && down > 0;
+            let case = format!("template={template} steers={steers} down={down} on_failure={on_failure} after={after}");
+            prop_assert_eq!(r.fake.w().held.contains(&id), held, "{}: {:?}", case, r.core.notices);
+            prop_assert_eq!(r.calls("restart("), 0, "{}", case);
+            prop_assert!(r.core.incidents.active_for(&id).is_none(), "{}", case);
+            prop_assert!(r.core.ledger().overrides.is_empty(), "{}", case);
+            prop_assert_eq!(says(&r, &alarm_text(running)), usize::from(held), "{}: {:?}", case, r.core.notices);
+            Ok(())
+        }
 
-            /// For any tool (plain or a template instance), protecting or
-            /// not, stopped (cleanly or killed, with or without OnFailure=)
-            /// or running, after any number of ticks: it is held exactly when
-            /// it protects traffic and is down; it is never restarted, never
-            /// an incident, never an inferred override; the alarm says so
-            /// once.
+        /// Every combination, at three lengths of time: for any tool (plain or
+        /// a template instance), protecting or not, running, stopped cleanly
+        /// or killed (with or without OnFailure=): held exactly when it
+        /// protects traffic and is down; never restarted, never an incident,
+        /// never an inferred override; alarmed once when held, never else.
+        #[test]
+        fn an_unmanaged_tool_is_held_exactly_when_it_protects_and_is_down() {
+            for template in [false, true] {
+                for steers in [false, true] {
+                    for down in 0..3 {
+                        for on_failure in [false, true] {
+                            for after in [3, 12, 40] {
+                                check(template, steers, down, on_failure, after).unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 24, failure_persistence: None, ..ProptestConfig::default() })]
+
+            /// And for any other length of time.
             #[test]
-            fn an_unmanaged_tool_is_held_exactly_when_it_protects_and_is_down(
+            fn at_any_length_of_time(
                 template in any::<bool>(), steers in any::<bool>(), down in 0u8..3, on_failure in any::<bool>(),
-                after in 3usize..40,
+                after in 3usize..80,
             ) {
-                let (export, running) = if template { ("tun@", "tun@a") } else { ("tun", "tun") };
-                let id = UnitId::service(running);
-                let mut r = rig(export, running, steers);
-                // (The fake's OnFailure= hold is unconditional; the real hold
-                // unit's condition skips a tool that protects nothing.)
-                if on_failure && steers {
-                    r.fake.w().hold_on_failure.insert(id.clone());
-                }
-                match down {
-                    1 => r.fake.w().stop_out_of_band(&id),
-                    2 => r.fake.w().kill(&id),
-                    _ => {}
-                }
-                r.ticks(after);
-                prop_assert_eq!(r.fake.w().held.contains(&id), steers && down > 0, "{:?}", r.core.notices);
-                prop_assert_eq!(r.calls("restart("), 0);
-                prop_assert!(r.core.incidents.active_for(&id).is_none());
-                prop_assert!(r.core.ledger().overrides.is_empty());
-                prop_assert!(says(&r, &alarm_text(running)) <= 1, "{:?}", r.core.notices);
+                check(template, steers, down, on_failure, after)?;
             }
         }
     }

@@ -237,9 +237,10 @@ pub struct World {
     /// Jobs `queued_jobs` reports (systemd's whole queue: a switch's stop and
     /// start jobs), and a failure of the query itself.
     pub queued_jobs: usize,
-    /// Network tools the generation exports that no manifest unit declares
-    /// (the export's `networkTools` minus the units' `holds`).
-    pub unmanaged_network_tools: BTreeSet<String>,
+    /// `list` fails (systemd's unit list cannot be read).
+    pub list_fails: Option<String>,
+    /// Units whose `observe` fails.
+    pub observe_fails: BTreeSet<UnitId>,
     /// `evaluate_built` fails (the export cannot be read).
     pub evaluate_built_fails: Option<String>,
     pub queued_jobs_fails: Option<String>,
@@ -494,7 +495,7 @@ impl World {
             declarations,
             inputs: self.base_inputs.clone(),
             services: BTreeMap::new(),
-            network_tools: units_holding.into_iter().chain(self.unmanaged_network_tools.iter().cloned()).collect(),
+            network_tools: units_holding.into_iter().collect(),
         };
         (eval, broken)
     }
@@ -857,6 +858,9 @@ impl UnitBackend for Fake {
     }
     fn observe(&self, id: &UnitId) -> Result<Observed, Outcome> {
         let w = self.w();
+        if w.observe_fails.contains(id) {
+            return Err(Outcome::Unknown("cannot observe it (scripted)".into()));
+        }
         Ok(w.units.get(&World::key(id)).map(|s| s.observed.clone()).unwrap_or(Observed::Absent))
     }
 
@@ -873,6 +877,9 @@ impl UnitBackend for Fake {
     }
 
     fn list(&self) -> Result<Vec<UnitId>, Outcome> {
+        if let Some(why) = &self.w().list_fails {
+            return Err(Outcome::Unknown(why.clone()));
+        }
         Ok(self.w().units.keys().cloned().collect())
     }
 
