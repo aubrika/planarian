@@ -271,3 +271,146 @@ pub fn classify(ev: &crate::ebpf::Event, family: u16) -> Genl {
         _ => Genl::SetUnnamed,
     }
 }
+
+/// The controller's name → id map as this watch last read it. Requests of
+/// every family (nl80211's scans, `ethtool`, taskstats) reach the probe, and
+/// each used to cost a controller dump per drain; a request whose family id
+/// is already in the map costs none. The map is read again when a request
+/// carries an id it does not hold (a module loaded since; once per id until
+/// the next tick, so a number nothing registered cannot make a dump per
+/// request) and at every tick (an id given up and reused).
+///
+/// The map is *known* only after a successful read. Until then, and after a
+/// failed read, it is unknown: [`GenlIds::family`] says so with an error,
+/// which the caller fails closed on, and an unknown map is read again at the
+/// next tick, not before. A failed read never reads as "no such family"
+/// (rule 21: nothing is derived from a failed tool).
+#[derive(Debug, Default)]
+pub struct GenlIds {
+    by_id: std::collections::BTreeMap<u16, String>,
+    /// Ids a read did not list, until the next tick.
+    unlisted: std::collections::BTreeSet<u16>,
+    /// The last read succeeded.
+    known: bool,
+}
+
+impl GenlIds {
+    /// Read the controller's list again, replacing the map (a tick, or the
+    /// first read). A failed read leaves the map unknown.
+    pub fn refresh(&mut self, fetch: &mut dyn FnMut() -> Result<Vec<(String, u16)>, String>) -> Result<(), String> {
+        self.unlisted.clear();
+        self.replace(fetch())
+    }
+
+    fn replace(&mut self, read: Result<Vec<(String, u16)>, String>) -> Result<(), String> {
+        match read {
+            Ok(list) => {
+                self.by_id = list.into_iter().map(|(n, i)| (i, n)).collect();
+                self.known = true;
+                Ok(())
+            }
+            Err(why) => {
+                self.known = false;
+                Err(why)
+            }
+        }
+    }
+
+    /// A request carried family id `id`: read the list only if the map is
+    /// known, does not hold the id, and has not been asked for it since the
+    /// last tick. An unknown map is an error (the tick reads it again).
+    pub fn ensure(
+        &mut self,
+        id: u16,
+        fetch: &mut dyn FnMut() -> Result<Vec<(String, u16)>, String>,
+    ) -> Result<(), String> {
+        if !self.known {
+            return Err("the generic netlink family list is not known".into());
+        }
+        if self.by_id.contains_key(&id) || self.unlisted.contains(&id) {
+            return Ok(());
+        }
+        self.unlisted.insert(id);
+        self.replace(fetch())?;
+        if self.by_id.contains_key(&id) {
+            self.unlisted.remove(&id);
+        }
+        Ok(())
+    }
+
+    /// The id of family `name` (`None`: it is not registered), or an error
+    /// while the map is unknown.
+    pub fn family(&self, name: &str) -> Result<Option<u16>, String> {
+        if !self.known {
+            return Err("the generic netlink family list is not known".into());
+        }
+        Ok(self.by_id.iter().find(|(_, n)| n.as_str() == name).map(|(i, _)| *i))
+    }
+}
+
+/// One generic netlink request the probe saw, given the family list kept
+/// (`ids`), applied to the tracker: the WireGuard bindings it makes, and what
+/// fails closed. Returns what to log.
+///
+/// - The request's family id is looked up if the map does not hold it
+///   (`GenlIds::ensure`). If the list cannot be read, the request cannot be
+///   told from a WireGuard one: the peers are unknown (`wireguard_unread`,
+///   cleared by a good read), **and** the unit that sent it, if it is a unit
+///   in the host's namespace, is marked lost (`lost(Some(unit))`), because
+///   the binding it may have made cannot be recovered from a later good read
+///   (a failed read must not make its unit stop protecting).
+/// - A WireGuard `SET` binds the unit to the device it names, pinned at the
+///   request from a fresh scan of the interface list (a failed scan marks
+///   the peers unknown and binds unpinned).
+#[allow(clippy::too_many_arguments)]
+pub fn take_genl(
+    t: &mut crate::model::Tracker,
+    ids: &mut GenlIds,
+    ev: &crate::ebpf::Event,
+    own_netns: u32,
+    unit: impl FnOnce() -> Option<planarian_schema::UnitId>,
+    fetch: &mut dyn FnMut() -> Result<Vec<(String, u16)>, String>,
+    scan: &mut dyn FnMut() -> Result<std::collections::BTreeMap<u32, String>, String>,
+    ifnames: &mut std::collections::BTreeMap<u32, String>,
+    read_ifnames: &mut dyn FnMut() -> std::collections::BTreeMap<u32, String>,
+) -> Vec<String> {
+    let mut log = vec![];
+    if let Some(ty) = ev.nlmsg_type()
+        && let Err(why) = ids.ensure(ty, fetch)
+    {
+        log.push(why);
+        t.wireguard_unread();
+        if ev.netns == own_netns
+            && let Some(u) = unit()
+        {
+            t.lost(Some(&u));
+        }
+        return log;
+    }
+    let Ok(Some(family)) = ids.family("wireguard") else { return log };
+    match (host_request(ev, family, own_netns), unit()) {
+        // A request from no unit (an administrator's `wg set`) binds nobody.
+        // The devices a unit configured follow their live peers, whoever
+        // changes them.
+        (Genl::Other, _) | (_, None) => {}
+        (Genl::Set(dev), Some(u)) => {
+            let found = scan().map(|m| m.into_iter().find(|(_, n)| *n == dev).map(|(i, _)| i));
+            if let Err(why) = &found {
+                log.push(why.clone());
+            }
+            t.bind_wireguard_scanned(&u, &dev, found);
+        }
+        (Genl::SetIndex(i), Some(u)) => {
+            let name = ifnames.get(&i).cloned().or_else(|| {
+                *ifnames = read_ifnames();
+                ifnames.get(&i).cloned()
+            });
+            match name {
+                Some(dev) => t.bind_wireguard_at(&u, &dev, Some(i)),
+                None => t.lost(Some(&u)),
+            }
+        }
+        (Genl::SetUnnamed, Some(u)) => t.lost(Some(&u)),
+    }
+    log
+}

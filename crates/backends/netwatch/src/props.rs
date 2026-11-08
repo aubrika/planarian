@@ -1409,3 +1409,123 @@ mod routeclassify {
         }
     }
 }
+
+// ---- the controller's id map (GenlIds) --------------------------------------
+
+mod genlids {
+    use crate::wg::GenlIds;
+    use proptest::prelude::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const NAMES: [&str; 3] = ["wireguard", "nl80211", "ethtool"];
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// A request carrying this family id reached the probe.
+        Request(u16),
+        Tick,
+        /// A module (un)loaded: the registry gains or loses a family.
+        Register(usize, u16),
+        Unregister(usize),
+        /// The next read of the controller fails.
+        FailNext,
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        proptest::collection::vec(
+            prop_oneof![
+                6 => (0x10u16..0x18).prop_map(Op::Request),
+                2 => Just(Op::Tick),
+                2 => (0..NAMES.len(), 0x10u16..0x18).prop_map(|(n, i)| Op::Register(n, i)),
+                1 => (0..NAMES.len()).prop_map(Op::Unregister),
+                1 => Just(Op::FailNext),
+            ],
+            0..40,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(super::cfg(512))]
+
+        /// The map costs a controller dump only when it must: never for an
+        /// id it holds, at most one for an id it does not (and none more for
+        /// that id until the next tick, whether the read found it or missed
+        /// it), and a tick's read leaves the map equal to the registry, so an
+        /// id given up and reused is not served stale. And a failed read is
+        /// never "no such family" (rule 21): the map is unknown from the
+        /// start and after any failed read, `family` is an error then, and
+        /// nothing reads the controller again before the tick.
+        #[test]
+        fn a_known_family_costs_no_dump_and_a_failed_read_is_never_no_such_family(ops in ops()) {
+            let mut registry: BTreeMap<usize, u16> = BTreeMap::new();
+            let mut ids = GenlIds::default();
+            let (fetches, fail) = (std::cell::Cell::new(0usize), std::cell::Cell::new(false));
+            let mut known = false;
+            // Ids asked about since the last tick that a read did not give.
+            let mut unlisted: BTreeSet<u16> = BTreeSet::new();
+            for op in &ops {
+                let reg = registry.clone();
+                let mut fetch = || {
+                    fetches.set(fetches.get() + 1);
+                    if fail.replace(false) {
+                        return Err("the controller did not answer".to_string());
+                    }
+                    Ok(reg.iter().map(|(n, i)| (NAMES[*n].to_string(), *i)).collect::<Vec<_>>())
+                };
+                match op {
+                    Op::Register(n, i) => {
+                        // A family has one id and an id one family.
+                        registry.retain(|k, v| *k != *n && *v != *i);
+                        registry.insert(*n, *i);
+                    }
+                    Op::Unregister(n) => { registry.remove(n); }
+                    Op::FailNext => fail.set(true),
+                    Op::Tick => {
+                        let failed = fail.get();
+                        let r = ids.refresh(&mut fetch);
+                        prop_assert_eq!(r.is_err(), failed);
+                        // A tick forgets what was looked for, read or not.
+                        unlisted.clear();
+                        known = !failed;
+                        if r.is_ok() {
+                            for (n, name) in NAMES.iter().enumerate() {
+                                prop_assert_eq!(ids.family(name), Ok(registry.get(&n).copied()), "{} after a tick", name);
+                            }
+                        }
+                    }
+                    Op::Request(id) => {
+                        let held = known && NAMES.iter().any(|n| ids.family(n) == Ok(Some(*id)));
+                        let (before, failing) = (fetches.get(), fail.get());
+                        let r = ids.ensure(*id, &mut fetch);
+                        let cost = fetches.get() - before;
+                        if !known {
+                            prop_assert_eq!(cost, 0, "an unknown map is read at the tick, not by a request");
+                            prop_assert!(r.is_err());
+                        } else if held {
+                            prop_assert_eq!(cost, 0, "id {:#x} was held", id);
+                            prop_assert!(r.is_ok());
+                        } else if unlisted.contains(id) {
+                            prop_assert_eq!(cost, 0, "id {:#x} was already looked for since the tick", id);
+                            prop_assert!(r.is_ok());
+                        } else {
+                            prop_assert_eq!(cost, 1, "id {:#x}, new to the map", id);
+                            unlisted.insert(*id);
+                            if failing {
+                                prop_assert!(r.is_err());
+                                known = false;
+                            } else if registry.values().any(|v| v == id) {
+                                unlisted.remove(id);
+                                prop_assert!(NAMES.iter().any(|n| ids.family(n) == Ok(Some(*id))), "found but not kept");
+                            }
+                        }
+                    }
+                }
+                // Known or not is what the caller reads: an unknown map never
+                // answers "not registered".
+                for name in NAMES {
+                    prop_assert_eq!(ids.family(name).is_err(), !known, "{} while known = {}", name, known);
+                }
+            }
+        }
+    }
+}
