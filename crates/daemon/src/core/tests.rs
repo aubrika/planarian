@@ -4702,6 +4702,66 @@ mod unmanaged_tools {
         assert!(seen_extra(&r) > before, "the rotation never resumed");
     }
 
+    /// `n` rotating tools (`x@NN`, protecting nothing) beside five always
+    /// observed ones (latched protecting); returns the rig and the rotating
+    /// names. For the budget tests.
+    fn budgeted(n: usize) -> (Rig, Vec<UnitId>) {
+        let (mut r, _) = many(5);
+        r.ticks(4);
+        assert_eq!(latched(&r), 5);
+        let extra: Vec<UnitId> = (0..n).map(|i| UnitId::service(&format!("x@{i:02}"))).collect();
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &extra {
+                w.units.insert(u.clone(), UnitSim::active(now));
+            }
+        }
+        r.core.network_tools = Some(["t@".to_string(), "x@".to_string()].into_iter().collect());
+        (r, extra)
+    }
+
+    fn times_seen(r: &Rig, units: &[UnitId]) -> Vec<u64> {
+        let w = r.fake.w();
+        units.iter().map(|u| w.observe_counts.get(u).copied().unwrap_or(0)).collect()
+    }
+
+    /// When the budget is spent the rotation yields and its cursor stays, so
+    /// that what it skipped is reached when it next runs: with a budget spent
+    /// on every second tick and sixteen rotating tools (two blocks of the cap),
+    /// every one is observed within a bounded number of ticks. (A cursor that
+    /// moved on a yield would skip a block for good.)
+    #[test]
+    fn a_yielding_rotation_still_reaches_every_tool() {
+        let (mut r, extra) = budgeted(16);
+        for t in 0..12 {
+            r.fake.w().command_cost = if t % 2 == 0 { Millis(600) } else { Millis(0) };
+            r.ticks(1);
+        }
+        let seen = times_seen(&r, &extra);
+        assert!(seen.iter().all(|n| *n >= 1), "never observed: {seen:?}");
+    }
+
+    /// Exactly the budget yields (`spent < budget` runs the rotation): the
+    /// always-observed work costing the whole of it leaves none for the
+    /// rotation, and one millisecond less does.
+    #[test]
+    fn work_that_costs_exactly_the_budget_yields_the_rotation() {
+        let budget = crate::hold::UNMANAGED_BUDGET.0;
+        let (mut r, extra) = budgeted(16);
+        // One batch call costs `command_cost`; the first tick of each setting warms nothing.
+        r.fake.w().command_cost = Millis(budget);
+        let before = times_seen(&r, &extra);
+        r.ticks(3);
+        assert_eq!(times_seen(&r, &extra), before, "the rotation ran at exactly the budget");
+        r.fake.w().command_cost = Millis(budget - 1);
+        r.ticks(3);
+        assert!(
+            times_seen(&r, &extra).iter().sum::<u64>() > before.iter().sum::<u64>(),
+            "it did not run just under it"
+        );
+    }
+
     mod props {
         use super::*;
         use proptest::prelude::*;
