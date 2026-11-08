@@ -2937,7 +2937,8 @@ mod genl_bounded {
     #[test]
     fn the_wireguard_lookups_return() {
         assert!(within(10, snapshot::wireguard_family).is_some());
-        assert!(within(10, snapshot::wireguard).is_some());
+        assert!(within(10, || snapshot::wireguard(snapshot::wireguard_family().unwrap_or(None))).is_some());
+        assert!(within(10, snapshot::families).is_some());
     }
 
     /// The regression itself (#71's gate: netwatch never signalled ready).

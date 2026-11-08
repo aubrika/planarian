@@ -266,6 +266,11 @@
 //! read as the kernel has them, after any such request and at every tick
 //! (`WG_CMD_GET_DEVICE`, a dump: `snapshot::wireguard`, parsed by
 //! `wg::devices`; the probe's 512-byte capture cannot hold several peers).
+//! Generic netlink family ids come from the controller's list, kept as
+//! `wg::GenlIds`: read at start and every tick, and again only for a request
+//! whose family id the map does not hold (once per id until the next tick),
+//! so another family's traffic (nl80211's scans) costs no dump per drain. A
+//! failed read is a loss, and the next tick reads again.
 //! GET_DEVICE dump names one interface: links are enumerated through
 //! rtnetlink, then each WireGuard interface is queried by index. In a large
 //! reply only the first chunk names the device; peer-only continuations

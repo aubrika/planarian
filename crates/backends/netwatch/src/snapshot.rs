@@ -183,16 +183,39 @@ pub(crate) fn family_id_by_name(name: &str) -> Result<Option<u16>, String> {
     }
 }
 
+/// Every family the controller lists, as (name, id): one dump, loading no
+/// module (see [`family_id`]).
+pub fn families() -> Result<Vec<(String, u16)>, String> {
+    let body = [CTRL_CMD_GETFAMILY, 1, 0, 0];
+    let reply = request(Some(netlink::GENERIC), GENL_ID_CTRL, NLM_F_DUMP, &body)
+        .map_err(|e| format!("generic netlink family list: {e}"))?;
+    Ok(families_in(&reply))
+}
+
+/// The (name, id) of each family among the controller's `NEWFAMILY` messages.
+pub fn families_in(msgs: &[Vec<u8>]) -> Vec<(String, u16)> {
+    msgs.iter()
+        .filter_map(|m| {
+            let attrs = crate::parse::attrs(m, 16 + 4)?;
+            let name = attrs.iter().find(|(t, _)| *t == CTRL_ATTR_FAMILY_NAME)?;
+            let (_, id) = attrs.iter().find(|(t, _)| *t == CTRL_ATTR_FAMILY_ID)?;
+            let id = id.get(0..2).map(|b| u16::from_ne_bytes([b[0], b[1]]))?;
+            Some((crate::parse::cstr(name.1), id))
+        })
+        .collect()
+}
+
 /// WireGuard's generic netlink family id, if the module is loaded.
 pub fn wireguard_family() -> Result<Option<u16>, String> {
     family_id("wireguard")
 }
 
 /// The WireGuard devices as the kernel has them, with their peers'
-/// endpoints (B-22 b), and the family id read on the way (`None`: no
-/// devices). The reply carries keys; [`crate::wg::devices`] reads none.
-pub fn wireguard() -> Result<(Option<u16>, Vec<crate::wg::Device>), String> {
-    let Some(family) = wireguard_family()? else { return Ok((None, vec![])) };
+/// endpoints (B-22 b), given WireGuard's family id (`None`: the module is
+/// not loaded, so no devices; the id comes from [`GenlIds`], not a lookup
+/// here). The reply carries keys; [`crate::wg::devices`] reads none.
+pub fn wireguard(family: Option<u16>) -> Result<Vec<crate::wg::Device>, String> {
+    let Some(family) = family else { return Ok(vec![]) };
     let links = dump(None, RTM_GETLINK, &[0u8; 16])?;
     let mut devices = vec![];
     for index in crate::wg::link_indices(&links)? {
@@ -201,7 +224,7 @@ pub fn wireguard() -> Result<(Option<u16>, Vec<crate::wg::Device>), String> {
             .map_err(|e| format!("wireguard device {index} dump: {e}"))?;
         devices.extend(crate::wg::devices(&msgs)?);
     }
-    Ok((Some(family), devices))
+    Ok(devices)
 }
 
 fn changes(hook: u32, msgs: Vec<Vec<u8>>, ifname: &mut dyn FnMut(u32) -> Option<String>) -> Vec<Change> {

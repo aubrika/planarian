@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 9f0dae6f8c3fc87bea6aaf972558be92b109cced1eeaba01e8185dc54c531bde # shrinks to reads = [[], [(0, {1})]]
 cc c0b5903c5cb87945385145519c256a90f4ef5e236876077f18603901a15fd67f # shrinks to steps = [Bind(0, 1), Set([])]
+cc c8577f9edbd73ad8c18ea83b24bc0a827dfa448e1274fe4434cca60530448f2d # shrinks to ops = [Request(20), FailNext, Tick, Request(20)]

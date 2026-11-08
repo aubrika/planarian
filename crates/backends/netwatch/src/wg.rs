@@ -271,3 +271,53 @@ pub fn classify(ev: &crate::ebpf::Event, family: u16) -> Genl {
         _ => Genl::SetUnnamed,
     }
 }
+
+/// The controller's name → id map as this watch last read it. Requests of
+/// every family (nl80211's scans, `ethtool`, taskstats) reach the probe, and
+/// each used to cost a controller dump per drain; a request whose family id
+/// is already in the map costs none. The map is read again when a request
+/// carries an id it does not hold (a module loaded since; once per id until
+/// the next tick, so a number nothing registered cannot make a dump per
+/// request) and at every tick (an id given up and reused). A failed read
+/// leaves the map as it was and is reported to the caller, which fails
+/// closed; the id is not asked about again before the tick either.
+#[derive(Debug, Default)]
+pub struct GenlIds {
+    by_id: std::collections::BTreeMap<u16, String>,
+    /// Ids a read did not list (or failed on), until the next tick.
+    unlisted: std::collections::BTreeSet<u16>,
+}
+
+impl GenlIds {
+    /// Read the controller's list again, replacing the map (a tick, or the
+    /// first read).
+    pub fn refresh(&mut self, fetch: &mut dyn FnMut() -> Result<Vec<(String, u16)>, String>) -> Result<(), String> {
+        self.unlisted.clear();
+        self.by_id = fetch()?.into_iter().map(|(n, i)| (i, n)).collect();
+        Ok(())
+    }
+
+    /// A request carried family id `id`: read the list only if the map does
+    /// not hold it and it has not been looked for since the last tick.
+    pub fn ensure(
+        &mut self,
+        id: u16,
+        fetch: &mut dyn FnMut() -> Result<Vec<(String, u16)>, String>,
+    ) -> Result<(), String> {
+        if self.by_id.contains_key(&id) || self.unlisted.contains(&id) {
+            return Ok(());
+        }
+        let read = fetch();
+        self.unlisted.insert(id);
+        self.by_id = read?.into_iter().map(|(n, i)| (i, n)).collect();
+        if self.by_id.contains_key(&id) {
+            self.unlisted.remove(&id);
+        }
+        Ok(())
+    }
+
+    /// The id of family `name`, as last read.
+    pub fn id(&self, name: &str) -> Option<u16> {
+        self.by_id.iter().find(|(_, n)| n.as_str() == name).map(|(i, _)| *i)
+    }
+}

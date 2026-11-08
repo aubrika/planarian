@@ -360,8 +360,10 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         Err(why)
     };
     let mut lost_seen = 0u64;
-    // WireGuard's generic netlink family id, once known (read each tick).
-    let mut wg_family: Option<u16> = crate::snapshot::wireguard_family().unwrap_or(None);
+    // The controller's family ids (`GenlIds`): read at start and every tick,
+    // and again for a request whose family id the map does not hold.
+    let mut genl_ids = crate::wg::GenlIds::default();
+    let _ = genl_ids.refresh(&mut crate::snapshot::families);
     // B-22 (a): the settings that carry DNS and proxy steering, recomputed
     // each pass they may have changed (a file changed, or external work the
     // ring delivered: a route or an interface may have moved the charge) and at
@@ -385,7 +387,6 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         let mut drained = 0;
         // A generic netlink request may have configured a WireGuard peer.
         let mut genl = false;
-        let mut family_checked = false;
         while let Some(item) = ring.next() {
             let Some(ev) = crate::ebpf::Event::parse(&item) else {
                 drained += 1;
@@ -402,19 +403,16 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
             if ev.hook == crate::ebpf::HOOK_GENL {
                 genl = true;
                 // WireGuard's family id is assigned when its module loads:
-                // an id this watch does not know is looked up again (once a
-                // drain) before the request is set aside as another family's.
-                if ev.nlmsg_type().is_some_and(|t| Some(t) != wg_family) && !family_checked {
-                    family_checked = true;
-                    match crate::snapshot::wireguard_family() {
-                        Ok(f) => wg_family = f,
-                        Err(why) => {
-                            eprintln!("netwatch: {why}");
-                            tracker.lost(None);
-                        }
-                    }
+                // an id the map does not hold is looked up again (once per id
+                // until the next tick) before the request is set aside as
+                // another family's. A known one costs no dump.
+                if let Some(t) = ev.nlmsg_type()
+                    && let Err(why) = genl_ids.ensure(t, &mut crate::snapshot::families)
+                {
+                    eprintln!("netwatch: {why}");
+                    tracker.lost(None);
                 }
-                if let Some(family) = wg_family {
+                if let Some(family) = genl_ids.id("wireguard") {
                     let unit = ev.cgpath.as_deref().and_then(unit_of_cgroup).or_else(|| cgroups.unit(ev.cgroup));
                     match (crate::wg::host_request(&ev, family, own_netns), unit) {
                         // A request from no unit (an administrator's `wg set`)
@@ -478,9 +476,9 @@ pub fn run(export: &Path, object: &Path, dir: &Path, notify: Option<&Path>) -> R
         // fails is a loss nothing can place: nothing is derived from a
         // failed tool.
         if genl || tick {
-            match crate::snapshot::wireguard() {
-                Ok((family, devices)) => {
-                    wg_family = family;
+            let listed = if tick { genl_ids.refresh(&mut crate::snapshot::families) } else { Ok(()) };
+            match listed.and_then(|()| crate::snapshot::wireguard(genl_ids.id("wireguard"))) {
+                Ok(devices) => {
                     changed |= tracker.set_wireguard(&devices);
                 }
                 Err(why) => {
