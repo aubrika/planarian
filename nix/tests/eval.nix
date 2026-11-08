@@ -365,7 +365,7 @@ pkgs.runCommand "planarian-module-eval.json" {
   echo "ok: every key path in the export survives planariad's Export, and none is filled by default ($(wc -l < paths-export) paths)"
   # And every value (prop-auditor's rule-23 note): a field parsed into a
   # different value, not only a dropped or defaulted key, is a defect.
-  vf='del(.networkTools, .networkToolsInitrd, .networkToolsUnordered) | (.units[], .userUnits[]) |= (.probes |= map(del(.flagged)))'
+  vf='del(.networkToolsInitrd, .networkToolsUnordered) | (.units[], .userUnits[]) |= (.probes |= map(del(.flagged)))'
   jq -S "$vf" $exportPath > values-export
   jq -S . parsed.json > values-read
   diff values-export values-read || { echo "export: a value differs between the export (<) and planariad's round trip (>)" >&2; exit 1; }
