@@ -337,13 +337,21 @@ pkgs.runCommand "planarian-module-eval.json" {
   echo '${builtins.toJSON expectedHolds}' | jq -c 'sort' > holds-want
   diff holds-want holds-read || { echo "export: the units planariad reads as network tools differ (above: want, read)" >&2; exit 1; }
   echo "ok: planariad reads $(jq length holds-read) network tools from the export, as the module classifies them, an instance among them"
+  # Rule 20: the list planariad reads for unmanaged tools (`networkTools`) is
+  # the module's own, in full, and not empty here (the check is not vacuous).
+  jq -c '.networkTools | sort' parsed.json > tools-read
+  jq -c '.networkTools | sort' $exportPath > tools-want
+  diff tools-want tools-read || { echo "export: planariad reads a different networkTools than the module exports (above: want, read)" >&2; exit 1; }
+  [ "$(jq length tools-read)" -gt 0 ] || { echo "export: the reference configuration has no networkTools (the check is vacuous)" >&2; exit 1; }
   # Every key path (array indices folded), both ways (the reviewer's diff):
   # one only in the export is dropped by planariad, one only in the round
-  # trip is filled by its default. The top-level network-tool lists are
-  # read raw by netwatch and the module, not through Export.
+  # trip is filled by its default. `networkToolsInitrd` and
+  # `networkToolsUnordered` are read raw by netwatch and the module, not
+  # through Export; `networkTools` is read through it too (the daemon's
+  # unmanaged tools), so it is compared like any other key.
   # (paths(scalars) would skip false and null: paths takes a predicate.)
   kp='[paths(type != "object" and type != "array") | map(if type == "number" then 0 else . end)] | unique'
-  jq -c "del(.networkTools, .networkToolsInitrd, .networkToolsUnordered) | $kp" $exportPath > keys-export
+  jq -c "del(.networkToolsInitrd, .networkToolsUnordered) | $kp" $exportPath > keys-export
   jq -c "$kp" parsed.json > keys-read
   # Exempt by name, one path: an Exec probe's `flagged` (§9, P11) is for
   # whoever reads the manifest; Rust readers show Exec from ProbeKind::Exec,
