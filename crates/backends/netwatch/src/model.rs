@@ -519,21 +519,39 @@ impl Tracker {
             if s.wireguard.is_empty() {
                 continue;
             }
-            // A binding is to a device, not to its name (B-27): one whose
-            // device is gone from a successful read, or whose name now
-            // belongs to a device with another interface index (made again
-            // between reads, by anyone), ends. A unit that configures the
-            // device again sends a request, which binds it afresh.
-            s.wireguard.retain(|name, index| match devices.iter().find(|d| &d.name == name) {
-                None => false,
-                Some(d) => match index {
-                    Some(i) => *i == d.ifindex,
-                    None => {
-                        *index = Some(d.ifindex);
-                        true
+            // A binding is to a device, not to its name (B-27). Once a read
+            // has pinned it by interface index:
+            // - the name on a device with another index (made again between
+            //   reads, by anyone) ends it;
+            // - the name gone, with the index standing under another name,
+            //   is a rename the read saw before its event did: the binding
+            //   follows the device (the event, when it comes, finds nothing
+            //   left to move);
+            // - the name gone, and the index too, is a deleted device: it
+            //   ends.
+            // A binding no read has pinned yet ends only by the device's
+            // `RTM_DELLINK` (a read without its name cannot tell a rename
+            // from a deletion). A unit that configures the device again sends
+            // a request, which binds it afresh.
+            let old = std::mem::take(&mut s.wireguard);
+            for (name, index) in old {
+                match devices.iter().find(|d| d.name == name) {
+                    Some(d) if index.is_none_or(|i| i == d.ifindex) => {
+                        s.wireguard.insert(name, Some(d.ifindex));
                     }
-                },
-            });
+                    Some(_) => {}
+                    None => match index {
+                        None => {
+                            s.wireguard.insert(name, None);
+                        }
+                        Some(i) => {
+                            if let Some(d) = devices.iter().find(|d| d.ifindex == i) {
+                                s.wireguard.insert(d.name.clone(), Some(i));
+                            }
+                        }
+                    },
+                }
+            }
             let now: BTreeSet<Endpoint> = devices
                 .iter()
                 .filter(|d| s.wireguard.contains_key(&d.name))

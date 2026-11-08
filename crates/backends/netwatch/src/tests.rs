@@ -2730,7 +2730,9 @@ mod wireguard {
     }
 
     fn dev(name: &str, eps: &[Endpoint]) -> Device {
-        Device { name: name.into(), ifindex: 10, endpoints: eps.to_vec() }
+        // One interface index per name, as the kernel has.
+        let ifindex = 10 + name.bytes().map(u32::from).sum::<u32>() % 1000;
+        Device { name: name.into(), ifindex, endpoints: eps.to_vec() }
     }
 
     /// The footprint of the unit that configured a tunnel carries that
@@ -2764,7 +2766,10 @@ mod wireguard {
         let claims = t.claims();
         assert!(!claims.wireguard.contains(&(a.clone(), "wga".to_string())), "ended with its device");
         assert!(claims.wireguard.contains(&(b.clone(), "wgb".to_string())));
-        assert!(claims.wireguard_index.contains(&(b.clone(), "wgb".to_string(), 10)), "pinned to the device read");
+        assert!(
+            claims.wireguard_index.contains(&(b.clone(), "wgb".to_string(), dev("wgb", &[]).ifindex)),
+            "pinned to the device read"
+        );
     }
 
     /// B-27: the old unit's binding ends with its device. A device of the
@@ -2794,6 +2799,35 @@ mod wireguard {
             after.set_wireguard(&[dev_at(12, &[e1])]);
             assert!(after.footprint(&b, NOW).endpoints.is_empty(), "gap {gap}: a device made while the watch was down");
         }
+    }
+
+    /// vm-netwatch (s) 1c, catalog run 42479947756: a rename the read sees
+    /// before its event does. The binding follows the device by its index,
+    /// and the event, when it comes, changes nothing.
+    #[test]
+    fn a_rename_a_read_sees_first_keeps_the_binding() {
+        let a = UnitId::service("wg-quick-a");
+        let (e1, e2) = (udp("192.0.2.7", 51820), udp("198.51.100.9", 1));
+        let named = |name: &str, eps: &[Endpoint]| Device { name: name.into(), ifindex: 10, endpoints: eps.to_vec() };
+        let mut t = Tracker::default();
+        t.bind_wireguard(&a, "nwwg0");
+        t.set_wireguard(&[named("nwwg0", &[e1])]);
+        // The kernel renamed it; the next read shows the new name, a peer
+        // changed too; the rename's event has not been drained yet.
+        t.set_wireguard(&[named("nwwg1", &[e2])]);
+        assert_eq!(t.footprint(&a, NOW).endpoints, [e2].into(), "the binding followed the device");
+        assert!(t.claims().wireguard.contains(&(a.clone(), "nwwg1".to_string())));
+        // The event arrives: nothing left to move.
+        t.rename_interface("nwwg0", "nwwg1");
+        t.set_wireguard(&[named("nwwg1", &[e2])]);
+        assert_eq!(t.footprint(&a, NOW).endpoints, [e2].into());
+        assert_eq!(t.claims().wireguard, vec![(a.clone(), "nwwg1".to_string())]);
+        // A binding no read has pinned yet survives a read without its name
+        // (it cannot be told from a rename); its DELLINK ends it.
+        let mut u = Tracker::default();
+        u.bind_wireguard(&a, "nwwg0");
+        u.set_wireguard(&[]);
+        assert!(u.claims().wireguard.contains(&(a.clone(), "nwwg0".to_string())));
     }
 
     /// RTM_DELLINK for `name` at `index`, from the host's netns.

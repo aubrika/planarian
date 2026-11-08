@@ -935,12 +935,21 @@ mod wgfold {
                             if bound[i].is_empty() {
                                 continue;
                             }
-                            let seen = bound[i].clone();
+                            // Mirror of the rule (model.rs): by name, else by the
+                            // pinned index under another name, else by nothing.
+                            let seen = std::mem::take(&mut bound[i]);
                             for (d, index) in seen {
                                 match r.iter().find(|(x, _, _)| *x == d) {
-                                    None => { bound[i].remove(&d); }
-                                    Some((_, now, _)) if index.is_some_and(|was| was != *now) => { bound[i].remove(&d); }
-                                    Some((_, now, _)) => { bound[i].insert(d, Some(*now)); }
+                                    Some((_, now, _)) if index.is_none_or(|was| was == *now) => { bound[i].insert(d, Some(*now)); }
+                                    Some(_) => {}
+                                    None => match index {
+                                        None => { bound[i].insert(d, None); }
+                                        Some(was) => {
+                                            if let Some((x, _, _)) = r.iter().find(|(_, now, _)| *now == was) {
+                                                bound[i].insert(*x, Some(was));
+                                            }
+                                        }
+                                    },
                                 }
                             }
                             want[i] = r.iter().filter(|(d, _, _)| bound[i].contains_key(d)).flat_map(|(_, _, e)| e.iter().map(|n| ep(*n))).collect();
