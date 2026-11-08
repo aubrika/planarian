@@ -769,7 +769,8 @@ impl Fake {
         let running: Vec<UnitId> = tools
             .iter()
             .filter(|u| {
-                !u.name.contains('@') || w.units.get(&World::key(u)).is_some_and(|s| s.observed == Observed::Active)
+                planarian_backend_netwatch::host::footprint_outlives_the_unit(u)
+                    || w.units.get(&World::key(u)).is_some_and(|s| s.observed == Observed::Active)
             })
             .cloned()
             .collect();

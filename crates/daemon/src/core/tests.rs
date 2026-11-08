@@ -4479,6 +4479,42 @@ mod unmanaged_tools {
         }
     }
 
+    /// A plain tool keeps its footprint when it stops (netwatch writes it
+    /// whether the tool runs or not), so what netwatch reports for it is the
+    /// word, not the latch: one latched as protecting nothing that begins to
+    /// steer and is then killed or stopped is held on the next tick, though
+    /// the daemon had last seen it protect nothing.
+    #[test]
+    fn a_plain_tool_that_began_to_steer_is_held_on_netwatchs_word_not_the_latch() {
+        for kill in [true, false] {
+            let vpn = UnitId::service("some-vpn");
+            let mut r = rig("some-vpn", "some-vpn", false);
+            r.ticks(2);
+            assert_eq!(r.core.unmanaged_latch.get(&vpn), Some(&false), "kill={kill}");
+            r.fake.w().steers_traffic(&vpn);
+            if kill {
+                r.fake.w().kill(&vpn);
+            } else {
+                r.fake.w().stop_out_of_band(&vpn);
+            }
+            r.ticks(1);
+            assert!(r.fake.w().held.contains(&vpn), "kill={kill}: {:?}", r.core.notices);
+        }
+    }
+
+    /// And a plain tool that netwatch reports protecting nothing is not held
+    /// when it stops, whatever the daemon has or has not seen of it (a tool
+    /// that steers nothing protects nothing, §12d).
+    #[test]
+    fn a_plain_tool_netwatch_reports_protecting_nothing_is_not_held_when_it_stops() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", false);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(6);
+        assert!(!r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
+        assert_eq!(says(&r, &alarm_text("some-vpn")), 0);
+    }
+
     mod props {
         use super::*;
         use proptest::prelude::*;

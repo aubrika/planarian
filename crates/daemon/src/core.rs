@@ -1071,8 +1071,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         };
         let all: Vec<UnitId> = self.unmanaged.iter().cloned().collect();
         let (must, rest): (Vec<UnitId>, Vec<UnitId>) = all.into_iter().partition(|u| standing(self, u));
-        let (every, rotate): (Vec<UnitId>, Vec<UnitId>) =
-            rest.into_iter().partition(|u| self.unmanaged_latch.get(u) == Some(&true));
+        // A plain tool's footprint is netwatch's own word whether it runs or
+        // not, so one reported protecting is looked at every tick; an
+        // instance's is gone when it stops, so its latch says.
+        let (every, rotate): (Vec<UnitId>, Vec<UnitId>) = rest.into_iter().partition(|u| {
+            self.unmanaged_latch.get(u) == Some(&true)
+                || (planarian_backend_netwatch::host::footprint_outlives_the_unit(u) && s.protecting.contains(u))
+        });
         let take = rotate.len().min(crate::hold::UNMANAGED_OBSERVE_PER_TICK);
         let start = if rotate.is_empty() { 0 } else { self.unmanaged_cursor % rotate.len() };
         self.unmanaged_cursor = start + take;
@@ -1093,22 +1098,19 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             let observed = match self.b.units().observe(&u) {
                 Ok(raw) => {
                     let seen = crate::hold::unmanaged_observed(raw.clone(), self.b.units().ended_by(&u), held);
+                    let down =
+                        matches!(seen, Observed::Failed(_) | Observed::Absent | Observed::Bound | Observed::Detected);
                     if raw == Observed::Active {
                         // Running: what netwatch says it protects now is its latch.
                         self.unmanaged_latch.insert(u.clone(), s.protecting.contains(&u));
-                    } else if matches!(
-                        seen,
-                        Observed::Failed(_) | Observed::Absent | Observed::Bound | Observed::Detected
-                    ) && self.unmanaged_latch.get(&u) == Some(&false)
+                    } else if down
+                        && !planarian_backend_netwatch::host::footprint_outlives_the_unit(&u)
+                        && self.unmanaged_latch.get(&u) == Some(&false)
                     {
-                        // Down, and it protected nothing when it ran.
+                        // A stopped instance has no footprint, so netwatch's
+                        // "protecting" for it is only the fail-closed
+                        // default; it protected nothing when it ran.
                         s.protecting.remove(&u);
-                    } else if matches!(
-                        seen,
-                        Observed::Failed(_) | Observed::Absent | Observed::Bound | Observed::Detected
-                    ) {
-                        // Down, protected or never recorded: fail closed.
-                        s.protecting.insert(u.clone());
                     }
                     seen
                 }
