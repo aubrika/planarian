@@ -305,6 +305,8 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// reached.
     unmanaged_latch: BTreeMap<UnitId, bool>,
     unmanaged_cursor: usize,
+    /// The last `list` of systemd's units for template instances, and when.
+    unmanaged_listed: Option<(Timestamp, Option<Vec<UnitId>>)>,
     unmanaged_many_noted: bool,
     /// A switch outside Planarian seen at `.0`: its stops and starts follow
     /// the profile change by more than a tick, so they stay explained until
@@ -510,6 +512,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             unmanaged_unreadable_noted: false,
             unmanaged_latch: BTreeMap::new(),
             unmanaged_cursor: 0,
+            unmanaged_listed: None,
             unmanaged_many_noted: false,
             switch_window: None,
             next_gc_check: Timestamp(0),
@@ -685,7 +688,22 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             }
         }
         let Some(tools) = self.network_tools.clone() else { return };
-        let listed = if tools.iter().any(|t| t.ends_with('@')) { self.b.units().list().ok() } else { None };
+        // `observe` runs several times a tick, and listing systemd's units is
+        // a command: once a tick is enough (a failed list stays failed that
+        // long, and keeps the previous instances).
+        let now = self.b.clock().now();
+        let listed = if tools.iter().any(|t| t.ends_with('@')) {
+            match &self.unmanaged_listed {
+                Some((at, l)) if now.0 < at.0 + planarian_state::TICK.0 => l.clone(),
+                _ => {
+                    let l = self.b.units().list().ok();
+                    self.unmanaged_listed = Some((now, l.clone()));
+                    l
+                }
+            }
+        } else {
+            None
+        };
         self.unmanaged = crate::hold::unmanaged_set(&tools, listed.as_deref(), &self.unmanaged, keep, defs);
         self.unmanaged_latch.retain(|u, _| self.unmanaged.contains(u));
     }

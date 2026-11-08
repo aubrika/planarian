@@ -4544,6 +4544,56 @@ mod unmanaged_tools {
         }
     }
 
+    /// A managed network tool killed while unmanaged tools are watched: its
+    /// alarm is the managed one, exactly once, and no unmanaged alarm is
+    /// raised (the unmanaged path must not swallow, duplicate or take over
+    /// the managed tool's hold episode).
+    #[test]
+    fn a_killed_managed_tool_raises_one_managed_alarm_beside_unmanaged_ones() {
+        let web = UnitId::service("gym-web");
+        let mut r = rig_with_network_tool(true, true);
+        let names: Vec<UnitId> = (0..12).map(|i| UnitId::service(&format!("u{i:02}"))).collect();
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &names {
+                w.units.insert(u.clone(), UnitSim::active(now));
+            }
+        }
+        r.core.network_tools = Some(names.iter().map(|u| u.name.clone()).chain(["t@".to_string()]).collect());
+        r.ticks(4);
+        assert!(!r.core.unmanaged.is_empty() && !r.core.unmanaged.contains(&web), "{:?}", r.core.unmanaged);
+        r.fake.w().kill(&web);
+        r.ticks(1);
+        assert!(r.fake.w().held.contains(&web), "precondition: OnFailure= held it");
+        r.ticks(10);
+        assert_eq!(hold_alarms(&r, &web), 1, "{:?}", r.core.notices);
+        assert!(
+            !r.core.notices.iter().any(|n| n.contains("not managed by Planarian")),
+            "an unmanaged alarm: {:?}",
+            r.core.notices
+        );
+        assert!(r.calls("restart(service:gym-web)") >= 1);
+        r.ticks(10);
+        assert!(!r.fake.w().held.contains(&web), "the hold lifts once it is back");
+    }
+
+    /// `observe` runs several times a tick; systemd's unit list is a command,
+    /// so it is read once a tick, not on each observe.
+    #[test]
+    fn the_unit_list_is_read_once_a_tick() {
+        let mut r = rig("openvpn@", "openvpn@work", true);
+        let before = r.fake.w().list_calls;
+        for _ in 0..4 {
+            r.ticks(1);
+            let _ = r.core.observe();
+            let _ = r.core.observe();
+        }
+        let calls = r.fake.w().list_calls - before;
+        assert!(calls <= 4, "{calls} lists in 4 ticks");
+        assert!(calls >= 3, "{calls}: it is still read");
+    }
+
     mod props {
         use super::*;
         use proptest::prelude::*;

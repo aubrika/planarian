@@ -237,8 +237,9 @@ pub struct World {
     /// Jobs `queued_jobs` reports (systemd's whole queue: a switch's stop and
     /// start jobs), and a failure of the query itself.
     pub queued_jobs: usize,
-    /// `list` fails (systemd's unit list cannot be read).
+    /// `list` fails (systemd's unit list cannot be read), and how often it was called.
     pub list_fails: Option<String>,
+    pub list_calls: u64,
     /// Units whose `observe` fails.
     pub observe_fails: BTreeSet<UnitId>,
     /// How many times each unit was observed (`observe`).
@@ -890,6 +891,7 @@ impl UnitBackend for Fake {
     }
 
     fn list(&self) -> Result<Vec<UnitId>, Outcome> {
+        self.w().list_calls += 1;
         if let Some(why) = &self.w().list_fails {
             return Err(Outcome::Unknown(why.clone()));
         }
