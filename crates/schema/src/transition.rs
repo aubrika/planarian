@@ -200,6 +200,11 @@ pub struct DerivedFacts {
     /// The target generation (revert, rollback, switch) is below the security floor (§12e).
     #[serde(default)]
     pub below_security_floor: bool,
+    /// Decisive journal format, kinds or fields the target cannot read
+    /// (§12c). Derived from the retained journal and the target build, and
+    /// bound into approvals; an incompatible target needs an administrator.
+    #[serde(default)]
+    pub journal_incompatibility: Vec<String>,
     /// A system-scope effect reaches another uid's online or active session (§11).
     #[serde(default)]
     pub other_sessions_affected: bool,

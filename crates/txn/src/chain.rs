@@ -1,7 +1,8 @@
 //! The journal's hash chain as a decision (I18), apart from the I/O in
 //! `journal.rs`. Hashing stays outside: SHA-256 is trusted (P5), so each
 //! record enters as a `Link` carrying the head it claims to follow (`prev`)
-//! and the head after it (`next`, from `journal::chain`). What is proved here
+//! and the head after it (`next`, from the frame-format-specific commitment
+//! in `journal`). What is proved here
 //! is everything else: a record follows exactly when its seq is the next one
 //! and its `prev` is the current head; a segment is accepted exactly when
 //! every record follows, and otherwise the first that does not is reported;
@@ -18,7 +19,8 @@ pub struct Link {
     pub seq: u64,
     /// The chain head this record says it follows.
     pub prev: Hash,
-    /// The chain head after it: SHA-256(`prev` ‖ `seq` ‖ payload).
+    /// The chain head after it: SHA-256 of the format's commitment, including
+    /// the record class for format 3.
     pub next: Hash,
 }
 
@@ -208,8 +210,8 @@ pub proof fn appending_keeps_the_chain(last: u64, head: Hash, links: Seq<Link>, 
     }
 }
 
-/// An edit is caught: if a record's `next` changes (its payload was edited,
-/// so its hash changed, P5) while the record after it is untouched, the
+/// An edit is caught: if a record's `next` changes (its payload or class
+/// was edited, so its hash changed, P5) while the record after it is untouched, the
 /// segment no longer verifies.
 pub proof fn an_edited_record_breaks_the_chain(last: u64, head: Hash, links: Seq<Link>, i: int, edited: Hash)
     requires

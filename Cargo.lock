@@ -2483,6 +2483,7 @@ version = "0.0.0"
 dependencies = [
  "planarian-fake",
  "planarian-schema",
+ "proptest",
  "serde",
  "serde_json",
 ]

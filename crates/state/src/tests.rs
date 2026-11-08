@@ -214,3 +214,72 @@ fn a_measurement_probe_runs_at_most_once_per_its_per() {
         assert!(ran_at(&s).0 - last.0 < per.0);
     }
 }
+
+/// Property test for the cadence scheduler's Measurement rate (catch-up
+/// coverage, `docs/regression-ledger.md` C16). P10 (#18): a Measurement
+/// probe's `per` was read nowhere, so it could run on every tick. Stated
+/// whole: for any `per`, any cadence, and requests or re-observes on any
+/// ticks, a run nobody asked for comes at least `per` after the one before
+/// it and no later than its interval and a tick, and a run asked for comes
+/// on the next tick (§10 binds `per` to the cadence only).
+/// `PROPTEST_CASES` goes deeper.
+mod rate_props {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::Config;
+
+    fn config() -> Config {
+        let cases = std::env::var("PROPTEST_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(64);
+        Config { cases, failure_persistence: None, ..Config::default() }
+    }
+
+    proptest! {
+        #![proptest_config(config())]
+
+        #[test]
+        fn a_measurement_runs_at_its_rate_unless_asked(
+            per_s in 1..90u64,
+            every_s in prop_oneof![Just(None), (1..40u64).prop_map(Some)],
+            asks in proptest::collection::vec(prop_oneof![8 => Just(0u8), 1 => Just(1), 1 => Just(2)], 40..80),
+        ) {
+            let web = UnitId::service("gym-web");
+            let http = ProbeId("gym-web-http".into());
+            let per = Millis::secs(per_s);
+            let mut units = fixtures::gym_units();
+            let mut base = TICK;
+            for p in units.get_mut(&web).unwrap().probes.iter_mut().filter(|p| p.id == http) {
+                p.side_effects = SideEffects::Measurement { bytes_max: 4096, per };
+                if let Some(e) = every_s {
+                    p.cadence = Cadence::Every(Millis::secs(e));
+                    base = Millis::secs(e);
+                }
+                prop_assume!(p.cost != ProbeCost::WakesHardware);
+            }
+            let interval = base.0.max(per.0);
+            let fake = gym_world(MemStore::new(1 << 20));
+            let mut a = Assembler::new(Manifest { units, user_units: fixtures::gym_user_units() }, fixtures::canonical());
+            let ran_at = |s: &SystemState| s.units[&web].1.iter().find(|e| e.probe == http).map(|e| e.at);
+            let mut last = ran_at(&tick(&fake, &mut a).0).expect("it runs at start");
+            for ask in asks {
+                match ask {
+                    1 => a.request(&web, &http),
+                    2 => a.reprobe(&web),
+                    _ => {}
+                }
+                let s = tick(&fake, &mut a).0;
+                let now = fake.w().now;
+                let at = ran_at(&s).expect("evidence");
+                if ask != 0 {
+                    prop_assert_eq!(at, now, "a run asked for was held back");
+                } else {
+                    // Check the gap before updating `last`, including ticks on which the probe ran.
+                    prop_assert!(now.0 - last.0 <= interval + TICK.0, "a cadence gap of {} ms exceeds interval {interval} ms plus a tick", now.0 - last.0);
+                    if at == now {
+                        prop_assert!(at.0 - last.0 >= per.0, "a cadence run {} ms after the last (per {} ms)", at.0 - last.0, per.0);
+                    }
+                }
+                last = at;
+            }
+        }
+    }
+}

@@ -67,6 +67,7 @@ fn base(caller_uid: u32, flags: [bool; 6], removes_sensitivity: Sensitivities) -
         changes_desired: flags[2],
         touches_core: flags[3],
         below_security_floor: flags[4],
+        journal_incompatibility: Vec::new(),
         other_sessions_affected: flags[5],
         affected_sessions: Vec::new(),
         restores_unattributed_stop: false,

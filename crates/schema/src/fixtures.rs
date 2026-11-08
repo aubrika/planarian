@@ -63,6 +63,7 @@ pub fn empty_state(now: u64) -> SystemState {
         resources: Resources::default(),
         core_hash: Hash::ZERO,
         holds: Default::default(),
+        protecting: Default::default(),
         observed_at: Timestamp(now),
     }
 }

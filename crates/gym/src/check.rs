@@ -468,6 +468,21 @@ pub fn judge(e: &Evidence, post: &T) -> Verdict {
                 Some(_) => {}
                 None => v.unchecked.push(key.clone()),
             },
+            // §12d: the units whose traffic was held at any time in the
+            // window (the journal's `HoldApplied`), and those still held at
+            // the end, each exactly.
+            "holds_seen" | "holds_at_end" => {
+                let want: BTreeSet<UnitId> =
+                    val.as_array().map(|a| a.iter().filter_map(|u| u.as_str()).map(unit).collect()).unwrap_or_default();
+                let got: BTreeSet<UnitId> = if key == "holds_seen" {
+                    e.ledger.hold_events.iter().filter(|(_, on)| *on).map(|(u, _)| u.clone()).collect()
+                } else {
+                    e.ledger.holds()
+                };
+                if got != want {
+                    fail(&mut v, format!("{key}: {got:?}, expected {want:?}"));
+                }
+            }
             "override_file" => match (val.as_str(), &e.third_party_override) {
                 (Some("third-party"), Some(h)) => {
                     if e.override_hash != Some(*h) {
