@@ -3991,3 +3991,35 @@ mod switch_window_busy {
         assert!(inferred_after(640, |_| {}, failing));
     }
 }
+
+/// C16 (docs/regression-ledger.md): the daemon's own re-observe of a unit
+/// under a diagnostic incident is nobody's request, so a Measurement probe of
+/// that unit still runs at most once per its `per`. (`Assembler::reprobe`,
+/// which the tick called for it, ran the probe on every tick.)
+#[test]
+fn a_diagnostic_incident_does_not_run_a_measurement_probe_inside_its_per() {
+    let mut r = Rig::new();
+    let web = UnitId::service("gym-web");
+    let http = ProbeId("gym-web-http".into());
+    let mut m = r.core.asm.manifest().clone();
+    for p in m.units.get_mut(&web).unwrap().probes.iter_mut().filter(|p| p.id == http) {
+        p.side_effects = SideEffects::Measurement { bytes_max: 4096, per: Millis::secs(60) };
+    }
+    r.core.asm.set_manifest(m);
+    r.ticks(2);
+    // Its health answer is slow: Unknown, a diagnostic incident, re-observed.
+    r.fake.w().units.get_mut(&web).unwrap().health = planarian_fake::Health::Delay(Millis::secs(60));
+    let ran_at = |r: &mut Rig| {
+        let (s, _) = r.core.observe();
+        s.units[&web].1.iter().find(|e| e.probe == http).map(|e| e.at)
+    };
+    let mut runs = std::collections::BTreeSet::new();
+    for _ in 0..40 {
+        r.ticks(1);
+        runs.extend(ran_at(&mut r));
+    }
+    assert!(r.core.incidents.diagnostic().iter().any(|i| i.target == web), "a diagnostic incident was open");
+    // 40 ticks = 200 s: at most 4 runs at one per 60 s (and the probe's own
+    // hang time stretches ticks, so fewer).
+    assert!(runs.len() <= 5, "the Measurement probe ran {} times in 200 s with per = 60 s", runs.len());
+}

@@ -202,6 +202,14 @@ fn a_measurement_probe_runs_at_most_once_per_its_per() {
     for w in runs.windows(2) {
         assert!(w[1].0 - w[0].0 >= per.0, "two cadence runs {} ms apart: {runs:?}", w[1].0 - w[0].0);
     }
+    // The daemon's own re-observe of a diagnostic incident is nobody's
+    // request: right after a cadence run it leaves the Measurement probe on
+    // its cadence (no run inside `per`).
+    while ran_at(&tick(&fake, &mut a).0) != fake.w().now {}
+    let last = fake.w().now;
+    a.reobserve(&web);
+    let s = tick(&fake, &mut a).0;
+    assert_eq!(ran_at(&s), last, "an internal re-observe ran a Measurement probe inside its per");
     // On request, or a re-observe, right after a cadence run: it runs on the
     // next tick, well inside the window.
     let asks: [fn(&mut Assembler, &UnitId, &ProbeId); 2] = [|a, u, p| a.request(u, p), |a, u, _| a.reprobe(u)];
@@ -240,7 +248,7 @@ mod rate_props {
         fn a_measurement_runs_at_its_rate_unless_asked(
             per_s in 1..90u64,
             every_s in prop_oneof![Just(None), (1..40u64).prop_map(Some)],
-            asks in proptest::collection::vec(prop_oneof![8 => Just(0u8), 1 => Just(1), 1 => Just(2)], 40..80),
+            asks in proptest::collection::vec(prop_oneof![8 => Just(0u8), 1 => Just(1), 1 => Just(2), 2 => Just(3)], 40..80),
         ) {
             let web = UnitId::service("gym-web");
             let http = ProbeId("gym-web-http".into());
@@ -264,12 +272,15 @@ mod rate_props {
                 match ask {
                     1 => a.request(&web, &http),
                     2 => a.reprobe(&web),
+                    // The daemon's own re-observe: never a run nobody asked
+                    // for inside `per`; the cadence checks below hold.
+                    3 => a.reobserve(&web),
                     _ => {}
                 }
                 let s = tick(&fake, &mut a).0;
                 let now = fake.w().now;
                 let at = ran_at(&s).expect("evidence");
-                if ask != 0 {
+                if ask == 1 || ask == 2 {
                     prop_assert_eq!(at, now, "a run asked for was held back");
                 } else {
                     // Check the gap before updating `last`, including ticks on which the probe ran.
@@ -282,4 +293,40 @@ mod rate_props {
             }
         }
     }
+}
+
+/// The daemon's own re-observe still re-runs what is not a Measurement: a
+/// slow-cadence Readiness probe runs on the next tick (the diagnostic
+/// incident's point), while a Measurement probe of the same unit stays on its
+/// cadence.
+#[test]
+fn an_internal_reobserve_reruns_readiness_probes_but_not_measurements() {
+    let web = UnitId::service("gym-web");
+    let http = ProbeId("gym-web-http".into());
+    let tcp = ProbeId("gym-web-tcp".into());
+    let mut units = fixtures::gym_units();
+    for p in units.get_mut(&web).unwrap().probes.iter_mut() {
+        p.cadence = Cadence::Every(Millis::secs(120));
+        p.side_effects = if p.id == http {
+            SideEffects::Measurement { bytes_max: 4096, per: Millis::secs(30) }
+        } else {
+            SideEffects::None
+        };
+    }
+    let fake = gym_world(MemStore::new(1 << 20));
+    let mut a = Assembler::new(Manifest { units, user_units: fixtures::gym_user_units() }, fixtures::canonical());
+    let at = |s: &SystemState, id: &ProbeId| s.units[&web].1.iter().find(|e| e.probe == *id).map(|e| e.at).unwrap();
+    let first = tick(&fake, &mut a).0;
+    let (h0, t0) = (at(&first, &http), at(&first, &tcp));
+    let _ = tick(&fake, &mut a);
+    a.reobserve(&web);
+    let s = tick(&fake, &mut a).0;
+    assert_eq!(at(&s, &http), h0, "the Measurement probe was run by an internal re-observe");
+    assert!(
+        at(&s, &tcp) > t0,
+        "the Readiness probe was not re-run: {:?} vs {:?} now {:?}",
+        at(&s, &tcp),
+        t0,
+        fake.w().now
+    );
 }

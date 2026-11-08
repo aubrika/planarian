@@ -166,9 +166,22 @@ impl Assembler {
         self.on_demand.insert((unit.clone(), probe.clone()));
     }
 
-    /// Re-run every Readiness probe of `unit` now (diagnostic incident: re-observe).
+    /// A run someone asked for: every probe of `unit` runs on the next tick,
+    /// a Measurement probe too (§10 binds `per` to the cadence only).
     pub fn reprobe(&mut self, unit: &UnitId) {
         self.last_run.retain(|(u, _), _| u != unit);
+    }
+
+    /// The daemon's own re-observe of a unit under a diagnostic incident: as
+    /// `reprobe`, except that a Measurement probe keeps its place in the
+    /// cadence, so `per` still holds (C16: nobody asked for these runs).
+    pub fn reobserve(&mut self, unit: &UnitId) {
+        let measured: BTreeSet<ProbeId> = self
+            .defs()
+            .get(unit)
+            .map(|d| d.probes.iter().filter(|p| per(p).is_some()).map(|p| p.id.clone()).collect())
+            .unwrap_or_default();
+        self.last_run.retain(|(u, p), _| u != unit || measured.contains(p));
     }
 
     fn interval(&self, p: &ProbeDef) -> Option<Millis> {

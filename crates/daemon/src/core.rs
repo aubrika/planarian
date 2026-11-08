@@ -2139,7 +2139,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
         let diag: Vec<UnitId> = self.incidents.diagnostic().iter().map(|i| i.target.clone()).collect();
         for t in diag {
-            self.asm.reprobe(&t);
+            self.asm.reobserve(&t);
         }
 
         let l = self.ledger();
