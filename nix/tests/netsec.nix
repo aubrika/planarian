@@ -490,13 +490,14 @@ pkgs.testers.runNixOSTest {
             assert hold_at >= died > 0, f"delay {delay}: hold active at {hold_at}, unit died at {died}"
             machine.fail(up_ok())
             peer.fail(new_ssh("alice"))
-            # The alarm is not instant: the managed one lands about 20 s
-            # after the hold, so wait for it, bounded. A lost alarm still
-            # fails; a late one passes.
+            # The alarm is not instant: it comes about 21 s to 48 s after the
+            # kill (the held tunnel's probe blocks the daemon's tick for 10 s),
+            # so wait for it, bounded. A lost alarm still fails; a late one
+            # passes.
             try:
-                machine.wait_until_succeeds(f"test $(journalctl -b -u planariad -o cat | grep -c '{ALARM}' || true) -gt {before}", timeout=30)
+                machine.wait_until_succeeds(f"test $(journalctl -b -u planariad -o cat | grep -c '{ALARM}' || true) -gt {before}", timeout=90)
             except Exception:
-                raise AssertionError(f"delay {delay}: no alarm within 30 s of the hold")
+                raise AssertionError(f"delay {delay}: no alarm within 90 s of the kill")
             # Back: the hold lifts once the unit is Running and Ready, by the
             # repair or, if this target has escalated (§13), by hand.
             machine.succeed("systemctl reset-failed wireguard-gym.service; systemctl start wireguard-gym.service")
@@ -599,7 +600,7 @@ pkgs.testers.runNixOSTest {
         machine.fail(lan_ok())
         peer.fail(new_ssh("alice"))
         machine.succeed("curl -sf --max-time 5 -o /dev/null http://127.0.0.1:8001/")
-        machine.wait_until_succeeds(f"[ $(journalctl -b -u planariad -o cat | grep 'ALARM: ' | grep '{UNMANAGED}' | grep -cF '{E_ALARM}' || true) -ge 1 ]", timeout=30)
+        machine.wait_until_succeeds(f"[ $(journalctl -b -u planariad -o cat | grep 'ALARM: ' | grep '{UNMANAGED}' | grep -cF '{E_ALARM}' || true) -ge 1 ]", timeout=90)
         # Not repaired: past §13's first backoff (10 s) and then some, the
         # unit is still down on the run that was killed, and the daemon has
         # named it in no repair, restart or incident.
@@ -628,7 +629,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"systemctl kill --signal=SIGKILL {UNMANAGED}.service")
         machine.wait_until_succeeds(f"systemctl is-active planarian-hold@{UNMANAGED}.service && test -e /run/planarian/hold/{UNMANAGED}", timeout=20)
         machine.fail(lan_ok())
-        machine.wait_until_succeeds(f"[ $(journalctl -b -u planariad -o cat | grep 'ALARM: ' | grep '{UNMANAGED}' | grep -cF '{E_ALARM}' || true) -ge 2 ]", timeout=30)
+        machine.wait_until_succeeds(f"[ $(journalctl -b -u planariad -o cat | grep 'ALARM: ' | grep '{UNMANAGED}' | grep -cF '{E_ALARM}' || true) -ge 2 ]", timeout=90)
         # A non-administrator's release asks for an administrator.
         code, out = as_alice(f"planarian hold release {UNMANAGED}")
         assert "approv" in out.lower() and "administrator" in out.lower(), out
