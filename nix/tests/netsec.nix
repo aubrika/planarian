@@ -490,7 +490,13 @@ pkgs.testers.runNixOSTest {
             assert hold_at >= died > 0, f"delay {delay}: hold active at {hold_at}, unit died at {died}"
             machine.fail(up_ok())
             peer.fail(new_ssh("alice"))
-            assert alarms() > before, f"delay {delay}: no alarm"
+            # The alarm is not instant: the managed one lands about 20 s
+            # after the hold, so wait for it, bounded. A lost alarm still
+            # fails; a late one passes.
+            try:
+                machine.wait_until_succeeds(f"test $(journalctl -b -u planariad -o cat | grep -c '{ALARM}' || true) -gt {before}", timeout=30)
+            except Exception:
+                raise AssertionError(f"delay {delay}: no alarm within 30 s of the hold")
             # Back: the hold lifts once the unit is Running and Ready, by the
             # repair or, if this target has escalated (§13), by hand.
             machine.succeed("systemctl reset-failed wireguard-gym.service; systemctl start wireguard-gym.service")
