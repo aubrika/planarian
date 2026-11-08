@@ -15,8 +15,9 @@ pub fn package_roots(pkg: &Path) -> Vec<PathBuf> {
     ["lib/systemd/system", "etc/systemd/system"].iter().map(|r| pkg.join(r)).filter(|p| p.is_dir()).collect()
 }
 
-/// The drop-in directories systemd reads for `unit` (a name with its `.service`):
-/// its own, each `-` prefix, the type-wide one, and a template's for an instance.
+/// The drop-in directories systemd reads for `unit` (a name with its
+/// `.service`), most specific first: its own, a template's for an instance,
+/// each `-` prefix (the longest first), and the type-wide one.
 pub fn dropin_dir_names(unit: &str) -> Vec<String> {
     let stem = unit.strip_suffix(".service").unwrap_or(unit);
     let mut dirs = vec![format!("{stem}.service.d")];
@@ -25,9 +26,10 @@ pub fn dropin_dir_names(unit: &str) -> Vec<String> {
     {
         dirs.push(format!("{tmpl}@.service.d"));
     }
-    for (i, _) in stem.match_indices('-') {
-        dirs.push(format!("{}-.service.d", &stem[..i]));
-    }
+    let mut prefixes: Vec<String> =
+        stem.match_indices('-').map(|(i, _)| format!("{}-.service.d", &stem[..i])).collect();
+    prefixes.reverse();
+    dirs.extend(prefixes);
     dirs.push("service.d".to_string());
     dirs
 }
@@ -36,27 +38,30 @@ fn read(path: &Path) -> Result<String, Error> {
     fs::read_to_string(path).map_err(|e| Error::Unreadable { file: path.display().to_string(), why: e.to_string() })
 }
 
-/// The drop-in files for `unit` across `roots`: every `*.conf` in each of the
-/// directories above, sorted by file name. One name in two directories is a
-/// [`Error::Collision`].
+/// The drop-in files for `unit` across `roots`, as systemd applies them: a
+/// file name in several of the unit's directories is read from the most
+/// specific one (own, then template, then the longer prefix, then the
+/// type-wide one), and the files are then applied sorted by file name. The
+/// same file name in the *same* directory of two roots (two packages) is a
+/// [`Error::Collision`]: which package's file is kept is not established.
 pub fn dropins(roots: &[PathBuf], unit: &str) -> Result<Vec<(String, PathBuf)>, Error> {
-    let mut by_name: BTreeMap<String, PathBuf> = BTreeMap::new();
-    for root in roots {
-        for d in dropin_dir_names(unit) {
-            let dir = root.join(&d);
-            let Ok(rd) = fs::read_dir(&dir) else { continue };
+    let mut chosen: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for d in dropin_dir_names(unit) {
+        let mut here: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for root in roots {
+            let Ok(rd) = fs::read_dir(root.join(&d)) else { continue };
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if !name.ends_with(".conf") {
-                    continue;
-                }
-                if by_name.insert(name.clone(), e.path()).is_some() {
+                if name.ends_with(".conf") && here.insert(name.clone(), e.path()).is_some() {
                     return Err(Error::Collision { name });
                 }
             }
         }
+        for (name, path) in here {
+            chosen.entry(name).or_insert(path); // a more specific level already chose
+        }
     }
-    Ok(by_name.into_iter().collect())
+    Ok(chosen.into_iter().collect())
 }
 
 /// The effective settings of `unit` whose main file is `main`, with the

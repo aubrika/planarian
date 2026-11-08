@@ -43,7 +43,11 @@ fn model_tool(c: &Cfg) -> bool {
         CapCfg::Plain(set) => NET.iter().any(|n| set.contains(n)),
         CapCfg::Inverted(set) => NET.iter().any(|n| !set.contains(n)),
     };
-    let root = matches!(c.user, None | Some("root") | Some("0")) && c.dynamic != Some(true);
+    let may_be_root = |u: &str| {
+        let digits = u.trim_start_matches('+');
+        u == "root" || u.contains('%') || (!digits.is_empty() && digits.chars().all(|ch| ch == '0'))
+    };
+    let root = c.user.is_none_or(may_be_root) && c.dynamic != Some(true);
     let bounding_open = matches!(c.bounding, CapCfg::Unset) || grants(&c.bounding);
     let nnp = c.nnp == Some(true);
     let dev =
@@ -301,11 +305,14 @@ fn words() -> impl Strategy<Value = Vec<&'static str>> {
 
 fn cfg() -> impl Strategy<Value = Cfg> {
     (
-        proptest::option::of(proptest::sample::select(vec!["root", "0", "nobody", "dnsmasq", "1000"])),
+        proptest::option::of(proptest::sample::select(vec![
+            "root", "0", "nobody", "dnsmasq", "1000", "%i", "%u", "00", "+0", "+00",
+        ])),
         proptest::option::of(any::<bool>()),
         cap_cfg(),
         cap_cfg(),
-        proptest::option::of(any::<bool>()),
+        // NoNewPrivileges mostly set, so the root and DynamicUser clauses of the rule decide.
+        prop_oneof![Just(None), Just(Some(true)), Just(Some(true)), Just(Some(true)), Just(Some(false))],
         words(),
         words(),
         words(),
@@ -331,7 +338,7 @@ fn style() -> impl Strategy<Value = Style> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(ProptestConfig::with_cases(1024))]
 
     /// parse(render(c)) == c, and the rule agrees with the model.
     #[test]
@@ -725,4 +732,113 @@ fn the_generated_drop_in_matches_the_nix_holddropins_text() {
     );
     assert_eq!(tree::hold_dropin(true, false), "[Unit]\nOnFailure=planarian-hold@%N.service\n");
     assert_eq!(tree::hold_dropin(false, true), "[Unit]\nOnFailure=planarian-hold@%N.service\n");
+}
+
+// ---- the root and DynamicUser clauses, deterministically -----------------
+
+fn tool(text: &str) -> bool {
+    is_network_tool(&settings(text))
+}
+
+#[test]
+fn a_unit_that_may_be_root_with_a_full_bounding_set_is_a_tool_whatever_else_it_says() {
+    // NoNewPrivileges=yes, so only the root clause can make these tools.
+    for user in ["root", "0", "00", "+0", "+00", "%i", "%u", "%U", "svc-%i"] {
+        assert!(tool(&format!("[Service]\nUser={user}\nNoNewPrivileges=yes\n")), "User={user}");
+    }
+    // A user that cannot be uid 0, with the same hardening, is not a tool.
+    for user in ["nobody", "1000", "dnsmasq", "10", "+1"] {
+        assert!(!tool(&format!("[Service]\nUser={user}\nNoNewPrivileges=yes\n")), "User={user}");
+    }
+}
+
+#[test]
+fn a_dynamic_user_is_not_root_even_with_no_user_or_user_root() {
+    assert!(!tool("[Service]\nDynamicUser=yes\nNoNewPrivileges=yes\n"), "User unset");
+    assert!(!tool("[Service]\nDynamicUser=yes\nUser=root\nNoNewPrivileges=yes\n"), "User=root");
+    // Without DynamicUser the same unit is root and a tool.
+    assert!(tool("[Service]\nNoNewPrivileges=yes\n"));
+}
+
+// ---- drop-in precedence across a unit's directories ----------------------
+
+#[test]
+fn the_same_drop_in_name_in_a_template_and_its_instance_is_read_from_the_instance() {
+    // The declared-template-plus-instance shape (gym-tpl@ and gym-tpl@a, with
+    // NixOS's overrides.conf in both): not a collision, and the instance's file wins.
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("units");
+    write(&root.join("gym-tpl@.service"), "[Service]\nExecStart=/bin/true\n");
+    write(&root.join("gym-tpl@.service.d/50-planarian-hold.conf"), &tree::hold_dropin(true, true));
+    write(&root.join("gym-tpl@.service.d/overrides.conf"), "[Unit]\nOnFailure=\n");
+    write(&root.join("gym-tpl@a.service.d/overrides.conf"), "[Service]\nEnvironment=X=1\n");
+    // The template's overrides.conf strips the hold, but the instance's file of the same name replaces it.
+    assert_eq!(tree::hold_problem(&root, "gym-tpl@a", true), None);
+    // The template itself still has its own stripping file.
+    assert!(tree::hold_problem(&root, "gym-tpl@", true).is_some());
+}
+
+#[test]
+fn the_most_specific_directory_wins_for_a_name_and_then_files_apply_by_name() {
+    let d = tempfile::tempdir().unwrap();
+    let p = pkg(d.path(), "a", "a-b-c@x.service", HARDENED);
+    let u = p.join("lib/systemd/system");
+    // The same name at every level; own > template > longer prefix > shorter prefix > type-wide.
+    for (dir, who) in [
+        ("service.d", "typewide"),
+        ("a-.service.d", "short"),
+        ("a-b-.service.d", "long"),
+        ("a-b-c@.service.d", "tmpl"),
+        ("a-b-c@x.service.d", "own"),
+    ] {
+        write(&u.join(dir).join("10-user.conf"), &format!("[Service]\nUser={who}\n"));
+    }
+    let roots = tree::package_roots(&p);
+    let main = u.join("a-b-c@x.service");
+    let s = tree::effective(&roots, "a-b-c@x.service", &main).unwrap();
+    assert_eq!(s.user.as_deref(), Some("own"));
+    fs::remove_file(u.join("a-b-c@x.service.d/10-user.conf")).unwrap();
+    let s = tree::effective(&roots, "a-b-c@x.service", &main).unwrap();
+    assert_eq!(s.user.as_deref(), Some("tmpl"));
+    fs::remove_file(u.join("a-b-c@.service.d/10-user.conf")).unwrap();
+    let s = tree::effective(&roots, "a-b-c@x.service", &main).unwrap();
+    assert_eq!(s.user.as_deref(), Some("long"), "a longer prefix is more specific than a shorter one");
+    fs::remove_file(u.join("a-b-.service.d/10-user.conf")).unwrap();
+    assert_eq!(tree::effective(&roots, "a-b-c@x.service", &main).unwrap().user.as_deref(), Some("short"));
+    fs::remove_file(u.join("a-.service.d/10-user.conf")).unwrap();
+    assert_eq!(tree::effective(&roots, "a-b-c@x.service", &main).unwrap().user.as_deref(), Some("typewide"));
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(96))]
+
+    /// The same drop-in file name at every level of a unit's directories: the
+    /// most specific one is the one read, whatever the decoys at the others.
+    #[test]
+    fn a_name_present_at_several_levels_is_read_from_the_most_specific(c in cfg(), levels in proptest::sample::subsequence(vec![0usize, 1, 2, 3, 4], 1..=5)) {
+        // Levels, most specific first: own, template, long prefix, short prefix, type-wide.
+        const DIRS: [&str; 5] = ["p-q-r@a.service.d", "p-q-r@.service.d", "p-q-.service.d", "p-.service.d", "service.d"];
+        let d = tempfile::tempdir().unwrap();
+        let p = pkg(d.path(), "a", "p-q-r@a.service", HARDENED);
+        let u = p.join("lib/systemd/system");
+        let real = render(&c, &Style::default()).remove(0).1.replace("[Unit]\nDescription=x\n\n[Service]\nExecStart=/bin/true\n", "[Service]\n");
+        let most_specific = *levels.iter().min().unwrap();
+        for &l in &levels {
+            // The most specific chosen level carries the real configuration (after resets of what a
+            // decoy would have set); the others carry a decoy that would change the verdict.
+            let text = if l == most_specific { format!("[Service]\nCapabilityBoundingSet=\nAmbientCapabilities=\nDeviceAllow=\nBindPaths=\nBindReadOnlyPaths=\n{}", real.trim_start_matches("[Service]\n")) }
+                else { "[Service]\nUser=decoy\nDynamicUser=yes\nNoNewPrivileges=yes\nCapabilityBoundingSet=CAP_CHOWN\nAmbientCapabilities=CAP_CHOWN\nDeviceAllow=/dev/net/tun\n".to_string() };
+            write(&u.join(DIRS[l]).join("10-x.conf"), &text);
+        }
+        // The decoy scalars at lesser levels are overridden only where the real file sets them.
+        let roots = tree::package_roots(&p);
+        let s = tree::effective(&roots, "p-q-r@a.service", &u.join("p-q-r@a.service")).unwrap();
+        // Only the unit's HARDENED main file and the chosen level's text contribute (decoys are shadowed).
+        let mut want = expected(&c);
+        want.user = c.user.map(str::to_string).or(Some("nobody".into()));
+        want.no_new_privileges = c.nnp.or(Some(true));
+        want.bounding = match &c.bounding { CapCfg::Unset | CapCfg::Reset => Caps::Reset, other => expected(&Cfg { bounding: other.clone(), ..c.clone() }).bounding };
+        want.ambient = match &c.ambient { CapCfg::Unset | CapCfg::Reset => Caps::Reset, other => expected(&Cfg { ambient: other.clone(), ..c.clone() }).ambient };
+        prop_assert_eq!(s, want);
+    }
 }

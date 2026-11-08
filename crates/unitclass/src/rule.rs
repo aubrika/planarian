@@ -5,6 +5,15 @@
 
 use crate::syntax::{CapSet, Settings};
 
+/// Could `User=` name uid 0 when the unit starts? `root`, a value with a
+/// specifier (`%i`, `%u`, `%U`, ... are expanded by systemd at start, so the
+/// instance may be root), or a numeric zero in any spelling (`0`, `00`, `+0`).
+/// Unknown reads as possibly root, the closed direction.
+pub fn may_be_root(user: &str) -> bool {
+    let digits = user.strip_prefix('+').unwrap_or(user);
+    user == "root" || user.contains('%') || (!digits.is_empty() && digits.bytes().all(|b| b == b'0'))
+}
+
 pub const NET_CAPS: [&str; 2] = ["CAP_NET_ADMIN", "CAP_NET_RAW"];
 pub const DEVICE_NEEDLES: [&str; 2] = ["/dev/net/tun", "/dev/ppp"];
 
@@ -13,10 +22,7 @@ pub const DEVICE_NEEDLES: [&str; 2] = ["/dev/net/tun", "/dev/ppp"];
 /// one (a bounding set that allows it and `NoNewPrivileges=` unset), or is
 /// given /dev/net/tun or /dev/ppp explicitly.
 pub fn is_network_tool(s: &Settings) -> bool {
-    let root = match &s.user {
-        None => true,
-        Some(u) => u == "root" || u == "0",
-    } && !s.dynamic_user.unwrap_or(false);
+    let root = s.user.as_deref().is_none_or(may_be_root) && !s.dynamic_user.unwrap_or(false);
     let ambient_grants = s.ambient.effective(None).is_some_and(|c: CapSet| c.grants(&NET_CAPS));
     // The bounding set allows a network capability, or is unset (everything).
     let bounding_allows = s.bounding.effective(None).is_none_or(|c| c.grants(&NET_CAPS));

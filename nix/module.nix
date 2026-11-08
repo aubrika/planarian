@@ -120,7 +120,11 @@ let
       svc = config.systemd.services.${name};
       sc = svc.serviceConfig;
       user = sc.User or "root";
-      root = (user == "root" || user == "0") && !(sc.DynamicUser or false);
+      # `User=` could be uid 0 when the unit starts: root, a specifier (`%i`, `%u`,
+      # ... expanded at start), or a numeric zero in any spelling. Unknown reads
+      # as possibly root, the closed direction (crates/unitclass `may_be_root`).
+      mayBeRoot = u: u == "root" || lib.hasInfix "%" u || builtins.match "[+]?0+" u != null;
+      root = mayBeRoot (toString user) && !(sc.DynamicUser or false);
       bounding = sc.CapabilityBoundingSet or null;
       # NoNewPrivileges= as systemd reads it; anything unrecognised counts
       # as unset (failing closed).

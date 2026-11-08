@@ -21,6 +21,7 @@ let
   inherit (pkgs) lib;
   hold = "[Unit]\nOnFailure=planarian-hold@%N.service\nAfter=planarian-netwatch.service\n";
   svc = text: "[Service]\nExecStart=/bin/true\n" + text;
+  run = text: "[Service]\nExecStart=/run/current-system/sw/bin/sleep 300\n" + text;
   fixtures = {
     "o-plain.service" = svc "User=nobody\nNoNewPrivileges=yes\nCapabilityBoundingSet=CAP_CHOWN CAP_KILL\n";
     "o-reset.service" = svc "CapabilityBoundingSet=CAP_CHOWN\nCapabilityBoundingSet=\nCapabilityBoundingSet=CAP_NET_RAW\n";
@@ -47,6 +48,22 @@ let
     "o-pre-.service.d/10-grant.conf" = "[Service]\nAmbientCapabilities=CAP_NET_RAW\n";
     "o-tmpl@.service" = svc "User=nobody\nNoNewPrivileges=yes\n";
     "o-tmpl@.service.d/10-grant.conf" = "[Service]\nBindPaths=/dev/net/tun\n";
+    "o-user-00.service" = svc "User=00\nNoNewPrivileges=yes\n";
+    "o-user-plus0.service" = svc "User=+0\nNoNewPrivileges=yes\n";
+    # Precedence: the same drop-in name at several levels of one unit's directories.
+    "o-prec@.service" = svc "NoNewPrivileges=yes\n";
+    "o-prec@.service.d/10-x.conf" = "[Service]\nUser=tmpl\n";
+    "o-prec@a.service.d/10-x.conf" = "[Service]\nUser=inst\n";
+    "o-pp-q.service" = svc "NoNewPrivileges=yes\n";
+    "o-pp-.service.d/10-x.conf" = "[Service]\nUser=prefix\n";
+    "o-pp-q.service.d/10-x.conf" = "[Service]\nUser=own\n";
+    "o-pp-q-r.service" = svc "NoNewPrivileges=yes\n";
+    "o-pp-.service.d/10-y.conf" = "[Service]\nUser=short\n";
+    "o-pp-q-.service.d/10-y.conf" = "[Service]\nUser=long\n";
+    # Units the VM starts: does systemd run them as uid 0?
+    "o-run-00.service" = run "User=00\nNoNewPrivileges=yes\n";
+    "o-run-plus0.service" = run "User=+0\nNoNewPrivileges=yes\n";
+    "o-run-spec@.service" = run "User=%i\nNoNewPrivileges=yes\n";
     "o-hold.service" = svc "User=nobody\n";
     "o-hold.service.d/50-planarian-hold.conf" = hold;
     "o-hold-strip.service" = svc "User=nobody\n";
@@ -65,7 +82,8 @@ let
   units = [
     "o-plain" "o-reset" "o-emptybounding" "o-accum" "o-ambreset" "o-invert" "o-numeric" "o-continue"
     "o-bool-true" "o-bool-one" "o-bool-off" "o-user-zero" "o-dyn" "o-device" "o-devreset" "o-bind"
-    "o-dropin-order" "o-dropin-reset" "o-pre-x" "o-tmpl@a" "o-hold" "o-hold-strip" "o-after-strip"
+    "o-dropin-order" "o-dropin-reset" "o-pre-x" "o-tmpl@a" "o-user-00" "o-user-plus0" "o-prec@a" "o-pp-q" "o-pp-q-r"
+    "o-hold" "o-hold-strip" "o-after-strip"
   ];
   capNames = [
     "CAP_CHOWN" "CAP_DAC_OVERRIDE" "CAP_DAC_READ_SEARCH" "CAP_FOWNER" "CAP_FSETID"
@@ -184,6 +202,20 @@ pkgs.testers.runNixOSTest {
         if tool_by_systemd(a) != ours["tool"]:
             bad.append((u, "tool", tool_by_systemd(a), ours["tool"]))
         print(f"{u}: tool={ours['tool']}")
+    # Does systemd start these as uid 0? The classifier must call each tool then
+    # (a unit that runs as root with the default bounding set holds CAP_NET_ADMIN).
+    runs = ["o-run-00", "o-run-plus0", "o-run-spec@root", "o-run-spec@nobody"]
+    for u in runs:
+        machine.execute(f"systemctl start {u}.service")
+        state = machine.succeed(f"systemctl show -p ActiveState,MainPID {u}.service")
+        kv = dict(line.split("=", 1) for line in state.splitlines())
+        uid = None
+        if kv.get("ActiveState") == "active" and kv.get("MainPID", "0") != "0":
+            uid = machine.succeed("awk '/^Uid:/ {print $2}' /proc/" + kv["MainPID"] + "/status").strip()
+        ours = json.loads(machine.succeed(f"planarian-unitclass show --units /etc/systemd/system {u}.service"))
+        print(f"{u}: systemd runs it as uid {uid}; classifier tool={ours['tool']}")
+        if uid == "0" and not ours["tool"]:
+            bad.append((u, "runs as root but is not classified as a tool", uid, ours["tool"]))
     assert not bad, "systemd and planarian-unitclass disagree: " + json.dumps(bad, indent=1)
   '';
 }

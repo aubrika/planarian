@@ -9,13 +9,13 @@
 #      classifier (nix/module.nix) and the raw one (crates/unitclass) must call
 #      each pair the same. The inputs are exactly those `isNetworkToolUnchecked`
 #      reads, each at values covering its classes:
-#        user:      root (unset) | nobody | DynamicUser
+#        user:      root (unset) | nobody | DynamicUser | %i | 00 | +0
 #        bounding:  unset | "" | one network cap | one other cap | `~` of one
 #                   network cap (the other still granted) | `~` of both
 #        ambient:   none | a network cap | another cap
 #        NoNewPrivileges: unset | yes
 #        device:    none | DeviceAllow=/dev/net/tun | BindPaths=/dev/ppp
-#      3 x 6 x 3 x 2 x 3 = 324 pairs. (Syntax is the crate's property tests'.)
+#      6 x 6 x 3 x 2 x 3 = 648 pairs. (Syntax is the crate's property tests'.)
 #   2. The B-23 case: an undeclared raw unit is a network tool in the built
 #      export and carries the hold and ordering drop-ins; a hardened one, a
 #      masked one and an unparsable one are classified as they should be; the
@@ -32,6 +32,11 @@ let
     { n = "root"; cfg = { }; text = ""; }
     { n = "nobody"; cfg = { User = "nobody"; }; text = "User=nobody\n"; }
     { n = "dyn"; cfg = { DynamicUser = true; }; text = "DynamicUser=yes\n"; }
+    # A specifier (expanded at start: the instance may be root) and numeric
+    # zeros in other spellings read as possibly root.
+    { n = "spec"; cfg = { User = "%i"; }; text = "User=%i\n"; }
+    { n = "zz"; cfg = { User = "00"; }; text = "User=00\n"; }
+    { n = "plus0"; cfg = { User = "+0"; }; text = "User=+0\n"; }
   ];
   boundings = [
     { n = "bunset"; cfg = { }; text = ""; }
@@ -99,7 +104,13 @@ let
         systemd.services = builtins.listToAttrs (map (c: {
           name = "m-${c.name}";
           value = { script = "true"; serviceConfig = c.serviceConfig; };
-        }) combos);
+        }) combos) // {
+          # The declared template plus instance shape: NixOS writes overrides.conf
+          # for the instance, and the template carries the hold's drop-in too
+          # (the reviewer's reproduction of the drop-in precedence bug).
+          "gym-tpl@" = { script = "true"; };
+          "gym-tpl@a" = { overrideStrategy = "asDropin"; serviceConfig.Environment = "X=1"; };
+        };
       })
     ];
   };
@@ -149,7 +160,7 @@ pkgs.runCommand "planarian-raw-units-check" {
 
   # 3. The hold stays in force.
   tools=$TMPDIR/tools
-  { printf '%s\n' ${lib.escapeShellArgs declared}; jq -r '.[]' "$raw"; } > "$tools"
+  { printf '%s\n' ${lib.escapeShellArgs declared} gym-tpl@a; jq -r '.[]' "$raw"; } > "$tools"
   ${unitclass} verify-hold --units ${units} --tools "$tools" ${lib.optionalString (cfg.services.planarian.package.netwatch or false) "--netwatch"}
   echo "ok: verify-hold passes on the built tree"
   strip() {
