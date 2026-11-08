@@ -2857,6 +2857,46 @@ mod wireguard {
         assert_eq!(after.footprint(&b, NOW).endpoints, [e2].into());
     }
 
+    /// Rule 21: a failed scan of the interface list is not "no such device".
+    /// The binding waits unpinned and the peers are marked unknown until a
+    /// read succeeds.
+    #[test]
+    fn a_failed_interface_scan_fails_closed_until_a_read_succeeds() {
+        let a = UnitId::service("wg-quick-a");
+        let marked = |t: &Tracker| {
+            t.view(WatchState::Attached { at: NOW }, &[], NOW)
+                .unattributed
+                .iter()
+                .any(|w| w.contains("WireGuard peers"))
+        };
+        let mut t = Tracker::default();
+        t.bind_wireguard_scanned(&a, "wg0", Err("/sys/class/net: Permission denied".into()));
+        assert!(marked(&t));
+        assert!(t.claims().wireguard.contains(&(a.clone(), "wg0".to_string())), "waits, unpinned");
+        t.set_wireguard(&[]);
+        assert!(!marked(&t), "a read that succeeded clears it");
+        // A scan that worked and found nothing is the ordinary case: no mark.
+        t.bind_wireguard_scanned(&a, "wg1", Ok(None));
+        assert!(!marked(&t));
+        // The scan itself: an unreadable directory or index is an error, a
+        // device gone between the listing and its index is not.
+        let dir = std::env::temp_dir().join(format!("nw-ifnames-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(crate::host::try_read_ifnames_in(&dir).is_err(), "no directory");
+        std::fs::create_dir_all(dir.join("wg0")).unwrap();
+        std::fs::create_dir_all(dir.join("gone")).unwrap();
+        std::fs::write(dir.join("wg0/ifindex"), "7\n").unwrap();
+        assert_eq!(
+            crate::host::try_read_ifnames_in(&dir).unwrap(),
+            [(7, "wg0".to_string())].into(),
+            "a device with no index file is gone"
+        );
+        std::fs::create_dir_all(dir.join("bad")).unwrap();
+        std::fs::write(dir.join("bad/ifindex"), "x\n").unwrap();
+        assert!(crate::host::try_read_ifnames_in(&dir).is_err(), "an index that is not a number");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// RTM_DELLINK for `name` at `index`, from the host's netns.
     fn dellink(name: &str, index: u32) -> crate::ebpf::Event {
         let mut body = vec![0u8; 16]; // ifinfomsg

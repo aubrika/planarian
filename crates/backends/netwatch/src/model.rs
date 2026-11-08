@@ -506,6 +506,21 @@ impl Tracker {
         self.bind_wireguard_at(unit, dev, None);
     }
 
+    /// A request configured `dev`; `scan` is what the scan of the kernel's
+    /// interface list said about its index: `Ok(Some(i))` pins at once,
+    /// `Ok(None)` is a name with no device, and `Err` is a scan that failed,
+    /// which fails closed (the peers are unknown) until a read succeeds,
+    /// never "no such device" (rule 21).
+    pub fn bind_wireguard_scanned(&mut self, unit: &UnitId, dev: &str, scan: Result<Option<u32>, String>) {
+        match scan {
+            Ok(index) => self.bind_wireguard_at(unit, dev, index),
+            Err(_) => {
+                self.wireguard_unread();
+                self.bind_wireguard_at(unit, dev, None);
+            }
+        }
+    }
+
     /// As [`Tracker::bind_wireguard`], pinned at once to the interface index
     /// the name has now (read at the request, from the kernel's own list),
     /// where it resolves: a binding pinned at its birth cannot be taken over
