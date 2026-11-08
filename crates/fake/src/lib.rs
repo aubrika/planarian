@@ -240,6 +240,8 @@ pub struct World {
     /// `list` fails (systemd's unit list cannot be read), and how often it was called.
     pub list_fails: Option<String>,
     pub list_calls: u64,
+    /// How many times `ended_by` was called.
+    pub ended_by_calls: u64,
     /// Units whose `observe` fails.
     pub observe_fails: BTreeSet<UnitId>,
     /// How many times each unit was observed (`observe`).
@@ -879,6 +881,7 @@ impl UnitBackend for Fake {
     }
 
     fn ended_by(&self, id: &UnitId) -> Option<Ending> {
+        self.w().ended_by_calls += 1;
         self.w().units.get(&World::key(id)).and_then(|s| s.ended)
     }
 

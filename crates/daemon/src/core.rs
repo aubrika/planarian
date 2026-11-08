@@ -1115,7 +1115,14 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             let held = s.holds.contains(&u);
             let observed = match self.b.units().observe(&u) {
                 Ok(raw) => {
-                    let seen = crate::hold::unmanaged_observed(raw.clone(), self.b.units().ended_by(&u), held);
+                    // How it ended is a second command, and matters only for a
+                    // unit that is not running.
+                    let ended = if matches!(raw, Observed::Absent | Observed::Bound | Observed::Detected) && !held {
+                        self.b.units().ended_by(&u)
+                    } else {
+                        None
+                    };
+                    let seen = crate::hold::unmanaged_observed(raw.clone(), ended, held);
                     let down =
                         matches!(seen, Observed::Failed(_) | Observed::Absent | Observed::Bound | Observed::Detected);
                     if raw == Observed::Active {

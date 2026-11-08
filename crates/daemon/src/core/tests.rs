@@ -4594,6 +4594,21 @@ mod unmanaged_tools {
         assert!(calls >= 3, "{calls}: it is still read");
     }
 
+    /// How a unit ended is asked of the backend only for one that is not
+    /// running: observing many running tools costs one command each.
+    #[test]
+    fn how_a_tool_ended_is_asked_only_of_a_tool_that_is_not_running() {
+        let (mut r, _) = many(30);
+        r.ticks(8);
+        let running = r.fake.w().ended_by_calls;
+        r.ticks(4);
+        // Running tools: no `ended_by` for the unmanaged ones (the managed
+        // units' residue asks for its own).
+        let before = r.fake.w().ended_by_calls;
+        r.ticks(4);
+        assert_eq!(r.fake.w().ended_by_calls, before, "asked of running tools ({running} before)");
+    }
+
     mod props {
         use super::*;
         use proptest::prelude::*;
