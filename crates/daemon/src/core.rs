@@ -350,12 +350,13 @@ impl Resume {
     }
 }
 
-/// P9: a slow tick is warned at most this often (the count rides along).
-/// How long after seeing a generation change outside Planarian its unit
-/// stops and starts stay explained (quiet period after the last queued job).
+/// How long after seeing a generation change outside Planarian the stops of
+/// its non-Security units stay explained (the quiet period after the last
+/// tick that saw queued work).
 pub const SWITCH_SETTLE: Millis = Millis::secs(60);
 /// The most a switch may keep explaining stops, however busy the queue.
 pub const SWITCH_SETTLE_MAX: Millis = Millis::secs(600);
+/// P9: a slow tick is warned at most this often (the count rides along).
 pub const SLOW_TICK_WARN_EVERY: Millis = Millis::secs(60);
 
 /// How often the daemon checks the §12b collection bounds.
@@ -1579,9 +1580,13 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
     /// Whether a switch outside Planarian is still settling at `now`: from
     /// the tick that saw the generation change until `SWITCH_SETTLE` after
-    /// the last tick that still saw work queued (a stop or start job), and
-    /// never beyond `SWITCH_SETTLE_MAX` after the change. A person's stop
-    /// after the window is a person's.
+    /// the last tick that still saw work queued, and never beyond
+    /// `SWITCH_SETTLE_MAX` after the change. A person's stop after the window
+    /// is a person's. Known limits (D24): the queue is `pending_jobs()`, which
+    /// on Linux lists only Planarian's own `planarian-op-*` units, so there
+    /// the window is the fixed `SWITCH_SETTLE`; the window is not restored
+    /// after a daemon restart; a person's stop of a non-Security unit inside
+    /// the window is read as a fault and repaired.
     fn in_switch_window(&mut self, now: Timestamp) -> bool {
         let Some((since, until)) = self.switch_window else { return false };
         let cap = since.plus(SWITCH_SETTLE_MAX);
@@ -1654,7 +1659,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 stopped_cleanly: st == UnitStatus::Stopped,
                 ended: if was_up && now_down { self.b.units().ended_by(u) } else { None },
                 service: def.id.kind == UnitKind::Service,
-                touched_by_planarian: self.touched.contains(u) || self.generation_touched || in_switch,
+                // Inside a switch window only non-Security units are explained:
+                // a Security unit's stop is always a fault, restarted and
+                // alarmed (§11).
+                touched_by_planarian: self.touched.contains(u)
+                    || self.generation_touched
+                    || (in_switch && !def.sensitivity.contains(Sensitivity::Security)),
                 expected: s.expected(u, defs),
                 requirement_crashed: def
                     .edges

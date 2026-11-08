@@ -3888,28 +3888,56 @@ fn a_switch_outside_planarian_explains_stops_in_later_ticks() {
 
 mod switch_window_props {
     use super::*;
-    use proptest::prelude::*;
 
-    proptest! {
-        #![proptest_config(ProptestConfig { cases: 24, failure_persistence: None, ..ProptestConfig::default() })]
+    /// An outside switch seen, `delay` ticks pass, then gym-db is stopped;
+    /// whether the stop was inferred as a person's. The oracle is literal:
+    /// the window is SWITCH_SETTLE = 60 s = 12 ticks from the tick that saw
+    /// the change, and the first stop the window no longer explains is the
+    /// one seen at delay 11 (measured; the change is seen one tick in).
+    fn inferred(delay: usize) -> bool {
+        let mut r = Rig::new();
+        r.ticks(2);
+        let g = r.fake.w().add_generation(&Default::default());
+        r.fake.w().current = g;
+        r.ticks(1 + delay);
+        r.fake.w().stop_out_of_band(&UnitId::service("gym-db"));
+        r.ticks(3);
+        !r.core.ledger().overrides.is_empty()
+    }
 
-        /// The window is bounded in both directions: a stop soon enough after
-        /// an observed outside switch is the switch's; one after the window
-        /// (SWITCH_SETTLE, nothing queued) is a person's and is inferred.
-        #[test]
-        fn a_stop_is_the_switchs_inside_the_window_and_a_persons_after_it(delay in 0usize..40) {
-            let settle_ticks = (SWITCH_SETTLE.0 / planarian_state::TICK.0) as usize;
-            prop_assume!(delay + 1 < settle_ticks || delay > settle_ticks + 2);
-            let mut r = Rig::new();
-            r.ticks(2);
-            let g = r.fake.w().add_generation(&Default::default());
-            r.fake.w().current = g;
-            r.ticks(1 + delay);
-            r.fake.w().stop_out_of_band(&UnitId::service("gym-db"));
-            r.ticks(3);
-            let inferred = !r.core.ledger().overrides.is_empty();
-            prop_assert_eq!(inferred, delay > settle_ticks, "delay {} ticks", delay);
+    /// Every delay, no sampling and no excluded boundary: explained up to
+    /// delay 10, a person's from delay 11 on.
+    #[test]
+    fn a_stop_is_the_switchs_inside_the_window_and_a_persons_after_it() {
+        for delay in 0..40 {
+            assert_eq!(inferred(delay), delay >= 11, "delay {delay} ticks");
         }
+    }
+}
+
+/// §11: a Security unit's stop is always a fault, restarted and alarmed, also
+/// inside a switch window (reviewer, 0ddca15).
+#[test]
+fn a_security_unit_stopped_inside_a_switch_window_is_still_alarmed() {
+    for kill in [true, false] {
+        let mut r = Rig::new();
+        r.ticks(2);
+        let g = r.fake.w().add_generation(&Default::default());
+        r.fake.w().current = g;
+        r.ticks(6);
+        if kill {
+            r.fake.w().kill(&UnitId::service("sshd"));
+        } else {
+            r.fake.w().stop_out_of_band(&UnitId::service("sshd"));
+        }
+        r.ticks(10);
+        assert!(
+            r.core.notices.iter().any(|n| n.starts_with("ALARM: service:sshd")),
+            "kill={kill}: {:?}",
+            r.core.notices
+        );
+        assert!(r.core.ledger().overrides.is_empty());
+        assert_eq!(r.status("service:sshd"), UnitStatus::Running);
     }
 }
 
