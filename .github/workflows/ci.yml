@@ -69,6 +69,12 @@ jobs:
             [ "$i" = 6 ] && exit 1
             sleep $((i * 20))
           done
+          # Whatever the path's origin (cache or download), it must hash to the
+          # fetchzip's outputHash in nix/verus.nix (the NAR hash of the unpacked
+          # source). A mismatch fails the job and the cache is not saved.
+          want=$(nix eval --raw --impure --expr "($expr).src.outputHash")
+          got=$(nix hash path --sri "$src")
+          [ "$got" = "$want" ] || { echo "verus source hash $got, want $want"; exit 1; }
           if [ ! -d ~/verus-src-cache ]; then
             nix copy --no-check-sigs --to "file://$HOME/verus-src-cache" "$src"
           fi
@@ -106,6 +112,10 @@ jobs:
           [ -s ~/kani-bundle/$bundle ] || curl -fsSL --retry 8 --retry-all-errors --retry-delay 15 \
             -o ~/kani-bundle/$bundle \
             https://github.com/model-checking/kani/releases/download/kani-0.68.0/$bundle
+          # The pinned digest (docs/pins.md) is checked on every use, cached or
+          # downloaded; a mismatch deletes the file and fails the job.
+          echo "32e2b484d73ede0bbf64a2cf0879c4259422497d8aec4ee67d448de9ae7843d3  $HOME/kani-bundle/$bundle" \
+            | sha256sum -c - || { rm -f ~/kani-bundle/$bundle; exit 1; }
           command -v cargo-kani || cargo install --locked kani-verifier --version 0.68.0
           cargo kani setup --use-local-bundle ~/kani-bundle/$bundle
       - run: cargo kani -p planarian-txn
