@@ -3072,6 +3072,51 @@ mod wireguard {
         assert!(!t2.footprint(&other, NOW).unattributed);
     }
 
+    /// A SET that names its device by index, where neither the scan nor the
+    /// cache holds that index, cannot be bound: its unit is marked lost
+    /// (prop-auditor's mutant on #87: that arm doing nothing). Where the list
+    /// holds it, the unit binds at that index.
+    #[test]
+    fn an_index_that_nothing_holds_marks_its_unit_lost() {
+        let u = UnitId::service("wg-setter");
+        let by_index = request(FAMILY, 1, &[attr(1, false, &7u32.to_ne_bytes())], usize::MAX);
+        let run = |t: &mut Tracker, ids: &mut wg::GenlIds, now: BTreeMap<u32, String>| {
+            wg::take_genl(
+                t,
+                ids,
+                &by_index,
+                0xF000_0000,
+                || Some(u.clone()),
+                &mut || Ok(vec![]),
+                &mut || Ok(BTreeMap::new()),
+                &mut BTreeMap::new(),
+                &mut || now.clone(),
+            );
+        };
+        let mut ids = wg::GenlIds::default();
+        assert!(ids.refresh(&mut || Ok(vec![("wireguard".to_string(), FAMILY)])).is_ok());
+        let mut t = Tracker::default();
+        run(&mut t, &mut ids, BTreeMap::new());
+        assert!(t.footprint(&u, NOW).unattributed, "no device holds index 7: the unit is lost");
+        let mut t = Tracker::default();
+        run(&mut t, &mut ids, [(7, "wgtest".to_string())].into());
+        assert!(!t.footprint(&u, NOW).unattributed);
+        assert!(t.claims().wireguard_index.contains(&(u.clone(), "wgtest".to_string(), 7)));
+    }
+
+    /// A SET that names no device at all (an empty name) marks its unit lost
+    /// (prop-auditor's mutant on #87: that arm doing nothing).
+    #[test]
+    fn a_set_that_names_no_device_marks_its_unit_lost() {
+        let u = UnitId::service("wg-setter");
+        let mut t = Tracker::default();
+        let mut ids = wg::GenlIds::default();
+        assert!(ids.refresh(&mut || Ok(vec![("wireguard".to_string(), FAMILY)])).is_ok());
+        take(&mut t, &mut ids, &wg_set(b"\0"), &u, None, Ok(BTreeMap::new()));
+        assert!(t.footprint(&u, NOW).unattributed);
+        assert!(t.claims().wireguard.is_empty(), "nothing was bound");
+    }
+
     /// With the list known, the same request binds its unit at the index the
     /// scan gives, and marks nothing lost.
     #[test]
