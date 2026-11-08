@@ -86,6 +86,20 @@ pub fn parse_show_many(text: &str, names: &[String]) -> Vec<Result<BTreeMap<Stri
         .collect()
 }
 
+/// The arguments of the one `systemctl show` that `observe_many` runs. The
+/// names follow `--`, so a name that begins with `-` is read as a unit and
+/// never as an option (`planariad --observe-units` takes names from its
+/// command line).
+pub fn observe_many_args(names: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "show".to_string(),
+        "--property=Id,LoadState,ActiveState,SubState,ExecMainStatus,Result,ExecMainCode".to_string(),
+        "--".to_string(),
+    ];
+    args.extend(names.iter().cloned());
+    args
+}
+
 /// `observe_many` from the command's result: a failed command or a timeout
 /// is an error for every unit; otherwise each as `observe` and `ended_by`
 /// would give it (how it ended only for a unit that is not running).
@@ -220,9 +234,8 @@ impl UnitBackend for Systemd {
                 .collect();
         }
         let names: Vec<String> = ids.iter().map(unit_name).collect();
-        let mut args: Vec<&str> =
-            vec!["show", "--property=Id,LoadState,ActiveState,SubState,ExecMainStatus,Result,ExecMainCode"];
-        args.extend(names.iter().map(String::as_str));
+        let args = observe_many_args(&names);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let o = self.ctl(&Scope::System, &args, QUERY_TIMEOUT);
         observe_many_from(&names, o.ok(), &o.stdout, &o.tail(), now())
     }
@@ -572,6 +585,27 @@ ExecMainStatus=0
         // The same output with an empty stdout and ok is not a pass.
         let got = observe_many_from(&n, true, "", "", Timestamp(0));
         assert!(got.iter().all(|(o, _)| o.is_err()), "{got:?}");
+    }
+
+    /// `planariad --observe-units` takes unit names from its command line:
+    /// one that begins with `-` must reach systemctl as a name. Every name
+    /// follows the one `--`, in order, and nothing but the verb and the
+    /// property list comes before it.
+    #[test]
+    fn a_unit_name_that_starts_with_a_dash_is_passed_as_a_name() {
+        let ns = names(&["-h.service", "--user", "--property=Id", "-", "sshd.service"]);
+        let args = observe_many_args(&ns);
+        let dd = args.iter().position(|a| a == "--").expect("a `--`");
+        assert_eq!(args[0], "show");
+        assert!(args[1].starts_with("--property="), "{args:?}");
+        assert_eq!(dd, 2, "{args:?}");
+        assert_eq!(&args[dd + 1..], &ns[..], "{args:?}");
+        assert_eq!(args.iter().filter(|a| *a == "--").count(), 1);
+        proptest::proptest!(|(raw in proptest::collection::vec("[-a-z.@]{1,12}", 0..8))| {
+            let args = observe_many_args(&raw);
+            proptest::prop_assert_eq!(&args[..3], &["show".to_string(), args[1].clone(), "--".to_string()]);
+            proptest::prop_assert_eq!(&args[3..], &raw[..]);
+        });
     }
 
     #[test]
