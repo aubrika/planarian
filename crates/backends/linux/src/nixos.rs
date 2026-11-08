@@ -74,6 +74,13 @@ pub struct Export {
     /// Every undeclared system service → its shipped-table sensitivity (§11).
     #[serde(default)]
     pub services: BTreeMap<String, Sensitivities>,
+    /// §12d: every system service that is a network tool, declared or not
+    /// (a template ends in `@`). Netwatch reads the same key
+    /// (`planarian_backend_netwatch::host::network_tools`), so the two agree
+    /// (`both_readers_of_networkTools_agree`). An export without the key is
+    /// from before it existed: empty here (netwatch, which needs the key to
+    /// attach its watch, fails closed instead).
+    pub network_tools: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +110,7 @@ impl Export {
             declarations: self.declarations,
             inputs: self.inputs.into_iter().map(|(k, v)| (k, (v.rev, v.path))).collect(),
             services: self.services,
+            network_tools: self.network_tools.into_iter().collect(),
         }
     }
 }
@@ -1254,6 +1262,41 @@ impl GenerationBackend for Nixos {
 
 #[cfg(test)]
 mod tests {
+    /// Rule 20, one list read twice: planariad's `Export` and netwatch's
+    /// `host::network_tools` read the export's `networkTools` and must give
+    /// the same set. Where they differ is only a missing key: netwatch needs
+    /// it to attach its watch (fail closed), `Export` reads it as empty (a
+    /// generation from before the key existed); a malformed list or document
+    /// is an error for both, never an empty set (rule 21).
+    #[test]
+    #[allow(non_snake_case)]
+    fn both_readers_of_networkTools_agree() {
+        use planarian_backend_netwatch::host::network_tools;
+        let units = r#""units": [], "userUnits": [], "coreUnits": {}, "devices": {}, "packages": {}, "insecure": []"#;
+        for list in
+            [r#"[]"#, r#"["wg-quick-wg0"]"#, r#"["wg-quick-wg0", "openvpn@", "tailscaled"]"#, r#"["a", "a", "b"]"#]
+        {
+            let doc = format!(r#"{{{units}, "networkTools": {list}}}"#);
+            let ours: Export = serde_json::from_str(&doc).unwrap();
+            let theirs = network_tools(&doc).expect("netwatch reads a well-formed list");
+            let (a, b): (BTreeSet<_>, BTreeSet<_>) =
+                (ours.network_tools.into_iter().collect(), theirs.into_iter().collect());
+            assert_eq!(a, b, "{list}");
+        }
+        // Missing key: Export reads empty, netwatch refuses (its watch is not attached).
+        let none = format!(r#"{{{units}}}"#);
+        assert!(serde_json::from_str::<Export>(&none).unwrap().network_tools.is_empty());
+        assert_eq!(network_tools(&none), None);
+        // Malformed: both refuse; neither makes it empty.
+        for bad in [r#"{"networkTools": [1]}"#, r#"{"networkTools": "x"}"#, r#"{"networkTools": ["a", null]}"#] {
+            let doc = format!(r#"{{{units}, {}"#, &bad[1..]);
+            assert!(serde_json::from_str::<Export>(&doc).is_err(), "{bad}");
+            assert_eq!(network_tools(&doc), None, "{bad}");
+        }
+        assert!(serde_json::from_str::<Export>("not json").is_err());
+        assert_eq!(network_tools("not json"), None);
+    }
+
     #[test]
     fn journal_kinds_reads_only_a_bounded_static_export() {
         let root = std::env::temp_dir().join(format!("planarian-journal-kinds-{}", std::process::id()));

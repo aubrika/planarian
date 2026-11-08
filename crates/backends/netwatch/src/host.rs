@@ -29,6 +29,15 @@ pub fn unit_of_cgroup(rel: &str) -> Option<UnitId> {
     (!svc.is_empty()).then(|| UnitId::service(svc))
 }
 
+/// Whether the watch still writes `unit`'s footprint while it is not running:
+/// a plain tool's always is (and it keeps what the unit changed, so a stopped
+/// tool that steered still reads as protecting), a template instance's only
+/// while it runs, so a stopped instance has none (and, with none, counts as
+/// protecting: fail closed). `expand_tools` is this rule.
+pub fn footprint_outlives_the_unit(unit: &UnitId) -> bool {
+    !unit.name.contains('@')
+}
+
 /// The network tools now: plain names as they are, a template (`name@`)
 /// as each running instance (`name@inst`) among `running`.
 pub fn expand_tools(tools: &[String], running: &BTreeSet<String>) -> Vec<UnitId> {
@@ -80,6 +89,33 @@ pub fn read_virtual_ifaces(class_net: &Path) -> BTreeSet<String> {
         .filter(|e| std::fs::read_link(e.path()).is_ok_and(|t| t.to_string_lossy().contains("/devices/virtual/")))
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect()
+}
+
+/// Interface index → name, from `dir` (`/sys/class/net`), or an error: a
+/// failed scan is never "no such device" (rule 21). A device that goes
+/// between the listing and its `ifindex` (`NotFound`) is simply gone; any
+/// other failure, or an index that does not parse, fails the whole scan.
+pub fn try_read_ifnames_in(dir: &Path) -> Result<BTreeMap<u32, String>, String> {
+    let mut out = BTreeMap::new();
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for e in rd {
+        let e = e.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        match std::fs::read_to_string(e.path().join("ifindex")) {
+            Ok(s) => {
+                let i = s.trim().parse().map_err(|_| format!("{name}: ifindex {:?} is not a number", s.trim()))?;
+                out.insert(i, name);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{name}: ifindex: {e}")),
+        }
+    }
+    Ok(out)
+}
+
+/// [`try_read_ifnames_in`] for the host's `/sys/class/net`.
+pub fn try_read_ifnames() -> Result<BTreeMap<u32, String>, String> {
+    try_read_ifnames_in(Path::new("/sys/class/net"))
 }
 
 /// Interface index → name, from `/sys/class/net`.

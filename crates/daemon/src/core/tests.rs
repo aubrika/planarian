@@ -2929,6 +2929,136 @@ fn a_held_network_tool_killed_outside_planarian_is_restarted_at_once() {
     assert!(!r.fake.w().held.contains(&web), "the hold lifts once it is back");
 }
 
+/// gym-web as a network tool with no Readiness probe, as the catalog's
+/// `gym-linger` is: back is then only "Running".
+fn rig_with_probeless_tool() -> Rig {
+    let mut r = rig_with_network_tool(true, true);
+    let mut m = r.core.asm.manifest().clone();
+    m.units.get_mut(&UnitId::service("gym-web")).unwrap().probes.retain(|p| p.role != ProbeRole::Readiness);
+    r.core.asm.set_manifest(m);
+    r.ticks(2);
+    r
+}
+
+/// §12d, catalog run 42504673480 (`vm-netsec`, "a lingering cgroup"): a
+/// tick reads a tool's status, then spends seconds on probes; the tool is
+/// SIGKILLed in that gap, OnFailure= holds it, and the tick's hold step then
+/// saw a hold on the host and, from its old reading, a tool that was
+/// Running: it alarmed and lifted in one observation, and traffic flowed
+/// while the tool was down. A hold lifts only on a status read at the moment
+/// of the lift, and never on the observation that alarmed it.
+#[test]
+fn a_kill_after_the_status_read_does_not_lift_the_hold_it_caused() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_probeless_tool();
+    r.fake.w().signal_after_observe.insert(web.clone(), 9);
+    r.ticks(1);
+    let held = r.fake.w().held.contains(&web);
+    assert!(held, "OnFailure= held it and nothing lifted it: {:?}", r.core.notices);
+    assert_eq!(r.calls("lift_hold(service:gym-web)"), 0, "lifted on a reading older than the kill");
+    assert!(!r.core.notices.iter().any(|n| n.contains("is back; network traffic flows again")), "{:?}", r.core.notices);
+    // It stays held until it is genuinely Running again, then lifts.
+    let mut seen_down_held = false;
+    for _ in 0..12 {
+        r.ticks(1);
+        let (running, held) = (r.status("service:gym-web") == UnitStatus::Running, r.fake.w().held.contains(&web));
+        assert!(running || held, "traffic flowed while the tool was down: {:?}", r.core.notices);
+        seen_down_held |= !running && held;
+    }
+    assert!(seen_down_held || r.calls("restart(service:gym-web)") >= 1);
+    assert_eq!(r.status("service:gym-web"), UnitStatus::Running);
+    assert!(!r.fake.w().held.contains(&web), "the hold lifts once it is back");
+}
+
+/// The same race for a hold the daemon has already journaled: the tool is
+/// Running when the tick reads it and killed before the hold step runs. The
+/// lift asks systemd again and finds it down.
+#[test]
+fn a_journaled_hold_does_not_lift_on_a_reading_older_than_a_second_kill() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_probeless_tool();
+    r.fake.w().kill(&web);
+    r.ticks(1);
+    assert!(r.core.ledger().holds().contains(&web), "journaled: {:?}", r.core.notices);
+    {
+        let mut w = r.fake.w();
+        w.units.get_mut(&web).unwrap().observed = Observed::Active;
+        w.signal_after_observe.insert(web.clone(), 9);
+    }
+    let before = r.calls("lift_hold(service:gym-web)");
+    r.ticks(1);
+    let after = r.calls("lift_hold(service:gym-web)");
+    let held = r.fake.w().held.contains(&web);
+    assert!(held, "lifted on a reading older than the kill: {:?}", r.core.notices);
+    assert_eq!(before, after, "asked the host to lift");
+}
+
+/// The fresh read before a lift is one systemd call, charged to the tick's
+/// hold budget: a read that takes the whole budget defers the lift to the
+/// next tick, and one that is cheap lifts at once.
+#[test]
+fn the_read_before_a_lift_is_charged_to_the_hold_budget() {
+    let web = UnitId::service("gym-web");
+    for (cost, lifts) in [(Millis(0), true), (Millis(100), true), (HOLD_WAIT, false), (Millis::secs(30), false)] {
+        let mut r = rig_with_probeless_tool();
+        r.fake.w().kill(&web);
+        r.ticks(1);
+        assert!(r.core.ledger().holds().contains(&web), "journaled: {:?}", r.core.notices);
+        {
+            let mut w = r.fake.w();
+            w.units.get_mut(&web).unwrap().observed = Observed::Active;
+            w.command_cost = cost;
+        }
+        r.core.hold_left = HOLD_WAIT;
+        let lifted = r.core.lift_back(&web);
+        r.fake.w().command_cost = Millis(0);
+        assert_eq!(lifted, lifts, "cost {cost:?}");
+        assert_eq!(r.calls("lift_hold(service:gym-web)") > 0, lifts, "cost {cost:?}");
+    }
+}
+
+/// The alarm for a hold the daemon finds already standing and the lift of
+/// that hold are never the same observation, even for a tool that is
+/// Running again by then (systemd restarted it before the daemon looked).
+#[test]
+fn the_alarm_for_a_hold_and_its_lift_are_never_one_observation() {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_probeless_tool();
+    r.fake.w().kill(&web);
+    r.fake.w().units.get_mut(&web).unwrap().observed = Observed::Active; // systemd's Restart= beat the daemon
+    assert!(r.fake.w().held.contains(&web));
+    r.ticks(1);
+    assert!(r.core.notices.iter().any(|n| *n == crate::hold::alarm(&web)), "alarmed: {:?}", r.core.notices);
+    assert_eq!(r.calls("lift_hold(service:gym-web)"), 0, "alarm and lift in one observation");
+    assert!(r.fake.w().held.contains(&web));
+    r.ticks(2);
+    assert!(!r.fake.w().held.contains(&web), "lifted on a later observation");
+}
+
+/// A killed tool whose child lingers in its cgroup is Failed (or, while
+/// systemd tears it down, Transitioning), never Running: its hold stands
+/// whatever the read says about processes.
+#[test]
+fn a_tool_that_is_failing_or_deactivating_stays_held() {
+    for linger in [
+        Observed::Failed(Reason::ExitCode(137)),
+        Observed::Transitioning { from: Box::new(Observed::Active), since: Timestamp(0) },
+    ] {
+        let web = UnitId::service("gym-web");
+        let mut r = rig_with_probeless_tool();
+        r.fake.w().kill(&web);
+        r.ticks(1);
+        assert!(r.fake.w().held.contains(&web));
+        // Held on the host and journaled; the unit's state is pinned.
+        for _ in 0..8 {
+            r.fake.w().units.get_mut(&web).unwrap().observed = linger.clone();
+            r.ticks(1);
+            assert!(r.fake.w().held.contains(&web), "lifted while {linger:?}: {:?}", r.core.notices);
+        }
+        assert_eq!(r.calls("lift_hold(service:gym-web)"), 0, "{linger:?}");
+    }
+}
+
 /// Stopped cleanly outside Planarian (`systemctl stop`: no OnFailure=):
 /// §12d's other half, "by `planariad` for a stop outside Planarian that is
 /// not attributed (always a fault, §11 residue)". Held by the daemon,
@@ -3458,6 +3588,120 @@ fn a_lift_that_alone_hangs_is_retried_quietly_once_a_minute() {
     r.ticks(15);
     assert!(!r.fake.w().held.contains(&web), "never lifted: {:?}", r.core.notices);
     assert_eq!(r.core.notices.iter().filter(|n| n.contains("flows again")).count(), 1, "{:?}", r.core.notices);
+}
+
+/// One retry of an unconfirmed lift, `arm` having changed what systemd will
+/// answer for the tool after the tick's own status read (Running, passing
+/// probes). Returns whether the tool is still held and how many times the
+/// host was asked to lift, before and after that tick.
+fn retry_after(arm: &dyn Fn(&mut planarian_fake::World, &UnitId)) -> (bool, usize, usize) {
+    let web = UnitId::service("gym-web");
+    let mut r = rig_with_probeless_tool();
+    r.fake.w().stop_out_of_band(&web);
+    for _ in 0..10 {
+        if r.fake.w().held.contains(&web) {
+            break;
+        }
+        r.ticks(1);
+    }
+    r.fake.w().lift_hangs = Some(Millis::secs(30));
+    for _ in 0..40 {
+        if r.core.lift_unconfirmed.contains_key(&web) {
+            break;
+        }
+        r.ticks(1);
+    }
+    assert!(r.core.lift_unconfirmed.contains_key(&web), "no unconfirmed lift: {:?}", r.core.notices);
+    r.fake.w().lift_hangs = None;
+    let asked = r.calls("lift_hold(service:gym-web)");
+    let mut armed = false;
+    for _ in 0..40 {
+        let due = {
+            let next = r.core.lift_unconfirmed.get(&web).copied();
+            next.is_some_and(|n| r.core.b.clock().boot_now().plus(planarian_state::TICK) >= n)
+        };
+        if due && !armed {
+            arm(&mut r.fake.w(), &web);
+            armed = true;
+        }
+        r.ticks(1);
+        if armed {
+            break;
+        }
+    }
+    assert!(armed, "the retry never came due");
+    let held = r.fake.w().held.contains(&web);
+    (held, asked, r.calls("lift_hold(service:gym-web)"))
+}
+
+/// The retry of a lift the host had not confirmed is a lift too: it asks
+/// systemd again, so a tool killed since the tick's status read keeps its hold.
+#[test]
+fn the_retry_of_an_unconfirmed_lift_does_not_open_traffic_for_a_tool_that_is_down() {
+    let (held, asked, now) = retry_after(&|w, web| {
+        w.signal_after_observe.insert(web.clone(), 9);
+    });
+    assert!(held, "the retry lifted on a reading older than the kill");
+    assert_eq!(now, asked, "asked the host to lift again");
+}
+
+/// Only `Active` at the moment of a lift lifts: whatever else systemd says
+/// then (failed, deactivating, unknown, absent, bound, detected, or nothing:
+/// the read fails) keeps the hold, for a journaled hold lifting on a
+/// Running tick and for the retry of an unconfirmed lift.
+#[test]
+fn only_an_active_answer_at_the_lift_lifts_the_hold() {
+    use planarian_schema::Reason;
+    let web = UnitId::service("gym-web");
+    #[derive(Clone, Debug)]
+    enum Answer {
+        Observed(Observed),
+        Unreadable,
+    }
+    let answers = [
+        Answer::Observed(Observed::Failed(Reason::ExitCode(137))),
+        Answer::Observed(Observed::Transitioning { from: Box::new(Observed::Active), since: Timestamp(0) }),
+        Answer::Observed(Observed::Unknown { since: Timestamp(0), reason: "backend error".into() }),
+        Answer::Observed(Observed::Absent),
+        Answer::Observed(Observed::Bound),
+        Answer::Observed(Observed::Detected),
+        Answer::Unreadable,
+        Answer::Observed(Observed::Active),
+    ];
+    for a in answers {
+        let lifts = matches!(a, Answer::Observed(Observed::Active));
+        // A journaled hold, the tick's reading Running.
+        let mut r = rig_with_probeless_tool();
+        r.fake.w().kill(&web);
+        r.ticks(1);
+        assert!(r.core.ledger().holds().contains(&web), "journaled: {:?}", r.core.notices);
+        {
+            let mut w = r.fake.w();
+            match &a {
+                Answer::Observed(o) => w.units.get_mut(&web).unwrap().observed = o.clone(),
+                Answer::Unreadable => {
+                    w.observe_fails.insert(web.clone());
+                }
+            }
+        }
+        r.core.hold_left = HOLD_WAIT;
+        assert_eq!(r.core.lift_back(&web), lifts, "lift_back with {a:?}");
+        assert_eq!(r.calls("lift_hold(service:gym-web)") > 0, lifts, "host asked, {a:?}");
+        assert_eq!(r.fake.w().held.contains(&web), !lifts, "held, {a:?}");
+        let lifted = r.core.ledger().hold_events.iter().any(|e| !e.1);
+        assert_eq!(lifted, lifts, "HoldLifted journaled, {a:?}");
+        // The retry of an unconfirmed lift.
+        let (held, asked, now) = retry_after(&|w, web| match &a {
+            Answer::Observed(o) => {
+                w.set_after_observe.insert(web.clone(), o.clone());
+            }
+            Answer::Unreadable => {
+                w.unreadable_after_observe.insert(web.clone());
+            }
+        });
+        assert_eq!(now > asked, lifts, "retry asked the host, {a:?}");
+        assert_eq!(held, !lifts, "retry held, {a:?}");
+    }
 }
 
 // ---- §9: "`Exec` probes, which run arbitrary commands, are permitted only
@@ -3990,4 +4234,887 @@ mod switch_window_busy {
         let failing = |r: &mut Rig| r.fake.w().queued_jobs_fails = Some("no bus".into());
         assert!(inferred_after(640, |_| {}, failing));
     }
+}
+
+mod unmanaged_tools {
+    use super::*;
+    use planarian_fake::UnitSim;
+    use proptest::test_runner::TestCaseError;
+
+    /// A machine whose generation exports `export` among its `networkTools`
+    /// with no manifest unit for it, and whose unit `running` runs (steering
+    /// traffic when `steers`).
+    fn rig(export: &str, running: &str, steers: bool) -> Rig {
+        let store = MemStore::new(8 << 20);
+        let fake = gym_world(store.clone());
+        let id = UnitId::service(running);
+        {
+            let mut w = fake.w();
+            for g in w.gens.values_mut() {
+                g.eval.network_tools.insert(export.to_string());
+            }
+            let now = w.now;
+            w.units.insert(id.clone(), UnitSim::active(now));
+            if steers {
+                w.steers_traffic(&id);
+            }
+            w.alive.insert(100);
+        }
+        let mut j = Journal::open(store).unwrap();
+        j.append(fake.w().now, Record::KnownGood(GenerationId(1))).unwrap();
+        let core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config());
+        let mut r = Rig { fake, core };
+        r.ticks(2);
+        r
+    }
+
+    fn alarm_text(u: &str) -> String {
+        format!(
+            "ALARM: service:{u} stopped and is not managed by Planarian. Network traffic is blocked until it is back or an administrator releases it."
+        )
+    }
+
+    fn says(r: &Rig, text: &str) -> usize {
+        r.core.notices.iter().filter(|n| n.as_str() == text).count()
+    }
+
+    /// A protecting unmanaged tool that stops is held and alarmed once, in the
+    /// spec's words; it is never restarted, never an incident, never an
+    /// inferred override.
+    #[test]
+    fn a_stopped_unmanaged_tool_is_held_alarmed_and_left_alone() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(30);
+        assert!(r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
+        assert!(r.core.ledger().holds().contains(&vpn), "journaled");
+        assert_eq!(says(&r, &alarm_text("some-vpn")), 1, "{:?}", r.core.notices);
+        assert_eq!(r.calls("restart("), 0, "an unmanaged tool is never restarted");
+        assert!(r.core.incidents.active_for(&vpn).is_none(), "never an incident");
+        assert!(r.core.ledger().incidents.is_empty(), "{:?}", r.core.ledger().incidents);
+        assert!(r.core.ledger().overrides.is_empty(), "not inferred as intended");
+    }
+
+    #[test]
+    fn a_crashed_unmanaged_tool_is_held_and_not_restarted() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        r.fake.w().hold_on_failure.insert(vpn.clone());
+        r.fake.w().kill(&vpn);
+        r.ticks(30);
+        assert!(r.fake.w().held.contains(&vpn));
+        assert_eq!(r.calls("restart("), 0);
+        assert!(r.core.incidents.active_for(&vpn).is_none());
+    }
+
+    /// Back by other means (someone starts it): the hold lifts.
+    #[test]
+    fn it_lifts_when_the_tool_is_running_again_by_other_means() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(5);
+        assert!(r.fake.w().held.contains(&vpn));
+        let now = r.fake.w().now;
+        *r.fake.w().units.get_mut(&vpn).unwrap() = UnitSim::active(now);
+        r.ticks(5);
+        assert!(!r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
+        assert!(r.core.ledger().holds().is_empty());
+        assert_eq!(r.calls("restart("), 0, "it came back without Planarian");
+    }
+
+    /// An administrator's `hold release` lifts it, and it is not held again
+    /// while it stays down.
+    #[test]
+    fn an_administrator_releases_the_hold_of_an_unmanaged_tool() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(5);
+        assert!(r.fake.w().held.contains(&vpn));
+        let resp = r.core.handle(ADMIN, Request::HoldRelease { unit: vpn.clone(), until: Until::NextBoot });
+        assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+        r.ticks(3);
+        assert!(!r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
+        r.ticks(10);
+        assert!(!r.fake.w().held.contains(&vpn), "not held again while released");
+        assert_eq!(r.calls("restart("), 0);
+    }
+
+    /// A tool that steers nothing protects no traffic: not held (§12d).
+    #[test]
+    fn an_unmanaged_tool_that_protects_nothing_is_not_held() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", false);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(10);
+        assert!(!r.fake.w().held.contains(&vpn));
+        assert_eq!(says(&r, &alarm_text("some-vpn")), 0);
+    }
+
+    /// A template in the export is each running instance.
+    #[test]
+    fn a_template_in_the_export_is_held_per_instance() {
+        let inst = UnitId::service("openvpn@work");
+        let mut r = rig("openvpn@", "openvpn@work", true);
+        r.fake.w().stop_out_of_band(&inst);
+        r.ticks(10);
+        assert!(r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
+        assert_eq!(says(&r, &alarm_text("openvpn@work")), 1);
+    }
+
+    /// A tool with a manifest unit is the manifest's: managed as before (its
+    /// alarm is the managed one, and it is repaired), never the unmanaged path.
+    #[test]
+    fn a_managed_tool_is_not_unmanaged() {
+        let mut r = rig("gym-web", "some-other", false);
+        assert!(r.core.unmanaged.is_empty(), "{:?}", r.core.unmanaged);
+        r.ticks(1);
+        assert!(!r.core.notices.iter().any(|n| n.contains("not managed by Planarian")));
+    }
+
+    /// Rule 21: an export that cannot be read is not an empty set of tools.
+    /// The daemon says so once, keeps trying, and watches the tools as soon
+    /// as it can read them.
+    #[test]
+    fn an_unreadable_export_is_not_an_empty_set() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        // As if the first read had failed.
+        r.core.network_tools = None;
+        r.core.unmanaged.clear();
+        r.fake.w().evaluate_built_fails = Some("export.json: unreadable".into());
+        r.ticks(5);
+        let said = r.core.notices.iter().filter(|n| n.contains("network tools could not be read")).count();
+        assert_eq!(said, 1, "{:?}", r.core.notices);
+        assert!(r.core.unmanaged.is_empty() && r.core.network_tools.is_none());
+        r.fake.w().evaluate_built_fails = None;
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(5);
+        assert!(r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
+    }
+
+    /// A failed list of systemd's units leaves a template's instances as they
+    /// were: a transient failure must not drop a held tool from the watch.
+    #[test]
+    fn a_failed_unit_list_keeps_a_templates_instances_watched() {
+        let inst = UnitId::service("openvpn@work");
+        let mut r = rig("openvpn@", "openvpn@work", true);
+        r.fake.w().list_fails = Some("systemctl list-units: timed out".into());
+        r.ticks(2);
+        r.fake.w().stop_out_of_band(&inst);
+        r.ticks(10);
+        assert!(r.fake.w().held.contains(&inst), "dropped from the watch: {:?}", r.core.notices);
+        r.fake.w().list_fails = None;
+        r.ticks(2);
+        assert!(r.fake.w().held.contains(&inst));
+    }
+
+    /// A hold unit is never an unmanaged tool, whatever a template in the
+    /// export would match, and a unit named exactly like the template is not
+    /// one of its instances.
+    #[test]
+    fn hold_units_and_the_bare_template_are_not_unmanaged_tools() {
+        let mut r = rig("planarian-hold@", "planarian-hold@some-vpn", true);
+        r.fake.w().units.insert(UnitId::service("planarian-hold@"), UnitSim::active(Timestamp(0)));
+        r.ticks(2);
+        assert!(r.core.unmanaged.is_empty(), "{:?}", r.core.unmanaged);
+        let mut r = rig("openvpn@", "openvpn@work", true);
+        r.fake.w().units.insert(UnitId::service("openvpn@"), UnitSim::active(Timestamp(0)));
+        r.ticks(2);
+        assert_eq!(r.core.unmanaged, BTreeSet::from([UnitId::service("openvpn@work")]));
+    }
+
+    /// A tool that cannot be observed is Unknown: neither held (it may be
+    /// running) nor lifted (it may be down).
+    #[test]
+    fn an_unobservable_unmanaged_tool_is_neither_held_nor_lifted() {
+        let vpn = UnitId::service("some-vpn");
+        // Not held while it cannot be seen, though it is protecting.
+        let mut r = rig("some-vpn", "some-vpn", true);
+        r.fake.w().observe_fails.insert(vpn.clone());
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(10);
+        assert!(!r.fake.w().held.contains(&vpn), "held what it could not see: {:?}", r.core.notices);
+        // Held, then not lifted while it cannot be seen even if it is back.
+        r.fake.w().observe_fails.clear();
+        r.ticks(3);
+        assert!(r.fake.w().held.contains(&vpn));
+        r.fake.w().observe_fails.insert(vpn.clone());
+        let now = r.fake.w().now;
+        *r.fake.w().units.get_mut(&vpn).unwrap() = UnitSim::active(now);
+        r.ticks(10);
+        assert!(r.fake.w().held.contains(&vpn), "lifted what it could not see");
+        r.fake.w().observe_fails.clear();
+        r.ticks(5);
+        assert!(!r.fake.w().held.contains(&vpn), "lifts once it can be seen running");
+    }
+
+    /// A unit that ended on its own is not down: a oneshot that finished
+    /// (`modprobe@x`: inactive, exit status 0) is never held or alarmed,
+    /// though it is in the export's templates and counts as protecting (no
+    /// footprint). Nor is one that was never seen running.
+    #[test]
+    fn a_finished_oneshot_instance_is_not_down() {
+        let inst = UnitId::service("modprobe@dm_mod");
+        let mut r = rig("modprobe@", "modprobe@dm_mod", true);
+        {
+            let mut w = r.fake.w();
+            let sim = w.units.get_mut(&inst).unwrap();
+            sim.observed = Observed::Bound;
+            sim.ended = Some(Ending::Exited(0));
+        }
+        r.ticks(20);
+        assert!(!r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
+        assert_eq!(says(&r, &alarm_text("modprobe@dm_mod")), 0);
+        assert!(r.core.ledger().holds().is_empty());
+        // Never seen up, and now inactive: not down either.
+        let mut r = rig("modprobe@", "modprobe@x", false);
+        r.fake.w().units.insert(
+            UnitId::service("modprobe@never"),
+            UnitSim { observed: Observed::Absent, ..UnitSim::active(Timestamp(0)) },
+        );
+        r.fake.w().steers_traffic(&UnitId::service("modprobe@never"));
+        r.ticks(20);
+        assert!(!r.fake.w().held.contains(&UnitId::service("modprobe@never")));
+    }
+
+    /// `n` unmanaged instances of `t@`, all protecting and running.
+    fn many(n: usize) -> (Rig, Vec<UnitId>) {
+        let names: Vec<UnitId> = (0..n).map(|i| UnitId::service(&format!("t@{i}"))).collect();
+        let mut r = rig("t@", "t@0", true);
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &names {
+                w.units.insert(u.clone(), UnitSim::active(now));
+                w.steers_traffic(u);
+            }
+        }
+        r.ticks(1);
+        (r, names)
+    }
+
+    fn observed_by_tick(r: &mut Rig) -> u64 {
+        let total = |r: &Rig| -> u64 {
+            r.fake.w().observe_counts.iter().filter(|(u, _)| u.name.starts_with("t@")).map(|(_, n)| *n).sum()
+        };
+        let before = total(r);
+        r.ticks(1);
+        total(r) - before
+    }
+
+    fn latched(r: &Rig) -> usize {
+        r.core.unmanaged_latch.values().filter(|p| **p).count()
+    }
+
+    /// Tools not yet seen running are rotated a few a tick; once seen
+    /// protecting, each is observed every tick.
+    #[test]
+    fn unseen_tools_are_rotated_and_seen_protecting_ones_are_observed_every_tick() {
+        const N: usize = 100;
+        let cap = crate::hold::UNMANAGED_OBSERVE_PER_TICK as u64;
+        let (mut r, names) = many(N);
+        // The first tick after they appear has seen at most `cap` of them (and t@0).
+        assert!(latched(&r) as u64 <= 1 + cap, "{} latched at once", latched(&r));
+        // Warming up: a tick looks at the latched ones plus at most `cap` new.
+        for _ in 0..N.div_ceil(cap as usize) + 2 {
+            let seen_now = latched(&r) as u64;
+            let calls = observed_by_tick(&mut r);
+            assert!(calls <= seen_now + cap, "a tick observed {calls} with {seen_now} latched (cap {cap})");
+        }
+        // Warm: every instance is observed every tick.
+        assert_eq!(latched(&r), N);
+        assert!(observed_by_tick(&mut r) >= N as u64, "a latched tool was skipped");
+        assert!(observed_by_tick(&mut r) >= N as u64);
+        assert!(names.iter().all(|u| r.fake.w().observe_counts.get(u).copied().unwrap_or(0) >= 1));
+    }
+
+    /// Whatever their number, a latched-protecting tool that goes down is held
+    /// on the next tick: a kill (systemd failed) and a clean stop alike (no
+    /// grace, no switch exemption).
+    #[test]
+    fn a_latched_tool_that_goes_down_is_held_on_the_next_tick_whatever_the_number() {
+        for n in [1usize, 8, 40, 100] {
+            let (mut r, names) = many(n);
+            r.ticks(n.div_ceil(crate::hold::UNMANAGED_OBSERVE_PER_TICK) + 3);
+            let (killed, stopped) = (&names[n - 1], &names[n / 2]);
+            r.fake.w().kill(killed);
+            r.fake.w().stop_out_of_band(stopped);
+            r.ticks(1);
+            assert!(r.fake.w().held.contains(killed), "n={n}: a kill not held on the next tick: {:?}", r.core.notices);
+            assert!(r.fake.w().held.contains(stopped), "n={n}: a clean stop not held on the next tick");
+        }
+    }
+
+    /// More than UNMANAGED_MANY observed every tick is said once.
+    #[test]
+    fn many_unmanaged_tools_observed_every_tick_are_said_once() {
+        let (mut r, _) = many(crate::hold::UNMANAGED_MANY + 8);
+        r.ticks(12);
+        let said =
+            r.core.notices.iter().filter(|n| n.contains("unmanaged network tools are observed every tick")).count();
+        assert_eq!(said, 1, "{:?}", r.core.notices);
+        let (mut r, _) = many(4);
+        r.ticks(12);
+        assert!(!r.core.notices.iter().any(|n| n.contains("observed every tick")));
+    }
+
+    /// The latch (a footprint exists only while an instance runs, so a stopped
+    /// one counts as protecting): an instance that protected nothing while it
+    /// ran and is restarted is held for nothing; one that protected traffic is
+    /// held at once and lifts when it runs again; one never observed running
+    /// and stopped by a signal is held (fail closed).
+    #[test]
+    fn what_a_tool_was_doing_while_it_ran_decides_whether_stopping_it_holds() {
+        let restart = |r: &mut Rig, inst: &UnitId| {
+            r.fake.w().stop_out_of_band(inst);
+            r.ticks(1);
+            let now = r.fake.w().now;
+            *r.fake.w().units.get_mut(inst).unwrap() = UnitSim::active(now);
+            r.ticks(3);
+        };
+        // Protected nothing while running (observed by rotation): a restart holds and alarms nothing.
+        let inst = UnitId::service("openvpn@quiet");
+        let mut r = rig("openvpn@", "openvpn@quiet", false);
+        r.ticks(2);
+        assert_eq!(r.core.unmanaged_latch.get(&inst), Some(&false), "{:?}", r.core.unmanaged_latch);
+        restart(&mut r, &inst);
+        assert!(!r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
+        assert_eq!(says(&r, &alarm_text("openvpn@quiet")), 0);
+        // Protected traffic: held at once, lifted when running again.
+        let inst = UnitId::service("openvpn@work");
+        let mut r = rig("openvpn@", "openvpn@work", true);
+        r.ticks(2);
+        assert_eq!(r.core.unmanaged_latch.get(&inst), Some(&true));
+        r.fake.w().stop_out_of_band(&inst);
+        r.ticks(1);
+        assert!(r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
+        let now = r.fake.w().now;
+        *r.fake.w().units.get_mut(&inst).unwrap() = UnitSim::active(now);
+        r.ticks(4);
+        assert!(!r.fake.w().held.contains(&inst), "never lifted: {:?}", r.core.notices);
+        // Never observed running, then stopped by a signal: held (fail closed).
+        let inst = UnitId::service("openvpn@late");
+        let mut r = rig("openvpn@", "openvpn@work", true);
+        r.fake.w().units.insert(
+            inst.clone(),
+            UnitSim { observed: Observed::Bound, ended: Some(Ending::Signal(15)), ..UnitSim::active(Timestamp(0)) },
+        );
+        r.ticks(12);
+        assert!(r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
+    }
+
+    /// A new run overwrites the latch: an instance that protected nothing,
+    /// then (restarted) protects traffic, is held when it stops.
+    #[test]
+    fn a_new_run_does_not_inherit_the_old_latch() {
+        let inst = UnitId::service("openvpn@work");
+        let mut r = rig("openvpn@", "openvpn@work", false);
+        r.ticks(2);
+        assert_eq!(r.core.unmanaged_latch.get(&inst), Some(&false));
+        r.fake.w().steers_traffic(&inst);
+        r.ticks(14);
+        assert_eq!(r.core.unmanaged_latch.get(&inst), Some(&true), "the latch was not updated");
+        r.fake.w().stop_out_of_band(&inst);
+        r.ticks(1);
+        assert!(r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
+    }
+
+    /// A hold that stands on a tool the generation no longer exports is still
+    /// watched and lifted once the tool is back.
+    #[test]
+    fn a_hold_stays_watched_after_the_export_stops_naming_the_tool() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(6);
+        assert!(r.fake.w().held.contains(&vpn));
+        // The export no longer lists it (a new generation, read at once).
+        r.core.network_tools = Some(Default::default());
+        r.ticks(2);
+        assert!(r.core.unmanaged.contains(&vpn), "dropped while held");
+        let now = r.fake.w().now;
+        *r.fake.w().units.get_mut(&vpn).unwrap() = UnitSim::active(now);
+        r.ticks(5);
+        assert!(!r.fake.w().held.contains(&vpn), "never lifted: {:?}", r.core.notices);
+        r.ticks(3);
+        assert!(!r.core.unmanaged.contains(&vpn), "watched once lifted and unexported");
+    }
+
+    /// `n` unmanaged instances of `q@` that protect nothing, running.
+    fn quiet(n: usize) -> (Rig, Vec<UnitId>) {
+        let names: Vec<UnitId> = (0..n).map(|i| UnitId::service(&format!("q@{i:02}"))).collect();
+        let r = rig("q@", "q@00", false);
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &names {
+                w.units.insert(u.clone(), UnitSim::active(now));
+            }
+        }
+        (r, names)
+    }
+
+    /// The rotation reaches every tool that is not always looked at: with
+    /// more than the per-tick cap of tools that protect nothing (latched
+    /// false, so they stay in the rotation), one that starts protecting is
+    /// re-latched within a round, so B-30's window is bounded. (A cursor that
+    /// did not advance would observe the same few forever.)
+    #[test]
+    fn the_rotation_reaches_a_tool_that_starts_protecting() {
+        const N: usize = 20;
+        let cap = crate::hold::UNMANAGED_OBSERVE_PER_TICK;
+        let (mut r, names) = quiet(N);
+        r.ticks(N.div_ceil(cap) + 2);
+        assert!(names.iter().all(|u| r.core.unmanaged_latch.get(u) == Some(&false)), "{:?}", r.core.unmanaged_latch);
+        let last = r.core.unmanaged.iter().next_back().unwrap().clone();
+        r.fake.w().steers_traffic(&last);
+        let mut ticks = 0;
+        while r.core.unmanaged_latch.get(&last) != Some(&true) && ticks < 3 * N {
+            r.ticks(1);
+            ticks += 1;
+        }
+        assert_eq!(r.core.unmanaged_latch.get(&last), Some(&true), "never re-latched");
+        assert!(ticks <= N.div_ceil(cap) + 1, "re-latched after {ticks} ticks");
+        r.fake.w().stop_out_of_band(&last);
+        r.ticks(1);
+        assert!(r.fake.w().held.contains(&last), "{:?}", r.core.notices);
+    }
+
+    /// A tool whose hold stands is observed on every tick, whatever its latch
+    /// and however many others are rotating: its lift does not wait for the
+    /// rotation.
+    #[test]
+    fn a_held_tool_is_observed_every_tick_beside_many_rotating_ones() {
+        let (mut r, _) = quiet(20);
+        let held: Vec<UnitId> = ["q@v1", "q@v2"].iter().map(|n| UnitId::service(n)).collect();
+        {
+            let mut w = r.fake.w();
+            for u in &held {
+                // Stopped by a signal and never observed running (no latch).
+                w.units.insert(
+                    u.clone(),
+                    UnitSim {
+                        observed: Observed::Bound,
+                        ended: Some(Ending::Signal(15)),
+                        ..UnitSim::active(Timestamp(0))
+                    },
+                );
+            }
+        }
+        // They are held when the rotation first reaches them (fail closed).
+        let mut ticks = 0;
+        while !held.iter().all(|u| r.fake.w().held.contains(u)) && ticks < 30 {
+            r.ticks(1);
+            ticks += 1;
+        }
+        assert!(held.iter().all(|u| r.fake.w().held.contains(u)), "{:?}", r.core.notices);
+        assert!(r.core.unmanaged.len() > crate::hold::UNMANAGED_OBSERVE_PER_TICK + 2);
+        for _ in 0..5 {
+            let before: Vec<u64> =
+                held.iter().map(|u| r.fake.w().observe_counts.get(u).copied().unwrap_or(0)).collect();
+            r.ticks(1);
+            for (u, b) in held.iter().zip(before) {
+                let now = r.fake.w().observe_counts.get(u).copied().unwrap_or(0);
+                assert!(now > b, "{u} was not observed this tick while held");
+            }
+        }
+    }
+
+    /// A plain tool keeps its footprint when it stops (netwatch writes it
+    /// whether the tool runs or not), so what netwatch reports for it is the
+    /// word, not the latch: one latched as protecting nothing that begins to
+    /// steer and is then killed or stopped is held on the next tick, though
+    /// the daemon had last seen it protect nothing.
+    #[test]
+    fn a_plain_tool_that_began_to_steer_is_held_on_netwatchs_word_not_the_latch() {
+        for kill in [true, false] {
+            let vpn = UnitId::service("some-vpn");
+            let mut r = rig("some-vpn", "some-vpn", false);
+            r.ticks(2);
+            assert_eq!(r.core.unmanaged_latch.get(&vpn), Some(&false), "kill={kill}");
+            r.fake.w().steers_traffic(&vpn);
+            if kill {
+                r.fake.w().kill(&vpn);
+            } else {
+                r.fake.w().stop_out_of_band(&vpn);
+            }
+            r.ticks(1);
+            assert!(r.fake.w().held.contains(&vpn), "kill={kill}: {:?}", r.core.notices);
+        }
+    }
+
+    /// And a plain tool that netwatch reports protecting nothing is not held
+    /// when it stops, whatever the daemon has or has not seen of it (a tool
+    /// that steers nothing protects nothing, §12d).
+    #[test]
+    fn a_plain_tool_netwatch_reports_protecting_nothing_is_not_held_when_it_stops() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", false);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(6);
+        assert!(!r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
+        assert_eq!(says(&r, &alarm_text("some-vpn")), 0);
+    }
+
+    /// A plain tool that netwatch reports protecting is observed every tick,
+    /// not by the rotation: among more than the per-tick cap of plain tools
+    /// that protect nothing (all rotating), one that begins to steer and is
+    /// killed is held on the very next tick, whichever place it has in the
+    /// rotation.
+    #[test]
+    fn a_plain_tool_reported_protecting_is_not_left_to_the_rotation() {
+        const N: usize = 20;
+        let names: Vec<UnitId> = (0..N).map(|i| UnitId::service(&format!("p{i:02}"))).collect();
+        let mut r = rig("p00", "p00", false);
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &names {
+                w.units.insert(u.clone(), UnitSim::active(now));
+            }
+        }
+        r.core.network_tools = Some(names.iter().map(|u| u.name.clone()).collect());
+        r.ticks(N.div_ceil(crate::hold::UNMANAGED_OBSERVE_PER_TICK) + 2);
+        assert!(names.iter().all(|u| r.core.unmanaged_latch.get(u) == Some(&false)), "{:?}", r.core.unmanaged_latch);
+        // Each place in the rotation: the first, a middle one, the last.
+        for victim in [&names[0], &names[N / 2], &names[N - 1]] {
+            r.fake.w().steers_traffic(victim);
+            r.fake.w().kill(victim);
+            r.ticks(1);
+            assert!(r.fake.w().held.contains(victim), "{victim} not held on the next tick: {:?}", r.core.notices);
+        }
+    }
+
+    /// A managed network tool killed while unmanaged tools are watched: its
+    /// alarm is the managed one, exactly once, and no unmanaged alarm is
+    /// raised (the unmanaged path must not swallow, duplicate or take over
+    /// the managed tool's hold episode).
+    #[test]
+    fn a_killed_managed_tool_raises_one_managed_alarm_beside_unmanaged_ones() {
+        let web = UnitId::service("gym-web");
+        let mut r = rig_with_network_tool(true, true);
+        let names: Vec<UnitId> = (0..12).map(|i| UnitId::service(&format!("u{i:02}"))).collect();
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &names {
+                w.units.insert(u.clone(), UnitSim::active(now));
+            }
+        }
+        r.core.network_tools = Some(names.iter().map(|u| u.name.clone()).chain(["t@".to_string()]).collect());
+        r.ticks(4);
+        assert!(!r.core.unmanaged.is_empty() && !r.core.unmanaged.contains(&web), "{:?}", r.core.unmanaged);
+        r.fake.w().kill(&web);
+        r.ticks(1);
+        assert!(r.fake.w().held.contains(&web), "precondition: OnFailure= held it");
+        r.ticks(10);
+        assert_eq!(hold_alarms(&r, &web), 1, "{:?}", r.core.notices);
+        assert!(
+            !r.core.notices.iter().any(|n| n.contains("not managed by Planarian")),
+            "an unmanaged alarm: {:?}",
+            r.core.notices
+        );
+        assert!(r.calls("restart(service:gym-web)") >= 1);
+        r.ticks(10);
+        assert!(!r.fake.w().held.contains(&web), "the hold lifts once it is back");
+    }
+
+    /// `observe` runs several times a tick; systemd's unit list is a command,
+    /// so it is read once a tick, not on each observe.
+    #[test]
+    fn the_unit_list_is_read_once_a_tick() {
+        let mut r = rig("openvpn@", "openvpn@work", true);
+        let before = r.fake.w().list_calls;
+        for _ in 0..4 {
+            r.ticks(1);
+            let _ = r.core.observe();
+            let _ = r.core.observe();
+        }
+        let calls = r.fake.w().list_calls - before;
+        assert!(calls <= 4, "{calls} lists in 4 ticks");
+        assert!(calls >= 3, "{calls}: it is still read");
+    }
+
+    /// How a unit ended is asked of the backend only for one that is not
+    /// running: observing many running tools costs one command each.
+    #[test]
+    fn how_a_tool_ended_is_asked_only_of_a_tool_that_is_not_running() {
+        let (mut r, _) = many(30);
+        r.ticks(8);
+        let running = r.fake.w().ended_by_calls;
+        r.ticks(4);
+        // Running tools: no `ended_by` for the unmanaged ones (the managed
+        // units' residue asks for its own).
+        let before = r.fake.w().ended_by_calls;
+        r.ticks(4);
+        assert_eq!(r.fake.w().ended_by_calls, before, "asked of running tools ({running} before)");
+    }
+
+    /// The unmanaged tools are observed in a few commands, not two for each:
+    /// with netwatch fail closed (every tool counts as protecting) and a hundred
+    /// of them, a tick makes a handful of calls, and a managed tool's kill is
+    /// seen and its alarm raised within a tick or two whatever the commands
+    /// cost (here 100 ms of fake time each, as a loaded VM's `systemctl show`).
+    #[test]
+    fn a_managed_alarm_does_not_wait_behind_many_unmanaged_tools() {
+        let web = UnitId::service("gym-web");
+        let mut r = rig_with_network_tool(true, true);
+        let names: Vec<UnitId> = (0..100).map(|i| UnitId::service(&format!("u{i:03}"))).collect();
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &names {
+                w.units.insert(u.clone(), UnitSim::active(now));
+            }
+            // Fail closed: every tool counts as protecting.
+            w.netwatch_failed = Some("not attached (scripted)".into());
+            w.command_cost = Millis(100);
+        }
+        r.core.network_tools = Some(names.iter().map(|u| u.name.clone()).collect());
+        r.ticks(3);
+        assert!(r.core.unmanaged.len() >= 100, "{}", r.core.unmanaged.len());
+        let before = r.fake.w().observe_many_calls;
+        r.ticks(1);
+        let calls = r.fake.w().observe_many_calls - before;
+        assert!((1..=6).contains(&calls), "{calls} batch calls in a tick");
+        let t_kill = r.fake.w().now;
+        r.fake.w().kill(&web);
+        let mut ticks = 0;
+        while hold_alarms(&r, &web) == 0 && ticks < 12 {
+            r.ticks(1);
+            ticks += 1;
+        }
+        let waited = r.fake.w().now.0 - t_kill.0;
+        assert_eq!(hold_alarms(&r, &web), 1, "{:?}", r.core.notices);
+        assert!(ticks <= 2, "the alarm came after {ticks} ticks");
+        assert!(waited <= 12_000, "the alarm came {waited} ms after the kill");
+    }
+
+    /// The alarm does not depend on who noticed first: a failure systemd's
+    /// OnFailure= held before the daemon looked (and the unit already back by
+    /// then) is still said, once.
+    #[test]
+    fn a_hold_applied_before_the_daemon_looked_is_still_alarmed_once() {
+        let web = UnitId::service("gym-web");
+        let mut r = rig_with_network_tool(true, true);
+        r.fake.w().kill(&web);
+        // Back before the daemon's next look (systemd's own restart, say).
+        let now = r.fake.w().now;
+        *r.fake.w().units.get_mut(&web).unwrap() = UnitSim::active(now);
+        assert!(r.fake.w().held.contains(&web), "precondition: OnFailure= held it");
+        r.ticks(12);
+        assert_eq!(hold_alarms(&r, &web), 1, "{:?}", r.core.notices);
+        assert!(!r.fake.w().held.contains(&web), "the hold lifts once it is back");
+    }
+
+    /// If observing the tools always looked at takes the tick's budget for
+    /// this work, the rotation waits for the next tick: the managed
+    /// observation and the holds after it are not made to wait behind it.
+    #[test]
+    fn the_rotation_yields_when_the_always_observed_tools_take_the_budget() {
+        let (mut r, _) = many(5);
+        r.ticks(4);
+        assert_eq!(latched(&r), 5, "five tools latched protecting");
+        let extra: Vec<UnitId> = (0..10).map(|i| UnitId::service(&format!("x@{i:02}"))).collect();
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &extra {
+                w.units.insert(u.clone(), UnitSim::active(now));
+            }
+        }
+        r.core.network_tools =
+            Some(["t@".to_string(), "x@".to_string()].into_iter().chain(["some-vpn".to_string()]).collect());
+        let seen_extra = |r: &Rig| -> u64 {
+            let w = r.fake.w();
+            extra.iter().map(|u| w.observe_counts.get(u).copied().unwrap_or(0)).sum()
+        };
+        // Cheap commands: the rotation runs.
+        r.ticks(2);
+        assert!(seen_extra(&r) > 0, "the rotation never ran");
+        // Dear ones (more than the budget for the always-observed ones): it yields.
+        r.fake.w().command_cost = Millis(600);
+        let before = seen_extra(&r);
+        r.ticks(3);
+        assert_eq!(seen_extra(&r), before, "the rotation ran behind a spent budget");
+        // And it resumes when the commands are cheap again.
+        r.fake.w().command_cost = Millis(0);
+        r.ticks(3);
+        assert!(seen_extra(&r) > before, "the rotation never resumed");
+    }
+
+    /// `n` rotating tools (`x@NN`, protecting nothing) beside five always
+    /// observed ones (latched protecting); returns the rig and the rotating
+    /// names. For the budget tests.
+    fn budgeted(n: usize) -> (Rig, Vec<UnitId>) {
+        let (mut r, _) = many(5);
+        r.ticks(4);
+        assert_eq!(latched(&r), 5);
+        let extra: Vec<UnitId> = (0..n).map(|i| UnitId::service(&format!("x@{i:02}"))).collect();
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &extra {
+                w.units.insert(u.clone(), UnitSim::active(now));
+            }
+        }
+        r.core.network_tools = Some(["t@".to_string(), "x@".to_string()].into_iter().collect());
+        (r, extra)
+    }
+
+    fn times_seen(r: &Rig, units: &[UnitId]) -> Vec<u64> {
+        let w = r.fake.w();
+        units.iter().map(|u| w.observe_counts.get(u).copied().unwrap_or(0)).collect()
+    }
+
+    /// When the budget is spent the rotation yields and its cursor stays, so
+    /// that what it skipped is reached when it next runs: with a budget spent
+    /// on every second tick and sixteen rotating tools (two blocks of the cap),
+    /// every one is observed within a bounded number of ticks. (A cursor that
+    /// moved on a yield would skip a block for good.)
+    #[test]
+    fn a_yielding_rotation_still_reaches_every_tool() {
+        let (mut r, extra) = budgeted(16);
+        for t in 0..12 {
+            r.fake.w().command_cost = if t % 2 == 0 { Millis(600) } else { Millis(0) };
+            r.ticks(1);
+        }
+        let seen = times_seen(&r, &extra);
+        assert!(seen.iter().all(|n| *n >= 1), "never observed: {seen:?}");
+    }
+
+    /// Exactly the budget yields (`spent < budget` runs the rotation): the
+    /// always-observed work costing the whole of it leaves none for the
+    /// rotation, and one millisecond less does.
+    #[test]
+    fn work_that_costs_exactly_the_budget_yields_the_rotation() {
+        let budget = crate::hold::UNMANAGED_BUDGET.0;
+        let (mut r, extra) = budgeted(16);
+        // One batch call costs `command_cost`; the first tick of each setting warms nothing.
+        r.fake.w().command_cost = Millis(budget);
+        let before = times_seen(&r, &extra);
+        r.ticks(3);
+        assert_eq!(times_seen(&r, &extra), before, "the rotation ran at exactly the budget");
+        r.fake.w().command_cost = Millis(budget - 1);
+        r.ticks(3);
+        assert!(
+            times_seen(&r, &extra).iter().sum::<u64>() > before.iter().sum::<u64>(),
+            "it did not run just under it"
+        );
+    }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// One case of the space below.
+        fn check(template: bool, steers: bool, down: u8, on_failure: bool, after: usize) -> Result<(), TestCaseError> {
+            let (export, running) = if template { ("tun@", "tun@a") } else { ("tun", "tun") };
+            let id = UnitId::service(running);
+            let mut r = rig(export, running, steers);
+            // (The fake's OnFailure= hold is unconditional; the real hold
+            // unit's condition skips a tool that protects nothing.)
+            if on_failure && steers {
+                r.fake.w().hold_on_failure.insert(id.clone());
+            }
+            match down {
+                1 => r.fake.w().stop_out_of_band(&id),
+                2 => r.fake.w().kill(&id),
+                _ => {}
+            }
+            r.ticks(after);
+            let held = steers && down > 0;
+            let case = format!("template={template} steers={steers} down={down} on_failure={on_failure} after={after}");
+            prop_assert_eq!(r.fake.w().held.contains(&id), held, "{}: {:?}", case, r.core.notices);
+            prop_assert_eq!(r.calls("restart("), 0, "{}", case);
+            prop_assert!(r.core.incidents.active_for(&id).is_none(), "{}", case);
+            prop_assert!(r.core.ledger().overrides.is_empty(), "{}", case);
+            prop_assert_eq!(says(&r, &alarm_text(running)), usize::from(held), "{}: {:?}", case, r.core.notices);
+            Ok(())
+        }
+
+        /// Every combination, at three lengths of time: for any tool (plain or
+        /// a template instance), protecting or not, running, stopped cleanly
+        /// or killed (with or without OnFailure=): held exactly when it
+        /// protects traffic and is down; never restarted, never an incident,
+        /// never an inferred override; alarmed once when held, never else.
+        #[test]
+        fn an_unmanaged_tool_is_held_exactly_when_it_protects_and_is_down() {
+            for template in [false, true] {
+                for steers in [false, true] {
+                    for down in 0..3 {
+                        for on_failure in [false, true] {
+                            for after in [3, 12, 40] {
+                                check(template, steers, down, on_failure, after).unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 24, failure_persistence: None, ..ProptestConfig::default() })]
+
+            /// And for any other length of time.
+            #[test]
+            fn at_any_length_of_time(
+                template in any::<bool>(), steers in any::<bool>(), down in 0u8..3, on_failure in any::<bool>(),
+                after in 3usize..80,
+            ) {
+                check(template, steers, down, on_failure, after)?;
+            }
+        }
+    }
+}
+
+/// C16 (docs/regression-ledger.md): the daemon's own re-observe of a unit
+/// under a diagnostic incident is nobody's request, so a Measurement probe of
+/// that unit still runs at most once per its `per`. (The tick called
+/// `Assembler::reprobe` for it, which ran the probe on every tick.)
+#[test]
+fn a_diagnostic_incident_does_not_run_a_measurement_probe_inside_its_per() {
+    let mut r = Rig::new();
+    let web = UnitId::service("gym-web");
+    let (http, tcp) = (ProbeId("gym-web-http".into()), ProbeId("gym-web-tcp".into()));
+    let mut m = r.core.asm.manifest().clone();
+    for p in m.units.get_mut(&web).unwrap().probes.iter_mut() {
+        if p.id == tcp {
+            // The Measurement probe under test, on a cadence slower than its
+            // `per`, so the cadence alone cannot produce the runs the lower
+            // bound below counts: they come from the re-observe.
+            p.side_effects = SideEffects::Measurement { bytes_max: 4096, per: Millis::secs(60) };
+            p.cadence = Cadence::Every(Millis::secs(600));
+        } else if p.id == http {
+            // The probe whose slow answer makes the unit Unknown.
+            p.side_effects = SideEffects::None;
+        }
+    }
+    r.core.asm.set_manifest(m);
+    r.ticks(2);
+    // Its health answer is slow: Unknown, a diagnostic incident, re-observed.
+    r.fake.w().units.get_mut(&web).unwrap().health = planarian_fake::Health::Delay(Millis::secs(60));
+    let ran_at = |r: &mut Rig| {
+        let (s, _) = r.core.observe();
+        s.units[&web].1.iter().find(|e| e.probe == tcp).map(|e| e.at)
+    };
+    let mut runs = std::collections::BTreeSet::new();
+    for _ in 0..40 {
+        r.ticks(1);
+        runs.extend(ran_at(&mut r));
+    }
+    assert!(r.core.incidents.diagnostic().iter().any(|i| i.target == web), "a diagnostic incident was open");
+    // 40 ticks = 200 s with per = 60 s: never faster than per (at most 4
+    // runs, one more for the run before the incident), and, with a cadence of
+    // 600 s, at least 3: the re-observe runs it at once past `per`. A stale
+    // `now` passed to `reobserve` would give 1.
+    assert!(runs.len() <= 5, "the Measurement probe ran {} times in 200 s with per = 60 s", runs.len());
+    assert!(
+        runs.len() >= 3,
+        "the Measurement probe ran only {} times in 200 s: a re-observe past per must run it",
+        runs.len()
+    );
 }

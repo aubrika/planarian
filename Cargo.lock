@@ -2354,6 +2354,7 @@ dependencies = [
  "ed25519-dalek",
  "nix",
  "planarian-backend-linux",
+ "planarian-backend-netwatch",
  "planarian-changes",
  "planarian-diagnose",
  "planarian-exec",

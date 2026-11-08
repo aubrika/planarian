@@ -38,7 +38,7 @@ fn fixture(identity: &str, shape: &Shape) -> Tracker {
             s.objects.insert((ChangeKind::Route, format!("route-{n}")), (Some(identity.into()), true));
         }
         s.endpoints.insert(endpoint);
-        s.wireguard.extend([identity.into(), "otherwg0".into()]);
+        s.wireguard.extend([(identity.to_string(), None), ("otherwg0".to_string(), None)]);
         s.unattributed = n % 2 == 0;
         t.units.insert(u.clone(), s);
         t.invocations.insert(u.clone(), Invocation { id: Some(format!("{:032x}", n + 1)), ended });
@@ -114,8 +114,8 @@ proptest! {
         prop_assert_eq!(state(&t), state(&want));
         for s in t.units.values() {
             prop_assert_eq!(&s.endpoints, &BTreeSet::from([endpoint]));
-            prop_assert!(s.wireguard.contains(&now));
-            prop_assert!(!s.wireguard.contains(&was));
+            prop_assert!(s.wireguard.contains_key(&now));
+            prop_assert!(!s.wireguard.contains_key(&was));
         }
         let claims = t.claims();
         let mut restored = Tracker::attach(&claims, &[], &BTreeSet::new());
