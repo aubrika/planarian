@@ -290,6 +290,10 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// whether a generation changed: their stops are not someone else's.
     touched: BTreeSet<UnitId>,
     generation_touched: bool,
+    /// A switch outside Planarian seen at `.0`: its stops and starts follow
+    /// the profile change by more than a tick, so they stay explained until
+    /// `.1` (see `SWITCH_SETTLE`).
+    switch_window: Option<(Timestamp, Timestamp)>,
     /// When to next check the §12b collection bounds.
     next_gc_check: Timestamp,
     /// The space report last noticed.
@@ -347,6 +351,11 @@ impl Resume {
 }
 
 /// P9: a slow tick is warned at most this often (the count rides along).
+/// How long after seeing a generation change outside Planarian its unit
+/// stops and starts stay explained (quiet period after the last queued job).
+pub const SWITCH_SETTLE: Millis = Millis::secs(60);
+/// The most a switch may keep explaining stops, however busy the queue.
+pub const SWITCH_SETTLE_MAX: Millis = Millis::secs(600);
 pub const SLOW_TICK_WARN_EVERY: Millis = Millis::secs(60);
 
 /// How often the daemon checks the §12b collection bounds.
@@ -475,6 +484,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
             generation_touched: false,
+            switch_window: None,
             next_gc_check: Timestamp(0),
             space_noted: Timestamp(0),
             awaiting_post: Vec::new(),
@@ -633,6 +643,8 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             // A switch outside Planarian stops and starts units too: none of
             // that is a person's stop (§11 residue).
             self.generation_touched = true;
+            let seen = self.b.clock().now();
+            self.switch_window = Some((seen, seen.plus(SWITCH_SETTLE)));
             self.note_declarations(Some(prev), current, true);
             // P19: a switch may install another core record.
             self.read_core_hash();
@@ -1565,6 +1577,25 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         self.cfg.posture = p;
     }
 
+    /// Whether a switch outside Planarian is still settling at `now`: from
+    /// the tick that saw the generation change until `SWITCH_SETTLE` after
+    /// the last tick that still saw work queued (a stop or start job), and
+    /// never beyond `SWITCH_SETTLE_MAX` after the change. A person's stop
+    /// after the window is a person's.
+    fn in_switch_window(&mut self, now: Timestamp) -> bool {
+        let Some((since, until)) = self.switch_window else { return false };
+        let cap = since.plus(SWITCH_SETTLE_MAX);
+        let busy = now.0 < until.0 && self.b.generations().pending_jobs().map_or(true, |j| !j.is_empty());
+        let until = if busy { Timestamp(until.0.max(now.plus(SWITCH_SETTLE).0)) } else { until };
+        let until = Timestamp(until.0.min(cap.0));
+        if now.0 >= until.0 {
+            self.switch_window = None;
+            return false;
+        }
+        self.switch_window = Some((since, until));
+        true
+    }
+
     /// §11, the unattributed residue: a unit seen running at the last tick and
     /// now ended by a termination signal (a `kill`, or a `systemctl stop`
     /// Planarian did not issue), which systemd will not restart and which is
@@ -1593,6 +1624,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         use planarian_exec::residue::EndingFacts;
         let host_held = self.b.units().held();
         let mut tried_hold = false;
+        let in_switch = self.in_switch_window(now);
         for (u, def) in defs {
             let st = s.status(u, defs);
             // A Security unit killed by a termination signal that systemd
@@ -1622,7 +1654,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 stopped_cleanly: st == UnitStatus::Stopped,
                 ended: if was_up && now_down { self.b.units().ended_by(u) } else { None },
                 service: def.id.kind == UnitKind::Service,
-                touched_by_planarian: self.touched.contains(u) || self.generation_touched,
+                touched_by_planarian: self.touched.contains(u) || self.generation_touched || in_switch,
                 expected: s.expected(u, defs),
                 requirement_crashed: def
                     .edges

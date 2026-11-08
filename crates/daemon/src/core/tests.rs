@@ -3867,3 +3867,48 @@ fn a_hold_only_the_journal_has_is_still_lifted_when_the_tool_stops_protecting() 
     r.ticks(40);
     assert!(r.core.ledger().holds().is_empty(), "left in the journal: {:?}", r.core.ledger().hold_events);
 }
+
+/// Regression (#82 catalog, owner-rebuild-breaks-service): a switch outside
+/// Planarian moves the profile link first and stops units a few ticks later.
+/// A stop that follows the observed generation change in a LATER tick is the
+/// switch's, not a person's: no inferred override.
+#[test]
+fn a_switch_outside_planarian_explains_stops_in_later_ticks() {
+    let mut r = Rig::new();
+    r.ticks(2);
+    let g = r.fake.w().add_generation(&Default::default());
+    r.fake.w().current = g;
+    r.ticks(1); // the generation change is observed here
+    r.ticks(1);
+    r.fake.w().stop_out_of_band(&UnitId::service("gym-web"));
+    r.ticks(4);
+    assert!(r.core.ledger().overrides.is_empty(), "inferred override: {:?}", r.core.ledger().overrides);
+    assert_ne!(r.status("service:gym-web"), UnitStatus::Overridden(OverrideDesired::Stopped));
+}
+
+mod switch_window_props {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 24, failure_persistence: None, ..ProptestConfig::default() })]
+
+        /// The window is bounded in both directions: a stop soon enough after
+        /// an observed outside switch is the switch's; one after the window
+        /// (SWITCH_SETTLE, nothing queued) is a person's and is inferred.
+        #[test]
+        fn a_stop_is_the_switchs_inside_the_window_and_a_persons_after_it(delay in 0usize..40) {
+            let settle_ticks = (SWITCH_SETTLE.0 / planarian_state::TICK.0) as usize;
+            prop_assume!(delay + 1 < settle_ticks || delay > settle_ticks + 2);
+            let mut r = Rig::new();
+            r.ticks(2);
+            let g = r.fake.w().add_generation(&Default::default());
+            r.fake.w().current = g;
+            r.ticks(1 + delay);
+            r.fake.w().stop_out_of_band(&UnitId::service("gym-db"));
+            r.ticks(3);
+            let inferred = !r.core.ledger().overrides.is_empty();
+            prop_assert_eq!(inferred, delay > settle_ticks, "delay {} ticks", delay);
+        }
+    }
+}
