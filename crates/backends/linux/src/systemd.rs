@@ -505,8 +505,10 @@ mod tests {
         }
     }
 
-    /// A multi-unit `systemctl show` (three units, properties in systemd's
-    /// own order, a blank line between): matched by Id, whatever the order.
+    /// A multi-unit `systemctl show` (three units, a blank line between),
+    /// HAND-WRITTEN from systemd's documented output, not captured: the
+    /// format itself is proven against the real command by vm-netsec
+    /// (`planariad --observe-units`). Matched by Id, whatever the order.
     const SHOW_MANY: &str = "Id=sshd.service
 LoadState=loaded
 ActiveState=active
