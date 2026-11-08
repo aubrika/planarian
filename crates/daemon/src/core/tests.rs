@@ -3994,8 +3994,8 @@ mod switch_window_busy {
 
 /// C16 (docs/regression-ledger.md): the daemon's own re-observe of a unit
 /// under a diagnostic incident is nobody's request, so a Measurement probe of
-/// that unit still runs at most once per its `per`. (`Assembler::reprobe`,
-/// which the tick called for it, ran the probe on every tick.)
+/// that unit still runs at most once per its `per`. (The tick called
+/// `Assembler::reprobe` for it, which ran the probe on every tick.)
 #[test]
 fn a_diagnostic_incident_does_not_run_a_measurement_probe_inside_its_per() {
     let mut r = Rig::new();

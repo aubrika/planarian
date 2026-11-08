@@ -166,22 +166,20 @@ impl Assembler {
         self.on_demand.insert((unit.clone(), probe.clone()));
     }
 
-    /// A run someone asked for: every probe of `unit` runs on the next tick,
-    /// a Measurement probe too (§10 binds `per` to the cadence only).
-    pub fn reprobe(&mut self, unit: &UnitId) {
-        self.last_run.retain(|(u, _), _| u != unit);
-    }
-
-    /// The daemon's own re-observe of a unit under a diagnostic incident: as
-    /// `reprobe`, except that a Measurement probe keeps its place in the
-    /// cadence, so `per` still holds (C16: nobody asked for these runs).
-    pub fn reobserve(&mut self, unit: &UnitId) {
-        let measured: BTreeSet<ProbeId> = self
+    /// The daemon's own re-observe of a unit under a diagnostic incident:
+    /// every probe of `unit` runs on the next tick, except that a Measurement
+    /// probe keeps its place in the cadence while its `per` has not yet
+    /// passed since its last run (C16: nobody asked for these runs). One
+    /// whose `per` has passed runs now, so a diagnosed unit's evidence does
+    /// not wait for a slow cadence. Other units are untouched. A person's run
+    /// is `request`.
+    pub fn reobserve(&mut self, unit: &UnitId, now: Timestamp) {
+        let rates: BTreeMap<ProbeId, Millis> = self
             .defs()
             .get(unit)
-            .map(|d| d.probes.iter().filter(|p| per(p).is_some()).map(|p| p.id.clone()).collect())
+            .map(|d| d.probes.iter().filter_map(|p| per(p).map(|m| (p.id.clone(), m))).collect())
             .unwrap_or_default();
-        self.last_run.retain(|(u, p), _| u != unit || measured.contains(p));
+        self.last_run.retain(|(u, p), last| u != unit || rates.get(p).is_some_and(|m| now.0 < last.0 + m.0));
     }
 
     fn interval(&self, p: &ProbeDef) -> Option<Millis> {
@@ -198,7 +196,7 @@ impl Assembler {
         };
         // §10: "`per` enforced by the cadence scheduler". A Measurement probe's
         // cadence is never faster than its declared rate. Runs on request
-        // (`request`, `reprobe`) are not held back by it.
+        // (`request`) are not held back by it, and a re-observe waits only for `per`.
         Some(Millis(base.0.max(per(p).map_or(0, |m| m.0))))
     }
 
