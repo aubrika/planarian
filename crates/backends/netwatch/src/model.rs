@@ -155,8 +155,10 @@ struct Standing {
     objects: BTreeMap<(ChangeKind, String), (Option<String>, bool)>,
     endpoints: BTreeSet<Endpoint>,
     /// WireGuard devices this unit configured (its generic netlink requests
-    /// named them): where its `endpoints` come from (B-22 b).
-    wireguard: BTreeSet<String>,
+    /// named them): where its `endpoints` come from (B-22 b). Each is bound
+    /// to the device it named: the name, and the interface index the first
+    /// read of it showed. A binding ends with that device (B-27).
+    wireguard: BTreeMap<String, Option<u32>>,
     unattributed: bool,
 }
 
@@ -234,6 +236,10 @@ pub struct Claims {
     /// (unit, WireGuard device it configured).
     #[serde(default)]
     pub wireguard: Vec<(UnitId, String)>,
+    /// (unit, device name, interface index): the device a binding was
+    /// first read to name (B-27); absent for one not read yet.
+    #[serde(default)]
+    pub wireguard_index: Vec<(UnitId, String, u32)>,
 }
 
 impl Claims {
@@ -267,8 +273,8 @@ impl Tracker {
             }
         };
         for s in self.units.values_mut() {
-            if s.wireguard.remove(was) {
-                s.wireguard.insert(now.to_string());
+            if let Some(index) = s.wireguard.remove(was) {
+                s.wireguard.insert(now.to_string(), index);
             }
             if let Some(value) = s.objects.remove(&(ChangeKind::Interface, was.to_string())) {
                 s.objects.insert((ChangeKind::Interface, now.to_string()), value);
@@ -364,7 +370,8 @@ impl Tracker {
                 c.objects.push((u.clone(), *k, o.clone(), i.clone(), *steers));
             }
             c.endpoints.extend(s.endpoints.iter().map(|e| (u.clone(), *e)));
-            c.wireguard.extend(s.wireguard.iter().map(|d| (u.clone(), d.clone())));
+            c.wireguard.extend(s.wireguard.keys().map(|d| (u.clone(), d.clone())));
+            c.wireguard_index.extend(s.wireguard.iter().filter_map(|(d, i)| i.map(|i| (u.clone(), d.clone(), i))));
             if s.unattributed {
                 c.unattributed_units.push(u.clone());
             }
@@ -407,6 +414,11 @@ impl Tracker {
         }
         for (u, d) in &previous.wireguard {
             t.bind_wireguard(u, d);
+        }
+        for (u, d, i) in &previous.wireguard_index {
+            if let Some(b) = t.units.get_mut(u).and_then(|s| s.wireguard.get_mut(d)) {
+                *b = Some(*i);
+            }
         }
         for u in &previous.unattributed_units {
             t.lost(Some(u));
@@ -473,8 +485,10 @@ impl Tracker {
     /// peers, whoever owns the device now (coordinator, Nov 3): the claim
     /// goes to the unit the request's cgroup names. Bindings accumulate and
     /// are saved in `.state`; another request does not clear an older one.
+    /// A binding lasts as long as the device it first named (B-27): a request
+    /// is a fresh claim, whose device the next read pins by interface index.
     pub fn bind_wireguard(&mut self, unit: &UnitId, dev: &str) {
-        self.units.entry(unit.clone()).or_default().wireguard.insert(dev.to_string());
+        self.units.entry(unit.clone()).or_default().wireguard.insert(dev.to_string(), None);
     }
 
     /// B-22 (b): each unit that configured WireGuard devices takes exactly
@@ -488,22 +502,30 @@ impl Tracker {
             if s.wireguard.is_empty() {
                 continue;
             }
+            // A binding is to a device, not to its name (B-27): one whose
+            // device is gone from a successful read, or whose name now
+            // belongs to a device with another interface index (made again
+            // between reads, by anyone), ends. A unit that configures the
+            // device again sends a request, which binds it afresh.
+            s.wireguard.retain(|name, index| match devices.iter().find(|d| &d.name == name) {
+                None => false,
+                Some(d) => match index {
+                    Some(i) => *i == d.ifindex,
+                    None => {
+                        *index = Some(d.ifindex);
+                        true
+                    }
+                },
+            });
             let now: BTreeSet<Endpoint> = devices
                 .iter()
-                .filter(|d| s.wireguard.contains(&d.name))
+                .filter(|d| s.wireguard.contains_key(&d.name))
                 .flat_map(|d| d.endpoints.iter().copied())
                 .collect();
             if s.endpoints != now {
                 s.endpoints = now;
                 changed = true;
             }
-            // A binding is to the device's name and outlives the device (a
-            // tunnel that bounces is the same unit's, and a restart keeps it
-            // in `.state`). Known limit: a later device of the same name,
-            // made by another unit, also hands this unit its peers. Neither
-            // another configuring request nor a watch restart clears the
-            // saved binding; it lasts until reboot or an explicit reset
-            // that actually removes it (B-27).
         }
         if changed {
             self.relatch();

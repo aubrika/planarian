@@ -2762,7 +2762,38 @@ mod wireguard {
         assert!(view(&t).units["wg-quick-a"].endpoints.is_empty());
         // Kept across a restart in `.state`.
         let claims = t.claims();
-        assert!(claims.wireguard.contains(&(a.clone(), "wga".to_string())));
+        assert!(!claims.wireguard.contains(&(a.clone(), "wga".to_string())), "ended with its device");
+        assert!(claims.wireguard.contains(&(b.clone(), "wgb".to_string())));
+        assert!(claims.wireguard_index.contains(&(b.clone(), "wgb".to_string(), 10)), "pinned to the device read");
+    }
+
+    /// B-27: the old unit's binding ends with its device. A device of the
+    /// same name made by another unit (after a read without it, or between
+    /// two reads, so with another interface index) hands the old unit
+    /// nothing; the new unit's request binds it.
+    #[test]
+    fn a_device_of_a_reused_name_is_not_the_old_units() {
+        let (a, b) = (UnitId::service("wg-quick-a"), UnitId::service("wg-quick-b"));
+        let (e1, e2) = (udp("192.0.2.7", 51820), udp("198.51.100.9", 1));
+        let dev_at = |index, eps: &[Endpoint]| Device { name: "wg0".into(), ifindex: index, endpoints: eps.to_vec() };
+        for gap in [true, false] {
+            let mut t = Tracker::default();
+            t.bind_wireguard(&a, "wg0");
+            t.set_wireguard(&[dev_at(10, &[e1])]);
+            if gap {
+                t.set_wireguard(&[]);
+            }
+            // b makes wg0 again (another index) and configures it.
+            t.bind_wireguard(&b, "wg0");
+            t.set_wireguard(&[dev_at(11, &[e2])]);
+            let at = |u: &UnitId| t.footprint(u, NOW).endpoints;
+            assert!(at(&a).is_empty(), "gap {gap}: the old binding went with its device");
+            assert_eq!(at(&b), [e2].into());
+            // A restart in between keeps the pin: the index survives `.state`.
+            let mut after = Tracker::attach(&t.claims(), &[], &BTreeSet::new());
+            after.set_wireguard(&[dev_at(12, &[e1])]);
+            assert!(after.footprint(&b, NOW).endpoints.is_empty(), "gap {gap}: a device made while the watch was down");
+        }
     }
 
     /// The latch keeps what an invocation found protecting with: a tunnel
