@@ -3590,10 +3590,11 @@ fn a_lift_that_alone_hangs_is_retried_quietly_once_a_minute() {
     assert_eq!(r.core.notices.iter().filter(|n| n.contains("flows again")).count(), 1, "{:?}", r.core.notices);
 }
 
-/// The retry of a lift the host had not confirmed is a lift too: it asks
-/// systemd again, so a tool killed since the tick's status read keeps its hold.
-#[test]
-fn the_retry_of_an_unconfirmed_lift_does_not_open_traffic_for_a_tool_that_is_down() {
+/// One retry of an unconfirmed lift, `arm` having changed what systemd will
+/// answer for the tool after the tick's own status read (Running, passing
+/// probes). Returns whether the tool is still held and how many times the
+/// host was asked to lift, before and after that tick.
+fn retry_after(arm: &dyn Fn(&mut planarian_fake::World, &UnitId)) -> (bool, usize, usize) {
     let web = UnitId::service("gym-web");
     let mut r = rig_with_probeless_tool();
     r.fake.w().stop_out_of_band(&web);
@@ -3613,25 +3614,94 @@ fn the_retry_of_an_unconfirmed_lift_does_not_open_traffic_for_a_tool_that_is_dow
     assert!(r.core.lift_unconfirmed.contains_key(&web), "no unconfirmed lift: {:?}", r.core.notices);
     r.fake.w().lift_hangs = None;
     let asked = r.calls("lift_hold(service:gym-web)");
-    let mut killed = false;
+    let mut armed = false;
     for _ in 0..40 {
         let due = {
             let next = r.core.lift_unconfirmed.get(&web).copied();
             next.is_some_and(|n| r.core.b.clock().boot_now().plus(planarian_state::TICK) >= n)
         };
-        if due && !killed {
-            r.fake.w().signal_after_observe.insert(web.clone(), 9);
-            killed = true;
+        if due && !armed {
+            arm(&mut r.fake.w(), &web);
+            armed = true;
         }
         r.ticks(1);
-        if killed {
+        if armed {
             break;
         }
     }
-    assert!(killed, "the retry never came due");
+    assert!(armed, "the retry never came due");
     let held = r.fake.w().held.contains(&web);
-    assert!(held, "the retry lifted on a reading older than the kill: {:?}", r.core.notices);
-    assert_eq!(r.calls("lift_hold(service:gym-web)"), asked, "asked the host to lift again");
+    (held, asked, r.calls("lift_hold(service:gym-web)"))
+}
+
+/// The retry of a lift the host had not confirmed is a lift too: it asks
+/// systemd again, so a tool killed since the tick's status read keeps its hold.
+#[test]
+fn the_retry_of_an_unconfirmed_lift_does_not_open_traffic_for_a_tool_that_is_down() {
+    let (held, asked, now) = retry_after(&|w, web| {
+        w.signal_after_observe.insert(web.clone(), 9);
+    });
+    assert!(held, "the retry lifted on a reading older than the kill");
+    assert_eq!(now, asked, "asked the host to lift again");
+}
+
+/// Only `Active` at the moment of a lift lifts: whatever else systemd says
+/// then (failed, deactivating, unknown, absent, bound, detected, or nothing:
+/// the read fails) keeps the hold, for a journaled hold lifting on a
+/// Running tick and for the retry of an unconfirmed lift.
+#[test]
+fn only_an_active_answer_at_the_lift_lifts_the_hold() {
+    use planarian_schema::Reason;
+    let web = UnitId::service("gym-web");
+    #[derive(Clone, Debug)]
+    enum Answer {
+        Observed(Observed),
+        Unreadable,
+    }
+    let answers = [
+        Answer::Observed(Observed::Failed(Reason::ExitCode(137))),
+        Answer::Observed(Observed::Transitioning { from: Box::new(Observed::Active), since: Timestamp(0) }),
+        Answer::Observed(Observed::Unknown { since: Timestamp(0), reason: "backend error".into() }),
+        Answer::Observed(Observed::Absent),
+        Answer::Observed(Observed::Bound),
+        Answer::Observed(Observed::Detected),
+        Answer::Unreadable,
+        Answer::Observed(Observed::Active),
+    ];
+    for a in answers {
+        let lifts = matches!(a, Answer::Observed(Observed::Active));
+        // A journaled hold, the tick's reading Running.
+        let mut r = rig_with_probeless_tool();
+        r.fake.w().kill(&web);
+        r.ticks(1);
+        assert!(r.core.ledger().holds().contains(&web), "journaled: {:?}", r.core.notices);
+        {
+            let mut w = r.fake.w();
+            match &a {
+                Answer::Observed(o) => w.units.get_mut(&web).unwrap().observed = o.clone(),
+                Answer::Unreadable => {
+                    w.observe_fails.insert(web.clone());
+                }
+            }
+        }
+        r.core.hold_left = HOLD_WAIT;
+        assert_eq!(r.core.lift_back(&web), lifts, "lift_back with {a:?}");
+        assert_eq!(r.calls("lift_hold(service:gym-web)") > 0, lifts, "host asked, {a:?}");
+        assert_eq!(r.fake.w().held.contains(&web), !lifts, "held, {a:?}");
+        let lifted = r.core.ledger().hold_events.iter().any(|e| !e.1);
+        assert_eq!(lifted, lifts, "HoldLifted journaled, {a:?}");
+        // The retry of an unconfirmed lift.
+        let (held, asked, now) = retry_after(&|w, web| match &a {
+            Answer::Observed(o) => {
+                w.set_after_observe.insert(web.clone(), o.clone());
+            }
+            Answer::Unreadable => {
+                w.unreadable_after_observe.insert(web.clone());
+            }
+        });
+        assert_eq!(now > asked, lifts, "retry asked the host, {a:?}");
+        assert_eq!(held, !lifts, "retry held, {a:?}");
+    }
 }
 
 // ---- §9: "`Exec` probes, which run arbitrary commands, are permitted only

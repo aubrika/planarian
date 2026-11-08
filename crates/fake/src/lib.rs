@@ -255,6 +255,11 @@ pub struct World {
     /// world changes before the daemon acts on it, as when a tick's probes
     /// take seconds after its status read.
     pub signal_after_observe: BTreeMap<UnitId, i32>,
+    /// As `signal_after_observe`, but the unit's observed state becomes this
+    /// (a state `signal` cannot make: deactivating, absent, bound...), or,
+    /// for `unreadable_after_observe`, its next `observe` fails.
+    pub set_after_observe: BTreeMap<UnitId, Observed>,
+    pub unreadable_after_observe: BTreeSet<UnitId>,
     /// `evaluate_built` fails (the export cannot be read).
     pub evaluate_built_fails: Option<String>,
     pub queued_jobs_fails: Option<String>,
@@ -683,6 +688,22 @@ impl World {
         }
     }
 
+    /// What `signal_after_observe`, `set_after_observe` and
+    /// `unreadable_after_observe` do to `id` once its `observe` has answered.
+    fn after_observe(&mut self, id: &UnitId) {
+        if let Some(sig) = self.signal_after_observe.remove(id) {
+            self.signal(id, sig);
+        }
+        if let Some(o) = self.set_after_observe.remove(id)
+            && let Some(sim) = self.units.get_mut(&World::key(id))
+        {
+            sim.observed = o;
+        }
+        if self.unreadable_after_observe.remove(id) {
+            self.observe_fails.insert(id.clone());
+        }
+    }
+
     pub fn signal(&mut self, unit: &UnitId, sig: i32) {
         let now = self.now;
         if let Some(sim) = self.units.get_mut(unit) {
@@ -888,9 +909,7 @@ impl UnitBackend for Fake {
             return Err(Outcome::Unknown("cannot observe it (scripted)".into()));
         }
         let seen = w.units.get(&World::key(id)).map(|s| s.observed.clone()).unwrap_or(Observed::Absent);
-        if let Some(sig) = w.signal_after_observe.remove(id) {
-            w.signal(id, sig);
-        }
+        w.after_observe(id);
         Ok(seen)
     }
 
@@ -910,9 +929,7 @@ impl UnitBackend for Fake {
                 let ended = matches!(observed, Observed::Absent | Observed::Bound | Observed::Detected)
                     .then(|| sim.and_then(|s| s.ended))
                     .flatten();
-                if let Some(sig) = w.signal_after_observe.remove(id) {
-                    w.signal(id, sig);
-                }
+                w.after_observe(id);
                 (Ok(observed), ended)
             })
             .collect()
