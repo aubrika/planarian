@@ -81,6 +81,28 @@ fn request(protocol: Option<rustix::net::Protocol>, ty: u16, flags: u16, body: &
     }
 }
 
+/// A dump the kernel flagged as interrupted: the list changed under it.
+pub(crate) const INTERRUPTED: &str = "an interrupted netlink dump";
+
+/// Run `read` again, up to `attempts` times in all, while it fails as
+/// interrupted (a peer list that changes under a dump is the normal answer to
+/// a `wg addconf` racing it; the next dump is consistent). Any other failure,
+/// or the last interruption, is returned: a failed dump is never a smaller
+/// snapshot.
+pub(crate) fn retry_interrupted<T>(
+    attempts: usize,
+    mut read: impl FnMut() -> Result<T, NlError>,
+) -> Result<T, NlError> {
+    let mut left = attempts.max(1);
+    loop {
+        left -= 1;
+        match read() {
+            Err(NlError::Other(s)) if s == INTERRUPTED && left > 0 => continue,
+            r => return r,
+        }
+    }
+}
+
 /// Collect a complete datagram, returning true only at a successful
 /// terminator. An interrupted or failed dump is never a smaller snapshot.
 pub(crate) fn collect_reply(bytes: &[u8], out: &mut Vec<Vec<u8>>) -> Result<bool, NlError> {
@@ -97,7 +119,7 @@ pub(crate) fn collect_reply(bytes: &[u8], out: &mut Vec<Vec<u8>>) -> Result<bool
             return Err(NlError::Other("a malformed netlink reply".into()));
         }
         if flags & NLM_F_DUMP_INTR != 0 {
-            return Err(NlError::Other("an interrupted netlink dump".into()));
+            return Err(NlError::Other(INTERRUPTED.into()));
         }
         if ty == NLMSG_DONE || ty == NLMSG_ERROR {
             let code = match len {
@@ -183,25 +205,65 @@ pub(crate) fn family_id_by_name(name: &str) -> Result<Option<u16>, String> {
     }
 }
 
+/// Every family the controller lists, as (name, id): one dump, loading no
+/// module (see [`family_id`]).
+pub fn families() -> Result<Vec<(String, u16)>, String> {
+    let body = [CTRL_CMD_GETFAMILY, 1, 0, 0];
+    let reply = request(Some(netlink::GENERIC), GENL_ID_CTRL, NLM_F_DUMP, &body)
+        .map_err(|e| format!("generic netlink family list: {e}"))?;
+    families_in(&reply)
+}
+
+/// The (name, id) of each family among the controller's `NEWFAMILY`
+/// messages. A message that cannot be read (cut attributes, no name, no id)
+/// is an error, never a smaller list (rule 21): a family missing from the
+/// map could be WireGuard's.
+pub fn families_in(msgs: &[Vec<u8>]) -> Result<Vec<(String, u16)>, String> {
+    msgs.iter()
+        .map(|m| {
+            let attrs =
+                crate::parse::attrs(m, 16 + 4).ok_or("a generic netlink family message with a malformed attribute")?;
+            let name = attrs
+                .iter()
+                .find(|(t, _)| *t == CTRL_ATTR_FAMILY_NAME)
+                .ok_or("a generic netlink family message naming no family")?;
+            let (_, id) = attrs
+                .iter()
+                .find(|(t, _)| *t == CTRL_ATTR_FAMILY_ID)
+                .ok_or("a generic netlink family message with no id")?;
+            let id = id
+                .get(0..2)
+                .map(|b| u16::from_ne_bytes([b[0], b[1]]))
+                .ok_or("a generic netlink family message with a cut id")?;
+            Ok((crate::parse::cstr(name.1), id))
+        })
+        .collect()
+}
+
+/// How many times a WireGuard device dump is tried while the kernel keeps
+/// flagging it interrupted (each try is bounded by the receive timeout).
+const WG_DUMP_ATTEMPTS: usize = 3;
+
 /// WireGuard's generic netlink family id, if the module is loaded.
 pub fn wireguard_family() -> Result<Option<u16>, String> {
     family_id("wireguard")
 }
 
 /// The WireGuard devices as the kernel has them, with their peers'
-/// endpoints (B-22 b), and the family id read on the way (`None`: no
-/// devices). The reply carries keys; [`crate::wg::devices`] reads none.
-pub fn wireguard() -> Result<(Option<u16>, Vec<crate::wg::Device>), String> {
-    let Some(family) = wireguard_family()? else { return Ok((None, vec![])) };
+/// endpoints (B-22 b), given WireGuard's family id (`None`: the module is
+/// not loaded, so no devices; the id comes from [`GenlIds`], not a lookup
+/// here). The reply carries keys; [`crate::wg::devices`] reads none.
+pub fn wireguard(family: Option<u16>) -> Result<Vec<crate::wg::Device>, String> {
+    let Some(family) = family else { return Ok(vec![]) };
     let links = dump(None, RTM_GETLINK, &[0u8; 16])?;
     let mut devices = vec![];
     for index in crate::wg::link_indices(&links)? {
         let body = crate::wg::get_device_request(index);
-        let msgs = request(Some(netlink::GENERIC), family, NLM_F_DUMP, &body)
+        let msgs = retry_interrupted(WG_DUMP_ATTEMPTS, || request(Some(netlink::GENERIC), family, NLM_F_DUMP, &body))
             .map_err(|e| format!("wireguard device {index} dump: {e}"))?;
         devices.extend(crate::wg::devices(&msgs)?);
     }
-    Ok((Some(family), devices))
+    Ok(devices)
 }
 
 fn changes(hook: u32, msgs: Vec<Vec<u8>>, ifname: &mut dyn FnMut(u32) -> Option<String>) -> Vec<Change> {

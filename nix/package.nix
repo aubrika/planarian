@@ -76,6 +76,20 @@ rustPlatform.buildRustPackage {
     install -Dm444 ${netwatchEbpf}/share/planarian/netwatch.bpf.o $out/share/planarian/netwatch.bpf.o
   '';
 
+  # §12c: the installed descriptor is what this build's own daemon prints,
+  # reads the journal format this build writes, and names the kinds a
+  # transition will write (a build that exported nothing is read as the
+  # original set, so an empty or missing file must fail here, not there).
+  doInstallCheck = true;
+  installCheckPhase = ''
+    runHook preInstallCheck
+    $out/bin/planariad --journal-kinds | cmp - $out/share/planarian/journal-kinds.json
+    grep -q '"format":3' $out/share/planarian/journal-kinds.json
+    grep -q '"Prepared"' $out/share/planarian/journal-kinds.json
+    grep -q '"Advance"' $out/share/planarian/journal-kinds.json
+    runHook postInstallCheck
+  '';
+
   # §12d, §15 (B-13): the module refuses a test build outside the gym.
   passthru.testBuild = gymHooks;
   # Whether the package carries netwatch: its loader and its eBPF object

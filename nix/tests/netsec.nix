@@ -154,10 +154,51 @@ pkgs.testers.runNixOSTest {
       };
     };
     services.planarian.units.gym-linger = { };
+    # The real `systemctl show` format for the daemon's batch observation
+    # (#93, `planariad --observe-units`): a oneshot that exits 0 (no
+    # RemainAfterExit, so it ends inactive) and a simple unit to stop with
+    # SIGTERM. Neither is a network tool (own network namespace, no
+    # capabilities), so stopping one holds nothing.
+    systemd.services.gym-oneshot = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${pkgs.coreutils}/bin/true";
+        DynamicUser = true;
+        PrivateNetwork = true;
+        CapabilityBoundingSet = [ "" ];
+      };
+    };
+    systemd.services.gym-term = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+        DynamicUser = true;
+        PrivateNetwork = true;
+        CapabilityBoundingSet = [ "" ];
+      };
+    };
+    # Case E (§12d "A network tool Planarian does not manage", owner decision,
+    # Nov 3): a network tool by its systemd configuration (root, no
+    # capability bounding set) that steers (a dropping rule for 203.0.113.81,
+    # which no test traffic uses) and has no services.planarian.units entry.
+    # Restart=no, so anything that brings it back is Planarian or a person.
+    systemd.services.gym-unmanaged = {
+      wantedBy = [ "multi-user.target" ];
+      path = [ pkgs.nftables pkgs.coreutils ];
+      serviceConfig = {
+        Type = "simple";
+        Restart = "no";
+        ExecStart = pkgs.writeShellScript "gym-unmanaged" ''
+          nft 'add table inet gymunmanaged; add chain inet gymunmanaged out { type filter hook output priority 0; }; add rule inet gymunmanaged out ip daddr 203.0.113.81 drop'
+          exec sleep infinity
+        '';
+      };
+    };
     # Declared, but with no sensitivity tag: only the kernel's attribution of
-    # its helper's rule makes it a network-security unit. TODO (#35, parked
-    # with the owner): the same with no entry at all, once §12d says what
-    # happens to an undeclared network tool (held; repaired or not).
+    # its helper's rule makes it a network-security unit. The same with no
+    # entry at all is case E (gym-unmanaged, below; §12d, Nov 3).
     services.planarian.units.gym-vpn-untagged = { };
     # The shared fixture's templated network tool (gym-tpl@, instance a),
     # declared with no tag so the daemon restarts it, as gym-vpn-untagged.
@@ -449,7 +490,14 @@ pkgs.testers.runNixOSTest {
             assert hold_at >= died > 0, f"delay {delay}: hold active at {hold_at}, unit died at {died}"
             machine.fail(up_ok())
             peer.fail(new_ssh("alice"))
-            assert alarms() > before, f"delay {delay}: no alarm"
+            # The alarm is not instant: it comes about 21 s to 48 s after the
+            # kill (the held tunnel's probe blocks the daemon's tick for 10 s),
+            # so wait for it, bounded. A lost alarm still fails; a late one
+            # passes.
+            try:
+                machine.wait_until_succeeds(f"test $(journalctl -b -u planariad -o cat | grep -c '{ALARM}' || true) -gt {before}", timeout=90)
+            except Exception:
+                raise AssertionError(f"delay {delay}: no alarm within 90 s of the kill")
             # Back: the hold lifts once the unit is Running and Ready, by the
             # repair or, if this target has escalated (§13), by hand.
             machine.succeed("systemctl reset-failed wireguard-gym.service; systemctl start wireguard-gym.service")
@@ -513,5 +561,117 @@ pkgs.testers.runNixOSTest {
         machine.wait_until_succeeds(lan_ok(), timeout=60)
         not_held("gym-linger")
         machine.succeed("rm -f /run/gym-linger-slow")
+
+    # Case E (§12d "A network tool Planarian does not manage", owner decision,
+    # Nov 3; the reviewer's, written from the spec): a network-security unit
+    # with no services.planarian.units entry is held like any other when it
+    # fails; Planarian does not repair it (it repairs only declared units);
+    # the hold lifts when the unit is Running again by other means, or on
+    # `hold release`; the alarm says it needs a person.
+    UNMANAGED = "gym-unmanaged"
+    E_ALARM = "stopped and is not managed by Planarian. Network traffic is blocked until it is back or an administrator releases it."
+    def e_alarms():
+        return int(machine.succeed(f"journalctl -b -u planariad -o cat | grep 'ALARM: ' | grep '{UNMANAGED}' | grep -cF '{E_ALARM}' || true").strip() or 0)
+    def invocation():
+        # When the unit's current or last main process started: unchanged
+        # while nothing starts it again (it outlives the process, as an
+        # InvocationID of a failed unit may not).
+        return machine.succeed(f"systemctl show -p ExecMainStartTimestampMonotonic --value {UNMANAGED}.service").strip()
+    def planarian_acted():
+        # Any line of the daemon's naming the unit as repaired, restarted or
+        # an incident (the alarm's own text uses none of these words).
+        return int(machine.succeed(f"journalctl -b -u planariad -o cat | grep '{UNMANAGED}' | grep -Eci 'restart|repair|incident' || true").strip() or 0)
+
+    with subtest("E: an undeclared network tool that fails is held, alarmed for a person, and not repaired"):
+        machine.wait_for_unit(f"{UNMANAGED}.service")
+        machine.succeed("nft list table inet gymunmanaged")
+        # Precondition: the classifier made it a network tool although no
+        # Planarian unit declares it.
+        machine.succeed(f"systemctl show -p OnFailure {UNMANAGED}.service | grep -q 'planarian-hold@'")
+        not_held(UNMANAGED)
+        machine.wait_until_succeeds(lan_ok(), timeout=60)
+        alarms_before, acted_before = all_alarms(), planarian_acted()
+        killed = invocation()
+        machine.succeed(f"systemctl kill --signal=SIGKILL {UNMANAGED}.service")
+        try:
+            machine.wait_until_succeeds(f"nft list table inet planarian-hold && systemctl is-active planarian-hold@{UNMANAGED}.service && test -e /run/planarian/hold/{UNMANAGED}", timeout=20)
+        except Exception:
+            raise AssertionError("not held:\n" + footprint(UNMANAGED))
+        machine.fail(lan_ok())
+        peer.fail(new_ssh("alice"))
+        machine.succeed("curl -sf --max-time 5 -o /dev/null http://127.0.0.1:8001/")
+        machine.wait_until_succeeds(f"[ $(journalctl -b -u planariad -o cat | grep 'ALARM: ' | grep '{UNMANAGED}' | grep -cF '{E_ALARM}' || true) -ge 1 ]", timeout=90)
+        # Not repaired: past §13's first backoff (10 s) and then some, the
+        # unit is still down on the run that was killed, and the daemon has
+        # named it in no repair, restart or incident.
+        for _ in range(45):
+            assert machine.execute(f"systemctl is-active --quiet {UNMANAGED}.service")[0] != 0, f"{UNMANAGED} was started again"
+            time.sleep(1)
+        assert invocation() == killed, f"a new run of {UNMANAGED}: {killed} -> {invocation()}"
+        assert planarian_acted() == acted_before, machine.succeed(f"journalctl -b -u planariad -o cat | grep '{UNMANAGED}' || true")
+        held_for(UNMANAGED)
+        machine.fail(lan_ok())
+        # One alarm, the owner's words, and no other (the one-ALARM check).
+        assert e_alarms() == 1, e_alarms()
+        assert all_alarms() == alarms_before + 1, machine.succeed("journalctl -b -u planariad -o cat | grep 'ALARM: ' || true")
+        assert int(machine.succeed("journalctl -b -u planariad -o cat | grep -c 'network tools could not be read' || true").strip() or 0) == 0
+
+    with subtest("E: started again by a person, the hold lifts"):
+        machine.succeed(f"systemctl reset-failed {UNMANAGED}.service; systemctl start {UNMANAGED}.service")
+        machine.wait_until_succeeds(lan_ok(), timeout=60)
+        not_held(UNMANAGED)
+        peer.succeed(new_ssh("alice"))
+        assert e_alarms() == 1, e_alarms()
+
+    with subtest("E: an administrator's hold release lifts it while the tool stays down"):
+        machine.wait_until_succeeds("nft list table inet gymunmanaged", timeout=30)
+        killed = invocation()
+        machine.succeed(f"systemctl kill --signal=SIGKILL {UNMANAGED}.service")
+        machine.wait_until_succeeds(f"systemctl is-active planarian-hold@{UNMANAGED}.service && test -e /run/planarian/hold/{UNMANAGED}", timeout=20)
+        machine.fail(lan_ok())
+        machine.wait_until_succeeds(f"[ $(journalctl -b -u planariad -o cat | grep 'ALARM: ' | grep '{UNMANAGED}' | grep -cF '{E_ALARM}' || true) -ge 2 ]", timeout=90)
+        # A non-administrator's release asks for an administrator.
+        code, out = as_alice(f"planarian hold release {UNMANAGED}")
+        assert "approv" in out.lower() and "administrator" in out.lower(), out
+        held_for(UNMANAGED)
+        out = as_bob(f"planarian hold release {UNMANAGED}")
+        if "approve" in out:
+            approve_as_root(out)
+        machine.wait_until_succeeds(lan_ok(), timeout=60)
+        not_held(UNMANAGED)
+        peer.succeed(new_ssh("alice"))
+        # Released, not repaired: the tool is still down on the killed run.
+        machine.fail(f"systemctl is-active {UNMANAGED}.service")
+        assert invocation() == killed, f"a new run of {UNMANAGED}: {killed} -> {invocation()}"
+        assert e_alarms() == 2, e_alarms()
+
+    # The daemon reads unmanaged tools with one multi-unit `systemctl show`
+    # (#93, `observe_many`). Its parser's sample is hand-written; this checks
+    # it against the real systemd's output, through the installed binary.
+    with subtest("observe_many reads the real systemctl show: running, not found, exited 0, stopped by SIGTERM"):
+        daemon = machine.succeed("readlink -f /proc/$(systemctl show -p MainPID --value planariad.service)/exe").strip()
+        def observe(*units):
+            out = machine.succeed(f"{daemon} --observe-units {' '.join(units)}")
+            got = {}
+            for line in out.splitlines():
+                parts = line.split("\t")
+                assert len(parts) == 3, out
+                got[parts[0]] = (parts[1], parts[2])
+            assert set(got) == set(units), out
+            return got, out
+        machine.wait_until_succeeds("systemctl show -p ActiveState --value gym-oneshot.service | grep -qx inactive", timeout=60)
+        machine.wait_for_unit("gym-term.service")
+        got, out = observe("sshd.service", "planarian-nosuch.service", "gym-oneshot.service", "gym-term.service")
+        assert got["sshd.service"][0] == "Ok(Active)", out
+        assert got["gym-term.service"][0] == "Ok(Active)", out
+        # Not found is Absent, never an Err (systemd answers for it).
+        assert got["planarian-nosuch.service"][0] == "Ok(Absent)", out
+        # A oneshot that ran and exited 0 is not running and ended on its own.
+        assert got["gym-oneshot.service"][0] == "Ok(Bound)", out
+        assert "Exited(0)" in got["gym-oneshot.service"][1], out
+        machine.succeed("systemctl stop gym-term.service")
+        got, out = observe("gym-term.service")
+        assert got["gym-term.service"][0] == "Ok(Bound)", out
+        assert "Signal(15)" in got["gym-term.service"][1], out
   '';
 }

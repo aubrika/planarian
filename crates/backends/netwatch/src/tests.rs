@@ -2496,7 +2496,7 @@ mod wireguard {
     use crate::wg::{self, Device, MUTANT, Mutant};
     use crate::{ChangeKind, Endpoint, Owner, Proto, Tracker, WatchState};
     use planarian_schema::UnitId;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::net::IpAddr;
 
     const NOW: u64 = 100;
@@ -2730,7 +2730,9 @@ mod wireguard {
     }
 
     fn dev(name: &str, eps: &[Endpoint]) -> Device {
-        Device { name: name.into(), ifindex: 10, endpoints: eps.to_vec() }
+        // One interface index per name, as the kernel has.
+        let ifindex = 10 + name.bytes().map(u32::from).sum::<u32>() % 1000;
+        Device { name: name.into(), ifindex, endpoints: eps.to_vec() }
     }
 
     /// The footprint of the unit that configured a tunnel carries that
@@ -2760,9 +2762,232 @@ mod wireguard {
         // The device is gone: its standing endpoints clear.
         assert!(t.set_wireguard(&[dev("wgb", &[e3])]));
         assert!(view(&t).units["wg-quick-a"].endpoints.is_empty());
-        // Kept across a restart in `.state`.
+        // `.state` keeps b's binding and the index its device was read at; a's ended with its device.
         let claims = t.claims();
-        assert!(claims.wireguard.contains(&(a.clone(), "wga".to_string())));
+        assert!(!claims.wireguard.contains(&(a.clone(), "wga".to_string())), "ended with its device");
+        assert!(claims.wireguard.contains(&(b.clone(), "wgb".to_string())));
+        assert!(
+            claims.wireguard_index.contains(&(b.clone(), "wgb".to_string(), dev("wgb", &[]).ifindex)),
+            "pinned to the device read"
+        );
+    }
+
+    /// B-27: the old unit's binding ends with its device. A device of the
+    /// same name made by another unit (after a read without it, or between
+    /// two reads, so with another interface index) hands the old unit
+    /// nothing; the new unit's request binds it.
+    #[test]
+    fn a_device_of_a_reused_name_is_not_the_old_units() {
+        let (a, b) = (UnitId::service("wg-quick-a"), UnitId::service("wg-quick-b"));
+        let (e1, e2) = (udp("192.0.2.7", 51820), udp("198.51.100.9", 1));
+        let dev_at = |index, eps: &[Endpoint]| Device { name: "wg0".into(), ifindex: index, endpoints: eps.to_vec() };
+        for gap in [true, false] {
+            let mut t = Tracker::default();
+            t.bind_wireguard(&a, "wg0");
+            t.set_wireguard(&[dev_at(10, &[e1])]);
+            if gap {
+                t.set_wireguard(&[]);
+            }
+            // b makes wg0 again (another index) and configures it.
+            t.bind_wireguard(&b, "wg0");
+            t.set_wireguard(&[dev_at(11, &[e2])]);
+            let at = |u: &UnitId| t.footprint(u, NOW).endpoints;
+            assert!(at(&a).is_empty(), "gap {gap}: the old binding went with its device");
+            assert_eq!(at(&b), [e2].into());
+            // A restart in between keeps the pin: the index survives `.state`.
+            let mut after = Tracker::attach(&t.claims(), &[], &BTreeSet::new());
+            after.set_wireguard(&[dev_at(12, &[e1])]);
+            assert!(after.footprint(&b, NOW).endpoints.is_empty(), "gap {gap}: a device made while the watch was down");
+        }
+    }
+
+    /// vm-netwatch (s) 1c, catalog run 42479947756: a rename the read sees
+    /// before its event does. The binding follows the device by its index,
+    /// and the event, when it comes, changes nothing.
+    #[test]
+    fn a_rename_a_read_sees_first_keeps_the_binding() {
+        let a = UnitId::service("wg-quick-a");
+        let (e1, e2) = (udp("192.0.2.7", 51820), udp("198.51.100.9", 1));
+        let named = |name: &str, eps: &[Endpoint]| Device { name: name.into(), ifindex: 10, endpoints: eps.to_vec() };
+        let mut t = Tracker::default();
+        t.bind_wireguard(&a, "nwwg0");
+        t.set_wireguard(&[named("nwwg0", &[e1])]);
+        // The kernel renamed it; the next read shows the new name, a peer
+        // changed too; the rename's event has not been drained yet.
+        t.set_wireguard(&[named("nwwg1", &[e2])]);
+        assert_eq!(t.footprint(&a, NOW).endpoints, [e2].into(), "the binding followed the device");
+        assert!(t.claims().wireguard.contains(&(a.clone(), "nwwg1".to_string())));
+        // The event arrives: nothing left to move.
+        t.rename_interface("nwwg0", "nwwg1");
+        t.set_wireguard(&[named("nwwg1", &[e2])]);
+        assert_eq!(t.footprint(&a, NOW).endpoints, [e2].into());
+        assert_eq!(t.claims().wireguard, vec![(a.clone(), "nwwg1".to_string())]);
+        // A binding that resolved to no device at its request ends with a read
+        // without its name, so a device made later under it is not this
+        // unit's (the reviewer's sequence on #83: a binds wg0 before it
+        // exists, b makes and configures it).
+        let b = UnitId::service("wg-quick-b");
+        let mut u = Tracker::default();
+        u.bind_wireguard_at(&a, "nwwg0", None);
+        u.set_wireguard(&[]);
+        assert!(!u.claims().wireguard.contains(&(a.clone(), "nwwg0".to_string())));
+        u.bind_wireguard_at(&b, "nwwg0", Some(10));
+        u.set_wireguard(&[named("nwwg0", &[e2])]);
+        assert!(u.footprint(&a, NOW).endpoints.is_empty(), "a carries nothing of b's device");
+        assert_eq!(u.footprint(&b, NOW).endpoints, [e2].into());
+    }
+
+    /// A DELLINK the watch never saw (it was not running): the saved binding
+    /// is pinned by index, so a device made again under the name with another
+    /// index is not the old unit's after the restart. (The same explicitly
+    /// chosen index is B-29.)
+    #[test]
+    fn a_device_made_again_while_the_watch_was_down_is_not_inherited() {
+        let (a, b) = (UnitId::service("wg-quick-a"), UnitId::service("wg-quick-b"));
+        let (e1, e2) = (udp("192.0.2.7", 51820), udp("198.51.100.9", 1));
+        let dev_at = |index, eps: &[Endpoint]| Device { name: "wg0".into(), ifindex: index, endpoints: eps.to_vec() };
+        let mut t = Tracker::default();
+        t.bind_wireguard_at(&a, "wg0", Some(10));
+        t.set_wireguard(&[dev_at(10, &[e1])]);
+        // The watch restarts from `.state`; b made wg0 again meanwhile.
+        let mut after = Tracker::attach(&t.claims(), &[], &BTreeSet::new());
+        after.bind_wireguard_at(&b, "wg0", Some(11));
+        after.set_wireguard(&[dev_at(11, &[e2])]);
+        assert!(after.footprint(&a, NOW).endpoints.is_empty(), "a is not bound to b's device");
+        assert_eq!(after.footprint(&b, NOW).endpoints, [e2].into());
+    }
+
+    /// A failed read of the controller's family list marks the peers unknown
+    /// (the loader's `ensure` error path), and the next good WireGuard read
+    /// clears it, as at N25: not the global lost-event mark.
+    #[test]
+    fn a_failed_controller_read_marks_the_peers_unknown_until_a_good_read() {
+        use crate::wg::GenlIds;
+        let marked = |t: &Tracker| {
+            t.view(WatchState::Attached { at: NOW }, &[], NOW)
+                .unattributed
+                .iter()
+                .any(|w| w.contains("WireGuard peers"))
+        };
+        let lost_global = |t: &Tracker| {
+            t.view(WatchState::Attached { at: NOW }, &[], NOW)
+                .unattributed
+                .iter()
+                .any(|w| w.contains("could not be placed"))
+        };
+        let mut t = Tracker::default();
+        let mut ids = GenlIds::default();
+        let mut fail = || Err::<Vec<(String, u16)>, String>("the controller did not answer".into());
+        assert!(ids.refresh(&mut fail).is_err());
+        // A request arrives while the list is unknown.
+        if ids.ensure(0x21, &mut fail).is_err() {
+            t.wireguard_unread();
+        }
+        assert!(marked(&t) && !lost_global(&t), "object-bound, not the global mark");
+        // The tick reads the list again, then a good WireGuard read follows.
+        assert!(ids.refresh(&mut || Ok(vec![("wireguard".to_string(), 0x21)])).is_ok());
+        assert_eq!(ids.family("wireguard"), Ok(Some(0x21)));
+        t.set_wireguard(&[]);
+        assert!(!marked(&t) && !lost_global(&t), "a good read clears it");
+    }
+
+    /// An `ifindex` that exists but cannot be read (here a directory) makes
+    /// the scan an error, never a device skipped (prop-auditor, #87).
+    #[test]
+    fn an_ifindex_that_cannot_be_read_fails_the_scan() {
+        let dir = std::env::temp_dir().join(format!("nw-ifindex-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("wg0/ifindex")).unwrap();
+        assert!(crate::host::try_read_ifnames_in(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rule 21: a failed scan of the interface list is not "no such device".
+    /// The binding waits unpinned and the peers are marked unknown until a
+    /// read succeeds.
+    #[test]
+    fn a_failed_interface_scan_fails_closed_until_a_read_succeeds() {
+        let a = UnitId::service("wg-quick-a");
+        let marked = |t: &Tracker| {
+            t.view(WatchState::Attached { at: NOW }, &[], NOW)
+                .unattributed
+                .iter()
+                .any(|w| w.contains("WireGuard peers"))
+        };
+        let mut t = Tracker::default();
+        t.bind_wireguard_scanned(&a, "wg0", Err("/sys/class/net: Permission denied".into()));
+        assert!(marked(&t));
+        assert!(t.claims().wireguard.contains(&(a.clone(), "wg0".to_string())), "waits, unpinned");
+        t.set_wireguard(&[]);
+        assert!(!marked(&t), "a read that succeeded clears it");
+        // A scan that worked and found nothing is the ordinary case: no mark.
+        t.bind_wireguard_scanned(&a, "wg1", Ok(None));
+        assert!(!marked(&t));
+        // The scan itself: an unreadable directory or index is an error, a
+        // device gone between the listing and its index is not.
+        let dir = std::env::temp_dir().join(format!("nw-ifnames-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(crate::host::try_read_ifnames_in(&dir).is_err(), "no directory");
+        std::fs::create_dir_all(dir.join("wg0")).unwrap();
+        std::fs::create_dir_all(dir.join("gone")).unwrap();
+        std::fs::write(dir.join("wg0/ifindex"), "7\n").unwrap();
+        assert_eq!(
+            crate::host::try_read_ifnames_in(&dir).unwrap(),
+            [(7, "wg0".to_string())].into(),
+            "a device with no index file is gone"
+        );
+        std::fs::create_dir_all(dir.join("bad")).unwrap();
+        std::fs::write(dir.join("bad/ifindex"), "x\n").unwrap();
+        assert!(crate::host::try_read_ifnames_in(&dir).is_err(), "an index that is not a number");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RTM_DELLINK for `name` at `index`, from the host's netns.
+    fn dellink(name: &str, index: u32) -> crate::ebpf::Event {
+        let mut body = vec![0u8; 16]; // ifinfomsg
+        body[4..8].copy_from_slice(&index.to_ne_bytes());
+        let mut attr = (4 + name.len() as u16 + 1).to_ne_bytes().to_vec();
+        attr.extend(3u16.to_ne_bytes()); // IFLA_IFNAME
+        attr.extend(name.as_bytes());
+        attr.push(0);
+        while !attr.len().is_multiple_of(4) {
+            attr.push(0);
+        }
+        body.extend(attr);
+        let mut d = vec![0u8; 16];
+        d[4..6].copy_from_slice(&17u16.to_ne_bytes()); // RTM_DELLINK
+        d.extend(body);
+        let len = d.len() as u32;
+        crate::ebpf::Event {
+            cgroup: 1,
+            tgid: 2,
+            hook: crate::ebpf::HOOK_RTNETLINK,
+            len,
+            netns: 0xF000_0000,
+            cgpath: None,
+            data: d,
+        }
+    }
+
+    /// B-27 (reviewer, #83): a device deleted and made again with the same
+    /// name *and the same interface index* between two reads looks the same
+    /// to the pin; its DELLINK is what ends the old unit's binding.
+    #[test]
+    fn a_device_deleted_and_made_again_at_the_same_index_is_not_the_old_units() {
+        let (a, b) = (UnitId::service("wg-quick-a"), UnitId::service("wg-quick-b"));
+        let (e1, e2) = (udp("192.0.2.7", 51820), udp("198.51.100.9", 1));
+        let dev_at = |eps: &[Endpoint]| Device { name: "wg0".into(), ifindex: 10, endpoints: eps.to_vec() };
+        let mut t = Tracker::default();
+        t.bind_wireguard(&a, "wg0");
+        t.set_wireguard(&[dev_at(&[e1])]);
+        assert_eq!(t.footprint(&a, NOW).endpoints, [e1].into());
+        let host = 0xF000_0000;
+        crate::parse::take(&mut t, &dellink("wg0", 10), host, || Some(UnitId::service("deleter")), &mut |_| None);
+        // Made again at index 10, configured by b, all before the next read.
+        t.bind_wireguard(&b, "wg0");
+        t.set_wireguard(&[dev_at(&[e2])]);
+        assert!(t.footprint(&a, NOW).endpoints.is_empty(), "a's binding ended with the device it named");
+        assert_eq!(t.footprint(&b, NOW).endpoints, [e2].into());
     }
 
     /// The latch keeps what an invocation found protecting with: a tunnel
@@ -2784,6 +3009,127 @@ mod wireguard {
     // ---- The request: which device did the unit configure?
 
     const FAMILY: u16 = 0x21;
+
+    /// Drive `wg::take_genl` with the pieces a test controls: the controller
+    /// list (`list`: `None` is a failed read) and the interface scan.
+    fn take(
+        t: &mut Tracker,
+        ids: &mut wg::GenlIds,
+        ev: &crate::ebpf::Event,
+        unit: &UnitId,
+        list: Option<Vec<(String, u16)>>,
+        scan: Result<BTreeMap<u32, String>, String>,
+    ) -> Vec<String> {
+        wg::take_genl(
+            t,
+            ids,
+            ev,
+            0xF000_0000,
+            || Some(unit.clone()),
+            &mut || list.clone().ok_or_else(|| "the controller did not answer".to_string()),
+            &mut || scan.clone(),
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new,
+        )
+    }
+
+    fn wg_set(name: &[u8]) -> crate::ebpf::Event {
+        request(FAMILY, 1, &[attr(2, false, name)], usize::MAX)
+    }
+
+    /// Reviewer, #87: while the family list cannot be read, a request cannot
+    /// be told from a WireGuard one. The peers are unknown (a mark a good read
+    /// clears), **and** the sending unit is marked lost, because a binding it
+    /// may have made cannot be recovered afterwards: when the mark clears, the
+    /// unit must not have stopped protecting. A request from another network
+    /// namespace is not the host's and marks no unit.
+    #[test]
+    fn a_request_while_the_family_list_is_unknown_marks_its_unit_lost() {
+        let (u, other) = (UnitId::service("wg-setter"), UnitId::service("elsewhere"));
+        let mut t = Tracker::default();
+        let mut ids = wg::GenlIds::default();
+        let log = take(&mut t, &mut ids, &wg_set(b"wgtest\0"), &u, None, Ok(BTreeMap::new()));
+        assert!(!log.is_empty(), "the failed read is reported");
+        assert!(t.footprint(&u, NOW).unattributed, "the unit that may have bound is lost");
+        let marked = |t: &Tracker| {
+            t.view(WatchState::Attached { at: NOW }, &[], NOW)
+                .unattributed
+                .iter()
+                .any(|w| w.contains("WireGuard peers"))
+        };
+        assert!(marked(&t));
+        // The next good read clears the peers mark, not the unit's.
+        assert!(ids.refresh(&mut || Ok(vec![("wireguard".to_string(), FAMILY)])).is_ok());
+        t.set_wireguard(&[]);
+        assert!(!marked(&t));
+        assert!(t.footprint(&u, NOW).unattributed, "still lost: the binding cannot be recovered");
+        // Another namespace's request marks nobody.
+        let mut t2 = Tracker::default();
+        let mut ids2 = wg::GenlIds::default();
+        let mut foreign = wg_set(b"wgtest\0");
+        foreign.netns = 0xF000_1234;
+        take(&mut t2, &mut ids2, &foreign, &other, None, Ok(BTreeMap::new()));
+        assert!(!t2.footprint(&other, NOW).unattributed);
+    }
+
+    /// A SET that names its device by index, where neither the scan nor the
+    /// cache holds that index, cannot be bound: its unit is marked lost
+    /// (prop-auditor's mutant on #87: that arm doing nothing). Where the list
+    /// holds it, the unit binds at that index.
+    #[test]
+    fn an_index_that_nothing_holds_marks_its_unit_lost() {
+        let u = UnitId::service("wg-setter");
+        let by_index = request(FAMILY, 1, &[attr(1, false, &7u32.to_ne_bytes())], usize::MAX);
+        let run = |t: &mut Tracker, ids: &mut wg::GenlIds, now: BTreeMap<u32, String>| {
+            wg::take_genl(
+                t,
+                ids,
+                &by_index,
+                0xF000_0000,
+                || Some(u.clone()),
+                &mut || Ok(vec![]),
+                &mut || Ok(BTreeMap::new()),
+                &mut BTreeMap::new(),
+                &mut || now.clone(),
+            );
+        };
+        let mut ids = wg::GenlIds::default();
+        assert!(ids.refresh(&mut || Ok(vec![("wireguard".to_string(), FAMILY)])).is_ok());
+        let mut t = Tracker::default();
+        run(&mut t, &mut ids, BTreeMap::new());
+        assert!(t.footprint(&u, NOW).unattributed, "no device holds index 7: the unit is lost");
+        let mut t = Tracker::default();
+        run(&mut t, &mut ids, [(7, "wgtest".to_string())].into());
+        assert!(!t.footprint(&u, NOW).unattributed);
+        assert!(t.claims().wireguard_index.contains(&(u.clone(), "wgtest".to_string(), 7)));
+    }
+
+    /// A SET that names no device at all (an empty name) marks its unit lost
+    /// (prop-auditor's mutant on #87: that arm doing nothing).
+    #[test]
+    fn a_set_that_names_no_device_marks_its_unit_lost() {
+        let u = UnitId::service("wg-setter");
+        let mut t = Tracker::default();
+        let mut ids = wg::GenlIds::default();
+        assert!(ids.refresh(&mut || Ok(vec![("wireguard".to_string(), FAMILY)])).is_ok());
+        take(&mut t, &mut ids, &wg_set(b"\0"), &u, None, Ok(BTreeMap::new()));
+        assert!(t.footprint(&u, NOW).unattributed);
+        assert!(t.claims().wireguard.is_empty(), "nothing was bound");
+    }
+
+    /// With the list known, the same request binds its unit at the index the
+    /// scan gives, and marks nothing lost.
+    #[test]
+    fn a_request_with_the_family_list_known_binds_and_marks_nothing() {
+        let u = UnitId::service("wg-setter");
+        let mut t = Tracker::default();
+        let mut ids = wg::GenlIds::default();
+        assert!(ids.refresh(&mut || Ok(vec![("wireguard".to_string(), FAMILY)])).is_ok());
+        let log = take(&mut t, &mut ids, &wg_set(b"wgtest\0"), &u, None, Ok([(7, "wgtest".to_string())].into()));
+        assert!(log.is_empty());
+        assert!(!t.footprint(&u, NOW).unattributed);
+        assert!(t.claims().wireguard_index.contains(&(u.clone(), "wgtest".to_string(), 7)));
+    }
 
     /// A captured generic netlink request: family, command, attributes,
     /// cut to `cut` bytes (the probe's capture window).
@@ -2933,11 +3279,86 @@ mod genl_bounded {
         assert_eq!(got, Ok(None));
     }
 
+    /// A family message, by construction: the genl header after the netlink
+    /// one, then the attributes given.
+    fn family_msg(attrs: &[Vec<u8>]) -> Vec<u8> {
+        let mut m = vec![0u8; 16 + 4];
+        m.extend(attrs.concat());
+        m
+    }
+
+    fn fattr(ty: u16, v: &[u8]) -> Vec<u8> {
+        let mut a = (4 + v.len() as u16).to_ne_bytes().to_vec();
+        a.extend(ty.to_ne_bytes());
+        a.extend(v);
+        while !a.len().is_multiple_of(4) {
+            a.push(0);
+        }
+        a
+    }
+
+    /// Rule 21: a message of the controller's list that cannot be read makes
+    /// the whole list an error, never a smaller one (the missing family could
+    /// be WireGuard's).
+    #[test]
+    fn an_unreadable_family_message_is_an_error_not_a_smaller_list() {
+        let good = family_msg(&[fattr(2, b"nl80211\0"), fattr(1, &0x1cu16.to_ne_bytes())]);
+        assert_eq!(snapshot::families_in(std::slice::from_ref(&good)), Ok(vec![("nl80211".to_string(), 0x1c)]));
+        let no_id = family_msg(&[fattr(2, b"wireguard\0")]);
+        let no_name = family_msg(&[fattr(1, &0x1du16.to_ne_bytes())]);
+        let cut_id = family_msg(&[fattr(2, b"wireguard\0"), fattr(1, &[7])]);
+        let mut cut_attr = good.clone();
+        cut_attr.truncate(cut_attr.len() - 6);
+        cut_attr[20..22].copy_from_slice(&200u16.to_ne_bytes()); // claims more than there is
+        for bad in [no_id, no_name, cut_id, cut_attr] {
+            assert!(snapshot::families_in(&[good.clone(), bad.clone()]).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A dump the kernel flags interrupted (a peer list changing under it) is
+    /// read again, up to the attempts given; any other failure is returned at
+    /// once, and the last interruption is returned, never a smaller result.
+    /// Exhaustive over every outcome sequence of length 4.
+    #[test]
+    fn an_interrupted_dump_is_retried_a_bounded_number_of_times() {
+        use crate::snapshot::{INTERRUPTED, NlError, retry_interrupted};
+        // 0 = interrupted, 1 = ok, 2 = another failure
+        for code in 0..3usize.pow(4) {
+            let outcomes: Vec<usize> = (0..4).map(|i| code / 3usize.pow(i) % 3).collect();
+            for attempts in 1..=4usize {
+                let mut calls = 0;
+                let got = retry_interrupted(attempts, || {
+                    let o = outcomes[calls];
+                    calls += 1;
+                    match o {
+                        0 => Err(NlError::Other(INTERRUPTED.into())),
+                        1 => Ok(calls),
+                        _ => Err(NlError::Errno(-1)),
+                    }
+                });
+                // The first outcome that is not an interruption ends it, or
+                // the attempts do.
+                let end = outcomes.iter().take(attempts).position(|o| *o != 0);
+                match end {
+                    Some(i) => {
+                        assert_eq!(calls, i + 1, "{outcomes:?} x{attempts}");
+                        assert_eq!(got.is_ok(), outcomes[i] == 1);
+                    }
+                    None => {
+                        assert_eq!(calls, attempts, "{outcomes:?} x{attempts}");
+                        assert!(matches!(got, Err(NlError::Other(ref s)) if s == INTERRUPTED));
+                    }
+                }
+            }
+        }
+    }
+
     /// The WireGuard lookups return too (none here, or the devices).
     #[test]
     fn the_wireguard_lookups_return() {
         assert!(within(10, snapshot::wireguard_family).is_some());
-        assert!(within(10, snapshot::wireguard).is_some());
+        assert!(within(10, || snapshot::wireguard(snapshot::wireguard_family().unwrap_or(None))).is_some());
+        assert!(within(10, snapshot::families).is_some());
     }
 
     /// The regression itself (#71's gate: netwatch never signalled ready).

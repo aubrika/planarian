@@ -37,16 +37,22 @@ Pin to bpffs: the **links** (each holds its program alive) and the **maps**. A p
 
 ## 3. Layout
 
-One directory, `/sys/fs/bpf/planarian/netwatch/`:
+One directory, `/run/planarian/netwatch-bpf/`, the root of **Planarian's own bpffs instance** (not the system's `/sys/fs/bpf`; see below):
 
 ```
 link-<probe>      one per entry of loader::PROBES (10)
 map-EVENTS  map-LOST  map-MOVE_SRC  map-RENAME_SRC  map-RODATA  map-META
 ```
 
-The directory is `root:root`, mode `0700`, created by the loader before the first pin; the parent `/sys/fs/bpf/planarian/` the same. bpffs enforces the file modes, so no uid but root can open, replace or unlink a pin. The watch checks owner and mode (with `fstat` on the opened directory, not the path) on every takeover and refuses a pin set that is not `0700 root` or that holds an entry it does not know (§5, "refuse").
+The directory is the root of a bpffs mounted with `-o mode=0700` (without the option the instance's root came up with default permissions in the probe), owned by root; the parent `/run/planarian/` is `root:root` `0755` as today, so nothing but the mount's root needs `0700`. bpffs enforces the file modes, so no uid but root can open, replace or unlink a pin. The watch checks owner and mode (with `fstat` on the opened directory, not the path) on every takeover and refuses a pin set that is not `0700 root` or that holds an entry it does not know (§5, "refuse").
 
-**The bpffs instance must cross the switch-root.** Each mount of bpffs is its own instance, so pins in the initrd's are seen in stage 2 only if the mount moves with `/sys` (systemd's switch-root moves the API mounts, including submounts). This is assumption A1 and the first thing to verify in a VM: boot with a pin made in the initrd and look for it after switch-root. If it does not carry, the design falls back to attaching afresh (spec: "the probes are gone"), which is correct but gives no gain, so A1 has to hold for F to be worth building.
+**The bpffs instance must cross the switch-root, and the system's does not.** lane-nix's probe (nixos kernel 6.18.57, systemd 260.5; run 42483509297, branch `lane-nix/initrd-probes` at 0c04bc8) found that pins made in the initrd's own `/sys/fs/bpf` are **not** there in stage 2: systemd's switch-root leaves a fresh, empty bpffs instance (A1 failed, twice). A separate bpffs mounted under `/run` in the initrd **did** survive with every pin intact, because `/run` moves to stage 2 with its submounts (A1b passed). So the design mounts its own instance:
+
+- `/run/planarian/netwatch-bpf` is a bpffs mount (`mount -t bpf -o mode=0700 bpf …`), made in the initrd before the initrd watch loads, by a mount unit (lane-nix's side) so that it is in the host mount namespace and not a service's private one.
+- Stage 2 does not mount a new one: the instance moved with `/run`. The stage-2 unit has the same mount unit ordered before it, and the mount is idempotent (already mounted at that path: nothing to do; the loader checks it is a bpffs with `statfs` and refuses a path that is not, §5 "refuse"). With no initrd watch (a scripted initrd) the stage-2 mount unit makes the instance fresh, and the same code runs.
+- A pin directory that is not a bpffs root, or whose mount is not `0700 root`, is refused.
+- Never use the system's `/sys/fs/bpf` for any of this: stage 2 probably over-mounts the initrd's instance rather than freeing it, so pins made there stay attached but hidden (reviewer, #94).
+- When a generation turns netwatch off, a named unit (`planarian-netwatch-bpf-clear.service`, `ExecStart` unpins the links and unmounts `/run/planarian/netwatch-bpf`, run from the stage-2 stop of the watch only when the export says it is off; the unit exists **only in generations with netwatch off** (reviewer, #94), so a generation with the watch on carries no unit that could remove the instance) removes the instance, so a stopped watch does not leave probes attached for a unit nobody runs. A plain stop or restart of the watch leaves it (§5).
 
 ## 4. The build-hash and layout check
 
@@ -94,7 +100,7 @@ Measure first, then set the size:
 2. lane-nix runs VM boots with a deliberately large ring (16 MiB) for the initrd configurations that matter: no initrd networking; `boot.initrd.network` with static addresses; with networkd in the initrd; a WireGuard or VLAN link set up in the initrd. It records `drained` for each.
 3. `ring_bytes = round_up_pow2(max_over_configs(drained) × 928 × 4)`, with a floor of 512 KiB, and the number and the configurations recorded in this file.
 
-The 4× margin covers slower hardware and a longer initrd (disk unlock waiting on a person, which is the real unknown: nothing in the initrd generates netlink requests while it waits, so the count should not grow with time, and the measurement must include that case). The function (`ring_bytes_for(measured)`) is pure and has a property test: the result is a power of two, at least the floor, at least `measured × 928`, and monotone in `measured`.
+The measurement boots include a long initrd (a wait on a disk-unlock prompt before switch-root, the reviewer's request), not only the quick ones. The 4× margin covers slower hardware and a longer initrd (disk unlock waiting on a person, which is the real unknown: nothing in the initrd generates netlink requests while it waits, so the count should not grow with time, and the measurement must include that case). The function (`ring_bytes_for(measured)`) is pure and has a property test: the result is a power of two, at least the floor, at least `measured × 928`, and monotone in `measured`.
 
 An overflow is never silent: `LOST` counts it and takeover reports it as a lost event, which fails closed (global `unattributed`).
 
@@ -115,23 +121,23 @@ An overflow is never silent: `LOST` counts it and takeover reports it as a lost 
 
 ## 9. Unverified assumptions (each needs a VM or kernel check before code)
 
-- **A1** The pinned bpffs instance is visible after switch-root (§3).
-- **A2** All ten hooks can be held by pinned links on the kernels NixOS ships (§2), including module BTF for fentry on the nfnetlink functions (`CONFIG_DEBUG_INFO_BTF_MODULES`) if the kprobes cannot be pinned. lane-nix probes this with a small clang-built object (aya's object uses legacy map sections, which libbpf and bpftool cannot load) on `lane-nix/initrd-probes`.
-- **A3** Cgroup attribution in the initrd: events from initrd units carry cgroup names (`initrd.slice`, `system.slice/<unit>`?) that `unit_of_cgroup` maps to the unit names the export lists. If initrd units live under paths the mapper rejects, their changes are `unattributed` (fail closed, but over-holding at every boot with initrd networking). Measure what the initrd's cgroup paths look like.
-- **A4** `/run/planarian/footprint` and `.state` written in the initrd survive the move of `/run` unchanged, including the `at` clock: `CLOCK_BOOTTIME` continues across switch-root, so the freshness window holds.
+- **A1** *Result (lane-nix, #90 probe): the system's `/sys/fs/bpf` instance is not carried (failed); a bpffs of our own under `/run` is (passed).* §3 uses the second.
+- **A2** *Result: all ten hooks held by pinned links and listed in stage 2 after the loader had exited, the two kprobes as `perf_event` links (so §2's option 2 works on this kernel); the other eight are fentry/fexit `tracing` links. Module BTF for nfnetlink is present in the initrd once the module is loaded, so option 1 is also available.* **Still open (A2b):** the probe used bpftool; whether aya can create or pin a perf-event link (or I make the raw `BPF_LINK_CREATE` call) is the next check, and it is mine (a loader spike, no product change).
+- **A3** *Result: the initrd unit's cgroup is `0::/system.slice/initrd-probe.service`, the same shape as stage 2, so `unit_of_cgroup` should map it.* Confirm with the real watch when it runs in the initrd.
+- **A4** *Result: `/run` files written in the initrd survived, and the `CLOCK_BOOTTIME` stamp continued (5.00 in the initrd, 24.27 after), so the freshness window holds.* Not covered: an initrd that takes much longer (disk unlock waiting on a person); the measurement boots in §6 should include one.
 - **A5** A new process resumes a pinned ring where the last one stopped. The consumer position of a `BPF_MAP_TYPE_RINGBUF` lives in the ring's own mapped page, not in the process, so a fresh mapping of the pinned map should see it. If a VM shows otherwise, the fallback is to treat the whole ring as unread, which re-applies events already applied and is harmless (applying an event twice changes nothing).
 
 ## 10. What I need from lane-nix
 
 - The initrd unit for the watch (`boot.initrd.systemd.services.planarian-netwatch-initrd`), with the binary and `netwatch.bpf.o` in the initrd's closure, ordered before every network tool the initrd runs, and the `initrd` list in `nix/netwatch-unordered.nix` for its startup chain with the cycle check.
-- bpffs mounted in the initrd before the unit (confirm systemd does it) and A1's VM probe.
+- A mount unit for `/run/planarian/netwatch-bpf` (`Type=bpf`, `Options=mode=0700`), in the initrd before the initrd watch and in stage 2 before `planarian-netwatch.service`; `module-eval` asserts the options.
 - The VM boots in §6 (large ring, several initrd configurations) and the numbers back to me for §6's formula.
 - `module-eval` assertions: a scripted initrd gets no initrd watch and no initrd network tools (spec); the systemd initrd gets the unit and its ordering.
 - The export: a field saying whether the initrd watch is configured, so the stage-2 watch and the posture scripts know whether `.watch` from the initrd is expected.
 
 ## 11. Order of work
 
-1. A1, A2 and A3 as VM probes, no product code (lane-nix with me): if A1 or A2 fails, stop and bring it to the owner.
+1. A1, A2, A3 and A4 are probed (§9): the layout changed (own bpffs under `/run`), nothing else did. A2b, aya's ability to pin the kprobe links, is next, as a loader spike with no product change; if aya cannot and a raw call is needed, say so before building.
 2. The pure pieces with their properties: `takeover_decision`, `ring_bytes_for`. No kernel needed.
 3. The loader: pin on first load, META, adopt / replace / refuse, `drained` logging.
 4. lane-nix's unit, ordering and `module-eval` assertions.

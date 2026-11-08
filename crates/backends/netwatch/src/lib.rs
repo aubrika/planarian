@@ -266,11 +266,28 @@
 //! read as the kernel has them, after any such request and at every tick
 //! (`WG_CMD_GET_DEVICE`, a dump: `snapshot::wireguard`, parsed by
 //! `wg::devices`; the probe's 512-byte capture cannot hold several peers).
+//! Generic netlink family ids come from the controller's list, kept as
+//! `wg::GenlIds`: read at start and every tick, and again only for a request
+//! whose family id the map does not hold (once per id until the next tick),
+//! so another family's traffic (nl80211's scans) costs no dump per drain. A
+//! failed read leaves the map unknown, never "no such family": the
+//! WireGuard read and every request fail closed (a loss) until the next tick
+//! reads again (rule 21).
+//! Limit (prop-auditor, #87): the map is read once per tick, so a family id
+//! that is given up and reused (nl80211's id taken by WireGuard after a
+//! reload, say) is read as the old family for up to one tick; the WireGuard
+//! dump on that id then fails closed (an error) rather than being
+//! misattributed, and the next tick's read makes the map exact.
 //! GET_DEVICE dump names one interface: links are enumerated through
 //! rtnetlink, then each WireGuard interface is queried by index. In a large
 //! reply only the first chunk names the device; peer-only continuations
 //! keep that identity. Netwatch's own read requests are discarded before
 //! the loader counts external work, so a dump cannot trigger itself.
+//! A binding lasts as long as the device it named (B-27): the first read of
+//! the device pins it by interface index (kept in `.state`), and a read
+//! without the device, with the name on a device of another index, or an
+//! `RTM_DELLINK` for it ends it; a unit that configures the device again
+//! binds afresh. A binding does not end with its unit's invocation (B-28).
 //! A unit takes exactly its devices' peers, so a peer changed by `wg set`
 //! follows and a device that is gone has none; the latch keeps them for the
 //! invocation, so the hold can still pass the peer. A request naming no

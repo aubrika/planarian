@@ -340,6 +340,21 @@ fn main() {
         println!("{}", serde_json::to_string(&planarian_txn::journal::supported()).expect("journal kinds serialize"));
         return;
     }
+    if args.get(1).map(String::as_str) == Some("--observe-units") {
+        // `planariad --observe-units <unit>...`: the real backend's
+        // `observe_many` (one `systemctl show`), one line per unit:
+        // `<unit>\t<observed>\t<how it ended>`. For the VM catalog, which runs
+        // it against the real `systemctl show` and checks what the parser made
+        // of it (vm-netsec). Opens no configuration, socket or journal.
+        use planarian_schema::UnitBackend;
+        let ids: Vec<planarian_schema::UnitId> =
+            args[2..].iter().map(|u| planarian_schema::UnitId::service(u.trim_end_matches(".service"))).collect();
+        let backend = planarian_backend_linux::systemd::Systemd::new(std::env::temp_dir());
+        for (u, (observed, ended)) in args[2..].iter().zip(backend.observe_many(&ids)) {
+            println!("{u}\t{observed:?}\t{ended:?}");
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("--check-export") {
         let Some(path) = args.get(2) else {
             eprintln!("usage: planariad --check-export <path>");
