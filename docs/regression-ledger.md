@@ -62,6 +62,7 @@ carries a property test for the invariant it changes.
 
 | J21 | A checkpoint-reset crash left a checkpointed prefix before later retained records; segment enumeration stopped at that prefix, so saved gym history omitted the suffix and a terminal transaction's decisive fields could disappear from compatibility requirements on the next compaction | #69 | txn::Journal::segment_locked/required_decisive_locked/compact_returning_segment | `a_reset_crash_prefix_cannot_hide_a_later_terminal_decisive_field`, `decisive_extensions_survive_reset_crashes_and_terminal_history` (journal_props.rs) | proptest + unit | the fixed case restores the pre-reset bytes, appends Prepared with a nonempty extension and terminal Rejected, then checks both field aliases, saved suffix, target incompatibility and compact/reopen retention; generated crash/reset choices await this head's CI | pending |
 | J22 | A CRC-valid format-3 frame with class 2–255 was mistaken for a torn frame and could be truncated at the tail | #69 | txn::journal::unframe/valid_class/decode/could_follow | `an_intact_unknown_class_is_integrity_and_kept`, `every_read_helper_refuses_an_intact_unknown_class`, `a_checkpoint_with_an_unknown_class_is_integrity`, `an_unknown_class_after_damage_is_still_an_intact_later_record`, `the_invalid_class_is_torn_mutant_is_caught` (journal/tests.rs) | proptest + unit + explicit mutant | generated mixed-format tail/middle frames and checkpoints must return Integrity without changing bytes; the explicit old-decoder mutant must lose the intact tail; awaits this head's CI | pending |
+| J23 | The original set a build without an export is taken to read was the last format-2 build before the export (20 kinds, withdrawn_for and prepared_again_from), not the first (§12c: "the journal format's original set"): a transition to such a build never asked about records and fields added during format 2, and a journal with them was read as if the target understood them | lane-daemon/journal-kinds-guards (#89) | txn::journal::compat::original/supported/active/record_requirements | `the_exported_descriptor_is_this_builds_reader`, `what_was_added_during_format_2_is_required_of_a_target_that_predates_the_export`, `a_prepared_transactions_added_fields_are_required_once_set`, `every_defaulted_field_of_a_decisive_kind_is_classified` (journal/tests.rs) | unit | verified: with the earlier `original()`/`supported()` the first, second and fourth fail; dropping `Prepared.candidate_nar` fails the third; counting a zero or false field as set fails the second | pending (needs a catalog run) |
 
 ## Daemon timing, holds and posture (`crates/daemon`, `crates/incident`, `nix/posture.nix`)
 
@@ -205,7 +206,7 @@ in a debug build).
 
 ## Counts
 
-106 rows, including the fixes in this stack: 22 journal and kernel (J), 24 daemon (D),
+107 rows, including the fixes in this stack: 23 journal and kernel (J), 24 daemon (D),
 18 change path (C), 19 backends, identity and gym (B), 23 netwatch (N).
 Two rows still owe a property test (status **gap**):
 - J4: the daemon restart selector was extracted in #76; its ledger row is reconciled by the closing docs lane.

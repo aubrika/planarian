@@ -1400,8 +1400,9 @@ proptest! {
 /// §12c ("Each build exports the kinds and decisive fields it reads"): the
 /// descriptor `planariad --journal-kinds` prints is `supported()`. It
 /// round-trips as the requirements a target is compared with, reads at least
-/// the original set a build without an export is taken to read (format 2, 20
-/// kinds), and names exactly the decisive kinds.
+/// the original set a build without an export is taken to read (what the
+/// first format-2 build, 90f1e37, read: format 2, 16 kinds, no decisive
+/// field), and names exactly the decisive kinds.
 #[test]
 fn the_exported_descriptor_is_this_builds_reader() {
     let json = serde_json::to_string(&supported()).unwrap();
@@ -1414,41 +1415,55 @@ fn the_exported_descriptor_is_this_builds_reader() {
     kinds.sort();
     assert_eq!(kinds, decisive, "the descriptor's kinds are the decisive kinds");
     let o = original();
-    assert_eq!((o.format, o.kinds.len()), (2, 20), "docs/deviations.md names the original set as format 2, 20 kinds");
+    assert_eq!((o.format, o.kinds.len()), (2, 16), "docs/deviations.md names the original set as format 2, 16 kinds");
+    assert!(o.fields.is_empty(), "the first format-2 build wrote no decisive field a later one added");
+    for added in ["ExternalAccepted", "AgentStarted", "HoldApplied", "HoldLifted", "NotPreparedAgain"] {
+        assert!(!o.kinds.iter().any(|k| k == added), "{added} was added during format 2");
+        assert!(back.kinds.iter().any(|k| k == added));
+    }
     assert!(o.unsupported_by(&back).is_empty(), "a build reads at least the original set");
 }
 
 /// Registry guard: a `#[serde(default)]` field is how a field is added
 /// without breaking older journals, and a reader that ignores one can act on a
 /// wrong value. So each defaulted field in the journal's records, the ledger
-/// they fold into and the transaction they carry must be classified here, as
-/// a decisive field the descriptor names (`supported()`), or as one that
-/// predates the export (and is therefore in the original set a build without
-/// an export is taken to read). A new one fails until a person classifies it.
+/// they fold into and the transaction they carry is classified here: present
+/// in the first format-2 build (90f1e37), so in the original set a build
+/// without an export is taken to read; or added during format 2, with the
+/// commit that added it, and then the descriptor must name a path for it (so
+/// a journal that uses it asks before a transition to a build that predates
+/// the export). A new defaulted field fails until a person classifies it.
+///
+/// The commit for each entry is the first one in which the field is in its
+/// struct or variant, found by walking `git log` over crates/txn/src/ledger.rs
+/// and crates/schema/src/txn.rs, and whether it is in 90f1e37 by
+/// `git merge-base --is-ancestor <commit> 90f1e37`.
 #[test]
 fn every_defaulted_field_of_a_decisive_kind_is_classified() {
     #[derive(Clone, Copy)]
-    enum Kind {
-        Decisive,
-        PredatesExport,
+    enum Era {
+        /// In the first format-2 build.
+        Original,
+        /// Added during format 2, by this commit.
+        AddedDuringFormat2(&'static str),
     }
-    use Kind::{Decisive, PredatesExport};
-    let table: &[(&str, Kind)] = &[
-        ("withdrawn_for", Decisive),
-        ("prepared_again_from", Decisive),
-        ("not_prepared_again", Decisive),
-        ("boot_at", PredatesExport),
-        ("approver", PredatesExport),
-        ("txn", PredatesExport),
-        ("instance", PredatesExport),
-        ("why", PredatesExport),
-        ("boot_only", PredatesExport),
-        ("security_floor", PredatesExport),
-        ("external", PredatesExport),
-        ("agents", PredatesExport),
-        ("hold_events", PredatesExport),
-        ("candidate_nar", PredatesExport),
-        ("pre_passing", PredatesExport),
+    use Era::{AddedDuringFormat2 as Added, Original};
+    let table: &[(&str, Era)] = &[
+        ("why", Original),            // LiveTxn.why, b462e32
+        ("security_floor", Original), // Ledger.security_floor, d1f133c
+        ("boot_at", Added("89eb2b4")),
+        ("approver", Added("d9e1ed2")),
+        ("txn", Added("d9e1ed2")),
+        ("instance", Added("8231a07")),
+        ("boot_only", Added("4e5cd1c")),
+        ("external", Added("db5b0f4")),
+        ("agents", Added("805cd1c")),
+        ("hold_events", Added("d10bc80")),
+        ("candidate_nar", Added("82a76ab")),
+        ("pre_passing", Added("ff11187")),
+        ("withdrawn_for", Added("2a24d30")),
+        ("prepared_again_from", Added("2a24d30")),
+        ("not_prepared_again", Added("b21f867")),
     ];
     let sources = [include_str!("../ledger.rs"), include_str!("../../../schema/src/txn.rs")];
     let mut found: Vec<String> = vec![];
@@ -1473,14 +1488,97 @@ fn every_defaulted_field_of_a_decisive_kind_is_classified() {
     for f in &found {
         assert!(
             table.iter().any(|(n, _)| n == f),
-            "`#[serde(default)]` field `{f}` is unclassified: add it to the descriptor's fields (a decisive field) or to this table (predates the export)"
+            "`#[serde(default)]` field `{f}` is unclassified: add it to this table (original, or added during format 2 with its commit) and name its path in `supported()`"
         );
     }
-    for (name, kind) in table {
+    let paths: Vec<String> = supported().fields.values().flatten().cloned().collect();
+    for (name, class) in table {
         assert!(found.iter().any(|f| f == name), "`{name}` is classified but is no longer a defaulted field");
-        if matches!(kind, Decisive) {
-            let described = supported().fields.values().flatten().any(|p| p.rsplit('.').next() == Some(*name));
-            assert!(described, "`{name}` is classified decisive but the descriptor names no path for it");
+        let described = paths.iter().any(|p| p.rsplit('.').next() == Some(*name));
+        match class {
+            Added(commit) => {
+                assert!(commit.len() == 7, "{name}: a short commit id");
+                assert!(
+                    described,
+                    "`{name}` was added during format 2 ({commit}) but the descriptor names no path for it"
+                );
+            }
+            Original => {
+                assert!(!described, "`{name}` is in the first format-2 build: the descriptor must not require it")
+            }
         }
     }
+}
+
+/// The kinds and fields added during format 2 are decisive for a build that
+/// predates the export: a journal that holds one asks before a transition to
+/// such a build (§12c AskFirst), and a field at its default does not.
+#[test]
+fn what_was_added_during_format_2_is_required_of_a_target_that_predates_the_export() {
+    use crate::ledger::HoldBy;
+    let unit = planarian_schema::UnitId::service("gym-web");
+    // (Every record also needs format 3; that is not what is under test.)
+    let needs = |r: &Record| {
+        let mut m = compat::record_requirements(r).unwrap().unsupported_by(&original());
+        m.retain(|x| !x.starts_with("journal format"));
+        m
+    };
+    let renew = |boot_at| Record::Renew {
+        txn: planarian_schema::TxnId(1),
+        epoch: 1,
+        worker_pid: None,
+        boot_at: Timestamp(boot_at),
+    };
+    assert_eq!(needs(&renew(5)), vec!["decisive field Renew.boot_at"]);
+    assert!(needs(&renew(0)).is_empty(), "a boot time at its default needs nothing");
+    let token = |approver, txn| Record::TokenUsed { nonce: [1; 16], expires: Timestamp(9), approver, txn };
+    assert_eq!(needs(&token(7, 0)), vec!["decisive field TokenUsed.approver"]);
+    assert_eq!(needs(&token(7, 3)), vec!["decisive field TokenUsed.approver", "decisive field TokenUsed.txn"]);
+    assert!(needs(&token(0, 0)).is_empty());
+    let agent = |instance| Record::AgentStarted { name: "a".into(), instance, by: 1000 };
+    assert_eq!(
+        needs(&agent([1; 16])),
+        vec!["decisive field AgentStarted.instance", "decisive field checkpoint.agents", "record kind AgentStarted"]
+    );
+    assert_eq!(needs(&agent([0; 16])), vec!["decisive field checkpoint.agents", "record kind AgentStarted"]);
+    for (record, kind, field) in [
+        (Record::HoldApplied { unit: unit.clone(), by: HoldBy::Daemon }, "HoldApplied", "hold_events"),
+        (Record::HoldLifted { unit: unit.clone(), reason: "r".into() }, "HoldLifted", "hold_events"),
+        (Record::ExternalAccepted { seq: 1, digest: planarian_schema::Hash([0; 32]) }, "ExternalAccepted", "external"),
+        (
+            Record::NotPreparedAgain { txn: planarian_schema::TxnId(2), reason: "r".into() },
+            "NotPreparedAgain",
+            "not_prepared_again",
+        ),
+    ] {
+        assert_eq!(
+            needs(&record),
+            vec![format!("decisive field checkpoint.{field}"), format!("record kind {kind}")],
+            "{kind}"
+        );
+        // And this build reads it.
+        assert!(compat::record_requirements(&record).unwrap().unsupported_by(&supported()).is_empty());
+    }
+}
+
+/// A transaction's decisive fields added during format 2 are required once
+/// set: a candidate's NAR hash (losing it skips C6's check, which fails open)
+/// and the probes passing before (R07), on `Prepared` and in a checkpoint.
+#[test]
+fn a_prepared_transactions_added_fields_are_required_once_set() {
+    use serde_json::json;
+    let required = |kind: &str, v: serde_json::Value| {
+        let mut r = compat::JournalRequirements { format: 3, kinds: vec![], fields: Default::default() };
+        compat::fields_in(kind, &v, &mut r);
+        r.fields.into_values().flatten().collect::<Vec<_>>()
+    };
+    assert_eq!(required("Prepared", json!({"candidate_nar": [1, 2, 3]})), ["candidate_nar"]);
+    assert!(required("Prepared", json!({"candidate_nar": null})).is_empty(), "None at its default");
+    assert_eq!(required("Prepared", json!({"check": {"pre_passing": {"u": ["p"]}}})), ["check.pre_passing"]);
+    assert!(required("Prepared", json!({"check": {"pre_passing": {}}})).is_empty());
+    assert_eq!(
+        required("checkpoint", json!({"live": {"1": {"txn": {"candidate_nar": [9]}, "boot_only": true}}})),
+        ["live.*.boot_only", "live.*.txn.candidate_nar"]
+    );
+    assert!(required("checkpoint", json!({"live": {"1": {"boot_only": false}}})).is_empty());
 }
