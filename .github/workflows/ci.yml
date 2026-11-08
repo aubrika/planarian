@@ -48,6 +48,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
+      # The Verus source is a GitHub release download that has been returning
+      # 504s. Keep the fetched store path in a file:// binary cache keyed on
+      # nix/verus.nix, restore it before the build, and retry the download
+      # when the cache is cold. The cache saves only after the job succeeds.
+      - uses: actions/cache@v4
+        with:
+          path: ~/verus-src-cache
+          key: verus-src-${{ hashFiles('nix/verus.nix') }}
+      - name: Verus source (from cache, else download with retries)
+        run: |
+          expr='(builtins.getFlake (toString ./.)).inputs.nixpkgs.legacyPackages.x86_64-linux.callPackage ./nix/verus.nix {}'
+          src=$(nix eval --raw --impure --expr "($expr).src.outPath")
+          echo "verus source: $src"
+          if [ -d ~/verus-src-cache ]; then
+            nix copy --no-check-sigs --from "file://$HOME/verus-src-cache" "$src" || true
+          fi
+          for i in 1 2 3 4 5 6; do
+            nix build --no-link --impure --expr "($expr).src" && break
+            [ "$i" = 6 ] && exit 1
+            sleep $((i * 20))
+          done
+          if [ ! -d ~/verus-src-cache ]; then
+            nix copy --no-check-sigs --to "file://$HOME/verus-src-cache" "$src"
+          fi
       - name: Package, module evaluation, boundaries, Verus proofs, the demo VM (H8)
         run: >
           nix build -L
@@ -68,9 +92,21 @@ jobs:
             ~/.cargo/bin/cargo-kani
             ~/.kani
           key: kani-0.68.0
+      # `cargo kani setup` downloads its release bundle from GitHub (504s
+      # lately) even when the cache above hit. Fetch the bundle ourselves, with
+      # retries, keep the tarball in its own cache, and hand it to setup.
+      - uses: actions/cache@v4
+        with:
+          path: ~/kani-bundle
+          key: kani-bundle-0.68.0
       - name: Kani 0.68.0 (docs/pins.md)
         run: |
+          bundle=kani-0.68.0-x86_64-unknown-linux-gnu.tar.gz
+          mkdir -p ~/kani-bundle
+          [ -s ~/kani-bundle/$bundle ] || curl -fsSL --retry 8 --retry-all-errors --retry-delay 15 \
+            -o ~/kani-bundle/$bundle \
+            https://github.com/model-checking/kani/releases/download/kani-0.68.0/$bundle
           command -v cargo-kani || cargo install --locked kani-verifier --version 0.68.0
-          cargo kani setup
+          cargo kani setup --use-local-bundle ~/kani-bundle/$bundle
       - run: cargo kani -p planarian-txn
       - run: cargo kani -p planarian-exec
