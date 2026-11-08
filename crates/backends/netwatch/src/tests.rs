@@ -2760,7 +2760,7 @@ mod wireguard {
         // The device is gone: its standing endpoints clear.
         assert!(t.set_wireguard(&[dev("wgb", &[e3])]));
         assert!(view(&t).units["wg-quick-a"].endpoints.is_empty());
-        // Kept across a restart in `.state`.
+        // `.state` keeps b's binding and the index its device was read at; a's ended with its device.
         let claims = t.claims();
         assert!(!claims.wireguard.contains(&(a.clone(), "wga".to_string())), "ended with its device");
         assert!(claims.wireguard.contains(&(b.clone(), "wgb".to_string())));
@@ -2794,6 +2794,79 @@ mod wireguard {
             after.set_wireguard(&[dev_at(12, &[e1])]);
             assert!(after.footprint(&b, NOW).endpoints.is_empty(), "gap {gap}: a device made while the watch was down");
         }
+    }
+
+    /// RTM_DELLINK for `name` at `index`, from the host's netns.
+    fn dellink(name: &str, index: u32) -> crate::ebpf::Event {
+        let mut body = vec![0u8; 16]; // ifinfomsg
+        body[4..8].copy_from_slice(&index.to_ne_bytes());
+        let mut attr = (4 + name.len() as u16 + 1).to_ne_bytes().to_vec();
+        attr.extend(3u16.to_ne_bytes()); // IFLA_IFNAME
+        attr.extend(name.as_bytes());
+        attr.push(0);
+        while !attr.len().is_multiple_of(4) {
+            attr.push(0);
+        }
+        body.extend(attr);
+        let mut d = vec![0u8; 16];
+        d[4..6].copy_from_slice(&17u16.to_ne_bytes()); // RTM_DELLINK
+        d.extend(body);
+        let len = d.len() as u32;
+        crate::ebpf::Event {
+            cgroup: 1,
+            tgid: 2,
+            hook: crate::ebpf::HOOK_RTNETLINK,
+            len,
+            netns: 0xF000_0000,
+            cgpath: None,
+            data: d,
+        }
+    }
+
+    /// B-27 (reviewer, #83): a device deleted and made again with the same
+    /// name *and the same interface index* between two reads looks the same
+    /// to the pin; its DELLINK is what ends the old unit's binding.
+    #[test]
+    fn a_device_deleted_and_made_again_at_the_same_index_is_not_the_old_units() {
+        let (a, b) = (UnitId::service("wg-quick-a"), UnitId::service("wg-quick-b"));
+        let (e1, e2) = (udp("192.0.2.7", 51820), udp("198.51.100.9", 1));
+        let dev_at = |eps: &[Endpoint]| Device { name: "wg0".into(), ifindex: 10, endpoints: eps.to_vec() };
+        let mut t = Tracker::default();
+        t.bind_wireguard(&a, "wg0");
+        t.set_wireguard(&[dev_at(&[e1])]);
+        assert_eq!(t.footprint(&a, NOW).endpoints, [e1].into());
+        let host = 0xF000_0000;
+        crate::parse::take(&mut t, &dellink("wg0", 10), host, || Some(UnitId::service("deleter")), &mut |_| None);
+        // Made again at index 10, configured by b, all before the next read.
+        t.bind_wireguard(&b, "wg0");
+        t.set_wireguard(&[dev_at(&[e2])]);
+        assert!(t.footprint(&a, NOW).endpoints.is_empty(), "a's binding ended with the device it named");
+        assert_eq!(t.footprint(&b, NOW).endpoints, [e2].into());
+    }
+
+    /// B-27 (coordinator, #83): a unit whose invocation has ended, with the
+    /// device still standing and another unit configuring it, gives the
+    /// device up: its failure must not hold the other's working tunnel. The
+    /// peers its invocation had stay latched for its own hold.
+    #[test]
+    fn an_ended_invocation_gives_up_a_device_another_unit_configured() {
+        let (a, b) = (UnitId::service("wg-quick-a"), UnitId::service("wg-quick-b"));
+        let (e1, e2) = (udp("192.0.2.7", 51820), udp("198.51.100.9", 1));
+        let dev = |eps: &[Endpoint]| Device { name: "wg0".into(), ifindex: 10, endpoints: eps.to_vec() };
+        let mut t = created_wg(&a, "wg0");
+        t.set_invocation(&a, crate::Invocation { id: Some("a".repeat(32)), ended: false });
+        t.bind_wireguard(&a, "wg0");
+        t.set_wireguard(&[dev(&[e1])]);
+        t.set_invocation(&a, crate::Invocation { id: Some("a".repeat(32)), ended: true });
+        // While a is live, b configuring the same device shares it.
+        t.set_invocation(&b, crate::Invocation { id: Some("b".repeat(32)), ended: false });
+        t.bind_wireguard(&b, "wg0");
+        t.set_wireguard(&[dev(&[e2])]);
+        assert!(t.footprint(&a, NOW).endpoints.contains(&e1), "latched for a's own hold");
+        let now = |t: &Tracker, u: &UnitId| t.footprint(u, NOW).endpoints;
+        assert_eq!(now(&t, &b), [e2].into());
+        assert!(!t.claims().wireguard.contains(&(a.clone(), "wg0".to_string())), "a's binding ended");
+        assert!(t.claims().wireguard.contains(&(b.clone(), "wg0".to_string())));
     }
 
     /// The latch keeps what an invocation found protecting with: a tunnel

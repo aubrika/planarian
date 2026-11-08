@@ -6,3 +6,5 @@
 # everyone who runs the test benefits from these saved cases.
 cc 9f0dae6f8c3fc87bea6aaf972558be92b109cced1eeaba01e8185dc54c531bde # shrinks to reads = [[], [(0, {1})]]
 cc c0b5903c5cb87945385145519c256a90f4ef5e236876077f18603901a15fd67f # shrinks to steps = [Bind(0, 1), Set([])]
+cc 7b78b558940f862bcf25ca39c29ba8e7957a4fad00854e064b733c6469e85daf # shrinks to steps = [Bind(2, 0), Bind(2, 1), Set([(0, 10, {1}), (1, 10, {})]), Del(0)]
+cc f5475cba030fecbf181a9e2acb910b058b710c3c3606c8de07ded495697ce42b # shrinks to steps = [Bind(2, 0), End(2), Bind(0, 0), Set([(0, 10, {1})])]

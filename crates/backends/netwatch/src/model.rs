@@ -322,6 +322,15 @@ impl Tracker {
             self.pre_attach.remove(&key);
             if c.kind == ChangeKind::Interface {
                 self.virtual_ifaces.remove(&c.object);
+                // A deleted device ends every WireGuard binding to it, even
+                // when a device of the same name and index is made again
+                // before the next read (B-27).
+                for s in self.units.values_mut() {
+                    if s.wireguard.remove(&c.object).is_some() {
+                        // Its peers went with it; what is left is read again.
+                        s.endpoints.clear();
+                    }
+                }
             }
             if c.kind == ChangeKind::Route {
                 self.route_through.remove(&c.object);
@@ -498,9 +507,23 @@ impl Tracker {
     /// the hold to pass its peer). Returns whether anything changed.
     pub fn set_wireguard(&mut self, devices: &[crate::wg::Device]) -> bool {
         let mut changed = false;
-        for s in self.units.values_mut() {
+        // Who is bound to each device now, before any binding ends.
+        let mut holders: BTreeMap<String, BTreeSet<UnitId>> = BTreeMap::new();
+        for (u, s) in &self.units {
+            for name in s.wireguard.keys() {
+                holders.entry(name.clone()).or_default().insert(u.clone());
+            }
+        }
+        for (u, s) in self.units.iter_mut() {
             if s.wireguard.is_empty() {
                 continue;
+            }
+            // A unit whose invocation has ended gives up a device another
+            // unit has configured since: it no longer steers it, and its
+            // failure must not hold the other's tunnel. The invocation's
+            // latch keeps the peers it had for its own hold.
+            if self.invocations.get(u).is_some_and(|i| i.ended) {
+                s.wireguard.retain(|name, _| holders.get(name).is_none_or(|h| h.iter().all(|x| x == u)));
             }
             // A binding is to a device, not to its name (B-27): one whose
             // device is gone from a successful read, or whose name now

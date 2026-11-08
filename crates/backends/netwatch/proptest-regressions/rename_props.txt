@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5cbc257ea192658f9b3d1339a1ab4d1abb6a529846f73158ed94ddde46f72759 # shrinks to was = "nwa", now = "nwb", port = 1, shape = [(false, false, true, false), (false, false, false, false)]

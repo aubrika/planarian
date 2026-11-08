@@ -104,10 +104,18 @@ proptest! {
         prop_assume!(was != now);
         let endpoint = Endpoint { proto: Proto::Udp, addr: "198.51.100.9".parse().unwrap(), port };
         let devices = [crate::wg::Device { name: now.clone(), ifindex: 7, endpoints: vec![endpoint] }];
-        let mut t = fixture(&was, &shape);
+        // Every owner is live here: an ended invocation gives up a device
+        // another unit is bound to (B-27), which is not what this checks.
+        let live = |mut t: Tracker| {
+            for i in t.invocations.values_mut() {
+                i.ended = false;
+            }
+            t
+        };
+        let mut t = live(fixture(&was, &shape));
         apply(&mut t, &event(HOST, &was, &now));
         t.set_wireguard(&devices);
-        let mut want = fixture(&now, &shape);
+        let mut want = live(fixture(&now, &shape));
         want.set_wireguard(&devices);
         // The independently constructed final identity includes current
         // peers, unrelated bindings and both invocation histories.
