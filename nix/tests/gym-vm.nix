@@ -591,6 +591,10 @@ let
         upstream.wait_for_unit("gym-upstream.service")
         machine.start()
         machine.wait_for_unit("planariad.service")
+        with subtest("every prebuilt candidate exports its installed journal reader"):
+            for name in ${builtins.toJSON (lib.attrNames candidates)}:
+                candidate = "/run/booted-system" if name == "base" else f"/run/booted-system/specialisation/{name}"
+                machine.succeed(f"cmp ${gymPkg}/share/planarian/journal-kinds.json {candidate}/sw/share/planarian/journal-kinds.json")
         gym = "planarian-gym vm"
         plan = json.loads(machine.succeed(f"{gym} plan --id {ID}"))
         print(plan)

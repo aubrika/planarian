@@ -27,16 +27,22 @@ pub fn hold_unit(unit: &UnitId) -> UnitId {
 
 /// The held unit a hold unit stands for, if `u` is one.
 pub fn held_by(u: &UnitId) -> Option<UnitId> {
-    u.name.strip_prefix("planarian-hold@").map(UnitId::service)
+    if u.kind != UnitKind::Service || u.scope != Scope::System {
+        return None;
+    }
+    u.name.strip_prefix("planarian-hold@").filter(|name| !name.is_empty()).map(UnitId::service)
 }
 
-/// The hold unit's definition: known, so an override on it derives the held
-/// unit's sensitivity (§11: releasing a hold that protects a Security unit
-/// needs an administrator), but never expected, so it is never watched,
+/// The release operation always needs an administrator (§12d), regardless
+/// of the protected tool's tags. The hold table is Core; this explicit,
+/// authorized release operation is Security, so it can ask an administrator
+/// rather than being rejected as a direct edit to Core. Never expected, it is never watched,
 /// repaired or counted as an incident.
 pub fn hold_def(held: &UnitDef) -> UnitDef {
     let mut d = held.clone();
     d.id = hold_unit(&held.id);
+    d.sensitivity.security = true;
+    d.sensitivity.core = false;
     d.desired = Desired { status: DesiredStatus::Stopped, when: Condition::Any(vec![]) };
     d.edges.clear();
     d.probes.clear();
@@ -50,8 +56,12 @@ pub fn hold_def(held: &UnitDef) -> UnitDef {
     d
 }
 
-/// The units whose failure holds traffic (interim: the exported `holds`).
-pub fn network_security(defs: &UnitDefs) -> impl Iterator<Item = &UnitDef> {
+/// The network tools: units able to change how traffic leaves the machine
+/// (the build-time half; the exported `holds`). Each has a hold unit. A
+/// *network-security* unit (§12d *Which units*) is a tool that is also in
+/// `SystemState::protecting`; only its failure holds traffic, which
+/// `Core::network_holds` and the residue facts apply.
+pub fn network_tools(defs: &UnitDefs) -> impl Iterator<Item = &UnitDef> {
     defs.values().filter(|d| d.holds)
 }
 
@@ -82,6 +92,16 @@ pub fn release_until(u: &Until) -> Option<Timestamp> {
     }
 }
 
+/// Only this effect is an authorized release. Merely leaving a hold alone,
+/// or an inference about it, must not open traffic.
+pub fn released(o: &Override) -> Option<UnitId> {
+    if o.attribution == Attribution::Attested && o.desired == OverrideDesired::Stopped {
+        held_by(&o.unit)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +112,10 @@ mod tests {
         assert_eq!(hold_unit(&wg), UnitId::service("planarian-hold@wireguard-gym"));
         assert_eq!(held_by(&hold_unit(&wg)), Some(wg.clone()));
         assert_eq!(held_by(&wg), None);
+        let mut user_hold = hold_unit(&wg);
+        user_hold.scope = Scope::User { uid: 1000, session: None };
+        assert_eq!(held_by(&user_hold), None);
+        assert_eq!(held_by(&UnitId::service("planarian-hold@")), None);
         assert_eq!(
             alarm(&wg),
             "ALARM: service:wireguard-gym stopped unexpectedly. Network traffic is blocked until it is back."
@@ -118,5 +142,38 @@ mod tests {
         assert_eq!(release_until(&Until::At(Timestamp(5))), Some(Timestamp(5)));
         assert_eq!(release_until(&Until::NextBoot), None);
         assert_eq!(release_until(&Until::Explicit), None);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn every_hold_has_an_administrator_floor_independent_of_the_tools_tags(
+            security in any::<bool>(), core in any::<bool>(), external in any::<bool>(),
+        ) {
+            let mut tool = planarian_schema::fixtures::service("tool");
+            tool.sensitivity.security = security;
+            tool.sensitivity.core = core;
+            tool.sensitivity.external = external;
+            let hold = hold_def(&tool);
+            prop_assert!(hold.sensitivity.security);
+            prop_assert!(!hold.sensitivity.core, "the explicit release can ask rather than CoreTarget");
+            prop_assert_eq!(hold.sensitivity.external, external);
+        }
+
+        #[test]
+        fn only_a_system_services_attested_stop_is_a_release(
+            name in "[a-z][a-z0-9-]{0,20}",
+            system in any::<bool>(), service in any::<bool>(), attested in any::<bool>(), desired in 0..4usize,
+        ) {
+            let mut unit = hold_unit(&UnitId::service(&name));
+            if !system { unit.scope = Scope::User { uid: 1000, session: None }; }
+            if !service { unit.kind = UnitKind::Target; }
+            let desired = [OverrideDesired::LeaveAlone, OverrideDesired::Stopped,
+                OverrideDesired::Absent, OverrideDesired::Detected][desired];
+            let mut o = Override::attested(unit, desired, Until::NextBoot, "release".into(), Actor::user(0));
+            if !attested { o.attribution = Attribution::Inferred; }
+            prop_assert_eq!(released(&o).is_some(), system && service && attested && desired == OverrideDesired::Stopped);
+        }
     }
 }

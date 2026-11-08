@@ -8,7 +8,7 @@
 use crate::admitted;
 use crate::cmd::run;
 use planarian_schema::{
-    Ending, Millis, Observed, OpId, Outcome, Reason, Scope, Timestamp, UnitBackend, UnitId, UnitKind,
+    Ending, JobId, Millis, Observed, OpId, Outcome, Reason, Scope, Timestamp, UnitBackend, UnitId, UnitKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -184,6 +184,14 @@ impl UnitBackend for Systemd {
         o.ok().then(|| o.stdout.trim().parse().ok()).flatten()
     }
 
+    fn queued_jobs(&self) -> Result<Vec<JobId>, Outcome> {
+        let o = self.ctl(&Scope::System, &["list-jobs", "--no-legend", "--plain"], QUERY_TIMEOUT);
+        if !o.ok() {
+            return Err(Outcome::Unknown(format!("systemctl list-jobs: {}", o.tail())));
+        }
+        parse_list_jobs(&o.stdout).map_err(|e| Outcome::Unknown(format!("systemctl list-jobs: {e}")))
+    }
+
     fn list(&self) -> Result<Vec<UnitId>, Outcome> {
         let o = self.ctl(
             &Scope::System,
@@ -276,6 +284,9 @@ impl UnitBackend for Systemd {
     fn release_hold(&self, unit: &UnitId, until: Option<Timestamp>, wait: Millis) -> Outcome {
         crate::hold::release_in(Path::new(crate::hold::RELEASED_DIR), unit, until, ms(wait))
     }
+    fn timed_release_active(&self, unit: &UnitId, until: Timestamp) -> Result<bool, Outcome> {
+        crate::hold::timed_release_active_in(Path::new(crate::hold::RELEASED_DIR), unit, until)
+    }
     fn end_release(&self, unit: &UnitId) -> Outcome {
         crate::hold::end_release_in(Path::new(crate::hold::RELEASED_DIR), unit)
     }
@@ -293,6 +304,24 @@ fn ms(m: Millis) -> std::time::Duration {
 
 /// Where the posture marks a raised failure class (`failed-<class>`).
 const FAILED_DIR: &str = "/run/planarian";
+
+/// `systemctl list-jobs --no-legend --plain`: one line per job, `JOB UNIT
+/// TYPE STATE` (e.g. `5731 gym-web.service stop running`); nothing at all
+/// when the queue is empty. A line that is not that shape is an error, never
+/// skipped (an unreadable queue must not read as an empty one).
+fn parse_list_jobs(out: &str) -> Result<Vec<JobId>, String> {
+    let mut jobs = vec![];
+    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        match f.as_slice() {
+            [id, unit, _type, _state] if id.parse::<u64>().is_ok() && unit.contains('.') => {
+                jobs.push(JobId(format!("{id} {unit}")));
+            }
+            _ => return Err(format!("unreadable line {line:?}")),
+        }
+    }
+    Ok(jobs)
+}
 
 /// A failure class is raised: `failed-*` exists in `dir`.
 fn posture_failed(dir: &Path) -> bool {
@@ -318,6 +347,85 @@ mod tests {
         std::fs::write(d.join("failed-crashed"), "").unwrap();
         assert!(posture_failed(&d));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn list_jobs_output_is_parsed_and_an_unreadable_line_is_an_error() {
+        let sample = "  5731 gym-web.service stop running\n  5732 gym-web.service start waiting\n 5733 multi-user.target start waiting\n";
+        let jobs = parse_list_jobs(sample).unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0], JobId("5731 gym-web.service".into()));
+        assert_eq!(parse_list_jobs("").unwrap(), vec![], "an empty queue prints nothing");
+        assert_eq!(parse_list_jobs("\n\n").unwrap(), vec![]);
+        for bad in ["No jobs running.", "3 jobs listed.", "x gym-web.service stop running", "5731 gym-web.service stop"]
+        {
+            assert!(parse_list_jobs(bad).is_err(), "{bad}");
+        }
+    }
+
+    mod list_jobs_props {
+        use super::super::parse_list_jobs;
+        use proptest::prelude::*;
+
+        fn good() -> impl Strategy<Value = String> {
+            (
+                1u64..1_000_000,
+                "[a-z][a-z0-9@-]{0,12}",
+                "(service|target|socket|mount)",
+                "(start|stop|restart|reload)",
+                "(running|waiting)",
+            )
+                .prop_map(|(id, n, k, t, st)| format!("{id} {n}.{k} {t} {st}"))
+        }
+        /// Anything `parse_list_jobs` must refuse: wrong field count, a
+        /// non-numeric id, a unit without a '.', a legend line.
+        fn bad() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("No jobs running.".to_string()),
+                (1u32..99).prop_map(|n| format!("{n} jobs listed.")),
+                "[a-z]{1,6} [a-z]{1,6}\\.service stop running",
+                (1u32..99999).prop_map(|n| format!("{n} gym-web.service stop")),
+                (1u32..99999).prop_map(|n| format!("{n} gym-web.service stop running extra")),
+                (1u32..99999).prop_map(|n| format!("{n} gymweb stop running")),
+            ]
+        }
+        fn pad() -> impl Strategy<Value = String> {
+            "[ \\t]{0,4}"
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 200, failure_persistence: None, ..ProptestConfig::default() })]
+
+            /// Well-formed lines, padded any way, with blank lines between,
+            /// parse to exactly that many jobs, in order.
+            #[test]
+            fn well_formed_lines_parse_to_exactly_that_many_jobs(
+                lines in prop::collection::vec((good(), pad(), pad(), 0usize..3), 0..8),
+            ) {
+                let text: String = lines
+                    .iter()
+                    .map(|(l, a, b, blank)| format!("{a}{l}{b}\n{}", "\n".repeat(*blank)))
+                    .collect();
+                let jobs = parse_list_jobs(&text).unwrap();
+                prop_assert_eq!(jobs.len(), lines.len());
+                for (j, (l, ..)) in jobs.iter().zip(&lines) {
+                    let mut f = l.split_whitespace();
+                    prop_assert_eq!(&j.0, &format!("{} {}", f.next().unwrap(), f.next().unwrap()));
+                }
+            }
+
+            /// One unreadable line anywhere makes the whole parse an Err:
+            /// an unreadable queue never reads as a shorter or empty one.
+            #[test]
+            fn one_unreadable_line_makes_the_parse_an_error(
+                before in prop::collection::vec(good(), 0..4),
+                after in prop::collection::vec(good(), 0..4),
+                bad in bad(),
+            ) {
+                let text = before.iter().chain([&bad]).chain(&after).map(|l| format!("{l}\n")).collect::<String>();
+                prop_assert!(parse_list_jobs(&text).is_err(), "{text:?}");
+            }
+        }
     }
 
     #[test]

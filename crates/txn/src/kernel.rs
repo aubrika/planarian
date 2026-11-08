@@ -7,7 +7,7 @@
 //! and process control sit below it, behind `Host`.
 
 use crate::journal::{Journal, JournalError};
-use crate::ledger::{LedgerError, LiveTxn, OpRecord, Reconciliation, Record};
+use crate::ledger::{Ledger, LedgerError, LiveTxn, OpRecord, Reconciliation, Record};
 use crate::machine::tag;
 use crate::store::Store;
 use planarian_schema::{
@@ -234,6 +234,15 @@ pub struct Kernel<S: Store, H: Host> {
     /// carries the handle's own epoch, never the ledger's current one, so a
     /// handle whose lease was taken is refused (I15).
     held: std::collections::BTreeMap<TxnId, u64>,
+}
+
+/// Whether a takeover acknowledges `op` as superseded: it is still
+/// unacknowledged in `ledger` (J7). The decision `supersede_unacked` makes
+/// under the journal's lock, apart from the write; an ack the old owner
+/// journaled since the takeover stands, and a second one would be
+/// `DuplicateOp`.
+pub fn supersedes(ledger: &Ledger, op: OpId) -> bool {
+    ledger.live.get(&op.txn).is_some_and(|l| l.unacked_ops().any(|o| o.op == op))
 }
 
 impl<S: Store, H: Host> Kernel<S, H> {
@@ -1027,8 +1036,7 @@ impl<S: Store, H: Host> Kernel<S, H> {
             let now = self.host.now();
             let ack = Record::OpAck { op: *op, outcome: Outcome::Unknown("superseded by takeover".into()) };
             let appended = self.journal.locked(|j| {
-                let still = j.ledger().live.get(&op.txn).is_some_and(|l| l.unacked_ops().any(|o| o.op == *op));
-                if still { j.append(now, ack.clone()).map(|_| true) } else { Ok(false) }
+                if supersedes(j.ledger(), *op) { j.append(now, ack.clone()).map(|_| true) } else { Ok(false) }
             })?;
             match appended {
                 Ok(_) => {}
