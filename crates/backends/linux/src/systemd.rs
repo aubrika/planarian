@@ -363,6 +363,71 @@ mod tests {
         }
     }
 
+    mod list_jobs_props {
+        use super::super::parse_list_jobs;
+        use proptest::prelude::*;
+
+        fn good() -> impl Strategy<Value = String> {
+            (
+                1u64..1_000_000,
+                "[a-z][a-z0-9@-]{0,12}",
+                "(service|target|socket|mount)",
+                "(start|stop|restart|reload)",
+                "(running|waiting)",
+            )
+                .prop_map(|(id, n, k, t, st)| format!("{id} {n}.{k} {t} {st}"))
+        }
+        /// Anything `parse_list_jobs` must refuse: wrong field count, a
+        /// non-numeric id, a unit without a '.', a legend line.
+        fn bad() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("No jobs running.".to_string()),
+                (1u32..99).prop_map(|n| format!("{n} jobs listed.")),
+                "[a-z]{1,6} [a-z]{1,6}\\.service stop running",
+                (1u32..99999).prop_map(|n| format!("{n} gym-web.service stop")),
+                (1u32..99999).prop_map(|n| format!("{n} gym-web.service stop running extra")),
+                (1u32..99999).prop_map(|n| format!("{n} gymweb stop running")),
+            ]
+        }
+        fn pad() -> impl Strategy<Value = String> {
+            "[ \\t]{0,4}"
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 200, failure_persistence: None, ..ProptestConfig::default() })]
+
+            /// Well-formed lines, padded any way, with blank lines between,
+            /// parse to exactly that many jobs, in order.
+            #[test]
+            fn well_formed_lines_parse_to_exactly_that_many_jobs(
+                lines in prop::collection::vec((good(), pad(), pad(), 0usize..3), 0..8),
+            ) {
+                let text: String = lines
+                    .iter()
+                    .map(|(l, a, b, blank)| format!("{a}{l}{b}\n{}", "\n".repeat(*blank)))
+                    .collect();
+                let jobs = parse_list_jobs(&text).unwrap();
+                prop_assert_eq!(jobs.len(), lines.len());
+                for (j, (l, ..)) in jobs.iter().zip(&lines) {
+                    let mut f = l.split_whitespace();
+                    prop_assert_eq!(&j.0, &format!("{} {}", f.next().unwrap(), f.next().unwrap()));
+                }
+            }
+
+            /// One unreadable line anywhere makes the whole parse an Err:
+            /// an unreadable queue never reads as a shorter or empty one.
+            #[test]
+            fn one_unreadable_line_makes_the_parse_an_error(
+                before in prop::collection::vec(good(), 0..4),
+                after in prop::collection::vec(good(), 0..4),
+                bad in bad(),
+            ) {
+                let text = before.iter().chain([&bad]).chain(&after).map(|l| format!("{l}\n")).collect::<String>();
+                prop_assert!(parse_list_jobs(&text).is_err(), "{text:?}");
+            }
+        }
+    }
+
     #[test]
     fn mapping() {
         let o = |s: &str| observed_from(&parse_show(s), Timestamp(0));
