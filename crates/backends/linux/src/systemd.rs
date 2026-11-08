@@ -59,6 +59,61 @@ pub fn ending_from(props: &BTreeMap<String, String>) -> Option<Ending> {
     }
 }
 
+/// `systemctl show --property=Id,… a.service b.service`: one block of
+/// `Key=value` lines per unit, blocks separated by a blank line, in no
+/// promised order, so matched by `Id`. Per requested name: its properties,
+/// or why they are not known: absent from the output, named by more than one
+/// block, or a block that cannot be read (no `Id`) is an error, never a
+/// guess.
+pub fn parse_show_many(text: &str, names: &[String]) -> Vec<Result<BTreeMap<String, String>, String>> {
+    let mut by_id: BTreeMap<String, Vec<BTreeMap<String, String>>> = BTreeMap::new();
+    let mut unreadable = 0;
+    for block in text.split("\n\n").map(str::trim).filter(|b| !b.is_empty()) {
+        let props = parse_show(block);
+        match props.get("Id") {
+            Some(id) if !id.is_empty() => by_id.entry(id.clone()).or_default().push(props),
+            _ => unreadable += 1,
+        }
+    }
+    names
+        .iter()
+        .map(|n| match by_id.get(n).map(Vec::as_slice) {
+            Some([one]) => Ok(one.clone()),
+            Some(_) => Err(format!("{n}: more than one block in systemctl show's output")),
+            None if unreadable > 0 => Err(format!("{n}: not in the output (a block had no Id)")),
+            None => Err(format!("{n}: not in systemctl show's output")),
+        })
+        .collect()
+}
+
+/// `observe_many` from the command's result: a failed command or a timeout
+/// is an error for every unit; otherwise each as `observe` and `ended_by`
+/// would give it (how it ended only for a unit that is not running).
+pub fn observe_many_from(
+    names: &[String],
+    ok: bool,
+    stdout: &str,
+    tail: &str,
+    now: Timestamp,
+) -> Vec<(Result<Observed, Outcome>, Option<Ending>)> {
+    if !ok {
+        return names.iter().map(|_| (Err(Outcome::Failed(tail.to_string())), None)).collect();
+    }
+    parse_show_many(stdout, names)
+        .into_iter()
+        .map(|r| match r {
+            Err(why) => (Err(Outcome::Unknown(why)), None),
+            Ok(props) => {
+                let observed = observed_from(&props, now);
+                let ended = matches!(observed, Observed::Absent | Observed::Bound | Observed::Detected)
+                    .then(|| ending_from(&props))
+                    .flatten();
+                (Ok(observed), ended)
+            }
+        })
+        .collect()
+}
+
 /// A unit file that belongs to the generation: in the store (directly or
 /// through /etc's links into it), written by a systemd generator, transient,
 /// or none at all (scopes, slices, devices, mounts systemd makes up).
@@ -148,6 +203,28 @@ impl UnitBackend for Systemd {
             return Err(Outcome::Failed(o.tail()));
         }
         Ok(observed_from(&parse_show(&o.stdout), now()))
+    }
+
+    fn observe_many(&self, ids: &[UnitId]) -> Vec<(Result<Observed, Outcome>, Option<Ending>)> {
+        // One command for system units; a user manager's units one at a time.
+        if ids.is_empty() || ids.iter().any(|u| u.scope != Scope::System) {
+            return ids
+                .iter()
+                .map(|u| {
+                    let o = self.observe(u);
+                    let ended = matches!(o, Ok(Observed::Absent | Observed::Bound | Observed::Detected))
+                        .then(|| self.ended_by(u))
+                        .flatten();
+                    (o, ended)
+                })
+                .collect();
+        }
+        let names: Vec<String> = ids.iter().map(unit_name).collect();
+        let mut args: Vec<&str> =
+            vec!["show", "--property=Id,LoadState,ActiveState,SubState,ExecMainStatus,Result,ExecMainCode"];
+        args.extend(names.iter().map(String::as_str));
+        let o = self.ctl(&Scope::System, &args, QUERY_TIMEOUT);
+        observe_many_from(&names, o.ok(), &o.stdout, &o.tail(), now())
     }
 
     fn foreign_units(&self) -> Vec<String> {
@@ -426,6 +503,82 @@ mod tests {
                 prop_assert!(parse_list_jobs(&text).is_err(), "{text:?}");
             }
         }
+    }
+
+    /// A multi-unit `systemctl show` (three units, a blank line between),
+    /// HAND-WRITTEN from systemd's documented output, not captured: the
+    /// format itself is proven against the real command by vm-netsec
+    /// (`planariad --observe-units`). Matched by Id, whatever the order.
+    const SHOW_MANY: &str = "Id=sshd.service
+LoadState=loaded
+ActiveState=active
+SubState=running
+Result=success
+ExecMainCode=0
+ExecMainStatus=0
+
+Id=wg-quick-wg0.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+Result=success
+ExecMainCode=2
+ExecMainStatus=15
+
+Id=modprobe@dm_mod.service
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+Result=success
+ExecMainCode=1
+ExecMainStatus=0
+";
+
+    fn names(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_multi_unit_show_is_matched_by_id_in_any_order() {
+        let n = names(&["modprobe@dm_mod.service", "sshd.service", "wg-quick-wg0.service"]);
+        let got = observe_many_from(&n, true, SHOW_MANY, "", Timestamp(0));
+        assert_eq!(got[0], (Ok(Observed::Bound), Some(Ending::Exited(0))), "a finished oneshot");
+        assert_eq!(got[1], (Ok(Observed::Active), None), "running: how it ended is not asked");
+        assert_eq!(got[2], (Ok(Observed::Bound), Some(Ending::Signal(15))), "stopped by SIGTERM");
+    }
+
+    /// Rule 21: what cannot be matched is an error for that unit, never Absent.
+    #[test]
+    fn a_missing_duplicate_or_unreadable_block_is_an_error_for_that_unit() {
+        let n = names(&["sshd.service", "absent.service"]);
+        let got = observe_many_from(&n, true, SHOW_MANY, "", Timestamp(0));
+        assert!(matches!(got[0].0, Ok(Observed::Active)));
+        assert!(matches!(&got[1].0, Err(Outcome::Unknown(w)) if w.contains("absent.service")), "{:?}", got[1]);
+        let dup = format!("{SHOW_MANY}\nId=sshd.service\nLoadState=loaded\nActiveState=failed\n");
+        let got = observe_many_from(&names(&["sshd.service", "wg-quick-wg0.service"]), true, &dup, "", Timestamp(0));
+        assert!(matches!(&got[0].0, Err(Outcome::Unknown(w)) if w.contains("more than one")), "{:?}", got[0]);
+        assert!(got[1].0.is_ok(), "the others are unaffected");
+        let junk = format!("{SHOW_MANY}\nLoadState=loaded\nActiveState=active\n");
+        let got = observe_many_from(&names(&["sshd.service", "gone.service"]), true, &junk, "", Timestamp(0));
+        assert!(got[0].0.is_ok());
+        assert!(matches!(&got[1].0, Err(Outcome::Unknown(w)) if w.contains("no Id")), "{:?}", got[1]);
+    }
+
+    #[test]
+    fn a_failed_command_is_an_error_for_every_unit() {
+        let n = names(&["sshd.service", "wg-quick-wg0.service"]);
+        let got = observe_many_from(&n, false, "", "Failed to connect to bus", Timestamp(0));
+        assert!(got.iter().all(|(o, e)| matches!(o, Err(Outcome::Failed(_))) && e.is_none()), "{got:?}");
+        // The same output with an empty stdout and ok is not a pass.
+        let got = observe_many_from(&n, true, "", "", Timestamp(0));
+        assert!(got.iter().all(|(o, _)| o.is_err()), "{got:?}");
+    }
+
+    #[test]
+    fn a_not_found_unit_is_absent_only_because_systemd_said_so() {
+        let text = "Id=ghost.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\n";
+        let got = observe_many_from(&names(&["ghost.service"]), true, text, "", Timestamp(0));
+        assert_eq!(got[0], (Ok(Observed::Absent), None));
     }
 
     #[test]

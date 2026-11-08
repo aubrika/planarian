@@ -111,6 +111,7 @@ fn eval(units: UnitDefs) -> EvaluatedGeneration {
         declarations: BTreeMap::new(),
         inputs: BTreeMap::new(),
         services: BTreeMap::new(),
+        network_tools: BTreeSet::new(),
     }
 }
 

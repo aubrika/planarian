@@ -29,6 +29,15 @@ pub fn unit_of_cgroup(rel: &str) -> Option<UnitId> {
     (!svc.is_empty()).then(|| UnitId::service(svc))
 }
 
+/// Whether the watch still writes `unit`'s footprint while it is not running:
+/// a plain tool's always is (and it keeps what the unit changed, so a stopped
+/// tool that steered still reads as protecting), a template instance's only
+/// while it runs, so a stopped instance has none (and, with none, counts as
+/// protecting: fail closed). `expand_tools` is this rule.
+pub fn footprint_outlives_the_unit(unit: &UnitId) -> bool {
+    !unit.name.contains('@')
+}
+
 /// The network tools now: plain names as they are, a template (`name@`)
 /// as each running instance (`name@inst`) among `running`.
 pub fn expand_tools(tools: &[String], running: &BTreeSet<String>) -> Vec<UnitId> {

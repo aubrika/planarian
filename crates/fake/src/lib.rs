@@ -237,6 +237,31 @@ pub struct World {
     /// Jobs `queued_jobs` reports (systemd's whole queue: a switch's stop and
     /// start jobs), and a failure of the query itself.
     pub queued_jobs: usize,
+    /// `list` fails (systemd's unit list cannot be read), and how often it was called.
+    pub list_fails: Option<String>,
+    pub list_calls: u64,
+    /// How many times `ended_by` and `observe_many` were called.
+    pub ended_by_calls: u64,
+    pub observe_many_calls: u64,
+    /// What a systemd command (`list`, `observe`, `ended_by`, one
+    /// `observe_many`) costs, charged to the fake clock as the real ones are.
+    pub command_cost: Millis,
+    /// Units whose `observe` fails.
+    pub observe_fails: BTreeSet<UnitId>,
+    /// How many times each unit was observed (`observe`).
+    pub observe_counts: BTreeMap<UnitId, u64>,
+    /// Units that receive the signal just after their next `observe` or
+    /// `observe_many` has answered: the read shows what it was, and the
+    /// world changes before the daemon acts on it, as when a tick's probes
+    /// take seconds after its status read.
+    pub signal_after_observe: BTreeMap<UnitId, i32>,
+    /// As `signal_after_observe`, but the unit's observed state becomes this
+    /// (a state `signal` cannot make: deactivating, absent, bound...), or,
+    /// for `unreadable_after_observe`, its next `observe` fails.
+    pub set_after_observe: BTreeMap<UnitId, Observed>,
+    pub unreadable_after_observe: BTreeSet<UnitId>,
+    /// `evaluate_built` fails (the export cannot be read).
+    pub evaluate_built_fails: Option<String>,
     pub queued_jobs_fails: Option<String>,
     /// §12d: network-security units whose failure holds traffic, as systemd's
     /// `OnFailure=` on them starts `planarian-hold@<unit>` (nix/posture.nix).
@@ -475,6 +500,7 @@ impl World {
             }
         }
         let locked = overrides.assignments.keys().filter(|k| self.forced.contains(*k)).cloned().collect();
+        let units_holding: Vec<String> = units.values().filter(|d| d.holds).map(|d| d.id.name.clone()).collect();
         let eval = EvaluatedGeneration {
             source: Hash::ZERO,
             options,
@@ -488,6 +514,7 @@ impl World {
             declarations,
             inputs: self.base_inputs.clone(),
             services: BTreeMap::new(),
+            network_tools: units_holding.into_iter().collect(),
         };
         (eval, broken)
     }
@@ -661,6 +688,22 @@ impl World {
         }
     }
 
+    /// What `signal_after_observe`, `set_after_observe` and
+    /// `unreadable_after_observe` do to `id` once its `observe` has answered.
+    fn after_observe(&mut self, id: &UnitId) {
+        if let Some(sig) = self.signal_after_observe.remove(id) {
+            self.signal(id, sig);
+        }
+        if let Some(o) = self.set_after_observe.remove(id)
+            && let Some(sim) = self.units.get_mut(&World::key(id))
+        {
+            sim.observed = o;
+        }
+        if self.unreadable_after_observe.remove(id) {
+            self.observe_fails.insert(id.clone());
+        }
+    }
+
     pub fn signal(&mut self, unit: &UnitId, sig: i32) {
         let now = self.now;
         if let Some(sim) = self.units.get_mut(unit) {
@@ -754,7 +797,17 @@ impl Fake {
             None => WatchState::Attached { at: now },
             Some(reason) => WatchState::Failed { reason: reason.clone() },
         };
-        let mut view = w.netwatch.view(watch, tools, now);
+        // As netwatch writes them: a template instance has a footprint only
+        // while it runs (a plain tool always has one).
+        let running: Vec<UnitId> = tools
+            .iter()
+            .filter(|u| {
+                planarian_backend_netwatch::host::footprint_outlives_the_unit(u)
+                    || w.units.get(&World::key(u)).is_some_and(|s| s.observed == Observed::Active)
+            })
+            .cloned()
+            .collect();
+        let mut view = w.netwatch.view(watch, &running, now);
         for u in &w.netwatch_stale {
             if let Some(f) = view.units.get_mut(&file_name(u)) {
                 f.at = now.saturating_sub(FRESH_SECS + 1);
@@ -849,12 +902,44 @@ impl UnitBackend for Fake {
         Ok(self.footprint_view(tools).protecting(tools, now))
     }
     fn observe(&self, id: &UnitId) -> Result<Observed, Outcome> {
-        let w = self.w();
-        Ok(w.units.get(&World::key(id)).map(|s| s.observed.clone()).unwrap_or(Observed::Absent))
+        let mut w = self.w();
+        w.now = Timestamp(w.now.0 + w.command_cost.0);
+        *w.observe_counts.entry(id.clone()).or_default() += 1;
+        if w.observe_fails.contains(id) {
+            return Err(Outcome::Unknown("cannot observe it (scripted)".into()));
+        }
+        let seen = w.units.get(&World::key(id)).map(|s| s.observed.clone()).unwrap_or(Observed::Absent);
+        w.after_observe(id);
+        Ok(seen)
+    }
+
+    fn observe_many(&self, ids: &[UnitId]) -> Vec<(Result<Observed, Outcome>, Option<Ending>)> {
+        // One command for all of them.
+        let mut w = self.w();
+        w.observe_many_calls += 1;
+        w.now = Timestamp(w.now.0 + w.command_cost.0);
+        ids.iter()
+            .map(|id| {
+                *w.observe_counts.entry(id.clone()).or_default() += 1;
+                if w.observe_fails.contains(id) {
+                    return (Err(Outcome::Unknown("cannot observe it (scripted)".into())), None);
+                }
+                let sim = w.units.get(&World::key(id));
+                let observed = sim.map(|s| s.observed.clone()).unwrap_or(Observed::Absent);
+                let ended = matches!(observed, Observed::Absent | Observed::Bound | Observed::Detected)
+                    .then(|| sim.and_then(|s| s.ended))
+                    .flatten();
+                w.after_observe(id);
+                (Ok(observed), ended)
+            })
+            .collect()
     }
 
     fn ended_by(&self, id: &UnitId) -> Option<Ending> {
-        self.w().units.get(&World::key(id)).and_then(|s| s.ended)
+        let mut w = self.w();
+        w.ended_by_calls += 1;
+        w.now = Timestamp(w.now.0 + w.command_cost.0);
+        w.units.get(&World::key(id)).and_then(|s| s.ended)
     }
 
     fn auto_restarts(&self, id: &UnitId) -> Option<u32> {
@@ -866,7 +951,13 @@ impl UnitBackend for Fake {
     }
 
     fn list(&self) -> Result<Vec<UnitId>, Outcome> {
-        Ok(self.w().units.keys().cloned().collect())
+        let mut w = self.w();
+        w.list_calls += 1;
+        w.now = Timestamp(w.now.0 + w.command_cost.0);
+        if let Some(why) = &w.list_fails {
+            return Err(Outcome::Unknown(why.clone()));
+        }
+        Ok(w.units.keys().cloned().collect())
     }
 
     fn start_agent(
@@ -1283,6 +1374,9 @@ impl GenerationBackend for Fake {
     }
 
     fn evaluate_built(&self, path: &StorePath) -> Result<EvaluatedGeneration, Outcome> {
+        if let Some(why) = &self.w().evaluate_built_fails {
+            return Err(Outcome::Failed(why.clone()));
+        }
         self.w()
             .gens
             .values()
