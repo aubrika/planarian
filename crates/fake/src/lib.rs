@@ -240,8 +240,12 @@ pub struct World {
     /// `list` fails (systemd's unit list cannot be read), and how often it was called.
     pub list_fails: Option<String>,
     pub list_calls: u64,
-    /// How many times `ended_by` was called.
+    /// How many times `ended_by` and `observe_many` were called.
     pub ended_by_calls: u64,
+    pub observe_many_calls: u64,
+    /// What a systemd command (`list`, `observe`, `ended_by`, one
+    /// `observe_many`) costs, charged to the fake clock as the real ones are.
+    pub command_cost: Millis,
     /// Units whose `observe` fails.
     pub observe_fails: BTreeSet<UnitId>,
     /// How many times each unit was observed (`observe`).
@@ -873,6 +877,7 @@ impl UnitBackend for Fake {
     }
     fn observe(&self, id: &UnitId) -> Result<Observed, Outcome> {
         let mut w = self.w();
+        w.now = Timestamp(w.now.0 + w.command_cost.0);
         *w.observe_counts.entry(id.clone()).or_default() += 1;
         if w.observe_fails.contains(id) {
             return Err(Outcome::Unknown("cannot observe it (scripted)".into()));
@@ -880,9 +885,32 @@ impl UnitBackend for Fake {
         Ok(w.units.get(&World::key(id)).map(|s| s.observed.clone()).unwrap_or(Observed::Absent))
     }
 
+    fn observe_many(&self, ids: &[UnitId]) -> Vec<(Result<Observed, Outcome>, Option<Ending>)> {
+        // One command for all of them.
+        let mut w = self.w();
+        w.observe_many_calls += 1;
+        w.now = Timestamp(w.now.0 + w.command_cost.0);
+        ids.iter()
+            .map(|id| {
+                *w.observe_counts.entry(id.clone()).or_default() += 1;
+                if w.observe_fails.contains(id) {
+                    return (Err(Outcome::Unknown("cannot observe it (scripted)".into())), None);
+                }
+                let sim = w.units.get(&World::key(id));
+                let observed = sim.map(|s| s.observed.clone()).unwrap_or(Observed::Absent);
+                let ended = matches!(observed, Observed::Absent | Observed::Bound | Observed::Detected)
+                    .then(|| sim.and_then(|s| s.ended))
+                    .flatten();
+                (Ok(observed), ended)
+            })
+            .collect()
+    }
+
     fn ended_by(&self, id: &UnitId) -> Option<Ending> {
-        self.w().ended_by_calls += 1;
-        self.w().units.get(&World::key(id)).and_then(|s| s.ended)
+        let mut w = self.w();
+        w.ended_by_calls += 1;
+        w.now = Timestamp(w.now.0 + w.command_cost.0);
+        w.units.get(&World::key(id)).and_then(|s| s.ended)
     }
 
     fn auto_restarts(&self, id: &UnitId) -> Option<u32> {
@@ -894,11 +922,13 @@ impl UnitBackend for Fake {
     }
 
     fn list(&self) -> Result<Vec<UnitId>, Outcome> {
-        self.w().list_calls += 1;
-        if let Some(why) = &self.w().list_fails {
+        let mut w = self.w();
+        w.list_calls += 1;
+        w.now = Timestamp(w.now.0 + w.command_cost.0);
+        if let Some(why) = &w.list_fails {
             return Err(Outcome::Unknown(why.clone()));
         }
-        Ok(self.w().units.keys().cloned().collect())
+        Ok(w.units.keys().cloned().collect())
     }
 
     fn start_agent(

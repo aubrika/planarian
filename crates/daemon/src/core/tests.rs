@@ -4609,6 +4609,99 @@ mod unmanaged_tools {
         assert_eq!(r.fake.w().ended_by_calls, before, "asked of running tools ({running} before)");
     }
 
+    /// The unmanaged tools are observed in a few commands, not two for each:
+    /// with netwatch fail closed (every tool counts as protecting) and a hundred
+    /// of them, a tick makes a handful of calls, and a managed tool's kill is
+    /// seen and its alarm raised within a tick or two whatever the commands
+    /// cost (here 100 ms of fake time each, as a loaded VM's `systemctl show`).
+    #[test]
+    fn a_managed_alarm_does_not_wait_behind_many_unmanaged_tools() {
+        let web = UnitId::service("gym-web");
+        let mut r = rig_with_network_tool(true, true);
+        let names: Vec<UnitId> = (0..100).map(|i| UnitId::service(&format!("u{i:03}"))).collect();
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &names {
+                w.units.insert(u.clone(), UnitSim::active(now));
+            }
+            // Fail closed: every tool counts as protecting.
+            w.netwatch_failed = Some("not attached (scripted)".into());
+            w.command_cost = Millis(100);
+        }
+        r.core.network_tools = Some(names.iter().map(|u| u.name.clone()).collect());
+        r.ticks(3);
+        assert!(r.core.unmanaged.len() >= 100, "{}", r.core.unmanaged.len());
+        let before = r.fake.w().observe_many_calls;
+        r.ticks(1);
+        let calls = r.fake.w().observe_many_calls - before;
+        assert!((1..=6).contains(&calls), "{calls} batch calls in a tick");
+        let t_kill = r.fake.w().now;
+        r.fake.w().kill(&web);
+        let mut ticks = 0;
+        while hold_alarms(&r, &web) == 0 && ticks < 12 {
+            r.ticks(1);
+            ticks += 1;
+        }
+        let waited = r.fake.w().now.0 - t_kill.0;
+        assert_eq!(hold_alarms(&r, &web), 1, "{:?}", r.core.notices);
+        assert!(ticks <= 2, "the alarm came after {ticks} ticks");
+        assert!(waited <= 12_000, "the alarm came {waited} ms after the kill");
+    }
+
+    /// The alarm does not depend on who noticed first: a failure systemd's
+    /// OnFailure= held before the daemon looked (and the unit already back by
+    /// then) is still said, once.
+    #[test]
+    fn a_hold_applied_before_the_daemon_looked_is_still_alarmed_once() {
+        let web = UnitId::service("gym-web");
+        let mut r = rig_with_network_tool(true, true);
+        r.fake.w().kill(&web);
+        // Back before the daemon's next look (systemd's own restart, say).
+        let now = r.fake.w().now;
+        *r.fake.w().units.get_mut(&web).unwrap() = UnitSim::active(now);
+        assert!(r.fake.w().held.contains(&web), "precondition: OnFailure= held it");
+        r.ticks(12);
+        assert_eq!(hold_alarms(&r, &web), 1, "{:?}", r.core.notices);
+        assert!(!r.fake.w().held.contains(&web), "the hold lifts once it is back");
+    }
+
+    /// If observing the tools always looked at takes the tick's budget for
+    /// this work, the rotation waits for the next tick: the managed
+    /// observation and the holds after it are not made to wait behind it.
+    #[test]
+    fn the_rotation_yields_when_the_always_observed_tools_take_the_budget() {
+        let (mut r, _) = many(5);
+        r.ticks(4);
+        assert_eq!(latched(&r), 5, "five tools latched protecting");
+        let extra: Vec<UnitId> = (0..10).map(|i| UnitId::service(&format!("x@{i:02}"))).collect();
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &extra {
+                w.units.insert(u.clone(), UnitSim::active(now));
+            }
+        }
+        r.core.network_tools =
+            Some(["t@".to_string(), "x@".to_string()].into_iter().chain(["some-vpn".to_string()]).collect());
+        let seen_extra = |r: &Rig| -> u64 {
+            let w = r.fake.w();
+            extra.iter().map(|u| w.observe_counts.get(u).copied().unwrap_or(0)).sum()
+        };
+        // Cheap commands: the rotation runs.
+        r.ticks(2);
+        assert!(seen_extra(&r) > 0, "the rotation never ran");
+        // Dear ones (more than the budget for the always-observed ones): it yields.
+        r.fake.w().command_cost = Millis(600);
+        let before = seen_extra(&r);
+        r.ticks(3);
+        assert_eq!(seen_extra(&r), before, "the rotation ran behind a spent budget");
+        // And it resumes when the commands are cheap again.
+        r.fake.w().command_cost = Millis(0);
+        r.ticks(3);
+        assert!(seen_extra(&r) > before, "the rotation never resumed");
+    }
+
     mod props {
         use super::*;
         use proptest::prelude::*;

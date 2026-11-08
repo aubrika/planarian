@@ -124,6 +124,13 @@ pub fn unmanaged_observed(raw: Observed, ended: Option<Ending>, held: bool) -> O
 /// and the ones held, are looked at every tick.
 pub const UNMANAGED_OBSERVE_PER_TICK: usize = 8;
 
+/// Units observed in one `systemctl show`.
+pub const UNMANAGED_BATCH: usize = 32;
+
+/// If observing the tools always looked at takes this long (of the clock), the
+/// rotation's tools wait for the next tick.
+pub const UNMANAGED_BUDGET: Millis = Millis(500);
+
 /// More unmanaged tools than this observed every tick is said once: each is
 /// a `systemctl show` in the tick.
 pub const UNMANAGED_MANY: usize = 32;

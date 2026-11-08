@@ -1099,7 +1099,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let take = rotate.len().min(crate::hold::UNMANAGED_OBSERVE_PER_TICK);
         let start = if rotate.is_empty() { 0 } else { self.unmanaged_cursor % rotate.len() };
         self.unmanaged_cursor = start + take;
-        let mut chosen: Vec<UnitId> = must.into_iter().chain(every).collect();
+        let chosen: Vec<UnitId> = must.into_iter().chain(every).collect();
         if chosen.len() > crate::hold::UNMANAGED_MANY {
             if !std::mem::replace(&mut self.unmanaged_many_noted, true) {
                 self.notice(format!(
@@ -1110,41 +1110,58 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         } else {
             self.unmanaged_many_noted = false;
         }
-        chosen.extend((0..take).map(|i| rotate[(start + i) % rotate.len()].clone()));
-        for u in chosen {
-            let held = s.holds.contains(&u);
-            let observed = match self.b.units().observe(&u) {
+        // The tools always looked at, in a few commands (a chunk is one
+        // `systemctl show`), then the rotation's, unless the first took the
+        // tick's whole budget for this work: managed observation and the
+        // holds that follow are not made to wait behind it.
+        let t0 = self.b.clock().now();
+        for chunk in chosen.chunks(crate::hold::UNMANAGED_BATCH) {
+            self.observe_unmanaged(&mut s, &mut defs, chunk);
+        }
+        let spent = self.b.clock().now().0.saturating_sub(t0.0);
+        if spent < crate::hold::UNMANAGED_BUDGET.0 {
+            let pick: Vec<UnitId> = (0..take).map(|i| rotate[(start + i) % rotate.len()].clone()).collect();
+            self.observe_unmanaged(&mut s, &mut defs, &pick);
+            self.unmanaged_cursor = start + take;
+        } else {
+            self.unmanaged_cursor = start;
+        }
+        (s, defs)
+    }
+
+    /// Observe `units` in one backend call and put each in `s` and `defs`,
+    /// updating latches (`with_unmanaged`).
+    fn observe_unmanaged(&mut self, s: &mut SystemState, defs: &mut UnitDefs, units: &[UnitId]) {
+        if units.is_empty() {
+            return;
+        }
+        let results = self.b.units().observe_many(units);
+        for (u, (observed, ended)) in units.iter().zip(results) {
+            let held = s.holds.contains(u);
+            let observed = match observed {
                 Ok(raw) => {
-                    // How it ended is a second command, and matters only for a
-                    // unit that is not running.
-                    let ended = if matches!(raw, Observed::Absent | Observed::Bound | Observed::Detected) && !held {
-                        self.b.units().ended_by(&u)
-                    } else {
-                        None
-                    };
                     let seen = crate::hold::unmanaged_observed(raw.clone(), ended, held);
                     let down =
                         matches!(seen, Observed::Failed(_) | Observed::Absent | Observed::Bound | Observed::Detected);
                     if raw == Observed::Active {
                         // Running: what netwatch says it protects now is its latch.
-                        self.unmanaged_latch.insert(u.clone(), s.protecting.contains(&u));
+                        self.unmanaged_latch.insert(u.clone(), s.protecting.contains(u));
                     } else if down
-                        && !planarian_backend_netwatch::host::footprint_outlives_the_unit(&u)
-                        && self.unmanaged_latch.get(&u) == Some(&false)
+                        && !planarian_backend_netwatch::host::footprint_outlives_the_unit(u)
+                        && self.unmanaged_latch.get(u) == Some(&false)
                     {
                         // A stopped instance has no footprint, so netwatch's
                         // "protecting" for it is only the fail-closed
                         // default; it protected nothing when it ran.
-                        s.protecting.remove(&u);
+                        s.protecting.remove(u);
                     }
                     seen
                 }
                 Err(o) => Observed::Unknown { since: s.observed_at, reason: format!("{o:?}") },
             };
             s.units.insert(u.clone(), (observed, vec![]));
-            defs.insert(u.clone(), crate::hold::unmanaged_def(&u));
+            defs.insert(u.clone(), crate::hold::unmanaged_def(u));
         }
-        (s, defs)
     }
 
     fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {
@@ -1375,8 +1392,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                 }
             } else if in_journal || on_host == Some(true) {
                 if !in_journal {
-                    // OnFailure= held it while the daemon was not looking.
+                    // OnFailure= held it while the daemon was not looking: its
+                    // traffic is blocked all the same, so the person is told
+                    // (once: the hold is journaled now, so the failed branch
+                    // above does not say it again).
                     self.journal(Record::HoldApplied { unit: u.clone(), by: HoldBy::OnFailure });
+                    self.notice(if self.unmanaged.contains(&u) { hold::unmanaged_alarm(&u) } else { hold::alarm(&u) });
                 }
                 if hold::back(s, defs, &u) {
                     self.lift_back(&u);
