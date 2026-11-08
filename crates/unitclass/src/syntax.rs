@@ -328,6 +328,16 @@ fn boolean(file: &str, key: &str, value: &str) -> Result<Option<bool>, Error> {
     }
 }
 
+/// A dependency list (`OnFailure=`, `After=`): systemd 260.5 does **not** reset
+/// it on an empty assignment (the oracle in nix/tests/unitclass-systemd.nix
+/// shows `OnFailure=planarian-hold@x.service` still in force after a later
+/// drop-in's empty `OnFailure=`), so an empty assignment adds nothing and removes
+/// nothing. Settings that do reset (`DeviceAllow=`, `BindPaths=`, capability
+/// sets) use [`list`] and [`Caps::assign`].
+fn dep_list(into: &mut Vec<String>, value: &str) {
+    into.extend(value.split_whitespace().map(str::to_string));
+}
+
 fn list(into: &mut Vec<String>, value: &str) {
     if value.is_empty() {
         into.clear();
@@ -342,8 +352,8 @@ impl Settings {
     pub fn apply_hold<'a>(&mut self, assignments: impl IntoIterator<Item = &'a Assignment>) {
         for a in assignments.into_iter().filter(|a| a.section == "Unit") {
             match a.key.as_str() {
-                "OnFailure" => list(&mut self.on_failure, &a.value),
-                "After" => list(&mut self.after, &a.value),
+                "OnFailure" => dep_list(&mut self.on_failure, &a.value),
+                "After" => dep_list(&mut self.after, &a.value),
                 _ => {}
             }
         }
@@ -371,8 +381,8 @@ impl Settings {
                 }
             } else if a.section == "Unit" {
                 match a.key.as_str() {
-                    "OnFailure" => list(&mut self.on_failure, &a.value),
-                    "After" => list(&mut self.after, &a.value),
+                    "OnFailure" => dep_list(&mut self.on_failure, &a.value),
+                    "After" => dep_list(&mut self.after, &a.value),
                     _ => {}
                 }
             }

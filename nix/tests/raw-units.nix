@@ -20,9 +20,10 @@
 #      export and carries the hold and ordering drop-ins; a hardened one, a
 #      masked one and an unparsable one are classified as they should be; the
 #      export is read by the consumer's own parser.
-#   3. The hold stays in force: a later drop-in or overrides.conf with an empty
-#      OnFailure= or After= makes `verify-hold` (which fails the system build)
-#      fail, and a clean tree passes.
+#   3. The hold stays in force: a hold drop-in that is missing or replaced by
+#      one without the lines makes `verify-hold` (which fails the system build)
+#      fail, and a clean tree passes. (An empty OnFailure=/After= resets
+#      nothing in systemd 260.5, and the oracle test shows it.)
 #   4. The boundary: a nonzero exit or unparsable output is never "no tools".
 { pkgs, self, nixpkgs }:
 
@@ -163,30 +164,34 @@ pkgs.runCommand "planarian-raw-units-check" {
   { printf '%s\n' ${lib.escapeShellArgs declared} gym-tpl@a; jq -r '.[]' "$raw"; } > "$tools"
   ${unitclass} verify-hold --units ${units} --tools "$tools" ${lib.optionalString (cfg.services.planarian.package.netwatch or false) "--netwatch"}
   echo "ok: verify-hold passes on the built tree"
-  strip() {
+  netwatch=${lib.optionalString (cfg.services.planarian.package.netwatch or false) "--netwatch"}
+  tamper() {   # unit file content: replace (or, with no content, remove) the hold's own drop-in in a copy of the tree
     rm -rf "$TMPDIR/tree"; cp -r --no-dereference ${units} "$TMPDIR/tree"; chmod -R u+w "$TMPDIR/tree"
-    mkdir -p "$TMPDIR/tree/$1.service.d"
-    printf '%s' "$2" > "$TMPDIR/tree/$1.service.d/$3"
-    if ${unitclass} verify-hold --units "$TMPDIR/tree" --tools "$tools" ${lib.optionalString (cfg.services.planarian.package.netwatch or false) "--netwatch"} 2> err; then
-      echo "raw-units: verify-hold passed with $3 stripping $2 from $1" >&2; exit 1
-    fi
-    grep -q "$1" err
+    rm -f "$TMPDIR/tree/$1.service.d/50-planarian-hold.conf"
+    if [ -n "''${2-}" ]; then printf '%s' "$2" > "$TMPDIR/tree/$1.service.d/50-planarian-hold.conf"; fi
   }
-  strip b23-raw '[Unit]
-OnFailure=
-' 90-strip.conf
-  strip b23-dropin '[Unit]
-OnFailure=
-' overrides.conf
-  strip m-root-bunset-anone-nunset-dnone '[Unit]
-OnFailure=
-' overrides.conf
-  ${lib.optionalString (cfg.services.planarian.package.netwatch or false) ''
-  strip b23-raw '[Unit]
-After=
-' 90-strip.conf
-  ''}
-  echo "ok: an empty OnFailure= (and After=) in a later drop-in or overrides.conf, on a raw or a declared tool, fails verify-hold"
+  # A hold drop-in that is missing, or replaced by one without the lines, fails the build.
+  for t in b23-raw b23-dropin m-root-bunset-anone-nunset-dnone; do
+    tamper "$t"
+    if ${unitclass} verify-hold --units "$TMPDIR/tree" --tools "$tools" $netwatch 2> err; then
+      echo "raw-units: verify-hold passed with the hold removed from $t" >&2; exit 1
+    fi
+    grep -q "$t" err
+    tamper "$t" '[Unit]
+Description=no hold here
+'
+    if ${unitclass} verify-hold --units "$TMPDIR/tree" --tools "$tools" $netwatch 2> err; then
+      echo "raw-units: verify-hold passed with the hold replaced in $t" >&2; exit 1
+    fi
+    grep -q "$t" err
+  done
+  # systemd 260.5 does not reset a dependency list on an empty assignment (the
+  # real-systemd oracle shows it), so a later empty OnFailure=/After= strips nothing.
+  rm -rf "$TMPDIR/tree"; cp -r --no-dereference ${units} "$TMPDIR/tree"; chmod -R u+w "$TMPDIR/tree"
+  printf '[Unit]\nOnFailure=\nAfter=\n' > "$TMPDIR/tree/b23-raw.service.d/90-empty.conf"
+  printf '[Unit]\nOnFailure=\n' > "$TMPDIR/tree/m-root-bunset-anone-nunset-dnone.service.d/overrides.conf"
+  ${unitclass} verify-hold --units "$TMPDIR/tree" --tools "$tools" $netwatch
+  echo "ok: a missing or replaced hold drop-in, on a raw or a declared tool, fails verify-hold; an empty OnFailure=/After= does not"
 
   # 4. The boundary: bad output or a bad read is never "no tools".
   printf 'not json' > bad.json

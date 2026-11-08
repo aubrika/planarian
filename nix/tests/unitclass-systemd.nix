@@ -185,22 +185,48 @@ pkgs.testers.runNixOSTest {
         dev = any("/dev/net/tun" in d or "/dev/ppp" in d for d in devices)
         return bool(net & set(s["ambient"])) or (root and bounding_open) or (bounding_open and not s["nnp"]) or dev
 
+    NOT_RUNNABLE = ["o-user-00", "o-user-plus0"]
     machine.wait_for_unit("multi-user.target")
     bad = []
+    over = []
     for u in UNITS:
         props = show_systemd(u)
         ours = json.loads(machine.succeed(f"planarian-unitclass show --units /etc/systemd/system {u}.service"))
         a = sem_systemd(u, props)
         b = sem_ours(u + ".service", ours)
+        if u in NOT_RUNNABLE:
+            # systemd cannot start these as written (an invalid user name), so
+            # its values are not comparable; the classifier must still call
+            # them tools (it reads them as possibly root, the closed direction).
+            if not ours["tool"]:
+                bad.append((u, "tool", "systemd rejects the unit", ours["tool"]))
+            print(f"{u}: systemd rejects it; classifier tool={ours['tool']}")
+            continue
+        dynamic = a["dynamic"]
         for k in a:
             if k == "after":
-                # systemd adds defaults to After=; ours must be a subset.
-                if not set(b[k]) <= set(a[k]):
+                # systemd adds defaults to After=; compare the hold's ordering exactly, the rest as a subset.
+                nw = "planarian-netwatch.service"
+                if (nw in a[k]) != (nw in b[k]) or not set(b[k]) <= set(a[k]):
+                    bad.append((u, k, a[k], b[k]))
+            elif k == "user" and dynamic:
+                continue  # a dynamic user is shown under the unit's name
+            elif k == "nnp" and dynamic:
+                continue  # DynamicUser= implies NoNewPrivileges= in systemd
+            elif k == "device":
+                if sorted(a[k]) != sorted(p for p in b[k] if p.startswith("/")):
                     bad.append((u, k, a[k], b[k]))
             elif a[k] != b[k]:
                 bad.append((u, k, a[k], b[k]))
-        if tool_by_systemd(a) != ours["tool"]:
-            bad.append((u, "tool", tool_by_systemd(a), ours["tool"]))
+        # Fail-open is the only disagreement that is a bug: the classifier
+        # saying "not a tool" where systemd's own values make it one. The
+        # reverse (a DynamicUser= unit systemd makes NoNewPrivileges) is the
+        # rule's conservative reading and is listed, not failed.
+        by_systemd = tool_by_systemd(a)
+        if by_systemd and not ours["tool"]:
+            bad.append((u, "tool (fail-open)", by_systemd, ours["tool"]))
+        elif ours["tool"] and not by_systemd:
+            over.append(u)
         print(f"{u}: tool={ours['tool']}")
     # Does systemd start these as uid 0? The classifier must call each tool then
     # (a unit that runs as root with the default bounding set holds CAP_NET_ADMIN).
@@ -216,6 +242,7 @@ pkgs.testers.runNixOSTest {
         print(f"{u}: systemd runs it as uid {uid}; classifier tool={ours['tool']}")
         if uid == "0" and not ours["tool"]:
             bad.append((u, "runs as root but is not classified as a tool", uid, ours["tool"]))
+    print("tools by the rule's conservative reading, not by systemd's values:", over)
     assert not bad, "systemd and planarian-unitclass disagree: " + json.dumps(bad, indent=1)
   '';
 }

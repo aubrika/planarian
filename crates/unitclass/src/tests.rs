@@ -681,22 +681,28 @@ fn the_hold_is_verified_in_the_merged_tree() {
     write(&root.join("t.service"), "[Service]\nExecStart=/bin/true\n");
     write(&root.join("t.service.d/50-planarian-hold.conf"), &tree::hold_dropin(true, true));
     assert_eq!(tree::hold_problem(&root, "t", true), None);
-    // A later drop-in with an empty OnFailure= strips the hold.
-    write(&root.join("t.service.d/90-strip.conf"), "[Unit]\nOnFailure=\n");
+    // systemd 260.5 does not reset a dependency list on an empty assignment
+    // (the oracle shows the hold still in force), so a later `OnFailure=` or
+    // `After=`, in a drop-in or overrides.conf, strips nothing.
+    write(&root.join("t.service.d/90-empty.conf"), "[Unit]\nOnFailure=\nAfter=\n");
+    write(&root.join("t.service.d/overrides.conf"), "[Unit]\nOnFailure=\n");
+    assert_eq!(tree::hold_problem(&root, "t", true), None);
+    fs::remove_file(root.join("t.service.d/90-empty.conf")).unwrap();
+    fs::remove_file(root.join("t.service.d/overrides.conf")).unwrap();
+    // A hold file with the lines missing (replaced by one of the same name) is a problem.
+    write(&root.join("t.service.d/50-planarian-hold.conf"), "[Unit]\nDescription=x\n");
     assert!(tree::hold_problem(&root, "t", true).unwrap().contains("OnFailure="));
-    fs::remove_file(root.join("t.service.d/90-strip.conf")).unwrap();
-    // The same for After=, only where ordering after netwatch is wanted.
-    write(&root.join("t.service.d/90-strip.conf"), "[Unit]\nAfter=\n");
+    // With only the OnFailure line, After= is a problem where ordering after netwatch is wanted.
+    write(&root.join("t.service.d/50-planarian-hold.conf"), &tree::hold_dropin(false, false));
     assert!(tree::hold_problem(&root, "t", true).unwrap().contains("After="));
     assert_eq!(
         tree::hold_problem(&root, "t", false),
         None,
         "a unit in the startup chain is not ordered after netwatch"
     );
-    // overrides.conf (NixOS's own drop-in for a declared unit) is read like any.
-    fs::remove_file(root.join("t.service.d/90-strip.conf")).unwrap();
-    write(&root.join("t.service.d/overrides.conf"), "[Unit]\nOnFailure=\n");
-    assert!(tree::hold_problem(&root, "t", true).is_some());
+    // No hold file at all is a problem.
+    fs::remove_file(root.join("t.service.d/50-planarian-hold.conf")).unwrap();
+    assert!(tree::hold_problem(&root, "t", false).is_some());
     // A tool with no unit file in the tree (a disabled service) or a masked one
     // cannot fail, so it is not a problem.
     assert_eq!(tree::hold_problem(&root, "missing", true), None);
@@ -720,7 +726,8 @@ fn the_hold_check_reads_the_hold_leniently() {
     );
     write(&root.join("t.service.d/50-planarian-hold.conf"), &tree::hold_dropin(true, true));
     assert_eq!(tree::hold_problem(&root, "t", true), None);
-    write(&root.join("t.service.d/90-strip.conf"), "[Unit]\nOnFailure=\n");
+    // A same-named hold file without the lines still fails it, whatever the main file's syntax.
+    write(&root.join("t.service.d/50-planarian-hold.conf"), "[Unit]\nDescription=x\n");
     assert!(tree::hold_problem(&root, "t", true).is_some());
 }
 
@@ -772,10 +779,12 @@ fn the_same_drop_in_name_in_a_template_and_its_instance_is_read_from_the_instanc
     write(&root.join("gym-tpl@.service.d/50-planarian-hold.conf"), &tree::hold_dropin(true, true));
     write(&root.join("gym-tpl@.service.d/overrides.conf"), "[Unit]\nOnFailure=\n");
     write(&root.join("gym-tpl@a.service.d/overrides.conf"), "[Service]\nEnvironment=X=1\n");
-    // The template's overrides.conf strips the hold, but the instance's file of the same name replaces it.
-    assert_eq!(tree::hold_problem(&root, "gym-tpl@a", true), None);
-    // The template itself still has its own stripping file.
-    assert!(tree::hold_problem(&root, "gym-tpl@", true).is_some());
+    assert_eq!(tree::hold_problem(&root, "gym-tpl@a", true), None, "no collision error");
+    assert_eq!(tree::hold_problem(&root, "gym-tpl@", true), None);
+    // An instance's own file of the hold's name, without the lines, shadows the template's.
+    write(&root.join("gym-tpl@a.service.d/50-planarian-hold.conf"), "[Unit]\nDescription=x\n");
+    assert!(tree::hold_problem(&root, "gym-tpl@a", true).is_some());
+    assert_eq!(tree::hold_problem(&root, "gym-tpl@", true), None);
 }
 
 #[test]
