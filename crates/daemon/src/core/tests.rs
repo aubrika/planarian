@@ -3991,3 +3991,51 @@ mod switch_window_busy {
         assert!(inferred_after(640, |_| {}, failing));
     }
 }
+
+/// C16 (docs/regression-ledger.md): the daemon's own re-observe of a unit
+/// under a diagnostic incident is nobody's request, so a Measurement probe of
+/// that unit still runs at most once per its `per`. (The tick called
+/// `Assembler::reprobe` for it, which ran the probe on every tick.)
+#[test]
+fn a_diagnostic_incident_does_not_run_a_measurement_probe_inside_its_per() {
+    let mut r = Rig::new();
+    let web = UnitId::service("gym-web");
+    let (http, tcp) = (ProbeId("gym-web-http".into()), ProbeId("gym-web-tcp".into()));
+    let mut m = r.core.asm.manifest().clone();
+    for p in m.units.get_mut(&web).unwrap().probes.iter_mut() {
+        if p.id == tcp {
+            // The Measurement probe under test, on a cadence slower than its
+            // `per`, so the cadence alone cannot produce the runs the lower
+            // bound below counts: they come from the re-observe.
+            p.side_effects = SideEffects::Measurement { bytes_max: 4096, per: Millis::secs(60) };
+            p.cadence = Cadence::Every(Millis::secs(600));
+        } else if p.id == http {
+            // The probe whose slow answer makes the unit Unknown.
+            p.side_effects = SideEffects::None;
+        }
+    }
+    r.core.asm.set_manifest(m);
+    r.ticks(2);
+    // Its health answer is slow: Unknown, a diagnostic incident, re-observed.
+    r.fake.w().units.get_mut(&web).unwrap().health = planarian_fake::Health::Delay(Millis::secs(60));
+    let ran_at = |r: &mut Rig| {
+        let (s, _) = r.core.observe();
+        s.units[&web].1.iter().find(|e| e.probe == tcp).map(|e| e.at)
+    };
+    let mut runs = std::collections::BTreeSet::new();
+    for _ in 0..40 {
+        r.ticks(1);
+        runs.extend(ran_at(&mut r));
+    }
+    assert!(r.core.incidents.diagnostic().iter().any(|i| i.target == web), "a diagnostic incident was open");
+    // 40 ticks = 200 s with per = 60 s: never faster than per (at most 4
+    // runs, one more for the run before the incident), and, with a cadence of
+    // 600 s, at least 3: the re-observe runs it at once past `per`. A stale
+    // `now` passed to `reobserve` would give 1.
+    assert!(runs.len() <= 5, "the Measurement probe ran {} times in 200 s with per = 60 s", runs.len());
+    assert!(
+        runs.len() >= 3,
+        "the Measurement probe ran only {} times in 200 s: a re-observe past per must run it",
+        runs.len()
+    );
+}

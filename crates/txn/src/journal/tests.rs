@@ -1396,3 +1396,324 @@ proptest! {
         prop_assert_eq!(again.ledger().not_prepared_again(), [TxnId(txn)].into_iter().collect());
     }
 }
+
+/// §12c ("Each build exports the kinds and decisive fields it reads"): the
+/// descriptor `planariad --journal-kinds` prints is `supported()`. It
+/// round-trips as the requirements a target is compared with, reads at least
+/// the original set a build without an export is taken to read (what the
+/// first format-2 build, 90f1e37, read: format 2, 16 kinds, no decisive
+/// field), and names exactly the decisive kinds.
+#[test]
+fn the_exported_descriptor_is_this_builds_reader() {
+    let json = serde_json::to_string(&supported()).unwrap();
+    let back: compat::JournalRequirements = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, supported());
+    assert_eq!(back.format, 3);
+    let mut decisive: Vec<String> = DECISIVE_KINDS.iter().map(|k| (*k).to_owned()).collect();
+    decisive.sort();
+    let mut kinds = back.kinds.clone();
+    kinds.sort();
+    assert_eq!(kinds, decisive, "the descriptor's kinds are the decisive kinds");
+    let o = original();
+    assert_eq!((o.format, o.kinds.len()), (2, 16), "docs/deviations.md names the original set as format 2, 16 kinds");
+    assert!(o.fields.is_empty(), "the first format-2 build wrote no decisive field a later one added");
+    for added in ["ExternalAccepted", "AgentStarted", "HoldApplied", "HoldLifted", "NotPreparedAgain"] {
+        assert!(!o.kinds.iter().any(|k| k == added), "{added} was added during format 2");
+        assert!(back.kinds.iter().any(|k| k == added));
+    }
+    assert!(o.unsupported_by(&back).is_empty(), "a build reads at least the original set");
+}
+
+/// Registry guard: a `#[serde(default)]` field is how a field is added
+/// without breaking older journals, and a reader that ignores one can act on a
+/// wrong value. So each defaulted field in the journal's records, the ledger
+/// they fold into and the transaction they carry is classified here: present
+/// in the first format-2 build (90f1e37), so in the original set a build
+/// without an export is taken to read; or added during format 2, with the
+/// commit that added it, and then the descriptor must name a path for it (so
+/// a journal that uses it asks before a transition to a build that predates
+/// the export). A new defaulted field fails until a person classifies it.
+///
+/// The commit for each entry is the first one in which the field is in its
+/// struct or variant, found by walking `git log` over crates/txn/src/ledger.rs
+/// and crates/schema/src/txn.rs, and whether it is in 90f1e37 by
+/// `git merge-base --is-ancestor <commit> 90f1e37`.
+#[test]
+fn every_defaulted_field_of_a_decisive_kind_is_classified() {
+    #[derive(Clone, Copy)]
+    enum Era {
+        /// In the first format-2 build.
+        Original,
+        /// Added during format 2, by this commit.
+        AddedDuringFormat2(&'static str),
+    }
+    use Era::{AddedDuringFormat2 as Added, Original};
+    let table: &[(&str, Era)] = &[
+        ("why", Original),            // LiveTxn.why, b462e32
+        ("security_floor", Original), // Ledger.security_floor, d1f133c
+        ("boot_at", Added("89eb2b4")),
+        ("approver", Added("d9e1ed2")),
+        ("txn", Added("d9e1ed2")),
+        ("instance", Added("8231a07")),
+        ("boot_only", Added("4e5cd1c")),
+        ("external", Added("db5b0f4")),
+        ("agents", Added("805cd1c")),
+        ("hold_events", Added("d10bc80")),
+        ("candidate_nar", Added("82a76ab")),
+        ("pre_passing", Added("ff11187")),
+        ("withdrawn_for", Added("2a24d30")),
+        ("prepared_again_from", Added("2a24d30")),
+        ("not_prepared_again", Added("b21f867")),
+    ];
+    let sources = [include_str!("../ledger.rs"), include_str!("../../../schema/src/txn.rs")];
+    let mut found: Vec<String> = vec![];
+    for src in sources {
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, l) in lines.iter().enumerate() {
+            if !l.trim_start().starts_with("#[serde(default") {
+                continue;
+            }
+            let field = lines[i + 1..]
+                .iter()
+                .map(|l| l.trim())
+                .find(|l| !l.starts_with("///") && !l.starts_with("#["))
+                .and_then(|l| l.trim_start_matches("pub ").split(':').next())
+                .expect("a field follows the attribute")
+                .to_owned();
+            found.push(field);
+        }
+    }
+    found.sort();
+    found.dedup();
+    for f in &found {
+        assert!(
+            table.iter().any(|(n, _)| n == f),
+            "`#[serde(default)]` field `{f}` is unclassified: add it to this table (original, or added during format 2 with its commit) and name its path in `supported()`"
+        );
+    }
+    let paths: Vec<String> = supported().fields.values().flatten().cloned().collect();
+    for (name, class) in table {
+        assert!(found.iter().any(|f| f == name), "`{name}` is classified but is no longer a defaulted field");
+        let described = paths.iter().any(|p| p.rsplit('.').next() == Some(*name));
+        match class {
+            Added(commit) => {
+                assert!(commit.len() == 7, "{name}: a short commit id");
+                assert!(
+                    described,
+                    "`{name}` was added during format 2 ({commit}) but the descriptor names no path for it"
+                );
+            }
+            Original => {
+                assert!(!described, "`{name}` is in the first format-2 build: the descriptor must not require it")
+            }
+        }
+    }
+}
+
+/// The kinds and fields added during format 2 are decisive for a build that
+/// predates the export: a journal that holds one asks before a transition to
+/// such a build (§12c AskFirst), and a field at its default does not.
+#[test]
+fn what_was_added_during_format_2_is_required_of_a_target_that_predates_the_export() {
+    use crate::ledger::HoldBy;
+    let unit = planarian_schema::UnitId::service("gym-web");
+    // (Every record also needs format 3; that is not what is under test.)
+    let needs = |r: &Record| {
+        let mut m = compat::record_requirements(r).unwrap().unsupported_by(&original());
+        m.retain(|x| !x.starts_with("journal format"));
+        m
+    };
+    let renew = |boot_at| Record::Renew {
+        txn: planarian_schema::TxnId(1),
+        epoch: 1,
+        worker_pid: None,
+        boot_at: Timestamp(boot_at),
+    };
+    assert_eq!(needs(&renew(5)), vec!["decisive field Renew.boot_at"]);
+    assert!(needs(&renew(0)).is_empty(), "a boot time at its default needs nothing");
+    let token = |approver, txn| Record::TokenUsed { nonce: [1; 16], expires: Timestamp(9), approver, txn };
+    // Root (uid 0) and the first transaction (id 0) are real values.
+    let both = vec!["decisive field TokenUsed.approver", "decisive field TokenUsed.txn"];
+    assert_eq!(needs(&token(7, 0)), both);
+    assert_eq!(needs(&token(7, 3)), both);
+    assert_eq!(needs(&token(0, 0)), both);
+    let agent = |instance| Record::AgentStarted { name: "a".into(), instance, by: 1000 };
+    assert_eq!(
+        needs(&agent([1; 16])),
+        vec!["decisive field AgentStarted.instance", "decisive field checkpoint.agents", "record kind AgentStarted"]
+    );
+    assert_eq!(needs(&agent([0; 16])), vec!["decisive field checkpoint.agents", "record kind AgentStarted"]);
+    for (record, kind, field) in [
+        (Record::HoldApplied { unit: unit.clone(), by: HoldBy::Daemon }, "HoldApplied", "hold_events"),
+        (Record::HoldLifted { unit: unit.clone(), reason: "r".into() }, "HoldLifted", "hold_events"),
+        (Record::ExternalAccepted { seq: 1, digest: planarian_schema::Hash([0; 32]) }, "ExternalAccepted", "external"),
+        (
+            Record::NotPreparedAgain { txn: planarian_schema::TxnId(2), reason: "r".into() },
+            "NotPreparedAgain",
+            "not_prepared_again",
+        ),
+    ] {
+        assert_eq!(
+            needs(&record),
+            vec![format!("decisive field checkpoint.{field}"), format!("record kind {kind}")],
+            "{kind}"
+        );
+        // And this build reads it.
+        assert!(compat::record_requirements(&record).unwrap().unsupported_by(&supported()).is_empty());
+    }
+}
+
+/// A transaction's decisive fields added during format 2 are required once
+/// set: a candidate's NAR hash (losing it skips C6's check, which fails open)
+/// and the probes passing before (R07), on `Prepared` and in a checkpoint.
+#[test]
+fn a_prepared_transactions_added_fields_are_required_once_set() {
+    use serde_json::json;
+    let required = |kind: &str, v: serde_json::Value| {
+        let mut r = compat::JournalRequirements { format: 3, kinds: vec![], fields: Default::default() };
+        compat::fields_in(kind, &v, &mut r);
+        r.fields.into_values().flatten().collect::<Vec<_>>()
+    };
+    assert_eq!(required("Prepared", json!({"candidate_nar": [1, 2, 3]})), ["candidate_nar"]);
+    assert!(required("Prepared", json!({"candidate_nar": null})).is_empty(), "None at its default");
+    assert_eq!(required("Prepared", json!({"check": {"pre_passing": {"u": ["p"]}}})), ["check.pre_passing"]);
+    assert!(required("Prepared", json!({"check": {"pre_passing": {}}})).is_empty());
+    assert_eq!(
+        required("checkpoint", json!({"live": {"1": {"txn": {"candidate_nar": [9]}, "boot_only": true}}})),
+        ["live.*.boot_only", "live.*.txn.candidate_nar"]
+    );
+    assert!(required("checkpoint", json!({"live": {"1": {"boot_only": false}}})).is_empty());
+}
+
+/// A value that is zero for real is set: the first transaction's id is 0, so
+/// a `withdrawn_for`, `prepared_again_from` or `TokenUsed.txn` of `TxnId(0)`
+/// must be required, and an approver of 0 is root, who approves most things.
+/// Only a field that can never be zero for real (a boot time, an agent's
+/// InvocationID, an unset flag) reads zero as unset. (A zero counted as unset
+/// everywhere dropped the first; the list then kept two.)
+#[test]
+fn a_value_of_zero_is_a_set_field_unless_zero_can_never_be_real() {
+    use serde_json::json;
+    let required = |kind: &str, v: serde_json::Value| {
+        let mut r = compat::JournalRequirements { format: 3, kinds: vec![], fields: Default::default() };
+        compat::fields_in(kind, &v, &mut r);
+        r.fields.into_values().flatten().collect::<Vec<_>>()
+    };
+    assert_eq!(required("Advance", json!({"withdrawn_for": 0})), ["withdrawn_for"]);
+    assert_eq!(required("Prepared", json!({"prepared_again_from": 0})), ["prepared_again_from"]);
+    assert_eq!(required("checkpoint", json!({"terminal": {"3": {"withdrawn_for": 0}}})), ["terminal.*.withdrawn_for"]);
+    assert_eq!(required("checkpoint", json!({"not_prepared_again": [0]})), ["not_prepared_again"]);
+    assert_eq!(required("TokenUsed", json!({"approver": 0, "txn": 0})), ["approver", "txn"]);
+    assert!(required("Renew", json!({"boot_at": 0})).is_empty());
+    assert!(required("AgentStarted", json!({"instance": [0, 0, 0, 0]})).is_empty());
+    assert_eq!(required("AgentStarted", json!({"instance": [0, 0, 0, 1]})), ["instance"]);
+    assert!(required("checkpoint", json!({"live": {"1": {"boot_only": false}}})).is_empty());
+}
+
+mod active_props {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn json_value() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            prop_oneof![Just(0i64), Just(1), Just(-1), any::<i64>()].prop_map(|n| json!(n)),
+            prop_oneof![Just(String::new()), "[a-z]{1,4}"].prop_map(Value::String),
+        ];
+        leaf.prop_recursive(3, 24, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                prop::collection::btree_map("[a-c]", inner, 0..4).prop_map(|m| Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    /// The independent model: a field a reader must understand is one that is
+    /// present, and, where zero is the default, has a non-default leaf. (Where
+    /// zero is real, anything but null, an empty list or an empty map is set.)
+    fn model(v: &Value, zero_default: bool) -> bool {
+        match v {
+            Value::Null => false,
+            Value::Bool(b) => !zero_default || *b,
+            Value::Number(n) => !zero_default || n.as_i64() != Some(0),
+            Value::String(s) => !zero_default || !s.is_empty(),
+            Value::Array(a) if zero_default => a.iter().any(|x| model(x, true)),
+            Value::Array(a) => !a.is_empty(),
+            Value::Object(o) => !o.is_empty(),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, failure_persistence: None, ..ProptestConfig::default() })]
+
+        #[test]
+        fn active_is_true_exactly_when_the_model_says_so(v in json_value(), zero_default in any::<bool>()) {
+            prop_assert_eq!(compat::active(&v, &[], zero_default), model(&v, zero_default), "{:?}", v);
+        }
+
+        /// A path into a value reaches the same decision as the value at its end.
+        #[test]
+        fn a_path_is_followed_to_the_value(v in json_value(), zero_default in any::<bool>()) {
+            let wrapped = json!({"live": {"7": {"txn": {"f": v.clone()}}}});
+            prop_assert_eq!(
+                compat::active(&wrapped, &["live", "*", "txn", "f"], zero_default),
+                model(&v, zero_default)
+            );
+            prop_assert!(!compat::active(&wrapped, &["live", "*", "txn", "absent"], zero_default));
+        }
+    }
+}
+
+mod reads_what_it_writes {
+    use super::*;
+    use crate::ledger::HoldBy;
+
+    fn written() -> impl Strategy<Value = Record> {
+        let unit = planarian_schema::UnitId::service("gym-web");
+        prop_oneof![
+            (any::<u64>(), any::<u64>()).prop_map(|(n, boot_at)| Record::Renew {
+                txn: planarian_schema::TxnId(n),
+                epoch: n,
+                worker_pid: None,
+                boot_at: Timestamp(boot_at),
+            }),
+            (prop_oneof![Just(0u64), any::<u64>()], prop_oneof![Just(0u64), any::<u64>()])
+                .prop_map(|(approver, txn)| Record::TokenUsed { nonce: [3; 16], expires: Timestamp(1), approver, txn }),
+            any::<[u8; 16]>().prop_map(|instance| Record::AgentStarted { name: "a".into(), instance, by: 1000 }),
+            any::<u64>().prop_map(|n| Record::Advance {
+                txn: planarian_schema::TxnId(n),
+                epoch: 1,
+                to: planarian_schema::TxnState::Prepared,
+                note: String::new(),
+                withdrawn_for: (n % 2 == 0).then_some(planarian_schema::TxnId(n / 2)),
+            }),
+            Just(Record::HoldApplied { unit: unit.clone(), by: HoldBy::Daemon }),
+            Just(Record::HoldLifted { unit, reason: "r".into() }),
+            any::<u64>().prop_map(|seq| Record::ExternalAccepted { seq, digest: planarian_schema::Hash([1; 32]) }),
+            any::<u64>().prop_map(|n| Record::NotPreparedAgain { txn: planarian_schema::TxnId(n), reason: "r".into() }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, failure_persistence: None, ..ProptestConfig::default() })]
+
+        /// A build reads everything it writes: what a record it writes needs
+        /// of a reader, this build's own descriptor supplies.
+        /// Root and the first transaction are real values: whatever the
+        /// approver and the transaction, both are named as reasons.
+        #[test]
+        fn a_token_names_its_approver_and_transaction_whatever_their_values(approver in prop_oneof![Just(0u64), any::<u64>()], txn in prop_oneof![Just(0u64), any::<u64>()]) {
+            let r = Record::TokenUsed { nonce: [3; 16], expires: Timestamp(1), approver, txn };
+            let mut m = compat::record_requirements(&r).unwrap().unsupported_by(&original());
+            m.retain(|x| !x.starts_with("journal format"));
+            prop_assert_eq!(m, vec!["decisive field TokenUsed.approver", "decisive field TokenUsed.txn"]);
+        }
+
+        #[test]
+        fn a_build_reads_everything_it_writes(r in written()) {
+            let needs = compat::record_requirements(&r).unwrap();
+            prop_assert!(needs.unsupported_by(&supported()).is_empty(), "{:?}", needs.unsupported_by(&supported()));
+        }
+    }
+}
