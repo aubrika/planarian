@@ -467,13 +467,19 @@ let
   # drop-in, so a template orders every instance, a tool shipped as unit
   # files is covered, and a socket- or timer-activated tool is ordered by
   # its service.
-  holdDropins = lib.listToAttrs (map (u: {
+  toolDropins = lib.listToAttrs (map (u: {
     name = "${u}.service.d/50-planarian-hold.conf";
     # %N: the failed unit's name, per instance for a template's drop-in.
     value = "[Unit]\nOnFailure=planarian-hold@%N.service\n"
       + lib.optionalString (netwatchOn && !(builtins.elem u unordered.cycle)) "After=planarian-netwatch.service\n";
-  }) cfg.holdUnits) // {
-    "nftables.service.d/50-planarian-hold.conf" = "[Service]\nExecStartPost=${hold} reapply\nExecReload=${hold} reapply\n";
+  }) cfg.holdUnits);
+  holdDropins = toolDropins // {
+    # The same file as nftables' own hold when nftables is a network tool:
+    # both go in it (a second file of that name would replace the first, and
+    # nftables would lose its OnFailure= hold and its ordering after netwatch).
+    "nftables.service.d/50-planarian-hold.conf" =
+      (toolDropins."nftables.service.d/50-planarian-hold.conf" or "")
+      + "[Service]\nExecStartPost=${hold} reapply\nExecReload=${hold} reapply\n";
   };
   netwatchOn = cfg.package.netwatch or false;
   unordered = import ./netwatch-unordered.nix;

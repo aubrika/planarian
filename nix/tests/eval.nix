@@ -202,6 +202,10 @@ let
   holdScript = builtins.readFile (builtins.head (pkgs.lib.splitString " " holdUnit.serviceConfig.ExecStart));
   vpn = unit "service:gym-vpn";
   nftDropin = hold.holdDropins."nftables.service.d/50-planarian-hold.conf";
+  # nftables as a network tool (networking.nftables.enable: root, unhardened):
+  # its file carries its own hold and the re-application, not one of them.
+  nftOn = (sys.extendModules { modules = [ { networking.nftables.enable = true; } ]; }).config.services.planarian;
+  nftOnDropin = nftOn.holdDropins."nftables.service.d/50-planarian-hold.conf";
   # §12d (netwatch): the reference kernel carries BTF and what aya's
   # programs on the netlink paths need. Read from its configuration (built,
   # like the respond script above). netwatch reports a failed attach at
@@ -264,6 +268,7 @@ let
     (check (!(sys.options.services.planarian.units.type.getSubOptions [ ] ? holds) && !(sys.options.services.planarian.units.type.getSubOptions [ ] ? networkTool)) "holds is not a manifest option, so no unit can opt out of the hold (§12d)")
     (check (hold.holdDropins."gym-vpn.service.d/50-planarian-hold.conf" == "[Unit]\nOnFailure=planarian-hold@%N.service\n") "a network-security unit's failure applies the hold through OnFailure= (§12d)")
     (check (!(cfg.systemd.services.gym-vpn ? onFailure) || !(builtins.elem "planarian-hold@gym-vpn.service" cfg.systemd.services.gym-vpn.onFailure)) "the OnFailure= is a drop-in, not a unit definition (no stub for an undefined unit)")
+    (check (builtins.elem "nftables" nftOn.holdUnits && pkgs.lib.hasInfix "\nOnFailure=planarian-hold@%N.service\n" nftOnDropin && pkgs.lib.hasInfix "ExecStartPost=" nftOnDropin && pkgs.lib.hasInfix "ExecReload=" nftOnDropin) "nftables, a network tool, keeps its OnFailure= hold in the file that also re-applies the hold after it loads (a file of the same name replaced the hold: verify-hold found it in vm-netwatch, #96)")
     (check (pkgs.lib.hasInfix "ExecStartPost=" nftDropin && pkgs.lib.hasInfix "ExecReload=" nftDropin && pkgs.lib.hasInfix " reapply" nftDropin) "a hold is re-applied after nftables.service starts or reloads, which may flush every table (§12d)")
     (check (cfg.environment.etc."planarian/hold/gym-vpn.allow".text == "udp 192.0.2.7 51820\niface wg9\n") "the hold passes the unit's holdAllow endpoints and its own interfaces, as a kill switch does (§12d; owner decision, Nov 2)")
     (check (ownIfaceSys.config.environment.etc."planarian/hold/gym-vpn.allow".text == "udp 192.0.2.7 51820\n") "with the switch off, the held unit's own interfaces are held too")
