@@ -4399,6 +4399,86 @@ mod unmanaged_tools {
         assert!(!r.core.unmanaged.contains(&vpn), "watched once lifted and unexported");
     }
 
+    /// `n` unmanaged instances of `q@` that protect nothing, running.
+    fn quiet(n: usize) -> (Rig, Vec<UnitId>) {
+        let names: Vec<UnitId> = (0..n).map(|i| UnitId::service(&format!("q@{i:02}"))).collect();
+        let r = rig("q@", "q@00", false);
+        {
+            let mut w = r.fake.w();
+            let now = w.now;
+            for u in &names {
+                w.units.insert(u.clone(), UnitSim::active(now));
+            }
+        }
+        (r, names)
+    }
+
+    /// The rotation reaches every tool that is not always looked at: with
+    /// more than the per-tick cap of tools that protect nothing (latched
+    /// false, so they stay in the rotation), one that starts protecting is
+    /// re-latched within a round, so B-30's window is bounded. (A cursor that
+    /// did not advance would observe the same few forever.)
+    #[test]
+    fn the_rotation_reaches_a_tool_that_starts_protecting() {
+        const N: usize = 20;
+        let cap = crate::hold::UNMANAGED_OBSERVE_PER_TICK;
+        let (mut r, names) = quiet(N);
+        r.ticks(N.div_ceil(cap) + 2);
+        assert!(names.iter().all(|u| r.core.unmanaged_latch.get(u) == Some(&false)), "{:?}", r.core.unmanaged_latch);
+        let last = r.core.unmanaged.iter().next_back().unwrap().clone();
+        r.fake.w().steers_traffic(&last);
+        let mut ticks = 0;
+        while r.core.unmanaged_latch.get(&last) != Some(&true) && ticks < 3 * N {
+            r.ticks(1);
+            ticks += 1;
+        }
+        assert_eq!(r.core.unmanaged_latch.get(&last), Some(&true), "never re-latched");
+        assert!(ticks <= N.div_ceil(cap) + 1, "re-latched after {ticks} ticks");
+        r.fake.w().stop_out_of_band(&last);
+        r.ticks(1);
+        assert!(r.fake.w().held.contains(&last), "{:?}", r.core.notices);
+    }
+
+    /// A tool whose hold stands is observed on every tick, whatever its latch
+    /// and however many others are rotating: its lift does not wait for the
+    /// rotation.
+    #[test]
+    fn a_held_tool_is_observed_every_tick_beside_many_rotating_ones() {
+        let (mut r, _) = quiet(20);
+        let held: Vec<UnitId> = ["q@v1", "q@v2"].iter().map(|n| UnitId::service(n)).collect();
+        {
+            let mut w = r.fake.w();
+            for u in &held {
+                // Stopped by a signal and never observed running (no latch).
+                w.units.insert(
+                    u.clone(),
+                    UnitSim {
+                        observed: Observed::Bound,
+                        ended: Some(Ending::Signal(15)),
+                        ..UnitSim::active(Timestamp(0))
+                    },
+                );
+            }
+        }
+        // They are held when the rotation first reaches them (fail closed).
+        let mut ticks = 0;
+        while !held.iter().all(|u| r.fake.w().held.contains(u)) && ticks < 30 {
+            r.ticks(1);
+            ticks += 1;
+        }
+        assert!(held.iter().all(|u| r.fake.w().held.contains(u)), "{:?}", r.core.notices);
+        assert!(r.core.unmanaged.len() > crate::hold::UNMANAGED_OBSERVE_PER_TICK + 2);
+        for _ in 0..5 {
+            let before: Vec<u64> =
+                held.iter().map(|u| r.fake.w().observe_counts.get(u).copied().unwrap_or(0)).collect();
+            r.ticks(1);
+            for (u, b) in held.iter().zip(before) {
+                let now = r.fake.w().observe_counts.get(u).copied().unwrap_or(0);
+                assert!(now > b, "{u} was not observed this tick while held");
+            }
+        }
+    }
+
     mod props {
         use super::*;
         use proptest::prelude::*;
