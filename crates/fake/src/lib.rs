@@ -237,6 +237,11 @@ pub struct World {
     /// Jobs `queued_jobs` reports (systemd's whole queue: a switch's stop and
     /// start jobs), and a failure of the query itself.
     pub queued_jobs: usize,
+    /// Network tools the generation exports that no manifest unit declares
+    /// (the export's `networkTools` minus the units' `holds`).
+    pub unmanaged_network_tools: BTreeSet<String>,
+    /// `evaluate_built` fails (the export cannot be read).
+    pub evaluate_built_fails: Option<String>,
     pub queued_jobs_fails: Option<String>,
     /// §12d: network-security units whose failure holds traffic, as systemd's
     /// `OnFailure=` on them starts `planarian-hold@<unit>` (nix/posture.nix).
@@ -475,6 +480,7 @@ impl World {
             }
         }
         let locked = overrides.assignments.keys().filter(|k| self.forced.contains(*k)).cloned().collect();
+        let units_holding: Vec<String> = units.values().filter(|d| d.holds).map(|d| d.id.name.clone()).collect();
         let eval = EvaluatedGeneration {
             source: Hash::ZERO,
             options,
@@ -488,6 +494,7 @@ impl World {
             declarations,
             inputs: self.base_inputs.clone(),
             services: BTreeMap::new(),
+            network_tools: units_holding.into_iter().chain(self.unmanaged_network_tools.iter().cloned()).collect(),
         };
         (eval, broken)
     }
@@ -1283,6 +1290,9 @@ impl GenerationBackend for Fake {
     }
 
     fn evaluate_built(&self, path: &StorePath) -> Result<EvaluatedGeneration, Outcome> {
+        if let Some(why) = &self.w().evaluate_built_fails {
+            return Err(Outcome::Failed(why.clone()));
+        }
         self.w()
             .gens
             .values()

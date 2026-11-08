@@ -3991,3 +3991,203 @@ mod switch_window_busy {
         assert!(inferred_after(640, |_| {}, failing));
     }
 }
+
+mod unmanaged_tools {
+    use super::*;
+    use planarian_fake::UnitSim;
+
+    /// A machine whose generation exports `export` among its `networkTools`
+    /// with no manifest unit for it, and whose unit `running` runs (steering
+    /// traffic when `steers`).
+    fn rig(export: &str, running: &str, steers: bool) -> Rig {
+        let store = MemStore::new(8 << 20);
+        let fake = gym_world(store.clone());
+        let id = UnitId::service(running);
+        {
+            let mut w = fake.w();
+            for g in w.gens.values_mut() {
+                g.eval.network_tools.insert(export.to_string());
+            }
+            let now = w.now;
+            w.units.insert(id.clone(), UnitSim::active(now));
+            if steers {
+                w.steers_traffic(&id);
+            }
+            w.alive.insert(100);
+        }
+        let mut j = Journal::open(store).unwrap();
+        j.append(fake.w().now, Record::KnownGood(GenerationId(1))).unwrap();
+        let core = Core::start(j, fake.clone(), OwnerId::Daemon { pid: 100, boot_id: Hash::ZERO }, config());
+        let mut r = Rig { fake, core };
+        r.ticks(2);
+        r
+    }
+
+    fn alarm_text(u: &str) -> String {
+        format!(
+            "ALARM: service:{u} stopped and is not managed by Planarian. Network traffic is blocked until it is back or an administrator releases it."
+        )
+    }
+
+    fn says(r: &Rig, text: &str) -> usize {
+        r.core.notices.iter().filter(|n| n.as_str() == text).count()
+    }
+
+    /// A protecting unmanaged tool that stops is held and alarmed once, in the
+    /// spec's words; it is never restarted, never an incident, never an
+    /// inferred override.
+    #[test]
+    fn a_stopped_unmanaged_tool_is_held_alarmed_and_left_alone() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(30);
+        assert!(r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
+        assert!(r.core.ledger().holds().contains(&vpn), "journaled");
+        assert_eq!(says(&r, &alarm_text("some-vpn")), 1, "{:?}", r.core.notices);
+        assert_eq!(r.calls("restart("), 0, "an unmanaged tool is never restarted");
+        assert!(r.core.incidents.active_for(&vpn).is_none(), "never an incident");
+        assert!(r.core.ledger().incidents.is_empty(), "{:?}", r.core.ledger().incidents);
+        assert!(r.core.ledger().overrides.is_empty(), "not inferred as intended");
+    }
+
+    #[test]
+    fn a_crashed_unmanaged_tool_is_held_and_not_restarted() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        r.fake.w().hold_on_failure.insert(vpn.clone());
+        r.fake.w().kill(&vpn);
+        r.ticks(30);
+        assert!(r.fake.w().held.contains(&vpn));
+        assert_eq!(r.calls("restart("), 0);
+        assert!(r.core.incidents.active_for(&vpn).is_none());
+    }
+
+    /// Back by other means (someone starts it): the hold lifts.
+    #[test]
+    fn it_lifts_when_the_tool_is_running_again_by_other_means() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(5);
+        assert!(r.fake.w().held.contains(&vpn));
+        let now = r.fake.w().now;
+        *r.fake.w().units.get_mut(&vpn).unwrap() = UnitSim::active(now);
+        r.ticks(5);
+        assert!(!r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
+        assert!(r.core.ledger().holds().is_empty());
+        assert_eq!(r.calls("restart("), 0, "it came back without Planarian");
+    }
+
+    /// An administrator's `hold release` lifts it, and it is not held again
+    /// while it stays down.
+    #[test]
+    fn an_administrator_releases_the_hold_of_an_unmanaged_tool() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(5);
+        assert!(r.fake.w().held.contains(&vpn));
+        let resp = r.core.handle(ADMIN, Request::HoldRelease { unit: vpn.clone(), until: Until::NextBoot });
+        assert!(matches!(resp, Response::Done { state: TxnState::Committed, .. }), "{resp:?}");
+        r.ticks(3);
+        assert!(!r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
+        r.ticks(10);
+        assert!(!r.fake.w().held.contains(&vpn), "not held again while released");
+        assert_eq!(r.calls("restart("), 0);
+    }
+
+    /// A tool that steers nothing protects no traffic: not held (§12d).
+    #[test]
+    fn an_unmanaged_tool_that_protects_nothing_is_not_held() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", false);
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(10);
+        assert!(!r.fake.w().held.contains(&vpn));
+        assert_eq!(says(&r, &alarm_text("some-vpn")), 0);
+    }
+
+    /// A template in the export is each running instance.
+    #[test]
+    fn a_template_in_the_export_is_held_per_instance() {
+        let inst = UnitId::service("openvpn@work");
+        let mut r = rig("openvpn@", "openvpn@work", true);
+        r.fake.w().stop_out_of_band(&inst);
+        r.ticks(10);
+        assert!(r.fake.w().held.contains(&inst), "{:?}", r.core.notices);
+        assert_eq!(says(&r, &alarm_text("openvpn@work")), 1);
+    }
+
+    /// A tool with a manifest unit is the manifest's: managed as before (its
+    /// alarm is the managed one, and it is repaired), never the unmanaged path.
+    #[test]
+    fn a_managed_tool_is_not_unmanaged() {
+        let mut r = rig("gym-web", "some-other", false);
+        assert!(r.core.unmanaged.is_empty(), "{:?}", r.core.unmanaged);
+        r.ticks(1);
+        assert!(!r.core.notices.iter().any(|n| n.contains("not managed by Planarian")));
+    }
+
+    /// Rule 21: an export that cannot be read is not an empty set of tools.
+    /// The daemon says so once, keeps trying, and watches the tools as soon
+    /// as it can read them.
+    #[test]
+    fn an_unreadable_export_is_not_an_empty_set() {
+        let vpn = UnitId::service("some-vpn");
+        let mut r = rig("some-vpn", "some-vpn", true);
+        // As if the first read had failed.
+        r.core.network_tools = None;
+        r.core.unmanaged.clear();
+        r.fake.w().evaluate_built_fails = Some("export.json: unreadable".into());
+        r.ticks(5);
+        let said = r.core.notices.iter().filter(|n| n.contains("network tools could not be read")).count();
+        assert_eq!(said, 1, "{:?}", r.core.notices);
+        assert!(r.core.unmanaged.is_empty() && r.core.network_tools.is_none());
+        r.fake.w().evaluate_built_fails = None;
+        r.fake.w().stop_out_of_band(&vpn);
+        r.ticks(5);
+        assert!(r.fake.w().held.contains(&vpn), "{:?}", r.core.notices);
+    }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 48, failure_persistence: None, ..ProptestConfig::default() })]
+
+            /// For any tool (plain or a template instance), protecting or
+            /// not, stopped (cleanly or killed, with or without OnFailure=)
+            /// or running, after any number of ticks: it is held exactly when
+            /// it protects traffic and is down; it is never restarted, never
+            /// an incident, never an inferred override; the alarm says so
+            /// once.
+            #[test]
+            fn an_unmanaged_tool_is_held_exactly_when_it_protects_and_is_down(
+                template in any::<bool>(), steers in any::<bool>(), down in 0u8..3, on_failure in any::<bool>(),
+                after in 3usize..40,
+            ) {
+                let (export, running) = if template { ("tun@", "tun@a") } else { ("tun", "tun") };
+                let id = UnitId::service(running);
+                let mut r = rig(export, running, steers);
+                // (The fake's OnFailure= hold is unconditional; the real hold
+                // unit's condition skips a tool that protects nothing.)
+                if on_failure && steers {
+                    r.fake.w().hold_on_failure.insert(id.clone());
+                }
+                match down {
+                    1 => r.fake.w().stop_out_of_band(&id),
+                    2 => r.fake.w().kill(&id),
+                    _ => {}
+                }
+                r.ticks(after);
+                prop_assert_eq!(r.fake.w().held.contains(&id), steers && down > 0, "{:?}", r.core.notices);
+                prop_assert_eq!(r.calls("restart("), 0);
+                prop_assert!(r.core.incidents.active_for(&id).is_none());
+                prop_assert!(r.core.ledger().overrides.is_empty());
+                prop_assert!(says(&r, &alarm_text(running)) <= 1, "{:?}", r.core.notices);
+            }
+        }
+    }
+}

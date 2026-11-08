@@ -290,6 +290,14 @@ pub struct Core<B: Backends + Clone, S: Store> {
     /// whether a generation changed: their stops are not someone else's.
     touched: BTreeSet<UnitId>,
     generation_touched: bool,
+    /// §12d: the running generation's exported network tools (a template ends
+    /// in `@`), `None` while they could not be read: never an empty set made
+    /// of a failed read (rule 21).
+    network_tools: Option<BTreeSet<String>>,
+    /// The tools among them that no manifest unit declares: held and alarmed
+    /// when they stop, never restarted, never an incident. Set each observe.
+    unmanaged: BTreeSet<UnitId>,
+    unmanaged_unreadable_noted: bool,
     /// A switch outside Planarian seen at `.0`: its stops and starts follow
     /// the profile change by more than a tick, so they stay explained until
     /// `.1` (see `SWITCH_SETTLE`).
@@ -395,8 +403,12 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let mut incidents = Manager::restore(ledger.incidents.values().cloned());
         incidents.startup_grace = cfg.startup_grace;
         let current = b.generations().current().unwrap_or_default();
+        let mut network_tools = None;
         let manifest = match b.generations().path_of(current).and_then(|p| b.generations().evaluate_built(&p)) {
-            Ok(e) => manifest_of(&e),
+            Ok(e) => {
+                network_tools = Some(e.network_tools.clone());
+                manifest_of(&e)
+            }
             Err(o) => {
                 notices.push_back(format!(
                     "the running generation has no Planarian manifest ({o:?}); nothing is watched until a generation built with services.planarian.enable is running"
@@ -485,6 +497,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
             earlier: BTreeMap::new(),
             touched: BTreeSet::new(),
             generation_touched: false,
+            network_tools,
+            unmanaged: BTreeSet::new(),
+            unmanaged_unreadable_noted: false,
             switch_window: None,
             next_gc_check: Timestamp(0),
             space_noted: Timestamp(0),
@@ -630,12 +645,69 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
     }
 
+    /// §12d: the exported network tools no manifest unit declares, as units:
+    /// a template (`name@`) as each instance systemd lists. An unreadable
+    /// export is never an empty set: the last set read stands, and with none
+    /// the daemon says so (once) and tries again. A failed list leaves the
+    /// instances of the previous tick.
+    fn refresh_unmanaged(&mut self, defs: &UnitDefs) {
+        if self.network_tools.is_none() {
+            let read = self
+                .b
+                .generations()
+                .current()
+                .and_then(|g| self.b.generations().path_of(g))
+                .and_then(|p| self.b.generations().evaluate_built(&p));
+            match read {
+                Ok(e) => {
+                    self.network_tools = Some(e.network_tools);
+                    self.unmanaged_unreadable_noted = false;
+                }
+                Err(o) => {
+                    if !std::mem::replace(&mut self.unmanaged_unreadable_noted, true) {
+                        self.notice(format!(
+                            "ALARM: this generation's network tools could not be read ({o:?}); a network tool Planarian does not manage is not watched until they can"
+                        ));
+                    }
+                    return;
+                }
+            }
+        }
+        let Some(tools) = self.network_tools.clone() else { return };
+        let mut want: BTreeSet<UnitId> = BTreeSet::new();
+        let mut templates = vec![];
+        for t in &tools {
+            match t.strip_suffix('@') {
+                Some(_) => templates.push(t.clone()),
+                None => {
+                    want.insert(UnitId::service(t.trim_end_matches(".service")));
+                }
+            }
+        }
+        if !templates.is_empty() {
+            match self.b.units().list() {
+                Ok(all) => {
+                    for u in all {
+                        if templates.iter().any(|t| u.name.starts_with(t.as_str()) && u.name.len() > t.len()) {
+                            want.insert(u);
+                        }
+                    }
+                }
+                // Keep the instances already known.
+                Err(_) => want.extend(self.unmanaged.iter().filter(|u| u.name.contains('@')).cloned()),
+            }
+        }
+        want.retain(|u| !defs.contains_key(u) && crate::hold::held_by(u).is_none());
+        self.unmanaged = want;
+    }
+
     /// Observe without acting (also used to answer requests).
     pub fn observe(&mut self) -> (SystemState, UnitDefs) {
         let l = self.ledger();
         let current = self.b.generations().current().unwrap_or(self.manifest_gen);
         if current != self.manifest_gen {
             if let Ok(e) = self.b.generations().path_of(current).and_then(|p| self.b.generations().evaluate_built(&p)) {
+                self.network_tools = Some(e.network_tools.clone());
                 self.gen_manifest = manifest_of(&e);
                 self.asm.set_manifest(self.effective_manifest().0);
             }
@@ -669,7 +741,9 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         let mut defs = self.asm.defs();
         // §12d: the network tools that protect traffic now. Fail closed: an
         // unreadable watch counts every tool as protecting.
-        let tools: Vec<UnitId> = crate::hold::network_tools(&defs).map(|d| d.id.clone()).collect();
+        self.refresh_unmanaged(&defs);
+        let tools: Vec<UnitId> =
+            crate::hold::network_tools(&defs).map(|d| d.id.clone()).chain(self.unmanaged.iter().cloned()).collect();
         s.protecting = if tools.is_empty() {
             BTreeSet::new()
         } else {
@@ -677,7 +751,10 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         };
         // §12d: each network-security unit's hold unit, known (so releasing
         // it derives the hold's administrator floor) but never expected.
-        let holds: Vec<UnitDef> = crate::hold::network_tools(&defs).map(crate::hold::hold_def).collect();
+        let holds: Vec<UnitDef> = crate::hold::network_tools(&defs)
+            .map(crate::hold::hold_def)
+            .chain(self.unmanaged.iter().map(|u| crate::hold::hold_def(&crate::hold::unmanaged_def(u))))
+            .collect();
         for d in holds {
             defs.entry(d.id.clone()).or_insert(d);
         }
@@ -970,6 +1047,23 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
         }
     }
 
+    /// `s` and `defs` with each unmanaged network tool added as a unit
+    /// observed through the backend (an unreadable one is Unknown: neither
+    /// held nor lifted this tick).
+    fn with_unmanaged(&self, s: &SystemState, defs: &UnitDefs) -> (SystemState, UnitDefs) {
+        let (mut s, mut defs) = (s.clone(), defs.clone());
+        for u in &self.unmanaged {
+            let observed = self
+                .b
+                .units()
+                .observe(u)
+                .unwrap_or_else(|o| Observed::Unknown { since: s.observed_at, reason: format!("{o:?}") });
+            s.units.insert(u.clone(), (observed, vec![]));
+            defs.insert(u.clone(), crate::hold::unmanaged_def(u));
+        }
+        (s, defs)
+    }
+
     fn network_holds(&mut self, s: &SystemState, defs: &UnitDefs) -> bool {
         use crate::hold;
         use planarian_txn::ledger::HoldBy;
@@ -1151,7 +1245,7 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
                     // fine: the hold is the same either way.
                     let by = if asked || on_host != Some(true) { HoldBy::Daemon } else { HoldBy::OnFailure };
                     self.journal(Record::HoldApplied { unit: u.clone(), by });
-                    self.notice(hold::alarm(&u));
+                    self.notice(if self.unmanaged.contains(&u) { hold::unmanaged_alarm(&u) } else { hold::alarm(&u) });
                 }
                 if on_host != Some(true) {
                     let now = self.b.clock().boot_now();
@@ -2041,7 +2135,16 @@ impl<B: Backends + Clone, S: Store> Core<B, S> {
 
         // §12d: the hold is in place before the incident opens; a hold the
         // daemon just applied is in the state the repair is derived from.
-        let (s, defs) = if self.network_holds(&s, &defs) { self.observe() } else { (s, defs) };
+        let held = if self.unmanaged.is_empty() {
+            self.network_holds(&s, &defs)
+        } else {
+            // The unmanaged tools are hold subjects only: seen and defined
+            // for this call, never in the state or defs the incident manager
+            // and the residue read, so none is repaired or opens an incident.
+            let (hs, hd) = self.with_unmanaged(&s, &defs);
+            self.network_holds(&hs, &hd)
+        };
+        let (s, defs) = if held { self.observe() } else { (s, defs) };
 
         self.flag_exec_probes(&defs);
 

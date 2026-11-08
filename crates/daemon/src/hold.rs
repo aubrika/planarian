@@ -65,6 +65,35 @@ pub fn network_tools(defs: &UnitDefs) -> impl Iterator<Item = &UnitDef> {
     defs.values().filter(|d| d.holds)
 }
 
+/// An unmanaged network tool (no manifest unit; the export's `networkTools`)
+/// as the hold code reads a unit: desired Running, a network tool. Never
+/// given to the assembler or the incident manager: it is never repaired.
+pub fn unmanaged_def(id: &UnitId) -> UnitDef {
+    UnitDef {
+        id: id.clone(),
+        desired: Desired { status: DesiredStatus::Running, when: Condition::Always },
+        edges: vec![],
+        sensitivity: Sensitivities::default(),
+        restart_disruption: Disruption::None,
+        probes: vec![],
+        synonyms: vec![],
+        systemd_restart: None,
+        startup_grace: None,
+        runtime_repair: None,
+        stops_are_faults: false,
+        holds: true,
+        hold_allow: vec![],
+        hold_interfaces: vec![],
+    }
+}
+
+/// The alarm when an unmanaged network tool stops and its traffic is held.
+pub fn unmanaged_alarm(unit: &UnitId) -> String {
+    format!(
+        "ALARM: {unit} stopped and is not managed by Planarian. Network traffic is blocked until it is back or an administrator releases it."
+    )
+}
+
 /// It has failed in §12d's sense: observed failed, or not running while it
 /// is desired running. A stop through an attested override is not a failure
 /// (the override makes it not expected).
