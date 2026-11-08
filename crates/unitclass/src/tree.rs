@@ -100,7 +100,7 @@ pub fn units(roots: &[PathBuf]) -> Result<Vec<(String, PathBuf)>, Error> {
             .map_err(|e| Error::Unreadable { file: root.display().to_string(), why: e.to_string() })?;
         for e in rd.flatten() {
             let file = e.file_name().to_string_lossy().into_owned();
-            if !file.ends_with(".service") || masked(&e.path()) || !e.path().is_file() {
+            if !file.ends_with(".service") || !e.path().is_file() {
                 continue;
             }
             out.push((file, e.path()));
