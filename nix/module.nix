@@ -47,11 +47,11 @@ let
             (builtins.attrNames os))
         (lib.filter isEnabled (builtins.attrNames options.services));
       unitPaths = lib.concatMap (u: drvs (u.path or [ ])) (builtins.attrValues config.systemd.services);
-      # The hold's drop-ins (§12d) are Planarian's own text files, no
+      # The hold's drop-ins (§12d) and the raw-unit classification (B-23) are Planarian's own generated files, no
       # package; they are computed from every service's configuration, which
       # may read this set (a cycle), so they are left out by their marker.
       roots = lib.concatMap drvs (config.environment.systemPackages
-          ++ builtins.filter (p: !(p.planarianHoldDropins or false)) config.systemd.packages)
+          ++ builtins.filter (p: !(p.planarianHoldDropins or false) && !(p.planarianRawUnits or false)) config.systemd.packages)
         ++ fromServices ++ unitPaths
         ++ drvs config.boot.kernelPackages.kernel ++ drvs config.hardware.firmware;
       item = p: let k = ok p.outPath; in if k == null then [ ] else [ { key = k; pkg = p; } ];
@@ -120,12 +120,17 @@ let
       svc = config.systemd.services.${name};
       sc = svc.serviceConfig;
       user = sc.User or "root";
-      root = (user == "root" || user == "0") && !(sc.DynamicUser or false);
+      # `User=` could be uid 0 when the unit starts: root, a specifier (`%i`, `%u`,
+      # ... expanded at start), or a numeric zero in any spelling. Unknown reads
+      # as possibly root, the closed direction (crates/unitclass `may_be_root`).
+      mayBeRoot = u: u == "root" || lib.hasInfix "%" u || builtins.match "[+]?0+" u != null;
+      root = mayBeRoot (toString user) && !(sc.DynamicUser or false);
       bounding = sc.CapabilityBoundingSet or null;
       # NoNewPrivileges= as systemd reads it; anything unrecognised counts
       # as unset (failing closed).
       noNewPrivs = builtins.elem (toString (sc.NoNewPrivileges or false)) [ "1" "true" "yes" "on" ];
-      devices = words ((sc.DeviceAllow or [ ]) ++ (sc.BindPaths or [ ]) ++ (sc.BindReadOnlyPaths or [ ]));
+      # NixOS accepts these as a string or a list; a string must not break the `++`.
+      devices = words (lib.concatMap lib.toList [ (sc.DeviceAllow or [ ]) (sc.BindPaths or [ ]) (sc.BindReadOnlyPaths or [ ]) ]);
     in
     builtins.elem name netdevUnits
     || grants (sc.AmbientCapabilities or [ ]) netCaps
@@ -717,7 +722,16 @@ in
         (lib.filterAttrs (n: _: !(cfg.units ? ${n})) config.systemd.services);
     };
 
-    environment.etc."planarian/export.json".text = builtins.toJSON cfg.export;
+    # The evaluated export with the build-time list of raw-unit network tools
+    # (B-23) unioned into `networkTools`: the raw names are only known after
+    # the build, and the consumers (planariad, netwatch) read this file.
+    environment.etc."planarian/export.json".source =
+      let evaluated = pkgs.writeText "planarian-export-evaluated.json" (builtins.toJSON cfg.export); in
+      if cfg.rawUnits == null then evaluated
+      else pkgs.runCommand "planarian-export.json" { nativeBuildInputs = [ pkgs.jq ]; } ''
+        jq -c --slurpfile raw ${cfg.rawUnits}/share/planarian/raw-network-tools.json \
+          '.networkTools = ((.networkTools + $raw[0]) | unique)' ${evaluated} > "$out"
+      '';
 
     environment.etc."planarian/config.json".text = builtins.toJSON {
       inherit (cfg) owner flakeAttr maxTier optionSensitivity;

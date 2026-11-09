@@ -2515,6 +2515,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "planarian-unitclass"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "tempfile",
+]
+
+[[package]]
 name = "planarian-watchdog"
 version = "0.0.0"
 dependencies = [

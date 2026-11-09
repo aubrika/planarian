@@ -48,7 +48,7 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
 
   # Install the daemon, the watchdog and the CLI; the gym is a developer tool.
-  cargoBuildFlags = [ "-p" "planarian-daemon" "-p" "planarian-watchdog" "-p" "planarian-cli" ]
+  cargoBuildFlags = [ "-p" "planarian-daemon" "-p" "planarian-watchdog" "-p" "planarian-cli" "-p" "planarian-unitclass" ]
     ++ lib.optionals netwatchLoader [ "-p" "planarian-backend-netwatch" ]
     ++ lib.optionals gymHooks [ "-p" "planarian-gym" ];
   buildFeatures = lib.optionals gymHooks [ "planarian-daemon/gym-hooks" ]
@@ -95,6 +95,9 @@ rustPlatform.buildRustPackage {
   # Whether the package carries netwatch: its loader and its eBPF object
   # (the module runs planarian-netwatch; coreFiles hashes both).
   passthru.netwatch = netwatchEbpf != null && netwatchLoader;
+  # Whether the package carries the raw-unit classifier (B-23): the module
+  # builds `planarian-raw-units` with it.
+  passthru.unitclass = true;
 
   meta = {
     description = "A self-healing layer for declaratively configured computers";

@@ -15,6 +15,7 @@ members = [
     "crates/daemon",
     "crates/backends/linux",
     "crates/backends/netwatch",
+    "crates/unitclass",
     "crates/watchdog",
     "crates/cli",
     "crates/gym",

@@ -467,13 +467,17 @@ let
   # drop-in, so a template orders every instance, a tool shipped as unit
   # files is covered, and a socket- or timer-activated tool is ordered by
   # its service.
-  holdDropins = lib.listToAttrs (map (u: {
+  toolDropins = lib.listToAttrs (map (u: {
     name = "${u}.service.d/50-planarian-hold.conf";
     # %N: the failed unit's name, per instance for a template's drop-in.
     value = "[Unit]\nOnFailure=planarian-hold@%N.service\n"
       + lib.optionalString (netwatchOn && !(builtins.elem u unordered.cycle)) "After=planarian-netwatch.service\n";
-  }) cfg.holdUnits) // {
-    "nftables.service.d/50-planarian-hold.conf" = "[Service]\nExecStartPost=${hold} reapply\nExecReload=${hold} reapply\n";
+  }) cfg.holdUnits);
+  # The re-application is its own file: two drop-ins of one name in one
+  # directory are one file to systemd (and to lndir, which keeps one), so
+  # nftables' own hold and the re-application must not share a name.
+  holdDropins = toolDropins // {
+    "nftables.service.d/50-planarian-reapply.conf" = "[Service]\nExecStartPost=${hold} reapply\nExecReload=${hold} reapply\n";
   };
   netwatchOn = cfg.package.netwatch or false;
   unordered = import ./netwatch-unordered.nix;
@@ -516,6 +520,34 @@ let
     mkdir -p "$out/etc/systemd/system/$(dirname ${lib.escapeShellArg n})"
     printf '%s' ${lib.escapeShellArg t} > "$out/etc/systemd/system/"${lib.escapeShellArg n}
   '') holdDropins));
+
+  # B-23 (docs/raw-unit-classification.md): the network tools that exist only
+  # as unit files in `systemd.packages` packages, classified at build time from
+  # the files themselves (never at evaluation: no import from derivation), with
+  # the same hold and ordering drop-ins `holdDropins` writes for declared
+  # units. Built from the packages other than the two tagged ones, so listing
+  # it in `systemd.packages` does not make it depend on itself.
+  unitclassOn = cfg.package.unitclass or false;
+  unitclass = "${cfg.package}/bin/planarian-unitclass";
+  rawUnitPackages = lib.filter (p: !(p.planarianRawUnits or false) && !(p.planarianHoldDropins or false)) config.systemd.packages;
+  rawUnits = pkgs.runCommand "planarian-raw-units" { passthru.planarianRawUnits = true; } ''
+    ${unitclass} classify --out "$out" ${lib.optionalString netwatchOn "--netwatch"} \
+      ${lib.concatMapStringsSep " " (n: "--cycle ${lib.escapeShellArg n}") unordered.cycle} \
+      ${lib.concatMapStringsSep " " (n: "--own ${lib.escapeShellArg n}") (import ./own-units.nix)} \
+      ${lib.concatMapStringsSep " " (n: "--have-hold ${lib.escapeShellArg n}") cfg.holdUnits} \
+      ${lib.escapeShellArgs (map toString rawUnitPackages)}
+    ${unitclass} check "$out/share/planarian/raw-network-tools.json"
+  '';
+  # The merged tree must keep both lines of every network tool's hold: a later
+  # drop-in or overrides.conf with an empty OnFailure= or After= strips them.
+  verifyHold = ''
+    tools=$(mktemp)
+    printf '%s\n' ${lib.escapeShellArgs cfg.holdUnits} > "$tools"
+    ${pkgs.jq}/bin/jq -r '.[]' ${rawUnits}/share/planarian/raw-network-tools.json >> "$tools"
+    ${unitclass} verify-hold --units ${config.environment.etc."systemd/system".source} --tools "$tools" \
+      ${lib.optionalString netwatchOn "--netwatch"} \
+      ${lib.concatMapStringsSep " " (n: "--cycle ${lib.escapeShellArg n}") unordered.cycle}
+  '';
 
   # I2 in A-D (§12d, B-12): every Planarian binary and script this
   # generation installs, hashed at build. The watchdog checks each against
@@ -571,6 +603,12 @@ in
       readOnly = true;
       internal = true;
       description = "The network tools that do not start after planarian-netwatch.service (nix/netwatch-unordered.nix: its startup chain, and the systemd initrd's survivors), for the export.";
+    };
+    rawUnits = mkOption {
+      type = types.nullOr types.package;
+      internal = true;
+      readOnly = true;
+      description = "The build-time classification of the network tools that are only unit files in systemd.packages (B-23): their hold drop-ins and `share/planarian/raw-network-tools.json`. Null when the package predates the classifier.";
     };
     networkToolsInitrd = mkOption {
       type = types.listOf types.str;
@@ -741,7 +779,9 @@ in
       assertion = lib.all (u: builtins.elem u unordered.cycle) cyclicTools;
       message = "planarian: network tools are ordered before planarian-netwatch.service, so ordering them after it (owner decision, Nov 2; SPEC §12d) would be a cycle: ${toString (lib.filter (u: !(builtins.elem u unordered.cycle)) cyclicTools)}. Remove that ordering.";
     };
-    systemd.packages = [ holdDropinPackage ];
+    systemd.packages = [ holdDropinPackage ] ++ lib.optional unitclassOn rawUnits;
+    services.planarian.rawUnits = if unitclassOn then rawUnits else null;
+    system.extraSystemBuilderCmds = lib.optionalString unitclassOn verifyHold;
     environment.etc = lib.listToAttrs (map (u: {
       name = "planarian/hold/${u}.allow";
       value.text = lib.concatMapStrings (a: "${a.protocol} ${a.address} ${toString a.port}\n") cfg.units.${u}.holdAllow
