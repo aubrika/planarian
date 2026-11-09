@@ -136,6 +136,24 @@ fn intact_records(store: &MemStore) -> usize {
     n
 }
 
+/// vm-netsec's package build (run 42543507704): `n = 1`, the last byte of the
+/// frame, a stale fill of 125. A frame ends in the payload's `}`, so writing
+/// `}` there tears nothing: the record is intact and open keeps it. Any other
+/// fill over that byte is a tear and drops it.
+#[test]
+fn overwriting_the_last_byte_with_itself_is_no_tear_and_with_anything_else_is() {
+    let (_, frames) = written(1);
+    let (start, end) = frames[0];
+    for fill in 0..=255u8 {
+        let (store, _) = written(1);
+        assert_eq!(store.read_at(end - 1, 1).unwrap(), vec![b'}']);
+        store.write_at(end - 1, &[fill]).unwrap();
+        let j = Journal::open(store).expect("opens");
+        assert_eq!(j.ledger().last_seq, if fill == b'}' { 1 } else { 0 }, "fill {fill}");
+        assert_eq!(j.offset(), if fill == b'}' { end } else { start }, "fill {fill}");
+    }
+}
+
 proptest! {
     #![proptest_config(config(256))]
 
@@ -152,12 +170,38 @@ proptest! {
         let (store, frames) = written(n);
         let (start, end) = frames[n - 1];
         let k = start + cut.index((end - start) as usize) as u64;
+        // A tear changes bytes: when the stale fill is what the frame already
+        // holds from `k` on (a frame ends `}}}`, so a fill of 125 over its
+        // last byte), nothing is torn and the record is intact (found by
+        // vm-netsec's build, n = 1, fill = 125, the last byte).
+        let old = store.read_at(k, (end - k) as usize).unwrap();
+        let fill = if old.iter().all(|b| *b == fill) { fill ^ 1 } else { fill };
         store.write_at(k, &vec![fill; (end - k) as usize]).unwrap();
         let mut j = Journal::open(store.clone()).expect("a torn tail opens");
         prop_assert_eq!(j.ledger().last_seq, n as u64 - 1);
         prop_assert_eq!(j.offset(), start);
         j.append(Timestamp(9_999), incident(99)).unwrap();
         prop_assert_eq!(Journal::open(store).unwrap().ledger().last_seq, n as u64);
+    }
+
+    /// The torn tail's other edge, exhaustively for one record: whatever
+    /// byte of the frame is the first overwritten and whatever the fill, the
+    /// record is dropped exactly when the write changed a byte, and kept when
+    /// it changed none (the frame is then intact, and open rightly keeps it).
+    #[test]
+    fn a_write_that_changes_a_byte_is_a_tear_and_one_that_changes_none_is_not(
+        k in 0..300u64,
+        fill in any::<u8>(),
+    ) {
+        let (store, frames) = written(1);
+        let (start, end) = frames[0];
+        prop_assume!(start + k < end);
+        let k = start + k;
+        let old = store.read_at(k, (end - k) as usize).unwrap();
+        let changed = old.iter().any(|b| *b != fill);
+        store.write_at(k, &vec![fill; (end - k) as usize]).unwrap();
+        let j = Journal::open(store).expect("a torn tail opens");
+        prop_assert_eq!(j.ledger().last_seq, if changed { 0 } else { 1 });
     }
 
     /// #41 (§12c Format), the intact half: an edit to any one record, re-framed
