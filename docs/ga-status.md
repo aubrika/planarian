@@ -19,11 +19,11 @@ the epic's gate checklist (issue #7) is ticked. Where rule 19 stands:
 
 | Step | State |
 | --- | --- |
-| (a) Reconcile the close-out review | Done: `docs/review-reconciliation.md` |
-| (b) B-20 (I24) | Closed (`8231a07`) |
-| (c) Documentation sweep | Done |
+| (a) Reconcile the close-out review | Done (as of 2026-11-01): `docs/review-reconciliation.md` |
+| (b) B-20 (I24) | Closed (`8231a07`; as of 2026-11-01) |
+| (c) Documentation sweep | Done (as of 2026-11-01) |
 | (d) §28's required changes | As of 2026-11-01 (not refreshed here): done in PR #6 except what issue #7 lists |
-| (e) §15 harness contract, §17a accounting checks | Done: runners nonzero on ERROR/FAIL/PARTIAL and on an UNSUPPORTED must-pass or acceptance entry without a `docs/deviations.md` waiver; CI strict; the accounting checked |
+| (e) §15 harness contract, §17a accounting checks | Done (as of 2026-11-01; the strict runs of 2026-11-09 below enforce it): runners nonzero on ERROR/FAIL/PARTIAL and on an UNSUPPORTED must-pass or acceptance entry without a `docs/deviations.md` waiver; CI strict; the accounting checked |
 | (f) One whole VM catalog run, this file from it | **Done on `577edb3`: run 42554727307, 129 of 129 jobs succeeded** (below) |
 
 The bypass register (`docs/bypasses.md`, `planarian-gym verification`) at
@@ -36,24 +36,24 @@ in the row.
 | Criterion (SPEC §4, Q8) | Status at `577edb3` |
 | --- | --- |
 | 1. The demonstration | Fake harness: CI's `demo.sh --harness fake` step succeeded. VMs: the four `ga-demo` jobs of run 42554727307 succeeded (`svc-killed`, `svc-misconfig-listen-address`, `crash-activating-bad`, `crash-daemon-restart-reconciles`) |
-| 2. ≥ 60% of the catalog cleared deterministically | Fake harness: **139 of 139 runnable entries fully checked (100%)** (CI run 42554606293, `planarian-gym run --strict`). VMs: **all 101 `catalog` jobs of run 42554727307 succeeded**; a job fails on ERROR, FAIL, PARTIAL, or an UNSUPPORTED without a waiver, so none of the 101 did. The per-entry verdict files are not read here: the two waived UNSUPPORTED entries of 2026-11-01 (below) are expected to be UNSUPPORTED still |
-| Q8, the personal-profile gate | Not re-measured here (as of 2026-11-01) |
-| 2. Every bad generation reverted | Not re-measured here: the entries that exercise it are in the catalog runs above |
+| 2. ≥ 60% of the catalog cleared deterministically | Fake harness: **140 of 140 PASS (100%)**, of which the metrics block counts 139 as runnable, all fully checked (CI run 42554606293, `planarian-gym run --strict`; the one entry the metrics leave out is `fake-assumptions-conformance`, which runs the conformance suite and has no simulation). VMs: **all 101 `catalog` jobs of run 42554727307 succeeded**; a job fails on ERROR, FAIL, PARTIAL, or an UNSUPPORTED without a waiver, so none of the 101 did. The per-entry verdict files are not read here: the two waived UNSUPPORTED entries of 2026-11-01 (below) are expected to be UNSUPPORTED still |
+| Q8, the personal-profile gate | Not re-measured on 2026-11-09. Value at 2026-11-01 (`6ad8521`): every must-pass and intent entry passes on each harness it lists, except `quiet-reference-workload`, whose benchmark had not run since R13 changed it (#8); no acceptance entry UNSUPPORTED; ≥ 95% cleared |
+| 2. Every bad generation reverted | **Yes**, on the entries that activate a bad generation: `gen-bad-switch`, `svc-misconfig-listen-address` and `crash-activating-bad` (fake and VM) all PASS on the fake harness (CI run 42554606293) and their VM `catalog` jobs succeeded (run 42554727307; the last two also as `ga-demo` jobs); `revert-fails` and `revert-fails-interlock-survives-compaction` (failed reverts) likewise. Not measured: `desktop-boot-fails-rollback` is a waived UNSUPPORTED (its row in `docs/deviations.md`), so a bad boot entry reverted by rollback is cleared nowhere |
 | 2. The manifest-weakening fault rejected | In the catalog (`manifest-weaken-via-proposal` on both harnesses, `manifest-weaken-out-of-band` on VMs), passing in the runs above |
 | 2. Zero gamed successes | Guarded: an unchecked key is PARTIAL and fails; UNSUPPORTED is never a pass |
 | 2. Unnecessary interventions on the intent cases = 0 | 0 on the 10 intent entries the fake harness runs (CI run 42554606293) |
 | 3. `policy` proofs pass in CI | Yes: Verus verifies 17 / 54 / 52 obligations in `schema` / `policy` / `txn` with 0 errors; Kani: two runs, 4 and 5 harnesses, 0 failures (`nix` and `kani` jobs, run 42554606293) |
-| 4. Baselines: the invisibility budget (§21) | Not re-measured (as of 2026-11-01) |
+| 4. Baselines: the invisibility budget (§21) | **Not measured on the current benchmark at `577edb3`, nor at `6ad8521`**: `bench.nix` reads cgroup accounting and per-frame p99 since R13, and that run is #8's. The pre-R13 figures (idle 0.063% of one core, 7.9 MB resident, 1.58 wakeups/s; game median p99 38.5 ms, a proxy R13 removed) are under "Earlier results", with no date recorded there |
 | 4. Baselines: the verification ratio (§17a) | **Trust count 37; internal-unproven 5; global d:a 52:63** (`planarian-gym verification`, `rust` job, run 42554606293) |
 
 ## The catalog at `577edb3`
 
-166 entries: 140 list the fake harness (139 runnable), 101 list VMs (76 on
+166 entries: 140 list the fake harness, 101 list VMs (76 on
 both), 25 VM-only, and `quiet-reference-workload` lists only the benchmark.
 
 | Harness | Result at `577edb3` |
 | --- | --- |
-| Fake (`planarian-gym run --strict`, CI run 42554606293) | 139 of 139 runnable entries fully checked; repair rate 16 of 16; 0 unnecessary interventions on 10 intent entries |
+| Fake (`planarian-gym run --strict`, CI run 42554606293) | 140 PASS of 140 entries that list the fake harness (the other 26 are not fake). The metrics block counts 139 of them: it counts an entry only when the simulation returns a run, and `fake-assumptions-conformance` (a matrix entry that runs the conformance suite, with no simulation) is not counted; it passed. Repair rate 16 of 16; 0 unnecessary interventions on 10 intent entries |
 | VMs ("VM tests" run 42554727307, one job per entry) | 101 of 101 `catalog` jobs succeeded |
 | The run's other jobs | `prebuild`, `catalog-ids`, `firecracker`, `installer`, `vm-generations`, `vm-netsec`, `vm-netwatch`, `vm-posture`, `vm-runtime`, `vm-unitclass-systemd`, 4 `ga-demo`, 14 `gym-smoke`: all succeeded (129 jobs in all) |
 | Benchmark | `quiet-reference-workload`: not run here |
