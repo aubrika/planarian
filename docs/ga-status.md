@@ -1,10 +1,16 @@
 # Phase A gate (GA) status
 
 Where Planarian stands against the Phase A exit gate (SPEC §4), with the
-evidence for each criterion and how to reproduce it. Updated 2026-11-01,
-from one commit and one run: **`6ad8521`, "VM tests" run 110**
-(whole catalog, dispatched 2026-11-01 01:30 UTC), and CI run 140 on the
-same commit.
+evidence for each criterion and how to reproduce it. Updated 2026-11-09,
+from one commit and two runs on it: **`577edb3`** (main after #96, the
+freeze commit), the whole VM catalog, "VM tests" run **42554727307**
+(dispatched `catalog: true`, no ids; 129 of 129 jobs succeeded), and CI run
+**42554606293** (`rust`, `nix`, `kani`: all succeeded).
+
+What this refresh covers: rule 19(f), the catalog and proof figures, and the
+bypass-register counts. The rows for (a)–(e) and the criteria this file did
+not re-measure (marked) are as of the 2026-11-01 version and are the
+coordinator's to update.
 
 ## Summary
 
@@ -16,49 +22,55 @@ the epic's gate checklist (issue #7) is ticked. Where rule 19 stands:
 | (a) Reconcile the close-out review | Done: `docs/review-reconciliation.md` |
 | (b) B-20 (I24) | Closed (`8231a07`) |
 | (c) Documentation sweep | Done |
-| (d) §28's required changes | Done in PR #6 except what issue #7 lists: §12f *Rollbacks* (the Oct 31 amendment, three new §15 cases), P19, C18 (#9); C10, C19, P21, P24 and two remainders (#10); P11 and module-eval assertions (#11); deviations for anything left (#12) |
-| (e) §15 harness contract, §17a accounting checks | Done: runners nonzero on ERROR/FAIL/PARTIAL and on an UNSUPPORTED must-pass or acceptance entry without a `docs/deviations.md` waiver; CI strict; the accounting checked (`62fb19e`, `82a76ab`) |
-| (f) One whole VM catalog run, this file from it | Run 110 on `6ad8521` (below). To be repeated on the closing commit once #8–#11 have merged (#12) |
+| (d) §28's required changes | As of 2026-11-01 (not refreshed here): done in PR #6 except what issue #7 lists |
+| (e) §15 harness contract, §17a accounting checks | Done: runners nonzero on ERROR/FAIL/PARTIAL and on an UNSUPPORTED must-pass or acceptance entry without a `docs/deviations.md` waiver; CI strict; the accounting checked |
+| (f) One whole VM catalog run, this file from it | **Done on `577edb3`: run 42554727307, 129 of 129 jobs succeeded** (below) |
 
-The bypass register has no open High row; six Medium rows stay open, none
-for Phase A.
+The bypass register (`docs/bypasses.md`, `planarian-gym verification`) at
+`577edb3` has no open High row; open Medium: B-4, B-8, B-9, B-10, B-18,
+B-19, B-22, B-23, B-26 (nine); open Low: B-28, B-29, B-30 (three). B-23 is
+partly closed by #96: raw units shipped through `systemd.packages` are
+classified at build time; its still-open parts, which fail open, are listed
+in the row.
 
-| Criterion (SPEC §4, Q8) | Status at `6ad8521` |
+| Criterion (SPEC §4, Q8) | Status at `577edb3` |
 | --- | --- |
-| 1. The demonstration | **Passes** on the fake harness (CI run 140) and on VMs (run 110, the four `ga-demo` jobs) |
-| 2. ≥ 60% of the catalog cleared deterministically | **154 of 156 (98.7%)**: 130 of 130 PASS on the fake harness; 99 PASS and 2 UNSUPPORTED of 101 on VMs; every key checked |
-| Q8, the personal-profile gate | Every must-pass and intent entry passes on each harness it lists, except `quiet-reference-workload`, whose benchmark has not run since R13 changed it (#8); no acceptance entry UNSUPPORTED; ≥ 95% cleared |
-| 2. Every bad generation reverted | Yes, on both harnesses |
-| 2. The manifest-weakening fault rejected | Yes (`manifest-weaken-via-proposal`; `manifest-weaken-out-of-band` on VMs) |
+| 1. The demonstration | Fake harness: CI's `demo.sh --harness fake` step succeeded. VMs: the four `ga-demo` jobs of run 42554727307 succeeded (`svc-killed`, `svc-misconfig-listen-address`, `crash-activating-bad`, `crash-daemon-restart-reconciles`) |
+| 2. ≥ 60% of the catalog cleared deterministically | Fake harness: **139 of 139 runnable entries fully checked (100%)** (CI run 42554606293, `planarian-gym run --strict`). VMs: **all 101 `catalog` jobs of run 42554727307 succeeded**; a job fails on ERROR, FAIL, PARTIAL, or an UNSUPPORTED without a waiver, so none of the 101 did. The per-entry verdict files are not read here: the two waived UNSUPPORTED entries of 2026-11-01 (below) are expected to be UNSUPPORTED still |
+| Q8, the personal-profile gate | Not re-measured here (as of 2026-11-01) |
+| 2. Every bad generation reverted | Not re-measured here: the entries that exercise it are in the catalog runs above |
+| 2. The manifest-weakening fault rejected | In the catalog (`manifest-weaken-via-proposal` on both harnesses, `manifest-weaken-out-of-band` on VMs), passing in the runs above |
 | 2. Zero gamed successes | Guarded: an unchecked key is PARTIAL and fails; UNSUPPORTED is never a pass |
-| 2. Unnecessary interventions on the intent cases = 0 | 0 on all 14 intent entries |
-| 3. `policy` proofs pass in CI | Yes: Verus verifies 17 / 54 / 52 obligations in `schema` / `policy` / `txn`, and the check fails when that differs from `docs/verification-ratio.toml`; Kani 4 + 4 harnesses (`txn`, `exec`) |
-| 4. Baselines: the invisibility budget (§21) | Not re-measured: `bench.nix` now reads cgroup accounting and per-frame p99 (R13); its run is #8's. The last figures (before R13, proxy p99) are under "Earlier results" |
-| 4. Baselines: the verification ratio (§17a) | **Trust count 37; internal-unproven 5; global d:a 52:63** (`planarian-gym verification --gate`, clean) |
+| 2. Unnecessary interventions on the intent cases = 0 | 0 on the 10 intent entries the fake harness runs (CI run 42554606293) |
+| 3. `policy` proofs pass in CI | Yes: Verus verifies 17 / 54 / 52 obligations in `schema` / `policy` / `txn` with 0 errors; Kani: two runs, 4 and 5 harnesses, 0 failures (`nix` and `kani` jobs, run 42554606293) |
+| 4. Baselines: the invisibility budget (§21) | Not re-measured (as of 2026-11-01) |
+| 4. Baselines: the verification ratio (§17a) | **Trust count 37; internal-unproven 5; global d:a 52:63** (`planarian-gym verification`, `rust` job, run 42554606293) |
 
-## The catalog at `6ad8521`
+## The catalog at `577edb3`
 
-156 entries: 130 run on the fake harness, 101 on VMs (75 on both), 25
-VM-only, and `quiet-reference-workload` on the benchmark.
+166 entries: 140 list the fake harness (139 runnable), 101 list VMs (76 on
+both), 25 VM-only, and `quiet-reference-workload` lists only the benchmark.
 
-| Harness | PASS | UNSUPPORTED | FAIL / PARTIAL / ERROR | Not run there |
-| --- | --- | --- | --- | --- |
-| Fake (`planarian-gym run --strict`, CI run 140) | 130 | 0 | 0 | 25 VM-only, 1 benchmark |
-| VMs ("VM tests" run 110, one job per entry) | 99 | 2 | 0 | 55 fake-only |
-| Benchmark | — | — | — | `quiet-reference-workload`: to run (#8) |
+| Harness | Result at `577edb3` |
+| --- | --- |
+| Fake (`planarian-gym run --strict`, CI run 42554606293) | 139 of 139 runnable entries fully checked; repair rate 16 of 16; 0 unnecessary interventions on 10 intent entries |
+| VMs ("VM tests" run 42554727307, one job per entry) | 101 of 101 `catalog` jobs succeeded |
+| The run's other jobs | `prebuild`, `catalog-ids`, `firecracker`, `installer`, `vm-generations`, `vm-netsec`, `vm-netwatch`, `vm-posture`, `vm-runtime`, `vm-unitclass-systemd`, 4 `ga-demo`, 14 `gym-smoke`: all succeeded (129 jobs in all) |
+| Benchmark | `quiet-reference-workload`: not run here |
 
-The two UNSUPPORTED verdicts are `repair` entries, which the harness
-contract does not gate, and each has a row in `docs/deviations.md`
-("Harness waivers"): `storage-nix-full-gc` (the test VM's store is the
-host's; it passes on the fake) and `desktop-boot-fails-rollback` (the test
-VM boots its kernel directly; VM-only, so not cleared anywhere).
+The UNSUPPORTED verdicts of the 2026-11-01 catalog were two `repair`
+entries, which the harness contract does not gate, each with a row in
+`docs/deviations.md` ("Harness waivers"): `storage-nix-full-gc` and
+`desktop-boot-fails-rollback`. Those rows are unchanged.
 
-Found on the way to this run, and fixed with a test that fails without the
-fix: a takeover acked an op its fenced but still running predecessor had
-just acked itself, which left the transaction in flight
-(`crash-slow-worker-overlap`, run 109; `6ad8521`). Open, for the owner: in
-the same entry the restarted daemon's startup revert stalls for 15
-minutes before the watchdog finishes it (PR #6).
+Between the 2026-11-01 evidence and this one the catalog gained entries and
+many fixes merged (among them the unmanaged-tool rule, #93, and the raw-unit
+classification, #96); the whole-catalog run above is the first to run all of
+them together on one commit. One catalog run on
+the way (a #96 candidate, 42534118414) had one failing job, a stall of the
+gym judge's unbounded `systemctl --user --machine=` call after a session
+drop; it passed on a single-entry re-run, and that call's bounding is on the
+post-audit list.
 
 ## Earlier results
 
