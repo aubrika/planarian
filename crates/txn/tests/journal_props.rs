@@ -81,7 +81,11 @@ fn config(cases: u32) -> Config {
 /// `n` simple records (incidents), each appended and fsync'd. Returns the
 /// store and each record's [start, end) byte range in the log.
 fn written(n: usize) -> (MemStore, Vec<(u64, u64)>) {
-    let store = store();
+    written_in(store(), n)
+}
+
+/// `written`, in the given store.
+fn written_in(store: MemStore, n: usize) -> (MemStore, Vec<(u64, u64)>) {
     let mut j = Journal::open(store.clone()).unwrap();
     let mut frames = Vec::new();
     for i in 0..n {
@@ -136,6 +140,55 @@ fn intact_records(store: &MemStore) -> usize {
     n
 }
 
+/// vm-netsec's package build (run 42543507704): `n = 1`, the last byte of the
+/// frame, a stale fill of 125. A frame ends in the payload's `}`, so writing
+/// `}` there tears nothing: the record is intact and open keeps it. Any other
+/// fill over that byte is a tear and drops it.
+#[test]
+fn overwriting_the_last_byte_with_itself_is_no_tear_and_with_anything_else_is() {
+    let (_, frames) = written(1);
+    let (start, end) = frames[0];
+    for fill in 0..=255u8 {
+        let (store, _) = written(1);
+        assert_eq!(store.read_at(end - 1, 1).unwrap(), vec![b'}']);
+        store.write_at(end - 1, &[fill]).unwrap();
+        let j = Journal::open(store).expect("opens");
+        assert_eq!(j.ledger().last_seq, if fill == b'}' { 1 } else { 0 }, "fill {fill}");
+        assert_eq!(j.offset(), if fill == b'}' { end } else { start }, "fill {fill}");
+    }
+}
+
+/// The torn tail, exhaustively for one record: from whatever byte of the
+/// frame the overwrite starts (every byte, the closing `}}}` included) and
+/// with whatever fill, the record is dropped exactly when the write changed a
+/// byte, and kept when it changed none (the frame is then intact, and open
+/// rightly keeps it). Plain loops over the frame's own length, so no byte is
+/// left out by a hard-coded range.
+#[test]
+fn a_write_that_changes_a_byte_is_a_tear_and_one_that_changes_none_is_not() {
+    // Small stores: 78 000 opens of the default megabyte would take an hour.
+    let small = || MemStore::new(8 << 10);
+    let (_, frames) = written_in(small(), 1);
+    let (start, end) = frames[0];
+    assert!(end - start > 5, "a frame is longer than its tail");
+    for k in start..end {
+        for fill in 0..=255u8 {
+            let (store, _) = written_in(small(), 1);
+            let old = store.read_at(k, (end - k) as usize).unwrap();
+            let changed = old.iter().any(|b| *b != fill);
+            store.write_at(k, &vec![fill; (end - k) as usize]).unwrap();
+            let j = Journal::open(store).expect("a torn tail opens");
+            assert_eq!(
+                j.ledger().last_seq,
+                if changed { 0 } else { 1 },
+                "overwritten from byte {} of {} with {fill}",
+                k - start,
+                end - start
+            );
+        }
+    }
+}
+
 proptest! {
     #![proptest_config(config(256))]
 
@@ -152,6 +205,12 @@ proptest! {
         let (store, frames) = written(n);
         let (start, end) = frames[n - 1];
         let k = start + cut.index((end - start) as usize) as u64;
+        // A tear changes bytes: when the stale fill is what the frame already
+        // holds from `k` on (a frame ends `}}}`, so a fill of 125 over its
+        // last byte), nothing is torn and the record is intact (found by
+        // vm-netsec's build, n = 1, fill = 125, the last byte).
+        let old = store.read_at(k, (end - k) as usize).unwrap();
+        let fill = if old.iter().all(|b| *b == fill) { fill ^ 1 } else { fill };
         store.write_at(k, &vec![fill; (end - k) as usize]).unwrap();
         let mut j = Journal::open(store.clone()).expect("a torn tail opens");
         prop_assert_eq!(j.ledger().last_seq, n as u64 - 1);
